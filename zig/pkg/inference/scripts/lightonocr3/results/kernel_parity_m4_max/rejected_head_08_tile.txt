@@ -1,4 +1,0 @@
-fast_default=1 forced_diagnostics=0
-frame_mode=production wall_us=1813.20 gpu_us=1678.96
-frame_mode=tensor8x32 wall_us=1770.53 gpu_us=1644.97
-fast_calls=0 fallback_calls=0

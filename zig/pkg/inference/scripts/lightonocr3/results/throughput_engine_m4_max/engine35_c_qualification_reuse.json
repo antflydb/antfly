@@ -1,9 +1,0 @@
-{
-  "reason": "Exact C/checker hash match with qualified engine31. Host-cache allocation and typed fallback policy verified independently by engine35 tests and reader paths.",
-  "qualification": "engine31_c_qualification_audit.json",
-  "qualification_sha256": "14acd43dffe3d21626ad469f76f9233eae328704dc2a6ef226bc029fcfa7811b",
-  "source_sha256": {
-    "zig/pkg/inference/src/backends/metal_kernels.m": "09ad77e04599180b3504ada81da484b52c5028438f226e8897b8b9aa5d1169da",
-    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "3a9e29acc38af2e18c519c7718f4a65048abf7e43882f7bcd910a7b4c7c498e3"
-  }
-}

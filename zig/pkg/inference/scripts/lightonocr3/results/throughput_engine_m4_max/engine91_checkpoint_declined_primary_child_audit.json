@@ -1,5 +1,0 @@
-{
-  "status": "declined_before_pause_or_git_work",
-  "reason": "The model waiter had just spawned its benchmark child; initial child-free guard rejected checkpoint. No controller suspended, no git stage/commit/push or archive work executed.",
-  "log_sha256": "751721b3b78452b34c949f8509717c436bd2b69fda63eafdb936c8921aac0972"
-}

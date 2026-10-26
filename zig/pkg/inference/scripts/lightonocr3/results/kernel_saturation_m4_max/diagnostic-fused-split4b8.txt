@@ -1,1 +1,0 @@
--[_MTLCommandEncoder dealloc]:134: failed assertion `Command encoder released without endEncoding'

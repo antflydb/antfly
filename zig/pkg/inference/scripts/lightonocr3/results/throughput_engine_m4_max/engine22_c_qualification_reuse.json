@@ -1,9 +1,0 @@
-{
-  "created_at": "2026-10-24T00:46:43.225788+00:00",
-  "qualification_manifest": "engine21_c_qualification_manifest.json",
-  "qualification_manifest_sha256": "5cefd215b151bae4813533960d5b3f524cbfa3f9552d592b7aee0979fed188e5",
-  "kernel_sha256": "511240c3faefdae4228533d7d62bf516f2ca74494f727e75c84b1891b1b4afd5",
-  "checker_sha256": "d65321f2b20dd330176391739c806df27dad46e449e442c589fa2dbaead925b0",
-  "basis": "Exact kernel and checker source identity; production changes are in the Zig projector and server, separately qualified by engine22 GPU reader and prepared-embedding tests.",
-  "functional_only": true
-}

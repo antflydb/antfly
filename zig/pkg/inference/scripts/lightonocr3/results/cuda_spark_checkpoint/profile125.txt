@@ -1,4 +1,0 @@
-49_selected 08 .cache/native08-candidate49-c64-v8-p8-batchprefix1-visionmlp1-widecache/report.json
-profile125_native_done native08-candidate123-compact125-c128-head0-r128-physical128-functional
-compact125_actual_kv_mapping 08 [(6, 24), (6, 24), (6, 24), (6, 24), (6, 24), (6, 24)]
-candidate123-compact125_fused_head_screens_finished

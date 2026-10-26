@@ -1,6 +1,0 @@
-{
-  "reason": "MLX proxy reference records use ordered image paths rather than image_index. Original scope-disabled native reader completed successfully; verify helper reuses that immutable report, indexes the same ordered fixtures, and completes the enabled case.",
-  "original_helper_sha256": "7e5ee4be18e74f6a0877f9b6f01a140bafe5ae1d8bf6a08ca072f30f358e6fbb",
-  "verify_helper_sha256": "e8cc2730041224edb2de4ece3ce7e8c39b8df33c3d942d30e0139e3deae889f4",
-  "runtime_changed": false
-}

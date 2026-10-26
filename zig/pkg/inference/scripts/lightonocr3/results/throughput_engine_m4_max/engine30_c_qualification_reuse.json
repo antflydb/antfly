@@ -1,9 +1,0 @@
-{
-  "scope": "Reuse engine29 C mathematical conformance; both C implementation and checker unchanged. New Zig streaming lifetime/ownership is separately verified by reader tests and primary exact page outputs.",
-  "files_sha256": {
-    "zig/pkg/inference/src/backends/metal_kernels.m": "8885f738cfdd58dc0e7ec5ca1affe2edc20f26647ea725cd8dc74c99b2ffd148",
-    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "9b8bb662b5134e84657e1c6d1c6c502429624d42606234cc7b46ad269ec8eca7"
-  },
-  "qualification_audit": "engine29_qualification_audit.json",
-  "qualification_audit_sha256": "102ece48d8aeded2603fbf88bbe9da05a65978943b2fcb158fe6bff715b2a2a2"
-}

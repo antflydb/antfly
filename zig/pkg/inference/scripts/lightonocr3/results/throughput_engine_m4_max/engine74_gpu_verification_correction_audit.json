@@ -1,7 +1,0 @@
-{
-  "status": "pass",
-  "reason": "All 257 Metal tests passed. Original private post-checker retained a width4 expectation; separate saved-results verifier requires observed width8 and retains all other counters. No runtime changes or re-execution of native tests.",
-  "original_verifier_sha256": "7536760659a0853e15e3a6184657c47faf3cd432df811eea1eb095d2b021c7df",
-  "corrected_saved_verifier_sha256": "33f5e913cf0135a146779f1643270ab9bf876921334ec3a99dc2580e0590b16f",
-  "native_test_log_sha256": "d4cb61b58766c6da2aeacb83905984f28ae0c60122f6baf3956911d2852f8335"
-}

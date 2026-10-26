@@ -1,9 +1,0 @@
-{
-  "status": "review_revised_before_build",
-  "scope": "Per-dispatch exact-object deduplication and complete read/write union; no cross-dispatch cached permissions or ownership/lifetime assumptions. Original GPU shader text unchanged. Fixed <=8256 byte stack set plus bounded arrays, only32 bytes added persistent counters. Initial encoder cache proposal never compiled or executed.",
-  "references": [
-    "https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/useresources(_:usage:)",
-    "https://developer.apple.com/documentation/metal/mtlcommandbufferdescriptor/retainedreferences"
-  ],
-  "reason": "Other operations can reconfigure resource usage in one encoder; re-declare complete usage for every recurrent dispatch."
-}

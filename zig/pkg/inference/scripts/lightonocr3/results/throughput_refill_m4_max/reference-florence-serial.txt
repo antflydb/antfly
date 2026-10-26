@@ -1,1 +1,0 @@
-{"batch_size": 1, "completed": 16, "elapsed_seconds": 5.612003875001392, "pages_per_second": 2.8510315310493315, "serial_reference_parity": true}

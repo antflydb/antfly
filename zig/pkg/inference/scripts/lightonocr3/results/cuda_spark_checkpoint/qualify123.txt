@@ -1,6 +1,0 @@
-prefix16-123_ownership_qualified
-prefix16_123_positive_admission_qualified
-core123-tests.txt 240 selected; 227 passed; 13 skipped.
-core123-wide-tests.txt 77 selected; 77 passed; 0 skipped.
-candidate123_qualified
-candidate123_qualified_ready_for_models

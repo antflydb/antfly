@@ -1,9 +1,0 @@
-{
-  "status": "all_16_outputs_exact_actual_short_dispatches_qualified",
-  "scope": "Source158: per-reader counter deltas qualify 3408 short-core and 712 short-direct-attention dispatches. Full actual API fixture strings match, native parity covers every page, 142 chunks/16 starts/16 finishes, up to8 prefixes per step, no admission pressure. Original caps and reserves retained. Cold smoke rate is not primary throughput evidence. Historical Cbuild scope literal source154 names the initial routing change; build input hashes and actual155/158 manifests distinguish test/counter revisions.",
-  "report_sha256": "8a8bfb88f209b73611bc25e3df6b044ad62b80274f9e8009a24be9f27309c888",
-  "build_manifest_sha256": "1183c6d1436a101bb08351e21edae36d7c221f50f859b43faa220b751d5e0b7a",
-  "binary_sha256": "4312fe8f64673b7c039335efcc65805ee018b345a6bd50464c0e87cf604b07eb",
-  "frozen_source_verified": true,
-  "primary_throughput_eligible": false
-}

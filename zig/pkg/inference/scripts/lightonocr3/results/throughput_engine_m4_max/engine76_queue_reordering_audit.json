@@ -1,9 +1,0 @@
-{
-  "reason": "Use the smaller isolated prefill probe after width8 qualification and before native primary timing while the existing 4B live-memory guard cannot admit the model.",
-  "cancelled_waiting_pid": 73605,
-  "cancelled_driver_sha256": "25f38eff1dde2c73885e5746fa9fb1ec010e80747a8cf22c7b785e0246f8a504",
-  "replacement_driver_sha256": "6741311afbca7ccc71fbe81d8a5e56063ef15637551df0165f8900f397fb70c2",
-  "native_budget_driver_sha256": "50fd4d231166c7547c96a7344b8fa99fee27a073d667baebdc9df4ce7663308f",
-  "cancelled_before_any_build_or_gpu_child": true,
-  "created_at": "2026-10-25T03:45:25.079979+00:00"
-}

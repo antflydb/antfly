@@ -1,6 +1,0 @@
-{
-  "status": "failed_test_counter_assertion",
-  "scope": "First16C suites passed; full failed128 at newnarrowprojection counter assertion after numerical checks passed. Remaining6suites and attention notrun in154.155corrects testonly and reruns24freshsuites. Historical executionaudit and initial test bytes preserved.",
-  "historical_audit_sha256": "77460c2869e6fa5777edae9f51a632565fb8c6cfb04da08821bc543126e5381c",
-  "initial_test_sha256": "bcb856c8138d232309f8afc85272d9b66025109cc390db5fb8a8217ed38630e7"
-}

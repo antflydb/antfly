@@ -1,8 +1,0 @@
-{
-  "status": "source_models_and_drivers_ready_binary_qualification_pending",
-  "created_at": "2026-10-25T18:45:42.916070+00:00",
-  "driver_sha256": "f0012cc9e6cdc0e87d64f0f8de7b4a2dc7383e874b8c0e9e4ff6a66184785049",
-  "source_file_count": 48,
-  "runtime_patch_sha256": "b3287c65d7ea90ee22a81ada79b28c9c73d5eecf6e3a6350870e87df0fbc6799",
-  "scope": "Separate worktree on same wolfspider host after paired172 closes. LightOn models reuse immutable hash-verified original copies through symlinks; Florence copies stream-hash verified. Local source180 noncheckpoint GPU build and full remote replay/model checks still pending. No performance result claimed."
-}

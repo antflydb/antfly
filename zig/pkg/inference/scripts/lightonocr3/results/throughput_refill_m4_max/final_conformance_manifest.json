@@ -1,5 +1,0 @@
-{
-  "zig/pkg/inference/src/backends/metal_kernels.m": "feb2018fe400987d7439f8548a020b684c20a6a2ac20dfbf5a087c929a2ef47c",
-  "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "525120ba01efdc54756d2092f2830b790a96dc3c0d1b2bd2761728e866c6e490",
-  ".venv-lighton-vllm-metal/bin/check-refill-final": "6586bd419857b8e4efd031f737202f339850a5f8802c07546ef0b37365ac7f90"
-}

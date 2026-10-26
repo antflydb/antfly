@@ -1,1 +1,0 @@
-{"concurrency": 8, "completed": 16, "elapsed_seconds": 34.95293674999266, "pages_per_second": 0.4577583884994545, "p50_ms": 11689.074499998242, "p95_ms": 32063.366707996465, "serial_reference_parity": true}

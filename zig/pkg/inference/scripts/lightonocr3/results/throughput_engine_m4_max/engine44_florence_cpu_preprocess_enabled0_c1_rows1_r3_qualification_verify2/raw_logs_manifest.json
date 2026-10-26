@@ -1,8 +1,0 @@
-{
-  "florence-batch-c1.txt": {
-    "compressed_path": "florence-batch-c1.txt.gz",
-    "raw_sha256": "84c4289c5db5d653eae86e0be818dcad3fcfabb87b4fc6f473379cace60572ca",
-    "raw_bytes": 875,
-    "compressed_sha256": "6782e8073d4fc17a0e76ae56be7a7a4dcea9993a6bc3c989975a4663e3538a53"
-  }
-}

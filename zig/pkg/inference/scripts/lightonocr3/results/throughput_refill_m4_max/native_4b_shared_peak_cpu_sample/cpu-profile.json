@@ -1,9 +1,0 @@
-{
-  "scope": "Separate instrumented CPU profile; excluded from throughput controls. Sample only the native test process descended from this owned benchmark runner.",
-  "sampled": true,
-  "pid": 31482,
-  "sample_seconds": 2,
-  "sample_exit_code": 0,
-  "report_sha256": "3a63fe483f0e2b0b4e34521e3c392f781071e3a178a8d827d6ab4d3b5a2b7264",
-  "binary_sha256": "8ad09042bbaafb82229263ab50f329a0f29b9eb96d0a2d70d3dedf87dd3c745a"
-}

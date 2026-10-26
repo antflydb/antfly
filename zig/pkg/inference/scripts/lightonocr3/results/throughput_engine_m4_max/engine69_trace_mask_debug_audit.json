@@ -1,6 +1,0 @@
-{
-  "status": "pass",
-  "scope": "Debug safety checks enabled, exact helper and boundary-test fragments extracted from frozen production source. Covers all 64 row bits, no overlap, complete u64 mask and invalid dimensions.",
-  "production_source_sha256": "395a981674f4d96ecdbe89daeab6578b959748ff491d17ce2aba16e0b24fafdb",
-  "extracted_debug_source_sha256": "3b995f0c178cf4dba6e41bcb99b270b61d1769e7d9e33dc6d62ded108c984acd"
-}

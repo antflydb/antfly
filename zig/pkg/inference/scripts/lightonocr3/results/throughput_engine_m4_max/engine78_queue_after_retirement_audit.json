@@ -1,7 +1,0 @@
-{
-  "cancelled_child_free_probe_queue_pid": 14382,
-  "original_probe_driver_sha256": "47f35508f5995bf2c81037a6cc1c1fdc354b16493f58bd28f05c5e3ace5593cc",
-  "replacement_probe_driver_sha256": "42c9162a4e50959b73d181700ec068351edd9c9b107354c4f385fcc1afeeaad3",
-  "retired_burst_screen_audit_sha256": "b3fb84b13c94ee3b1aae5eddbbca2720d70629dd2f79e010e5ced3683c9beda1",
-  "reason": "Continue smaller, separately excluded GPU research after retiring an unstarted full-model control for sustained insufficient memory. Native source74 remains qualified; no throughput winner inferred."
-}

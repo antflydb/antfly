@@ -1,3 +1,0 @@
-uv run --project scripts --locked python scripts/check_apache_boundary.py
-Apache product boundary verified: 2424 source files; server entry points remain ELv2
-uv run --project scripts --locked python scripts/license_headers.py --check

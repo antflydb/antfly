@@ -1,3 +1,0 @@
-fused_tensor in=1024 out=3584 rows=8 tn=16 base_gpu_us=180.64 candidate_gpu_us=125.93 base_wall_us=405.28 candidate_wall_us=329.05 max_abs=0
-fused_tensor in=1024 out=3584 rows=8 tn=32 base_gpu_us=179.39 candidate_gpu_us=157.21 base_wall_us=366.42 candidate_wall_us=313.38 max_abs=0
-fused_tensor in=1024 out=3584 rows=8 tn=64 base_gpu_us=181.38 candidate_gpu_us=267.37 base_wall_us=347.57 candidate_wall_us=441.86 max_abs=0

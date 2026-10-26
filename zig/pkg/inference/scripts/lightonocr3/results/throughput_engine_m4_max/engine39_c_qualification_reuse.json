@@ -1,8 +1,0 @@
-{
-  "status": "pass",
-  "source_sha256": "d7373ce8ce87ad8c43436ac6491d47bde546d13498887091194c95546cd6e031",
-  "checker_sha256": "fc908aef10a62eb80adc1e325f0adf2c1ee0e941f35414e1da8c924746064268",
-  "prior_audit": "engine38_c_qualification_audit.json",
-  "prior_audit_sha256": "b80b918b3dd55e07ac018bf81a2d987f63634acd2198b059c8b2d41d15b58669",
-  "scope": "C shaders, dispatchers and numerical checker are unchanged from engine38. New Zig ownership tests and actual reader on/off qualification cover vision frame submission and lifetime changes."
-}

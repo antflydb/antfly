@@ -1,8 +1,0 @@
-{
-  "lighton08-batch-c16.txt": {
-    "compressed_path": "lighton08-batch-c16.txt.gz",
-    "raw_sha256": "03e73059c6d0ca7faeb4b6956abadcc42fb926bf7f472c2dd44b8e2dce449330",
-    "raw_bytes": 18677,
-    "compressed_sha256": "321b5da4eddaecf82810843d65e21524c007fd80c803c69d57abd98c32a9f776"
-  }
-}

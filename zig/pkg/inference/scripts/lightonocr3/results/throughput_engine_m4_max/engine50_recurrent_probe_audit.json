@@ -1,9 +1,0 @@
-{
-  "status": "failed",
-  "exit_code": 22,
-  "build_manifest_sha256": "e67dde851794a913d88cb8de35ca1307066eb1a7673a3e0bbcfc2ac5489ff1b6",
-  "raw_stdout_sha256": "960e5de190b5f0cfb168b0e348c87adb03be5076ce4b2e5b2e4ae7f03c2e8c2d",
-  "raw_stderr_sha256": "73f4a9aad0023b261821a634a9ffdd2d74180f5c992b992df4862dc88d365cb8",
-  "scope": "Private diagnostic only. 24 distinct recurrent layers, 64/48/33 independent page states. Same F32 state/layout/precision, actual runtime indirect resource path; candidates change lane memory mapping. ABBA two warm/eight timed frames per leg. Every output and full persistent state compared after each leg; unchanged single/batch staged conformance covers cold/continuation/offset/private producer/fallback/cancel. Not a full-model or vLLM win.",
-  "cases": []
-}

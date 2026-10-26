@@ -1,6 +1,0 @@
-batch_argmax_check rows=1 cpu=pass legacy=pass private_producer=pass token_canary=pass missing_pipeline=pass standalone=pass cancel=pass
-batch_argmax_check rows=2 cpu=pass legacy=pass private_producer=pass token_canary=pass missing_pipeline=pass standalone=pass cancel=pass
-batch_argmax_check rows=16 cpu=pass legacy=pass private_producer=pass token_canary=pass missing_pipeline=pass standalone=pass cancel=pass
-batch_argmax_check rows=33 cpu=pass legacy=pass private_producer=pass token_canary=pass missing_pipeline=pass standalone=pass cancel=pass
-batch_argmax_check rows=64 cpu=pass legacy=pass private_producer=pass token_canary=pass missing_pipeline=pass standalone=pass cancel=pass
-batch_argmax_check rows=65 cpu=pass legacy=pass private_producer=pass token_canary=pass missing_pipeline=pass standalone=pass cancel=pass

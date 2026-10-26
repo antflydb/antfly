@@ -1,9 +1,0 @@
-# Diagnostic only: remove MLX's wired-memory advantage, never a parity target.
-import sys
-import mlx.core as mx
-_original_set_wired_limit = mx.set_wired_limit
-def _disable_wiring(requested):
-    old = _original_set_wired_limit(0)
-    print(f'OCR_WIRING_ABLATION requested={requested} forced=0', file=sys.stderr, flush=True)
-    return old
-mx.set_wired_limit = _disable_wiring

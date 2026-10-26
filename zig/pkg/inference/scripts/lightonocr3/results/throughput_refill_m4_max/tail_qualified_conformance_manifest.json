@@ -1,5 +1,0 @@
-{
-  "zig/pkg/inference/src/backends/metal_kernels.m": "e9c41e4790d52c2d0ad0f81acd29a2f36e0c246b1696ae2b7a486af75e36804f",
-  "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "af5a9725e4de4b3c084602e680755cc5772a302c8e3890ba1832de767ed80aa4",
-  ".venv-lighton-vllm-metal/bin/check-tail-qualified": "c0b3e85b82261b47de7ce1152c7b82316aa65c99f535e0bf5f7c550f96dae60f"
-}

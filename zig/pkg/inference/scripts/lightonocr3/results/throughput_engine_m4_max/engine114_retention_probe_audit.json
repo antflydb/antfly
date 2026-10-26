@@ -1,7 +1,0 @@
-{
-  "status": "cpu_only_probe_complete",
-  "created_at": "2026-10-25T12:56:42.218967+00:00",
-  "source_sha256": "7487eef3e580369357e86d60bd81db122252833a52933b3bf4b1ac0d713ce1d9",
-  "log_sha256": "3bf1258931cee88a0c7269dc4795c5d30b76874069f0250ba44835b620f29136",
-  "scope": "Approximate recurrent retain topology on NSObject identities, CPU only. All model screens closed before this probe; no GPU or model measurement. Earlier untimed gap check declined before any pause because next cohort already launched. No production change or throughput claim."
-}

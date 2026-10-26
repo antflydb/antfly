@@ -1,9 +1,0 @@
-{
-  "status": "pass",
-  "primary_full_model_comparison": false,
-  "scope": "Fresh R64 reference diagnostic, automatic cache and original benchmark settings; not a paired R128 claim.",
-  "pages_per_second": 0.9239785873685031,
-  "report": "vllm_4b_diagnostic_reference29_stage_screen_c64_r64/report.json",
-  "report_sha256": "b0ab9e9045177e27314ec2f09906019ab99168216ed52540bdf1306193b3470c",
-  "log_sha256": "c61fe0a2c2c82cd519d7e03adb3fe11f1933c04e2f80fdb8b60fd5a50731e64e"
-}

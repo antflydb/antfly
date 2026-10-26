@@ -1,7 +1,0 @@
-{
-  "status": "test_counter_error_corrected_in155_production_C_unchanged",
-  "scope": "154full suite exited128 at the new narrow-prefill assertion, after104core shapes passed and first projection numeric checks passed (max7.51e-6). wide_mpp_projection_calls intentionally records decoder/head projections only.155checks actual planned+dedicated MPP dispatch counters instead. Original154logs/audit/freeze preserved; fresh155C24suite required.",
-  "failed_audit_sha256": "77460c2869e6fa5777edae9f51a632565fb8c6cfb04da08821bc543126e5381c",
-  "old_freeze_sha256": "973e234bbb8c5a47fb49ae22f0846610ec1b9308860fd0ee4ff66a28152d8ef8",
-  "corrected_freeze_sha256": "2d7940f39a46c5c75cd7f0c4c4a6f7f3c0899e6adc3c8aa0cc9bd6593ea733dd"
-}

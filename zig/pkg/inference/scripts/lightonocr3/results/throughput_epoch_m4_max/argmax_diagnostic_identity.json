@@ -1,8 +1,0 @@
-{
-  "purpose": "Standalone current-source Metal argmax diagnostic; scenarios include finite/tied winners, leading NaN followed by positive infinity, and all nonfinite. Initial failed checked build is preserved separately.",
-  "driver_sha256": "3a91cd8d22e2419ea3f755b504de0c51ae19e7278ca8d086ca7c6c3423cdf204",
-  "before_binary_sha256": "0b4591cbb6d0c6b549473ff737ac9bea09610a11718362fb0c8e6bef43e3a541",
-  "final_binary_sha256": "165594ac4931c471ff2904c6dba44b9113269b3266bf5c6bb96325a380784d57",
-  "before_c_source_sha256": "43b0b2f2b030359502df60f325c95700a9cd6ab8afcf4e7aefe6499a808195ec",
-  "final_c_source_sha256": "1cd2d2c9b9633852c68268ce1fa76e9cdc2742d09fed3a1106e3be562518922f"
-}

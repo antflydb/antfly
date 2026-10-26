@@ -1,5 +1,0 @@
-{
-  "zig/pkg/inference/src/backends/metal_kernels.m": "7f4b930ffd18cb8c77999d130142846ed000757746588c0829d7a14cfffbf488",
-  "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "1139053ad1ca09e9693255e47565db38fff15d13961bbfd3ded85561901a865c",
-  ".venv-lighton-vllm-metal/bin/check-ocr-kernels": "36351e9cc232bfe014d5e79b1b7e31012a3274a33de0cb0a706e2ca7a331119d"
-}

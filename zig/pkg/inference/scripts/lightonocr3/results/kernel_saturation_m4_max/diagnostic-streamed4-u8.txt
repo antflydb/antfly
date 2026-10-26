@@ -1,3 +1,0 @@
-grouped_head in=2560 out=9216 rows=4 sg=2 base_gpu_us=191.76 candidate_gpu_us=299.07 base_wall_us=320.95 candidate_wall_us=425.95 max_abs=5.72205e-06
-grouped_head in=2560 out=9216 rows=4 sg=4 base_gpu_us=190.13 candidate_gpu_us=322.92 base_wall_us=333.99 candidate_wall_us=462.02 max_abs=5.72205e-06
-grouped_head in=2560 out=9216 rows=4 sg=8 base_gpu_us=184.04 candidate_gpu_us=334.93 base_wall_us=309.11 candidate_wall_us=458.69 max_abs=5.72205e-06

@@ -1,8 +1,0 @@
-{
-  "reason": "Obsolete harness assertion required a 9..16-row projection tile even when actual physical64 cohorts skipped that narrow range. Native run completed all64 with exact output. Verifier retains positive actual wide-MPP projection/head checks and all existing memory/output checks.",
-  "original_report": "engine39_08_vision_stream0_physical64_c64_vf2_r64_qualification/report.json",
-  "original_report_sha256": "92aeb2acf9be91471808c975d27d741f9baa6a0facdf061f70da3b8390ebb6db",
-  "immutable_original_report": true,
-  "derived_verification_report": "engine39_08_vision_stream0_physical64_c64_vf2_r64_qualification/verified_report.json",
-  "runtime_source_changes": false
-}

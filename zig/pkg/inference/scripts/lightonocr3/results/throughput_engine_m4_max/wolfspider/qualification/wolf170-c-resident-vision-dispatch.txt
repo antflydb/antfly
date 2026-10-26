@@ -1,1 +1,0 @@
-resident_vision_dispatch positive=pass gpu_producer=pass missing_pipeline=pass dtype=pass disable=pass shape=pass scalar=pass no_fallback_writes=pass legacy_restored=pass

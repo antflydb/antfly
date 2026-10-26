@@ -1,6 +1,0 @@
-1/116 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...[default] (warn): inference live-memory admission denied requested_bytes=11348275670 pending_bytes=0 available_bytes=15461882265 reserve_bytes=6442450944 capacity_bytes=9019431321 basis=macos_memory_pressure policy=dynamic_pressure process_rss_bytes=76283904 process_anonymous_bytes=0 process_private_dirty_bytes=0
-[default] (warn): loadModel(/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b) backend metal admission failed: ResourceTemporarilyUnavailable; peak_host=2269655134 peak_backend=9078620536 host_limit=30064771072 backend_limit=17179869184 combined_limit=30064771072
-[default] (err): loadModel(/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b) failed: no backend accepted model
-[default] (err): manifest paths onnx=null visual=null audio=null text_projection=null visual_projection=null audio_projection=null
-FAIL (ResourceTemporarilyUnavailable)
-1 selected; 0 passed; 0 skipped; 2 failed; 0 leaked.

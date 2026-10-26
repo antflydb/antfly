@@ -1,7 +1,0 @@
-{
-  "status": "singleton_fixture_correction_only",
-  "original_failed_audit_sha256": "d0d6d6b94cf984c1bbfa1412ea49266c56bd9a5053e0b1f9d51b03f45a8275ed",
-  "completed_cases_preserved": "24 valid ABBA records at 64 and 48 pages, no numerical/canary failures",
-  "failure": "33 pages end with a singleton; existing batch_begin API declines one-item batches. New fixture routes singleton through existing direct core call, as production does.",
-  "rerun_scope": "33 pages only; same three shader sources and runtime copy. Reruns staged conformance on the unchanged kernels before the missing 33-page cases."
-}

@@ -1,8 +1,0 @@
-{
-  "lighton4b-batch-c16.txt": {
-    "compressed_path": "lighton4b-batch-c16.txt.gz",
-    "raw_sha256": "da6996150ba65670aa66cfa19da6566460d6ecd2ec84bde7d22b8d8700bb1c53",
-    "raw_bytes": 18602,
-    "compressed_sha256": "8acba0ae0b0a4e720813493116b94f0eacffec9539f7ca746a217b56de155d78"
-  }
-}

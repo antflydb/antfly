@@ -1,6 +1,0 @@
-{
-  "status": "c_checks_passed_not_model_qualified",
-  "checks": 23,
-  "scope": "InitialextendedcacheCbuildpassed23suites. No model timing or full MetalZig qualification. Before model execution exact-size reuse will replace best-fit for the extended pool to preserve admitted physical working-set bounds. Legacy8MiBbestfitunchanged.",
-  "freeze_sha256": "144e23351a16c05b16262982c1ef540db1b81e0e0e292c610639830dbfc0e5ba"
-}

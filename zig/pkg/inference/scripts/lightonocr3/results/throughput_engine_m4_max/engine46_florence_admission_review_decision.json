@@ -1,6 +1,0 @@
-{
-  "status": "not_promoted",
-  "scope": "Review decision, not an observed OOM or a failed numerical test. Engine46 admission helpers and boundary tests pass, but shrinking decoder logits is insufficient proof of the separate vision encoder/host temporary peak, especially with alternate buffer reuse or fallback paths. Restore the exact qualified engine45 Florence reading source; retain the F32 full64 LightOn experiment. No caps are raised and no unknown encoder peak is credited.",
-  "restored_reading_sha256": "1f567d4eb339aa4aa510deb1cc5d3cfed2b2a45c4321579927b8ba64cc06f9e9",
-  "validated_experiment_manifest_sha256": "67019e1ce25902fee5915d3ea08bf0dc2bbe2cdb387253d4d757660e7126f507"
-}

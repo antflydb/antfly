@@ -1,6 +1,0 @@
-{
-  "status": "read_only_complete",
-  "known_logged_benchmark_pids": 110,
-  "surviving_owned_processes": [],
-  "scope": "Read-only PID/start-time matches against this worktree reference server logs. No process terminated and no other workloads modified."
-}

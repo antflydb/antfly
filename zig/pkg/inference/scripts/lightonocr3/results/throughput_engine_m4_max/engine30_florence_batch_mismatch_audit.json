@@ -1,7 +1,0 @@
-{
-  "scope": "MLX batch1 succeeds; batch2 output differs and is excluded as a performance reference. Driver stops on mismatch; batch4/8 and native stage unrun. A new serial-only reference will be used.",
-  "report": "mlx_florence_engine30_reference/report.json",
-  "report_sha256": "ea9f1e2154da6be91e43bc55cd937c44ac4e694070e4690ceef606e1126e3be0",
-  "valid_serial_pages_per_second": 4.7110621831321025,
-  "invalid_batch2_primary_throughput_eligible": false
-}

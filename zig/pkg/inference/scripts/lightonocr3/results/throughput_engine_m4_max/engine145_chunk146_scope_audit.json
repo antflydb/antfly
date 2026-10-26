@@ -1,9 +1,0 @@
-{
-  "status": "full_grouped_correctness_pass_not_primary_timing",
-  "scope": "Source145 bounded transient admission, four128-token chunks. Historical human scope literal Source139 in smoke driver is stale; executed binary/source identity is source145 manifest, verified here. No original reports or executed driver bytes edited.",
-  "smoke_report_sha256": "2ab6384428b6f902c2dba83bd34d703b4d7a414c27e31302596ed1ddad3a97eb",
-  "smoke_driver_sha256": "27c9ebd5f61e3b2cd8b3f78d800a9d718dbac330b18fc961156a5e6c65b602d7",
-  "build_manifest_sha256": "0e583310490ed1067f381495a49fa4eff9b3441c364ccfedeba8b860c1290bb8",
-  "binary_sha256": "aaf42a171ea78b2a7984b0836209901d0bb8c6c88845ee7f340ec9cbc18b6fca",
-  "frozen_source_verified": true
-}
