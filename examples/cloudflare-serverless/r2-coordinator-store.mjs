@@ -33,7 +33,10 @@ export class R2CoordinatorStore {
   constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8} = {}) {
     this.module = module; this.bucket = bucket; this.namespace = namespace; this.prefix = prefix; this.clock = clock; this.onMetrics = onMetrics;
     this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;this.recoveryWindow=recoveryWindow;
-    this.owner = owner ?? Array.from(crypto.getRandomValues(new Uint8Array(16)));
+    const copyOwner=value=>{if(!Array.isArray(value)&&!(value instanceof Uint8Array)||value.length!==16||!Array.from(value).every(v=>Number.isInteger(v)&&v>=0&&v<=255))throw Error("InvalidCoordinatorOwner");return Array.from(value);};
+    const randomOwner=()=>Array.from(crypto.getRandomValues(new Uint8Array(16)));
+    this.owner=typeof owner?.then==="function"||owner==null?randomOwner():copyOwner(owner);
+    if(typeof owner?.then==="function"){this.ownerReady=Promise.resolve(owner).then(value=>{if(value!=null)this.owner=copyOwner(value);});this.ownerReady.catch(()=>{});}
     this.cache = cache??createImmutableReadCache({includeCommitLog:true,maxEntries:1024,writeThrough:true});
     const raw=transport??createR2Transport({database:bucket},{maxPutBytes:4*1024*1024});
     this.rawTransport=raw;this.snapshotKernel=readKernel??kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;
@@ -43,6 +46,7 @@ export class R2CoordinatorStore {
     if(background)this.idleCheckpoint=new IdleCheckpoint({revision:()=>this.state?.revision??0,isIdle:()=>!this.running&&!this.pending.length,background,onError:error=>{try{this.onMetrics?.({event:"antfly.checkpoint_deferred",error:String(error)});}catch{}},checkpoint:()=>this.transaction(async tx=>{if(this.pending.length)return{busy:true};const revision=tx.snapshot().revision;return{done:await tx.checkpoint(),revision};},{priority:"maintenance"})});
   }
   async native(coordinate) {
+    if(this.ownerReady)await this.ownerReady;
     if(!this.kernel)this.host ??= await instantiateHost(this.module, this.transport, {clock:this.clock,onMetrics:sample=>this.chargeMetrics(sample)});
     const cursor=Object.hasOwn(coordinate,"state")?coordinate.state:this.state??(coordinate.action==="begin"&&this.observedState?.next>0?this.observedState:null);
     let transport=this.transport,cleanup=async()=>{};
@@ -108,6 +112,7 @@ export class R2CoordinatorStore {
     this.rows.set(key,{value:structuredClone(value),bytes});this.rowBytes+=bytes;
   }
   async readOnly(run,{traceId,traceIds=[]}={}){
+    if(this.ownerReady)await this.ownerReady;
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
     const owned=this.acquired,captured=structuredClone(owned?this.state:(this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=this.clock()+5000,started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false;
     const reserve=(operations,bytes)=>{if(usedOperations+operations>=254||usedBytes+bytes>=8*1024*1024){admissionBudgetExceeded=true;throw Error("ReadSnapshotNeedsAdmission");}usedOperations+=operations;usedBytes+=bytes;};
@@ -123,7 +128,7 @@ export class R2CoordinatorStore {
         if(prefetched?.has(request.key)){const result=prefetched.get(request.key);prefetched.delete(request.key);if(result.error)throw result.error;return result.value;}
         return raw(request,body);
       };
-    }else transport=recoveryReadAhead(guarded,{window:this.recoveryWindow||1,reserve,cursor:captured,followSeals:!owned});
+    }else transport=recoveryReadAhead(guarded,{window:this.recoveryWindow||1,initialWindow:1,reserve,cursor:captured,followSeals:!owned});
     const native=(state,coordinate)=>{
       if(usedOperations>=254||usedBytes>=8*1024*1024)throw Error("ReadSnapshotNeedsAdmission");
       return this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,fairKey:this.namespace,priority:"interactive",deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,...sample});}catch{}}});

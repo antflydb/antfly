@@ -535,3 +535,25 @@ test("durable hint encoding bounds compact metadata and rejects corrupt or misma
  for(const mutate of[x=>x.records[0][1].body_base64='!!!',x=>x.records[0][1].body_base64='A'.repeat(5468),x=>x.records.push(x.records[0]),x=>x.format=2]){const invalid=structuredClone(encoded);mutate(invalid);assert.equal(decodeReadHints(namespace,'7',invalid),null);}
  assert.equal(encodeReadHints(namespace,'8',hint),null);
 });
+
+
+test("actor-version ownership resumes after reconstruction and still fences different deployments",async()=>{
+ const{actorOwner}=await import('../actor-owner.mjs'),actor='a'.repeat(64),version='01234567-0123-4567-89ab-0123456789ab',namespace='stable-actor',identity=await actorOwner(actor,version,namespace),bucket=new Bucket();
+ assert.deepEqual(await actorOwner(actor.toUpperCase(),version.toUpperCase(),namespace),identity);assert.equal(actorOwner(actor,undefined,namespace),undefined);assert.notDeepEqual(await actorOwner('b'.repeat(64),version,namespace),identity);assert.notDeepEqual(await actorOwner(actor,version,'other'),identity);
+ const first=new R2CoordinatorStore(module,bucket,namespace,{owner:actorOwner(actor,version,namespace)});await first.transaction(tx=>tx.put('a',1));const epoch=structuredClone(first.state.epoch);
+ const reopened=new R2CoordinatorStore(module,bucket,namespace,{owner:actorOwner(actor,version,namespace)});await reopened.transaction(tx=>tx.put('b',2));assert.deepEqual(reopened.state.epoch,epoch);assert.deepEqual(reopened.owner,identity);assert.deepEqual(await reopened.transaction(tx=>tx.getMany(['a','b'])),[1,2]);
+ const replacement=new R2CoordinatorStore(module,bucket,namespace,{owner:actorOwner(actor,'01234567-0123-4567-89ab-0123456789ac',namespace)});await replacement.transaction(tx=>tx.put('c',3));await assert.rejects(first.transaction(tx=>tx.put('stale',true)),/ImmutableLogFenced/);assert.deepEqual(await replacement.transaction(tx=>tx.getMany(['a','b','c','stale'])),[1,2,3,undefined]);
+});
+test("overlapping reconstructed owners cannot acknowledge forked roots and retry preserves both updates",async()=>{
+ const bucket=new Bucket(),namespace='same-owner-overlap',owner=Array(16).fill(1),seed=new R2CoordinatorStore(module,bucket,namespace,{owner});await seed.transaction(tx=>tx.put('seed',0));
+ const left=new R2CoordinatorStore(module,bucket,namespace,{owner:Promise.resolve(owner)}),right=new R2CoordinatorStore(module,bucket,namespace,{owner:Promise.resolve(owner)});let entered=0,release;const barrier=new Promise(resolve=>release=resolve),write=(store,key,value)=>store.transaction(async tx=>{if(++entered===2)release();await barrier;tx.put(key,value);});
+ const result=await Promise.allSettled([write(left,'left',1),write(right,'right',2)]);assert.equal(result.filter(r=>r.status==='fulfilled').length,1);assert.equal(result.filter(r=>r.status==='rejected').length,1);const index=result.findIndex(r=>r.status==='rejected'),loser=index===0?left:right;await loser.transaction(tx=>tx.put(index===0?'left':'right',index===0?1:2));
+ const check=new R2CoordinatorStore(module,bucket,namespace,{owner});assert.deepEqual(await check.transaction(tx=>tx.getMany(['seed','left','right'])),[0,1,2]);
+});
+test("idle read observers probe one tail slot and grow only after an authenticated contiguous prefix",async()=>{
+ const{recoveryReadAhead}=await import('../recovery-read-ahead.mjs'),{ObjectStoreError}=await import('../../../zig/lib/objectstore/wasm/r2.mjs'),state={format:1,epoch:Array(16).fill(1),owner:Array(16).fill(2),next:30,revision:100,root:''},prefix='db/epochs/'+'01'.repeat(16)+'/',calls=[];let live=false;
+ const raw=async request=>{calls.push(request.key);if(request.key==='db/CHECKPOINT')return{body:utf8.encode(JSON.stringify({state})),json:{}};if(live&&request.key===prefix+'00000000000000000030.json')return{body:utf8.encode(JSON.stringify({kind:'commit',epoch:state.epoch,slot:30,parent_revision:100,state:{...state,next:31,revision:101}})),json:{}};throw new ObjectStoreError(1,'missing');};
+ const read=recoveryReadAhead(raw,{window:8,initialWindow:1,cursor:state,followSeals:true});await read({op:'get',key:'db/CHECKPOINT'});await assert.rejects(read({op:'get',key:prefix+'SEALED'}),e=>e.status===1);await assert.rejects(read({op:'get',key:prefix+'00000000000000000030.json'}),e=>e.status===1);assert.equal(calls.length,3);
+ calls.length=0;live=true;await read({op:'get',key:'db/CHECKPOINT'});await assert.rejects(read({op:'get',key:prefix+'SEALED'}),e=>e.status===1);await read({op:'get',key:prefix+'00000000000000000030.json'});await assert.rejects(read({op:'get',key:prefix+'SEALED'}),e=>e.status===1);assert.ok(calls.includes(prefix+'00000000000000000031.json'));assert.ok(calls.includes(prefix+'00000000000000000032.json'));assert.ok(!calls.includes(prefix+'00000000000000000033.json'));assert.equal(calls.filter(key=>key.endsWith('/SEALED')).length,2);
+ assert.throws(()=>recoveryReadAhead(raw,{window:8,initialWindow:9}),/InvalidRecoveryWindow/);
+});

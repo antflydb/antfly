@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {actorOwner} from "./actor-owner.mjs";
 import {writeReadHints} from "./publication-read-hints.mjs";
 import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
 import {metadataObjectCall} from "./metadata-object-call.mjs";
@@ -49,14 +50,16 @@ export class R2CommitCoordinator extends DurableObject {
     if (!env.ANTFLY_INCARNATION) throw new Error("CoordinatorNamespaceRequired");
     if(env.ANTFLY_TENANTS){const binding=env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");}
     this.env = env;
-    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics()}));}});
+    const instanceId=crypto.randomUUID(),owner=actorOwner(ctx.id.toString(),env.WORKER_VERSION?.id,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION);
+    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{owner,kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
     this.serviceStore = Object.create(this.store);
     this.serviceStore.transaction = run => this.transaction(run);
     this.maintenanceStore=Object.create(this.store);this.maintenanceStore.transaction=run=>this.transaction(run,{priority:"maintenance"});
     this.publication=new PublicationScheduler(this.maintenanceStore,env.ANTFLY_INCARNATION);
     this.maintenance=new MaintenanceTickets(this.maintenanceStore);
     this.journal = new R2CollectionJournal(this.maintenanceStore);
-    this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,"r2"));
+    this.authorityAdmission=new AuthorityAdmission(async()=>{if(this.store.ownerReady)await this.store.ownerReady;return openAuthority(env,"r2");});
+    if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.actor_started",role:"writer",actor_id:ctx.id.toString(),actor_instance_id:instanceId,version:env.WORKER_VERSION?.id,owner_identity:owner?"actor-version":"ephemeral",...kernelMetrics()}));
   }
   async ensureAuthority(){if(!this.authority){const authority=await this.authorityAdmission.get();this.authority??=authority;}return this.authority;}
   requestMaintenance(kind,jobId){return this.maintenance.request(kind,jobId);}

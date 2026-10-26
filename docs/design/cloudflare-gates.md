@@ -358,3 +358,12 @@ replayed after an ambiguous transport result. Existing resource-error observatio
 remain disqualifying even if a later attempt succeeds. Cold calls now stop after
 the first transport or HTTP failure, rather than issuing a retry that the final
 one-attempt policy would reject anyway. Prior failed reports are not rewritten.
+
+
+The Cloudflare native-owner identity is scoped to the provider's physical actor,
+deployment version and storage namespace. Actor reconstruction within one
+deployment can resume that owner under Durable Object serialization. Deployment
+or physical-actor changes retain native fencing; hosts without validated provider
+metadata use random owners. Read-only log recovery starts with one slot and
+adapts only after validated contiguous progress, retaining fresh seal probes and
+all native recovery budgets. Neither optimization changes acceptance thresholds.

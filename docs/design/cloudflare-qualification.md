@@ -1279,3 +1279,35 @@ modes, both collectors, reindex, erased platform storage and migration. Native
 module hashes remain unchanged. The next comparison enables local native read
 admission using those durable hints. Recovering a stalled control redeploys its
 unchanged sealed bundle; it does not alter the frozen native code or parameters.
+
+
+The ten-minute local-reader diagnostic (`durable-local-reader-smoke-3.json`)
+completed 240 reads and 80 writes per side without request/resource errors and
+verified 80 bodies per side and eight receipts overall. Candidate read/write p95 was 1,336 /
+8,823 ms versus 6,214 / 7,027 ms for the frozen control. This fails both absolute
+latency limits and the relative write limit. No reserved cold epoch was used.
+Local native metadata admission was active; traces still showed expensive
+metadata recovery and commits. Repeated unowned snapshots suggest reconstruction,
+but do not establish its cause or prove a memory failure.
+
+The Cloudflare adapter now derives the native owner from the physical Durable
+Object ID, deployment version and storage namespace. Provider serialization of
+that physical actor permits the same deployment to resume ownership after
+reconstruction, avoiding an unnecessary epoch rotation. A changed physical actor
+or deployment has a different owner and must pass native fencing. Generic hosts
+and adapters missing valid provider identity/version metadata retain random
+owners. This policy requires exclusive execution of each provider actor; it is
+not a general concurrent-host owner-sharing protocol. Regression checks cover
+reconstruction, changed-version fencing and conflicting same-owner roots.
+Constructor metrics identify actor instances so live reconstruction can be
+measured rather than inferred from missing volatile state.
+
+Read-only recovery now starts with one speculative log slot and doubles its
+window only after consuming a complete authenticated contiguous prefix, up to
+the existing eight-slot limit. Checkpoint and epoch changes reset the window.
+Idle observation therefore reads the checkpoint, seal and next slot rather than
+probing eight future slots. Fresh seal checks, native validation, operation/byte
+bounds and mutable recovery behavior are unchanged. These changes pass all 191
+Node checks and all eight persisted Worker checks in 323.1 seconds, including
+receipt replay after reconstruction and progress behind a suspended builder.
+Live qualification remains pending.
