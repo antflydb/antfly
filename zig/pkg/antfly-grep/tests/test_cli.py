@@ -7944,12 +7944,16 @@ class CliTests(unittest.TestCase):
     def test_workspace_oversized_lexical_index_backs_off_until_inventory_shrinks(self):
         if os.name == "nt":
             self.skipTest("long path fixture requires POSIX paths")
-        source = "src/" + "/".join(ch * 240 for ch in "abc")
+        # Linux permits 4 KiB paths; use that space to exercise the same real
+        # 16 MiB admission boundary with one quarter as many inodes, watches,
+        # opens and deletes. Darwin's 1 KiB path limit needs shorter prefixes.
+        components = 12 if sys.platform.startswith("linux") else 3
+        source = "src/" + "/".join(chr(97 + n) * 240 for n in range(components))
         directory = self.root / source
         directory.mkdir(parents=True)
-        count = 24000
-        # Shared long directory prefixes exceed the 16 MiB path budget without
-        # needing hundreds of thousands of files or a test-only product flag.
+        count = 72000 // components
+        # Shared directory prefixes exceed the production path budget; no
+        # test-only memory limit or relaxed response deadline is involved.
         paths = [directory / f"f{i:05}.txt" for i in range(count)]
         for path in paths:
             path.write_text("negative\n")
