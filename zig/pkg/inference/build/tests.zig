@@ -46,7 +46,7 @@ pub fn create(ctx: Context) Suite {
     const dual_accelerator_macos = ctx.target.result.os.tag == .macos and
         ctx.backend.enable_metal and ctx.backend.enable_cuda;
     const tests = b.addTest(.{
-        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (dual_accelerator_macos) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (dual_accelerator_macos) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else if (ctx.backend.enable_cuda) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,

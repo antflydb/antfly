@@ -304,6 +304,7 @@ pub fn create(config: Config) Graph {
     };
     structured_mod.addImport("antfly_generating", generating_mod);
     structured_mod.addImport("antfly_extracting", extracting_mod);
+    structured_mod.addImport("antfly_image", image_mod);
     const transcribing_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/transcribing/src/mod.zig")),
         .target = target,

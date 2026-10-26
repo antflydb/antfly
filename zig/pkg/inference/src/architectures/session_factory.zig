@@ -100,6 +100,7 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     qwen3_embedding,
     embedding_gemma2,
     qwen3_vl_generation,
+    lightonocr3,
 };
 const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
 const GpuHostedCompute = void;
@@ -2178,6 +2179,13 @@ fn cudaProfileForArch(
                 model_manifest.model_type == .generator and
                 model_manifest.isQwen3VlGenerationSafetensorsBundle())
                 .qwen3_vl_generation
+            else
+                null,
+            .qwen3_5 => if (task == .generic and model_manifest.isLightOnOcr3() and
+                cfg.hasQwen35VisionArchitectureContract() and
+                cfg.qwen35_linear_key_head_dim == 128 and cfg.qwen35_linear_value_head_dim == 128 and
+                cfg.qwen35_linear_conv_kernel_dim == 4)
+                .lightonocr3
             else
                 null,
             else => null,
@@ -5146,12 +5154,41 @@ fn metalHostedBudgetPolicy(
     return sharedGpuHostedBudgetPolicy(model_weight_bytes, manifest, arch_config, quant_mode);
 }
 
+fn lightOnOcr4bBudgetPolicy(
+    model_weight_bytes: u64,
+    manifest: manifest_mod.ModelManifest,
+    arch_config: ArchConfig,
+) ?GpuHostedBudgetPolicy {
+    if (!manifest.isLightOnOcr3() or manifest.usesGgufWeights() or model_weight_bytes == 0) return null;
+    const qualified = switch (arch_config) {
+        .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32,
+        else => false,
+    };
+    if (!qualified) return null;
+    const weights: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
+    const host = weights +| mib(256);
+    const device = weights +| gib(1);
+    var context = defaultPlanContextForBackend(.gpu);
+    context.host_budget_bytes = @max(context.host_budget_bytes, host);
+    context.backend_budget_bytes = @max(context.backend_budget_bytes, device);
+    return .{
+        .budget_floor = .{ .host_limit_bytes = host, .backend_limit_bytes = device, .combined_limit_bytes = host +| device +| gib(1) },
+        .shared_cache_floor = .{ .host_limit_bytes = host, .backend_limit_bytes = device },
+        .plan_context = context,
+        .prefer_f32_dense_tensors = false,
+    };
+}
+
 fn sharedGpuHostedBudgetPolicy(
     model_weight_bytes: u64,
     manifest: manifest_mod.ModelManifest,
     arch_config: ArchConfig,
     quant_mode: GpuHostedQuantExecutionMode,
 ) GpuHostedBudgetPolicy {
+    // The 4B BF16 artifact exceeds generic cache limits. Account for its
+    // mapped source and prepared GPU weights before loading any projections.
+    // Explicit serving limits are applied after this automatic floor.
+    if (lightOnOcr4bBudgetPolicy(model_weight_bytes, manifest, arch_config)) |policy| return policy;
     const prefer_f32_dense_tensors = shouldPreferGpuHostedF32DenseTensors(arch_config);
     const lazy_quant_budget_floor = if (shouldUseLargeGpuHostedLazyQuantBudgets(model_weight_bytes, manifest, quant_mode, false))
         recommendedGpuHostedLazyQuantBudgetFloor(model_weight_bytes, quant_mode)
@@ -5423,10 +5460,25 @@ fn makeMetalHostedComputeBackend(
         },
     );
     compute.require_f32_linears = self.arch_config == .embedding_gemma2;
+    compute.qwen35_ocr_deferred_attention = switch (self.arch_config) {
+        .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and
+            ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
+                (cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32)),
+        else => false,
+    };
+    compute.lightonocr3_projections = compute.qwen35_ocr_deferred_attention;
     // The shared provider belongs to this model, and init holds its execution
     // lease. Configure encoder normalization before any device work is queued.
     if (compute.provider_impl.raw_decode_runtime) |raw| {
         @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(raw, @intFromBool(self.arch_config == .embedding_gemma2));
+        const qwen35_ocr = switch (self.arch_config) {
+            .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and
+                ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
+                    (cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32)),
+            else => false,
+        };
+        @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(raw, @intFromBool(qwen35_ocr));
+        @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_lightonocr3_projections(raw, @intFromBool(compute.lightonocr3_projections));
     }
     return compute.ownedComputeBackend();
 }
@@ -11683,6 +11735,33 @@ test "unsupported families keep their gguf weight mapping" {
     );
 }
 
+test "LightOnOCR3 4B budget covers both weight domains and preserves explicit limits" {
+    const cfg = try gpt_mod.parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config-4b.json"));
+    var capabilities = [_][]const u8{"lightonocr3"};
+    var tasks = [_][]const u8{ "read", "generate" };
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .generator,
+        .config_model_arch = "qwen3_5",
+        .capabilities = &capabilities,
+        .tasks = &tasks,
+    };
+    const weight_bytes = 9_078_531_072;
+    const policy = lightOnOcr4bBudgetPolicy(weight_bytes, manifest, .{ .gpt = cfg }).?;
+    try std.testing.expect(policy.budget_floor.host_limit_bytes > weight_bytes);
+    try std.testing.expect(policy.budget_floor.backend_limit_bytes > weight_bytes);
+    try std.testing.expect(policy.budget_floor.combined_limit_bytes > policy.budget_floor.host_limit_bytes + policy.budget_floor.backend_limit_bytes);
+    try std.testing.expectEqual(policy.budget_floor.host_limit_bytes, policy.shared_cache_floor.host_limit_bytes);
+    try std.testing.expectEqual(policy.budget_floor.backend_limit_bytes, policy.shared_cache_floor.backend_limit_bytes);
+    var unqualified = manifest;
+    unqualified.capabilities = &.{};
+    try std.testing.expect(lightOnOcr4bBudgetPolicy(weight_bytes, unqualified, .{ .gpt = cfg }) == null);
+    const small = try gpt_mod.parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config.json"));
+    try std.testing.expect(lightOnOcr4bBudgetPolicy(weight_bytes, manifest, .{ .gpt = small }) == null);
+    const overridden = runtime.tier.memory.applyLimitOverrides(policy.budget_floor, .{ .backend_limit_bytes = 1 });
+    try std.testing.expectEqual(@as(usize, 1), overridden.backend_limit_bytes);
+}
+
 test "embeddinggemma2 coefficient cache relinquishes device credit before recovery and readmits before publication" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     const Cache = @import("antfly_video").preparation.CoefficientCache;
@@ -11742,4 +11821,27 @@ test "resolved decoder contract survives wrappers and common CPU executor prepar
     // Reading resolved semantics never dereferences a wrapped implementation.
     wrapped.ptr = @ptrFromInt(8);
     try std.testing.expectEqual(@as(usize, 32), getGptConfig(wrapped).?.vocab_size);
+}
+
+test "LightOnOCR3 CUDA loader profile requires the reader role and supported recurrent geometry" {
+    const a = std.testing.allocator;
+    const cfg = try gpt_mod.parseConfig(a, @embedFile("../models/testdata/lightonocr3/config.json"));
+    var capabilities = [_][]const u8{"lightonocr3"};
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = a,
+        .model_type = .generator,
+        .config_model_arch = "qwen3_5",
+        .capabilities = &capabilities,
+    };
+    try std.testing.expectEqual(CudaCapabilityProfile.lightonocr3, cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest).?);
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .classifier, &manifest) == null);
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .extractor, &manifest) == null);
+    var unsupported = cfg;
+    unsupported.qwen35_linear_key_head_dim = 64;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
+    unsupported = cfg;
+    unsupported.vision_temporal_patch_size = 1;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
+    manifest.capabilities = &.{};
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest) == null);
 }

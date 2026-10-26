@@ -57,17 +57,27 @@ fn debugPrint(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub const Qwen35LinearLayerState = struct {
+    device: metal_compute_mod.Qwen35LinearState = .{},
+    cuda_device: if (build_options.enable_cuda) @import("../ops/cuda/gated_delta.zig").State else struct {
+        pub fn deinit(_: *@This()) void {}
+        pub fn reset(_: *@This()) void {}
+    } = .{},
+    device_only: bool = false,
     conv: []f32 = &.{},
     recurrent: []f32 = &.{},
     initialized: bool = false,
 
     pub fn deinit(self: *Qwen35LinearLayerState, allocator: std.mem.Allocator) void {
+        self.device.deinit();
+        self.cuda_device.deinit();
         if (self.conv.len > 0) allocator.free(self.conv);
         if (self.recurrent.len > 0) allocator.free(self.recurrent);
         self.* = .{};
     }
 
     fn reset(self: *Qwen35LinearLayerState) void {
+        self.device.reset();
+        self.cuda_device.reset();
         if (self.conv.len > 0) @memset(self.conv, 0);
         if (self.recurrent.len > 0) @memset(self.recurrent, 0);
         self.initialized = false;
@@ -81,8 +91,11 @@ pub const Qwen35LinearCache = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !Qwen35LinearCache {
         const layer_count: usize = @intCast(config.num_hidden_layers);
         const layers = try allocator.alloc(Qwen35LinearLayerState, layer_count);
-        errdefer allocator.free(layers);
         for (layers) |*state| state.* = .{};
+        errdefer {
+            for (layers) |*state| state.deinit(allocator);
+            allocator.free(layers);
+        }
 
         const key_heads: usize = @intCast(config.qwen35_linear_num_key_heads);
         const value_heads: usize = @intCast(config.qwen35_linear_num_value_heads);
@@ -96,11 +109,11 @@ pub const Qwen35LinearCache = struct {
 
         for (layers, 0..) |*state, layer| {
             if (!config.layerUsesQwen35LinearAttention(layer)) continue;
+            state.device_only = config.qwen35_device_only_state;
+            if (state.device_only) continue;
             state.conv = try allocator.alloc(f32, conv_dim * conv_kernel);
-            errdefer state.deinit(allocator);
             @memset(state.conv, 0);
             state.recurrent = try allocator.alloc(f32, recurrent_len);
-            errdefer state.deinit(allocator);
             @memset(state.recurrent, 0);
         }
 
@@ -119,7 +132,8 @@ pub const Qwen35LinearCache = struct {
 
     fn layerState(self: *Qwen35LinearCache, layer: usize) ?*Qwen35LinearLayerState {
         if (layer >= self.layers.len) return null;
-        if (self.layers[layer].conv.len == 0 or self.layers[layer].recurrent.len == 0) return null;
+        if (!self.layers[layer].device_only and
+            (self.layers[layer].conv.len == 0 or self.layers[layer].recurrent.len == 0)) return null;
         return &self.layers[layer];
     }
 };
@@ -587,30 +601,13 @@ pub const DecodeContext = struct {
         paged_decode,
     };
 
-    pub const KvCacheView = struct {
-        sequence_id: runtime.kv.manager.SequenceId,
-        pool_id: runtime.kv.block.KvPoolId,
-        logical_block_count: usize,
-        tail_tokens: u16,
-        position_offset: usize = 0,
-        max_inflight_tokens: usize = 0,
-        allow_swa_ring: bool = false,
-        logical_blocks: ?[]const runtime.kv.block.KvBlockId = null,
-        kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
-    };
+    // Share the backend view type rather than relying on matching struct
+    // layouts when a decoder adds request-specific state.
+    pub const KvCacheView = backend_contracts.KvCacheView;
+    pub const KvBatchView = backend_contracts.KvBatchView;
 
-    pub const KvBatchView = struct {
-        kv_cache: KvCacheView,
-        kv_manager: *runtime.kv.manager.KvManager,
-        kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
-        // Per-item overrides for mixed prefill+decode batches.
-        per_item_query_len: ?usize = null,
-        per_item_total_len: ?usize = null,
-        per_item_kv_len: ?usize = null,
-        per_item_kv_position_offset: ?usize = null,
-        per_item_mode: ?@import("../ops/ops.zig").AttentionMode = null,
-    };
-
+    /// Set only by a reader whose admission includes retained decode plans.
+    prepared_lighton_decode: bool = false,
     attention_mode: AttentionMode = .full_recompute,
     total_sequence_len: usize,
     query_sequence_len: usize,
@@ -627,6 +624,15 @@ pub const DecodeContext = struct {
     deepseek_v4_compressed_cache: ?*DeepSeekV4CompressedCache = null,
     moe_runtime: ?*runtime.moe.runtime.MoeRuntime = null,
     qwen35_linear_cache: ?*Qwen35LinearCache = null,
+    qwen35_linear_batch: ?[]const ?*Qwen35LinearCache = null,
+    /// Logical page lengths in a physically contiguous [1, sum(lengths)] query.
+    /// Attention and recurrent state must split at these boundaries; dense
+    /// projections operate on the complete tensor without padding.
+    packed_query_lengths: ?[]const usize = null,
+    packed_recurrent_groups: ?*usize = null,
+    packed_recurrent_rows: ?*usize = null,
+    packed_attention_groups: ?*usize = null,
+    packed_attention_rows: ?*usize = null,
     gemma4_layer_spec_cache: ?*Gemma4LayerSpecCache = null,
     /// Qualification/selection-only capture of actual post-RoPE queries.
     /// Implementations retain at most `horizon` rows per donor consumer.
@@ -1329,6 +1335,10 @@ pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
     const result = try cb.toFloat32(logits, allocator);
     applyFinalLogitSoftcap(config, result);
     maybeDebugTopLogits(result, config.vocab_size);
+    if (config.hasQwen35VisionArchitectureContract() and decode_context != null and
+        decode_context.?.attention_mode == .paged_prefill and
+        platform.env.getenvBool("TERMITE_METAL_STAGE_TIMING_LOG_FRAMES"))
+        std.debug.print("LIGHTONOCR3 profile_prefill_items={d} profile_prefill_query_tokens={d}\n", .{ batch, seq_len });
     return result;
 }
 
@@ -2090,6 +2100,10 @@ fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
     ple_vectors: ?CT,
     replay_label: []const u8,
 ) !HiddenTensorResult {
+    // Recurrent history needs capture-aware argument patching and lifetime
+    // tracking. This candidate explicitly declines CUDA replay until qualified.
+    if (cb.kind() == .cuda and config.family == .qwen3_5 and config.qwen35_has_linear_attention)
+        return forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors);
     if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
         return forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors);
     }
@@ -3004,6 +3018,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
     var hidden = hidden_input;
     var owns_hidden = true;
     errdefer if (owns_hidden) cb.free(hidden);
+    try validatePackedQwenContext(config, batch, query_seq_len, decode_context);
     const shared_boundary: ?usize = if (output == .all) null else blk: {
         if (batch != 1 or pre_norm_out != null or trace_sink != null) return error.UnsupportedShape;
         break :blk sharedKvPrefillBoundary(config, (decode_context orelse return error.UnsupportedShape).*) orelse return error.UnsupportedShape;
@@ -3098,18 +3113,45 @@ fn forwardFinalHiddenWithSharedKvOutput(
         qwen3vl_forward_context != null and
         qwen3vl_forward_context.?.attention_mode == .paged_prefill and
         qwen3vl_forward_context.?.query_sequence_len > 1;
+    // Qwen3.5's host recurrent core drains and reopens an active frame at
+    // each readback. Batch the surrounding GPU projections, attention, and
+    // FFN work across those required boundaries instead of waiting per op.
+    const qwen35_forward_frame = config.hasQwen35VisionArchitectureContract() and
+        qwen3vl_forward_context != null and
+        !getenvBool("TERMITE_METAL_DISABLE_QWEN35_FORWARD_FRAME");
     if (cb.kind() == .metal and
-        config.family == .qwen3_vl and
         trace_sink == null and
-        (qwen3vl_eager_decode_frame or qwen3vl_prepared_prefill_frame) and
+        ((config.family == .qwen3_vl and (qwen3vl_eager_decode_frame or qwen3vl_prepared_prefill_frame)) or qwen35_forward_frame) and
         !cb.decoderRuntimeHasActiveFrame())
     {
         owns_qwen3vl_forward_frame = try cb.decoderRuntimeBeginFrame();
         if (owns_qwen3vl_forward_frame) {
-            try cb.decoderRuntimeSetActiveFrameRegime(if (qwen3vl_eager_decode_frame) .decode else .prefill);
+            try cb.decoderRuntimeSetActiveFrameRegime(if (isDecodeStep(decode_context)) .decode else .prefill);
         }
     }
     defer if (owns_qwen3vl_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
+
+    const prefill_stream_layers: usize = if (comptime build_options.enable_metal) blk: {
+        const layers = metal_compute_mod.MetalCompute.lightOnPrefillStreamLayers(cb);
+        break :blk if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, owns_qwen3vl_forward_frame, layers) and trace_sink == null and
+            !prefillTraceEnabled() and !forceLayerCloneDebug() and !debugLastRowEnabled() and
+            !debugTensorStatsEnabled()) layers else 0;
+    } else 0;
+    const stream_first_layers: usize = if (prefill_stream_layers != 0) prefill_stream_layers else if (comptime build_options.enable_metal) blk: {
+        const layers = metal_compute_mod.MetalCompute.lightOnStreamFirstLayers(cb);
+        // Only the explicit native greedy-stream owner may lend its frame.
+        // Ordinary borrowed frames retain the existing no-submit contract.
+        const can_stream_frame = owns_qwen3vl_forward_frame or
+            (metal_compute_mod.MetalCompute.lightOnGpuGreedyStreamEnabled(cb) and
+                cb.decoderRuntimeHasActiveFrame() and !metal_compute_mod.MetalCompute.lightOnHasSubmittedFrame(cb));
+        break :blk if (lightOnForwardSplitEligible(config, batch, isDecodeStep(decode_context), can_stream_frame, layers) and
+            metal_compute_mod.MetalCompute.lightOnPreparedStreamReady(cb, config, batch)) layers else 0;
+    } else 0;
+    const stream_chunks = prefill_stream_layers != 0 or (if (comptime build_options.enable_metal) metal_compute_mod.MetalCompute.lightOnStreamChunksEnabled(cb) else false);
+    if (comptime build_options.enable_metal) metal_compute_mod.MetalCompute.setLightOnExpectedStreamFrames(cb, @intCast(lightOnStreamFrameCount(config.num_hidden_layers, stream_first_layers, stream_chunks)));
+    // At most one submitted prefix and one active suffix exist. Drain the
+    // submitted prefix on every exit before releasing any borrowed context.
+    defer if (stream_first_layers != 0) cb.decoderRuntimeWaitSubmittedFrame() catch {};
 
     // A long-lived Metal frame may recycle a released buffer immediately for
     // a later encoded layer even though an earlier command still reads it.
@@ -3254,6 +3296,27 @@ fn forwardFinalHiddenWithSharedKvOutput(
             hidden = cloned_hidden;
             owns_hidden = true;
         }
+        if (lightOnStreamBoundary(layer + 1, config.num_hidden_layers, stream_first_layers, stream_chunks)) {
+            try cb.checkExecutionControl();
+            // Finish the prior submitted group before promoting this active
+            // group. Only the existing two storage banks can be in flight.
+            try cb.decoderRuntimeWaitSubmittedFrame();
+            try cb.decoderRuntimeSubmitFrame();
+            errdefer cb.decoderRuntimeWaitSubmittedFrame() catch {};
+            if (!try cb.decoderRuntimeBeginFrame()) return error.StreamedForwardFrameUnavailable;
+            // Preserve the prefill BF16 input policy across every new group.
+            try cb.decoderRuntimeSetActiveFrameRegime(if (prefill_stream_layers != 0) .prefill else .decode);
+            if (comptime build_options.enable_metal) {
+                if (prefill_stream_layers != 0) {
+                    metal_compute_mod.MetalCompute.noteLightOnPrefillStreamSplit(cb);
+                } else {
+                    if (metal_compute_mod.MetalCompute.lightOnGpuGreedyStreamEnabled(cb) and
+                        @import("antfly_platform").env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_TOKEN_ENCODER", true))
+                        _ = try cb.decoderRuntimeBeginPlannedComputeScope();
+                    metal_compute_mod.MetalCompute.noteLightOnStreamSplit(cb);
+                }
+            }
+        }
         // Materialize layer groups on lazy backends when the policy asks for a
         // bounded graph. Dense decode can leave this disabled and let the final
         // token read force evaluation of the full stack.
@@ -3315,8 +3378,13 @@ fn forwardFinalHiddenWithSharedKvOutput(
     }
     hidden = final_hidden;
     if (owns_qwen3vl_forward_frame) {
+        if (stream_first_layers != 0) try cb.decoderRuntimeWaitSubmittedFrame();
         try cb.decoderRuntimeSubmitAndWaitFrame();
         owns_qwen3vl_forward_frame = false;
+        if (comptime build_options.enable_metal) {
+            if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, true, 1))
+                metal_compute_mod.MetalCompute.noteLightOnPrefillComplete(cb);
+        }
     }
     if (!is_freestanding and prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
         debugPrint("prefill-trace: gpt final norm done\n", .{});
@@ -3420,6 +3488,77 @@ pub fn denseQwen3PrefillEligible(config: Config) bool {
         !std.math.isFinite(config.rope_freq_scale) or config.rope_freq_scale <= 0 or
         !std.math.isFinite(config.rope_partial_factor) or config.rope_partial_factor <= 0 or config.rope_partial_factor > 1) return false;
     return true;
+}
+
+fn lightOnForwardSplitEligible(config: Config, batch: usize, decode: bool, owns_frame: bool, layers: usize) bool {
+    return decode and owns_frame and batch >= 2 and batch <= 64 and layers >= 1 and layers <= 16 and
+        layers < config.num_hidden_layers and config.hasQwen35VisionArchitectureContract() and
+        ((config.hidden_size == 1024 and config.num_hidden_layers == 24) or
+            (config.hidden_size == 2560 and config.num_hidden_layers == 32));
+}
+
+fn lightOnPrefillSplitEligible(config: Config, batch: usize, query: usize, paged_prefill: bool, owns_frame: bool, layers: usize) bool {
+    return paged_prefill and owns_frame and batch == 1 and query > 1 and query <= 1024 and
+        config.qwen35_device_only_state and layers >= 1 and layers <= 16 and
+        layers < config.num_hidden_layers and config.hasQwen35VisionArchitectureContract() and
+        ((config.hidden_size == 1024 and config.num_hidden_layers == 24) or
+            (config.hidden_size == 2560 and config.num_hidden_layers == 32));
+}
+
+test "LightOnOCR3 prefill streaming preserves prompt and frame eligibility" {
+    inline for (.{ "../models/testdata/lightonocr3/config.json", "../models/testdata/lightonocr3/config-4b.json" }) |path| {
+        var config = try gpt_config.parseConfig(std.testing.allocator, @embedFile(path));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, true, true, 8));
+        config.qwen35_device_only_state = true;
+        for ([_]usize{ 2, 432, 554, 662, 1024 }) |query| {
+            for ([_]usize{ 1, 2, 4, 8, 16 }) |layers| {
+                try std.testing.expect(lightOnPrefillSplitEligible(config, 1, query, true, true, layers));
+                try std.testing.expectEqual(1 + (config.num_hidden_layers - 1) / layers, lightOnStreamFrameCount(config.num_hidden_layers, layers, true));
+            }
+        }
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 2, 512, true, true, 8));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 1, true, true, 8));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 1025, true, true, 8));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, false, true, 8));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, true, false, 8));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, true, true, 0));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, true, true, 17));
+        config.family = .qwen3;
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, true, true, 8));
+    }
+}
+
+fn lightOnStreamFrameCount(total_layers: usize, first_layers: usize, chunks: bool) usize {
+    if (first_layers == 0 or first_layers >= total_layers) return 1;
+    return if (chunks) 1 + (total_layers - 1) / first_layers else 2;
+}
+
+fn lightOnStreamBoundary(completed_layers: usize, total_layers: usize, first_layers: usize, chunks: bool) bool {
+    if (first_layers == 0 or completed_layers == 0 or completed_layers >= total_layers) return false;
+    return if (chunks) completed_layers % first_layers == 0 else completed_layers == first_layers;
+}
+
+test "LightOnOCR3 rolling chunks omit empty final frames and preserve prefix mode" {
+    var boundaries: [32]usize = undefined;
+    var count: usize = 0;
+    for (0..33) |completed| {
+        if (lightOnStreamBoundary(completed, 32, 4, true)) {
+            boundaries[count] = completed;
+            count += 1;
+        }
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 4, 8, 12, 16, 20, 24, 28 }, boundaries[0..count]);
+    try std.testing.expectEqual(@as(usize, 8), lightOnStreamFrameCount(32, 4, true));
+    try std.testing.expectEqual(@as(usize, 6), lightOnStreamFrameCount(24, 4, true));
+    try std.testing.expectEqual(@as(usize, 7), lightOnStreamFrameCount(32, 5, true));
+    try std.testing.expectEqual(@as(usize, 32), lightOnStreamFrameCount(32, 1, true));
+    try std.testing.expectEqual(@as(usize, 2), lightOnStreamFrameCount(24, 16, true));
+    try std.testing.expectEqual(@as(usize, 2), lightOnStreamFrameCount(32, 4, false));
+    try std.testing.expect(!lightOnStreamBoundary(8, 32, 4, false));
+    try std.testing.expect(lightOnStreamBoundary(4, 32, 4, false));
+    try std.testing.expect(!lightOnStreamBoundary(32, 32, 4, true));
+    try std.testing.expectEqual(@as(usize, 1), lightOnStreamFrameCount(32, 0, true));
+    try std.testing.expectEqual(@as(usize, 1), lightOnStreamFrameCount(0, 4, true));
 }
 
 pub const DenseQwen3PrefillOptions = struct {
@@ -6076,6 +6215,14 @@ fn decoderBlock(
     }
     defer if (owns_gemma4_batch_frame) cb.decoderRuntimeCancelFrame() catch {};
 
+    const owns_ocr_prefill_scope = if (config.hasQwen35VisionArchitectureContract() and
+        decode_context != null and decode_context.?.attention_mode == .paged_prefill and
+        decode_context.?.query_sequence_len > 1)
+        try metal_compute_mod.MetalCompute.beginOcrEncoderScope(cb, .prefill)
+    else
+        false;
+    defer if (owns_ocr_prefill_scope) cb.decoderRuntimeEndPlannedComputeScope();
+
     const result = try decoderBlockImpl(
         cb,
         allocator,
@@ -6142,6 +6289,45 @@ fn decoderBlockImpl(
     const num_heads = config.num_attention_heads;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
+
+    if (comptime build_options.enable_metal) {
+        if (trace_sink == null and decode_context != null and decode_context.?.prepared_lighton_decode and
+            query_seq_len == 1 and batch >= 1 and batch <= 64 and config.hasQwen35VisionArchitectureContract() and
+            config.layerUsesQwen35LinearAttention(layer) and layer < 32 and no_overrides: {
+            inline for (.{ "attn_norm_slots", "attn_q_slots", "attn_k_slots", "attn_v_slots", "fused_qkv_linear_slots", "attn_out_proj_linear_slots", "attn_sub_norm_slots", "ffn_norm_slots", "mlp_fc1_slots", "mlp_fc2_slots", "mlp_gate_slots", "mlp_up_slots", "mlp_sub_norm_slots", "mlp_down_slots" }) |name| {
+                if (@field(raw_overrides, name)[layer] != null) break :no_overrides false;
+            }
+            break :no_overrides true;
+        } and
+            layer0_attn_norm_override == null and layer0_fused_qkv_override == null and layer0_q_override == null and layer0_k_override == null and layer0_v_override == null)
+        {
+            var states: [64]*metal_compute_mod.Qwen35LinearState = undefined;
+            var count: usize = 0;
+            if (batch == 1) {
+                if (decode_context.?.qwen35_linear_cache) |cache| if (cache.layerState(layer)) |state| {
+                    states[0] = &state.device;
+                    count = 1;
+                };
+            } else if (decode_context.?.qwen35_linear_batch) |caches| {
+                if (caches.len == batch) for (caches) |cache| {
+                    const state = if (cache) |value| value.layerState(layer) else null;
+                    if (state == null) break;
+                    states[count] = &state.?.device;
+                    count += 1;
+                };
+            }
+            const Weights = struct {
+                cb: *const ComputeBackend,
+                config: Config,
+                layer: usize,
+                pub fn weight(source: @This(), suffix: []const u8) !CT {
+                    var name: [256]u8 = undefined;
+                    return getModelWeight(source.cb, source.config, try std.fmt.bufPrint(&name, "model.layers.{d}.{s}", .{ source.layer, suffix }));
+                }
+            };
+            if (count == batch) if (try metal_compute_mod.MetalCompute.lightOnPreparedLinearBlock(cb, config, hidden, states[0..count], layer, Weights{ .cb = cb, .config = config, .layer = layer })) |result| return result;
+        }
+    }
 
     var name_buf: [256]u8 = undefined;
     var attn_norm_slot = decoderOverrideLayerSlot(raw_overrides.attn_norm_slots, layer);
@@ -6231,8 +6417,16 @@ fn decoderBlockImpl(
         const attn_res = try cb.add(attn_out, hidden);
         errdefer cb.free(attn_res);
 
+        compute_region_scope.deinit();
+        compute_region_scope = try cb.decoderRuntimePushComputeRegion(.ffn_norm);
+        if (try tryLightOnFusedFfnBlock(cb, config, attn_res, total, layer, &name_buf)) |result| {
+            cb.free(attn_res);
+            return result;
+        }
         const ffn_normed = try applyFFNNorm(cb, allocator, config, attn_res, layer, &name_buf);
         defer cb.free(ffn_normed);
+        compute_region_scope.deinit();
+        compute_region_scope = try cb.decoderRuntimePushComputeRegion(.ffn);
         const ffn_started_at = monotonicNowNs();
         const ffn_out = try feedForward(cb, allocator, config, ffn_normed, total, layer, &name_buf, decode_context);
         defer cb.free(ffn_out);
@@ -6245,7 +6439,8 @@ fn decoderBlockImpl(
     }
 
     const shares_kv = config.layerSharesKv(layer) and !disableSharedKvDebug();
-    const kv_layer_index = if (shares_kv) config.kvDonorLayerIndex(layer).? else layer;
+    const kv_source_layer = if (shares_kv) config.kvDonorLayerIndex(layer).? else layer;
+    const kv_layer_index = config.compactQwen35KvStorageLayerIndex(kv_source_layer) orelse return error.InvalidKvLayerIndex;
     if (config.gemma4_mtp_assistant and traceGemma4MtpDonorDebug()) {
         const mode_name = if (decode_context) |ctx| @tagName(ctx.attention_mode) else "none";
         const total_sequence_len = if (decode_context) |ctx| ctx.total_sequence_len else seq_len;
@@ -6485,10 +6680,8 @@ fn decoderBlockImpl(
             try attnProject(cb, allocator, config, normed, total, hidden_size, @intCast(q_projection_dim), layer, "q", &name_buf);
         const q, const q_gate: ?CT = if (q_projection_dim == q_dim) .{ q_projected, null } else split_q: {
             defer cb.free(q_projected);
-            const q_main = try cb.sliceLastDim(q_projected, 0, q_dim);
-            errdefer cb.free(q_main);
-            const gate = try cb.sliceLastDim(q_projected, q_dim, q_dim * 2);
-            break :split_q .{ q_main, gate };
+            const split = try cb.splitPerHeadGate(q_projected, total, num_heads, head_dim);
+            break :split_q .{ split.query, split.gate };
         };
         const k: CT, const v_omitted_local: bool, const v_local: CT = if (shares_kv)
             .{ try createZeroCT(cb, allocator, total * kv_dim), false, try createZeroCT(cb, allocator, total * kv_dim) }
@@ -6881,7 +7074,9 @@ fn decoderBlockImpl(
             try applyAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context);
         defer cb.free(attn_out);
         debug_timing_stats.attention_core_nanos += @intCast(monotonicNowNs() - attn_core_started_at);
+        try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-raw", attn_out, num_heads * head_dim);
         const gated_attn_out = if (q_gate) |gate| blk_gate: {
+            try maybeDumpGatedLayerStageStats(cb, allocator, layer, "gate", gate, num_heads * head_dim);
             const sigmoid_gate = try cb.sigmoid(gate);
             defer cb.free(sigmoid_gate);
             break :blk_gate try cb.multiply(attn_out, sigmoid_gate);
@@ -7141,6 +7336,13 @@ fn decoderBlockImpl(
         // Residual
         break :blk try cb.add(proj, hidden);
     };
+
+    if (trace_sink == null) {
+        if (try tryLightOnFusedFfnBlock(cb, config, attn_res, total, layer, &name_buf)) |result| {
+            cb.free(attn_res);
+            return result;
+        }
+    }
 
     // --- FFN sublayer ---
     compute_region_scope.deinit();
@@ -7588,6 +7790,10 @@ pub fn maybeAdjustNormWeight(
 ) !CT {
     if (std.math.approxEqAbs(f32, config.norm_weight_offset, 0.0, 1e-6)) return weight;
 
+    if (comptime @import("build_options").enable_cuda) {
+        if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnAdjustedNormWeight(cb, weight, dim, config.norm_weight_offset)) |adjusted| return adjusted;
+    }
+
     if (try cb.addScalar(weight, config.norm_weight_offset)) |adjusted| return adjusted;
 
     if (cb.kind() == .graph) {
@@ -7901,6 +8107,15 @@ pub fn maybeDumpGatedLayerStageStats(
     if (!shouldDumpGatedLayer(layer)) return;
     const values = try cb.toFloat32(tensor, allocator);
     defer allocator.free(values);
+    if (comptime @import("builtin").is_test) {
+        if (platform.env.getenv("ANTFLY_TEST_GATED_TENSOR_DIR")) |directory| {
+            const name = try std.fmt.allocPrint(allocator, "{s}-layer{d}-{s}.f32", .{ @tagName(cb.kind()), layer, stage });
+            defer allocator.free(name);
+            const path = try std.fs.path.join(allocator, &.{ directory, name });
+            defer allocator.free(path);
+            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(values) });
+        }
+    }
     if (values.len < row_dim or row_dim == 0) return;
     const row_count = values.len / row_dim;
     if (row_count == 0) return;
@@ -8206,18 +8421,67 @@ fn cloneTensorMaterialized(cb: *const ComputeBackend, allocator: std.mem.Allocat
     return cb.fromFloat32Shape(values, shape_i32);
 }
 
+pub const max_packed_qwen_items = 128;
+
+pub fn packedQueryRowCount(lengths: []const usize) !usize {
+    if (lengths.len == 0 or lengths.len > max_packed_qwen_items) return error.InvalidPackedQueryShape;
+    var total: usize = 0;
+    for (lengths) |len| {
+        if (len == 0) return error.InvalidPackedQueryShape;
+        total = std.math.add(usize, total, len) catch return error.InvalidPackedQueryShape;
+    }
+    if (total > 4096) return error.InvalidPackedQueryShape;
+    return total;
+}
+
+// Validate the complete packed layout before the first layer can update any
+// recurrent or KV history. A malformed later page must not partially execute.
+fn validatePackedQwenContext(config: Config, batch: usize, query_rows: usize, maybe_context: ?*const DecodeContext) !void {
+    const context = maybe_context orelse return;
+    const lengths = context.packed_query_lengths orelse return;
+    const total = try packedQueryRowCount(lengths);
+    if (config.family != .qwen3_5 or batch != 1 or total != query_rows or context.query_sequence_len != total or
+        context.attention_mode != .paged_prefill or context.attn_or_mask != null) return error.InvalidPackedQueryShape;
+    const positions = context.mrope_positions orelse return error.InvalidPackedQueryShape;
+    if (positions.len != 3 * total) return error.InvalidPackedQueryShape;
+    const views = context.kv_batch orelse return error.InvalidPackedQueryShape;
+    const caches = context.qwen35_linear_batch orelse return error.InvalidPackedQueryShape;
+    if (views.len != lengths.len or caches.len != lengths.len) return error.InvalidPackedQueryShape;
+    for (views, lengths, caches, 0..) |view, len, cache, index| {
+        const total_len = view.per_item_total_len orelse return error.InvalidPackedQueryShape;
+        const kv_len = view.per_item_kv_len orelse return error.InvalidPackedQueryShape;
+        const offset = view.per_item_kv_position_offset orelse return error.InvalidPackedQueryShape;
+        const mode = view.per_item_mode orelse return error.InvalidPackedQueryShape;
+        if (cache == null or view.per_item_query_len != len or total_len < len or offset > total_len or kv_len > total_len - offset or
+            mode == .dense_causal or (mode == .paged_decode and len != 1)) return error.InvalidPackedQueryShape;
+        for (views[0..index], caches[0..index]) |prior, prior_cache| {
+            if (cache == prior_cache or (view.kv_manager == prior.kv_manager and view.kv_cache.pool_id == prior.kv_cache.pool_id and
+                view.kv_cache.sequence_id == prior.kv_cache.sequence_id)) return error.InvalidPackedQueryShape;
+        }
+    }
+}
+
 pub fn qwen35LinearAttention(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
     input: CT,
-    batch: usize,
+    physical_batch: usize,
     seq_len: usize,
     layer: usize,
     decode_context: ?*const DecodeContext,
     name_buf: *[256]u8,
 ) !CT {
-    if (batch != 1) return error.UnsupportedQwen35LinearAttentionBatch;
+    const packed_lengths = if (decode_context) |dc| dc.packed_query_lengths else null;
+    if (packed_lengths) |lengths| {
+        if (physical_batch != 1 or try packedQueryRowCount(lengths) != seq_len) return error.InvalidPackedQueryShape;
+        if (decode_context.?.qwen35_linear_batch == null or decode_context.?.qwen35_linear_batch.?.len != lengths.len) return error.InvalidPackedQueryShape;
+        for (decode_context.?.qwen35_linear_batch.?) |cache| if (cache == null) return error.InvalidPackedQueryShape;
+    }
+    const batch = if (packed_lengths) |lengths| lengths.len else physical_batch;
+    if (batch > 1 and (decode_context == null or
+        decode_context.?.qwen35_linear_batch == null or decode_context.?.qwen35_linear_batch.?.len != batch))
+        return error.UnsupportedQwen35LinearAttentionBatch;
     if (config.qwen35_linear_conv_kernel_dim == 0 or
         config.qwen35_linear_key_head_dim == 0 or
         config.qwen35_linear_value_head_dim == 0 or
@@ -8227,6 +8491,13 @@ pub fn qwen35LinearAttention(
         return error.InvalidQwen35LinearAttentionConfig;
     }
 
+    if (packed_lengths == null and batch > 1 and seq_len > 1) if (decode_context.?.kv_batch) |views| for (views) |view| {
+        // A padded query must never advance another page's recurrent history.
+        if (view.per_item_query_len != 0 and view.per_item_query_len != seq_len) return error.UnsupportedQwen35LinearAttentionBatch;
+    };
+    if (batch > 1) for (decode_context.?.qwen35_linear_batch.?) |cache| {
+        if (cache == null) return error.InvalidQwen35LinearAttentionConfig;
+    };
     const hidden_size: usize = config.hidden_size;
     const key_heads: usize = @intCast(config.qwen35_linear_num_key_heads);
     const value_heads: usize = @intCast(config.qwen35_linear_num_value_heads);
@@ -8235,35 +8506,79 @@ pub fn qwen35LinearAttention(
     const key_dim = key_heads * key_head_dim;
     const value_dim = value_heads * value_head_dim;
     const conv_dim = key_dim * 2 + value_dim;
-    const conv_kernel: usize = @intCast(config.qwen35_linear_conv_kernel_dim);
-    const total = batch * seq_len;
+    const total = physical_batch * seq_len;
     if (total == 0) return error.InvalidSequenceLength;
     if (value_heads % key_heads != 0) return error.InvalidQwen35LinearAttentionConfig;
 
     const mixed_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_qkv.weight", .{layer}) catch return error.NameTooLong;
     const mixed_w = try getModelWeight(cb, config, mixed_w_name);
     defer cb.free(mixed_w);
-    const mixed = try cb.linearNoBias(input, mixed_w, total, hidden_size, conv_dim);
-    defer cb.free(mixed);
+    const fused_projections: ?[4]CT = fused: {
+        if (comptime @import("build_options").enable_cuda) {
+            const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+            if (CudaCompute.lightOnProjectionFusionEnabled(cb)) {
+                const z_weight = try getModelWeight(cb, config, std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_z.weight", .{layer}) catch return error.NameTooLong);
+                defer cb.free(z_weight);
+                const b_weight = try getModelWeight(cb, config, std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_b.weight", .{layer}) catch return error.NameTooLong);
+                defer cb.free(b_weight);
+                const a_weight = try getModelWeight(cb, config, std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_a.weight", .{layer}) catch return error.NameTooLong);
+                defer cb.free(a_weight);
+                break :fused try CudaCompute.lightOnInputProjections(cb, input, .{ mixed_w, z_weight, b_weight, a_weight }, total, hidden_size, conv_dim, value_dim, value_heads);
+            }
+        }
+        break :fused null;
+    };
+    defer if (fused_projections) |projections| for (projections) |projection| cb.free(projection);
+    const mixed = if (fused_projections) |projections| projections[0] else try cb.linearNoBias(input, mixed_w, total, hidden_size, conv_dim);
+    defer if (fused_projections == null) cb.free(mixed);
 
     const z_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_z.weight", .{layer}) catch return error.NameTooLong;
     const z_w = try getModelWeight(cb, config, z_w_name);
     defer cb.free(z_w);
-    const z = try cb.linearNoBias(input, z_w, total, hidden_size, value_dim);
-    defer cb.free(z);
+    const z = if (fused_projections) |projections| projections[1] else try cb.linearNoBias(input, z_w, total, hidden_size, value_dim);
+    defer if (fused_projections == null) cb.free(z);
 
     const b_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_b.weight", .{layer}) catch return error.NameTooLong;
     const b_w = try getModelWeight(cb, config, b_w_name);
     defer cb.free(b_w);
-    const beta_proj = try cb.linearNoBias(input, b_w, total, hidden_size, value_heads);
-    defer cb.free(beta_proj);
+    const beta_proj = if (fused_projections) |projections| projections[2] else try cb.linearNoBias(input, b_w, total, hidden_size, value_heads);
+    defer if (fused_projections == null) cb.free(beta_proj);
 
     const a_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_a.weight", .{layer}) catch return error.NameTooLong;
     const a_w = try getModelWeight(cb, config, a_w_name);
     defer cb.free(a_w);
-    const a_proj = try cb.linearNoBias(input, a_w, total, hidden_size, value_heads);
-    defer cb.free(a_proj);
+    const a_proj = if (fused_projections) |projections| projections[3] else try cb.linearNoBias(input, a_w, total, hidden_size, value_heads);
+    defer if (fused_projections == null) cb.free(a_proj);
 
+    if (comptime build_options.enable_metal) {
+        if (packed_lengths == null and seq_len == 1 and batch > 1 and batch <= 16 and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb)) {
+            var states: [16]*metal_compute_mod.Qwen35LinearState = undefined;
+            var count: usize = 0;
+            for (decode_context.?.qwen35_linear_batch.?) |cache| {
+                const state = cache.?.layerState(layer) orelse break;
+                states[count] = &state.device;
+                count += 1;
+            }
+            if (count == batch) if (try metal_compute_mod.MetalCompute.lightOnPackedCore(cb, states[0..count], .{
+                .mixed = mixed,
+                .z = z,
+                .beta = beta_proj,
+                .a = a_proj,
+                .key_heads = key_heads,
+                .value_heads = value_heads,
+                .dim = key_head_dim,
+                .value_dim = value_head_dim,
+                .conv_kernel = config.qwen35_linear_conv_kernel_dim,
+                .eps = config.norm_eps,
+            })) |core| {
+                defer cb.free(core);
+                const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
+                const out_weight = try getModelWeight(cb, config, out_name);
+                defer cb.free(out_weight);
+                return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+            };
+        }
+    }
     const conv_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.conv1d.weight", .{layer}) catch return error.NameTooLong;
     const conv_w = try getModelWeight(cb, config, conv_w_name);
     defer cb.free(conv_w);
@@ -8277,29 +8592,478 @@ pub fn qwen35LinearAttention(
     const norm_w = try getModelWeight(cb, config, norm_w_name);
     defer cb.free(norm_w);
 
-    const mixed_host = try cb.toFloat32(mixed, allocator);
-    defer allocator.free(mixed_host);
-    const z_host = try cb.toFloat32(z, allocator);
-    defer allocator.free(z_host);
-    const beta_host = try cb.toFloat32(beta_proj, allocator);
-    defer allocator.free(beta_host);
-    const a_host = try cb.toFloat32(a_proj, allocator);
-    defer allocator.free(a_host);
+    if (comptime build_options.enable_cuda) {
+        if (packed_lengths == null and seq_len > 1 and batch > 1 and batch <= 16 and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_PREFIX") and cb.kind() == .cuda and config.qwen35_device_only_state) {
+            var states: [16]*@import("../ops/cuda/gated_delta.zig").State = undefined;
+            var count: usize = 0;
+            if (decode_context) |dc| if (dc.qwen35_linear_batch) |caches| {
+                if (caches.len != batch) return error.InvalidBatchDecodeState;
+                for (caches) |cache| {
+                    const state = if (cache) |c| c.layerState(layer) else null;
+                    if (state == null or !state.?.device_only) break;
+                    states[count] = &state.?.cuda_device;
+                    count += 1;
+                }
+            };
+            if (count == batch) if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.qwen35LinearCorePrefillBatch(cb, states[0..count], .{
+                .mixed = mixed,
+                .z = z,
+                .beta = beta_proj,
+                .a = a_proj,
+                .conv_weight = conv_w,
+                .a_log = a_log_w,
+                .dt_bias = dt_bias_w,
+                .norm_weight = norm_w,
+                .key_heads = key_heads,
+                .value_heads = value_heads,
+                .dim = key_head_dim,
+                .value_dim = value_head_dim,
+                .conv_kernel = config.qwen35_linear_conv_kernel_dim,
+                .seq_len = seq_len,
+                .device_state_admitted = true,
+                .eps = config.norm_eps,
+            })) |core| {
+                defer cb.free(core);
+                const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
+                const out_weight = try getModelWeight(cb, config, out_name);
+                defer cb.free(out_weight);
+                return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+            };
+        }
+    }
+    if (comptime build_options.enable_cuda) {
+        if (packed_lengths == null and seq_len == 1 and batch > 1 and batch <= 64 and cb.kind() == .cuda and config.qwen35_device_only_state) {
+            var states: [64]*@import("../ops/cuda/gated_delta.zig").State = undefined;
+            var count: usize = 0;
+            if (decode_context) |dc| if (dc.qwen35_linear_batch) |caches| {
+                if (caches.len != batch) return error.InvalidBatchDecodeState;
+                for (caches) |cache| {
+                    const state = if (cache) |c| c.layerState(layer) else null;
+                    if (state == null or !state.?.device_only) break;
+                    states[count] = &state.?.cuda_device;
+                    count += 1;
+                }
+            };
+            if (count == batch) if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.qwen35LinearCoreBatch(cb, states[0..count], .{
+                .mixed = mixed,
+                .z = z,
+                .beta = beta_proj,
+                .a = a_proj,
+                .conv_weight = conv_w,
+                .a_log = a_log_w,
+                .dt_bias = dt_bias_w,
+                .norm_weight = norm_w,
+                .key_heads = key_heads,
+                .value_heads = value_heads,
+                .dim = key_head_dim,
+                .value_dim = value_head_dim,
+                .conv_kernel = config.qwen35_linear_conv_kernel_dim,
+                .eps = config.norm_eps,
+            })) |core| {
+                defer cb.free(core);
+                const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
+                const out_weight = try getModelWeight(cb, config, out_name);
+                defer cb.free(out_weight);
+                return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+            };
+        }
+    }
+    if (packed_lengths) |lengths| {
+        const core = try qwen35PackedProjectedCore(cb, allocator, config, mixed, z, beta_proj, a_proj, conv_w, a_log_w, dt_bias_w, norm_w, decode_context.?, layer, lengths);
+        defer cb.free(core);
+        const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
+        const out_weight = try getModelWeight(cb, config, out_name);
+        defer cb.free(out_weight);
+        return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+    }
+    if (packed_lengths == null and batch == 1) {
+        const state = if (decode_context) |dc| if (dc.qwen35_linear_cache) |cache| cache.layerState(layer) else null else null;
+        const core = try qwen35ProjectedCore(cb, allocator, config, mixed, z, beta_proj, a_proj, conv_w, a_log_w, dt_bias_w, norm_w, state, seq_len, null);
+        defer cb.free(core);
+        const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
+        const out_weight = try getModelWeight(cb, config, out_name);
+        defer cb.free(out_weight);
+        return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+    }
+    // Batch the weight-heavy projections; each page keeps its own DeltaNet
+    // history. Device row slices and core assembly never read state to the host.
+    var assembled: ?CT = null;
+    defer if (assembled) |tensor| cb.free(tensor);
+    const cores = try allocator.alloc(CT, batch);
+    defer allocator.free(cores);
+    var core_count: usize = 0;
+    defer for (cores[0..core_count]) |core| cb.free(core);
+    const parallel_cores = if (comptime build_options.enable_metal)
+        if (seq_len == 1 and key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
+            try metal_compute_mod.MetalCompute.beginQwen35LinearBatch(cb, batch)
+        else
+            false
+    else
+        false;
+    // A single destination lets each independent core write its final row
+    // directly. The old concatenation grows and copies every earlier row once
+    // per newcomer, opening a blit encoder at each join.
+    if (comptime build_options.enable_metal) {
+        if (parallel_cores and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb))
+            assembled = try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(value_dim) });
+    }
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda and config.qwen35_device_only_state and
+            platform.env.getenvBool("TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE") and
+            key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4)
+        {
+            var resident_states = true;
+            if (decode_context) |dc| {
+                if (dc.qwen35_linear_batch) |caches| {
+                    if (caches.len != batch) return error.InvalidBatchDecodeState;
+                    for (caches) |cache| {
+                        const state = if (cache) |value| value.layerState(layer) else null;
+                        resident_states = resident_states and state != null and state.?.device_only;
+                    }
+                } else resident_states = false;
+            } else resident_states = false;
+            if (resident_states) assembled = try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(value_dim) });
+        }
+    }
+    const direct_output = assembled != null;
+    var pending_cores = parallel_cores;
+    defer if (comptime build_options.enable_metal) {
+        if (pending_cores) metal_compute_mod.MetalCompute.abortQwen35LinearBatch(cb);
+    };
+    for (0..batch) |row| {
+        const state = if (decode_context) |dc| blk: {
+            const cache = if (dc.qwen35_linear_batch) |caches| caches[row] else dc.qwen35_linear_cache;
+            break :blk if (cache) |c| c.layerState(layer) else null;
+        } else null;
+        const mixed_row = try cb.sliceRows2D(allocator, mixed, row * seq_len, seq_len, conv_dim);
+        defer cb.free(mixed_row);
+        const z_row = try cb.sliceRows2D(allocator, z, row * seq_len, seq_len, value_dim);
+        defer cb.free(z_row);
+        const beta_row = try cb.sliceRows2D(allocator, beta_proj, row * seq_len, seq_len, value_heads);
+        defer cb.free(beta_row);
+        const a_row = try cb.sliceRows2D(allocator, a_proj, row * seq_len, seq_len, value_heads);
+        defer cb.free(a_row);
+        const destination = if (direct_output and assembled != null)
+            try cb.sliceRows2D(allocator, assembled.?, row * seq_len, seq_len, value_dim)
+        else
+            null;
+        defer if (destination) |tensor| cb.free(tensor);
+        cores[row] = try qwen35ProjectedCore(cb, allocator, config, mixed_row, z_row, beta_row, a_row, conv_w, a_log_w, dt_bias_w, norm_w, state, seq_len, destination);
+        core_count += 1;
+    }
+    if (comptime build_options.enable_metal) {
+        if (parallel_cores) {
+            try metal_compute_mod.MetalCompute.endQwen35LinearBatch(cb);
+            pending_cores = false;
+        }
+    }
+    for (cores, 0..) |core, row| {
+        if (direct_output and assembled != null) {
+            if (cb.kind() == .cuda) continue;
+            if (comptime build_options.enable_metal) {
+                // A declined device core may use the established fallback.
+                // Only those rows need a copy, after all collected cores run.
+                if (!metal_compute_mod.MetalCompute.debugSharesStorage(cb, core, assembled.?)) {
+                    if (!try cb.copyRows2D(allocator, assembled.?, row * seq_len, core, 0, seq_len, value_dim))
+                        return error.UnsupportedTensorType;
+                }
+            }
+            continue;
+        }
+        if (assembled) |previous| {
+            const joined = try cb.concatRows2D(allocator, previous, core, row * seq_len, seq_len, value_dim);
+            cb.free(previous);
+            assembled = joined;
+        } else assembled = try cb.sliceRows2D(allocator, core, 0, seq_len, value_dim);
+    }
+    const out_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
+    const out_w = try getModelWeight(cb, config, out_w_name);
+    defer cb.free(out_w);
+    return cb.linearNoBias(assembled.?, out_w, total, value_dim, hidden_size);
+}
+
+// Dense projections already span the complete packed tensor. Warm adjacent
+// decode rows can use one existing packed core workspace instead of allocating
+// conv/gates/core/output tensors for every page at every layer.
+fn qwen35PackedProjectedCore(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    mixed: CT,
+    z: CT,
+    beta: CT,
+    a_proj: CT,
+    conv_w: CT,
+    a_log: CT,
+    dt_bias: CT,
+    norm_w: CT,
+    context: *const DecodeContext,
+    layer: usize,
+    lengths: []const usize,
+) !CT {
+    const total = try packedQueryRowCount(lengths);
+    const key_heads: usize = config.qwen35_linear_num_key_heads;
+    const value_heads: usize = config.qwen35_linear_num_value_heads;
+    const key_dim: usize = config.qwen35_linear_key_head_dim;
+    const value_head_dim: usize = config.qwen35_linear_value_head_dim;
+    const channels = 2 * key_heads * key_dim + value_heads * value_head_dim;
+    const width = value_heads * value_head_dim;
+    const caches = context.qwen35_linear_batch orelse return error.InvalidPackedQueryShape;
+    if (comptime build_options.enable_cuda) {
+        const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+        if (config.qwen35_device_only_state and CudaCompute.lightOnRaggedCoreEnabled(cb)) ragged: {
+            if (caches.len != lengths.len) return error.InvalidPackedQueryShape;
+            var states: [max_packed_qwen_items]*@import("../ops/cuda/gated_delta.zig").State = undefined;
+            for (caches, 0..) |cache, index| {
+                const state = (cache orelse return error.InvalidPackedQueryShape).layerState(layer) orelse return error.InvalidPackedQueryShape;
+                if (!state.device_only) break :ragged;
+                states[index] = &state.cuda_device;
+            }
+            if (try CudaCompute.qwen35LinearCoreRaggedBatch(cb, states[0..lengths.len], lengths, .{
+                .device_state_admitted = true,
+                .mixed = mixed,
+                .z = z,
+                .beta = beta,
+                .a = a_proj,
+                .conv_weight = conv_w,
+                .a_log = a_log,
+                .dt_bias = dt_bias,
+                .norm_weight = norm_w,
+                .key_heads = key_heads,
+                .value_heads = value_heads,
+                .dim = key_dim,
+                .value_dim = value_head_dim,
+                .conv_kernel = config.qwen35_linear_conv_kernel_dim,
+                .eps = config.norm_eps,
+            })) |core| {
+                // Count independent page bindings; query rows have a separate
+                // CUDA counter because prefixes contribute more than one row.
+                if (context.packed_recurrent_groups) |counter| counter.* += 1;
+                if (context.packed_recurrent_rows) |counter| counter.* += lengths.len;
+                return core;
+            }
+        }
+    }
+    const output = (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(width) })) orelse return error.UnsupportedTensorType;
+    errdefer cb.free(output);
+    var index: usize = 0;
+    var offset: usize = 0;
+    while (index < lengths.len) {
+        if (comptime build_options.enable_metal) {
+            if (lengths[index] == 1 and key_dim == 128 and value_head_dim == 128 and key_heads == 16 and
+                (value_heads == 16 or value_heads == 32) and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
+            grouped: {
+                var count: usize = 1;
+                while (count < metal_compute_mod.MetalCompute.lightOnRecurrentGroupRows(cb) and index + count < lengths.len and lengths[index + count] == 1) : (count += 1) {}
+                if (count < 2) break :grouped;
+                var states: [64]*metal_compute_mod.Qwen35LinearState = undefined;
+                for (0..count) |row| {
+                    const cache = caches[index + row] orelse break :grouped;
+                    const state = cache.layerState(layer) orelse break :grouped;
+                    states[row] = &state.device;
+                }
+                const mq = try cb.sliceRows2D(allocator, mixed, offset, count, channels);
+                defer cb.free(mq);
+                const zz = try cb.sliceRows2D(allocator, z, offset, count, width);
+                defer cb.free(zz);
+                const bb = try cb.sliceRows2D(allocator, beta, offset, count, value_heads);
+                defer cb.free(bb);
+                const aa = try cb.sliceRows2D(allocator, a_proj, offset, count, value_heads);
+                defer cb.free(aa);
+                if (try metal_compute_mod.MetalCompute.lightOnPackedCore(cb, states[0..count], .{ .mixed = mq, .z = zz, .beta = bb, .a = aa, .key_heads = key_heads, .value_heads = value_heads, .dim = key_dim, .value_dim = value_head_dim, .conv_kernel = config.qwen35_linear_conv_kernel_dim, .eps = config.norm_eps })) |core| {
+                    defer cb.free(core);
+                    if (!try cb.copyRows2D(allocator, output, offset, core, 0, count, width)) return error.UnsupportedTensorType;
+                    if (context.packed_recurrent_groups) |counter| counter.* += 1;
+                    if (context.packed_recurrent_rows) |counter| counter.* += count;
+                    index += count;
+                    offset += count;
+                    continue;
+                }
+            }
+        }
+        if (comptime build_options.enable_cuda) {
+            if (cb.kind() == .cuda and config.qwen35_device_only_state and lengths[index] == 1 and
+                key_dim == 128 and value_head_dim == 128 and key_heads == 16 and
+                (value_heads == 16 or value_heads == 32) and config.qwen35_linear_conv_kernel_dim == 4)
+            cuda_grouped: {
+                var count: usize = 1;
+                while (count < 64 and index + count < lengths.len and lengths[index + count] == 1) : (count += 1) {}
+                if (count < 2) break :cuda_grouped;
+                var states: [64]*@import("../ops/cuda/gated_delta.zig").State = undefined;
+                for (0..count) |row| {
+                    const cache = caches[index + row] orelse break :cuda_grouped;
+                    const state = cache.layerState(layer) orelse break :cuda_grouped;
+                    if (!state.device_only) break :cuda_grouped;
+                    states[row] = &state.cuda_device;
+                }
+                const mq = try cb.sliceRows2D(allocator, mixed, offset, count, channels);
+                defer cb.free(mq);
+                const zz = try cb.sliceRows2D(allocator, z, offset, count, width);
+                defer cb.free(zz);
+                const bb = try cb.sliceRows2D(allocator, beta, offset, count, value_heads);
+                defer cb.free(bb);
+                const aa = try cb.sliceRows2D(allocator, a_proj, offset, count, value_heads);
+                defer cb.free(aa);
+                if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.qwen35LinearCoreBatch(cb, states[0..count], .{
+                    .mixed = mq,
+                    .z = zz,
+                    .beta = bb,
+                    .a = aa,
+                    .conv_weight = conv_w,
+                    .a_log = a_log,
+                    .dt_bias = dt_bias,
+                    .norm_weight = norm_w,
+                    .key_heads = key_heads,
+                    .value_heads = value_heads,
+                    .dim = key_dim,
+                    .value_dim = value_head_dim,
+                    .conv_kernel = config.qwen35_linear_conv_kernel_dim,
+                    .eps = config.norm_eps,
+                })) |core| {
+                    defer cb.free(core);
+                    if (!try cb.copyRows2D(allocator, output, offset, core, 0, count, width)) return error.UnsupportedTensorType;
+                    if (context.packed_recurrent_groups) |counter| counter.* += 1;
+                    if (context.packed_recurrent_rows) |counter| counter.* += count;
+                    index += count;
+                    offset += count;
+                    continue;
+                }
+            }
+        }
+        const len = lengths[index];
+        const mq = try cb.sliceRows2D(allocator, mixed, offset, len, channels);
+        defer cb.free(mq);
+        const zz = try cb.sliceRows2D(allocator, z, offset, len, width);
+        defer cb.free(zz);
+        const bb = try cb.sliceRows2D(allocator, beta, offset, len, value_heads);
+        defer cb.free(bb);
+        const aa = try cb.sliceRows2D(allocator, a_proj, offset, len, value_heads);
+        defer cb.free(aa);
+        const cache = caches[index] orelse return error.InvalidPackedQueryShape;
+        const core = try qwen35ProjectedCore(cb, allocator, config, mq, zz, bb, aa, conv_w, a_log, dt_bias, norm_w, cache.layerState(layer), len, null);
+        defer cb.free(core);
+        if (!try cb.copyRows2D(allocator, output, offset, core, 0, len, width)) return error.UnsupportedTensorType;
+        index += 1;
+        offset += len;
+    }
+    return output;
+}
+
+fn qwen35ProjectedCore(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    mixed: CT,
+    z: CT,
+    beta_proj: CT,
+    a_proj: CT,
+    conv_w: CT,
+    a_log_w: CT,
+    dt_bias_w: CT,
+    norm_w: CT,
+    maybe_state: ?*Qwen35LinearLayerState,
+    seq_len: usize,
+    destination: ?CT,
+) !CT {
+    const key_heads: usize = @intCast(config.qwen35_linear_num_key_heads);
+    const value_heads: usize = @intCast(config.qwen35_linear_num_value_heads);
+    const key_head_dim: usize = @intCast(config.qwen35_linear_key_head_dim);
+    const value_head_dim: usize = @intCast(config.qwen35_linear_value_head_dim);
+    const value_dim = value_heads * value_head_dim;
+    const conv_dim = key_heads * key_head_dim * 2 + value_dim;
+    const conv_kernel: usize = @intCast(config.qwen35_linear_conv_kernel_dim);
+    const total = seq_len;
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda and (getenvBool("TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE") or
+            (maybe_state != null and (maybe_state.?.cuda_device.initialized or maybe_state.?.cuda_device.failed))))
+        {
+            if (maybe_state) |state| {
+                if (state.initialized and !state.cuda_device.initialized) return error.CudaRecurrentStateMigrationUnavailable;
+                if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.qwen35LinearCore(cb, &state.cuda_device, .{
+                    .device_state_admitted = state.device_only,
+                    .destination = destination,
+                    .mixed = mixed,
+                    .z = z,
+                    .beta = beta_proj,
+                    .a = a_proj,
+                    .conv_weight = conv_w,
+                    .a_log = a_log_w,
+                    .dt_bias = dt_bias_w,
+                    .norm_weight = norm_w,
+                    .seq_len = seq_len,
+                    .key_heads = key_heads,
+                    .value_heads = value_heads,
+                    .dim = key_head_dim,
+                    .value_dim = value_head_dim,
+                    .conv_kernel = conv_kernel,
+                    .eps = config.norm_eps,
+                })) |core| return core;
+            }
+        }
+    }
+    if (comptime build_options.enable_metal) {
+        if (cb.kind() == .metal and !getenvBool("TERMITE_METAL_DISABLE_QWEN35_RECURRENT_CORE")) {
+            if (maybe_state) |state| {
+                if (try metal_compute_mod.MetalCompute.qwen35LinearCore(cb, &state.device, .{
+                    .destination = destination,
+                    .mixed = mixed,
+                    .z = z,
+                    .beta = beta_proj,
+                    .a = a_proj,
+                    .conv_weight = conv_w,
+                    .a_log = a_log_w,
+                    .dt_bias = dt_bias_w,
+                    .norm_weight = norm_w,
+                    .seq_len = seq_len,
+                    .key_heads = key_heads,
+                    .value_heads = value_heads,
+                    .dim = key_head_dim,
+                    .value_dim = value_head_dim,
+                    .conv_kernel = conv_kernel,
+                    .eps = config.norm_eps,
+                })) |core| {
+                    return core;
+                }
+            }
+        }
+    }
+
+    // A resident page has no host matrices to fall back to. Never restart its
+    // history from zero, or allocate unadmitted host state after a GPU decline.
+    if (config.qwen35_device_only_state or
+        (maybe_state != null and maybe_state.?.device_only)) return error.ResidentImageOperationUnavailable;
+
+    // Decode rows are small: collect the four projection results on-device
+    // and read them in one transfer. Prefill keeps separate dense host views
+    // so the convolution can stream contiguous rows without an unpack copy.
+    const packed_host: ?[]f32 = if (cb.kind() == .metal and total == 1) blk: {
+        const qkv_z = try cb.concat(mixed, z, total, conv_dim, value_dim);
+        defer cb.free(qkv_z);
+        const ba = try cb.concat(beta_proj, a_proj, total, value_heads, value_heads);
+        defer cb.free(ba);
+        const combined = try cb.concat(qkv_z, ba, total, conv_dim + value_dim, value_heads * 2);
+        defer cb.free(combined);
+        break :blk try cb.toFloat32(combined, allocator);
+    } else null;
+    defer if (packed_host) |data| allocator.free(data);
+    const mixed_host = if (packed_host) |data| data[0..conv_dim] else try cb.toFloat32(mixed, allocator);
+    defer if (packed_host == null) allocator.free(mixed_host);
+    const z_host = if (packed_host) |data| data[conv_dim..][0..value_dim] else try cb.toFloat32(z, allocator);
+    defer if (packed_host == null) allocator.free(z_host);
+    const beta_host = if (packed_host) |data| data[conv_dim + value_dim ..][0..value_heads] else try cb.toFloat32(beta_proj, allocator);
+    defer if (packed_host == null) allocator.free(beta_host);
+    const a_host = if (packed_host) |data| data[conv_dim + value_dim + value_heads ..][0..value_heads] else try cb.toFloat32(a_proj, allocator);
+    defer if (packed_host == null) allocator.free(a_host);
     const conv_weight = try cb.toFloat32(conv_w, allocator);
     defer allocator.free(conv_weight);
     const a_log = try cb.toFloat32(a_log_w, allocator);
     defer allocator.free(a_log);
     const dt_bias = try cb.toFloat32(dt_bias_w, allocator);
     defer allocator.free(dt_bias);
-    const adjusted_norm_w = try maybeAdjustNormWeight(cb, allocator, config, norm_w, value_head_dim);
-    defer if (adjusted_norm_w != norm_w) cb.free(adjusted_norm_w);
-    const norm_weight = try cb.toFloat32(adjusted_norm_w, allocator);
+    // DeltaNet's gated RMSNorm has an ordinary scale initialized to one.
+    // Only Qwen3.5's decoder RMSNorms use the (1 + weight) convention.
+    const norm_weight = try cb.toFloat32(norm_w, allocator);
     defer allocator.free(norm_weight);
-
-    const maybe_state = if (decode_context) |dc|
-        if (dc.qwen35_linear_cache) |cache| cache.layerState(layer) else null
-    else
-        null;
 
     const conv_out = try allocator.alloc(f32, total * conv_dim);
     defer allocator.free(conv_out);
@@ -8338,13 +9102,10 @@ pub fn qwen35LinearAttention(
 
     qwen35RmsNormGatedHost(core, z_host, norm_weight, config.norm_eps, total, value_heads, value_head_dim);
     const core_shape = [_]i32{ @intCast(total), @intCast(value_dim) };
-    const core_ct = try cb.fromFloat32Shape(core, &core_shape);
-    defer cb.free(core_ct);
-
-    const out_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
-    const out_w = try getModelWeight(cb, config, out_w_name);
-    defer cb.free(out_w);
-    return cb.linearNoBias(core_ct, out_w, total, value_dim, hidden_size);
+    // Resume on the device after the host recurrence. A host carrier here
+    // selects a synchronous host-I/O linear and pulls its output back again.
+    const core_ct = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(core, &core_shape));
+    return core_ct;
 }
 
 fn qwen35CausalDepthwiseConv1d(
@@ -8380,23 +9141,21 @@ fn qwen35CausalDepthwiseConv1d(
                 };
                 sum += x * weight[c * kernel + kk];
             }
-            output[t * channels + c] = sum / (1.0 + @exp(-sum));
+            output[t * channels + c] = sum;
         }
     }
+    activations.silu(output);
 
     if (state) |s| {
         for (0..channels) |c| {
             for (0..kernel) |slot| {
-                const combined_len = if (state_initialized) kernel + seq_len else seq_len;
-                const start = if (combined_len > kernel) combined_len - kernel else 0;
-                const src = start + slot;
-                s[c * kernel + slot] = if (state_initialized and src < kernel)
-                    s[c * kernel + src]
-                else blk: {
-                    const input_index = if (state_initialized) src - kernel else src;
-                    if (input_index >= seq_len) break :blk @as(f32, 0);
-                    break :blk input[input_index * channels + c];
-                };
+                // History has one representation for every partition: the
+                // last kernel samples, with zeros on the left after reset.
+                const src = seq_len + slot;
+                s[c * kernel + slot] = if (src < kernel)
+                    (if (state_initialized) s[c * kernel + src] else 0)
+                else
+                    input[(src - kernel) * channels + c];
             }
         }
     }
@@ -8453,13 +9212,16 @@ fn qwen35RecurrentGatedDeltaRuleHost(
     const q_buf = q_buf_stack[0..key_head_dim];
     const k_buf = k_buf_stack[0..key_head_dim];
 
-    for (0..seq_len) |t| {
-        const row = conv_out[t * conv_dim ..][0..conv_dim];
-        const q_all = row[0..key_dim];
-        const k_all = row[key_dim..][0..key_dim];
-        const v_all = row[key_dim * 2 ..][0..value_dim];
-        for (0..value_heads) |vh| {
-            const kh = vh / repeat;
+    // Heads are independent. Finish one head's token stream while its
+    // recurrent matrix is hot in L1, instead of cycling through every head's
+    // matrix for each token.
+    for (0..value_heads) |vh| {
+        const kh = vh / repeat;
+        for (0..seq_len) |t| {
+            const row = conv_out[t * conv_dim ..][0..conv_dim];
+            const q_all = row[0..key_dim];
+            const k_all = row[key_dim..][0..key_dim];
+            const v_all = row[key_dim * 2 ..][0..value_dim];
             const q_src = q_all[kh * key_head_dim ..][0..key_head_dim];
             const k_src = k_all[kh * key_head_dim ..][0..key_head_dim];
             l2NormInto(q_src, q_buf);
@@ -8470,26 +9232,242 @@ fn qwen35RecurrentGatedDeltaRuleHost(
             const g = -@exp(a_log[vh]) * softplus(a_projection[t * value_heads + vh] + dt_bias[vh]);
             const g_exp = @exp(g);
             const state_head = recurrent[vh * key_head_dim * value_head_dim ..][0 .. key_head_dim * value_head_dim];
-            for (state_head) |*value| value.* *= g_exp;
-
             const v_src = v_all[vh * value_head_dim ..][0..value_head_dim];
             const out_dst = output[t * value_dim + vh * value_head_dim ..][0..value_head_dim];
-            var v_idx: usize = 0;
-            while (v_idx < value_head_dim) : (v_idx += 1) {
-                var kv_mem: f32 = 0;
-                for (0..key_head_dim) |k_idx| {
-                    kv_mem += state_head[k_idx * value_head_dim + v_idx] * k_buf[k_idx];
+            qwen35DeltaHead(state_head, k_buf, q_buf, v_src, out_dst, g_exp, beta);
+        }
+    }
+}
+
+// Work on eight adjacent value columns together so both state passes use
+// contiguous loads and SIMD. Each column retains the scalar key reduction
+// order; the tail handles arbitrary value-head dimensions.
+fn qwen35DeltaHead(state: []f32, key: []const f32, query: []const f32, value: []const f32, output: []f32, decay: f32, beta: f32) void {
+    const V = @Vector(8, f32);
+    var col: usize = 0;
+    while (col + 8 <= value.len) : (col += 8) {
+        var memory: V = @splat(0);
+        for (key, 0..) |k, row| {
+            const offset = row * value.len + col;
+            const old: V = state[offset..][0..8].*;
+            const decayed = old * @as(V, @splat(decay));
+            state[offset..][0..8].* = decayed;
+            memory += decayed * @as(V, @splat(k));
+        }
+        const v: V = value[col..][0..8].*;
+        const delta = (v - memory) * @as(V, @splat(beta));
+        var out: V = @splat(0);
+        for (key, query, 0..) |k, q, row| {
+            const offset = row * value.len + col;
+            const decayed: V = state[offset..][0..8].*;
+            const updated = decayed + @as(V, @splat(k)) * delta;
+            state[offset..][0..8].* = updated;
+            out += updated * @as(V, @splat(q));
+        }
+        output[col..][0..8].* = out;
+    }
+    while (col < value.len) : (col += 1) {
+        var memory: f32 = 0;
+        for (key, 0..) |k, row| {
+            const offset = row * value.len + col;
+            state[offset] *= decay;
+            memory += state[offset] * k;
+        }
+        const delta = (value[col] - memory) * beta;
+        var out: f32 = 0;
+        for (key, query, 0..) |k, q, row| {
+            const offset = row * value.len + col;
+            state[offset] += k * delta;
+            out += state[offset] * q;
+        }
+        output[col] = out;
+    }
+}
+
+test "LightOnOCR3 Metal recurrent core matches CPU prefill continuation and reset without readbacks" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const metal_runtime = @import("../backends/metal_runtime.zig");
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer store.lazy_weights.deinit(a);
+    var compute = try metal_compute_mod.MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var state: metal_compute_mod.Qwen35LinearState = .{};
+    defer state.deinit();
+    var peer_state: metal_compute_mod.Qwen35LinearState = .{};
+    defer peer_state.deinit();
+    const seq = 6;
+    const key_heads = 1;
+    const value_heads = 2;
+    const dim = 128;
+    const channels = (2 * key_heads + value_heads) * dim;
+    const value_width = value_heads * dim;
+    var mixed: [seq * channels]f32 = undefined;
+    var z: [seq * value_width]f32 = undefined;
+    var beta: [seq * value_heads]f32 = undefined;
+    var ap: [seq * value_heads]f32 = undefined;
+    var conv_weight: [channels * 4]f32 = undefined;
+    var norm_weight: [dim]f32 = undefined;
+    const alog = [_]f32{ -0.8, 0.1 };
+    const dt = [_]f32{ 0.2, -0.1 };
+    for (&mixed, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.013) * 0.7;
+    for (&z, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.017);
+    for (&beta, &ap, 0..) |*b, *p, i| {
+        b.* = @as(f32, @floatFromInt(i % 5)) * 0.2 - 0.4;
+        p.* = @as(f32, @floatFromInt(i % 7)) * 0.1 - 0.3;
+    }
+    for (&conv_weight, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 9)) * 0.04 - 0.16;
+    for (&norm_weight, 0..) |*v, i| v.* = 0.5 + @as(f32, @floatFromInt(i % 7)) * 0.1;
+    var conv: [seq * channels]f32 = undefined;
+    var expected: [seq * value_width]f32 = undefined;
+    const recurrent = try a.alloc(f32, value_heads * dim * dim);
+    defer a.free(recurrent);
+    try qwen35CausalDepthwiseConv1d(&mixed, &conv_weight, null, false, &conv, seq, channels, 4);
+    try qwen35RecurrentGatedDeltaRuleHost(&conv, &beta, &ap, &alog, &dt, recurrent, false, &expected, seq, key_heads, value_heads, dim, dim);
+    qwen35RmsNormGatedHost(&expected, &z, &norm_weight, 1e-6, seq, value_heads, dim);
+    const cw = try cb.fromFloat32(&conv_weight);
+    defer cb.free(cw);
+    const al = try cb.fromFloat32(&alog);
+    defer cb.free(al);
+    const bias = try cb.fromFloat32(&dt);
+    defer cb.free(bias);
+    const nw = try cb.fromFloat32(&norm_weight);
+    defer cb.free(nw);
+    // A prefix shorter than the convolution kernel exercises left padding.
+    // Repeat from a reset state to ensure old GPU buffers cannot leak history.
+    for (0..3) |round| {
+        // Qualify both the separate encoders and the shared encoder against
+        // the same independent CPU history, including reset and continuation.
+        metal_runtime.termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(compute.provider_impl.raw_decode_runtime, @intFromBool(round != 0));
+        state.reset();
+        peer_state.reset();
+        var offset: usize = 0;
+        for ([_]usize{ 2, 1, 3 }) |count| {
+            const x = try cb.fromFloat32Shape(mixed[offset * channels ..][0 .. count * channels], &.{ @intCast(count), channels });
+            defer cb.free(x);
+            const gate = try cb.fromFloat32Shape(z[offset * value_width ..][0 .. count * value_width], &.{ @intCast(count), value_width });
+            defer cb.free(gate);
+            const b = try cb.fromFloat32Shape(beta[offset * value_heads ..][0 .. count * value_heads], &.{ @intCast(count), value_heads });
+            defer cb.free(b);
+            const p = try cb.fromFloat32Shape(ap[offset * value_heads ..][0 .. count * value_heads], &.{ @intCast(count), value_heads });
+            defer cb.free(p);
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            errdefer cb.decoderRuntimeCancelFrame() catch {};
+            // Prefill leaves large released private buffers in the frame pool.
+            // Persistent history must not capture these oversized allocations.
+            const check_storage = round == 0 and offset == 0 and platform.env.getenvBoolDefault("TERMITE_METAL_BUFFER_REUSE", true);
+            var oversized: [7]?*anyopaque = @splat(null);
+            if (check_storage) {
+                const Tensor = @import("../backends/metal_tensor.zig").MetalTensor;
+                const raw_runtime: *anyopaque = @ptrCast(compute.provider_impl.raw_decode_runtime.?);
+                for (&oversized) |*handle| {
+                    var temporary = try Tensor.deviceAllocateFreshWithAllocator(a, raw_runtime, 4 * 1024 * 1024, .private, &.{1024 * 1024});
+                    handle.* = temporary.deviceHandle();
+                    temporary.deinit();
                 }
-                const delta = (v_src[v_idx] - kv_mem) * beta;
-                for (0..key_head_dim) |k_idx| {
-                    state_head[k_idx * value_head_dim + v_idx] += k_buf[k_idx] * delta;
-                }
-                var out: f32 = 0;
-                for (0..key_head_dim) |k_idx| {
-                    out += state_head[k_idx * value_head_dim + v_idx] * q_buf[k_idx];
-                }
-                out_dst[v_idx] = out;
+                var probe = try Tensor.deviceAllocateWithAllocator(a, raw_runtime, 512, .private, &.{128});
+                defer probe.deinit();
+                try std.testing.expect(std.mem.indexOfScalar(?*anyopaque, &oversized, probe.deviceHandle()) != null);
             }
+            const queued = round == 2 and count == 1 and try metal_compute_mod.MetalCompute.beginQwen35LinearBatch(&cb, 2);
+            var pending = queued;
+            defer if (pending) metal_compute_mod.MetalCompute.abortQwen35LinearBatch(&cb);
+            var audit: @import("../backends/metal_tensor.zig").TransferAudit = .{};
+            const outputs = blk: {
+                try @import("../backends/metal_tensor.zig").beginTransferAudit(&audit);
+                defer @import("../backends/metal_tensor.zig").endTransferAudit();
+                const request = .{
+                    .mixed = x,
+                    .z = gate,
+                    .beta = b,
+                    .a = p,
+                    .conv_weight = cw,
+                    .a_log = al,
+                    .dt_bias = bias,
+                    .norm_weight = nw,
+                    .seq_len = count,
+                    .key_heads = @as(usize, key_heads),
+                    .value_heads = @as(usize, value_heads),
+                    .dim = @as(usize, dim),
+                    .value_dim = @as(usize, dim),
+                    .conv_kernel = @as(usize, 4),
+                    .eps = @as(f32, 1e-6),
+                };
+                const first = (try metal_compute_mod.MetalCompute.qwen35LinearCore(&cb, &state, request)) orelse return error.UnexpectedNull;
+                errdefer cb.free(first);
+                if (check_storage) {
+                    for (state.conv) |tensor| try std.testing.expect(std.mem.indexOfScalar(?*anyopaque, &oversized, tensor.?.deviceHandle()) == null);
+                    try std.testing.expect(std.mem.indexOfScalar(?*anyopaque, &oversized, state.recurrent.?.deviceHandle()) == null);
+                    for (state.weights) |tensor| try std.testing.expect(std.mem.indexOfScalar(?*anyopaque, &oversized, tensor.?.deviceHandle()) == null);
+                }
+                const peer = (try metal_compute_mod.MetalCompute.qwen35LinearCore(&cb, &peer_state, request)) orelse return error.UnexpectedNull;
+                errdefer cb.free(peer);
+                if (queued) {
+                    try metal_compute_mod.MetalCompute.endQwen35LinearBatch(&cb);
+                    pending = false;
+                }
+                break :blk [_]CT{ first, peer };
+            };
+            const output = outputs[0];
+            defer for (outputs) |tensor| cb.free(tensor);
+            try std.testing.expectEqual(@as(usize, 0), audit.download_calls);
+            try std.testing.expect(metal_compute_mod.MetalCompute.debugHasDeviceTensor(&cb, output));
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            for (actual, expected[offset * value_width ..][0 .. count * value_width]) |got, want| try std.testing.expectApproxEqAbs(want, got, 3e-4);
+            const peer_actual = try cb.toFloat32(outputs[1], a);
+            defer a.free(peer_actual);
+            for (peer_actual, expected[offset * value_width ..][0 .. count * value_width]) |got, want| try std.testing.expectApproxEqAbs(want, got, 3e-4);
+            offset += count;
+        }
+        const actual_state = try state.recurrent.?.toHostSlice();
+        for (actual_state, recurrent) |got, want| try std.testing.expectApproxEqAbs(want, got, 3e-5);
+        const actual_conv = try state.conv[0].?.toHostSlice();
+        for (0..channels) |channel| for (0..4) |slot| try std.testing.expectEqual(mixed[(seq - 4 + slot) * channels + channel], actual_conv[channel * 4 + slot]);
+    }
+}
+
+test "LightOnOCR3 SIMD recurrent update matches scalar reference with tails and cached state" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 1, 7, 8, 13, 128 }) |value_dim| {
+        const key_dim = 5;
+        const key = [_]f32{ 0.2, -0.1, 0.4, 0.3, -0.5 };
+        const query = [_]f32{ -0.1, 0.3, 0.2, -0.4, 0.1 };
+        const value = try allocator.alloc(f32, value_dim);
+        defer allocator.free(value);
+        const state = try allocator.alloc(f32, key_dim * value_dim);
+        defer allocator.free(state);
+        const expected_state = try allocator.alloc(f32, state.len);
+        defer allocator.free(expected_state);
+        const output = try allocator.alloc(f32, value_dim);
+        defer allocator.free(output);
+        const expected = try allocator.alloc(f32, value_dim);
+        defer allocator.free(expected);
+        for (state, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 23)) / 23 - 0.5;
+        @memcpy(expected_state, state);
+        for (value, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 11)) / 11;
+        // Repeat to verify updates to the persistent state as well as output.
+        for (0..3) |_| {
+            const decay: f32 = 0.8;
+            const beta: f32 = 0.65;
+            for (expected_state) |*v| v.* *= decay;
+            for (0..value_dim) |col| {
+                var memory: f32 = 0;
+                for (0..key_dim) |row| memory += expected_state[row * value_dim + col] * key[row];
+                const delta = (value[col] - memory) * beta;
+                var result: f32 = 0;
+                for (0..key_dim) |row| {
+                    expected_state[row * value_dim + col] += key[row] * delta;
+                    result += expected_state[row * value_dim + col] * query[row];
+                }
+                expected[col] = result;
+            }
+            qwen35DeltaHead(state, &key, &query, value, output, decay, beta);
+            for (output, expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-6);
+            for (state, expected_state) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-6);
         }
     }
 }
@@ -8511,9 +9489,19 @@ fn qwen35RmsNormGatedHost(
             var sum_sq: f32 = 0;
             for (chunk) |value| sum_sq += value * value;
             const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(head_dim)) + eps);
-            for (chunk, 0..) |*value, idx| {
+            const lanes = @import("inference_linalg").primitives.vec_len;
+            const Vec = @Vector(lanes, f32);
+            var idx: usize = 0;
+            while (idx + lanes <= head_dim) : (idx += lanes) {
+                const values: Vec = chunk[idx..][0..lanes].*;
+                const scale: Vec = weight[idx..][0..lanes].*;
+                const z: Vec = gate[start + idx ..][0..lanes].*;
+                const silu = z / (@as(Vec, @splat(1)) + activations.expVec(-z));
+                chunk[idx..][0..lanes].* = values * @as(Vec, @splat(inv_rms)) * scale * silu;
+            }
+            while (idx < head_dim) : (idx += 1) {
                 const z = gate[start + idx];
-                value.* = value.* * inv_rms * weight[idx] * (z / (1.0 + @exp(-z)));
+                chunk[idx] = chunk[idx] * inv_rms * weight[idx] * (z / (1.0 + @exp(-z)));
             }
         }
     }
@@ -8554,6 +9542,51 @@ test "qwen3.5 causal depthwise conv updates rolling state" {
     try std.testing.expectApproxEqAbs(want, next_out[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 3), state[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4), state[1], 1e-6);
+}
+
+test "LightOnOCR3 causal convolution short initial prefixes preserve contiguous and split execution after reset" {
+    const channels = 3;
+    const kernel = 4;
+    const count = 9;
+    var input: [count * channels]f32 = undefined;
+    var weight: [channels * kernel]f32 = undefined;
+    for (&input, 0..) |*x, n| x.* = @as(f32, @floatFromInt(n + 1)) / 8;
+    for (&weight, 0..) |*x, n| x.* = @as(f32, @floatFromInt(n % 7 + 1)) / 4;
+    var reference: [count * channels]f32 = undefined;
+    var reference_history: [channels * kernel]f32 = @splat(std.math.nan(f32));
+    try qwen35CausalDepthwiseConv1d(&input, &weight, &reference_history, false, &reference, count, channels, kernel);
+    for (1..kernel) |initial| {
+        for ([_]usize{ 1, count }) |chunk| {
+            for ([_]bool{ false, true }) |reset| {
+                var history: [channels * kernel]f32 = @splat(std.math.nan(f32));
+                var actual: [count * channels]f32 = undefined;
+                if (reset) {
+                    var discarded: [5 * channels]f32 = undefined;
+                    try qwen35CausalDepthwiseConv1d(input[0 .. 5 * channels], &weight, &history, false, &discarded, 5, channels, kernel);
+                }
+                try qwen35CausalDepthwiseConv1d(input[0 .. initial * channels], &weight, &history, false, actual[0 .. initial * channels], initial, channels, kernel);
+                for (0..channels) |c| for (0..kernel) |slot| {
+                    const expected: f32 = if (slot < kernel - initial) 0 else input[(slot - (kernel - initial)) * channels + c];
+                    try std.testing.expectEqual(expected, history[c * kernel + slot]);
+                };
+                var start = initial;
+                while (start < count) {
+                    const end: usize = @min(start + chunk, count);
+                    try qwen35CausalDepthwiseConv1d(input[start * channels .. end * channels], &weight, &history, true, actual[start * channels .. end * channels], end - start, channels, kernel);
+                    start = end;
+                }
+                for (reference, actual) |expected, got| try std.testing.expectApproxEqAbs(expected, got, 1e-6);
+                try std.testing.expectEqualSlices(f32, &reference_history, &history);
+            }
+        }
+    }
+    const unit_weights = [_]f32{ 1, 1, 1, 1 };
+    var history = [_]f32{ 0, 0, 0, 0 };
+    var first: [1]f32 = undefined;
+    var second: [1]f32 = undefined;
+    try qwen35CausalDepthwiseConv1d(&.{1}, &unit_weights, &history, false, &first, 1, 1, 4);
+    try qwen35CausalDepthwiseConv1d(&.{2}, &unit_weights, &history, true, &second, 1, 1, 4);
+    try std.testing.expectApproxEqAbs(@as(f32, 3) / (1 + @exp(-@as(f32, 3))), second[0], 1e-6);
 }
 
 test "qwen3.5 recurrent gated delta rule updates state" {
@@ -8855,6 +9888,90 @@ fn runPreparedAttentionWithSinkMetadata(
     return result;
 }
 
+// Q/K already contain each token's explicit multimodal position. Split only
+// the stateful attention operation; output rows retain their packed order.
+fn runPackedQwenAttention(
+    cb: *const ComputeBackend,
+    Q: CT,
+    K: CT,
+    V: CT,
+    attention: ops.AttentionContext,
+    sink: backend_contracts.AttentionSinkMetadata,
+    lengths: []const usize,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    context: ?*const DecodeContext,
+) !CT {
+    const total = try packedQueryRowCount(lengths);
+    const views = attention.kv_batch orelse return error.InvalidPackedQueryShape;
+    if (views.len != lengths.len or attention.query_sequence_len != total or attention.attn_or_mask != null) return error.InvalidPackedQueryShape;
+    for (lengths, views) |len, view| {
+        if (view.per_item_query_len != len or view.per_item_total_len == null or view.per_item_kv_len == null or
+            view.per_item_kv_position_offset == null or view.per_item_mode == null) return error.InvalidPackedQueryShape;
+    }
+    const a = std.heap.page_allocator;
+    const width = num_heads * head_dim;
+    const kv_width = num_kv_heads * head_dim;
+    const result = (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(width) })) orelse return error.UnsupportedTensorType;
+    errdefer cb.free(result);
+    var offset: usize = 0;
+    var index: usize = 0;
+    while (index < lengths.len) {
+        const view = views[index];
+        const len = lengths[index];
+        var count: usize = 1;
+        if (len == 1 and view.per_item_mode == .paged_decode) {
+            while ((cb.kind() != .cuda or count < 64) and index + count < lengths.len and lengths[index + count] == 1 and views[index + count].per_item_mode == .paged_decode) : (count += 1) {}
+        }
+        const rows = if (count > 1) count else len;
+        const q = try cb.sliceRows2D(a, Q, offset, rows, width);
+        defer cb.free(q);
+        const k = try cb.sliceRows2D(a, K, offset, rows, kv_width);
+        defer cb.free(k);
+        const v = try cb.sliceRows2D(a, V, offset, rows, kv_width);
+        defer cb.free(v);
+        var item = attention;
+        if (count > 1) {
+            // Every query is one token, so this contiguous subrange has the
+            // exact [batch, 1] layout consumed by the existing batched paged
+            // attention kernels. Per-page KV/position overrides stay intact.
+            item.kv_batch = views[index..][0..count];
+            item.kv_cache = null;
+            item.kv_manager = null;
+            item.mode = .paged_decode;
+            item.query_sequence_len = 1;
+            item.total_sequence_len = 0;
+            item.kv_sequence_len = 0;
+            item.kv_position_offset = 0;
+            for (item.kv_batch.?) |peer| {
+                item.total_sequence_len = @max(item.total_sequence_len, peer.per_item_total_len.?);
+                item.kv_sequence_len = @max(item.kv_sequence_len, peer.per_item_kv_len.?);
+            }
+        } else {
+            item.kv_batch = null;
+            item.kv_cache = view.kv_cache;
+            item.kv_manager = view.kv_manager;
+            item.kv_storage = view.kv_storage;
+            item.mode = view.per_item_mode.?;
+            item.query_sequence_len = len;
+            item.total_sequence_len = view.per_item_total_len.?;
+            item.kv_sequence_len = view.per_item_kv_len.?;
+            item.kv_position_offset = view.per_item_kv_position_offset.?;
+        }
+        const output = try runPreparedAttentionWithSinkMetadata(cb, q, k, v, item, sink, count, num_heads, num_kv_heads, head_dim);
+        defer cb.free(output);
+        if (!try cb.copyRows2D(a, result, offset, output, 0, rows, width)) return error.UnsupportedTensorType;
+        if (count > 1) if (context) |dc| {
+            if (dc.packed_attention_groups) |counter| counter.* += 1;
+            if (dc.packed_attention_rows) |counter| counter.* += count;
+        };
+        offset += rows;
+        index += count;
+    }
+    return result;
+}
+
 fn applyAttentionWithSink(
     cb: *const ComputeBackend,
     config: Config,
@@ -8891,9 +10008,9 @@ fn applyAttentionWithSink(
     const is_mixed = if (decode_context) |dc| dc.isMixedBatch() else false;
 
     if (config.position_encoding == .rope) {
-        if (config.isQwen3Vl()) {
-            if (!config.hasQwen3VlArchitectureContract()) return error.InvalidQwen3VlArchitectureContract;
-            if (is_mixed) return error.Qwen3VlMixedBatchMropeUnsupported;
+        if (config.isQwen3Vl() or (config.isQwen35() and decode_context != null and decode_context.?.mrope_positions != null)) {
+            if (!config.hasQwen3VlArchitectureContract() and !config.hasQwen35VisionArchitectureContract()) return error.InvalidQwen3VlArchitectureContract;
+            if (is_mixed and !config.isQwen35()) return error.Qwen3VlMixedBatchMropeUnsupported;
             const dc = decode_context orelse return error.Qwen3VlMropePositionsRequired;
             const token_count = std.math.mul(usize, batch, attention.query_sequence_len) catch
                 return error.InvalidQwen3VlMropeShape;
@@ -8922,9 +10039,10 @@ fn applyAttentionWithSink(
                 return error.InvalidQwen3VlMropeShape;
             if (positions.len != expected_position_count) return error.InvalidQwen3VlMropeShape;
             const rope_started_at = monotonicNowNs();
-            const Q_rope = (try cb.mrope(
+            const Q_rope = (try cb.partialMrope(
                 Q,
                 token_count,
+                num_heads,
                 head_dim,
                 rope_theta,
                 config.rope_freq_scale,
@@ -8932,9 +10050,10 @@ fn applyAttentionWithSink(
                 config.mrope_section,
             )) orelse return error.Qwen3VlMropeBackendRequired;
             defer cb.free(Q_rope);
-            const K_rope = (try cb.mrope(
+            const K_rope = (try cb.partialMrope(
                 K,
                 token_count,
+                num_kv_heads,
                 head_dim,
                 rope_theta,
                 config.rope_freq_scale,
@@ -8942,9 +10061,15 @@ fn applyAttentionWithSink(
                 config.mrope_section,
             )) orelse return error.Qwen3VlMropeBackendRequired;
             defer cb.free(K_rope);
+            try maybeDumpGatedLayerStageStats(cb, std.heap.page_allocator, layer, "q-rope", Q_rope, num_heads * head_dim);
+            try maybeDumpGatedLayerStageStats(cb, std.heap.page_allocator, layer, "k-rope", K_rope, num_kv_heads * head_dim);
             debug_timing_stats.attention_rope_nanos += @intCast(monotonicNowNs() - rope_started_at);
             try maybeDebugLayerTensorLastRow(cb, std.heap.page_allocator, layer, "q_mrope", Q_rope, num_heads * head_dim);
             try maybeDebugLayerTensorLastRow(cb, std.heap.page_allocator, layer, "k_mrope", K_rope, num_kv_heads * head_dim);
+            if (dc.packed_query_lengths) |lengths| {
+                if (batch != 1 or try packedQueryRowCount(lengths) != token_count) return error.InvalidPackedQueryShape;
+                return runPackedQwenAttention(cb, Q_rope, K_rope, V, attention, sink_metadata, lengths, num_heads, num_kv_heads, head_dim, dc);
+            }
             return runPreparedAttentionWithSinkMetadata(
                 cb,
                 Q_rope,
@@ -9431,10 +10556,7 @@ fn attentionContext(seq_len: usize, decode_context: ?*const DecodeContext) ops.A
         .attn_or_mask = dc.attn_or_mask,
         .kv_manager = dc.kv_manager,
         .kv_storage = dc.kv_storage,
-        .kv_batch = if (dc.kv_batch) |batch|
-            @ptrCast(batch)
-        else
-            null,
+        .kv_batch = dc.kv_batch,
         .kv_cache = if (dc.kv_cache) |kv|
             .{
                 .sequence_id = kv.sequence_id,
@@ -9573,6 +10695,32 @@ fn feedForward(
             defer cb.free(gate_w);
             const up_w = try getFFNWeight(cb, config, layer, "up", name_buf);
             defer cb.free(up_w);
+            const down_w = try getFFNWeight(cb, config, layer, "down", name_buf);
+            defer cb.free(down_w);
+            // Both integrated OCR decoders have qualified gate/up + SiLU
+            // kernels. Keep the paired projection fallback on other profiles.
+            // Long-prompt FFNs also reach the backend's optional packed-prefill
+            // selector. The backend owns feature flags and frame/capability guards.
+            const packed_prefill_candidate = !isDecodeStep(decode_context) and
+                total >= 128 and total <= 1024 and hidden_size == 2560;
+            if (total >= 1 and ((cb.kind() == .cuda and total <= 8192) or packed_prefill_candidate or total <= 8 or
+                (isDecodeStep(decode_context) and total <= 64 and
+                    (hidden_size != 2560 or total < 64 or cb.kind() == .cuda or platform.env.getenvBool("TERMITE_METAL_ENABLE_LIGHTONOCR3_FULL64_GATE_UP")))) and
+                config.hasQwen35VisionArchitectureContract() and
+                ((hidden_size == 1024 and inter_size == 3584 and config.num_hidden_layers == 24) or
+                    (hidden_size == 2560 and inter_size == 9216 and config.num_hidden_layers == 32)))
+            {
+                if (try cb.gatedFfnNoBias(&.{
+                    .input = input,
+                    .gate_weight = gate_w,
+                    .up_weight = up_w,
+                    .down_weight = down_w,
+                    .rows = total,
+                    .hidden_size = hidden_size,
+                    .intermediate_size = inter_size,
+                    .activation = decoderRuntimeActivationKind(config.activation),
+                })) |fused| return fused;
+            }
             debug_timing_stats.ffn_project_pair_calls += 1;
             const gate_up = try cb.linearNoBiasPair(input, gate_w, up_w, total, hidden_size, inter_size);
             const gate_proj = gate_up.first;
@@ -9595,8 +10743,6 @@ fn feedForward(
             };
             defer cb.free(gated);
 
-            const down_w = try getFFNWeight(cb, config, layer, "down", name_buf);
-            defer cb.free(down_w);
             const output = try cb.linearNoBias(gated, down_w, total, inter_size, hidden_size);
             return output;
         },
@@ -10732,6 +11878,22 @@ fn runGroupedExpertBatchTensor(
 
 fn applyAttnNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT, layer: usize, buf: *[256]u8) !CT {
     return applyNormAt(cb, allocator, config, hidden, layer, "attn", buf);
+}
+
+fn tryLightOnFusedFfnBlock(cb: *const ComputeBackend, config: Config, input: CT, rows: usize, layer: usize, name_buf: *[256]u8) !?CT {
+    if (comptime !build_options.enable_cuda) return null;
+    const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+    if (!config.hasQwen35VisionArchitectureContract() or config.activation != .silu or config.usesMoe() or !CudaCompute.lightOnFfnBlockEnabled(cb)) return null;
+    const norm_name = try std.fmt.bufPrint(name_buf, "model.layers.{d}.post_attention_layernorm.weight", .{layer});
+    const norm = try getModelWeight(cb, config, norm_name);
+    defer cb.free(norm);
+    const gate = try getFFNWeight(cb, config, layer, "gate", name_buf);
+    defer cb.free(gate);
+    const up = try getFFNWeight(cb, config, layer, "up", name_buf);
+    defer cb.free(up);
+    const down = try getFFNWeight(cb, config, layer, "down", name_buf);
+    defer cb.free(down);
+    return CudaCompute.lightOnFfnBlock(cb, .{ .input = input, .norm = norm, .weights = .{ gate, up, down }, .rows = rows, .hidden = config.hidden_size, .intermediate = config.intermediateSize(layer), .eps = config.norm_eps, .weight_offset = config.norm_weight_offset });
 }
 
 fn applyFFNNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT, layer: usize, buf: *[256]u8) !CT {
@@ -12793,4 +13955,710 @@ pub fn getLmHeadWeight(cb: *const ComputeBackend, config: Config) !CT {
         return try getEmbeddingWeight(cb, config);
     }
     return cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+}
+
+test "LightOnOCR3 DeltaNet gated norm uses its scale directly without a plus-one shift" {
+    var data = [_]f32{ 3, 4 };
+    const gate = [_]f32{ 1, 2 };
+    const weight = [_]f32{ 0.5, 2 };
+    qwen35RmsNormGatedHost(&data, &gate, &weight, 1e-6, 1, 1, 2);
+    const inv_rms = 1.0 / @sqrt(@as(f32, 12.5 + 1e-6));
+    try std.testing.expectApproxEqAbs(@as(f32, 3) * inv_rms * 0.5 / (1 + @exp(@as(f32, -1))), data[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4) * inv_rms * 2 * 2 / (1 + @exp(@as(f32, -2))), data[1], 1e-6);
+}
+
+test "LightOnOCR3 batched DeltaNet projections match independent histories across decode and retirement" {
+    const a = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    var compute = native_compute_mod.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const cfg = Config{ .family = .qwen3_5, .hidden_size = 4, .num_hidden_layers = 1, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_conv_kernel_dim = 4 };
+    const prefix = "model.layers.0.linear_attn.";
+    inline for (.{
+        .{ "in_proj_qkv.weight", 6, 4 }, .{ "in_proj_z.weight", 2, 4 },
+        .{ "in_proj_b.weight", 1, 4 },   .{ "in_proj_a.weight", 1, 4 },
+        .{ "conv1d.weight", 6, 4 },      .{ "out_proj.weight", 4, 2 },
+    }) |spec| {
+        var values: [spec[1] * spec[2]]f32 = undefined;
+        for (&values, 0..) |*value, idx| value.* = @sin(@as(f32, @floatFromInt(idx + 1))) * 0.2;
+        try putDeepSeekV4TestWeight(a, &store, prefix ++ spec[0], &.{ spec[1], spec[2] }, &values);
+    }
+    try putDeepSeekV4TestWeight(a, &store, prefix ++ "A_log", &.{1}, &.{-0.2});
+    try putDeepSeekV4TestWeight(a, &store, prefix ++ "dt_bias", &.{1}, &.{0.1});
+    try putDeepSeekV4TestWeight(a, &store, prefix ++ "norm.weight", &.{2}, &.{ 1, 0.8 });
+    var caches: [4]Qwen35LinearCache = undefined;
+    for (&caches) |*cache| cache.* = try Qwen35LinearCache.init(a, cfg);
+    defer for (&caches) |*cache| cache.deinit();
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    var views: [2]DecodeContext.KvBatchView = undefined;
+    for (&views, 0..) |*view, row| view.* = .{ .kv_manager = &manager, .kv_cache = .{ .sequence_id = @intCast(row), .pool_id = 0, .logical_block_count = 0, .tail_tokens = 0 } };
+    const batch_caches = [_]?*Qwen35LinearCache{ &caches[2], &caches[3] };
+    var name: [256]u8 = undefined;
+    // Equal-length prefill batches must preserve each page's complete history.
+    const prefix_len = 3;
+    for (&views) |*view| view.per_item_query_len = prefix_len;
+    const prefix_values = [_]f32{ 0.1, -0.2, 0.3, 0.4, 0.3, 0.8, -0.4, 0.2, 0.9, -0.5, 0.1, 0.6, 1.1, -0.2, 0.3, 0.4, -0.7, 0.2, 0.8, 0.1, 0.4, 0.3, -0.6, 0.9 };
+    const prefix_input = try cb.fromFloat32Shape(&prefix_values, &.{ 6, 4 });
+    defer cb.free(prefix_input);
+    const prefix_context = DecodeContext{ .total_sequence_len = prefix_len, .query_sequence_len = prefix_len, .kv_sequence_len = 0, .kv_batch = &views, .qwen35_linear_batch = &batch_caches };
+    const prefix_batch = try qwen35LinearAttention(&cb, a, cfg, prefix_input, 2, prefix_len, 0, &prefix_context, &name);
+    defer cb.free(prefix_batch);
+    const prefix_actual = try cb.toFloat32(prefix_batch, a);
+    defer a.free(prefix_actual);
+    for (0..2) |row| {
+        const input = try cb.fromFloat32Shape(prefix_values[row * 12 ..][0..12], &.{ 3, 4 });
+        defer cb.free(input);
+        const context = DecodeContext{ .total_sequence_len = prefix_len, .query_sequence_len = prefix_len, .kv_sequence_len = 0, .qwen35_linear_cache = &caches[row] };
+        const output = try qwen35LinearAttention(&cb, a, cfg, input, 1, prefix_len, 0, &context, &name);
+        defer cb.free(output);
+        const expected = try cb.toFloat32(output, a);
+        defer a.free(expected);
+        for (expected, prefix_actual[row * 12 ..][0..12]) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+        for (caches[row].layers[0].recurrent, caches[row + 2].layers[0].recurrent) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+        for (caches[row].layers[0].conv, caches[row + 2].layers[0].conv) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    }
+    for (&views) |*view| view.per_item_query_len = 1;
+    for (0..4) |step| {
+        const values = [_]f32{ 0.2, @as(f32, @floatFromInt(step)) * 0.1, -0.1, 0.8, 0.7, 0.3, -0.2, 0.4 };
+        const input = try cb.fromFloat32Shape(&values, &.{ 2, 4 });
+        defer cb.free(input);
+        const context = DecodeContext{ .total_sequence_len = step + prefix_len + 1, .query_sequence_len = 1, .kv_sequence_len = step + prefix_len, .kv_batch = &views, .qwen35_linear_batch = &batch_caches };
+        const batch = try qwen35LinearAttention(&cb, a, cfg, input, 2, 1, 0, &context, &name);
+        defer cb.free(batch);
+        const actual = try cb.toFloat32(batch, a);
+        defer a.free(actual);
+        for (0..2) |row| {
+            const single_input = try cb.fromFloat32Shape(values[row * 4 ..][0..4], &.{ 1, 4 });
+            defer cb.free(single_input);
+            const single_context = DecodeContext{ .total_sequence_len = step + prefix_len + 1, .query_sequence_len = 1, .kv_sequence_len = step + prefix_len, .qwen35_linear_cache = &caches[row] };
+            const single = try qwen35LinearAttention(&cb, a, cfg, single_input, 1, 1, 0, &single_context, &name);
+            defer cb.free(single);
+            const expected = try cb.toFloat32(single, a);
+            defer a.free(expected);
+            for (expected, actual[row * 4 ..][0..4]) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+            for (caches[row].layers[0].recurrent, caches[row + 2].layers[0].recurrent) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+            for (caches[row].layers[0].conv, caches[row + 2].layers[0].conv) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+        }
+    }
+    // A three-token prefill chunk and one decode token share projections,
+    // while retaining both pages' complete recurrent histories.
+    const packed_lengths = [_]usize{ 3, 1 };
+    const packed_values = prefix_values[0..16];
+    const packed_input = try cb.fromFloat32Shape(packed_values, &.{ 4, 4 });
+    defer cb.free(packed_input);
+    views[0].per_item_query_len = 3;
+    views[1].per_item_query_len = 1;
+    const packed_context = DecodeContext{ .total_sequence_len = 10, .query_sequence_len = 4, .kv_sequence_len = 7, .kv_batch = &views, .qwen35_linear_batch = &batch_caches, .packed_query_lengths = &packed_lengths };
+    const packed_output = try qwen35LinearAttention(&cb, a, cfg, packed_input, 1, 4, 0, &packed_context, &name);
+    defer cb.free(packed_output);
+    const packed_actual = try cb.toFloat32(packed_output, a);
+    defer a.free(packed_actual);
+    var packed_offset: usize = 0;
+    for (packed_lengths, 0..) |len, row| {
+        const single_input = try cb.fromFloat32Shape(packed_values[packed_offset * 4 ..][0 .. len * 4], &.{ @intCast(len), 4 });
+        defer cb.free(single_input);
+        const single_context = DecodeContext{ .total_sequence_len = 7 + len, .query_sequence_len = len, .kv_sequence_len = 7, .qwen35_linear_cache = &caches[row] };
+        const single = try qwen35LinearAttention(&cb, a, cfg, single_input, 1, len, 0, &single_context, &name);
+        defer cb.free(single);
+        const expected = try cb.toFloat32(single, a);
+        defer a.free(expected);
+        for (expected, packed_actual[packed_offset * 4 ..][0 .. len * 4]) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+        for (caches[row].layers[0].recurrent, caches[row + 2].layers[0].recurrent) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+        for (caches[row].layers[0].conv, caches[row + 2].layers[0].conv) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+        packed_offset += len;
+    }
+    // Retiring/resetting one page must leave its peer's history intact.
+    const before = try a.dupe(f32, caches[3].layers[0].recurrent);
+    defer a.free(before);
+    caches[2].reset();
+    try std.testing.expectEqualSlices(f32, before, caches[3].layers[0].recurrent);
+}
+
+test "LightOnOCR3 device recurrent cache omits CPU matrices and refuses host fallback" {
+    const a = std.testing.allocator;
+    const cfg = Config{ .family = .qwen3_5, .hidden_size = 4, .num_hidden_layers = 5, .qwen35_has_linear_attention = true, .qwen35_device_only_state = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_conv_kernel_dim = 4 };
+    var cache = try Qwen35LinearCache.init(a, cfg);
+    defer cache.deinit();
+    for (cache.layers, 0..) |layer, index| {
+        try std.testing.expectEqual(cfg.layerUsesQwen35LinearAttention(index), layer.device_only);
+        try std.testing.expectEqual(@as(usize, 0), layer.conv.len);
+        try std.testing.expectEqual(@as(usize, 0), layer.recurrent.len);
+    }
+    try std.testing.expect(cache.layerState(0) != null);
+    try std.testing.expect(cache.layerState(3) == null);
+    var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    var compute = native_compute_mod.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const placeholder = try cb.fromFloat32Shape(&.{0}, &.{1});
+    defer cb.free(placeholder);
+    // Reject at the real fallback boundary before any history download or
+    // unadmitted allocation of a fresh zeroed host history.
+    try std.testing.expectError(error.ResidentImageOperationUnavailable, qwen35ProjectedCore(
+        &cb,
+        a,
+        cfg,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        cache.layerState(0),
+        1,
+        null,
+    ));
+    cache.reset();
+    for (cache.layers) |layer| {
+        try std.testing.expectEqual(@as(usize, 0), layer.conv.len + layer.recurrent.len);
+    }
+}
+
+test "LightOnOCR3 device recurrent cache unwinds descriptor allocation failure" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var cache = try Qwen35LinearCache.init(allocator, .{ .family = .qwen3_5, .num_hidden_layers = 5, .qwen35_has_linear_attention = true, .qwen35_device_only_state = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_conv_kernel_dim = 4 });
+            defer cache.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "LightOnOCR3 page cache initialization releases every earlier layer on allocation failure" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var cache = try Qwen35LinearCache.init(allocator, .{ .family = .qwen3_5, .num_hidden_layers = 5, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_conv_kernel_dim = 4 });
+            defer cache.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "LightOnOCR3 forward prefix streaming only splits owned batched decode frames" {
+    inline for (.{ "../models/testdata/lightonocr3/config.json", "../models/testdata/lightonocr3/config-4b.json" }) |path| {
+        const config = try gpt_config.parseConfig(std.testing.allocator, @embedFile(path));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 2, true, true, 4));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 16, true, true, 8));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 1, true, true, 4));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 17, true, true, 4));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 32, true, true, 4));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 33, true, true, 4));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 64, true, true, 4));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 65, true, true, 4));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 2, false, true, 4));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 2, true, false, 4));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 2, true, true, 0));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 2, true, true, config.num_hidden_layers));
+    }
+}
+
+test "LightOnOCR3 packed query bounds reject empty zero overflowing and oversized groups" {
+    var lengths: [64]usize = @splat(1);
+    lengths[0] = 554;
+    try std.testing.expectEqual(@as(usize, 617), try packedQueryRowCount(&lengths));
+    try std.testing.expectEqual(@as(usize, 4096), try packedQueryRowCount(&.{ 2048, 2048 }));
+    try std.testing.expectError(error.InvalidPackedQueryShape, packedQueryRowCount(&.{}));
+    try std.testing.expectError(error.InvalidPackedQueryShape, packedQueryRowCount(&.{ 1, 0 }));
+    try std.testing.expectError(error.InvalidPackedQueryShape, packedQueryRowCount(&.{ 4096, 1 }));
+    try std.testing.expectError(error.InvalidPackedQueryShape, packedQueryRowCount(&.{ std.math.maxInt(usize), 1 }));
+    const widest: [max_packed_qwen_items]usize = @splat(1);
+    try std.testing.expectEqual(@as(usize, 128), try packedQueryRowCount(&widest));
+    const excessive: [max_packed_qwen_items + 1]usize = @splat(1);
+    try std.testing.expectError(error.InvalidPackedQueryShape, packedQueryRowCount(&excessive));
+}
+
+test "LightOnOCR3 packed full attention preserves causal page boundaries" {
+    const a = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    var compute = native_compute_mod.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const q = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, -4, -5 }, &.{ 4, 2 });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(&.{ 2, 1, 4, 3, 6, 5, 10, 11 }, &.{ 4, 2 });
+    defer cb.free(k);
+    const v = try cb.fromFloat32Shape(&.{ 3, 7, 4, 8, 5, 9, -100, -200 }, &.{ 4, 2 });
+    defer cb.free(v);
+    const lengths = [_]usize{ 3, 1 };
+    var views: [2]DecodeContext.KvBatchView = undefined;
+    for (&views, lengths, 0..) |*view, len, index| view.* = .{ .kv_manager = &manager, .kv_cache = .{ .sequence_id = @intCast(index), .pool_id = 0, .logical_block_count = 0, .tail_tokens = 0 }, .per_item_query_len = len, .per_item_total_len = len, .per_item_kv_len = len, .per_item_kv_position_offset = 0, .per_item_mode = .dense_causal };
+    const context = ops.AttentionContext{ .total_sequence_len = 4, .query_sequence_len = 4, .kv_sequence_len = 4, .kv_batch = &views };
+    const result = try runPackedQwenAttention(&cb, q, k, v, context, .{}, &lengths, 1, 1, 2, null);
+    defer cb.free(result);
+    const actual = try cb.toFloat32(result, a);
+    defer a.free(actual);
+    var offset: usize = 0;
+    for (lengths) |len| {
+        const qs = try cb.sliceRows2D(a, q, offset, len, 2);
+        defer cb.free(qs);
+        const ks = try cb.sliceRows2D(a, k, offset, len, 2);
+        defer cb.free(ks);
+        const vs = try cb.sliceRows2D(a, v, offset, len, 2);
+        defer cb.free(vs);
+        const output = try cb.gqaCausalAttention(qs, ks, vs, null, 1, len, 1, 1, 2);
+        defer cb.free(output);
+        const expected = try cb.toFloat32(output, a);
+        defer a.free(expected);
+        try std.testing.expectEqualSlices(f32, expected, actual[offset * 2 ..][0 .. len * 2]);
+        offset += len;
+    }
+    try std.testing.expectEqualSlices(f32, &.{ -100, -200 }, actual[6..8]);
+    views[1].per_item_query_len = 2;
+    try std.testing.expectError(error.InvalidPackedQueryShape, runPackedQwenAttention(&cb, q, k, v, context, .{}, &lengths, 1, 1, 2, null));
+}
+
+test "LightOnOCR3 packed metadata rejects aliases and malformed later pages before execution" {
+    var manager = runtime.kv.manager.KvManager.init(std.testing.allocator);
+    defer manager.deinit();
+    // Metadata validation never dereferences a layer cache or a KV block.
+    var cache_storage: [2]Qwen35LinearCache = undefined;
+    var caches = [_]?*Qwen35LinearCache{ &cache_storage[0], &cache_storage[1] };
+    const lengths = [_]usize{ 3, 1 };
+    const positions: [12]u32 = @splat(0);
+    var views: [2]DecodeContext.KvBatchView = undefined;
+    for (&views, lengths, 0..) |*view, len, index| view.* = .{ .kv_manager = &manager, .kv_cache = .{ .sequence_id = @intCast(index), .pool_id = 0, .logical_block_count = 0, .tail_tokens = 0 }, .per_item_query_len = len, .per_item_total_len = len, .per_item_kv_len = len, .per_item_kv_position_offset = 0, .per_item_mode = if (index == 0) .paged_prefill else .paged_decode };
+    const cfg = Config{ .family = .qwen3_5 };
+    var context = DecodeContext{ .attention_mode = .paged_prefill, .total_sequence_len = 3, .query_sequence_len = 4, .kv_sequence_len = 3, .kv_batch = &views, .qwen35_linear_batch = &caches, .mrope_positions = &positions, .packed_query_lengths = &lengths };
+    try validatePackedQwenContext(cfg, 1, 4, &context);
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(.{ .family = .llama }, 1, 4, &context));
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 2, 4, &context));
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 1, 3, &context));
+    caches[1] = caches[0];
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 1, 4, &context));
+    caches[1] = &cache_storage[1];
+    views[1].kv_cache.sequence_id = 0;
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 1, 4, &context));
+    views[1].kv_cache.sequence_id = 1;
+    views[1].per_item_total_len = 0;
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 1, 4, &context));
+    views[1].per_item_total_len = 1;
+    context.mrope_positions = positions[0..11];
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 1, 4, &context));
+}
+
+test "LightOnOCR3 packed decode attention grouping preserves independent KV writes" {
+    const a = std.testing.allocator;
+    var weights = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &weights);
+    var compute = native_compute_mod.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
+    const pool_config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 };
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(pool_config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
+    defer storage.deinit();
+    var views: [6]DecodeContext.KvBatchView = undefined;
+    for (&views, 0..) |*view, index| {
+        const id = try manager.attachSequence(pool_id);
+        try std.testing.expectEqual(id, try storage.attachSequence(storage.poolId()));
+        try manager.appendTokens(id, 2);
+        try storage.appendTokens(id, 2);
+        const page = @as(f32, @floatFromInt(index % 3 + 1));
+        try storage.writeLayerKvSuffix(id, 0, 1, 1, &.{ page, -page }, &.{ page * 100, page * 200 });
+        const table = manager.blockTable(id).?;
+        view.* = .{ .kv_manager = &manager, .kv_storage = &storage, .kv_cache = .{ .sequence_id = id, .pool_id = pool_id, .logical_block_count = table.blocks.items.len, .tail_tokens = table.tail_tokens, .logical_blocks = table.blocks.items, .kv_storage = &storage }, .per_item_query_len = 1, .per_item_total_len = 2, .per_item_kv_len = 2, .per_item_kv_position_offset = 0, .per_item_mode = .paged_decode };
+    }
+    const q = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, -1, -2 }, &.{ 3, 2 });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(&.{ 2, 1, 4, 3, -2, -1 }, &.{ 3, 2 });
+    defer cb.free(k);
+    const v = try cb.fromFloat32Shape(&.{ 7, 8, 9, 10, 11, 12 }, &.{ 3, 2 });
+    defer cb.free(v);
+    const lengths = [_]usize{ 1, 1, 1 };
+    const attention = ops.AttentionContext{ .mode = .paged_prefill, .total_sequence_len = 2, .query_sequence_len = 3, .kv_sequence_len = 2, .kv_batch = views[0..3], .kv_storage = &storage };
+    const grouped = try runPackedQwenAttention(&cb, q, k, v, attention, .{}, &lengths, 1, 1, 2, null);
+    defer cb.free(grouped);
+    const actual = try cb.toFloat32(grouped, a);
+    defer a.free(actual);
+    for (0..3) |index| {
+        const qs = try cb.sliceRows2D(a, q, index, 1, 2);
+        defer cb.free(qs);
+        const ks = try cb.sliceRows2D(a, k, index, 1, 2);
+        defer cb.free(ks);
+        const vs = try cb.sliceRows2D(a, v, index, 1, 2);
+        defer cb.free(vs);
+        const serial_attention = ops.AttentionContext{ .mode = .paged_decode, .total_sequence_len = 2, .query_sequence_len = 1, .kv_sequence_len = 2, .kv_manager = &manager, .kv_storage = &storage, .kv_cache = views[index + 3].kv_cache };
+        const output = try runPreparedAttentionWithSinkMetadata(&cb, qs, ks, vs, serial_attention, .{}, 1, 1, 1, 2);
+        defer cb.free(output);
+        const expected = try cb.toFloat32(output, a);
+        defer a.free(expected);
+        try std.testing.expectEqualSlices(f32, expected, actual[index * 2 ..][0..2]);
+        const packed_kv = try storage.gatherLayerKv(a, views[index].kv_cache.sequence_id, 0, 2);
+        defer a.free(packed_kv.k);
+        defer a.free(packed_kv.v);
+        const serial_kv = try storage.gatherLayerKv(a, views[index + 3].kv_cache.sequence_id, 0, 2);
+        defer a.free(serial_kv.k);
+        defer a.free(serial_kv.v);
+        try std.testing.expectEqualSlices(f32, serial_kv.k, packed_kv.k);
+        try std.testing.expectEqualSlices(f32, serial_kv.v, packed_kv.v);
+        const page = @as(f32, @floatFromInt(index + 1));
+        try std.testing.expectEqualSlices(f32, &.{ page * 100, page * 200 }, packed_kv.v[0..2]);
+    }
+}
+
+test "LightOnOCR3 CUDA recurrent core preserves continuation reset and device residency" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var controller = runtime.tier.memory.AdmissionController{};
+    compute.ctx.video_cache_budget.admission = .{
+        .controller = &controller,
+        .limits = .{ .backend_limit_bytes = 1024 * 1024 * 1024 },
+        .check_live_memory = false,
+    };
+    var state: @import("../ops/cuda/gated_delta.zig").State = .{};
+    defer {
+        state.deinit();
+        std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes) catch unreachable;
+    }
+    const kh = 1;
+    const vh = 2;
+    const channels = (kh * 2 + vh) * 128;
+    const width = vh * 128;
+    var cw: [channels * 4]f32 = undefined;
+    var nw: [128]f32 = undefined;
+    const alog = [_]f32{ -0.8, 0.1 };
+    const dt = [_]f32{ 0.2, -0.1 };
+    for (&cw, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 9)) * 0.04 - 0.16;
+    for (&nw, 0..) |*v, i| v.* = 0.5 + @as(f32, @floatFromInt(i % 7)) * 0.1;
+    const dcw = try cb.fromFloat32(&cw);
+    defer cb.free(dcw);
+    const dnw = try cb.fromFloat32(&nw);
+    defer cb.free(dnw);
+    const dal = try cb.fromFloat32(&alog);
+    defer cb.free(dal);
+    const ddt = try cb.fromFloat32(&dt);
+    defer cb.free(ddt);
+    const host_state = try a.alloc(f32, vh * 128 * 128);
+    defer a.free(host_state);
+    const host_history = try a.alloc(f32, channels * 4);
+    defer a.free(host_history);
+    for (0..2) |round| {
+        state.reset();
+        var initialized = false;
+        for ([_]usize{ 3, 1, 6, 1 }) |seq| {
+            const mixed = try a.alloc(f32, seq * channels);
+            defer a.free(mixed);
+            const gate = try a.alloc(f32, seq * width);
+            defer a.free(gate);
+            const beta = try a.alloc(f32, seq * vh);
+            defer a.free(beta);
+            const ap = try a.alloc(f32, seq * vh);
+            defer a.free(ap);
+            for (mixed, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.013) * 0.7;
+            for (gate, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.017);
+            for (beta, ap, 0..) |*b, *p, i| {
+                b.* = @as(f32, @floatFromInt(i % 5)) * 0.2 - 0.4;
+                p.* = @as(f32, @floatFromInt(i % 7)) * 0.1 - 0.3;
+            }
+            const conv = try a.alloc(f32, seq * channels);
+            defer a.free(conv);
+            const expected = try a.alloc(f32, seq * width);
+            defer a.free(expected);
+            try qwen35CausalDepthwiseConv1d(mixed, &cw, host_history, initialized, conv, seq, channels, 4);
+            try qwen35RecurrentGatedDeltaRuleHost(conv, beta, ap, &alog, &dt, host_state, initialized, expected, seq, kh, vh, 128, 128);
+            qwen35RmsNormGatedHost(expected, gate, &nw, 1e-6, seq, vh, 128);
+            const dx = try cb.fromFloat32Shape(mixed, &.{ @intCast(seq), channels });
+            defer cb.free(dx);
+            const dz = try cb.fromFloat32Shape(gate, &.{ @intCast(seq), width });
+            defer cb.free(dz);
+            const db = try cb.fromFloat32Shape(beta, &.{ @intCast(seq), vh });
+            defer cb.free(db);
+            const da = try cb.fromFloat32Shape(ap, &.{ @intCast(seq), vh });
+            defer cb.free(da);
+            var destination: ?CT = if (round == 1) (try cb.allocUninitF32Shape(&.{ @intCast(seq), width })).? else null;
+            defer if (destination) |tensor| cb.free(tensor);
+            const readbacks = compute.stats.d2h_bytes;
+            const uploads = compute.stats.h2d_bytes;
+            const request = .{
+                .destination = destination,
+                .mixed = dx,
+                .z = dz,
+                .beta = db,
+                .a = da,
+                .conv_weight = dcw,
+                .a_log = dal,
+                .dt_bias = ddt,
+                .norm_weight = dnw,
+                .seq_len = seq,
+                .key_heads = @as(usize, kh),
+                .value_heads = @as(usize, vh),
+                .dim = @as(usize, 128),
+                .value_dim = @as(usize, 128),
+                .conv_kernel = @as(usize, 4),
+                .eps = @as(f32, 1e-6),
+            };
+            if (round == 0 and !initialized) {
+                const original = compute.ctx.video_cache_budget.admission;
+                defer compute.ctx.video_cache_budget.admission = original;
+                compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 16;
+                var denied: @import("../ops/cuda/gated_delta.zig").State = .{};
+                defer denied.deinit();
+                try std.testing.expectError(error.ResourceLimitExceeded, cuda.CudaCompute.qwen35LinearCore(&cb, &denied, request));
+                try std.testing.expect(denied.ctx == null and !denied.initialized);
+                try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+            }
+            const output = (try cuda.CudaCompute.qwen35LinearCore(&cb, &state, request)).?;
+            defer cb.free(output);
+            try std.testing.expect(controller.snapshot().backend_scratch_bytes > 0);
+            if (round == 0 and !initialized) {
+                const original = compute.ctx.video_cache_budget.admission;
+                defer compute.ctx.video_cache_budget.admission = original;
+                const held = controller.snapshot().backend_scratch_bytes;
+                compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = held;
+                var denied: @import("../ops/cuda/gated_delta.zig").State = .{};
+                defer denied.deinit();
+                try std.testing.expectError(error.ResourceTemporarilyUnavailable, cuda.CudaCompute.qwen35LinearCore(&cb, &denied, request));
+                try std.testing.expect(denied.ctx == null and !denied.initialized);
+                try std.testing.expectEqual(held, controller.snapshot().backend_scratch_bytes);
+            }
+            // The returned output owns a retained destination handle.
+            if (destination) |tensor| cb.free(tensor);
+            destination = null;
+            try std.testing.expectEqual(readbacks, compute.stats.d2h_bytes);
+            try std.testing.expectEqual(uploads, compute.stats.h2d_bytes);
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+            var invalid = request;
+            const alias = try cb.sliceRows2D(a, dx, 0, seq, width);
+            defer cb.free(alias);
+            invalid.destination = alias;
+            try std.testing.expectError(error.InvalidTensorShape, cuda.CudaCompute.qwen35LinearCore(&cb, &state, invalid));
+            try std.testing.expect(!state.failed);
+            compute.debug_cuda_graph_capture_active = true;
+            defer compute.debug_cuda_graph_capture_active = false;
+            try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, cuda.CudaCompute.qwen35LinearCore(&cb, &state, request));
+            compute.debug_cuda_graph_capture_active = false;
+            try std.testing.expect(!state.failed);
+            initialized = true;
+        }
+    }
+}
+
+test "LightOnOCR3 CUDA sampler downloads IDs and preserves suppression and lowest-index ties" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const vocab = 248320;
+    const values = try a.alloc(f32, 3 * vocab);
+    defer a.free(values);
+    @memset(values, -1000);
+    values[1] = 100;
+    values[17] = 20;
+    values[23] = 10;
+    values[vocab + 18] = 10;
+    values[vocab + 29] = 10;
+    values[2 * vocab] = 10;
+    values[3 * vocab - 1] = 9;
+    const logits = try cb.fromFloat32Shape(values, &.{ 3, vocab });
+    defer cb.free(logits);
+    const before = compute.stats.d2h_bytes;
+    const choices = (try cb.argmaxRowsSuppress(logits, 0, 3, vocab, &.{ 1, 17 }, a)).?;
+    defer a.free(choices);
+    try std.testing.expectEqualSlices(u32, &.{ 23, 18, 0 }, choices);
+    try std.testing.expectEqual(@as(usize, 3 * @sizeOf(u32)), compute.stats.d2h_bytes - before);
+}
+
+test "LightOnOCR3 CUDA packed recurrent groups preserve ragged continuations and permuted page ownership" {
+    try checkCudaPackedRecurrent(false, false);
+}
+
+test "LightOnOCR3 CUDA compact recurrent batch preserves fresh resets and ragged independent page ownership" {
+    try checkCudaPackedRecurrent(true, false);
+}
+
+test "LightOnOCR3 CUDA fully fused mixed GDN decode preserves fresh resets and permuted page ownership" {
+    try checkCudaPackedRecurrent(true, true);
+}
+
+fn checkCudaPackedRecurrent(ragged: bool, fused_decode: bool) !void {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const a = std.testing.allocator;
+    for ([_]u32{ 16, 32 }) |vh| {
+        var compute = try cuda.CudaCompute.init(a);
+        defer compute.deinit();
+        compute.capability_profile = .lightonocr3;
+        compute.lighton_recurrent_batch_enabled = true;
+        compute.lighton_ragged_recurrent_enabled = ragged;
+        compute.lighton_fused_gdn_decode_enabled = fused_decode;
+        compute.lighton_fused_batch_recurrent = true;
+        compute.lighton_cached_recurrent_gates = true;
+        const cb = compute.computeBackend();
+        const cfg = Config{ .family = .qwen3_5, .num_hidden_layers = 1, .qwen35_has_linear_attention = true, .qwen35_device_only_state = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 16, .qwen35_linear_num_value_heads = vh, .qwen35_linear_key_head_dim = 128, .qwen35_linear_value_head_dim = 128, .qwen35_linear_conv_kernel_dim = 4, .norm_eps = 1e-6 };
+        const channels = (32 + vh) * 128;
+        const width = vh * 128;
+        const counts = [_]usize{ channels * 4, vh, vh, 128 };
+        var weights: [4]CT = undefined;
+        var loaded: usize = 0;
+        defer for (weights[0..loaded]) |weight| cb.free(weight);
+        for (counts, 0..) |count, wi| {
+            const values = try a.alloc(f32, count);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = switch (wi) {
+                1 => -0.8,
+                2 => 0.1,
+                3 => 1,
+                else => @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 64,
+            };
+            if (ragged) {
+                const name = try std.fmt.allocPrint(a, "ragged-test.weight.{d}", .{wi});
+                const shape = [_]i64{@intCast(count)};
+                const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(values), .dtype = .f32, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+                try compute.insertWeightFromTensor(name, &tensor);
+                weights[wi] = try cb.getWeight(name);
+            } else weights[wi] = try cb.fromFloat32(values);
+            loaded += 1;
+        }
+        var caches: [6]Qwen35LinearCache = undefined;
+        var initialized: usize = 0;
+        defer for (caches[0..initialized]) |*cache| cache.deinit();
+        for (&caches) |*cache| {
+            cache.* = try Qwen35LinearCache.init(a, cfg);
+            initialized += 1;
+        }
+        // Seed every state through the independently qualified single-page
+        // CUDA implementation before exercising ragged continuation groups.
+        const widths = [_]usize{ channels, width, vh, vh };
+        var seed: [4]CT = undefined;
+        var seeded: usize = 0;
+        defer for (seed[0..seeded]) |tensor| cb.free(tensor);
+        for (widths, 0..) |dim, which| {
+            const values = try a.alloc(f32, 3 * dim);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i + which * 17)) * 0.013) * 0.2;
+            seed[which] = try cb.fromFloat32Shape(values, &.{ 3, @intCast(dim) });
+            seeded += 1;
+        }
+        for (&caches) |*cache| {
+            const output = (try cuda.CudaCompute.qwen35LinearCore(&cb, &cache.layers[0].cuda_device, .{
+                .device_state_admitted = false,
+                .destination = @as(?CT, null),
+                .mixed = seed[0],
+                .z = seed[1],
+                .beta = seed[2],
+                .a = seed[3],
+                .conv_weight = weights[0],
+                .a_log = weights[1],
+                .dt_bias = weights[2],
+                .norm_weight = weights[3],
+                .seq_len = @as(usize, 3),
+                .key_heads = @as(usize, 16),
+                .value_heads = @as(usize, vh),
+                .dim = @as(usize, 128),
+                .value_dim = @as(usize, 128),
+                .conv_kernel = @as(usize, 4),
+                .eps = @as(f32, 1e-6),
+            })).?;
+            cb.free(output);
+        }
+        var group_count: usize = 0;
+        var group_rows: usize = 0;
+        for ([_][3]usize{ .{ 3, 1, 1 }, .{ 1, 4, 1 }, .{ 1, 1, 1 } }, 0..) |lengths, round| {
+            if (ragged and round == 1) {
+                caches[0].reset();
+                caches[3].reset();
+            }
+            const order: [3]usize = if (round == 2) .{ 2, 0, 1 } else .{ 0, 1, 2 };
+            const total = lengths[0] + lengths[1] + lengths[2];
+            var inputs: [4]CT = undefined;
+            var filled: usize = 0;
+            defer for (inputs[0..filled]) |tensor| cb.free(tensor);
+            for (widths, 0..) |dim, which| {
+                const values = try a.alloc(f32, total * dim);
+                defer a.free(values);
+                for (values, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i + round * 37 + which * 17)) * 0.019) * 0.3;
+                inputs[which] = try cb.fromFloat32Shape(values, &.{ @intCast(total), @intCast(dim) });
+                filled += 1;
+            }
+            var pages: [3]?*Qwen35LinearCache = undefined;
+            for (&pages, order) |*page, id| page.* = &caches[id];
+            const context = DecodeContext{ .total_sequence_len = total, .query_sequence_len = total, .kv_sequence_len = total, .qwen35_linear_batch = &pages, .packed_recurrent_groups = &group_count, .packed_recurrent_rows = &group_rows };
+            if (ragged and round == 2) {
+                const before = compute.ctx.stats.kernel_launches;
+                var aliases = pages;
+                aliases[1] = aliases[0];
+                var invalid = context;
+                invalid.qwen35_linear_batch = &aliases;
+                try std.testing.expectError(error.InvalidTensorShape, qwen35PackedProjectedCore(&cb, a, cfg, inputs[0], inputs[1], inputs[2], inputs[3], weights[0], weights[1], weights[2], weights[3], &invalid, 0, &lengths));
+                try std.testing.expectEqual(before, compute.ctx.stats.kernel_launches);
+                compute.debug_cuda_graph_capture_active = true;
+                defer compute.debug_cuda_graph_capture_active = false;
+                try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, qwen35PackedProjectedCore(&cb, a, cfg, inputs[0], inputs[1], inputs[2], inputs[3], weights[0], weights[1], weights[2], weights[3], &context, 0, &lengths));
+                try std.testing.expectEqual(before, compute.ctx.stats.kernel_launches);
+            }
+            const result = try qwen35PackedProjectedCore(&cb, a, cfg, inputs[0], inputs[1], inputs[2], inputs[3], weights[0], weights[1], weights[2], weights[3], &context, 0, &lengths);
+            defer cb.free(result);
+            const actual = try cb.toFloat32(result, a);
+            defer a.free(actual);
+            var offset: usize = 0;
+            for (lengths, order) |len, id| {
+                var row_inputs: [4]CT = undefined;
+                var sliced: usize = 0;
+                defer for (row_inputs[0..sliced]) |tensor| cb.free(tensor);
+                for (inputs, widths, 0..) |input, dim, which| {
+                    row_inputs[which] = try cb.sliceRows2D(a, input, offset, len, dim);
+                    sliced += 1;
+                }
+                const reference = if (ragged) (try cuda.CudaCompute.qwen35LinearCore(&cb, &caches[id + 3].layers[0].cuda_device, .{
+                    .device_state_admitted = false,
+                    .destination = @as(?CT, null),
+                    .mixed = row_inputs[0],
+                    .z = row_inputs[1],
+                    .beta = row_inputs[2],
+                    .a = row_inputs[3],
+                    .conv_weight = weights[0],
+                    .a_log = weights[1],
+                    .dt_bias = weights[2],
+                    .norm_weight = weights[3],
+                    .seq_len = len,
+                    .key_heads = @as(usize, 16),
+                    .value_heads = @as(usize, vh),
+                    .dim = @as(usize, 128),
+                    .value_dim = @as(usize, 128),
+                    .conv_kernel = @as(usize, 4),
+                    .eps = @as(f32, 1e-6),
+                })).? else try qwen35ProjectedCore(&cb, a, cfg, row_inputs[0], row_inputs[1], row_inputs[2], row_inputs[3], weights[0], weights[1], weights[2], weights[3], &caches[id + 3].layers[0], len, null);
+                defer cb.free(reference);
+                const expected = try cb.toFloat32(reference, a);
+                defer a.free(expected);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual[offset * width ..][0 .. len * width]));
+                const left = &caches[id].layers[0].cuda_device;
+                const right = &caches[id + 3].layers[0].cuda_device;
+                for ([_]@import("../ops/cuda/buffer.zig").DeviceBuffer{ left.history[0], left.recurrent }, [_]@import("../ops/cuda/buffer.zig").DeviceBuffer{ right.history[0], right.recurrent }) |got, want| {
+                    const x = try a.alloc(u8, got.len);
+                    defer a.free(x);
+                    const y = try a.alloc(u8, want.len);
+                    defer a.free(y);
+                    try got.copyToHost(&compute.ctx, x);
+                    try want.copyToHost(&compute.ctx, y);
+                    try compute.ctx.synchronize();
+                    try std.testing.expectEqualSlices(u8, y, x);
+                }
+                offset += len;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, if (ragged) 3 else 2), group_count);
+        try std.testing.expectEqual(@as(usize, if (ragged) 9 else 5), group_rows);
+        if (ragged) try std.testing.expectEqual(@as(usize, 3), compute.lighton_recurrent.ragged_batch_calls);
+        try std.testing.expectEqual(@as(usize, if (fused_decode) 3 else 0), compute.lighton_recurrent.fused_decode_calls);
+    }
 }
