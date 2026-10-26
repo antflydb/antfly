@@ -235,6 +235,17 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
                 "request": reverse,
             }
         )
+    else:
+        small = dict(plan["cases"][0]["request"], limit=1)
+        small["filter_query"] = {"range": {"path": "/hn_id", "gte": 0}}
+        plan["cases"].append(
+            {
+                "name": "dense_small_metadata",
+                "identity_field": "hn_id",
+                "expected_ids": [0],
+                "request": small,
+            }
+        )
     if not additional_declarations:
         del plan["indexes"]
     plan_path = tmp_path / "plan.json"
@@ -280,7 +291,7 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
         {"text"} if bounded_windows else {"text", "hn_key"}
     )
     assert all(report["initial_index_revisions"].values())
-    assert len(report["samples"]) == (6 if bounded_windows else 4)
+    assert len(report["samples"]) == 6
     for case in ("custom_identity", "filtered_identity"):
         assert (
             len({s["result_sha256"] for s in report["samples"] if s["case"] == case})
@@ -303,6 +314,17 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
     )
     assert all(0 < p["ordered_scanned_count"] < row_count for p in profiles), profiles
     assert all(p["candidate_count"] < row_count for p in profiles), profiles
+    if not bounded_windows:
+        small_profiles = [
+            s["profile"]["sort"]
+            for s in report["samples"]
+            if s["case"] == "dense_small_metadata"
+        ]
+        assert len(small_profiles) == 2
+        assert all(p["ordered_scanned_count"] <= 3 for p in small_profiles), (
+            small_profiles
+        )
+        assert all(p["candidate_count"] <= 2 for p in small_profiles), small_profiles
     if bounded_windows:
         assert all(
             p["selection_reason"] == "bounded_best_first_sort" for p in profiles
