@@ -21702,7 +21702,9 @@ pub const ApiHttpServer = struct {
         const logical = if (self.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = input.database, .namespace = input.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*value| value.deinit(self.alloc);
-        var request = borrowed_context;
+        // Native storage/provider requests carry platform-monotonic budgets.
+        // Translate once while retaining the ingress fanout capability.
+        var request = try borrowed_context.platformDeadline();
         request.native_service = .memory;
         request.row_policy_credential = &identity;
         request.table_read_authorization = .{ .ptr = &identity, .allows = MemoryIngressCredential.read };
@@ -59750,7 +59752,12 @@ test "native memory worker budgets slow semantic publication independently from 
             return std.json.parseFromSliceLeaky(memory.memory.types.State, a, (try backend.get(backend.ptr, a, "control")).?.json, .{});
         }
     };
-    const a = std.testing.allocator;
+    // This fixture measures model/publication budgets, not allocation stack
+    // unwinding. Keep safety and leak checks without tracing every DB scratch
+    // allocation through the large test executable's debug information.
+    var fixture_heap: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.testing.expectEqual(@as(usize, 0), fixture_heap.deinit()) catch @panic("memory budget fixture leaked");
+    const a = fixture_heap.allocator();
     var directory = try TestDirectory.init("memory-worker-semantic-budget");
     defer directory.cleanup();
     var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
