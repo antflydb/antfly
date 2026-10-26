@@ -2494,6 +2494,7 @@ pub const LiteResolvedOpenOptions = struct {
     /// Internal: the connection boundary owns the cross-process path lease.
     externally_locked: bool = false,
     artifact_reader_fence: bool = false,
+    reader_coordinator: ?*lite_backend.native.ReaderCoordinator = null,
     /// Borrowed only during open, under the connection's publication fence.
     allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
 };
@@ -2750,6 +2751,7 @@ pub fn openLiteHandleAllocWithSharedInference(
     }
 
     backend.native_docstore.?.artifact_reader_fence = resolved.artifact_reader_fence;
+    backend.native_docstore.?.file.reader_coordinator = resolved.reader_coordinator;
 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
