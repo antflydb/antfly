@@ -205,6 +205,20 @@ pub fn acquireDeclared(identity: []const u8, aliases: []const curation.Redirect,
     return cache.acquireKey(digest, aliases, &.{}, suppress, "");
 }
 
+/// Effective alias paths already came from the fenced native projection.
+/// Cache only configured negatives under a separate identity domain.
+pub fn acquireDeclaredNegatives(identity: ?[]const u8, suppress: []const u8) !Lease {
+    if (identity) |id| {
+        var hash = Hash.init(.{});
+        hashBytes(&hash, "configured-resolver-negatives-v1");
+        hashBytes(&hash, id);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return cache.acquireKey(digest, &.{}, &.{}, suppress, "");
+    }
+    return cache.acquire(&.{}, &.{}, suppress, "");
+}
+
 test "compiled curation leases retain immutable policy across eviction and content changes" {
     var local: Cache = .{ .allocator = std.testing.allocator };
     defer local.deinit();

@@ -7401,11 +7401,9 @@ pub fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     const handle = guard.handle;
-    const configs = handle.database().core.index_manager.resolverQueryRoutingDescriptors(handle.alloc, resolver_name.bytes(), false) catch |err| return capi.mapError(err);
-    defer {
-        for (configs) |*cfg| cfg.deinit(handle.alloc);
-        handle.alloc.free(configs);
-    }
+    const admission = handle.database().core.index_manager.resolverQueryAdmission(handle.alloc, resolver_name.bytes(), false) catch |err| return capi.mapError(err);
+    defer admission.deinit();
+    const configs = admission.configs;
     for (configs) |cfg| {
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
         const Mention = struct { text: []const u8, label: []const u8, local_id: []const u8 = "query" };
@@ -7422,16 +7420,30 @@ pub fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name
         defer handle.alloc.free(minted);
         var authority_arena = std.heap.ArenaAllocator.init(handle.alloc);
         defer authority_arena.deinit();
-        const current = @import("resolver_authority.zig").currentConfig(handle.parent_handle orelse handle, handle.database(), authority_arena.allocator(), cfg, .{ .key = minted, .text = parsed.value.text }) catch |err| return capi.mapError(err);
-        const effective_aliases = current.effectiveAliasesAlloc(handle.alloc) catch |err| return capi.mapError(err);
-        defer handle.alloc.free(effective_aliases);
-        var policy_arena = std.heap.ArenaAllocator.init(handle.alloc);
-        defer policy_arena.deinit();
-        const redirects = resolver_lib.curation.RedirectIndex.init(policy_arena.allocator(), effective_aliases) catch |err| return capi.mapError(err);
-        const key = redirects.canonical(minted);
-        const policy = resolver_lib.curation.Index.init(policy_arena.allocator(), current.suppress_json, current.curation_json) catch |err| return capi.mapError(err);
-        const suppressed = ((policy.textReason(policy_arena.allocator(), parsed.value.text) catch |err| return capi.mapError(err)) != null) or policy.keySuppressed(minted) or policy.keySuppressed(key);
-        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = current.effectiveGeneration(), .namespace_curation_generation = current.namespace_curation_generation, .namespace_curation_table_id = current.namespace_curation_table_id, .suppressed = suppressed }) catch |err| return capi.mapError(err);
+        const authority = @import("resolver_authority.zig");
+        // Native rendering shares resolve's scoped policy and final fences.
+        // A missing destination remains a valid declaration-only key render.
+        const destination = @import("tables.zig").get(handle.parent_handle orelse handle, cfg.table) catch |err| switch (err) {
+            error.UndefinedTable => null,
+            else => return capi.mapError(err),
+        };
+        var observation: struct { table_id: u64, revision: u64 } = .{ .table_id = cfg.namespace_curation_table_id, .revision = cfg.namespace_curation_generation };
+        if (destination != null) {
+            var session = authority.QuerySession.initRenderAdmitted(authority_arena.allocator(), handle, cfg, &admission) catch |err| return capi.mapError(err);
+            session.prepareMention(authority_arena.allocator(), &cfg, &resolver, .{ .text = parsed.value.text, .label = parsed.value.label, .local_id = parsed.value.local_id }) catch |err| return capi.mapError(err);
+            session.verify(handle) catch |err| return capi.mapError(err);
+            const captured = session.namespaceObservation(authority_arena.allocator(), cfg) catch |err| return capi.mapError(err);
+            observation = .{ .table_id = captured.table_id, .revision = captured.revision };
+        } else {
+            const current = authority.currentConfig(handle.parent_handle orelse handle, handle.database(), authority_arena.allocator(), cfg, .{ .key = minted, .text = parsed.value.text }) catch |err| return capi.mapError(err);
+            resolver.installCachedPolicy(current.aliases, current.merges, current.suppress_json, current.curation_json) catch |err| return capi.mapError(err);
+            observation = .{ .table_id = current.namespace_curation_table_id, .revision = current.namespace_curation_generation };
+        }
+        const index = resolver.alias_index.?;
+        const key = index.canonical(minted);
+        const policy = resolver.curation_index;
+        const suppressed = ((policy.textReason(authority_arena.allocator(), parsed.value.text) catch |err| return capi.mapError(err)) != null) or policy.keySuppressed(minted) or policy.keySuppressed(key);
+        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = cfg.effectiveGeneration(), .namespace_curation_generation = observation.revision, .namespace_curation_table_id = observation.table_id, .suppressed = suppressed }) catch |err| return capi.mapError(err);
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
@@ -7462,16 +7474,14 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
     if (extraction) |value| {
         if (value != .object or value.object.get("entities") == null or value.object.get("entities").? != .array) return capi.mapErrorContext(error.InvalidArgument, "extraction must contain an entities array");
     }
-    const configs = handle.database().core.index_manager.resolverQueryRoutingDescriptors(alloc, resolver_name.bytes(), true) catch |err| return capi.mapError(err);
-    defer {
-        for (configs) |*cfg| cfg.deinit(alloc);
-        alloc.free(configs);
-    }
+    const admission = handle.database().core.index_manager.resolverQueryAdmission(alloc, resolver_name.bytes(), true) catch |err| return capi.mapError(err);
+    defer admission.deinit();
+    const configs = admission.configs;
     for (configs) |*cfg| {
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
         var query_arena = std.heap.ArenaAllocator.init(alloc);
         defer query_arena.deinit();
-        var policy_session = @import("resolver_authority.zig").QuerySession.init(query_arena.allocator(), handle, cfg.*, configs) catch |err| return capi.mapError(err);
+        var policy_session = @import("resolver_authority.zig").QuerySession.initAdmitted(query_arena.allocator(), handle, cfg.*, &admission) catch |err| return capi.mapError(err);
         if (cfg.source_artifact_kind == .chunk) return capi.mapErrorContext(error.InvalidArgument, "query resolution requires an asset-scoped resolver");
         // Native connections cache producers on their provider-owning snapshot;
         // read-only databases otherwise have no enrichment producer. Repeated

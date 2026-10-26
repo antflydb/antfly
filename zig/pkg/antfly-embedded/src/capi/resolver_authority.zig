@@ -918,12 +918,22 @@ pub const QuerySession = struct {
         if (!result.matchesEpoch(database)) return error.Busy;
         return result;
     }
+    const Admission = @import("../storage/db/catalog/index_manager.zig").IndexManager.QueryAdmission;
     pub fn init(a: A, handle: *h.Handle, selected: h.db_mod.ResolverConfig, configs: []const h.db_mod.ResolverConfig) !QuerySession {
+        return initInternal(a, handle, selected, configs, null, true);
+    }
+    pub fn initAdmitted(a: A, handle: *h.Handle, selected: h.db_mod.ResolverConfig, admission: *const Admission) !QuerySession {
+        return initInternal(a, handle, selected, admission.configs, admission, true);
+    }
+    pub fn initRenderAdmitted(a: A, handle: *h.Handle, selected: h.db_mod.ResolverConfig, admission: *const Admission) !QuerySession {
+        return initInternal(a, handle, selected, admission.configs, admission, false);
+    }
+    fn initInternal(a: A, handle: *h.Handle, selected: h.db_mod.ResolverConfig, configs: []const h.db_mod.ResolverConfig, admission: ?*const Admission, include_siblings: bool) !QuerySession {
         const root = handle.parent_handle orelse handle;
-        var result: QuerySession = .{ .a = a, .root = root, .database = handle.database(), .selected = selected, .definitions = try declarations(a, configs, selected), .source_schema = try schema(handle.database(), root.alloc) };
-        for (configs) |cfg| {
-            if (!runs(selected, cfg)) continue;
-            if (cfg.aliases.len != 0 or cfg.suppress_json.len != 0) try result.profiles.put(a, cfg.name, try (native.static_profiles.Definition{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json }).identity(a));
+        var result: QuerySession = .{ .a = a, .root = root, .database = handle.database(), .selected = selected, .definitions = if (admission) |cut| cut.fingerprint else try declarations(a, configs, selected), .source_schema = try schema(handle.database(), root.alloc) };
+        for (configs, 0..) |cfg, index| {
+            if (!runs(selected, cfg) or (!include_siblings and !std.mem.eql(u8, cfg.name, selected.name))) continue;
+            if (cfg.aliases.len != 0 or cfg.suppress_json.len != 0) try result.profiles.put(a, cfg.name, if (admission) |cut| cut.profile(index) else try (native.static_profiles.Definition{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json }).identity(a));
             const db = try tables.get(root, cfg.table);
             const key = try identity(a, cfg.table, cfg.key_template);
             if (!result.targets.contains(key)) try result.targets.put(a, key, .{ .table = cfg.table, .template = cfg.key_template, .table_id = db.core.identity_namespace.table_id, .stamp = try namespaceStamp(db, a, cfg.key_template) });
@@ -967,6 +977,13 @@ pub const QuerySession = struct {
         self.root = root;
         self.database = handle.database();
     }
+    pub fn prepareMention(self: *QuerySession, a: A, cfg: *const h.db_mod.ResolverConfig, target: *resolver.Resolver, mention: resolver.ExtractedEntity) !void {
+        try prepare(self, cfg, a, target, &.{mention}, null);
+    }
+    pub fn namespaceObservation(self: *QuerySession, a: A, cfg: h.db_mod.ResolverConfig) !struct { table_id: u64, revision: u64 } {
+        const target = self.targets.get(try identity(a, cfg.table, cfg.key_template)) orelse return error.Busy;
+        return .{ .table_id = target.table_id, .revision = if (target.stamp) |stamp| stamp.revision else cfg.namespace_curation_generation };
+    }
     pub fn loader(self: *QuerySession) runtime.QueryPolicy {
         return .{ .ptr = self, .prepare = prepare, .replaces_configured_policy = true };
     }
@@ -990,6 +1007,7 @@ pub const QuerySession = struct {
             if (candidate.resolved_doc_ref) |ref| try seeds.put(a, ref.key, {});
         };
         var current = cfg.*;
+        var complete_aliases = false;
         if (captured.stamp) |expected| {
             const LiteTxn = @import("../storage/lite/docstore.zig").Txn;
             var profile_txn: ?LiteTxn = null;
@@ -1019,7 +1037,7 @@ pub const QuerySession = struct {
                 defer txn.abort();
                 var bridge: Bridge = .{ .txn = &txn };
                 var inline_profile: native.Store.InlineQueryProfile = .{ .aliases = cfg.aliases };
-                prepared = (try bridge.store(a, prefix).prepareQuery(cfg.key_template, .{ .id = self.profiles.get(cfg.name) orelse return error.Busy, .ptr = &inline_profile, .load = native.Store.InlineQueryProfile.load, .estimated_bytes = inline_profile.estimate(), .lookup = profile_lookup }, candidates != null)) orelse return error.Busy;
+                prepared = (try bridge.store(a, prefix).prepareQuery(cfg.key_template, .{ .id = self.profiles.get(cfg.name) orelse return error.Busy, .ptr = &inline_profile, .load = native.Store.InlineQueryProfile.load, .estimated_bytes = if (profile_lookup != null) std.math.maxInt(usize) else inline_profile.estimate(), .lookup = profile_lookup }, candidates != null)) orelse return error.Busy;
                 if (prepared.?.stamp.revision != expected.revision or !std.mem.eql(u8, &prepared.?.stamp.fingerprint, &expected.fingerprint)) return error.Busy;
             }
             var joined: native.QueryPolicyUnion = .{};
@@ -1037,13 +1055,14 @@ pub const QuerySession = struct {
                 if (head.revision != expected.revision or !std.mem.eql(u8, &head.fingerprint, &expected.fingerprint)) return error.Busy;
                 const seed_end = @min(seeds.count(), seed_offset + 1024);
                 const text_end = @min(texts.count(), text_offset + 128);
-                const part = if (prepared) |query| try store.queryPrepared(query, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], candidates != null) else (try store.queryPolicy(cfg.key_template, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], &.{}, candidates != null)) orelse return error.Busy;
+                const part = if (prepared) |query| try store.queryExecutionPrepared(query, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], candidates != null) else (try store.queryExecutionPolicy(cfg.key_template, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], &.{}, candidates != null)) orelse return error.Busy;
                 try joined.add(a, page, part);
                 seed_offset = seed_end;
                 text_offset = text_end;
                 if (seed_offset == seeds.count() and text_offset == texts.count()) break;
             }
             const snapshot = try joined.finish();
+            complete_aliases = snapshot.complete_aliases;
             current.merges = snapshot.namespace.merges;
             current.curation_json = try json(a, snapshot.namespace.state);
             current.shared_projection = null;
@@ -1052,7 +1071,9 @@ pub const QuerySession = struct {
             if (try namespaceStamp(db, a, cfg.key_template) != null) return error.Busy;
             current = try currentConfig(self.root, self.database, a, cfg.*, null);
         }
-        if (captured.stamp != null) {
+        if (captured.stamp != null and complete_aliases) {
+            try target.installQueryProjection(a, self.profiles.get(cfg.name), cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
+        } else if (captured.stamp != null) {
             try target.installQueryPolicy(a, self.profiles.get(cfg.name), cfg.aliases, cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
         } else try target.installCachedPolicy(current.aliases, current.merges, current.suppress_json, current.curation_json);
     }
@@ -1301,10 +1322,12 @@ test "capi resolver curation schema digests qualify snapshots and reuse unchange
     try stamp.verify(&root.db, bounded.allocator());
     // A new immutable snapshot may reuse identical scalar generation values.
     // Its process incarnation must still force content requalification.
+    const prior_instance = stamp.instance;
     root.db.query_schema_identity.store(0, .release);
     try std.testing.expect(!stamp.matchesEpoch(&root.db));
-    try std.testing.expectError(error.OutOfMemory, stamp.verify(&root.db, bounded.allocator()));
-    try stamp.verify(&root.db, a);
+    try stamp.verify(&root.db, bounded.allocator());
+    try std.testing.expect(stamp.matchesEpoch(&root.db));
+    try std.testing.expect(stamp.instance != prior_instance);
     const version: u32 = blk: {
         var view = root.db.core.acquireSchemaView() orelse break :blk 0;
         defer view.release();
@@ -1519,9 +1542,11 @@ test "capi resolver curation query uses persisted profile nodes under leased cac
     var unused: u8 = 0;
     const pressure = try native.query_context.acquire(@splat(210), true, .{ .ptr = &unused, .load = Pressure.load });
     defer pressure.release();
-    const installed = try root.db.core.index_manager.resolverQueryRoutingDescriptors(a, cfg.name, true);
+    const admission = try root.db.core.index_manager.resolverQueryAdmission(a, cfg.name, true);
+    defer admission.deinit();
+    const installed = admission.configs;
     const query_cfg = installed[0];
-    var session = try QuerySession.init(a, root, query_cfg, installed);
+    var session = try QuerySession.initAdmitted(a, root, query_cfg, &admission);
     var target = try resolver.Resolver.initFromParts(a, cfg.table, cfg.key_template, .{}, false, "");
     defer target.deinit();
     const mentions: []const resolver.ExtractedEntity = &.{.{ .local_id = "query-admission-0", .label = "concept", .text = "query-admission-0" }};
@@ -1529,6 +1554,7 @@ test "capi resolver curation query uses persisted profile nodes under leased cac
     try QuerySession.prepare(&session, &query_cfg, a, &target, mentions, null);
     try std.testing.expectEqual(builds, native.test_query_base_loads.load(.monotonic));
     try std.testing.expectEqualStrings("concept/query-root", target.alias_index.?.canonical(profile_aliases[0].key));
+    try std.testing.expectEqual(@as(usize, 0), target.query_policy_lease.?.aliases().len);
     try session.verify(root);
 }
 
@@ -1611,7 +1637,9 @@ test "capi resolver curation initial routing admission excludes unrelated policy
     for (0..10) |_| {
         var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer scratch.deinit();
-        const configs = try manager.resolverQueryRoutingDescriptors(scratch.allocator(), selected.name, true);
+        const admission = try manager.resolverQueryAdmission(scratch.allocator(), selected.name, true);
+        defer admission.deinit();
+        const configs = admission.configs;
         try std.testing.expectEqual(@as(usize, 2), configs.len);
         try std.testing.expectEqualStrings("selected", configs[0].name);
         try std.testing.expectEqualStrings("sibling", configs[1].name);
@@ -1624,13 +1652,22 @@ test "capi resolver curation initial routing admission excludes unrelated policy
         try std.testing.expect(scratch.queryCapacity() < 16 * 1024);
     }
     try std.testing.expectEqual(@as(usize, 1), manager.test_resolver_lookup_builds);
-    for ([_][]const u8{ "missing", "retired", "staged" }) |name| try std.testing.expectEqual(@as(usize, 0), (try manager.resolverQueryRoutingDescriptors(a, name, true)).len);
-    const private_configs = try manager.resolverQueryRoutingDescriptors(a, "staged", false);
+    for ([_][]const u8{ "missing", "retired", "staged" }) |name| {
+        const admission = try manager.resolverQueryAdmission(a, name, true);
+        defer admission.deinit();
+        try std.testing.expectEqual(@as(usize, 0), admission.configs.len);
+    }
+    const private_admission = try manager.resolverQueryAdmission(a, "staged", false);
+    defer private_admission.deinit();
+    const private_configs = private_admission.configs;
     try std.testing.expectEqual(@as(usize, 1), private_configs.len);
     try std.testing.expectEqualStrings("staged", private_configs[0].name);
+    try std.testing.expectEqualSlices(u8, &private_admission.fingerprint, &try manager.resolverQueryDeclarationsFingerprint(private_configs[0]));
     // Snapshots own the declarations they admitted; a later sibling edit must
     // change the final proof without changing an already captured snapshot.
-    const snapshot = try manager.resolverQueryRoutingDescriptors(a, selected.name, true);
+    const captured = try manager.resolverQueryAdmission(a, selected.name, true);
+    defer captured.deinit();
+    const snapshot = captured.configs;
     const before = try QuerySession.declarations(a, snapshot, selected);
     manager.resolvers.items[1].min_confidence = 0.8;
     manager.invalidateWritePlanSnapshot();

@@ -2591,3 +2591,15 @@ Query producer projections are serialized once per distinct source artifact,
 independent of the number of referring resolvers. Declaration removal retires
 unused producer rows in the same transaction. A 1,000-resolver regression shares
 one 256 KiB producer and uses 31,071,451 bytes of a bounded 64 MiB writer arena.
+
+Native resolver execution now uses topology protocol 55's opt-in complete alias
+projection. The owner composes only requested and incident paths through ready
+persistent profile nodes, so an oversized alias profile never requires a full
+compiled execution index. HTTP and Lite attach the same bounded projection;
+Lite key rendering uses the same preparation and final fences. Immutable Lite
+declaration leases retain catalog-owned bodies and precomputed SHA-256 identities
+across inference and catalog retirement. Warm admission uses 2,296 bytes at
+100,000 selected aliases, and the oversized projection regression performs ten
+phases without loading the full profile. Existing native-head, schema, binding,
+incarnation and authorization checks remain independent of these immutable
+lifetimes. See `RESOLUTION.md` for the execution and compatibility contract.

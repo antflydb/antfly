@@ -711,6 +711,14 @@ pub const Resolver = struct {
     /// immutable declaration. Admission owns identity; live heads own mutations.
     pub fn installQueryPolicy(self: *Resolver, a: std.mem.Allocator, identity: ?[]const u8, configured_aliases: []const KeyAlias, suppress: []const u8, native_aliases: []const KeyAlias, state: []const u8, seeds: []const []const u8) !void {
         const configured = if (identity) |id| try policy_cache.acquireDeclared(id, configured_aliases, suppress) else try policy_cache.acquire(configured_aliases, &.{}, suppress, "");
+        return self.installPreparedQueryPolicy(a, configured, suppress, native_aliases, state, seeds);
+    }
+    /// A complete native query projection needs no full configured alias index.
+    pub fn installQueryProjection(self: *Resolver, a: std.mem.Allocator, identity: ?[]const u8, suppress: []const u8, aliases: []const KeyAlias, state: []const u8, seeds: []const []const u8) !void {
+        const configured = try policy_cache.acquireDeclaredNegatives(identity, suppress);
+        return self.installPreparedQueryPolicy(a, configured, suppress, aliases, state, seeds);
+    }
+    fn installPreparedQueryPolicy(self: *Resolver, a: std.mem.Allocator, configured: policy_cache.Lease, suppress: []const u8, native_aliases: []const KeyAlias, state: []const u8, seeds: []const []const u8) !void {
         errdefer configured.release();
         var index = try curation.Index.init(a, "", state);
         var native: std.StringHashMapUnmanaged([]const u8) = .empty;
@@ -1651,10 +1659,13 @@ pub const WorkStats = struct {
 };
 
 pub fn fingerprint(alloc: std.mem.Allocator, value: anytype) ![32]u8 {
-    const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
-    defer alloc.free(bytes);
+    _ = alloc;
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.Writer.Hashing(@import("antfly_hash").Sha256) = .init(&buffer);
+    try std.json.Stringify.value(value, .{}, &writer.writer);
+    try writer.writer.flush();
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    writer.hasher.final(&digest);
     return digest;
 }
 
@@ -4083,4 +4094,28 @@ test "legacy query policy attachment retains full large pin sets" {
     try target.installCachedPolicy(&.{}, &.{}, "", state);
     try std.testing.expectEqual(@as(usize, 9000), target.curation_index.distinct.count());
     try std.testing.expect(try target.curation_index.pinnedDistinct(a, "from-8999", "to-8999"));
+}
+
+test "native execution projections retain only negatives across large profile identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var target = try Resolver.initFromParts(a, "entities", "entity/{{_entity.text}}", .{}, false, "");
+    defer target.deinit();
+    // The source identity may describe a profile larger than the policy cache.
+    // Only the bounded effective paths and configured negatives reach attachment.
+    const suppress = "{\"keys\":[\"entity/blocked\"],\"texts\":[\"noise\"]}";
+    try target.installQueryProjection(a, "large-profile-projection", suppress, &.{.{ .key = "entity/a", .target = "entity/b" }}, "", &.{"entity/a"});
+    const retained = target.query_policy_lease.?.policy;
+    for (0..10) |_| {
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        try target.installQueryProjection(scratch.allocator(), "large-profile-projection", suppress, &.{.{ .key = "entity/a", .target = "entity/b" }}, "", &.{"entity/a"});
+        try std.testing.expect(retained == target.query_policy_lease.?.policy);
+        try std.testing.expectEqual(@as(usize, 0), target.query_policy_lease.?.aliases().len);
+        try std.testing.expectEqualStrings("entity/b", target.alias_index.?.canonical("entity/a"));
+        try std.testing.expect(target.curation_index.keySuppressed("entity/blocked"));
+        try std.testing.expect(scratch.queryCapacity() < 16 * 1024);
+    }
+    std.debug.print("NATIVE PROJECTION phases=10 retained_configured_aliases=0 arena_bytes_per_phase<16384\n", .{});
 }

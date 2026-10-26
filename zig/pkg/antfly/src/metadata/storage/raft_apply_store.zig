@@ -23181,11 +23181,11 @@ pub const RaftApplyStore = struct {
                     var indexed_profile: StaticProfiles.QueryReader = .{ .backend = store.backend, .root = profile_root, .profile = reference.id, .indexed = try StaticProfiles.queryNodesReady(a, txn, profile_root, reference.id) };
                     const prepared = (try store.prepareQuery(read.key_template, .{ .id = reference.id, .ptr = &loader, .load = Loader.load, .estimated_bytes = try StaticProfiles.queryEstimatedBytes(a, txn, profile_root, reference.id), .lookup = indexed_profile.lookup() }, read.distinct)) orelse return error.CatalogGenerationChanged;
                     defer prepared.release();
-                    const snapshot = try store.queryPrepared(prepared, read.seeds, read.texts, read.distinct);
+                    const snapshot = if (read.complete_aliases) try store.queryExecutionPrepared(prepared, read.seeds, read.texts, read.distinct) else try store.queryPrepared(prepared, read.seeds, read.texts, read.distinct);
                     result.namespaces = try a.dupe(native.Snapshot, &.{snapshot});
                     break :policy_read;
                 };
-                if (try store.queryPolicy(read.key_template, read.seeds, read.texts, read.aliases, read.distinct)) |snapshot|
+                if (if (read.complete_aliases) try store.queryExecutionPolicy(read.key_template, read.seeds, read.texts, read.aliases, read.distinct) else try store.queryPolicy(read.key_template, read.seeds, read.texts, read.aliases, read.distinct)) |snapshot|
                     result.namespaces = try a.dupe(native.Snapshot, &.{snapshot});
             },
             .receipt => if (try stagingGet(txn, try std.fmt.allocPrint(a, "{s}receipt/{s}", .{ store.prefix, read.id }))) |raw| {
@@ -42280,6 +42280,15 @@ test "resolver curation namespace propagation query profile references reuse can
         try std.testing.expect(response.len < 4096);
     }
     try std.testing.expectEqual(loads + 1, RaftApplyStore.test_query_profile_loads.load(.monotonic));
+    var execution = input;
+    execution.authority.?.complete_aliases = true;
+    execution.authority.?.distinct = false;
+    execution.authority.?.seeds = &.{aliases[17].key};
+    const projected = try std.json.parseFromSliceLeaky(domain.View, a, try store.resolverCatalogRead(a, group, execution), .{});
+    try std.testing.expect(projected.namespaces[0].complete_aliases);
+    try std.testing.expectEqual(@as(usize, 1), projected.namespaces[0].namespace.merges.len);
+    try std.testing.expectEqualStrings(aliases[17].key, projected.namespaces[0].namespace.merges[0].key);
+    try std.testing.expectEqualStrings("entity/routed-root", projected.namespaces[0].namespace.merges[0].target);
     // Missing optional admission hints (older files/writers) use only this
     // profile's indexed adjacency, without loading its complete declaration.
     {
@@ -42295,6 +42304,10 @@ test "resolver curation namespace propagation query profile references reuse can
     }
     const indexed = try std.json.parseFromSliceLeaky(domain.View, a, try store.resolverCatalogRead(a, group, input), .{});
     try std.testing.expectEqual(@as(usize, 0), indexed.namespaces[0].namespace.state.distinct.len);
+    try std.testing.expectEqual(loads + 1, RaftApplyStore.test_query_profile_loads.load(.monotonic));
+    const projected_indexed = try std.json.parseFromSliceLeaky(domain.View, a, try store.resolverCatalogRead(a, group, execution), .{});
+    try std.testing.expect(projected_indexed.namespaces[0].complete_aliases);
+    try std.testing.expectEqualStrings("entity/routed-root", projected_indexed.namespaces[0].namespace.merges[0].target);
     try std.testing.expectEqual(loads + 1, RaftApplyStore.test_query_profile_loads.load(.monotonic));
     read.seeds = &.{"entity/routed-other-17"};
     var query = input;

@@ -511,10 +511,11 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
             defer parsed.deinit();
             if (!parsed.consumesLabel(mention.label)) return error.InvalidArgument;
             const minted = try parsed.renderKeyAlloc(a, .{ .text = mention.text, .label = mention.label, .local_id = mention.local_id });
-            const current = try queryConfig(server, alloc, a, cfg, &.{minted}, &.{mention.text}, false, request, if (query_fence) |*fence| fence else null);
+            const projected = try queryConfig(server, alloc, a, cfg, &.{minted}, &.{mention.text}, false, request, if (query_fence) |*fence| fence else null);
+            const current = projected.config;
             const identity = if (query_fence) |fence| if (fence.profiles.get(cfg.name)) |profile| profile.id else null else null;
             if (server.source.vtable.supports_resolver_authority and cfg.namespace_curation_table_id != 0) {
-                try parsed.installQueryPolicy(a, identity, cfg.aliases, cfg.suppress_json, current.merges, current.curation_json, &.{minted});
+                if (projected.complete_aliases) try parsed.installQueryProjection(a, identity, cfg.suppress_json, current.merges, current.curation_json, &.{minted}) else try parsed.installQueryPolicy(a, identity, cfg.aliases, cfg.suppress_json, current.merges, current.curation_json, &.{minted});
             } else try parsed.installCachedPolicy(current.aliases, current.merges, current.suppress_json, current.curation_json);
             const index = parsed.alias_index.?;
             const policy = parsed.curation_index;
@@ -1533,8 +1534,9 @@ const QueryFence = struct {
 
 /// The caller pins the catalog cut before any model work and revalidates it
 /// before returning. Legacy source-owned configs already carry their policy.
-fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, cfg: Config, seeds: []const []const u8, texts: []const []const u8, distinct: bool, request: operation.RequestContext, fence: ?*const QueryFence) !Config {
-    if (!server.source.vtable.supports_resolver_authority or cfg.namespace_curation_table_id == 0) return cfg;
+const QueryConfig = struct { config: Config, complete_aliases: bool = false };
+fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, cfg: Config, seeds: []const []const u8, texts: []const []const u8, distinct: bool, request: operation.RequestContext, fence: ?*const QueryFence) !QueryConfig {
+    if (!server.source.vtable.supports_resolver_authority or cfg.namespace_curation_table_id == 0) return .{ .config = cfg };
     var joined: native_authority.records.QueryPolicyUnion = .{};
     var seed_offset: usize = 0;
     var text_offset: usize = 0;
@@ -1545,7 +1547,7 @@ fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, 
         const page_allocator = page_arena.allocator();
         const seed_end = @min(seeds.len, seed_offset + 1024);
         const text_end = @min(texts.len, text_offset + 128);
-        const bytes = try server.source.systemCatalog(page_allocator, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .authority = .{ .mode = .policy, .expected_head = if (fence) |pinned| try pinned.expected(a, cfg) else null, .key_template = cfg.key_template, .seeds = seeds[seed_offset..seed_end], .texts = texts[text_offset..text_end], .aliases = if (profile != null or seed_offset == seed_end) &.{} else cfg.aliases, .query_profile = if (seed_offset != seed_end) profile else null, .distinct = distinct } } });
+        const bytes = try server.source.systemCatalog(page_allocator, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .authority = .{ .mode = .policy, .expected_head = if (fence) |pinned| try pinned.expected(a, cfg) else null, .key_template = cfg.key_template, .seeds = seeds[seed_offset..seed_end], .texts = texts[text_offset..text_end], .aliases = if (profile != null or seed_offset == seed_end) &.{} else cfg.aliases, .query_profile = if (seed_offset != seed_end) profile else null, .distinct = distinct, .complete_aliases = true } } });
         const view = try std.json.parseFromSliceLeaky(native_authority.View, page_allocator, bytes, .{});
         if (!view.native or view.table_id != cfg.namespace_curation_table_id or view.namespaces.len != 1) return error.CatalogGenerationChanged;
         try joined.add(a, page_allocator, view.namespaces[0]);
@@ -1561,7 +1563,7 @@ fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, 
     current.merges = snapshot.namespace.merges;
     current.curation_json = try std.json.Stringify.valueAlloc(a, snapshot.namespace.state, .{});
     current.namespace_curation_generation = snapshot.head.revision;
-    return current;
+    return .{ .config = current, .complete_aliases = snapshot.complete_aliases };
 }
 
 fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, table: anytype, all: []const Config, cfg: Config, body: []const u8, request: operation.RequestContext, fence: ?*const QueryFence) !@import("public_table_http.zig").OwnedResponse {
@@ -1597,10 +1599,11 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
                 try seeds.put(allocator, candidate.doc_ref.key, {});
                 if (candidate.resolved_doc_ref) |ref| try seeds.put(allocator, ref.key, {});
             };
-            const current = try queryConfig(self.server, self.owner, allocator, policy_cfg.*, seeds.keys(), texts.keys(), candidate_lists != null, self.request, self.fence);
+            const projected = try queryConfig(self.server, self.owner, allocator, policy_cfg.*, seeds.keys(), texts.keys(), candidate_lists != null, self.request, self.fence);
+            const current = projected.config;
             const identity = if (self.fence) |captured| if (captured.profiles.get(policy_cfg.name)) |profile| profile.id else null else null;
             if (self.server.source.vtable.supports_resolver_authority and policy_cfg.namespace_curation_table_id != 0) {
-                try target.installQueryPolicy(allocator, identity, policy_cfg.aliases, policy_cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
+                if (projected.complete_aliases) try target.installQueryProjection(allocator, identity, policy_cfg.suppress_json, current.merges, current.curation_json, seeds.keys()) else try target.installQueryPolicy(allocator, identity, policy_cfg.aliases, policy_cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
             } else try target.installCachedPolicy(current.aliases, current.merges, current.suppress_json, current.curation_json);
         }
         fn filter(ptr: *anyopaque, _: std.mem.Allocator, physical: []const u8) ![]const u8 {
@@ -2462,7 +2465,7 @@ test "resolver curation HTTP query policy chunks large mention and candidate set
     for (texts, 0..) |*text_value, i| text_value.* = try std.fmt.allocPrint(a, "mention {d}", .{i});
     const cfg: Config = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .namespace_curation_table_id = 7 };
     var pinned = try QueryFence.init(a, .{ .version = 1, .revision = 42, .table = .{ .table_id = 1, .name = "source" }, .query_fingerprint = @splat(1), .query_heads = &.{.{ .table_id = 7, .key_template = cfg.key_template, .stamp = .{ .revision = 3, .fingerprint = @splat(1) } }} }, "r", false);
-    const current = try queryConfig(&server, std.testing.allocator, a, cfg, seeds, texts, true, .{}, &pinned);
+    const current = (try queryConfig(&server, std.testing.allocator, a, cfg, seeds, texts, true, .{}, &pinned)).config;
     try std.testing.expectEqual(@as(usize, 3), server.source.calls);
     try std.testing.expectEqual(seeds.len, server.source.seeds);
     try std.testing.expectEqual(texts.len, server.source.texts);

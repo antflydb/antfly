@@ -2001,33 +2001,47 @@ lease, so eviction cannot free an active reader's policy. Content changes,
 including removal of a correction, select a different compiled policy. Grants,
 authorized documents, and decision results are not cached.
 
-Native query attachment leases the immutable configured alias/negative-policy
-index by its admission-qualified profile identity. It composes only the rendered
-mention paths and incident distinct endpoints against current native redirects
-and tombstones, then builds a request-local canonical index for those paths.
-The 16,384-node safety bound applies to each traversal, not the union of native
-pages: 9,000 independent aliases (18,000 nodes) remain a valid query, with each
-shared suffix traversed once. Configured key/text negatives are borrowed under
-that lease; live negatives, pins and removals remain request-local. The two resolution phases replace and
-release their leases explicitly, and stage restoration releases the final query
-lease before restoring the caller's policy. Rendering uses the same attachment.
-Legacy source-owned policy retains its full cached index and its existing limits;
-only complete adapters elide baseline compilation. Augmenting callbacks retain
-the configured baseline. The private policy wire contract and its complete head
-fences are unchanged.
-Ten warm attachments against 10,000 configured aliases allocate 4,640 bytes of
-request arenas instead of at least 35,984,100 bytes of copied/rebuilt indexes.
+Native query execution projects the configured forward paths together with native
+redirects, tombstones, negatives and incident distinct endpoints at one fenced
+owner read cut. Ready persistent nodes provide point/seek access even when the
+profile exceeds the process cache budget. Attachment compiles only the returned
+paths; it never builds a whole configured alias index. Configured key/text
+negatives use a separate immutable cache identity so a previous full-policy
+entry cannot collide with the projection. Live negatives, pins and removals
+remain request-local. The 16,384-node bound applies per traversal, not to the
+union of pages: 9,000 independent aliases remain a valid multi-page query.
+The two resolution phases replace their leases explicitly and restore caller
+state on completion. Legacy source-owned policies keep their full cached
+semantics until native enrollment; augmenting callbacks keep their baseline.
 
-Lite initial query and key-render admission use a catalog-owned directory keyed
-by resolver name and source artifact/routing domain. A warm read clones only the
-selected declaration and overlapping active siblings in catalog order, preserving
-catch-all label exclusions and declaration fingerprints. Private replacements stay
-in their own routing domain; public queries cannot select them or retired names.
-The directory is invalidated with structural catalog publication and warm reads
-use the shared catalog lock. A one-resolver admission uses 2,232 bytes of request
-arena capacity at both 100 and 1,000 declarations, copying zero unrelated aliases;
-the previous 1,000-declaration path copied 999,000 aliases into 59,848,688 bytes.
-The sibling-routing regression admits two relevant declarations within 16 KiB.
+Topology protocol 55 adds the private opt-in `complete_aliases` policy projection.
+Its namespace alias slice contains effective configured and native query paths,
+not new durable corrections. Inspection reads retain their previous wire shape.
+Page union rejects a mixture of complete and incomplete projections, as well as
+mixed heads. HTTP and Lite consume the same complete projection; older replies
+retain the configured-policy fallback. Existing static-node readiness and
+backfill fences remain required before using persistent lookups.
+
+Lite initial query and key-render admission lease immutable declarations from a
+catalog-owned name and source/routing directory. Bodies are copied once per
+admitted declaration and generation. Declaration fingerprints and profile IDs
+are computed once outside the catalog lock with the shared SHA-256. Warm
+admissions copy only small descriptors and retain their owners; catalog
+retirement releases its references without invalidating in-flight readers.
+Catalog epochs, native heads and final declaration proofs still revalidate
+independently. Private replacements retain their own routing domains.
+A one-resolver warm admission uses 2,296 bytes of request arena capacity at
+1,000, 10,000 and 100,000 selected aliases, rather than copying up to 12 MB of
+selected aliases and recomputing their identities on every request.
+
+Lite key rendering uses the same policy preparation and final fences as query
+resolution, rather than rebuilding the entire configured redirect index for
+one key. It observes sibling label declarations without executing sibling
+resolvers or opening their destinations. Declaration-only rendering without a
+destination and legacy source-owned policy retain their prior semantics.
+The oversized-profile regression performs ten phases with zero full-profile
+loads and twenty point expansions. Only configured negatives enter the compiled
+policy cache; native projection attachment retains zero configured aliases.
 
 Lite final declaration verification reads a scalar scoped fingerprint from the
 owner's namespace lookup. The scope includes the selected resolver and overlapping

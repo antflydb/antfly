@@ -12912,9 +12912,13 @@ pub const IndexManager = struct {
     /// Import immutable policy once into this owner's allocator. Transient
     /// metadata arenas never lend their lifetime to persistent catalog slots.
     const ResolverSlot = struct { retired: bool, index: usize };
-    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)), names: std.StringHashMapUnmanaged(ResolverSlot), routing: std.StringHashMapUnmanaged(std.ArrayList(usize)), profiles: std.StringHashMapUnmanaged([]const u8) = .empty, query_proofs: std.AutoHashMapUnmanaged([32]u8, [32]u8) = .empty, query_proof_generation: u64 = 0, reserved: std.StringHashMapUnmanaged(void) };
+    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)), names: std.StringHashMapUnmanaged(ResolverSlot), routing: std.StringHashMapUnmanaged(std.ArrayList(usize)), declarations: std.AutoHashMapUnmanaged(usize, *QueryDeclaration) = .empty, declaration_generation: u64 = 0, profiles: std.StringHashMapUnmanaged([]const u8) = .empty, query_proofs: std.AutoHashMapUnmanaged([32]u8, [32]u8) = .empty, query_proof_generation: u64 = 0, reserved: std.StringHashMapUnmanaged(void) };
     fn invalidateResolverNamespaceLookup(self: *IndexManager) void {
-        if (self.resolver_namespace_lookup) |*lookup| lookup.arena.deinit();
+        if (self.resolver_namespace_lookup) |*lookup| {
+            var owners = lookup.declarations.valueIterator();
+            while (owners.next()) |owner| owner.*.release();
+            lookup.arena.deinit();
+        }
         self.resolver_namespace_lookup = null;
     }
     fn ensureResolverLookup(self: *IndexManager) !void {
@@ -13405,9 +13409,15 @@ pub const IndexManager = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         var hash = Hash.init(.{});
-        for (self.resolvers.items) |cfg| {
-            if (cfg.replacement_index.len != 0) continue;
-            if (std.mem.eql(u8, cfg.name, selected.name) or (selected.sharesRoutingDomain(cfg) and std.mem.eql(u8, selected.source_artifact, cfg.source_artifact) and cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) hash.update(&try cfg.queryDefinitionFingerprint(arena.allocator()));
+        for (self.resolvers.items, 0..) |cfg, index| {
+            if (cfg.replacement_index.len != 0 and !std.mem.eql(u8, cfg.replacement_index, selected.replacement_index)) continue;
+            if (std.mem.eql(u8, cfg.name, selected.name) or (selected.sharesRoutingDomain(cfg) and std.mem.eql(u8, selected.source_artifact, cfg.source_artifact) and cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) {
+                if (lookup.declaration_generation == generation) if (lookup.declarations.get(index)) |owner| if (owner.prepared.load(.acquire)) {
+                    hash.update(&owner.fingerprint);
+                    continue;
+                };
+                hash.update(&try cfg.queryDefinitionFingerprint(arena.allocator()));
+            }
         }
         var result: [32]u8 = undefined;
         hash.final(&result);
@@ -13420,46 +13430,129 @@ pub const IndexManager = struct {
         return result;
     }
 
-    /// Initial query/render admission owns only the requested declaration and
-    /// overlapping routing siblings. The immutable directory indexes names and
-    /// artifact/domain groups; unrelated aliases and producer bodies are never
-    /// cloned. Keep catalog order so declaration fingerprints match final fences.
-    pub fn resolverQueryRoutingDescriptors(self: *IndexManager, alloc: Allocator, name: []const u8, public_only: bool) ![]ResolverConfig {
+    /// Declaration bodies belong to one catalog generation. Active admissions
+    /// retain their own references across DDL, inference and cache eviction.
+    const QueryDeclaration = struct {
+        alloc: Allocator,
+        references: std.atomic.Value(usize) = .init(1),
+        mutex: std.atomic.Mutex = .unlocked,
+        config: ResolverConfig,
+        prepared: std.atomic.Value(bool) = .init(false),
+        fingerprint: [32]u8 = undefined,
+        profile: [64]u8 = undefined,
+        fn release(self: *@This()) void {
+            if (self.references.fetchSub(1, .acq_rel) == 1) {
+                const alloc = self.alloc;
+                self.config.deinit(alloc);
+                alloc.destroy(self);
+            }
+        }
+        fn prepare(self: *@This()) !void {
+            if (self.prepared.load(.acquire)) return;
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.prepared.load(.acquire)) return;
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            self.fingerprint = try self.config.queryDefinitionFingerprint(a);
+            @memcpy(&self.profile, try (@import("../resolver_static_profiles.zig").Definition{ .key_template = self.config.key_template, .aliases = self.config.aliases, .suppress_json = self.config.suppress_json }).identity(a));
+            self.prepared.store(true, .release);
+        }
+    };
+    pub const QueryAdmission = struct {
+        alloc: Allocator,
+        configs: []ResolverConfig,
+        owners: []*QueryDeclaration,
+        fingerprint: [32]u8 = undefined,
+        pub fn deinit(self: @This()) void {
+            for (self.owners) |owner| owner.release();
+            self.alloc.free(self.owners);
+            self.alloc.free(self.configs);
+        }
+        fn prepare(self: *@This()) !void {
+            var hash = @import("antfly_hash").Sha256.init(.{});
+            for (self.owners) |owner| {
+                try owner.prepare();
+                hash.update(&owner.fingerprint);
+            }
+            hash.final(&self.fingerprint);
+        }
+        pub fn profile(self: @This(), index: usize) []const u8 {
+            return &self.owners[index].profile;
+        }
+    };
+    pub fn resolverQueryAdmission(self: *IndexManager, alloc: Allocator, name: []const u8, public_only: bool) !QueryAdmission {
         self.catalog_mutex.lockShared();
-        if (self.resolver_namespace_lookup != null) {
-            defer self.catalog_mutex.unlockShared();
-            return self.cloneResolverQueryRoutingDescriptors(alloc, name, public_only);
-        }
+        const warm = self.acquireQueryAdmissionLocked(alloc, name, public_only, false) catch |err| {
+            self.catalog_mutex.unlockShared();
+            return err;
+        };
         self.catalog_mutex.unlockShared();
-        self.catalog_mutex.lockExclusive();
-        defer self.catalog_mutex.unlockExclusive();
-        try self.ensureResolverLookup();
-        return self.cloneResolverQueryRoutingDescriptors(alloc, name, public_only);
+        var result = warm orelse cold: {
+            self.catalog_mutex.lockExclusive();
+            defer self.catalog_mutex.unlockExclusive();
+            try self.ensureResolverLookup();
+            break :cold (try self.acquireQueryAdmissionLocked(alloc, name, public_only, true)).?;
+        };
+        errdefer result.deinit();
+        // Hashing happens once per declaration, outside the catalog lock.
+        try result.prepare();
+        return result;
     }
-    fn cloneResolverQueryRoutingDescriptors(self: *IndexManager, alloc: Allocator, name: []const u8, public_only: bool) ![]ResolverConfig {
+    fn acquireQueryAdmissionLocked(self: *IndexManager, alloc: Allocator, name: []const u8, public_only: bool, create: bool) !?QueryAdmission {
+        if (self.resolver_namespace_lookup == null) return null;
         const lookup = &self.resolver_namespace_lookup.?;
-        const slot = lookup.names.get(name) orelse return alloc.alloc(ResolverConfig, 0);
-        if (slot.retired) return alloc.alloc(ResolverConfig, 0);
-        const selected = self.resolvers.items[slot.index];
-        if (public_only and selected.replacement_index.len != 0) return alloc.alloc(ResolverConfig, 0);
-        const route = try std.json.Stringify.valueAlloc(alloc, .{ selected.source_artifact, selected.replacement_index }, .{});
-        defer alloc.free(route);
-        const group = lookup.routing.get(route) orelse unreachable;
-        var result: std.ArrayList(ResolverConfig) = .empty;
-        errdefer {
-            for (result.items) |*cfg| cfg.deinit(alloc);
-            result.deinit(alloc);
+        if (lookup.declaration_generation != self.writePlanGeneration()) {
+            if (!create) return null;
+            var old = lookup.declarations.valueIterator();
+            while (old.next()) |owner| owner.*.release();
+            lookup.declarations.clearRetainingCapacity();
+            lookup.declaration_generation = self.writePlanGeneration();
         }
-        for (group.items) |index| {
-            var cfg = self.resolvers.items[index];
-            if (index != slot.index and (!selected.sharesRoutingDomain(cfg) or !cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) continue;
-            cfg.merges = &.{};
-            cfg.curation_json = "{}";
-            var owned = try ResolverConfig.clone(alloc, cfg);
-            errdefer owned.deinit(alloc);
-            try result.append(alloc, owned);
+        var configs: std.ArrayList(ResolverConfig) = .empty;
+        var owners: std.ArrayList(*QueryDeclaration) = .empty;
+        var transferred = false;
+        defer if (!transferred) {
+            for (owners.items) |owner| owner.release();
+            owners.deinit(alloc);
+            configs.deinit(alloc);
+        };
+        const slot = lookup.names.get(name);
+        if (slot != null and !slot.?.retired) {
+            const selected = self.resolvers.items[slot.?.index];
+            if (!public_only or selected.replacement_index.len == 0) {
+                const route = try std.json.Stringify.valueAlloc(alloc, .{ selected.source_artifact, selected.replacement_index }, .{});
+                defer alloc.free(route);
+                const group = lookup.routing.get(route) orelse unreachable;
+                for (group.items) |index| {
+                    var cfg = self.resolvers.items[index];
+                    if (index != slot.?.index and (!selected.sharesRoutingDomain(cfg) or !cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) continue;
+                    var owner = lookup.declarations.get(index);
+                    if (owner == null) {
+                        if (!create) return null;
+                        cfg.merges = &.{};
+                        cfg.curation_json = "{}";
+                        const entry = try self.alloc.create(QueryDeclaration);
+                        errdefer self.alloc.destroy(entry);
+                        var owned = try ResolverConfig.clone(self.alloc, cfg);
+                        errdefer owned.deinit(self.alloc);
+                        entry.* = .{ .alloc = self.alloc, .config = owned };
+                        try lookup.declarations.put(lookup.arena.allocator(), index, entry);
+                        owner = entry;
+                    }
+                    try owners.ensureUnusedCapacity(alloc, 1);
+                    try configs.append(alloc, owner.?.config);
+                    _ = owner.?.references.fetchAdd(1, .monotonic);
+                    owners.appendAssumeCapacity(owner.?);
+                }
+            }
         }
-        return result.toOwnedSlice(alloc);
+        const owned_configs = try configs.toOwnedSlice(alloc);
+        errdefer alloc.free(owned_configs);
+        const owned_owners = try owners.toOwnedSlice(alloc);
+        transferred = true;
+        return .{ .alloc = alloc, .configs = owned_configs, .owners = owned_owners };
     }
 
     /// Caller-owned snapshot of one identity. Lookup is shared with namespace
@@ -50263,4 +50356,69 @@ test "capi resolver reservation removal preserves independently raised native ep
     defer read.abort();
     try std.testing.expectEqual(required, try resolver_catalog.readMinimumReaderVersion(&read, required));
     try std.testing.expectEqual(required, try resolver_catalog.catalogReaderVersion(a, try read.get(resolver_catalog_key)));
+}
+
+test "resolver curation query admission retains large immutable declarations across generation changes" {
+    const a = std.testing.allocator;
+    var inputs = std.heap.ArenaAllocator.init(a);
+    defer inputs.deinit();
+    const aliases = try inputs.allocator().alloc(@import("antfly_resolver").KeyAlias, 100000);
+    for (aliases, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(inputs.allocator(), "entity/alias-{d}", .{i}), .target = "entity/root" };
+    var manager: IndexManager = undefined;
+    manager.alloc = a;
+    manager.catalog_mutex = .{};
+    manager.resolvers = .empty;
+    defer manager.resolvers.deinit(a);
+    manager.retired_resolvers = .empty;
+    manager.resolver_namespace_lookup = null;
+    manager.test_resolver_lookup_builds = 0;
+    manager.test_resolver_query_proof_builds = 0;
+    manager.write_plan_generation = .init(1);
+    defer manager.invalidateResolverNamespaceLookup();
+    try manager.resolvers.append(a, .{ .name = "selected", .table = "entities", .key_template = "entity/{{_entity.text}}", .source_artifact = "kg", .resolution_artifact = "out", .aliases = aliases });
+    const captured = try manager.resolverQueryAdmission(a, "selected", true);
+    defer captured.deinit();
+    for (0..10) |_| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const admission = try manager.resolverQueryAdmission(scratch.allocator(), "selected", true);
+        defer admission.deinit();
+        try std.testing.expectEqual(captured.configs[0].aliases.ptr, admission.configs[0].aliases.ptr);
+        try std.testing.expectEqualSlices(u8, &captured.fingerprint, &admission.fingerprint);
+        try std.testing.expectEqualStrings(captured.profile(0), admission.profile(0));
+        try std.testing.expect(scratch.queryCapacity() < 4096);
+    }
+    // Retiring the owner must leave in-flight snapshots valid, while the next
+    // admission and final declaration fence observe the replacement.
+    manager.resolvers.items[0].aliases = &.{.{ .key = "entity/alias-0", .target = "entity/new-root" }};
+    manager.invalidateWritePlanSnapshot();
+    manager.invalidateResolverNamespaceLookup();
+    const changed = try manager.resolverQueryAdmission(a, "selected", true);
+    defer changed.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &captured.fingerprint, &changed.fingerprint));
+    try std.testing.expectEqualStrings("entity/root", captured.configs[0].aliases[0].target);
+    try std.testing.expectEqualStrings("entity/new-root", changed.configs[0].aliases[0].target);
+    try std.testing.expectEqualSlices(u8, &changed.fingerprint, &try manager.resolverQueryDeclarationsFingerprint(changed.configs[0]));
+    std.debug.print("LEASED ADMISSION aliases=100000 warm_requests=10 arena_bytes_per_request<4096 copied_aliases=0\n", .{});
+}
+
+test "resolver curation query admission unwinds allocation failures" {
+    const Scenario = struct {
+        fn run(a: Allocator) !void {
+            var manager: IndexManager = undefined;
+            manager.alloc = a;
+            manager.catalog_mutex = .{};
+            manager.resolvers = .empty;
+            defer manager.resolvers.deinit(a);
+            manager.retired_resolvers = .empty;
+            manager.resolver_namespace_lookup = null;
+            manager.test_resolver_lookup_builds = 0;
+            manager.write_plan_generation = .init(1);
+            defer manager.invalidateResolverNamespaceLookup();
+            try manager.resolvers.append(a, .{ .name = "selected", .table = "entities", .key_template = "entity/{{_entity.text}}", .source_artifact = "kg", .resolution_artifact = "out", .aliases = &.{.{ .key = "a", .target = "b" }} });
+            const admission = try manager.resolverQueryAdmission(a, "selected", true);
+            defer admission.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
