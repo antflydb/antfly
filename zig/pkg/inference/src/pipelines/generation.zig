@@ -11798,13 +11798,6 @@ pub const NativeGenerationPipeline = struct {
             const weight = try self.graphWeight("lm_head.weight");
             defer self.cb.free(weight);
             const choices = if (cuda_lighton) blk: {
-                if (comptime build_options.enable_cuda) {
-                    if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnFusedHead(&self.cb, hidden, weight, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size, self.gpt_config.suppressTokenIds(), self.allocator)) |tokens| break :blk tokens;
-                }
-                // Dense BF16 heads do not use CUDA's quantized fused sampler.
-                // Keep the logits on device and download only one ID per page.
-                // Reuse this committed hidden state if sampling fails; never
-                // replay the recurrent forward to obtain a fallback result.
                 const logits = try self.cb.linearNoBias(hidden, weight, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
                 defer self.cb.free(logits);
                 break :blk try self.cb.argmaxRowsSuppress(logits, 0, claimed.len, self.gpt_config.vocab_size, self.gpt_config.suppressTokenIds(), self.allocator) orelse return error.ResidentImageOperationUnavailable;

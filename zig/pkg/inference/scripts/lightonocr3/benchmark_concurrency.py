@@ -473,21 +473,17 @@ def run(args, model, label, mode, concurrency, output):
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_FFN",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE",
-                "ANTFLY_CUDA_ENABLE_LIGHTON_TEMP_LRU",
-                "ANTFLY_CUDA_ENABLE_OCR_TEMP_INDEX",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PACKED_MIXED",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_RAGGED_RECURRENT",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BF16_INPUTS",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_GDN_DECODE",
-                "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_HEAD",
                 "ANTFLY_CUDA_PROFILE_OCR_TEMP_SCANS",
                 "ANTFLY_LIGHTONOCR3_PHYSICAL128",
                 "ANTFLY_LIGHTONOCR3_COMPACT_KV",
                 "ANTFLY_CUDA_ENABLE_FLORENCE_CANONICAL_DECODE_GEMM",
                 "ANTFLY_FLORENCE2_CUDA_CHECK_ENCODER_BATCH",
-                "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_GRAPHS",
                 "ANTFLY_TEST_OCR_CUDA_PROFILE_RANGE",
                 "ANTFLY_CUDA_ENABLE_OCR_PINNED_METADATA",
                 "ANTFLY_CUDA_ENABLE_OCR_PINNED_INPUTS",
@@ -648,16 +644,6 @@ def run(args, model, label, mode, concurrency, output):
                             )
                         }
                     )
-                    head_rows = [
-                        int(value)
-                        for value in re.findall(
-                            r"LIGHTONOCR3 cuda_fused_head_step_rows=(\d+)", section
-                        )
-                    ]
-                    sample["cuda_fused_head_steps"] = len(head_rows)
-                    sample["cuda_fused_head_rows"] = sum(head_rows)
-                    if args.require_lighton_fused_head and not head_rows:
-                        result["status"] = "missing_timed_lighton_fused_head"
                     if (
                         args.require_wide_vision
                         and max(sample["vision_batch_sizes"], default=0) <= 8
@@ -1179,11 +1165,6 @@ def run(args, model, label, mode, concurrency, output):
                 "cuda_fused_cross_calls",
             ),
             (
-                args.require_lighton_ffn_graph,
-                "lighton_ffn_graph",
-                "cuda_ffn_graph_calls",
-            ),
-            (
                 args.require_florence_encoder_microbatch,
                 "florence_encoder_microbatch",
                 "cuda_encoder_microbatch_chunks",
@@ -1291,11 +1272,6 @@ def run(args, model, label, mode, concurrency, output):
                 args.require_lighton_bf16_prefill_ffn,
             ),
             (
-                "cuda_fused_head_calls",
-                "lighton_fused_head",
-                args.require_lighton_fused_head,
-            ),
-            (
                 "cuda_fused_gdn_decode_calls",
                 "lighton_fused_gdn_decode",
                 args.require_lighton_fused_gdn_decode,
@@ -1320,7 +1296,6 @@ def run(args, model, label, mode, concurrency, output):
                 "lighton_fused_vision_qkv",
                 args.require_lighton_fused_vision_qkv,
             ),
-            ("cuda_temp_index_hits", "ocr_temp_index", args.require_ocr_temp_index),
             (
                 "cuda_prefix_shared_qk_calls",
                 "lighton_prefix_shared_qk",
@@ -1340,11 +1315,6 @@ def run(args, model, label, mode, concurrency, output):
                 "cuda_incremental_admission_items",
                 "florence_incremental_admission",
                 args.require_florence_incremental_admission,
-            ),
-            (
-                "cuda_temp_lru_retains",
-                "lighton_temp_lru",
-                args.require_lighton_temp_lru,
             ),
             (
                 "cuda_norm_weight_cache_hits",
@@ -1489,13 +1459,6 @@ def run(args, model, label, mode, concurrency, output):
             and not result["lighton_position_cache_hits"]
         ):
             result["status"] = "missing_lighton_position_cache"
-        ffn_graphs = re.findall(
-            r"LIGHTONOCR3 cuda_ffn_graph_calls=(\d+) graphs=(\d+) failed=(\d+)", text
-        )
-        result["lighton_ffn_graph_counts"] = [int(n) for _, n, _ in ffn_graphs]
-        result["lighton_ffn_graph_failed"] = any(int(f) for _, _, f in ffn_graphs)
-        if args.require_lighton_ffn_graph and result["lighton_ffn_graph_failed"]:
-            result["status"] = "lighton_ffn_graph_capture_failed"
         fused_ffn = re.findall(
             r"LIGHTONOCR3 cuda_fused_ffn_calls=(\d+) paired_weights=(\d+)", text
         )
@@ -1936,7 +1899,6 @@ def main():
     )
     parser.add_argument("--require-florence-fused-bias", action="store_true")
     parser.add_argument("--require-florence-fused-depthwise", action="store_true")
-    parser.add_argument("--require-lighton-ffn-graph", action="store_true")
     parser.add_argument("--require-ocr-pinned-metadata", action="store_true")
     parser.add_argument("--require-ocr-pinned-inputs", action="store_true")
     parser.add_argument("--require-florence-fused-cross-attention", action="store_true")
@@ -1953,17 +1915,14 @@ def main():
     parser.add_argument("--require-lighton-bf16-prefill-ffn", action="store_true")
     parser.add_argument("--require-wide-packed-prefill", action="store_true")
     parser.add_argument("--require-lighton-norm-weight-cache", action="store_true")
-    parser.add_argument("--require-lighton-temp-lru", action="store_true")
     parser.add_argument("--require-florence-bart-ffn", action="store_true")
     parser.add_argument("--require-florence-incremental-admission", action="store_true")
     parser.add_argument("--require-cuda-temp-cache", action="store_true")
-    parser.add_argument("--require-ocr-temp-index", action="store_true")
     parser.add_argument("--require-lighton-fused-vision-qkv", action="store_true")
     parser.add_argument("--require-lighton-ragged-recurrent", action="store_true")
     parser.add_argument("--require-lighton-ffn-bf16-inputs", action="store_true")
     parser.add_argument("--require-lighton-ffn-block", action="store_true")
     parser.add_argument("--require-lighton-fused-gdn-decode", action="store_true")
-    parser.add_argument("--require-lighton-fused-head", action="store_true")
     parser.add_argument("--require-florence-fused-kv-append", action="store_true")
     parser.add_argument("--require-lighton-attention-chunk128", action="store_true")
     parser.add_argument("--require-florence-fused-mlp", action="store_true")

@@ -14,7 +14,6 @@
         "ANTFLY_CUDA_ENABLE_LIGHTON_CACHED_RECURRENT_GATES": "1",
         "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BF16_INPUTS": "1",
         "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK": "1",
-        "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_GRAPHS": "0",
         "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_BATCH_RECURRENT": "1",
         "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_FFN": "0",
         "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_GDN_DECODE": "1",
@@ -29,10 +28,8 @@
         "ANTFLY_CUDA_ENABLE_LIGHTON_RAGGED_RECURRENT": "1",
         "ANTFLY_CUDA_ENABLE_LIGHTON_SHARED_RECURRENT_WEIGHTS": "1",
         "ANTFLY_CUDA_ENABLE_LIGHTON_STATE_POOL": "1",
-        "ANTFLY_CUDA_ENABLE_LIGHTON_TEMP_LRU": "0",
         "ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN": "1",
         "ANTFLY_CUDA_ENABLE_OCR_PINNED_METADATA": "1",
-        "ANTFLY_CUDA_ENABLE_OCR_TEMP_INDEX": "0",
         "ANTFLY_INFERENCE_CUDA_CUBLASLT_BF16_TUNING_PROFILE": "off",
         "ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES": "1024",
         "ANTFLY_INFERENCE_CUDA_CUBLASLT_WORKSPACE_MB": "0",
@@ -89,7 +86,6 @@
         "ANTFLY_LIGHTONOCR3_VISION_WAIT_US": "1000",
         "ANTFLY_LIGHTONOCR3_WAIT_FOR_PREFILL_PEERS": "0",
         "TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE": "1",
-        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_HEAD": "0",
         "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS": "0",
         "ANTFLY_LIGHTONOCR3_PHYSICAL128": "0"
       }
@@ -140,7 +136,6 @@
       "qualification": "Unqualified experimental BF16 projection outputs for prefix and decode; F32 tensor storage and recurrent state. This is not a complete vLLM BF16 activation match.",
       "environment": {
         "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS": "1",
-        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_HEAD": "0",
         "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK": "0"
       }
     },
@@ -149,7 +144,6 @@
       "qualification": "Unqualified experimental BF16 projection outputs for prefix and decode; F32 tensor storage and recurrent state. This is not a complete vLLM BF16 activation match.",
       "environment": {
         "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS": "1",
-        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_HEAD": "0",
         "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK": "0"
       }
     },
