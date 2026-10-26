@@ -22,7 +22,8 @@ export const corpusId=id=>typeof id==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3
 export function planCorpus(run,configs,report,id){
  assertUnusedRecovery(run);
  const sides=report?.sides??[report?.baseline,report?.candidate],side=sides.find(s=>s?.run===run.id);
- const closed=report?.sides?['complete','failed'].includes(report.stage)&&Number.isFinite(report.finished_at):Boolean(report?.fatal);
+ const verifiedShort=Number.isFinite(report?.workload?.finished_at)&&report.soak_ms>0&&report.soak_ms<3600000&&report.baseline?.verification?.passed===true&&report.candidate?.verification?.passed===true;
+ const closed=report?.sides?['complete','failed'].includes(report.stage)&&Number.isFinite(report.finished_at):Boolean(report?.fatal)||verifiedShort;
  if(!closed||!side||side.execution_id!==run.last_execution_id||report.execution_id!==run.last_execution_id)throw Error('CorpusExecutionStillActiveOrStale');
  if(!run.paused||configs.length!==4)throw Error('PauseCorpusDeliveryFirst');
  const routes=configs.map(c=>JSON.parse(c.vars?.ANTFLY_TENANTS??'{}'));

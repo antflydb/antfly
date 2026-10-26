@@ -60,6 +60,7 @@ test('corpus preparation rejects active stale consumed and mismatched role histo
  for(const bad of[{...run,paused:false},{...run,cold_execution_id:'used'},{...run,last_execution_id:crypto.randomUUID()},{...run,corpus:{id,tenants:{}}}])assert.throws(()=>planCorpus(bad,configs,r,id));
  assert.throws(()=>planCorpus(run,configs,{...r,fatal:undefined},id));const changed=structuredClone(configs);changed[1].vars.ANTFLY_TENANTS='{}';assert.throws(()=>planCorpus(run,changed,r,id));assert.throws(()=>planCorpus(run,configs,r,'not-an-id'));
  const diagnostic={execution_id,stage:'complete',finished_at:Date.now(),sides:[r.candidate]};assert.equal(planCorpus(run,configs,diagnostic,id).run.corpus.id,id);assert.throws(()=>planCorpus(run,configs,{...diagnostic,stage:'workload'},id));
+ const short={execution_id,soak_ms:300000,workload:{finished_at:Date.now()},candidate:{...r.candidate,verification:{passed:true}},baseline:{verification:{passed:true}}};assert.equal(planCorpus(run,configs,short,id).run.corpus.id,id);assert.throws(()=>planCorpus(run,configs,{...short,soak_ms:3600000},id));assert.throws(()=>planCorpus(run,configs,{...short,baseline:{}},id));
 });
 test('paired corpus provenance must match and remain distinct between trials',()=>{
  const reports=Array.from({length:3},(_,i)=>{const r=report();r.trial=i+1;r.baseline.corpus={id:crypto.randomUUID()};r.candidate.corpus=structuredClone(r.baseline.corpus);return r;});assert.equal(evaluateGate(reports).passed,true);
@@ -214,7 +215,7 @@ test('warm transport retries retain original input and include all retry and sch
 test('transport replay requires a stable mutation identity and preserves its receipt',async()=>{
  const version='01234567-0123-4567-89ab-0123456789ab',bodies=[],client=new GateClient({origin:'https://fixture.invalid',version},'disposable-fixture',{fetch:async(url,request)=>{bodies.push(request.body);if(bodies.length===1)throw new TypeError('fetch failed');return Response.json({committed:true,visibility:'receipt-0000000000000001'},{headers:{'X-Antfly-Version':version}});}}),input={op:'mutate',operation_id:'fixed-receipt',mutations:[]};
  const result=await client.call('a',input,'write');assert.equal(result.sample.attempts,2);assert.equal(result.value.visibility,'receipt-0000000000000001');assert.deepEqual(bodies,[JSON.stringify(input),JSON.stringify(input)]);
- let calls=0;const unsafe=new GateClient({},'fixture',{fetch:async()=>{calls++;throw new TypeError('fetch failed');}});unsafe.run.origin='https://fixture.invalid';await assert.rejects(unsafe.call('a',{op:'mutate'},'write'),/fetch failed/);assert.equal(calls,1);
+ let calls=0;const unsafe=new GateClient({},'fixture',{fetch:async()=>{calls++;throw new TypeError('fetch failed',{cause:{code:'UND_ERR_SOCKET',headers:{Authorization:'must-not-retain'}}});}});unsafe.run.origin='https://fixture.invalid';await assert.rejects(unsafe.call('a',{op:'mutate'},'write'),/fetch failed/);assert.equal(calls,1);assert.equal(unsafe.errors[0].cause_code,'UND_ERR_SOCKET');assert.ok(!JSON.stringify(unsafe.errors).includes('must-not-retain'));await assert.rejects(unsafe.call('a',{op:'compact'},'compact'),/fetch failed/);assert.equal(calls,2);
 });
 test('cold attempts never retry transport or backpressure and warm recovery retains resource failures',async()=>{
  const version='01234567-0123-4567-89ab-0123456789ab';

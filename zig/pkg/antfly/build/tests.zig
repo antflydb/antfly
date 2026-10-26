@@ -2955,12 +2955,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, filtered_topk_mod, true, true);
     const filtered_topk_tests = b.addTest(.{
         .root_module = filtered_topk_mod,
-        .filters = &.{ "producer top k", "logical value borrowed", "deferred membership refines", "PostingsIterator advanceTo", "observed physical ordering", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "public tie row cursors", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys", "rank cursors" },
+        .filters = &.{ "producer top k", "logical value borrowed", "deferred membership refines", "PostingsIterator advanceTo", "observed physical ordering", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "public tie row cursors", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys" },
         .max_rss = 8 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("lake-filtered-topk-test", "Verify bounded native membership, exclusion masks and cached public ties")
-        .dependOn(&addFilteredTestRunArtifact(b, filtered_topk_tests).step);
+    const filtered_topk_step = b.step("lake-filtered-topk-test", "Verify bounded native membership, exclusion masks and cached public ties");
+    filtered_topk_step.dependOn(&addFilteredTestRunArtifact(b, filtered_topk_tests).step);
+    // Rank cursors belong to the shared objectstore engine after extraction.
+    // Keep their coverage in this lake gate without silently accepting an
+    // empty local-owner selection or importing a second copy of the engine.
+    const run_ordered_rank_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, ordered_tree_tests, &.{"rank cursors"});
+    filtered_topk_step.dependOn(&run_ordered_rank_tests.step);
     const lake_refinement_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_refinement_bench_root.zig"),
         .target = target,

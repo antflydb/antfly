@@ -50,7 +50,7 @@ export class GateClient {
    if(!response.ok)throw Error('HTTP '+response.status+': '+(value.error??'unknown'));
    const version=response.headers.get('X-Antfly-Version');if(version!==this.run.version)throw Error('mixed version: '+version);
    const finished=Date.now(),sample={tenant,phase,op:input.op??path,ms:finished-scheduled,scheduled_at:scheduled,started_at:started,finished_at:finished,scheduling_delay_ms:Math.max(0,started-scheduled),execution_ms:finished-started,attempts:attempts+1,version,epoch};this.samples.push(sample);return{value,sample};
-  }throw Error('admission exhausted: '+JSON.stringify(last));}catch(error){this.errors.push({phase,tenant,ms:Date.now()-scheduled,attempts:Math.min(attempts+1,20),error:String(error)});throw error;}
+  }throw Error('admission exhausted: '+JSON.stringify(last));}catch(error){const code=error?.cause?.code??error?.code;this.errors.push({phase,tenant,ms:Date.now()-scheduled,attempts:Math.min(attempts+1,20),error:String(error),cause_code:typeof code==="string"&&/^[A-Z][A-Z0-9_]{0,63}$/.test(code)?code:undefined});throw error;}
  }
  body(tenant,id,text='seed '+id){return JSON.stringify({tenant,text,payload:'x'.repeat(1024)});}
  recordCommit(tenant,id,body,input,value){

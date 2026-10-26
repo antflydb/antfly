@@ -1516,3 +1516,33 @@ independently against its unmodified source/native artifacts. A correctness-only
 replacement and hashed evidence are prepared for review in
 [the control proposal](cloudflare-control-correctness.md). This is not permission
 to modify an existing frozen comparison or reinterpret its failed reports.
+
+Latest main was merged through `9d553bc925` in `f71498ec3f`, including the
+serverless/lake performance changes and `lake.read` naming. The sole conflict
+ported authenticated child pruning into the extracted shared ordered engine;
+lookahead does not speculate past arbitrary pruning hooks. Forward/reverse
+pruning and read-ahead regressions pass. Lake rank-cursor coverage now runs from
+its existing shared-engine test artifact with strict runtime selection.
+
+The rebuilt candidate passes 657 native tests (six skipped), 211 Node checks and
+all eleven persisted Worker checks. Both lake targets complete with 236 passes,
+one skip and no failures/leaks. The retained-cut fixture now verifies the full
+legacy payload and distinct native/legacy cache entries, then forces bounded
+private replay in a separate cold cache. It no longer assumes allocator layout
+must make an ordinary legacy replay uncacheable. A final focused replay check
+also passes; production cache quotas are unchanged.
+
+Both frozen ANN populations pass unchanged recall/GET/byte requirements with the
+new native artifacts. The refreshed 50,000-document, 384-dimensional, 1 KiB-body
+report passes all ten stages; sampled maximum linear memory is 27,525,120 bytes,
+working set 11,788,282 bytes and 871 operations per step. The 1,000-document
+reindex report also passes all eleven stages. These remain local native capacity
+measurements, not live Cloudflare latency qualification.
+
+The user approved the separate correctness-only control `21205a7021`, retaining
+the original native modules. Original-control reports and sealed bundles are
+archived before replacement. New comparisons use the app-local metadata profile
+and fresh paired corpus identities. Final live gate evidence is still required;
+all 300 reserved recovery epochs remain unused at this checkpoint. Transport
+failure reports retain only bounded symbolic cause codes, without copying
+headers or relaxing replay safety.
