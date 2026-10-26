@@ -29538,6 +29538,17 @@ fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std
         return try out.toOwnedSlice(alloc);
     }
 
+    // Signed inference grants are independent of table scope. Older hosts
+    // ignore this additive claim and fail closed for non-admin job owners.
+    if (payload.get("inference_operations")) |operations| {
+        if (operations != .array) return error.Unauthorized;
+        for (operations.array.items) |operation| {
+            const name = jsonStringValue(operation) orelse return error.Unauthorized;
+            const permission: usermgr.PermissionType = if (std.mem.eql(u8, name, "read")) .read else if (std.mem.eql(u8, name, "write")) .write else return error.Unauthorized;
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .inference, "*", permission));
+        }
+    }
+
     const tables_value = payload.get("tables");
     const operations_value = payload.get("operations");
     if (operations_value != null and operations_value.? == .array and operations_value.?.array.items.len > 0) {
@@ -59970,4 +59981,35 @@ test "trusted principal table operations preserve discovery hints without granti
     try std.testing.expect(clone.mcp_creation_discovery);
     try std.testing.expect(!permissionsAllow(clone.permissions, .table, "new_table", .admin));
     try std.testing.expect(!permissionsAllow(clone.permissions, .table, "antfly_sources", .admin));
+}
+
+test "trusted principal inference operations grant no table or administrative authority" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"inference_operations":["read","write"]}
+    , .{});
+    defer parsed.deinit();
+    const permissions = try trustedPrincipalPermissionsFromPayload(a, parsed.value.object);
+    defer freePermissions(a, permissions);
+    try std.testing.expect(permissionsAllow(permissions, .inference, "*", .read));
+    try std.testing.expect(permissionsAllow(permissions, .inference, "*", .write));
+    try std.testing.expect(!permissionsAllow(permissions, .inference, "*", .admin));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "docs", .read));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "docs", .write));
+}
+test "trusted principal inference operations reject malformed and expanded grants" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"inference_operations":"write"}
+        ,
+        \\{"inference_operations":["admin"]}
+        ,
+        \\{"inference_operations":["*"]}
+        ,
+        \\{"inference_operations":[7]}
+    }) |raw| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.Unauthorized, trustedPrincipalPermissionsFromPayload(a, parsed.value.object));
+    }
 }

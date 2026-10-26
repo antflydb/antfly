@@ -2141,7 +2141,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-index-http-test", "Run unified relational index CRUD and document index compatibility").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, relational_index_http_tests, &.{ "api http server unified relational index CRUD", "api http server serves table index metadata routes", "index maintenance actions require table admin permission" }).step);
-    const gateway_filters = &.{ "httpx inference gateway", "linked API route manifest", "api kernel includes inference gateway", "provider registry gateway", "httpx inference connection", "local inference connection admission", "internal service credentials cannot authorize public inference routes" };
+    const gateway_filters = &.{ "httpx inference gateway", "linked API route manifest", "api kernel includes inference gateway", "provider registry gateway", "httpx inference connection", "local inference connection admission", "internal service credentials cannot authorize public inference routes", "trusted principal inference operations" };
     const gateway_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = gateway_filters,
