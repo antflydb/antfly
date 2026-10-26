@@ -2209,6 +2209,7 @@ pub const ProvisionedTableWriteCache = struct {
     hit_count: std.atomic.Value(u64) = .init(0),
     miss_count: std.atomic.Value(u64) = .init(0),
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    lsm_selection: @import("maintenance_selection.zig").Policy = .{},
     retired_entries: std.ArrayListUnmanaged(*Entry) = .empty,
     closing_entries: std.ArrayListUnmanaged(*Entry) = .empty,
     table_metadata: std.ArrayListUnmanaged(TableMetadata) = .empty,
@@ -2300,6 +2301,7 @@ pub const ProvisionedTableWriteCache = struct {
     };
 
     const Entry = struct {
+        lsm_last_served: u64 = 0,
         group_id: u64,
         lsm_root_generation: u64,
         hot_standby_write_gate_generation: ?u64 = null,
@@ -3268,6 +3270,7 @@ pub const ProvisionedTableWriteCache = struct {
         };
         self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.runtime_hook_state);
         try owned_entry.db.activateResolverReplayRuntimes();
+        owned_entry.lsm_last_served = self.lsm_selection.epoch;
         try self.entries.append(self.alloc, owned_entry);
         // Artifact-issue mutations invalidate their compact status summary in
         // the same primary-store batch. Rebuild it on the stable, long-lived
@@ -3641,6 +3644,7 @@ pub const ProvisionedTableWriteCache = struct {
         try owned_entry.db.activateResolverReplayRuntimes();
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
+        owned_entry.lsm_last_served = self.lsm_selection.epoch;
         try self.entries.append(self.alloc, owned_entry);
         owned_entry.db.startResidentBackgroundWorkersIfNeeded();
         opened.* = null;
@@ -3701,6 +3705,7 @@ pub const ProvisionedTableWriteCache = struct {
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
 
         try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
+        owned_entry.lsm_last_served = self.lsm_selection.epoch;
         try self.entries.append(self.alloc, owned_entry);
         owned_entry.db.startResidentBackgroundWorkersIfNeeded();
     }
@@ -4150,21 +4155,58 @@ pub const ProvisionedTableWriteCache = struct {
         });
     }
 
-    fn leaseLsmMaintenanceEntryLocked(self: *ProvisionedTableWriteCache, comptime best_effort: bool) ?CachedDb {
-        var best_entry: ?*Entry = null;
-        var best_score: u64 = 0;
+    const LsmMaintenanceChoice = struct {
+        lease: CachedDb,
+        primary_only: bool,
+    };
+
+    const LsmSelectionMode = enum { all, shared_debt, primary_debt };
+
+    /// One eligibility pool for due work, shared debt and primary-only debt.
+    /// A separate due-first selector would bypass fair turns indefinitely.
+    fn leaseScheduledLsmMaintenanceLocked(
+        self: *ProvisionedTableWriteCache,
+        comptime best_effort: bool,
+        comptime mode: LsmSelectionMode,
+    ) ?LsmMaintenanceChoice {
+        const Policy = @import("maintenance_selection.zig").Policy;
+        var selected_entry: ?*Entry = null;
+        var selected_candidate: ?Policy.Candidate = null;
+        var primary_only = false;
         for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            if (entry.db.hasActiveDenseBulkWork()) continue;
-            const raw_score = if (best_effort) entry.db.lsmMaintenanceDebtHint() else entry.db.lsmMaintenanceScore();
-            const score = if (raw_score != 0) raw_score else versionPinnedObsoleteScore(entry);
-            if (score > best_score) {
-                best_score = score;
-                best_entry = entry;
+            const shared_due = if (mode == .all) blk: {
+                break :blk if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |ns| ns == 0 else false;
+            } else false;
+            const primary_due = if (mode == .all) blk: {
+                break :blk if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |ns| ns == 0 else false;
+            } else false;
+            // Existing local due cleanup remains eligible during bulk ingest;
+            // bulk sessions exclude score-based work, not due reclamation.
+            if (entry.bulk_ingest_session_open and !shared_due and !primary_due) continue;
+            const shared_score: u64 = if (!shared_due and !primary_due and mode != .primary_debt and !entry.db.hasActiveDenseBulkWork()) blk: {
+                const raw = if (best_effort) entry.db.lsmMaintenanceDebtHint() else entry.db.lsmMaintenanceScore();
+                break :blk if (raw != 0) raw else versionPinnedObsoleteScore(entry);
+            } else 0;
+            const primary_score = if (!shared_due and !primary_due and mode != .shared_debt) entry.db.primaryLsmMaintenanceDebtHint() else 0;
+            // Preserve the old lane preference on pressure turns. Due shared
+            // work can reclaim files even while dense replay suppresses scores.
+            const use_primary = !shared_due and (primary_due or shared_score == 0);
+            const candidate: Policy.Candidate = .{
+                .last_served = entry.lsm_last_served,
+                .score = if (use_primary) primary_score else shared_score,
+                .due = if (use_primary) primary_due else shared_due,
+                .priority = if (use_primary) 0 else 1,
+            };
+            if (self.lsm_selection.prefers(candidate, selected_candidate)) {
+                selected_entry = entry;
+                selected_candidate = candidate;
+                primary_only = use_primary;
             }
         }
-        if (best_score == 0) return null;
-        return self.leaseEntryLocked(best_entry.?);
+        const entry = selected_entry orelse return null;
+        const lease = self.leaseEntryLocked(entry);
+        self.lsm_selection.selected(&entry.lsm_last_served);
+        return .{ .lease = lease, .primary_only = primary_only };
     }
 
     fn versionPinnedObsoleteScore(entry: *Entry) u64 {
@@ -4172,30 +4214,12 @@ pub const ProvisionedTableWriteCache = struct {
         return if (stats.obsolete_paths_pinned_by_versions != 0) 1 else 0;
     }
 
-    fn leaseLsmMaintenanceDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
-        for (self.entries.items) |entry| {
-            if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                if (delay_ns == 0) return self.leaseEntryLocked(entry);
-            }
-        }
-        return null;
-    }
-
-    fn leasePrimaryLsmMaintenanceDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
-        for (self.entries.items) |entry| {
-            if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                if (delay_ns == 0) return self.leaseEntryLocked(entry);
-            }
-        }
-        return null;
-    }
-
     pub fn leaseLsmMaintenanceRoundLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
-        return self.leaseLsmMaintenanceEntryLocked(false);
+        return if (self.leaseScheduledLsmMaintenanceLocked(false, .shared_debt)) |choice| choice.lease else null;
     }
 
     pub fn leaseLsmMaintenanceRoundBestEffortLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
-        return self.leaseLsmMaintenanceEntryLocked(true);
+        return if (self.leaseScheduledLsmMaintenanceLocked(true, .shared_debt)) |choice| choice.lease else null;
     }
 
     pub fn maxLsmMaintenanceScoreLocked(self: *const ProvisionedTableWriteCache) u64 {
@@ -4246,22 +4270,11 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     pub fn leasePrimaryLsmMaintenanceRoundLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
-        var best_entry: ?*Entry = null;
-        var best_score: u64 = 0;
-        for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            const score = entry.db.primaryLsmMaintenanceDebtHint();
-            if (score > best_score) {
-                best_score = score;
-                best_entry = entry;
-            }
-        }
-        if (best_score == 0) return null;
-        return self.leaseEntryLocked(best_entry.?);
+        return if (self.leaseScheduledLsmMaintenanceLocked(false, .primary_debt)) |choice| choice.lease else null;
     }
 
     pub fn leasePrimaryLsmMaintenanceRoundBestEffortLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
-        return self.leasePrimaryLsmMaintenanceRoundLocked();
+        return if (self.leaseScheduledLsmMaintenanceLocked(true, .primary_debt)) |choice| choice.lease else null;
     }
 
     fn bulkIngestSessionActiveForTable(self: *const ProvisionedTableWriteCache, table_name: []const u8) bool {
@@ -4545,6 +4558,7 @@ pub const ProvisionedTableWriteCache = struct {
             try dest.entries.ensureUnusedCapacity(dest.alloc, 1);
             _ = self.entries.orderedRemove(i);
             entry.lsm_root_generation = dest_generation;
+            entry.lsm_last_served = dest.lsm_selection.epoch;
             dest.entries.appendAssumeCapacity(entry);
             moved += 1;
         }
@@ -15031,22 +15045,9 @@ pub const ProvisionedTableWriteSource = struct {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return .{};
-            if (cache.leaseLsmMaintenanceDueLocked()) |lease| break :blk lease;
-            if (cache.leasePrimaryLsmMaintenanceDueLocked()) |lease| {
-                primary_only = true;
-                break :blk lease;
-            }
-            if (cache.maxLsmMaintenanceScoreLocked() != 0) {
-                if (cache.leaseLsmMaintenanceRoundLocked()) |lease| break :blk lease;
-            }
-            // Dense replay can suppress index-LSM maintenance while the
-            // primary store independently accumulates debt. The blocking
-            // maintenance lane must retain the same primary-only fallback as
-            // the best-effort lane, otherwise a forced fair turn still does
-            // no work under sustained public ingestion.
-            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return .{};
-            primary_only = true;
-            break :blk cache.leasePrimaryLsmMaintenanceRoundLocked() orelse return .{};
+            const choice = cache.leaseScheduledLsmMaintenanceLocked(false, .all) orelse return .{};
+            primary_only = choice.primary_only;
+            break :blk choice.lease;
         };
         defer {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
@@ -15085,17 +15086,9 @@ pub const ProvisionedTableWriteSource = struct {
         var leased = blk: {
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return .{};
-            if (cache.leaseLsmMaintenanceDueLocked()) |lease| break :blk lease;
-            if (cache.leasePrimaryLsmMaintenanceDueLocked()) |lease| {
-                primary_only = true;
-                break :blk lease;
-            }
-            if (cache.maxLsmMaintenanceScoreLocked() != 0) {
-                if (cache.leaseLsmMaintenanceRoundBestEffortLocked()) |lease| break :blk lease;
-            }
-            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return .{};
-            primary_only = true;
-            break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return .{};
+            const choice = cache.leaseScheduledLsmMaintenanceLocked(true, .all) orelse return .{};
+            primary_only = choice.primary_only;
+            break :blk choice.lease;
         };
         defer {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
@@ -48647,6 +48640,95 @@ fn implementationTests() type {
             try std.testing.expect(!try write_cache.finishExpiredAutoBulkIngestLocked(idle_finish_ns + 1));
             const primary_after_recheck = write_cache.entries.items[0].*.db.snapshotPrimaryLsmWriteStatsForTest().?;
             try std.testing.expectEqual(primary_after_idle.manifest_writes, primary_after_recheck.manifest_writes);
+        }
+
+        test "maintenance selection local cache shares persistent due work with quieter debt" {
+            const Fixture = struct {
+                // Keep the DB's large open/close control flow out of the
+                // selector test's nested failure and cleanup paths.
+                noinline fn open(alloc: std.mem.Allocator, path: []const u8) !db_mod.DB {
+                    return db_mod.DB.open(alloc, path, .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+                }
+                noinline fn close(db: *db_mod.DB) void {
+                    db.close();
+                }
+            };
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            for ([_]bool{ false, true }) |best_effort| {
+                var cache = ProvisionedTableWriteCache.init(alloc);
+                defer cache.deinit();
+                var entries: [3]ProvisionedTableWriteCache.Entry = undefined;
+                var initialized: usize = 0;
+                defer {
+                    cache.entries.clearRetainingCapacity();
+                    for (entries[0..initialized]) |*entry| {
+                        std.debug.assert(entry.active_leases == 0);
+                        entry.db.source_pin_cleanup.epoch.store(0, .release);
+                        Fixture.close(&entry.db);
+                    }
+                }
+                for (&entries, 0..) |*entry, i| {
+                    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fair-{d}-{d}", .{ tmp.sub_path, @intFromBool(best_effort), i });
+                    defer alloc.free(path);
+                    entry.* = .{
+                        .group_id = i + 1,
+                        .lsm_root_generation = 1,
+                        .table_name = @constCast("docs"),
+                        .managed_config_fingerprint = @splat(0),
+                        .db = try Fixture.open(alloc, path),
+                        .bulk_ingest_session_open = i == 2,
+                    };
+                    initialized += 1;
+                    // Stable debt in the real DB probe, without executing a
+                    // storage step that would consume it between selections.
+                    entry.db.source_pin_cleanup.next_ns.store(if (i == 0) 0 else std.math.maxInt(u64), .release);
+                    entry.db.source_pin_cleanup.epoch.store(1, .release);
+                    try cache.entries.append(alloc, entry);
+                }
+                for (0..16) |turn| {
+                    {
+                        var choice = if (best_effort)
+                            cache.leaseScheduledLsmMaintenanceLocked(true, .all).?
+                        else
+                            cache.leaseScheduledLsmMaintenanceLocked(false, .all).?;
+                        defer choice.lease.deinit(alloc);
+                        try std.testing.expect(!choice.primary_only);
+                        try std.testing.expectEqual(@as(u64, if (turn % 2 == 0) 1 else 2), choice.lease.entry.?.group_id);
+                        for (entries) |entry| try std.testing.expectEqual(@as(usize, @intFromBool(entry.group_id == choice.lease.entry.?.group_id)), entry.active_leases);
+                    }
+                    for (entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.active_leases);
+                }
+                // Due reclamation retains its preexisting bulk-session
+                // eligibility and joins the same fair selection pool.
+                entries[2].db.source_pin_cleanup.next_ns.store(0, .release);
+                {
+                    var bulk_due = cache.leaseScheduledLsmMaintenanceLocked(true, .all).?;
+                    defer bulk_due.lease.deinit(alloc);
+                    try std.testing.expectEqual(@as(u64, 3), bulk_due.lease.entry.?.group_id);
+                    try std.testing.expect(!bulk_due.primary_only);
+                }
+                // Fresh LSMs conservatively publish a nonzero primary hint.
+                // That is eligible primary work, independent of our injected
+                // source-pin cleanup debt. Verify the primary-only lane and
+                // release its pin on every assertion path.
+                {
+                    var primary = cache.leaseScheduledLsmMaintenanceLocked(true, .primary_debt).?;
+                    defer primary.lease.deinit(alloc);
+                    try std.testing.expect(primary.primary_only);
+                    try std.testing.expect(primary.lease.db.primaryLsmMaintenanceDebtHint() != 0);
+                }
+                for (entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.active_leases);
+                const epoch = cache.lsm_selection.epoch;
+                // Score-based work remains excluded during bulk ingest. An
+                // empty eligibility pool consumes neither a pin nor a turn.
+                for (&entries) |*entry| entry.bulk_ingest_session_open = true;
+                var unexpected = cache.leaseScheduledLsmMaintenanceLocked(true, .primary_debt);
+                defer if (unexpected) |*choice| choice.lease.deinit(alloc);
+                try std.testing.expect(unexpected == null);
+                try std.testing.expectEqual(epoch, cache.lsm_selection.epoch);
+            }
         }
 
         test "maintenance lease batch releases all pins on every allocation failure" {

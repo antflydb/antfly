@@ -300,6 +300,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     mutex: std.atomic.Mutex = .unlocked,
     quiescing: bool = false,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    lsm_selection: @import("maintenance_selection.zig").Policy = .{},
     publications: std.ArrayListUnmanaged(*PendingPublication) = .empty,
     owner_cache_hits: std.atomic.Value(u64) = .init(0),
     owner_cache_misses: std.atomic.Value(u64) = .init(0),
@@ -464,6 +465,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     const LeaseAdmission = enum { shared, exclusive, exclusive_if_idle };
 
     const Entry = struct {
+        lsm_last_served: u64 = 0,
         group_id: u64,
         table_name: []u8,
         generation: u64,
@@ -512,6 +514,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     const Lease = struct {
         source: *ProvisionedKernelOwnerSource,
         entry: *Entry,
+        maintenance_last_served: u64 = 0,
         exclusive: bool = false,
         apply_only: bool = false,
         active: bool = true,
@@ -3141,9 +3144,22 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (entry.retired or entry.transient_retirement_pending or entry.exclusive_pending or
                 entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             entry.active_users += 1;
-            return .{ .source = self, .entry = entry };
+            return .{ .source = self, .entry = entry, .maintenance_last_served = entry.lsm_last_served };
         }
         return null;
+    }
+
+    const LsmSelection = struct {
+        limit: usize,
+        policy: @import("maintenance_selection.zig").Policy,
+    };
+
+    fn beginLsmSelection(self: *ProvisionedKernelOwnerSource, best_effort: bool) ?LsmSelection {
+        if (best_effort) {
+            if (!self.mutex.tryLock()) return null;
+        } else lock(&self.mutex);
+        defer self.mutex.unlock();
+        return .{ .limit = self.entries.items.len, .policy = self.lsm_selection };
     }
 
     fn selectedMaintenanceLease(
@@ -3151,6 +3167,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_name: []const u8,
         generation: u64,
+        selection: LsmSelection,
         best_effort: bool,
     ) ?Lease {
         if (best_effort) {
@@ -3159,12 +3176,16 @@ pub const ProvisionedKernelOwnerSource = struct {
             lock(&self.mutex);
         }
         defer self.mutex.unlock();
+        // Another round won while inspection was unlocked. Do not execute a
+        // stale fair-turn decision or hold registry ownership across storage I/O.
+        if (selection.policy.epoch != self.lsm_selection.epoch) return null;
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or entry.generation != generation or
                 !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.retired or entry.transient_retirement_pending or entry.exclusive_pending or
                 entry.exclusive_active or entry.bulk_ingest_active.load(.acquire)) return null;
             entry.active_users += 1;
+            self.lsm_selection.selected(&entry.lsm_last_served);
             return .{ .source = self, .entry = entry };
         }
         return null;
@@ -3175,15 +3196,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         best_effort: bool,
     ) !storage_maintenance_source.RoundResult {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const limit = self.maintenanceEntryLimit(best_effort) orelse return .{};
+        const selection = self.beginLsmSelection(best_effort) orelse return .{};
         var cursor: usize = 0;
         var selected_name: ?[]u8 = null;
         defer if (selected_name) |name| self.alloc.free(name);
         var selected_group_id: u64 = 0;
         var selected_generation: u64 = 0;
-        var selected_score: u64 = 0;
-        var selected_due = false;
-        while (self.nextMaintenanceLease(&cursor, limit, best_effort, true)) |borrowed| {
+        var selected_candidate: ?@import("maintenance_selection.zig").Policy.Candidate = null;
+        while (self.nextMaintenanceLease(&cursor, selection.limit, best_effort, true)) |borrowed| {
             var lease = borrowed;
             const status = lease.owner().maintenance(
                 lease.entry.table_name,
@@ -3193,28 +3213,26 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (best_effort) continue;
                 return err;
             };
-            const due = status.has_next_wake_delay != 0 and status.next_wake_delay_ns == 0;
-            if (due or status.maintenance_score != 0) {
-                if (selected_name == null or
-                    (due and !selected_due) or
-                    (due == selected_due and status.maintenance_score > selected_score))
-                {
-                    const name = self.alloc.dupe(u8, lease.entry.table_name) catch |err| {
-                        lease.deinit();
-                        return err;
-                    };
-                    if (selected_name) |previous| self.alloc.free(previous);
-                    selected_name = name;
-                    selected_group_id = lease.entry.group_id;
-                    selected_generation = lease.entry.generation;
-                    selected_score = status.maintenance_score;
-                    selected_due = due;
-                }
+            const candidate: @import("maintenance_selection.zig").Policy.Candidate = .{
+                .last_served = lease.maintenance_last_served,
+                .score = status.maintenance_score,
+                .due = status.has_next_wake_delay != 0 and status.next_wake_delay_ns == 0,
+            };
+            if (selection.policy.prefers(candidate, selected_candidate)) {
+                const name = self.alloc.dupe(u8, lease.entry.table_name) catch |err| {
+                    lease.deinit();
+                    return err;
+                };
+                if (selected_name) |previous| self.alloc.free(previous);
+                selected_name = name;
+                selected_group_id = lease.entry.group_id;
+                selected_generation = lease.entry.generation;
+                selected_candidate = candidate;
             }
             lease.deinit();
         }
         const name = selected_name orelse return .{};
-        var selected = self.selectedMaintenanceLease(selected_group_id, name, selected_generation, best_effort) orelse return .{};
+        var selected = self.selectedMaintenanceLease(selected_group_id, name, selected_generation, selection, best_effort) orelse return .{};
         defer selected.deinit();
         const lease = &selected;
         const result = try lease.owner().maintenance(
@@ -4674,6 +4692,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .exclusive_pending = false,
             .exclusive_active = exclusive,
         };
+        entry.lsm_last_served = self.lsm_selection.epoch;
         self.entries.appendAssumeCapacity(entry);
         _ = self.owner_cache_misses.fetchAdd(1, .monotonic);
         return .{ .source = self, .entry = entry, .exclusive = exclusive };
@@ -9365,4 +9384,71 @@ test "storage owner entity sink bridge preserves curation capability and missing
     const entries = [_]abi.EntityUpsert{.{ .table = .fromSlice("entities"), .storage_table = .fromSlice("table:7"), .key = .fromSlice("entity/retired"), .doc_json = .fromSlice("{}"), .skip_if_missing = 1 }};
     try std.testing.expectEqual(abi.Status.ok, hooks.entity_sink.upsert_batch_fn.?(hooks.entity_sink.callback_ctx, &entries, entries.len));
     try std.testing.expect(fixture.seen);
+}
+
+test "maintenance selection production owner dispatch shares due turns and releases every pin" {
+    const root = @import("antfly_source_root");
+    if (comptime !@hasDecl(root, "MaintenanceSelectionProbe")) return error.SkipZigTest;
+    const Source = ProvisionedKernelOwnerSource;
+    for ([_]bool{ false, true }) |best_effort| {
+        var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer source.entries.deinit(std.testing.allocator);
+        var probes = [_]root.MaintenanceSelectionProbe{
+            .{ .score = std.math.maxInt(u64), .due = true },
+            .{ .score = 1 },
+            .{ .due = true },
+            .{ .score = std.math.maxInt(u64), .due = true },
+        };
+        var entries: [4]Source.Entry = undefined;
+        const names = [_][]const u8{ "hot", "cold", "due", "bulk" };
+        for (&entries, &probes, names, 0..) |*entry, *probe, name, i| {
+            entry.* = .{
+                .group_id = i + 1,
+                .table_name = @constCast(name),
+                .generation = 1,
+                .identity = .{ .table_id = i + 1, .shard_id = i + 1, .range_id = i + 1 },
+                .schema_json = @constCast("{}"),
+                .indexes_json = @constCast("{}"),
+                .restore_bootstrap_json = @constCast(""),
+                .initial_child_bootstrap_json = @constCast(""),
+                .owner = .{ .handle = @ptrCast(probe) },
+                .resident = true,
+                .bulk_ingest_active = .init(i == 3),
+            };
+            try source.entries.append(std.testing.allocator, entry);
+        }
+        var gaps: [3]usize = @splat(0);
+        for (0..48) |turn| {
+            const result = try Source.runLsmMaintenanceRound(&source, best_effort);
+            const chosen = result.group_id.? - 1;
+            try std.testing.expect(chosen < gaps.len);
+            if (turn % 2 == 0) try std.testing.expectEqual(@as(u64, 0), chosen);
+            for (&gaps, 0..) |*gap, i| {
+                gap.* = if (i == chosen) 0 else gap.* + 1;
+                try std.testing.expect(gap.* < 2 * gaps.len);
+            }
+            for (entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+        }
+        try std.testing.expectEqual(@as(usize, 0), probes[3].inspections);
+        try std.testing.expectEqual(@as(usize, 0), probes[3].steps);
+        probes[0].fail_step = true;
+        try std.testing.expectError(error.StorageBusy, Source.runLsmMaintenanceRound(&source, best_effort));
+        try std.testing.expect((try Source.runLsmMaintenanceRound(&source, best_effort)).group_id.? != 1);
+        for (entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+        const epoch = source.lsm_selection.epoch;
+        try std.testing.expect(source.mutex.tryLock());
+        const busy = try Source.runLsmMaintenanceRound(&source, true);
+        source.mutex.unlock();
+        try std.testing.expect(busy.group_id == null);
+        try std.testing.expectEqual(epoch, source.lsm_selection.epoch);
+
+        // A concurrent winner invalidates this scan's scheduling snapshot.
+        const snapshot = source.beginLsmSelection(false).?;
+        var first = source.selectedMaintenanceLease(2, "cold", 1, snapshot, false).?;
+        defer first.deinit();
+        try std.testing.expect(source.selectedMaintenanceLease(3, "due", 1, snapshot, false) == null);
+        try std.testing.expectEqual(epoch + 1, source.lsm_selection.epoch);
+        try std.testing.expectEqual(@as(usize, 1), entries[1].active_users);
+        try std.testing.expectEqual(@as(usize, 0), entries[2].active_users);
+    }
 }

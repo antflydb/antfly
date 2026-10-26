@@ -3861,6 +3861,45 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-controlled-service-lock-test", "Verify service lock waits release CPU and preserve original lifetime and lock ownership")
         .dependOn(&b.addRunArtifact(controlled_service_lock_tests).step);
 
+    const maintenance_selection_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/maintenance_selection_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, maintenance_selection_root, true, true);
+    maintenance_selection_root.addImport("antfly_source_root", maintenance_selection_root);
+    const maintenance_selection_tests = b.addTest(.{
+        .name = "maintenance-selection-tests",
+        .root_module = maintenance_selection_root,
+        .filters = &.{ "maintenance selection bounds", "maintenance selection new owners", "maintenance selection production owner" },
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const maintenance_selection_run = b.addRunArtifact(maintenance_selection_tests);
+    maintenance_selection_run.addArg("--require-no-skips");
+    b.step("antfly-maintenance-selection-test", "Verify due and debt work share bounded fair turns through the owner registry")
+        .dependOn(&maintenance_selection_run.step);
+
+    const maintenance_selection_local_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/maintenance_selection_local_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, maintenance_selection_local_root, true, true);
+    maintenance_selection_local_root.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    maintenance_selection_local_root.addImport("antfly_source_root", maintenance_selection_local_root);
+    const maintenance_selection_local_tests = b.addTest(.{
+        .name = "maintenance-selection-local-tests",
+        .root_module = maintenance_selection_local_root,
+        .filters = &.{"maintenance selection local cache"},
+        .max_rss = @as(usize, 12) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const maintenance_selection_local_run = b.addRunArtifact(maintenance_selection_local_tests);
+    maintenance_selection_local_run.addArg("--require-no-skips");
+    b.step("antfly-maintenance-selection-local-test", "Verify due/debt fairness and lease accounting against real local DB probes")
+        .dependOn(&maintenance_selection_local_run.step);
+
     const owner_close_retirement_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/owner_close_retirement_test_root.zig"),
         .target = target,

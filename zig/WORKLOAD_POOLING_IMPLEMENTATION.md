@@ -4,6 +4,54 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Maintenance table selection (2026-10-25)
+
+Both production maintenance selectors now alternate pressure-priority selection
+with oldest-served selection. The typed storage owner source uses its existing
+inspection/dispatch ABI; the local DB cache puts due work, shared debt and the
+primary-only fallback into one eligibility pool. A separate due-first scan can no
+longer consume every round ahead of quieter debt. Pressure turns retain due-work
+and shared/primary lane preference; equally ranked owners also rotate by age.
+Bulk-ingest exclusions and existing physical owner leases remain in force;
+local due reclamation retains its preexisting eligibility during bulk sessions.
+
+Each registry owns one counter and each entry one last-service stamp. New entries
+and entries transferred between local caches join at the destination's current
+counter. Attempts count even when storage reports no progress or fails. For a
+stable set of N continuously observed eligible owners, oldest-served turns give
+each owner an attempt within 2N selections while reserving half the selections for
+pressure priority. This is a selection-count guarantee, not a physical duration
+or CPU-quantum guarantee. Busy/unobserved owners and registry mutation remain
+subject to the existing probe and scan behavior.
+
+The typed source inspects one pinned owner at a time, releases inspection pins,
+then revalidates the chosen generation and exclusion flags under the registry
+mutex. A concurrent winning round invalidates the scan's counter snapshot.
+Only a validated selected lease advances the counter; storage runs after the
+mutex is released. The local cache selects and pins under its existing local
+registry lock, then runs storage after unlocking. No new wait queue, retained
+request payload, durable format or maintenance wire method is introduced.
+
+Focused Debug and ReleaseFast qualification passes the policy's persistent
+hot/due debt, arrival and counter-wrap cases, production typed dispatch with
+deterministic owner replies, and actual local DB probes and lease accounting,
+with zero skips, failures or leaks. The physical fixture preserves conservative
+startup primary hints and releases every selection lease on assertion failure.
+The optimized build completes 70/70 steps; all four boundary companions pass.
+The dedicated targets are `antfly-maintenance-selection-test` and
+`antfly-maintenance-selection-local-test`. The three final receipts
+`maintenance-fair-selection-v5-fast`, `maintenance-fair-selection-v5-debug`, and
+`maintenance-fair-selection-v5-local-debug` bind the same 5758 native/schema
+inputs to the final sources. Interrupted and failing fixture attempts remain
+separate from this evidence.
+
+The full workload design remains open. Original admission must still reach the
+normal production maintenance driver; retained builders need integration with
+registered publication roots, durable manifest/WAL completion and recovery.
+These selectors do not establish that a whole physical maintenance step yields
+within bounded runnable quanta or that every engine satisfies the full default
+overload and fairness contract. Full GNU/Linux qualification remains waived.
+
 ## Canonical prepared replay key plans (2026-10-20)
 
 Source `4c8ab4ee1a7143dc0e06b1e887475e7b0cb5afb7` derives replay wire costs and owned physical document-prefix
