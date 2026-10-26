@@ -2359,19 +2359,30 @@ Configured aliases and live native redirects compose at a pinned namespace head.
 A prepared immutable context indexes distinct pairs by effective canonical
 component and is keyed by profile identity plus qualified native graph lineage. Warm
 reads follow only requested/incident paths; unrelated pinned aliases do not
-trigger forward qualification. A cold context reads the graph once in bounded
-sequential pages outside writer ownership. The shared cache is limited to 64 MiB
+trigger forward qualification. An immutable static profile base is loaded once; graph overlays retain its maps
+and node postings and compile only native records plus affected static
+predecessors. Cold overlays read native graph pages outside writer ownership.
+The shared cache assigns 48 MiB to bases/overlays and 16 MiB to routing
 with access-based byte-budgeted eviction and reference-counted leases across
 pages. Identical concurrent misses share a build; conservative build reservations
 prevent graph compilation under cache pressure. Idle LRU entries are reclaimed
 before denying admission; active payloads remain charged through their last
-lease even after retention eviction. A separate derived graph stamp
+lease even after retention eviction. Dependencies keep bases discoverable and
+charge shared payload once; reclaiming idle overlays releases their bases.
+A separate derived graph stamp
 preserves reuse through text/provenance edits while the complete namespace head
 still fences publication. Legacy or mismatched stamps use full lineage.
 
 Oversized or unadmitted graphs use pin-directed queries over immutable profile
 node/component postings and sparse native pin counts. Native edit intersections
-identify components redirected into the requested roots. Only matched pin-bearing
+identify components redirected into the requested roots. Roots absent from both
+the static domain and native incoming directory skip this intersection while
+retaining their own pins. A bounded root-to-component projection reuses the
+intersection across pages and pin edits. Its SHA-256 key includes profile identity
+and a redirect/removal signature; the optional head-qualified `query-routing`
+stamp falls back to full lineage after legacy writes or restore. Compilation
+reserves 12 MiB, bounds scratch at 8 MiB and raw route data at 1 MiB; budget or
+scratch exhaustion retains the exact indexed join. Only matched pin-bearing
 nodes need effective forward qualification and native pin-child traversal;
 unpinned reverse alias branches are never visited. Returned facts and forward
 path limits match the compiled query path. Embedded and routed adapters share

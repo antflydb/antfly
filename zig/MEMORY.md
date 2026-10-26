@@ -2441,10 +2441,13 @@ identity, namespace template and a separate graph fingerprint.
 It indexes distinct pairs by their effective canonical endpoints, after native
 overrides and removal tombstones are applied. A query looks up only its canonical
 components and loads their forward policy paths; unrelated pinned aliases never
-become query seeds. Static maps can be reused independently of mutable heads for
-rendering or namespaces without pins.
+become query seeds. Each immutable profile has one leased base containing static maps and node
+postings. Native graph versions retain that base and compile only native changes,
+pins and the affected static predecessor frontier. Unchanged components resolve
+through the base; no profile-sized map is copied for a new graph generation.
 
-The shared cache retains at most 64 MiB including charged entry overhead, with
+The shared cache has 48 MiB for profile bases and graph overlays plus 16 MiB
+for component routing, including charged entry overhead, with
 byte-budgeted access-based eviction rather than a fixed entry count. Sixty-four
 yielding build-lock stripes coalesce identical cold misses; directory locks cover
 only lookup/publication and eviction reclamation runs outside them. Conservative
@@ -2452,10 +2455,13 @@ compilation reservations account for concurrent builds before graph I/O. Admissi
 reclaims idle LRU entries before denying a reservation. Retention and live payload
 charges are separate: evicted contexts remain charged until their final lease
 releases them, and their accounting object survives cache teardown. Payload
-reclamation remains outside the directory lock.
+reclamation remains outside the directory lock. Dependent overlays keep their
+base discoverable and alive; its payload is charged once. Reclaiming idle
+overlays makes an otherwise unused base eligible for reclamation.
 Preparation reads only redirect, removed-alias and distinct records in bounded sequential pages,
 inside a read snapshot and outside writer leases. This cold compilation costs
-O(static aliases + native graph + pins) once per retained profile/graph; warm
+O(static aliases) once per retained profile, then O(native graph + pins +
+affected static predecessors) per retained graph version; warm
 pages do not rescan or recompile that state. Reference-counted leases keep active
 pages valid through eviction; response data is copied out before releasing the
 lease. Zero-fingerprint legacy heads cannot qualify a shared composed entry.
@@ -2473,12 +2479,30 @@ budget select pin-directed indexed reads before native graph compilation. Source
 enrollment atomically publishes immutable profile-node postings both by node hash
 and by static canonical component, with an explicit readiness marker. Native
 redirect/removal postings identify which static components can feed a requested
-root. Ordered seeks intersect only those component nodes with propagated native
+root. A root absent from the static domain and native incoming directory cannot
+have other identities feeding it; it skips global edit discovery while still
+reading its own pins. A bounded immutable root-to-component routing projection
+reuses the edit intersection across pages. Its SHA-256 key includes the profile
+and a direction-only native signature, so pin/provenance edits preserve routing.
+The optional `query-routing` record is qualified by the complete head; stale or
+missing records use full lineage. Routing compilation reserves 12 MiB, uses
+8 MiB bounded scratch, and caps raw frozen route data at 1 MiB. Admission or
+scratch exhaustion selects the exact indexed join instead of partial routing.
+Ordered seeks intersect only those component nodes with propagated native
 pin counts; native pin-child postings then discover incident distinct pairs.
 Unpinned reverse alias branches never become query seeds. Effective forward
 qualification preserves native override/removal precedence and handles edges
 crossing static components. Only requested and incident forward paths consume the
 same traversal allowance as the compiled path, independent of cache state.
+
+Regression qualification retains 5,000 aliases across ten graph versions with
+one profile load and 60,584 bytes of combined overlay arenas (the earlier full
+context builds used 78,581,860 bytes). A root with its own pin and no incoming
+identity takes 31 reads and four seeks at both 100 and 1,000 unrelated edits.
+Warm routing takes 12 reads and six/seven seeks respectively. Redirect changes
+invalidate routing immediately, pin-only changes reuse it, and stale optional
+stamps fall back to the complete head. Two hundred randomized valid forests
+with 800 compiled/indexed comparisons return identical pin facts.
 
 Both adapters share this operation. Routed queries use persistent profile-node
 postings; embedded phases use their immutable in-memory node index. Older

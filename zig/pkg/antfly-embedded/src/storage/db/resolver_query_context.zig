@@ -63,8 +63,12 @@ pub const NodeIndex = struct {
         return if (lo == nodes.len) null else nodes[lo];
     }
 };
+pub const Route = struct { root: []const u8, component: []const u8 };
 pub const Graph = struct {
-    aliases: []const resolver.KeyAlias,
+    routes: []const Route = &.{},
+    aliases: []const resolver.KeyAlias = &.{},
+    base: ?Lease = null,
+    shared_profile: bool = false,
     native_aliases: []const resolver.KeyAlias = &.{},
     removed: []const []const u8 = &.{},
     pairs: []const resolver.curation.Pair = &.{},
@@ -79,8 +83,19 @@ const Budget = struct {
         if (self.references.fetchSub(1, .acq_rel) == 1) self.allocator.destroy(self);
     }
 };
+pub const Redirects = struct {
+    local: resolver.curation.RedirectIndex,
+    base: ?*const Context = null,
+    pub fn canonical(self: Redirects, key: []const u8) []const u8 {
+        if (self.local.canonical_keys.get(key)) |known| return known;
+        return if (self.base) |base| base.redirects.canonical(key) else key;
+    }
+};
 pub const Context = struct {
     references: std.atomic.Value(usize) = .init(1),
+    dependents: std.atomic.Value(usize) = .init(0),
+    base: ?Lease = null,
+    shared_profile: bool = false,
     arena: std.heap.ArenaAllocator,
     key: [32]u8,
     accounting: ?*Budget = null,
@@ -93,43 +108,102 @@ pub const Context = struct {
     nodes: NodeIndex,
     native_targets: std.StringHashMapUnmanaged([]const u8) = .empty,
     removed: std.StringHashMapUnmanaged(void) = .empty,
-    redirects: resolver.curation.RedirectIndex,
+    redirects: Redirects,
     pins: std.StringHashMapUnmanaged(std.ArrayList(resolver.curation.Pair)) = .empty,
+    routes: []const Route = &.{},
+    pub fn routesFor(self: *const Context, root: []const u8) []const Route {
+        var lo: usize = 0;
+        var hi = self.routes.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.lessThan(u8, self.routes[mid].root, root)) lo = mid + 1 else hi = mid;
+        }
+        const first = lo;
+        while (lo < self.routes.len and std.mem.eql(u8, self.routes[lo].root, root)) lo += 1;
+        return self.routes[first..lo];
+    }
     fn release(self: *Context) void {
         if (self.references.fetchSub(1, .acq_rel) == 1) {
             const owner = self.arena.child_allocator;
             const budget = self.accounting;
             const charged = self.charged;
+            const base = self.base;
             self.arena.deinit();
             owner.destroy(self);
             if (budget) |accounting| {
                 _ = accounting.live.fetchSub(charged, .acq_rel);
                 accounting.release();
             }
+            if (base) |parent| {
+                _ = @constCast(parent.context).dependents.fetchSub(1, .acq_rel);
+                parent.release();
+            }
         }
     }
-    fn build(owner: A, key: [32]u8, loader: Loader) !*Context {
+    fn build(owner: A, cache_key: [32]u8, loader: Loader) !*Context {
         var arena = std.heap.ArenaAllocator.init(owner);
         errdefer arena.deinit();
         const a = arena.allocator();
         const graph = try loader.load(loader.ptr, a);
-        const nodes = try NodeIndex.init(a, graph.aliases);
-        var statics: std.StringHashMapUnmanaged([]const u8) = .empty;
+        const base = if (graph.base) |lease| lease.dependency() else null;
+        errdefer if (base) |parent| {
+            _ = @constCast(parent.context).dependents.fetchSub(1, .acq_rel);
+            parent.release();
+        };
+        const nodes = if (base) |parent| parent.context.nodes else try NodeIndex.init(a, graph.aliases);
+        var statics: std.StringHashMapUnmanaged([]const u8) = if (base) |parent| parent.context.static_targets else .empty;
+        var reverse: std.StringHashMapUnmanaged(std.ArrayList(resolver.KeyAlias)) = if (base) |parent| parent.context.static_reverse else .empty;
         var natives: std.StringHashMapUnmanaged([]const u8) = .empty;
         var removed: std.StringHashMapUnmanaged(void) = .empty;
-        var reverse: std.StringHashMapUnmanaged(std.ArrayList(resolver.KeyAlias)) = .empty;
-        for (graph.aliases) |alias| {
+        if (base == null) for (graph.aliases) |alias| {
             try statics.put(a, alias.key, alias.target);
             const entry = try reverse.getOrPut(a, alias.target);
             if (!entry.found_existing) entry.value_ptr.* = .empty;
             try entry.value_ptr.append(a, alias);
-        }
+        };
         for (graph.native_aliases) |alias| try natives.put(a, alias.key, alias.target);
         for (graph.removed) |id| try removed.put(a, id, {});
-        var effective: std.ArrayList(resolver.KeyAlias) = .empty;
-        for (graph.aliases) |alias| if (!natives.contains(alias.key) and !removed.contains(alias.key)) try effective.append(a, alias);
-        try effective.appendSlice(a, graph.native_aliases);
-        const redirects = try resolver.curation.RedirectIndex.init(a, effective.items);
+        var redirects: Redirects = undefined;
+        if (base) |parent| {
+            var affected: std.StringHashMapUnmanaged(void) = .empty;
+            var pending: std.ArrayList([]const u8) = .empty;
+            for (graph.native_aliases) |alias| try pending.append(a, alias.key);
+            try pending.appendSlice(a, graph.removed);
+            var offset: usize = 0;
+            while (offset < pending.items.len) : (offset += 1) {
+                const id = pending.items[offset];
+                if ((try affected.getOrPut(a, id)).found_existing) continue;
+                if (parent.context.static_reverse.get(id)) |incoming| for (incoming.items) |edge| try pending.append(a, edge.key);
+            }
+            var local: resolver.curation.RedirectIndex = .{ .source = graph.native_aliases };
+            var visiting: std.StringHashMapUnmanaged(void) = .empty;
+            var path: std.ArrayList([]const u8) = .empty;
+            var iterator = affected.keyIterator();
+            while (iterator.next()) |start| {
+                path.clearRetainingCapacity();
+                var key = start.*;
+                const terminal = walk: while (true) {
+                    if (local.canonical_keys.get(key)) |known| break :walk known;
+                    if (!affected.contains(key)) break :walk parent.context.redirects.canonical(key);
+                    if ((try visiting.getOrPut(a, key)).found_existing) return error.InvalidResolverAliasCycle;
+                    try path.append(a, key);
+                    if (natives.get(key)) |target| key = target else {
+                        if (removed.contains(key)) break :walk key;
+                        key = statics.get(key) orelse break :walk key;
+                    }
+                };
+                for (path.items) |id| {
+                    try local.canonical_keys.put(a, id, terminal);
+                    _ = visiting.remove(id);
+                }
+            }
+            redirects = .{ .local = local, .base = parent.context };
+        } else {
+            var effective: std.ArrayList(resolver.KeyAlias) = .empty;
+            for (graph.aliases) |alias| if (!natives.contains(alias.key) and !removed.contains(alias.key)) try effective.append(a, alias);
+            try effective.appendSlice(a, graph.native_aliases);
+            redirects = .{ .local = try resolver.curation.RedirectIndex.init(a, effective.items) };
+        }
         var pins: std.StringHashMapUnmanaged(std.ArrayList(resolver.curation.Pair)) = .empty;
         for (graph.pairs) |pair| {
             const from = redirects.canonical(pair.from);
@@ -142,12 +216,17 @@ pub const Context = struct {
             }
         }
         const result = try owner.create(Context);
-        result.* = .{ .arena = arena, .key = key, .composed = graph.composed, .static_reverse = reverse, .static_targets = statics, .nodes = nodes, .native_targets = natives, .removed = removed, .redirects = redirects, .pins = pins };
+        result.* = .{ .arena = arena, .key = cache_key, .base = base, .shared_profile = graph.shared_profile, .composed = graph.composed, .static_reverse = reverse, .static_targets = statics, .nodes = nodes, .native_targets = natives, .removed = removed, .redirects = redirects, .pins = pins, .routes = graph.routes };
         return result;
     }
 };
 pub const Lease = struct {
     context: *const Context,
+    fn dependency(self: Lease) Lease {
+        _ = @constCast(self.context).references.fetchAdd(1, .monotonic);
+        _ = @constCast(self.context).dependents.fetchAdd(1, .monotonic);
+        return self;
+    }
     pub fn release(self: Lease) void {
         @constCast(self.context).release();
     }
@@ -285,33 +364,54 @@ pub const Cache = struct {
         self.mutex.unlock();
         if (!cacheable or bytes > self.budget_bytes) return .{ .context = context };
         self.lock();
+        while (self.bytes + bytes > self.budget_bytes) {
+            var candidate = self.oldest;
+            const victim = while (candidate) |item| : (candidate = item.next) {
+                if (item.dependents.load(.acquire) != 0) continue;
+                if (item.shared_profile and item.references.load(.acquire) > 1) continue;
+                break item;
+            } else {
+                self.mutex.unlock();
+                return .{ .context = context };
+            };
+            self.unlink(victim);
+            _ = self.entries.remove(victim.key);
+            self.bytes -= weight(victim);
+            self.mutex.unlock();
+            // Dropping an idle overlay may make its shared base reclaimable.
+            victim.release();
+            self.lock();
+        }
         self.entries.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.mutex.unlock();
             return err;
         };
-        var retired: ?*Context = null;
-        while (self.bytes + bytes > self.budget_bytes) {
-            const victim = self.oldest.?;
-            self.unlink(victim);
-            _ = self.entries.remove(victim.key);
-            self.bytes -= weight(victim);
-            victim.next = retired;
-            retired = victim;
-        }
         self.entries.putAssumeCapacity(key, context);
         self.touch(context);
         self.bytes += bytes;
         _ = context.references.fetchAdd(1, .monotonic);
         self.mutex.unlock();
-        // Reclaim potentially large arenas without blocking directory hits.
-        while (retired) |victim| {
-            retired = victim.next;
-            victim.release();
-        }
         return .{ .context = context };
     }
 };
-var shared: Cache = .{};
+// One decoded-index budget: immutable bases/overlays and routing have separate
+// admission lanes, so a fully leased graph tier can still warm a tiny route.
+var shared: Cache = .{ .budget_bytes = 48 * 1024 * 1024 };
+var routing: Cache = .{ .budget_bytes = 16 * 1024 * 1024 };
+pub const RoutingScratch = struct {
+    bytes: []u8,
+    pub fn init() !RoutingScratch {
+        return .{ .bytes = try heap.alloc(u8, 8 * 1024 * 1024) };
+    }
+    pub fn deinit(self: RoutingScratch) void {
+        heap.free(self.bytes);
+    }
+};
+pub fn tryRouting(key: [32]u8, loader: Loader) !?Lease {
+    var bounded = loader;
+    bounded.estimated_bytes = 12 * 1024 * 1024; // 8 MiB scratch + <=4 MiB frozen data.
+    return routing.tryAcquire(key, true, bounded);
+}
 pub fn acquire(key: [32]u8, cacheable: bool, loader: Loader) !Lease {
     return shared.acquire(key, cacheable, loader);
 }
@@ -488,4 +588,38 @@ test "native resolver authority estimated admission reclaims idle contexts and a
     const fourth = (try cache.tryAcquire(@splat(4), true, .{ .ptr = &unused, .load = Empty.load, .estimated_bytes = charge })).?;
     defer fourth.release();
     try std.testing.expectEqual(charge * 2, cache.accounting.?.live.load(.acquire));
+}
+
+test "native resolver authority overlays share profile ownership through allocation failures and eviction" {
+    const Fixture = struct {
+        base: Lease,
+        fn profile(_: *anyopaque, a: A) !Graph {
+            const aliases = try a.alloc(resolver.KeyAlias, 2);
+            aliases[0] = .{ .key = "a", .target = "b" };
+            aliases[1] = .{ .key = "b", .target = "root" };
+            return .{ .aliases = aliases, .shared_profile = true };
+        }
+        fn overlay(ptr: *anyopaque, _: A) !Graph {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .base = self.base, .composed = true, .native_aliases = &.{.{ .key = "b", .target = "moved" }}, .pairs = &.{.{ .from = "a", .to = "other" }} };
+        }
+        fn run(a: A) !void {
+            var local: Cache = .{ .allocator = a };
+            defer local.deinit();
+            var unused: u8 = 0;
+            const base = try local.acquire(@splat(61), true, .{ .ptr = &unused, .load = profile });
+            defer base.release();
+            var fixture: @This() = .{ .base = base };
+            const child = try local.acquire(@splat(62), true, .{ .ptr = &fixture, .load = overlay });
+            defer child.release();
+            try std.testing.expect(base.context.nodes.nodes.ptr == child.context.nodes.nodes.ptr);
+            try std.testing.expectEqual(@as(usize, 1), base.context.dependents.load(.acquire));
+            try std.testing.expectEqualStrings("moved", child.context.redirects.canonical("a"));
+            try std.testing.expectEqualStrings("root", base.context.redirects.canonical("a"));
+            try std.testing.expectEqual(@as(usize, 1), child.context.pins.get("moved").?.items.len);
+            local.deinit();
+            try std.testing.expectEqualStrings("moved", child.context.redirects.canonical("a"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
