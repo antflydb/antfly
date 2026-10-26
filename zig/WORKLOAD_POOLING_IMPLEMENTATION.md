@@ -29396,3 +29396,61 @@ immutable retirement, two pin-index, four durable checkpoint, four WAL and four
 publication cases pass. The 4/45/1/8 boundary companions and five native ABI cases
 also pass. No final case fails, skips or leaks. Legacy writer pin/parent cleanup
 and production/default integration remain open; the full goal remains active.
+
+
+## Admitted legacy writer and complete root retirement (2026-10-26)
+
+Legacy writer version pins now use the existing bounded run-pin registry instead
+of a string-map destructor. Mounted canonical writers retain an actual stable
+pin token in their payload; binding validates the issuer and path before the
+fixed slot/flag transfer. Release drops that token without hashing or locking.
+Legacy joined registration/release remain bootstrap compatibility paths; funded
+admitted production opening is still required before default rollout.
+
+Writer tree entries now own an incremental retirement cursor. A final legacy
+payload uses workspace prepaid at construction, validates its actual physical
+producer, and runs saved version/snapshot-registry forget operations under the
+original port. Forget operations require a zero construction bound and allocate
+no new registry metadata. Invalidated plans stop and retire their exact saved
+borrows before retry. Physical metadata/state/filter/index cleanup uses the
+existing bounded snapshot cursor. A completed shared-memory header is never
+re-inspected on retry. The physical payload header has a 16 KiB compile-time
+limit and is freed before its accounting charge returns.
+
+Revision cleanup owns only the child's private file caches; metadata and memory
+state remain with the retained parent. Parent references transfer to the same
+cursor one at a time, preventing recursive physical destruction. Staged, unadopted
+inputs keep their producer ownership. Generic registered-writer drops remain
+fixed/non-final. Unknown physical producers refuse admitted retirement before
+calling an opaque destructor; their explicit joined fallback remains available.
+
+QuiescedLegacyRootMigration.retireOldRootsWithAdmission now consumes the complete
+displaced writer/directory/ledger root set off-lock. Abort joins the exact partial
+writer cursor. The startup caller still excludes Backend access and accounting
+until deinit. Native/storage-owner ABIs are 146/206; public API ABI and durable
+formats are unchanged. This does not activate the normal maintenance driver.
+Memory-run import, funded/admitted opening and legacy global-registry accounting,
+normal original-Port forwarding and overload qualification remain required.
+The full design remains incomplete and full Linux qualification stays waived.
+
+Six focused cases cover real migrated native SST/version-pin cleanup; every
+recorded writer original rejection with retry and joined abort; staged input,
+retained/final parent and shared-memory ownership; long metadata and private
+filters; actual pin issuer/path rejection; forced peer invalidation of a saved
+registry borrow; and refusal of an unknown producer before its joined callback.
+Owned allocations remain disabled through migration retirement and abort.
+
+The registered-writer removal contract remains one structural node credit for a
+non-final drop. The entry cursor claims that atomic reference in init; only a
+final physical owner waits for subsequent work credits. The first broader probe
+caught the delayed-drop mismatch in registered root removal and checkpoint
+preparation; existing publication/checkpoint regressions cover the correction.
+
+Final bounded-writer-retirement-v5-fast and -debug receipts pass all five
+commands and 100/100 native build steps each against identical current
+5,762-input maps. Six writer, four directory/ledger, six migration, seven snapshot,
+four immutable retirement, two pin-index, four durable checkpoint, four WAL and
+four publication cases pass. The 4/45/1/8 boundary companions and five native ABI
+cases also pass. No final case fails, skips or leaks. The complete displaced
+root set can now retire under original admission; startup quiescence/join remains
+required. Production/default integration and the full goal remain incomplete.

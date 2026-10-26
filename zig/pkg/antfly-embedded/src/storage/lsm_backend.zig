@@ -131,43 +131,9 @@ else
 
 var file_pin_release_epoch: @import("antfly_platform").atomic.Value(u64) = .init(0);
 
-const ObsoletePathRefRegistry = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    refs: std.StringHashMapUnmanaged(u64) = .empty,
-
-    fn retain(self: *ObsoletePathRefRegistry, path: []const u8) !void {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.refs.getPtr(path)) |count| {
-            count.* +|= 1;
-            return;
-        }
-        const owned = try std.heap.page_allocator.dupe(u8, path);
-        errdefer std.heap.page_allocator.free(owned);
-        try self.refs.put(std.heap.page_allocator, owned, 1);
-    }
-
-    fn release(self: *ObsoletePathRefRegistry, path: []const u8) void {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        const count = self.refs.getPtr(path) orelse return;
-        if (count.* > 1) {
-            count.* -= 1;
-            return;
-        }
-        const removed = self.refs.fetchRemove(path).?;
-        std.heap.page_allocator.free(removed.key);
-        _ = file_pin_release_epoch.fetchAdd(1, .release);
-    }
-
-    fn isRetained(self: *ObsoletePathRefRegistry, path: []const u8) bool {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        return self.refs.contains(path);
-    }
-};
-
-var obsolete_path_refs = ObsoletePathRefRegistry{};
+// Version pins use the same bounded registry protocol as directory pins.
+// The retained token releases without hashing a path or taking the mutex.
+var obsolete_path_refs = @import("lsm_backend/run_pin_registry.zig").Registry{ .epoch = &file_pin_release_epoch };
 // Read transactions borrow run metadata instead of cloning it. Track those
 // borrows separately from open-manifest ownership so compaction can retire
 // each generation as soon as its own last reader exits, without waiting for a
@@ -7439,8 +7405,12 @@ pub const Backend = struct {
             if (run.owner) |owner| if (owner.registered != null) continue;
             if (run.version_ref_pinned) continue;
             const path = run.path orelse continue;
-            try obsolete_path_refs.retain(path);
-            run.version_ref_pinned = true;
+            const pin = try obsolete_path_refs.retainPin(path);
+            RunStore.installVersionPin(run, pin, null) catch |cause| {
+                pin.release();
+                obsolete_path_refs.forget(path);
+                return cause;
+            };
         }
     }
 
@@ -8071,14 +8041,29 @@ pub const Backend = struct {
         _ = self;
         const owned = run.versionOwner();
         if (!owned.version_ref_pinned) return;
-        if (owned.path) |path| obsolete_path_refs.release(path);
+        if (RunStore.takeVersionPin(owned)) |pin| pin.release() else if (owned.path) |path| obsolete_path_refs.release(path);
         owned.version_ref_pinned = false;
+        if (owned.path) |path| obsolete_path_refs.forget(path);
     }
 
-    fn destroyOwnedRun(run: *Run, allocator: Allocator) void {
-        if (run.version_ref_pinned) if (run.path) |path| obsolete_path_refs.release(path);
-        if (run.path) |path| run_snapshot_refs.forget(path);
+    /// Known legacy producer callback; admitted retirement validates this exact
+    /// issuer and uses saved registry operations instead of this joined path.
+    pub fn destroyOwnedRun(run: *Run, allocator: Allocator) void {
+        if (run.version_ref_pinned) {
+            if (RunStore.takeVersionPin(run)) |pin| pin.release() else if (run.path) |path| obsolete_path_refs.release(path);
+            run.version_ref_pinned = false;
+        }
+        if (run.path) |path| {
+            obsolete_path_refs.forget(path);
+            run_snapshot_refs.forget(path);
+        }
         run.deinit(allocator);
+    }
+    pub fn isVersionPin(pin: *run_pin_registry.Registry.Pin) bool {
+        return pin.registry == &obsolete_path_refs;
+    }
+    pub fn prepareVersionPinForget(path: []const u8) run_pin_registry.Operation {
+        return .init(&obsolete_path_refs, path, .forget);
     }
 
     fn obsoletePathPinnedByOpenVersion(self: *Backend, path: []const u8) bool {

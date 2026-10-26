@@ -4720,7 +4720,7 @@ const LegacyMigrationFixture = struct {
     const io_mod = @import("antfly_local_sources").storage_lsm_backend_storage_io;
     const Control = RegisteredOutputFixture.Control;
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
-    const Mode = enum { install, abort, stale, receipt, lineage, checkpoint, account, install_refusal, retire_dirs, retire_abort };
+    const Mode = enum { install, abort, stale, receipt, lineage, checkpoint, account, install_refusal, retire_dirs, retire_abort, retire_all, retire_all_abort };
 
     fn run(mode: Mode, target: ?usize, oom: bool) !Stats {
         const a = std.testing.allocator;
@@ -4786,7 +4786,7 @@ const LegacyMigrationFixture = struct {
         var competing: lsm.Backend.QuiescedLegacyRootMigration = .{};
         defer competing.deinit();
         try std.testing.expectError(error.ResourceBudgetExceeded, competing.captureWithAdmission(&backend, original));
-        const retire_mode = mode == .retire_dirs or mode == .retire_abort;
+        const retire_mode = mode == .retire_dirs or mode == .retire_abort or mode == .retire_all or mode == .retire_all_abort;
         const start = failing.alloc_index;
         if (oom and target != null) failing.fail_index = start + target.?;
         control.live = true;
@@ -4855,17 +4855,22 @@ const LegacyMigrationFixture = struct {
                 try std.testing.expectEqual(@as(u64, 37), backend.unpublished_wal_logical_bytes);
                 try std.testing.expect(backend.manifest_dirty and backend.obsolete_manifest_dirty);
                 if (retire_mode) {
+                    const writer_mode = mode == .retire_all or mode == .retire_all_abort;
+                    // The separate directory/ledger suite already sweeps those
+                    // checkpoints. Here every recorded fault targets writer work.
+                    if (writer_mode) try migration.retireOldDirectoriesAndLedgersWithAdmission(original);
                     control.calls = 0;
                     control.target = target;
                     control.live = true;
                     observed = false;
                     const retire_start = failing.alloc_index;
                     while (true) {
-                        migration.retireOldDirectoriesAndLedgersWithAdmission(original) catch |cause| {
+                        const retired = if (writer_mode) migration.retireOldRootsWithAdmission(original) else migration.retireOldDirectoriesAndLedgersWithAdmission(original);
+                        retired catch |cause| {
                             try std.testing.expectError(error.Canceled, @as(anyerror!void, cause));
                             try std.testing.expect(!observed);
                             observed = true;
-                            if (mode == .retire_abort) break;
+                            if (mode == .retire_abort or mode == .retire_all_abort) break;
                             continue;
                         };
                         break;
@@ -4874,6 +4879,7 @@ const LegacyMigrationFixture = struct {
                     try std.testing.expectEqual(@as(usize, 0), stats.allocations);
                     control.live = false;
                     if (mode == .retire_dirs) try std.testing.expect(migration.old_directory == null and migration.old_durable_directory == null and migration.old_obsolete == null and migration.old_durable_obsolete == null);
+                    if (mode == .retire_all) try std.testing.expect(migration.old_store == null and migration.store_cleanup == null);
                 }
                 migration.deinit();
                 failing.fail_index = std.math.maxInt(usize);
@@ -5137,4 +5143,315 @@ test "physical cache metadata bounded legacy retirement retains shared memory co
         _ = try LegacyMemoryRetirementFixture.run(at, false);
         _ = try LegacyMemoryRetirementFixture.run(at, true);
     }
+}
+
+const LegacyWriterRetirementFixture = struct {
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+    const Store = @FieldType(lsm.Backend, "runs");
+    const State = @import("antfly_local_sources").storage_lsm_backend_state.State;
+    const Mode = enum { staged, revision, parent_final, owned };
+    fn make(a: std.mem.Allocator, memory: bool) !lsm.repository.Run {
+        var physical_run: lsm.repository.Run = .{
+            .id = 901,
+            .level = 1,
+            .size_bytes = 0,
+            .path = if (memory) null else try a.dupe(u8, "/writer/901.tbl"),
+            .smallest_namespace_name = null,
+            .smallest_key = try a.alloc(u8, 32 * 1024 + 3),
+            .largest_namespace_name = null,
+            .largest_key = try a.alloc(u8, 32 * 1024 + 7),
+            .entry_count = 1,
+            .bloom_filter = null,
+            .state = null,
+        };
+        @memset(physical_run.smallest_key, 'a');
+        @memset(physical_run.largest_key, 'z');
+        if (memory) {
+            var state: State = .{};
+            try state.upsert(a, .{ .name = "docs" }, "key", "retained", false);
+            physical_run.state = state;
+            try physical_run.shareMemory(a);
+        }
+        return physical_run;
+    }
+    fn run(mode: Mode, target: ?usize, abort: bool) !usize {
+        const a = std.testing.allocator;
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const owned = failing.allocator();
+        var source = try make(owned, mode != .staged);
+        var source_live = true;
+        defer if (source_live) source.deinit(owned);
+        var live: Store = .{};
+        var live_valid = true;
+        defer if (live_valid) live.deinit(owned);
+        var candidate: Store = .{};
+        var candidate_valid = true;
+        defer if (candidate_valid) candidate.deinit(owned);
+        if (mode == .staged) {
+            try candidate.stage(owned, source);
+        } else {
+            try live.append(owned, source);
+            source_live = false;
+            if (mode == .revision or mode == .parent_final) {
+                candidate = live.fork();
+                const raw = live.at(0);
+                try candidate.remove(owned, raw);
+                var metadata = raw.*;
+                metadata.level = 2;
+                try candidate.stageRevision(owned, Store.revision(raw, metadata));
+                const child = candidate.at(0);
+                child.bloom_filter = .{ .bytes = try owned.alloc(u8, 48 * 1024 + 9), .bit_count = (48 * 1024 + 9) * 8, .hash_count = 3 };
+                @memset(child.bloom_filter.?.bytes, 0x6a);
+                child.owns_bloom_filter = true;
+                if (mode == .parent_final) {
+                    live.deinit(owned);
+                    live = .{};
+                }
+            } else {
+                candidate = live;
+                live = .{};
+            }
+        }
+        var job = Store.Reclaimer.init(&candidate);
+        candidate_valid = false;
+        var finished = false;
+        defer if (!finished) {
+            var credits: usize = std.math.maxInt(usize);
+            std.debug.assert(job.step(owned, &credits));
+            job.finishContents();
+        };
+        failing.fail_index = failing.alloc_index;
+        const before = failing.alloc_index;
+        var control: RegisteredOutputFixture.Control = .{ .live = true, .target = target };
+        const payload = control.payload();
+        const original = read_admission.Port.init(&payload);
+        var rejected = false;
+        while (true) {
+            var credits: usize = 1;
+            const complete = job.stepWithAdmission(owned, &credits, original) catch |cause| {
+                try std.testing.expectError(error.Canceled, @as(anyerror!void, cause));
+                try std.testing.expect(!rejected);
+                rejected = true;
+                if (abort) break;
+                continue;
+            };
+            if (complete) {
+                job.finishContents();
+                finished = true;
+                break;
+            }
+        }
+        if (target != null) try std.testing.expect(rejected);
+        try std.testing.expectEqual(before, failing.alloc_index);
+        if (finished and mode == .staged) {
+            try std.testing.expectEqual(@as(u8, 'a'), source.smallest_key[0]);
+            try std.testing.expectEqualStrings("/writer/901.tbl", source.path.?);
+        }
+        if (finished and mode == .revision) {
+            const raw = live.at(0);
+            try std.testing.expectEqual(@as(u8, 'a'), raw.smallest_key[0]);
+            try std.testing.expectEqualStrings("retained", try raw.state.?.get(.{ .name = "docs" }, "key"));
+        }
+        // Cleanup stays allocation-free with the fault allocator exhausted.
+        if (finished and live.count() != 0) {
+            var parent = Store.Reclaimer.init(&live);
+            var credits: usize = std.math.maxInt(usize);
+            std.debug.assert(parent.step(owned, &credits));
+            parent.finishContents();
+            live_valid = false;
+        }
+        return control.calls;
+    }
+};
+
+test "physical cache metadata bounded writer retirement consumes migrated native version pins and roots" {
+    _ = try LegacyMigrationFixture.run(.retire_all, null, false);
+}
+
+test "physical cache metadata bounded writer retirement resumes every original rejection and abort" {
+    const healthy = try LegacyMigrationFixture.run(.retire_all, null, false);
+    for (0..healthy.checks) |at| {
+        try std.testing.expect((try LegacyMigrationFixture.run(.retire_all, at, false)).observed);
+        try std.testing.expect((try LegacyMigrationFixture.run(.retire_all_abort, at, false)).observed);
+    }
+}
+
+test "physical cache metadata bounded writer retirement preserves staged input and parent ownership" {
+    for ([_]LegacyWriterRetirementFixture.Mode{ .staged, .revision, .parent_final, .owned }) |mode| {
+        const checks = try LegacyWriterRetirementFixture.run(mode, null, false);
+        for (0..checks) |at| {
+            _ = try LegacyWriterRetirementFixture.run(mode, at, false);
+            _ = try LegacyWriterRetirementFixture.run(mode, at, true);
+        }
+    }
+}
+
+test "physical cache metadata bounded writer retirement binds the actual version pin path and issuer" {
+    const F = LegacyWriterRetirementFixture;
+    const a = std.testing.allocator;
+    var backend = F.lsm.Backend.init(a, .{});
+    defer backend.close();
+    var one = try F.make(a, false);
+    var one_live = true;
+    defer if (one_live) one.deinit(a);
+    var two = try F.make(a, false);
+    var two_live = true;
+    defer if (two_live) two.deinit(a);
+    two.id = 902;
+    a.free(two.path.?);
+    two.path = try a.dupe(u8, "/writer/902.tbl");
+    try backend.runs.append(a, one);
+    one_live = false;
+    try backend.runs.append(a, two);
+    two_live = false;
+    try backend.registerOpenManifestRunRefs();
+    const raw_one = backend.runs.at(0);
+    const raw_two = backend.runs.at(1);
+    const first = F.Store.takeVersionPin(raw_one).?;
+    const second = F.Store.takeVersionPin(raw_two).?;
+    var first_live = true;
+    defer if (first_live) {
+        first.release();
+        var forget = F.lsm.Backend.prepareVersionPinForget("/writer/901.tbl");
+        defer forget.deinit();
+        _ = forget.planWithAdmission(null) catch unreachable;
+        forget.resumeWithAdmission(null) catch unreachable;
+        forget.publishWithAdmission(null) catch unreachable;
+    };
+    var second_live = true;
+    defer if (second_live) {
+        second.release();
+        var forget = F.lsm.Backend.prepareVersionPinForget("/writer/902.tbl");
+        defer forget.deinit();
+        _ = forget.planWithAdmission(null) catch unreachable;
+        forget.resumeWithAdmission(null) catch unreachable;
+        forget.publishWithAdmission(null) catch unreachable;
+    };
+    const Registry = @typeInfo(@TypeOf(F.lsm.Backend.prepareVersionPinForget("/writer/901.tbl").registry)).pointer.child;
+    var foreign: Registry = .{ .allocator = a };
+    defer foreign.deinitJoined();
+    const foreign_pin = try foreign.retainPin("/writer/901.tbl");
+    defer {
+        foreign_pin.release();
+        foreign.forget("/writer/901.tbl");
+    }
+    try std.testing.expectError(error.InvalidArgument, F.Store.installVersionPin(raw_one, foreign_pin, quotaControl()));
+    try std.testing.expectError(error.InvalidArgument, F.Store.installVersionPin(raw_one, second, quotaControl()));
+    try std.testing.expectError(error.InvalidArgument, F.Store.installVersionPin(raw_two, first, quotaControl()));
+    try std.testing.expect(!raw_one.version_ref_pinned and !raw_two.version_ref_pinned);
+    try F.Store.installVersionPin(raw_one, first, quotaControl());
+    first_live = false;
+    try F.Store.installVersionPin(raw_two, second, quotaControl());
+    second_live = false;
+    try std.testing.expect(raw_one.version_ref_pinned and raw_two.version_ref_pinned);
+}
+
+const LegacyWriterStaleFixture = struct {
+    const F = LegacyWriterRetirementFixture;
+    const Result = struct { checks: usize, intercepted: bool };
+    fn run(target: ?usize) !Result {
+        const a = std.testing.allocator;
+        var backend = F.lsm.Backend.init(a, .{});
+        defer backend.close();
+        var input = try F.make(a, false);
+        var input_live = true;
+        defer if (input_live) input.deinit(a);
+        try backend.runs.append(a, input);
+        input_live = false;
+        try backend.registerOpenManifestRunRefs();
+        var detached = backend.runs;
+        backend.runs = .{ .destroy_run = F.lsm.Backend.destroyOwnedRun };
+        var job = F.Store.Reclaimer.init(&detached);
+        var finished = false;
+        defer if (!finished) {
+            var credits: usize = std.math.maxInt(usize);
+            std.debug.assert(job.step(a, &credits));
+            job.finishContents();
+        };
+        var control: RegisteredOutputFixture.Control = .{ .live = true, .target = target };
+        const payload = control.payload();
+        const original = read_admission.Port.init(&payload);
+        var intercepted = false;
+        while (true) {
+            var credits: usize = 1;
+            const complete = job.stepWithAdmission(a, &credits, original) catch |cause| {
+                try std.testing.expectError(error.Canceled, @as(anyerror!void, cause));
+                if (job.tree.retiring_node) |node| {
+                    const record = node.entry.payload.?;
+                    const work = &record.retirement;
+                    if (work.phase == .version_forget and work.forgetting != null and work.forgetting.?.found and !work.forgetting.?.committed and !work.forgetting.?.retiring) {
+                        // Simulate a peer collecting the now-unpinned record
+                        // between plan and publish. The saved borrow stays alive.
+                        work.forgetting.?.registry.forget(record.run.path.?);
+                        intercepted = true;
+                    }
+                }
+                continue;
+            };
+            if (complete) {
+                job.finishContents();
+                finished = true;
+                break;
+            }
+        }
+        return .{ .checks = control.calls, .intercepted = intercepted };
+    }
+};
+
+test "physical cache metadata bounded writer retirement replans invalidated registry borrows" {
+    const healthy = try LegacyWriterStaleFixture.run(null);
+    var exercised = false;
+    for (0..healthy.checks) |at| {
+        if ((try LegacyWriterStaleFixture.run(at)).intercepted) {
+            exercised = true;
+            break;
+        }
+    }
+    try std.testing.expect(exercised);
+}
+
+test "physical cache metadata bounded writer retirement refuses unknown producers before joined callback" {
+    const F = LegacyWriterRetirementFixture;
+    const a = std.testing.allocator;
+    const Callback = struct {
+        var called: usize = 0;
+        fn destroy(physical_run: *F.lsm.repository.Run, allocator: std.mem.Allocator) void {
+            called += 1;
+            physical_run.deinit(allocator);
+        }
+    };
+    Callback.called = 0;
+    var store: F.Store = .{ .destroy_run = Callback.destroy };
+    var store_live = true;
+    defer if (store_live) store.deinit(a);
+    var input = try F.make(a, false);
+    var input_live = true;
+    defer if (input_live) input.deinit(a);
+    try store.append(a, input);
+    input_live = false;
+    var job = F.Store.Reclaimer.init(&store);
+    store_live = false;
+    var finished = false;
+    defer if (!finished) {
+        var credits: usize = std.math.maxInt(usize);
+        std.debug.assert(job.step(a, &credits));
+        job.finishContents();
+    };
+    var refused = false;
+    for (0..128) |_| {
+        var credits: usize = 1;
+        const complete = job.stepWithAdmission(a, &credits, quotaControl()) catch |cause| {
+            try std.testing.expectError(error.ExecutionWaitUnsupported, @as(anyerror!void, cause));
+            refused = true;
+            break;
+        };
+        try std.testing.expect(!complete);
+    }
+    try std.testing.expect(refused);
+    try std.testing.expectEqual(@as(usize, 0), Callback.called);
+    var credits: usize = std.math.maxInt(usize);
+    try std.testing.expect(job.step(a, &credits));
+    job.finishContents();
+    finished = true;
+    try std.testing.expectEqual(@as(usize, 1), Callback.called);
 }

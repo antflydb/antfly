@@ -97,6 +97,7 @@ pub fn Migration(comptime Backend: type) type {
         old_obsolete: ?Ledger = null,
         old_durable_directory: ?*Directory = null,
         old_durable_obsolete: ?Ledger = null,
+        store_cleanup: ?Store.Reclaimer = null,
         directory_cleanup: ?Directory.Reclaimer = null,
         durable_directory_cleanup: ?Directory.Reclaimer = null,
         obsolete_cleanup: ?Ledger.Reclaimer = null,
@@ -260,6 +261,22 @@ pub fn Migration(comptime Backend: type) type {
             self.phase = .installed;
         }
 
+        /// Retire the complete displaced root set with the original execution
+        /// authority. The frame and Backend remain quiesced until deinit joins.
+        pub fn retireOldRootsWithAdmission(self: *Self, original: admission.Port) !void {
+            try self.retireOldDirectoriesAndLedgersWithAdmission(original);
+            const b = self.backend.?;
+            while (self.old_store != null) {
+                try original.checkpoint();
+                if (self.store_cleanup == null) self.store_cleanup = .init(&self.old_store.?);
+                var credits: usize = 1;
+                if (!try self.store_cleanup.?.stepWithAdmission(b.allocator, &credits, original)) continue;
+                self.store_cleanup.?.finishContents();
+                self.store_cleanup = null;
+                self.old_store = null;
+            }
+        }
+
         /// Off-lock while startup exclusion remains held. The original port
         /// reaches every detached node and physical metadata quantum. Writer
         /// RunOwner retirement is separate; it still requires joined teardown.
@@ -335,6 +352,13 @@ pub fn Migration(comptime Backend: type) type {
                     @field(self, fields[0]) = null;
                     @field(self, fields[1]) = null;
                 }
+            }
+            if (self.store_cleanup) |*job| {
+                var credits: usize = std.math.maxInt(usize);
+                std.debug.assert(job.step(b.allocator, &credits));
+                job.finishContents();
+                self.store_cleanup = null;
+                self.old_store = null;
             }
             if (self.old_store) |*store| store.deinit(b.allocator);
             if (self.old_directory) |directory| directory.destroy(b.allocator);

@@ -22,6 +22,11 @@ const Run = @import("repository.zig").Run;
 const Directory = @import("run_directory.zig").Directory;
 const Account = @import("memory_account.zig").Account;
 const DestroyRun = *const fn (*Run, std.mem.Allocator) void;
+const admission = @import("../../common/read_admission.zig");
+const pins = @import("run_pin_registry.zig");
+const snapshots = @import("run_snapshot_clone.zig");
+const Backend = @import("../lsm_backend.zig").Backend;
+const RunOwner = @import("repository.zig").RunOwner;
 
 /// Slice-backed planner fixtures remain an independent oracle. Production
 /// uses the ordered owner; these adapters never materialize a hidden vector.
@@ -73,6 +78,41 @@ pub fn get(runs: anytype, rank: usize) Run {
     return runs[rank];
 }
 
+const RetirementWorkspace = struct {
+    phase: enum { start, version_forget, snapshot_forget, physical, finish } = .start,
+    forgetting: ?pins.Operation = null,
+    stale: bool = false,
+    physical: ?snapshots.Retirement = null,
+
+    /// Forget never creates registry metadata. A stale plan owns its partial
+    /// retirement before retry; no port or Backend receiver escapes this call.
+    fn forget(self: *@This(), operation: pins.Operation, original: ?admission.Port) !bool {
+        if (self.forgetting == null) self.forgetting = operation;
+        const saved = &self.forgetting.?;
+        if (!self.stale and !saved.committed) {
+            const result: anyerror!void = work: {
+                const bytes = saved.planWithAdmission(original) catch |cause| break :work cause;
+                if (bytes != 0) break :work error.ResourceAccountingMismatch;
+                saved.resumeWithAdmission(original) catch |cause| break :work cause;
+                saved.publishWithAdmission(original) catch |cause| break :work cause;
+                break :work {};
+            };
+            result catch |cause| {
+                if (cause != error.CompactionPlanningStale) return cause;
+                self.stale = true;
+                return false;
+            };
+        }
+        try saved.retireWithAdmission(original);
+        self.forgetting = null;
+        if (self.stale) {
+            self.stale = false;
+            return false;
+        }
+        return true;
+    }
+};
+
 const Payload = struct {
     owner: @import("repository.zig").RunOwner,
     parent: ?*@import("repository.zig").RunOwner = null,
@@ -81,9 +121,16 @@ const Payload = struct {
     destroy_run: ?DestroyRun,
     account: *Account,
     bytes: u64,
+    version_pin: ?*pins.Registry.Pin = null,
+    retirement: RetirementWorkspace = .{},
 
     fn destroy(header: *@import("repository.zig").RunOwner, allocator: std.mem.Allocator) void {
         const payload: *Payload = @alignCast(@fieldParentPtr("owner", header));
+        if (payload.version_pin) |pin| {
+            pin.release();
+            payload.version_pin = null;
+            payload.run.version_ref_pinned = false;
+        }
         if (payload.parent) |parent| {
             if (payload.run.owns_bloom_filter) if (payload.run.bloom_filter) |*filter| filter.deinit(allocator);
             if (payload.run.table_index) |*index| index.deinit(allocator);
@@ -153,6 +200,115 @@ const Entry = struct {
     pub fn deinit(self: Entry, allocator: std.mem.Allocator) void {
         if (self.run.owner) |owner| owner.release(allocator);
     }
+    /// Own one detached entry reference. Parent references transfer into this
+    /// cursor instead of recursively invoking physical RunOwner destruction.
+    pub const Retirement = struct {
+        owner: ?*RunOwner,
+        claimed: bool = false,
+        pub fn init(entry: Entry) @This() {
+            const owner = entry.run.owner orelse return .{ .owner = null };
+            // Preserve the fixed generic-drop contract: registered anchors and
+            // shared writers finish within the structural node credit. Only
+            // the exclusive final physical owner needs later work credits.
+            if (owner.refs.fetchSub(1, .acq_rel) != 1) return .{ .owner = null };
+            return .{ .owner = owner, .claimed = true };
+        }
+        pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+            if (self.owner == null) return true;
+            while (credits.* != 0) if (self.stepWithAdmission(allocator, credits, null) catch unreachable) return true;
+            return false;
+        }
+        fn isolated(payload: *Payload) Run {
+            var run = payload.run;
+            run.owner = null;
+            run.version_ref_pinned = false;
+            if (payload.parent != null) {
+                // Revision metadata/state remain owned by the retained parent;
+                // only this revision's private file caches belong to the child.
+                run.output_ticket = null;
+                run.shared_memory = null;
+                run.shared_read_version = false;
+                run.owns_metadata = false;
+                run.owns_path = false;
+                if (run.path == null) run.state = null;
+            }
+            return run;
+        }
+        pub fn stepWithAdmission(self: *@This(), allocator: std.mem.Allocator, credits: *usize, original: ?admission.Port) !bool {
+            const owner = self.owner orelse return true;
+            if (credits.* == 0) return false;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            if (!self.claimed) {
+                self.claimed = true;
+                if (owner.refs.fetchSub(1, .acq_rel) != 1) {
+                    self.owner = null;
+                    return true;
+                }
+            }
+            if (owner.destroy != Payload.destroy) {
+                if (original != null) return error.ExecutionWaitUnsupported;
+                owner.destroy(owner, allocator);
+                self.owner = null;
+                return true;
+            }
+            const payload: *Payload = @alignCast(@fieldParentPtr("owner", owner));
+            comptime std.debug.assert(@sizeOf(Payload) <= 16 * 1024);
+            const work = &payload.retirement;
+            switch (work.phase) {
+                .start => {
+                    const producer = payload.parent == null and payload.owned;
+                    const known = payload.destroy_run == null or payload.destroy_run == Backend.destroyOwnedRun;
+                    const supported = !producer or (known and snapshots.Retirement.supports(isolated(payload)) and
+                        (!payload.run.version_ref_pinned or (payload.destroy_run == Backend.destroyOwnedRun and payload.version_pin != null)));
+                    if (!supported) {
+                        if (original != null) return error.ExecutionWaitUnsupported;
+                        Payload.destroy(owner, allocator);
+                        self.owner = null;
+                        return true;
+                    }
+                    if (payload.parent != null) work.phase = .physical else if (!payload.owned) work.phase = .finish else {
+                        if (payload.version_pin) |pin| {
+                            pin.release();
+                            payload.version_pin = null;
+                            payload.run.version_ref_pinned = false;
+                        }
+                        work.phase = if (payload.destroy_run == Backend.destroyOwnedRun) .version_forget else .physical;
+                    }
+                    return false;
+                },
+                .version_forget => {
+                    if (payload.run.path) |path| if (!try work.forget(Backend.prepareVersionPinForget(path), original)) return false;
+                    work.phase = .snapshot_forget;
+                    return false;
+                },
+                .snapshot_forget => {
+                    if (payload.run.path) |path| if (!try work.forget(Backend.prepareRunSnapshotRefOperation(path, .forget), original)) return false;
+                    work.phase = .physical;
+                    return false;
+                },
+                .physical => {
+                    if (work.physical == null) {
+                        const physical = try snapshots.Retirement.init(isolated(payload));
+                        work.physical = physical;
+                    }
+                    if (!try work.physical.?.step(allocator, original)) return false;
+                    work.phase = .finish;
+                    return false;
+                },
+                .finish => {
+                    const parent = payload.parent;
+                    const account = payload.account;
+                    const bytes = payload.bytes;
+                    allocator.destroy(payload);
+                    account.discharge(bytes);
+                    self.owner = parent;
+                    self.claimed = false;
+                    return parent == null;
+                },
+            }
+        }
+    };
     pub fn retainedBytes(_: Entry) usize {
         return 0;
     }
@@ -165,6 +321,36 @@ fn compare(a: Entry, b: Entry) std.math.Order {
 
 pub const Store = struct {
     pub const Tree = @import("ordered_index.zig").Index(Entry, compare);
+    /// Bind the actual canonical legacy writer token, not a borrowed revision.
+    pub fn installVersionPin(run: *Run, pin: *pins.Registry.Pin, original: ?admission.Port) !void {
+        if (original) |port| try port.checkpoint();
+        if (!Backend.isVersionPin(pin)) return error.InvalidArgument;
+        const path = run.path orelse return error.InvalidArgument;
+        const registered_path = pin.path();
+        if (path.len != registered_path.len) return error.InvalidArgument;
+        var offset: usize = 0;
+        while (offset < path.len) {
+            if (original) |port| try port.checkpoint();
+            const end = @min(path.len, offset + 16 * 1024);
+            if (!std.mem.eql(u8, path[offset..end], registered_path[offset..end])) return error.InvalidArgument;
+            offset = end;
+        }
+        const owner = run.owner orelse return error.ExecutionWaitUnsupported;
+        if (owner.destroy != Payload.destroy or owner.raw != run) return error.ExecutionWaitUnsupported;
+        const payload: *Payload = @alignCast(@fieldParentPtr("owner", owner));
+        if (!payload.owned or payload.parent != null or payload.destroy_run != Backend.destroyOwnedRun or payload.version_pin != null or run.version_ref_pinned) return error.InvalidArgument;
+        payload.version_pin = pin;
+        run.version_ref_pinned = true;
+    }
+    pub fn takeVersionPin(run: *Run) ?*pins.Registry.Pin {
+        const owner = run.owner orelse return null;
+        if (owner.destroy != Payload.destroy or owner.raw != run) return null;
+        const payload: *Payload = @alignCast(@fieldParentPtr("owner", owner));
+        const pin = payload.version_pin;
+        payload.version_pin = null;
+        if (pin != null) run.version_ref_pinned = false;
+        return pin;
+    }
     pub const empty: Store = .{};
     tree: Tree = .{},
     destroy_run: ?DestroyRun = null,
@@ -258,6 +444,11 @@ pub const Store = struct {
         }
         pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
             return self.tree.step(allocator, credits);
+        }
+        pub fn stepWithAdmission(self: *@This(), allocator: std.mem.Allocator, credits: *usize, original: ?admission.Port) !bool {
+            if (original) |port| try port.checkpoint();
+            if (comptime @import("builtin").is_test) if (original != null and self.store.test_projection != null) return error.ExecutionWaitUnsupported;
+            return self.tree.stepWithAdmission(allocator, credits, original);
         }
         pub fn finish(self: *@This(), allocator: std.mem.Allocator) void {
             self.store.invalidateProjection(allocator);

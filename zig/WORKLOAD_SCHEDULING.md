@@ -1722,3 +1722,15 @@ prepaid payload storage; native/storage-owner ABIs are 145/205. Legacy writer
 RunOwner pin/parent retirement, memory-run migration and production maintenance
 integration remain required before default rollout. The full goal remains active;
 full Linux qualification remains waived.
+
+
+### Admitted complete legacy root retirement (2026-10-26)
+
+Writer version-pin release now uses a stable issued token. Saved registry and
+physical cleanup cursors retire writer payloads and transfer parent references
+without recursive destruction. Quiesced migration can retire its complete old
+writer/directory/ledger set under original admission. Native/storage-owner ABIs
+are 146/206. The startup exclusion/join contract remains; production opening,
+legacy global funding, memory-run import, normal maintenance integration and
+overload qualification remain open. The full goal stays active; full Linux
+qualification remains waived.
