@@ -1577,3 +1577,20 @@ limit. Both sides acknowledged all 32 setup batches, the candidate converged,
 and neither recorded final request/resource errors. Its report is archived.
 The existing setup-only resume path may replay those same operation identities;
 it never reuses a corpus after measured workload mutations.
+
+
+The checkpoint smoke comparison encountered Cloudflare Queue-metrics error
+10250 ("Queue is overloaded. Please back off."). That request remains a failure
+in its report. The shared qualification wrapper now maps only that exact
+platform-overload exception to JSON 503, using the driver's unchanged bounded
+logical retries and deadline. Unrecognized errors still fail. A regression checks
+successful retry and fatal unknown/resource errors; all 216 Node checks pass.
+This changes the same control-plane probe for both sides, without changing data
+operations, native modules, numerical gates or any prior report.
+
+Post-setup audits found control DLQ jobs on pairs 2 and 3, including original
+publication identities for the current corpora. Recovery re-enqueues their exact
+JSON bodies on the corresponding original main Queue before acknowledging each
+leased DLQ message. Body hashes and accepted replays are retained locally. Queue
+health must be re-audited before any formal workload; this operational recovery
+does not turn either setup timeout into a passing trial.

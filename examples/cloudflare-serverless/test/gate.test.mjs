@@ -222,3 +222,13 @@ test('cold attempts never retry transport or backpressure and warm recovery reta
  for(const failure of ['network','backpressure']){let calls=0;const cold=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async()=>{calls++;if(failure==='network')throw new DOMException('timeout','TimeoutError');return Response.json({error:'CoordinatorRecovering'},{status:503});}});await assert.rejects(cold.call('a',{op:'count'},'cold',{epoch:1}));assert.equal(calls,1);assert.equal(cold.errors[0].attempts,1);}
  let calls=0;const warm=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async()=>++calls===1?Response.json({error:'SQLITE_NOMEM'},{status:503}):Response.json({count:'512'},{headers:{'X-Antfly-Version':version}})});assert.equal((await warm.call('a',{op:'count'},'read')).sample.attempts,2);assert.equal(warm.resourceErrors.length,1);
 });
+
+
+test('Queue metrics overload uses bounded logical retries while unknown failures remain fatal',async()=>{
+ const{qualificationQueueMetrics}=await import('../qualification/physical-epochs.mjs');let calls=0;
+ const env={WORKER_VERSION:{id:'v'},MAINTENANCE:{async metrics(){if(++calls===1)throw Error('Queue is overloaded. Please back off. (10250)');return{backlogCount:2,backlogBytes:64};}},DEAD_LETTERS:{async metrics(){return{backlogCount:0};}}};
+ const client=new GateClient({id:'test',origin:'https://metrics.invalid',version:'v'},'test',{fetch:()=>qualificationQueueMetrics(env)});
+ const{value,sample}=await client.call('a',{},'queue',{path:'/_qualification/queue'});assert.equal(sample.attempts,2);assert.equal(client.errors.length,0);assert.deepEqual(value,{dead_letter_count:0,backlog_count:2,backlog_bytes:64,oldest_ms:0});
+ env.MAINTENANCE.metrics=async()=>{throw Error('OutOfMemory');};await assert.rejects(qualificationQueueMetrics(env),/OutOfMemory/);
+ env.MAINTENANCE.metrics=async()=>{throw Error('unrecognized platform failure');};await assert.rejects(qualificationQueueMetrics(env),/unrecognized platform failure/);
+});

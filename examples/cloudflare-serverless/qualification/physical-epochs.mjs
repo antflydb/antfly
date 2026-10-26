@@ -46,6 +46,18 @@ export function withPublicationDiagnostics(Base){return class extends Base{
  }
  publicationDiagnostics(){return{last_execution:this.qualificationLastExecution??null,last_error:this.qualificationLastError??null};}
 };}
+// Queue metrics are control-plane reads. Surface the observed platform
+// overload as retryable admission, under the driver's unchanged deadline and
+// attempt limit. Every other metrics failure remains a failure.
+export async function qualificationQueueMetrics(env){
+ try{
+  const[m,dead]=await Promise.all([env.MAINTENANCE.metrics(),env.DEAD_LETTERS.metrics()]);
+  return Response.json({dead_letter_count:dead.backlogCount,backlog_count:m.backlogCount,backlog_bytes:m.backlogBytes,oldest_ms:m.oldestMessageTimestamp?Math.max(0,Date.now()-m.oldestMessageTimestamp.getTime()):0},{headers:{"X-Antfly-Version":env.WORKER_VERSION.id}});
+ }catch(error){
+  if(error?.message!=="Queue is overloaded. Please back off. (10250)")throw error;
+  return Response.json({error:"QueueMetricsOverloaded"},{status:503,headers:{"X-Antfly-Version":env.WORKER_VERSION.id}});
+ }
+}
 export function qualificationApp(app){return{...app,async fetch(request,env,ctx){
  const path=new URL(request.url).pathname;
  if(path.startsWith("/_qualification/")&&(!env.API_TOKEN||request.headers.get("Authorization")!=="Bearer "+env.API_TOKEN))return new Response("unauthorized",{status:401});
@@ -57,7 +69,7 @@ export function qualificationApp(app){return{...app,async fetch(request,env,ctx)
  }
  if(path==="/_qualification/queue"){
   if(request.method!=="POST"||!env.ANTFLY_INCARNATION.startsWith("qualification-")||request.headers.get("Authorization")!=="Bearer "+env.API_TOKEN)return new Response("unauthorized",{status:401});
-  const[m,dead]=await Promise.all([env.MAINTENANCE.metrics(),env.DEAD_LETTERS.metrics()]);return Response.json({dead_letter_count:dead.backlogCount,backlog_count:m.backlogCount,backlog_bytes:m.backlogBytes,oldest_ms:m.oldestMessageTimestamp?Math.max(0,Date.now()-m.oldestMessageTimestamp.getTime()):0},{headers:{"X-Antfly-Version":env.WORKER_VERSION.id}});
+  return qualificationQueueMetrics(env);
  }
  return app.fetch(request,epochEnv(env,Number(request.headers.get("X-Antfly-Physical-Epoch")??0)),ctx);
 },queue(batch,env,ctx){return app.queue(batch,epochEnv(env,0),ctx);},scheduled(controller,env,ctx){return app.scheduled(controller,epochEnv(env,0),ctx);}};}
