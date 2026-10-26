@@ -20440,4 +20440,19 @@ test "httpx inference gateway document jobs persist before dispatch and publish 
     var wrong = try handler.documentExtractStatus(&wrong_ctx);
     defer wrong.deinit();
     try std.testing.expectEqual(@as(u16, 404), wrong.status.code);
+
+    // Opaque extraction schemas may use credential-shaped field names. Exercise
+    // the public submission boundary so provider-credential scans cannot be
+    // reintroduced after the operation-specific envelope validation.
+    var extract_request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/extract/jobs");
+    defer extract_request.deinit();
+    extract_request.body = "{\"request\":{\"model\":\"local/native-extractor\",\"schema_version\":2,\"schema\":{\"structures\":{\"record\":{\"fields\":{\"api_key\":\"str\"}}}},\"inputs\":[{\"content\":\"Find the key label\"}]}}";
+    var extract_ctx = httpx.Context.init(a, std.testing.io, &extract_request);
+    defer extract_ctx.deinit();
+    var submitted = try handler.documentExtractCreate(&extract_ctx);
+    defer submitted.deinit();
+    try std.testing.expectEqual(@as(u16, 202), submitted.status.code);
+    var submitted_json = try std.json.parseFromSlice(std.json.Value, a, submitted.body.?, .{});
+    defer submitted_json.deinit();
+    try store.cancel(work, submitted_json.value.object.get("id").?.string, "anonymous");
 }

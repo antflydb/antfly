@@ -3007,13 +3007,7 @@ pub const Runtime = struct {
         if (cfg.provider != .antfly or request.media.len != 0) return null;
         // Explicit document inputs preserve format, page selection and provenance.
         // Otherwise retain the established image-source parser and wire form.
-        const body = if (request.source_parts_json) |parts| document: {
-            var parsed_parts = try std.json.parseFromSlice(std.json.Value, a, parts, .{ .parse_numbers = false });
-            defer parsed_parts.deinit();
-            const value = parsed_parts.value;
-            if (value == .object and value.object.get("documents") != null) break :document try std.json.Stringify.valueAlloc(a, .{ .model = cfg.model, .documents = value.object.get("documents").?, .prompt = cfg.prompt, .max_tokens = cfg.max_tokens }, .{ .emit_null_optional_fields = false });
-            break :document try self.documentReadBody(a, request, cfg);
-        } else try self.documentReadBody(a, request, cfg);
+        const body = try self.documentReadBody(a, request, cfg);
         defer a.free(body);
         const result = try self.documentCall(a, cfg.model orelse return error.InvalidReaderConfig, cfg.resolvedUrl(), cfg.api_key, body, false);
         defer a.free(result);
@@ -3025,7 +3019,17 @@ pub const Runtime = struct {
         return try encodeReaderResults(a, request.content_type, items);
     }
     fn documentReadBody(self: *Runtime, a: Allocator, request: asset_producer.Request, cfg: readers.Config) ![]u8 {
-        _ = self;
+        if (request.source_parts_json) |parts| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, parts, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            const value = parsed.value;
+            if (value == .object) if (value.object.get("documents")) |documents| return std.json.Stringify.valueAlloc(a, .{ .model = cfg.model, .documents = documents, .prompt = cfg.prompt, .max_tokens = cfg.max_tokens }, .{ .emit_null_optional_fields = false });
+            if (try @import("reader_source.zig").parsePartsValue(a, value, false)) |selected| {
+                var source = selected;
+                defer source.deinit(a);
+                return self.documentImageBody(a, source, cfg);
+            }
+        }
         const input = std.mem.trim(u8, request.source_text, " \t\r\n");
         if (std.mem.startsWith(u8, input, "{")) {
             var parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{ .parse_numbers = false });
@@ -3035,13 +3039,16 @@ pub const Runtime = struct {
         if (documentSourceMediaType(input, request.content_type)) |media_type| {
             return std.json.Stringify.valueAlloc(a, .{ .model = cfg.model, .documents = [_]readers.DocumentSource{.{ .id = "source", .url = input, .media_type = media_type }}, .prompt = cfg.prompt, .max_tokens = cfg.max_tokens }, .{ .emit_null_optional_fields = false });
         }
-        var source = try parseReaderSourceWithMetadataOnly(a, request.source_text, request.source_parts_json, false);
+        var source = try @import("reader_source.zig").parseText(a, request.source_text);
         defer source.deinit(a);
+        return self.documentImageBody(a, source, cfg);
+    }
+    fn documentImageBody(_: *Runtime, a: Allocator, source: @import("reader_source.zig").Source, cfg: readers.Config) ![]u8 {
         const Image = struct { url: []const u8 };
         const images = try a.alloc(Image, source.images.len);
         defer a.free(images);
         for (images, source.images) |*image, url| image.* = .{ .url = url };
-        return std.json.Stringify.valueAlloc(a, .{ .model = cfg.model, .images = images, .prompt = cfg.prompt, .max_tokens = cfg.max_tokens }, .{ .emit_null_optional_fields = false });
+        return std.json.Stringify.valueAlloc(a, .{ .model = cfg.model, .images = images, .prompt = source.prompt orelse cfg.prompt, .max_tokens = cfg.max_tokens }, .{ .emit_null_optional_fields = false });
     }
     fn extractDocumentDurably(self: *Runtime, a: Allocator, request: asset_producer.Request) !?[]u8 {
         if (try generated_extractor.isGenerated(a, request.config_json)) return null;
@@ -8607,4 +8614,29 @@ test "index document checkpoint producer uses duplex remote execution with table
     defer a.free(replay);
     try std.testing.expectEqualStrings("remote page", replay);
     try std.testing.expectEqual(@as(usize, 1), peer.calls.load(.acquire));
+}
+
+test "index document checkpoint producer preserves source part prompt and locator precedence" {
+    const a = std.testing.allocator;
+    var runtime: Runtime = undefined;
+    const Case = struct { parts: ?[]const u8, prompt: []const u8, document: bool };
+    for ([_]Case{
+        .{ .parts = "[{\"type\":\"text\",\"text\":\"Return only the total\"},{\"type\":\"media\",\"url\":\"https://example.test/receipt.png\"}]", .prompt = "Return only the total", .document = false },
+        .{ .parts = "[{\"type\":\"media\",\"url\":\"https://example.test/receipt.png\"}]", .prompt = "Describe image", .document = false },
+        .{ .parts = "[{\"type\":\"text\",\"text\":\"No media means fallback\"}]", .prompt = "Describe image", .document = true },
+        .{ .parts = null, .prompt = "Describe image", .document = true },
+    }) |case| {
+        const body = try runtime.documentReadBody(a, .{ .producer_type = .reader, .config_json = "{}", .source_text = "https://example.test/fallback.pdf", .source_parts_json = case.parts }, .{ .provider = .antfly, .model = "reader", .prompt = "Describe image" });
+        defer a.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.prompt, parsed.value.object.get("prompt").?.string);
+        if (case.document) {
+            try std.testing.expectEqualStrings("https://example.test/fallback.pdf", parsed.value.object.get("documents").?.array.items[0].object.get("url").?.string);
+            try std.testing.expect(parsed.value.object.get("images") == null);
+        } else {
+            try std.testing.expectEqualStrings("https://example.test/receipt.png", parsed.value.object.get("images").?.array.items[0].object.get("url").?.string);
+            try std.testing.expect(parsed.value.object.get("documents") == null);
+        }
+    }
 }

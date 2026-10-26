@@ -65,6 +65,75 @@ fn validateTree(value: V, depth: usize, remaining: *usize) !void {
         else => {},
     }
 }
+/// Document callers select server-owned models, never provider configuration.
+/// Validate the request envelope while leaving schema names and source data
+/// opaque; credential-shaped names in those values are ordinary document data.
+fn validateSubmission(operation: Operation, request: V) !void {
+    if (request != .object) return error.InvalidInferenceRequest;
+    const fields: []const []const u8 = if (operation == .read)
+        &.{ "model", "documents", "images", "prompt", "max_tokens", "retain_artifact" }
+    else
+        &.{ "model", "schema_version", "schema", "options", "inputs", "documents", "read_artifact" };
+    for (request.object.keys()) |key| {
+        var known = false;
+        for (fields) |allowed| if (std.mem.eql(u8, key, allowed)) {
+            known = true;
+            break;
+        };
+        if (!known) return error.InvalidInferenceRequest;
+    }
+}
+
+pub const LeasePolicy = struct {
+    duration_ms: u64 = lease_ms,
+    renew_interval_ms: u64 = 5_000,
+    fn validate(self: @This()) !void {
+        if (self.duration_ms == 0 or self.duration_ms > 1_800_000 or self.renew_interval_ms == 0 or self.renew_interval_ms >= self.duration_ms) return error.InvalidDocumentCheckpoint;
+    }
+};
+
+/// One lease tenure covers every storage/provider operation, including the
+/// initial upload and retained callback draining. Reuse the host IO executor.
+const LeaseRenewal = struct {
+    persistence: *storage.Context,
+    lease: runs.Lease,
+    policy: LeasePolicy = .{},
+    on_loss: ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } = null,
+    group: std.Io.Group = .init,
+    fn start(self: *@This()) !void {
+        try self.policy.validate();
+        try self.group.concurrent(self.persistence.io, loop, .{self});
+    }
+    fn stop(self: *@This()) void {
+        self.group.cancel(self.persistence.io);
+    }
+    fn loop(self: *@This()) std.Io.Cancelable!void {
+        while (true) {
+            try self.persistence.io.sleep(.fromMilliseconds(@intCast(self.policy.renew_interval_ms)), .awake);
+            const active = self.renew() catch {
+                if (self.on_loss) |sink| sink.notify(sink.ptr);
+                return;
+            };
+            if (!active) return;
+        }
+    }
+    fn renew(self: *@This()) !bool {
+        var arena = std.heap.ArenaAllocator.init(self.persistence.metadata.alloc);
+        defer arena.deinit();
+        const store = try self.persistence.interface();
+        store.renew(arena.allocator(), self.lease, self.persistence.now_fn(), self.policy.duration_ms) catch |err| {
+            if (err == error.DocumentRunLeaseLost) {
+                const current = try store.loadAt(arena.allocator(), self.lease.run_id, self.lease.owner, self.persistence.now_fn());
+                // Atomic completion ends renewal without cancelling the root
+                // response or its remaining retained callback borrows.
+                if (current.state == .succeeded and current.attempt == self.lease.attempt and std.mem.eql(u8, &current.nonce, &self.lease.nonce)) return false;
+            }
+            return err;
+        };
+        return true;
+    }
+};
+
 fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, operation: Operation, action: Action, backing: A) !httpx.Response {
     if (!server.publicInferenceEnabled()) return gateway.disabledResponse(ctx);
     var arena = std.heap.ArenaAllocator.init(backing);
@@ -95,7 +164,7 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
         if (request != .object) return error.InvalidInferenceRequest;
         var nodes: usize = 1_000_000;
         try validateTree(request, 0, &nodes);
-        try jobs.validateRequest(a, request);
+        try validateSubmission(operation, request);
         // Persist the effective backend selector, never a mutable gateway alias.
         const selector = request.object.get("model") orelse return error.ModelRequired;
         if (selector != .string) return error.InvalidInferenceRequest;
@@ -158,6 +227,9 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
         try store.create(.{ .run_id = id, .owner = principal, .operation = operation, .connection = connection, .prepared = false, .identity = identity, .retention_until_ms = now() + retention * 1000, .limits = .{ .calls = 10_000, .tokens = 1_000_000, .pixels = 400_000_000, .source_bytes = 64 * 1024 * 1024 + bytes.len, .output_bytes = 256 * 1024 * 1024 }, .inputs = &.{} });
         const lease = try store.claim(a, id, principal, identity, now(), lease_ms);
         errdefer store.fail(a, lease, now()) catch {};
+        var renewal = LeaseRenewal{ .persistence = &persistence, .lease = lease };
+        try renewal.start();
+        defer renewal.stop();
         const key = digest("submitted-request-v1");
         if (!try store.reserve(a, lease, key, .{ .source_bytes = bytes.len }, now())) return error.InvalidDocumentCheckpoint;
         const reference = try store.complete(a, lease, key, .{ .source_bytes = bytes.len }, bytes, now());
@@ -248,6 +320,7 @@ pub fn Work(comptime Server: type) type {
         term: u64,
         slot: ?usize = null,
         lease: ?runs.Lease = null,
+        lease_policy: LeasePolicy = .{},
         persistence: storage.Context = undefined,
         cancelled: std.atomic.Value(bool) = .init(false),
         binding_live: std.atomic.Value(bool) = .init(false),
@@ -263,24 +336,13 @@ pub fn Work(comptime Server: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             self.binding_live.store(false, .release);
         }
-        fn heartbeat(self: *Self) std.Io.Cancelable!void {
-            const io = self.server.inferenceIo();
-            while (true) {
-                try io.sleep(.fromMilliseconds(5000), .awake);
-                var arena = std.heap.ArenaAllocator.init(self.server.alloc);
-                defer arena.deinit();
-                const store = self.persistence.interface() catch {
-                    self.cancelled.store(true, .release);
-                    return;
-                };
-                store.renew(arena.allocator(), self.lease.?, now(), lease_ms) catch {
-                    self.cancelled.store(true, .release);
-                    return;
-                };
-            }
+        fn leaseLost(raw: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            self.cancelled.store(true, .release);
         }
         pub fn run(raw: *anyopaque) !void {
             const self: *Self = @ptrCast(@alignCast(raw));
+            try self.lease_policy.validate();
             try authority(self);
             self.persistence = try context(self.server);
             self.persistence.authority = .{ .ptr = self, .check_fn = authority };
@@ -290,12 +352,17 @@ pub fn Work(comptime Server: type) type {
             defer arena.deinit();
             const a = arena.allocator();
             const record = try store.loadAt(a, self.id, self.owner, now());
-            self.lease = store.claim(a, self.id, self.owner, record.identity, now(), lease_ms) catch |err| switch (err) {
+            self.lease = store.claim(a, self.id, self.owner, record.identity, now(), self.lease_policy.duration_ms) catch |err| switch (err) {
                 error.DocumentRunBusy, error.DocumentRunTerminal => return,
                 else => return err,
             };
             const lease = self.lease.?;
             errdefer store.yieldLeaseUntil(a, lease, now(), now() +| @import("job_retry.zig").retryDelayMs(std.hash.Wyhash.hash(0, self.id), lease.attempt)) catch {};
+            // Own the lease across request hydration, inference, and retained
+            // callback draining. Artifact IO may outlive a lease interval.
+            var renewal = LeaseRenewal{ .persistence = &self.persistence, .lease = lease, .policy = self.lease_policy, .on_loss = .{ .ptr = self, .notify = leaseLost } };
+            try renewal.start();
+            defer renewal.stop();
             if (record.attempt >= 8) {
                 try store.failWithCode(a, lease, now(), "DocumentRetriesExhausted");
                 return;
@@ -313,9 +380,6 @@ pub fn Work(comptime Server: type) type {
                 // the root call. Drain those borrows before freeing this work.
                 while (self.binding_live.load(.acquire)) self.server.inferenceIo().sleep(.fromMilliseconds(1), .awake) catch {};
             }
-            var group: std.Io.Group = .init;
-            defer group.cancel(self.server.inferenceIo());
-            try group.concurrent(self.server.inferenceIo(), heartbeat, .{self});
             var transport_budget: sources.sql_memory_budget = .{ .backing = self.server.alloc, .limit = 256 * 1024 * 1024 };
             var client = httpx.Client.initWithConfig(transport_budget.allocator(), self.server.inferenceIo(), .{ .keep_alive = false, .max_response_size = 1024 * 1024 * 1024, .max_error_response_size = 64 * 1024, .retry_policy = .{ .max_retries = 0 } });
             defer client.deinit();
@@ -348,7 +412,7 @@ pub fn Work(comptime Server: type) type {
     };
 }
 
-test "httpx inference gateway document job preflight bounds recursive schemas before credential traversal" {
+test "httpx inference gateway document job preflight bounds recursive schemas before envelope validation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -388,4 +452,129 @@ test "httpx inference gateway document workers fence publication when ownership 
     try Work(Server).authority(&current);
     current.cancelled.store(true, .release);
     try std.testing.expect(Work(Server).cancelledFn(&current));
+}
+
+test "httpx inference gateway document job validation treats schemas and source data as opaque" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const valid = try std.json.parseFromSliceLeaky(V, work, "{\"model\":\"extractor\",\"schema_version\":2,\"schema\":{\"structures\":{\"record\":{\"fields\":{\"api_key\":\"str\",\"session_token\":\"str\"}}}},\"inputs\":[{\"content\":{\"credentials_json\":\"document data\"}}]}", .{});
+    try validateSubmission(.extract, valid);
+    // Provider settings are server-owned, not part of either public envelope.
+    for ([_][]const u8{ "{\"model\":\"m\",\"api_key\":\"inline\"}", "{\"model\":\"m\",\"generator\":{\"api_key\":\"inline\"}}", "{\"model\":\"m\",\"provider\":\"openai\"}" }) |body| {
+        const request = try std.json.parseFromSliceLeaky(V, work, body, .{});
+        try std.testing.expectError(error.InvalidInferenceRequest, validateSubmission(.extract, request));
+        try std.testing.expectError(error.InvalidInferenceRequest, validateSubmission(.read, request));
+    }
+    const read = try std.json.parseFromSliceLeaky(V, work, "{\"model\":\"reader\",\"documents\":[{\"id\":\"receipt\",\"url\":\"https://example.test/file.pdf\"}],\"prompt\":\"Find api_key\"}", .{});
+    try validateSubmission(.read, read);
+}
+
+test "httpx inference gateway document worker renews throughout slow request hydration" {
+    const artifacts = @import("../serverless/artifacts/store.zig");
+    const FsStore = @import("../serverless/artifacts/fs_store.zig").FsStore;
+    const abi = sources.inference_connection_abi;
+    const Cancellation = @import("antfly_cancellation").CancellationToken;
+    const Slow = struct {
+        var delay_next: std.atomic.Value(bool) = .init(false);
+        fn read(raw: *anyopaque, a: A, id: []const u8, _: usize, cancellation: Cancellation) ![]u8 {
+            if (delay_next.swap(false, .acq_rel)) {
+                // Longer than the worker lease, with no provider work yet.
+                const until = now() + 2500;
+                while (now() < until) {
+                    try cancellation.check();
+                    try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+                }
+            }
+            const fs: *FsStore = @ptrCast(@alignCast(raw));
+            return fs.getAllocWithCancellation(a, id, cancellation);
+        }
+    };
+    const Target = struct {
+        calls: usize = 0,
+        fn invoke(call: *const abi.InvokeContext) callconv(.c) abi.Status {
+            complete(call) catch |err| return abi.statusFromError(err);
+            return .ok;
+        }
+        fn complete(call: *const abi.InvokeContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(call.target_context));
+            const a = call.allocator.asStd();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const work = arena.allocator();
+            var client = try readers.document_rpc.Client.initBound(a, call.document_store, std.testing.io);
+            defer client.deinit();
+            const store = client.store();
+            const record = try store.loadAt(work, client.id, client.owner, now());
+            try std.testing.expect(record.revision > 10); // Renewals preceded inference.
+            const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+            try store.prepare(work, lease, record.identity, record.limits, record.inputs, now());
+            const reply = "{\"object\":\"list\",\"data\":[]}";
+            try std.testing.expect(try store.reserve(work, lease, @splat(17), .{ .calls = 1, .output_bytes = 1024 }, now()));
+            const result = try store.complete(work, lease, @splat(17), .{ .calls = 1, .output_bytes = reply.len }, reply, now());
+            try store.finish(work, lease, result, now());
+            const bytes = try a.dupe(u8, reply);
+            call.out_response.* = .{ .status = 200, .body = .{ .ptr = bytes.ptr, .len = bytes.len } };
+            self.calls += 1;
+        }
+    };
+    const Server = struct {
+        alloc: A,
+        document_job_store: jobs.Store,
+        document_artifact_files: ?FsStore = null,
+        restore_leadership_term: std.atomic.Value(u64) = .init(7),
+        cfg: struct {
+            document_artifact_store: ?artifacts.ArtifactStore,
+            node_config: ?*const sources.common_config.Config = null,
+            local_inference_connection_target: ?connections.LocalInferenceConnectionTarget,
+            secret_store: ?*sources.common_secrets.FileStore = null,
+        },
+        pub fn inferenceIo(_: *@This()) std.Io {
+            return std.testing.io;
+        }
+        pub fn documentExecutionPermitted(_: *@This()) bool {
+            return true;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/slow-document-jobs", .{tmp.sub_path});
+    defer a.free(path);
+    const artifacts_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/slow-document-artifacts", .{tmp.sub_path});
+    defer a.free(artifacts_path);
+    var files = try FsStore.init(a, artifacts_path);
+    defer files.deinit();
+    var artifact_store = files.artifactStore();
+    var table = artifact_store.vtable.*;
+    table.get_bounded_alloc_with_cancellation = Slow.read;
+    artifact_store.vtable = &table;
+    var target = Target{};
+    var server = Server{ .alloc = a, .document_job_store = jobs.Store.init(a, .{ .namespace = .documents }), .cfg = .{ .document_artifact_store = artifact_store, .local_inference_connection_target = .{ .capabilities = abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } } };
+    defer server.document_job_store.deinit();
+    const opened = try a.create(jobs.OpenedStore);
+    opened.* = try jobs.OpenedStore.open(a, path);
+    try server.document_job_store.attachOpenedStore(opened);
+    var persistence = try context(&server);
+    const store = try persistence.interface();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const request = "{\"model\":\"native-reader\",\"documents\":[]}";
+    const identity: runs.Identity = .{ .request = digest(request), .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
+    try store.create(.{ .run_id = "slow-hydration", .owner = "alice", .connection = sources.common_config.local_inference_connection_id, .prepared = false, .identity = identity, .inputs = &.{}, .limits = .{ .calls = 1, .source_bytes = 4096, .output_bytes = 4096 } });
+    const submission = try store.claim(work, "slow-hydration", "alice", identity, now(), lease_ms);
+    try std.testing.expect(try store.reserve(work, submission, @splat(1), .{ .source_bytes = request.len }, now()));
+    const ref = try store.complete(work, submission, @splat(1), .{ .source_bytes = request.len }, request, now());
+    try store.attachRequest(work, submission, ref, now());
+    try store.yieldLease(work, submission, now());
+    Slow.delay_next.store(true, .release);
+    var job = Work(Server){ .server = &server, .id = "slow-hydration", .owner = "alice", .term = 7, .lease_policy = .{ .duration_ms = 2000, .renew_interval_ms = 50 } };
+    try Work(Server).run(&job);
+    try std.testing.expectEqual(@as(usize, 1), target.calls);
+    try std.testing.expectEqual(.succeeded, (try store.loadAt(work, "slow-hydration", "alice", now())).state);
+    try std.testing.expect(!job.cancelled.load(.acquire));
+    var finished = LeaseRenewal{ .persistence = &persistence, .lease = job.lease.?, .policy = job.lease_policy };
+    try std.testing.expect(!try finished.renew());
 }

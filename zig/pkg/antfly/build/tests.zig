@@ -748,6 +748,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_api_document_runs_tests = addFilteredTestRunArtifact(b, api_document_runs_tests);
+    const document_job_lifecycle_tests = b.addTest(.{
+        .root_module = api_restore_jobs_test_mod,
+        .filters = &.{ "httpx inference gateway document job", "httpx inference gateway document worker" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_document_job_lifecycle_tests = addFilteredTestRunArtifact(b, document_job_lifecycle_tests);
+    b.step("antfly-document-job-lifecycle-test", "Verify document request validation and lease renewal during hydration").dependOn(&run_document_job_lifecycle_tests.step);
     const document_runs_protocol_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("lib/readers/src/document_runs.zig"),
@@ -766,6 +773,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const api_document_runs_test_step = b.step("antfly-api-document-runs-test", "Run durable document artifact checkpoints and lease recovery");
     api_document_runs_test_step.dependOn(&run_api_document_runs_tests.step);
+    api_document_runs_test_step.dependOn(&run_document_job_lifecycle_tests.step);
     api_document_runs_test_step.dependOn(&run_document_runs_protocol_tests.step);
     api_document_runs_test_step.dependOn(&run_document_stream_tests.step);
     const run_api_restore_jobs_tests = addFilteredTestRunArtifact(b, api_restore_jobs_tests);

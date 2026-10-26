@@ -200,9 +200,10 @@ pub const Owner = struct {
         const scratch = arena.allocator();
         const store = call.store();
         const initial: runs.Identity = .{ .request = request_hash, .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
-        if (try call.root(scratch)) |prior| {
+        if (try self.backend.get(self.backend.ptr, scratch, root_key)) |observed| {
+            const prior = try std.json.parseFromSliceLeaky(Root, scratch, observed, .{});
             if (!std.mem.eql(u8, prior.run.run_id, run_id) or prior.run.retired) {
-                if (!try collect(self.backend, scratch, root_key, blob_scope, 32)) return error.WriterLocked;
+                if (try collect(self.backend, scratch, root_key, observed, blob_scope, 32) != .done) return error.WriterLocked;
             }
         }
         if (try call.root(scratch) == null) try store.create(.{ .run_id = run_id, .owner = root_key, .operation = if (extract) .extract else .read, .identity = initial, .prepared = false, .limits = .{ .calls = 1024, .tokens = 1_000_000, .pixels = 400_000_000, .source_bytes = 128 * 1024 * 1024, .output_bytes = 256 * 1024 * 1024 }, .inputs = &.{} });
@@ -236,20 +237,23 @@ pub const Owner = struct {
 pub fn now() u64 {
     return @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
 }
-/// Atomically fence uploads first; bounded deletion leaves the root until the
-/// last blob is gone. Native blob writes and this marker share one transaction.
-pub fn collect(backend: Backend, a: A, root_key: []const u8, blobs: []const u8, limit: usize) !bool {
-    const old = (try backend.get(backend.ptr, a, root_key)) orelse return true;
-    var root = try std.json.parseFromSliceLeaky(Root, a, old, .{});
+pub const Collection = enum { done, more, changed };
+/// Retire only the exact root inspected by the lifecycle owner. A concurrent
+/// checkpoint or replacement invalidates that decision; the caller must inspect
+/// it again. Blob deletion remains conditional on the retirement marker.
+pub fn collect(backend: Backend, a: A, root_key: []const u8, observed: []const u8, blobs: []const u8, limit: usize) !Collection {
+    if (limit == 0 or limit > 32) return error.InvalidDocumentCheckpoint;
+    var root = try std.json.parseFromSliceLeaky(Root, a, observed, .{});
     root.run.retired = true;
-    root.run.revision += 1;
+    root.run.revision = try std.math.add(u64, root.run.revision, 1);
     const marker = try std.json.Stringify.valueAlloc(a, root, .{});
-    if (!try backend.mutate(backend.ptr, root_key, old, &.{.{ .key = root_key, .value = marker }}, &.{})) return false;
+    if (!try backend.mutate(backend.ptr, root_key, observed, &.{.{ .key = root_key, .value = marker }}, &.{})) return .changed;
     const keys = try backend.keys(backend.ptr, a, blobs, limit);
     const deletes = try a.alloc([]const u8, keys.len + @as(usize, if (keys.len < limit) 1 else 0));
     for (keys, deletes[0..keys.len]) |key, *dest| dest.* = key;
     if (keys.len < limit) deletes[keys.len] = root_key;
-    return try backend.mutate(backend.ptr, root_key, marker, &.{}, deletes) and keys.len < limit;
+    if (!try backend.mutate(backend.ptr, root_key, marker, &.{}, deletes)) return .changed;
+    return if (keys.len < limit) .done else .more;
 }
 
 pub const TestBackend = struct {
@@ -379,9 +383,11 @@ test "index document checkpoint cleanup fences uploads and collects bounded blob
     const id = try scope(scratch, "doc", "read");
     const root_key = try rootKey(scratch, id);
     const prefix = try blobScope(scratch, id);
-    try std.testing.expect(!try collect(backend.backend(), scratch, root_key, prefix, 1));
+    try std.testing.expectEqual(Collection.more, try collect(backend.backend(), scratch, root_key, (try backend.backend().get(&backend, scratch, root_key)).?, prefix, 1));
     try std.testing.expectError(error.DocumentRunLeaseLost, store.put_fn(store.ptr, scratch, upload, "late"));
-    while (!try collect(backend.backend(), scratch, root_key, prefix, 1)) {}
+    while (try backend.backend().get(&backend, scratch, root_key)) |observed| {
+        if (try collect(backend.backend(), scratch, root_key, observed, prefix, 1) == .done) break;
+    }
     try std.testing.expectEqual(@as(usize, 0), backend.values.count());
 }
 
@@ -450,4 +456,47 @@ test "index document checkpoint binding outlives the producer invocation allocat
     defer arena.deinit();
     const record = try client.store().load(arena.allocator(), client.id, client.owner);
     try std.testing.expectEqual(hash("request"), record.identity.request);
+}
+
+test "index document checkpoint retirement rejects stale source and checkpoint observations" {
+    const a = std.testing.allocator;
+    var backend = TestBackend.init(a);
+    defer backend.deinit();
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    var owner = Owner{ .allocator = a, .backend = backend.backend(), .binding = .{ .document = "doc", .producer = "reader", .source_key = "doc", .source_digest = @splat(1), .producer_digest = @splat(2) }, .io = io.io() };
+    defer owner.drain();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const id = try scope(scratch, "doc", "reader");
+    const key = try rootKey(scratch, id);
+    const prefix = try blobScope(scratch, id);
+    {
+        const initial = try owner.factory().bind(a, "request", false);
+        initial.view().release();
+    }
+    const obsolete = (try backend.backend().get(&backend, scratch, key)).?;
+    owner.binding.source_digest = @splat(3);
+    const replacement = try owner.factory().bind(a, "request", false);
+    defer replacement.view().release();
+    var client = try rpc.Client.initBound(a, replacement.view(), io.io());
+    defer client.deinit();
+    const store = client.store();
+    const record = try store.load(scratch, client.id, client.owner);
+    const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+    try store.prepare(scratch, lease, record.identity, record.limits, record.inputs, now());
+    try std.testing.expectEqual(Collection.changed, try collect(backend.backend(), scratch, key, obsolete, prefix, 32));
+    const observed = (try backend.backend().get(&backend, scratch, key)).?;
+    try std.testing.expect(try store.reserve(scratch, lease, @splat(9), .{ .calls = 1, .output_bytes = 4 }, now()));
+    const page = try store.complete(scratch, lease, @splat(9), .{ .calls = 1, .output_bytes = 4 }, "page", now());
+    try std.testing.expectEqual(Collection.changed, try collect(backend.backend(), scratch, key, observed, prefix, 32));
+    try std.testing.expectEqualStrings("page", try store.read(scratch, page, 4));
+    const current = try store.load(scratch, client.id, client.owner);
+    try std.testing.expectEqual(@as(u64, 1), current.used.calls);
+    try std.testing.expect(!current.retired);
+    // A fresh lifecycle decision can still retire the exact current root.
+    const fresh = (try backend.backend().get(&backend, scratch, key)).?;
+    try std.testing.expectEqual(Collection.done, try collect(backend.backend(), scratch, key, fresh, prefix, 32));
+    try std.testing.expectEqual(@as(usize, 0), backend.values.count());
 }

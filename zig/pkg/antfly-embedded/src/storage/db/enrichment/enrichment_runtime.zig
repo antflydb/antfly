@@ -13805,7 +13805,7 @@ fn processAsset(
         try finishAcceptedAssetGraph(runtime, request);
         try settleAcceptedMediaOutput(runtime, request, window);
         try retireMediaPassForAssetRequest(runtime, request);
-        try retireIndexDocumentCheckpoint(runtime, request);
+        try retireIndexDocumentCheckpoint(runtime, request, if (context) |*value| value else null);
         return;
     }
     // Accepted provenance already validates the saved causal guards. In
@@ -13823,7 +13823,7 @@ fn processAsset(
         prior_input = try @import("group_prior_input.zig").capture(runtime.alloc, runtime.artifact_store orelse return error.ArtifactCatalogDrift, request, observed.?, if (context) |*value| value else null, .{ .ptr = runtime, .render = Render.render });
     }
     const raw = observed orelse {
-        try retireIndexDocumentCheckpoint(runtime, request);
+        try retireIndexDocumentCheckpoint(runtime, request, if (context) |*value| value else null);
         if (context) |*value| {
             std.log.debug("producer retirement replay artifact={s}", .{requestArtifactName(request)});
             const artifact = requestArtifactName(request);
@@ -15410,13 +15410,22 @@ const IndexDocumentCheckpoint = struct {
         return true;
     }
 };
-fn retireIndexDocumentCheckpoint(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
+fn retireIndexDocumentCheckpoint(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, authority: ?*const @import("../artifact_producer_context.zig").Token) !void {
     var arena = std.heap.ArenaAllocator.init(runtime.alloc);
     defer arena.deinit();
     const a = arena.allocator();
     const id = try document_checkpoints.scope(a, request.doc_key, requestArtifactName(request));
     var context = IndexDocumentCheckpoint{ .runtime = runtime, .fence = try requiredRuntimeStoreWriteFence(runtime), .for_gc = true };
-    if (!try document_checkpoints.collect(context.backend(), a, try document_checkpoints.rootKey(a, id), try document_checkpoints.blobScope(a, id), 32)) runtime.document_checkpoint_gc_pending.store(true, .release);
+    const key = try document_checkpoints.rootKey(a, id);
+    const observed = (try context.backend().get(&context, a, key)) orelse return;
+    const root = try std.json.parseFromSliceLeaky(document_checkpoints.Root, a, observed, .{});
+    // An older publication/deletion must not retire a newer source or producer
+    // incarnation that has already started under the same document scope.
+    if (root.binding.source_sequence > request.sequence or root.binding.generation != request.reprocess_generation or !std.mem.eql(u8, &root.binding.producer_digest, &document_checkpoints.hash(request.producer_json))) return;
+    if (authority) |token| {
+        if (root.binding.catalog_epoch != token.epoch or !std.mem.eql(u8, &root.binding.namespace, &token.namespace) or !std.mem.eql(u8, &root.binding.catalog_digest, &token.catalog_digest)) return;
+    } else if (root.binding.catalog_epoch != 0) return;
+    if (try document_checkpoints.collect(context.backend(), a, key, observed, try document_checkpoints.blobScope(a, id), 32) != .done) runtime.document_checkpoint_gc_pending.store(true, .release);
 }
 fn maintainIndexDocumentCheckpoints(runtime: *EnrichmentRuntime) !void {
     if (!runtime.document_checkpoint_gc_mutex.tryLock()) return;
@@ -15526,7 +15535,7 @@ fn maintainIndexDocumentCheckpoints(runtime: *EnrichmentRuntime) !void {
                 obsolete = logical == null or !std.mem.eql(u8, &sourceRecordDigest(logical.?), &root.binding.source_digest);
             }
         }
-        if (obsolete and !try document_checkpoints.collect(context.backend(), root_alloc, key, try document_checkpoints.blobScope(root_alloc, key[document_checkpoints.root_prefix.len..]), 32)) runtime.document_checkpoint_gc_pending.store(true, .release);
+        if (obsolete and try document_checkpoints.collect(context.backend(), root_alloc, key, raw, try document_checkpoints.blobScope(root_alloc, key[document_checkpoints.root_prefix.len..]), 32) != .done) runtime.document_checkpoint_gc_pending.store(true, .release);
     }
 }
 
@@ -15560,7 +15569,7 @@ fn applyAssetProducerBatchOutput(
     try materializeGraphAssetForRuntime(runtime, item.request, produced, item.raw_doc, window);
     recordArtifactBytes(runtime, .asset, produced.len);
     try queueArtifactCoverageOutcomeForRequest(runtime, window, item.request, .produced);
-    try retireIndexDocumentCheckpoint(runtime, item.request);
+    try retireIndexDocumentCheckpoint(runtime, item.request, null);
 }
 
 /// Use the same completed-state gate for metadata fingerprints known before a

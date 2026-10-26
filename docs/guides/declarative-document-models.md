@@ -646,8 +646,9 @@ TTL. Acceptance retires intermediates; source replacement/deletion, producer
 removal, and catalog/reprocess changes
 invalidate previous preparation. The existing maintenance scheduler rotates
 through bounded root pages and deletes at most 32 blobs per root per pass,
-including while source replay is idle. A retirement marker fences writes before
-deletion. Retained callbacks and responses use a lifetime-owned, bounded,
+including while source replay is idle. Retirement compares the exact inspected
+root before fencing writes and deleting blobs. A concurrent checkpoint or source
+replacement requires a fresh lifecycle decision. Retained callbacks and responses use a lifetime-owned, bounded,
 synchronized allocator and drain before their enrichment context is released.
 
 A reader may receive a JSON document descriptor containing `documents` to
@@ -655,7 +656,9 @@ preserve media type, page selection, slide notes and visibility. PDF/PPTX source
 URIs can also be inferred from their suffix or explicit media type. Extractor
 producers support one document source per indexed invocation, while ordinary
 text extraction keeps its existing response representation. Job APIs retain
-their broader request forms and independent result/event retention.
+their broader request forms and independent result/event retention. Authored
+text/media parts retain their locator and prompt precedence over fallback
+source text and the configured prompt.
 
 ### Ownership, recovery and shared artifacts
 
@@ -678,12 +681,19 @@ checkpoints and model accounting remain in the document executor.
 
 Runnable and retention indexes change atomically with job state and principal
 quotas. Recovery visits at most 32 records per pass and admits four distinct
-jobs concurrently. Lease renewal moves the recovery ticket to the new expiry.
+jobs concurrently. Lease renewal covers initial request persistence, request
+hydration, inference, and draining retained callbacks. It moves the recovery
+ticket to the new expiry.
 Transient failures persist a retry deadline using the same exponential backoff
 and deterministic jitter as index repair (250 ms base, 30 second cap).
 Collectors retain tombstones and revisit completed namespaces after a minute
 to catch uploads that finish after ownership loss. Completed history is not
 loaded into memory or scanned for ordinary job dispatch.
+
+Public document submissions accept the operation’s request envelope and select
+server-owned model configuration. Schema field names and extraction input data
+are opaque document data; names such as `api_key` are valid there. Provider
+configuration and credentials cannot be supplied as request envelope fields.
 
 Configure the existing artifact lane before submitting independent jobs that
 must survive HA promotion. Document jobs use a `document-jobs` subnamespace:
