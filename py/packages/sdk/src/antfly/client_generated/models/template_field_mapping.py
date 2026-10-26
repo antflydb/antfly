@@ -39,9 +39,11 @@ class TemplateFieldMapping:
                 sorting; users should not configure doc_values directly.
                  Default: False.
             missing_null_policy (TemplateFieldMappingMissingNullPolicy | Unset): Missing/null sort policy for this mapped
-                field. The current production
-                policy rejects missing or null native sort values so sorted cursors
-                remain replayable JSON scalar tuples.
+                field. The default missing_rejected
+                rejects missing or null native sort values. Opt in to nulls_ordered
+                to sort missing/null values first ascending and last descending,
+                with JSON null in replayable sort cursor tuples. Native sorting
+                requires a complete producer proof for nullable physical layouts.
                  Default: TemplateFieldMappingMissingNullPolicy.MISSING_REJECTED.
     """
 

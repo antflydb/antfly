@@ -29,7 +29,7 @@ const Token = @import("antfly_cancellation").CancellationToken;
 const commitments = @import("lake_row_input_commitment.zig");
 const max_rows = 8192;
 const max_fragments = 16384;
-const Fragment = struct { prefix: [32]u8, bits: u16, name: []const u8, count: u64, digest: [32]u8, dirty: bool = false, membership_dirty: bool = true, incremental: bool = false };
+const Fragment = struct { prefix: [32]u8, bits: u16, name: []const u8, count: u64, digest: [32]u8, dirty: bool = false, membership_dirty: bool = true, incremental: bool = false, order_tag: ?[]const u8 = null };
 
 pub const Build = struct {
     a: A,
@@ -40,11 +40,19 @@ pub const Build = struct {
     root: identity.Root,
     space: identity.Space = undefined,
     prior_navigation: ?navigation.Root = null,
-    fragments: []const Fragment = &.{},
+    fragments: []Fragment = &.{},
     slots: []const u32 = &.{},
     spool: ?*Spool = null,
+    order_capture: ?*@import("lake_row_payloads.zig").Capture = null,
     census_rows_hashed: u64 = 0,
     input_rows_hashed: u64 = 0,
+    ordering_rows_fetched: u64 = 0,
+    ordering_payload_decodes: u64 = 0,
+    ordering_keys_reused: u64 = 0,
+    ordering_keys_captured: u64 = 0,
+    ordering_input_cohort: ?[32]u8 = null,
+    prior_ordering_keys: ?tree.Ref = null,
+    ordering_edits: ?*@import("lake_index_page_mutations.zig").Mutations = null,
     store: stores.ArtifactStore,
     schemas: @import("sql_schema_cache.zig").Cache,
     table: local.sql_catalog.Table = undefined,
@@ -106,9 +114,12 @@ pub const Build = struct {
 };
 
 pub fn prepare(a: A, store: *stores.ArtifactStore, table: local.common_topology_records.TableRecord, physical: *local.serverless_query_lake_serving.ServingSource, provider: *Provider, root: identity.Root, previous: ?identity.Root) !?*Build {
+    return prepareWithCapture(a, store, table, physical, provider, root, previous, null);
+}
+pub fn prepareWithCapture(a: A, store: *stores.ArtifactStore, table: local.common_topology_records.TableRecord, physical: *local.serverless_query_lake_serving.ServingSource, provider: *Provider, root: identity.Root, previous: ?identity.Root, capture: ?*@import("lake_row_payloads.zig").Capture) !?*Build {
     if (provider.identity_spill_bytes == 0 or root.current.rows == 0) return null;
     const self = try a.create(Build);
-    self.* = .{ .a = a, .arena = .init(a), .physical = physical, .root = root, .store = store.*, .schemas = .init(a), .context = provider.context, .token = .{ .ptr = provider, .is_cancelled_fn = canceled } };
+    self.* = .{ .a = a, .arena = .init(a), .physical = physical, .root = root, .order_capture = capture, .store = store.*, .schemas = .init(a), .context = provider.context, .token = .{ .ptr = provider, .is_cancelled_fn = canceled } };
     var owned = true;
     defer if (owned) self.deinit();
     const scheduler = local.sql_parallel_scheduler.global();
@@ -198,10 +209,27 @@ fn planRange(self: *Build, a: A, pages: *Pages, prefix: [32]u8, bits: u16, fragm
 }
 fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRecord, provider: *Provider, previous: ?identity.Root) !void {
     const out = self.arena.allocator();
+    self.table = try self.schemas.resolve(self.context.io.?, out, table.schema_json, table.table_id, table.name);
     var reads: u64 = 0;
     var writes: u64 = 0;
     var pages = self.pageStore(&reads, &writes);
     pages.admitPublication();
+    var parsed_schema = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
+    defer parsed_schema.deinit(a);
+    const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed_schema);
+    defer local.storage_schema.freeSchema(a, runtime);
+    const order = try local.storage_db_document_mapper.indexSortFieldsForSchemaAlloc(a, runtime);
+    defer a.free(order);
+    const order_recipe: ?[32]u8 = if (order.len != 0) recipe: {
+        const bytes = try std.json.Stringify.valueAlloc(a, order, .{});
+        defer a.free(bytes);
+        var digest: [32]u8 = undefined;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("native-logical-physical-order-v2-nullable");
+        hash.update(bytes);
+        hash.final(&digest);
+        break :recipe digest;
+    } else null;
     const prior = if (previous) |old| if (std.mem.eql(u8, &old.namespace, &self.root.namespace) and std.mem.eql(u8, &old.values_recipe, &self.root.values_recipe)) old.native_space else null else null;
     var fragments: std.ArrayList(Fragment) = .empty;
     const prior_navigation = if (prior) |space| try navigation.load(out, self.store, space.navigation orelse return error.InvalidLogicalRowIdentity, self.token, null) else null;
@@ -224,11 +252,34 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
         };
         var changed: Changes = .{ .owner = self, .fragments = old_fragments };
         try tree.visitDifferences(a, pages.store(), previous.?.current.by_id, self.root.current.by_id, &changed);
+        // Compact identity maps omit values. Only the dedicated ordering
+        // cohort can invalidate the coordinate layout on a payload-only edit.
+        if (order.len != 0) {
+            const InputChanges = struct {
+                owner: *Build,
+                fragments: []Fragment,
+                ordering_digest: ?[32]u8,
+                pub fn change(v: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
+                    try Build.check(v.owner);
+                    const key = (right orelse left.?).key;
+                    if (key.len != 64) return error.InvalidLogicalRowIdentity;
+                    const digest = v.ordering_digest orelse return;
+                    if (std.mem.eql(u8, key[0..32], &digest)) v.fragments[try fragmentFor(v.fragments, key[32..64])].dirty = true;
+                }
+            };
+            var input_changes: InputChanges = .{ .owner = self, .fragments = old_fragments, .ordering_digest = @import("lake_row_input_recipes.zig").orderingDigest(self.root.current.input_recipes) };
+            try tree.visitDifferences(a, pages.store(), previous.?.current.input_versions, self.root.current.input_versions, &input_changes);
+        }
+
         for (old_fragments) |fragment| {
             if (fragment.dirty) {
                 const first = fragments.items.len;
                 try planRange(self, a, &pages, fragment.prefix, fragment.bits, &fragments);
-                if (fragments.items.len == first + 1 and std.mem.eql(u8, fragments.items[first].name, fragment.name)) fragments.items[first].membership_dirty = fragment.membership_dirty;
+                for (fragments.items[first..]) |*replacement| replacement.dirty = true;
+                if (fragments.items.len == first + 1 and std.mem.eql(u8, fragments.items[first].name, fragment.name)) {
+                    fragments.items[first].membership_dirty = fragment.membership_dirty;
+                    fragments.items[first].order_tag = fragment.order_tag;
+                }
             } else try fragments.append(out, fragment);
         }
     } else for (0..16) |i| {
@@ -271,8 +322,10 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     self.provider.skip_indexes = &.{};
     self.provider.expected_delete_objects = null;
     self.provider.fragment_rows = .{ .ptr = self, .open = Build.open, .replayable = Build.replayable, .open_selected = Build.openSelected };
-    const nav = try navigation.build(a, out, &self.store, &self.provider, prior_navigation, self.token);
-    self.provider.native_delta = nav.delta;
+    const layout_changed = try a.alloc(bool, self.fragments.len);
+    defer a.free(layout_changed);
+    for (self.fragments, layout_changed) |fragment, *changed| changed.* = prior == null or fragment.membership_dirty or !orderTagMatches(fragment.order_tag, order_recipe) or
+        (fragment.dirty and (order_recipe == null or !self.root.current.compact));
     self.provider.replay_recommended = true;
     var old_root = self.root;
     old_root.current = prior orelse self.root.current;
@@ -282,23 +335,66 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     old_root.certificate = null;
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io orelse return error.InvalidLogicalRowIdentity, .context = self, .checkpoint = Build.check, .max_bytes = provider.identity_spill_bytes };
     defer manager.deinit();
-    const builder = try @import("lake_row_identity_delta.zig").Builder.createWithOptions(a, &manager, &pages, names, if (prior != null) old_root else null, if (prior != null) nav.delta else null, &.{}, inventory.source_id, inventory.snapshot_id, self.root.current.compact);
+    self.ordering_input_cohort = @import("lake_row_input_recipes.zig").orderingDigest(self.root.current.input_recipes);
+    const key_recipe = orderingKeyRecipe(self.ordering_input_cohort, order);
+    if (prior) |space| {
+        if (std.meta.eql(space.ordering_cohort, key_recipe)) self.prior_ordering_keys = space.ordering_keys;
+    }
+    var ordering_edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
+    ordering_edits.private_pages.phase = self.store.io_phase;
+    defer ordering_edits.deinit();
+    self.ordering_edits = &ordering_edits;
+    defer self.ordering_edits = null;
+    if (self.prior_ordering_keys != null) {
+        const Removed = struct {
+            edits: *@import("lake_index_page_mutations.zig").Mutations,
+            pub fn change(v: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
+                if (right == null) try v.edits.addRecord(left.?.key, null);
+            }
+        };
+        var removed: Removed = .{ .edits = &ordering_edits };
+        try tree.visitDifferences(a, pages.store(), previous.?.current.by_id, self.root.current.by_id, &removed);
+    }
+    const builder = try @import("lake_row_identity_delta.zig").Builder.createWithScan(a, &manager, &pages, names, if (prior != null) old_root else null, null, &.{}, inventory.source_id, inventory.snapshot_id, self.root.current.compact, layout_changed);
     defer builder.deinit();
-    for (self.fragments, builder.slots, builder.scan) |fragment, slot, changed| if (changed) {
-        const upper = upperBound(fragment.prefix, fragment.bits);
-        var cursor = try tree.Cursor.init(a, pages.store(), self.root.current.by_id, &fragment.prefix, if (upper) |*value| value else null);
-        defer cursor.deinit();
-        var row: u64 = 0;
-        while (try cursor.next()) |record| {
-            try Build.check(self);
-            const resolved = try identity.decodeState(self.root.current, record.key, record.value);
-            try builder.add(resolved.state, .{ .file = slot, .group = 0, .row = row });
-            row += 1;
+    for (self.fragments, files, builder.slots, 0..) |*fragment, *file, slot, file_index| {
+        if (builder.scan[file_index] or fragment.dirty) {
+            var region = std.heap.ArenaAllocator.init(a);
+            defer region.deinit();
+            const fa = region.allocator();
+            if (order_recipe) |recipe| {
+                const sorted = try orderFragment(self, fa, &pages, fragment.*, runtime, order);
+                if (sorted) |ordered| {
+                    var hash = std.crypto.hash.Blake3.init(.{});
+                    hash.update("native-logical-ordered-members-v1");
+                    for (ordered.indices) |index| hash.update(&ordered.states[index].id);
+                    var digest: [32]u8 = undefined;
+                    hash.final(&digest);
+                    const tag = try std.fmt.allocPrint(out, "so1-{s}-{s}", .{ std.fmt.bytesToHex(&recipe, .lower), std.fmt.bytesToHex(&digest, .lower) });
+                    if (!builder.scan[file_index] and (fragment.order_tag == null or !std.mem.eql(u8, fragment.order_tag.?, tag))) try builder.rescanFile(file_index);
+                    fragment.order_tag = tag;
+                    if (builder.scan[file_index]) for (ordered.indices, 0..) |index, row| {
+                        try builder.add(ordered.states[index], .{ .file = slot, .group = 0, .row = row });
+                    };
+                } else {
+                    const tag = try std.fmt.allocPrint(out, "su1-{s}", .{std.fmt.bytesToHex(&recipe, .lower)});
+                    if (!builder.scan[file_index] and (fragment.order_tag == null or !std.mem.eql(u8, fragment.order_tag.?, tag))) try builder.rescanFile(file_index);
+                    fragment.order_tag = tag;
+                    if (builder.scan[file_index]) try addCanonicalFragment(self, a, &pages, fragment.*, builder, slot);
+                }
+            } else {
+                fragment.order_tag = null;
+                try addCanonicalFragment(self, a, &pages, fragment.*, builder, slot);
+            }
         }
-        if (row != fragment.count) return error.InvalidLogicalRowIdentity;
-    };
+        file.etag = if (fragment.order_tag) |tag| @constCast(tag) else &.{};
+    }
     self.slots = try out.dupe(u32, builder.slots);
     self.space = (try builder.finish(self.root.namespace, self.root.values_recipe, self.root.cut)).current;
+    self.space.ordering_keys = try ordering_edits.finish(self.prior_ordering_keys);
+    self.space.ordering_cohort = if (self.space.ordering_keys != null) key_recipe else null;
+    const nav = try navigation.build(a, out, &self.store, &self.provider, prior_navigation, self.token);
+    self.provider.native_delta = nav.delta;
     self.space.navigation = nav.ref;
     if (self.space.rows != self.root.current.rows) return error.InvalidLogicalRowIdentity;
     try prepareInputs(self, a, &pages, previous, table.indexes_json);
@@ -308,15 +404,431 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     var prospective = self.root;
     prospective.version = identity.metadata_version;
     prospective.native_space = self.space;
-    const bindings = try a.alloc(identity.ReusedIndex, self.root.current.input_recipes.len);
+    const consumer_recipes = try @import("lake_row_input_recipes.zig").consumers(a, self.root.current.input_recipes);
+    defer a.free(consumer_recipes);
+    const bindings = try a.alloc(identity.ReusedIndex, consumer_recipes.len);
     defer a.free(bindings);
-    for (bindings, self.root.current.input_recipes) |*binding, recipe| binding.* = .{ .name = recipe.name, .space = indexSpace(self, recipe.name), .translation = if (self.space.by_id) |ref| .{ .forward = ref, .reverse = ref, .ranked = false } else null };
+    for (bindings, consumer_recipes) |*binding, recipe| binding.* = .{ .name = recipe.name, .space = indexSpace(self, recipe.name), .translation = if (self.space.by_id) |ref| .{ .forward = ref, .reverse = ref, .ranked = false } else null };
     prospective.reused = bindings;
     prospective.certificate = @splat(255);
     const encoded = try std.json.Stringify.valueAlloc(a, prospective, .{});
     defer a.free(encoded);
     if (encoded.len +| 4096 > identity.max_root_bytes) return error.LogicalRowIdentityAdmissionDeclined;
-    self.table = try self.schemas.resolve(self.context.io.?, out, table.schema_json, table.table_id, table.name);
+}
+
+// Input cohorts sort/deduplicate source columns and intentionally omit layout.
+// Cached tuples additionally bind emitted field positions: changing (a,b) to
+// (b,a), or selecting another alias of the same input, cannot reinterpret keys.
+// Direction is absent because reversing an order preserves the typed values.
+fn orderingKeyRecipe(input: ?[32]u8, fields: []const local.segment.SegmentIndexSortField) ?[32]u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("native-lake-typed-ordering-keys-v1");
+    hash.update(&(input orelse return null));
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, field.field.len, .big);
+        hash.update(&length);
+        hash.update(field.field);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn orderTagMatches(tag: ?[]const u8, recipe: ?[32]u8) bool {
+    const wanted = recipe orelse return tag == null;
+    const value = tag orelse return false;
+    if (!((value.len == 133 and std.mem.startsWith(u8, value, "so1-")) or
+        (value.len == 68 and std.mem.startsWith(u8, value, "su1-")))) return false;
+    return std.mem.eql(u8, value[4..68], &std.fmt.bytesToHex(&wanted, .lower));
+}
+
+fn addCanonicalFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, builder: *@import("lake_row_identity_delta.zig").Builder, slot: u32) !void {
+    const upper = upperBound(fragment.prefix, fragment.bits);
+    var cursor = try tree.Cursor.init(a, pages.store(), self.root.current.by_id, &fragment.prefix, if (upper) |*value| value else null);
+    defer cursor.deinit();
+    var row: u64 = 0;
+    while (try cursor.next()) |record| {
+        try Build.check(self);
+        const resolved = try identity.decodeState(self.root.current, record.key, record.value);
+        try builder.add(resolved.state, .{ .file = slot, .group = 0, .row = row });
+        row += 1;
+    }
+    if (row != fragment.count) return error.InvalidLogicalRowIdentity;
+}
+
+const OrderedFragment = struct { states: []identity.logical.State, indices: []u32 };
+/// Coordinates are assigned in index order before any producer consumes them.
+/// Existing by-ID/by-location maps authenticate the permutation and its inverse;
+/// readers, maintenance and GC keep their existing publication-bound closure.
+fn orderFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?OrderedFragment {
+    // Native private IDs encode the assigned coordinate. They can close a
+    // key tuple ascending, but cannot lead it or reverse it without a separate
+    // segment permutation. Keep those declarations on the exact fallback.
+    for (fields, 0..) |field, i| if (std.mem.eql(u8, field.field, "_id") and (field.desc or i + 1 != fields.len)) return null;
+    const capture = self.order_capture orelse return orderProjectedFragment(self, a, pages, fragment, schema, fields);
+    if (!capture.complete or capture.rows != self.root.current.rows or fragment.count > max_rows) return error.InvalidLogicalRowIdentity;
+    const previous_phase = capture.routes.phase;
+    capture.routes.phase = self.store.io_phase;
+    defer capture.routes.phase = previous_phase;
+    const count: usize = @intCast(fragment.count);
+    const states = try a.alloc(identity.logical.State, count);
+    const docs = try a.alloc(local.introducer.TextDocument, count);
+    var reader: Spool = .{ .a = a, .owner = self, .budget = .{ .backing = a, .limit = Spool.workspace_bytes }, .captured = capture, .columns = capture.columns, .specs = capture.specs, .manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = Build.check } };
+    defer self.ordering_payload_decodes += reader.payload_decodes;
+    defer while (reader.evictPayload()) {};
+    var page: ?*local.storage_db_types.ColumnSourcePage = null;
+    defer if (page) |value| value.release();
+    var offset: ?u64 = null;
+    const upper = upperBound(fragment.prefix, fragment.bits);
+    var logical = try tree.Cursor.init(a, pages.store(), self.root.current.by_id, &fragment.prefix, if (upper) |*value| value else null);
+    defer logical.deinit();
+    var payload = try tree.Cursor.init(a, capture.route_store, capture.route_root, &fragment.prefix, if (upper) |*value| value else null);
+    defer payload.deinit();
+    var captured_keys = if (capture.ordering_root) |key_root| try tree.Cursor.init(a, capture.route_store, key_root, &fragment.prefix, if (upper) |*value| value else null) else null;
+    defer if (captured_keys) |*cursor| cursor.deinit();
+    var retained = try OrderKeys.init(self, a, pages, fragment);
+    defer retained.deinit();
+    const Missing = struct { row: usize, offset: u64, index: usize, version: ?[32]u8 };
+    var missing: std.ArrayList(Missing) = .empty;
+    var row: usize = 0;
+    while (try logical.next()) |record| {
+        try Build.check(self);
+        if (row == count) return error.InvalidLogicalRowIdentity;
+        const route = (try payload.next()) orelse return error.InvalidLogicalRowIdentity;
+        if (route.value.len != 24 or !std.mem.eql(u8, record.key, route.key)) return error.InvalidLogicalRowIdentity;
+        states[row] = (try identity.decodeState(self.root.current, record.key, record.value)).state;
+        const version = try retained.version(states[row].id);
+        if (try retained.restore(a, states[row].id, version, fields)) |doc| {
+            docs[row] = doc;
+            self.ordering_keys_reused += 1;
+        } else if (captured_keys) |*cursor| {
+            try cursor.seekForward(&states[row].id);
+            const entry = (try cursor.next()) orelse return null;
+            if (!std.mem.eql(u8, entry.key, &states[row].id)) return null;
+            const tuple = try @import("lake_ordering_keys.zig").decodeIntoArena(a, entry.value);
+            docs[row] = try orderingDocFromTuple(a, states[row].id, fields, tuple.keys);
+            try retained.remember(a, states[row].id, version, docs[row]);
+            self.ordering_keys_captured += 1;
+        } else try missing.append(a, .{ .row = row, .offset = std.mem.readInt(u64, route.value[0..8], .big), .index = @intCast(std.mem.readInt(u64, route.value[8..16], .big)), .version = version });
+        row += 1;
+    }
+    if (row != count or (try payload.next()) != null) return error.InvalidLogicalRowIdentity;
+    // Logical hash order scatters neighboring rows across payload blocks. Read
+    // each missing block once, independently of the optional eight-page cache.
+    std.mem.sort(Missing, missing.items, {}, struct {
+        fn less(_: void, left: Missing, right: Missing) bool {
+            return left.offset < right.offset;
+        }
+    }.less);
+    var ordering_batch: ?OrderingBatch = null;
+    for (missing.items) |item| {
+        try Build.check(self);
+        if (offset == null or offset.? != item.offset) {
+            if (page) |held| held.release();
+            page = null;
+            var phase = try self.store.beginIo(1);
+            defer phase.abort();
+            page = reader.readPayload(item.offset) catch |err| return phase.failed(err);
+            try phase.finish();
+            offset = item.offset;
+            ordering_batch = (try OrderingBatch.bind(a, page.?.columns, schema, fields)) orelse return null;
+        }
+        if (item.index >= page.?.len) return error.InvalidLogicalRowIdentity;
+        docs[item.row] = (try ordering_batch.?.document(a, item.index, &states[item.row])) orelse return null;
+        self.ordering_rows_fetched += 1;
+        try retained.remember(a, states[item.row].id, item.version, docs[item.row]);
+    }
+    const indices = local.introducer.sortedTextDocumentIndicesAlloc(a, docs, fields) catch |err| switch (err) {
+        error.InvalidSegment, error.UnsupportedTypedDocValues => return null,
+        else => return err,
+    };
+    return .{ .states = states, .indices = indices };
+}
+
+fn orderingDocFromTuple(a: A, id: [32]u8, fields: []const local.segment.SegmentIndexSortField, keys: []const local.segment.SegmentIndexSortBoundValue) !local.introducer.TextDocument {
+    var values: std.ArrayList(local.introducer.NamedSortValue) = .empty;
+    var index: usize = 0;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        if (index >= keys.len or keys[index] == .id) return error.InvalidLogicalRowIdentity;
+        try values.append(a, .{ .field_name = field.field, .value = keys[index] });
+        index += 1;
+    }
+    if (index != keys.len) return error.InvalidLogicalRowIdentity;
+    return .{ .id = try a.dupe(u8, &id), .stored_data = "", .text_fields = &.{}, .index_sort_values = values.items };
+}
+
+/// A batch borrows schema and column storage only while that batch is live.
+/// Resolve virtual fields, literal dotted names and nested paths once; flat
+/// scalar kernels avoid the JSON adapter and mapped-value allocation per row.
+pub const OrderingBatch = struct {
+    const Entry = struct {
+        field: []const u8,
+        mapping: local.storage_schema.FieldMapping,
+        column: ?usize,
+        tail: []const u8 = "",
+    };
+    entries: []const Entry,
+    columns: []const rows.ColumnVector,
+    pub fn bind(a: A, columns: []const rows.ColumnVector, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?OrderingBatch {
+        var entries: std.ArrayList(Entry) = .empty;
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.field, "_id")) continue;
+            const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse return null;
+            const source = for (schema.exact_fields) |mapped| {
+                if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+            } else field.field;
+            var entry: Entry = .{ .field = field.field, .mapping = resolved.mapping, .column = null };
+            for (columns, 0..) |column, index| if (std.mem.eql(u8, column.name, source)) {
+                entry.column = index;
+                break;
+            };
+            if (entry.column == null) if (std.mem.indexOfScalar(u8, source, '.')) |dot| {
+                for (columns, 0..) |column, index| if (std.mem.eql(u8, column.name, source[0..dot])) {
+                    entry.column = index;
+                    entry.tail = source[dot + 1 ..];
+                    break;
+                };
+            };
+            try entries.append(a, entry);
+        }
+        return .{ .entries = try entries.toOwnedSlice(a), .columns = columns };
+    }
+    fn value(self: OrderingBatch, a: A, entry: Entry, row: usize, own_bytes: bool) !?local.segment.SegmentIndexSortBoundValue {
+        const index = entry.column orelse return .null_value;
+        const column = self.columns[index];
+        if (column.nulls.isNull(row)) return .null_value;
+        if (entry.tail.len == 0) switch (entry.mapping.field_type) {
+            .numeric => switch (column.values) {
+                .i64 => |values| return .{ .i64_val = values[row] },
+                .dictionary_i64 => |values| return .{ .i64_val = values.at(row) },
+                .f64 => |values| return if (std.math.isFinite(values[row])) .{ .f64_val = values[row] } else null,
+                .dictionary_f64 => |values| return if (std.math.isFinite(values.at(row))) .{ .f64_val = values.at(row) } else null,
+                else => {},
+            },
+            .boolean => switch (column.values) {
+                .bool => |values| return .{ .bool_val = values[row] },
+                else => {},
+            },
+            .keyword, .link => switch (column.values) {
+                .bytes => |values| return .{ .bytes_val = if (own_bytes) try a.dupe(u8, values[row]) else values[row] },
+                .dictionary_bytes => |values| return .{ .bytes_val = if (own_bytes) try a.dupe(u8, values.at(row)) else values.at(row) },
+                else => {},
+            },
+            else => {},
+        };
+        var raw = try column.values.jsonAt(a, row);
+        if (entry.tail.len != 0) {
+            var parts = std.mem.splitScalar(u8, entry.tail, '.');
+            while (parts.next()) |part| {
+                if (raw != .object) return .null_value;
+                raw = raw.object.get(part) orelse return .null_value;
+            }
+        }
+        if (raw == .null) return .null_value;
+        const typed = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, entry.mapping, raw)) orelse return null;
+        return switch (typed) {
+            .numeric_val => |number| switch (number) {
+                inline else => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+            },
+            inline .datetime_ns, .u64_val, .i64_val, .f64_val, .bytes_val, .bool_val => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+            else => null,
+        };
+    }
+    /// Capture consumes this tuple before releasing the source batch. Flat
+    /// byte keys may borrow columns until the encoder copies their bytes.
+    pub fn tupleInto(self: OrderingBatch, a: A, row: usize, output: []local.segment.SegmentIndexSortBoundValue) !bool {
+        if (output.len != self.entries.len) return error.InvalidLogicalRowIdentity;
+        for (self.entries, output) |entry, *value_| value_.* = (try self.value(a, entry, row, false)) orelse return false;
+        return true;
+    }
+    pub fn document(self: OrderingBatch, a: A, row: usize, state: *const identity.logical.State) !?local.introducer.TextDocument {
+        const values = try a.alloc(local.introducer.NamedSortValue, self.entries.len);
+        for (self.entries, values) |entry, *target| target.* = .{ .field_name = entry.field, .value = (try self.value(a, entry, row, true)) orelse return null };
+        return .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .index_sort_values = values };
+    }
+};
+
+pub fn orderingDocument(a: A, columns: []const rows.ColumnVector, row: usize, state: *const identity.logical.State, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?local.introducer.TextDocument {
+    const batch = (try OrderingBatch.bind(a, columns, schema, fields)) orelse return null;
+    return batch.document(a, row, state);
+}
+
+/// Incremental verification may retain no complete payload capture. Gather only
+/// the declared ordering columns at this changed fragment's authenticated
+/// physical coordinates; unrelated rows and source bodies never enter the sort.
+fn orderProjectedFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?OrderedFragment {
+    const count: usize = @intCast(fragment.count);
+    if (count > max_rows) return error.InvalidLogicalRowIdentity;
+    const states = try a.alloc(identity.logical.State, count);
+    const docs = try a.alloc(local.introducer.TextDocument, count);
+    const refs = try a.alloc(rows.RowRef, count);
+    var retained = try OrderKeys.init(self, a, pages, fragment);
+    defer retained.deinit();
+    const versions = try a.alloc(?[32]u8, count);
+    var requested: usize = 0;
+    const seen = try a.alloc(bool, count);
+    @memset(seen, false);
+    var positions: std.StringHashMapUnmanaged(usize) = .empty;
+    var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store(), .max_bytes = 1024 * 1024 };
+    defer cache.deinit();
+    var reader: identity.Reader = .{ .root = self.root, .pages = pages, .cache = &cache };
+    const upper = upperBound(fragment.prefix, fragment.bits);
+    var logical = try tree.Cursor.init(a, pages.store(), self.root.current.by_id, &fragment.prefix, if (upper) |*value| value else null);
+    defer logical.deinit();
+    var row: usize = 0;
+    while (try logical.next()) |record| {
+        try Build.check(self);
+        if (row == count) return error.InvalidLogicalRowIdentity;
+        const resolved = try identity.decodeState(self.root.current, record.key, record.value);
+        states[row] = resolved.state;
+        versions[row] = try retained.version(states[row].id);
+        if (try retained.restore(a, states[row].id, versions[row], fields)) |doc| {
+            docs[row] = doc;
+            seen[row] = true;
+            self.ordering_keys_reused += 1;
+            row += 1;
+            continue;
+        }
+        refs[requested] = try reader.reference(a, self.root.current, resolved);
+        refs[requested].external.identity_version = self.physical.inventory.row_identity_version;
+        const key = try local.storage_rowsource_identity.allocId(a, refs[requested]);
+        const entry = try positions.getOrPut(a, key);
+        if (entry.found_existing) return error.InvalidLogicalRowIdentity;
+        entry.value_ptr.* = row;
+        requested += 1;
+        row += 1;
+    }
+    if (row != count) return error.InvalidLogicalRowIdentity;
+    var columns: std.StringHashMapUnmanaged(void) = .empty;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse return null;
+        const source = for (schema.exact_fields) |mapped| {
+            if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+        } else field.field;
+        try columns.put(a, source, {});
+    }
+    if (columns.count() == 0 or count == 0) {
+        for (states, docs) |*state, *doc| doc.* = .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .typed_fields = &.{} };
+    } else if (requested != 0) {
+        const paths = try a.alloc([]const u8, columns.count());
+        var names = columns.keyIterator();
+        for (paths) |*path| path.* = names.next().?.*;
+        var physical = try self.physical.parallelView(a);
+        defer physical.closeParallelView(self.physical);
+        const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = paths, .row_refs = refs[0..requested], .limit = @intCast(requested) }, .{ .deadline_ns = self.context.deadline_ns, .cancellation = self.token }, &physical);
+        defer cursor.close(cursor.ptr);
+        const next = cursor.next_columns orelse return error.UnsupportedSqlExecution;
+        var found: usize = 0;
+        while (true) {
+            try Build.check(self);
+            var phase = try self.store.beginIo(1);
+            defer phase.abort();
+            const page = next(cursor.ptr, a, 256) catch |err| return phase.failed(err);
+            try phase.finish();
+            if (page.selection.len == 0) break;
+            const projected = try a.dupe(rows.ColumnVector, page.batch.columns);
+            for (projected) |*column| for (self.table.columns) |definition| {
+                if (std.mem.eql(u8, column.name, definition.name)) column.name = definition.path;
+            };
+            const ordering_batch = (try OrderingBatch.bind(a, projected, schema, fields)) orelse return null;
+            for (page.selection) |selected| {
+                var ref = page.batch.rowRef(selected);
+                ref.external.identity_version = self.physical.inventory.row_identity_version;
+                const key = try local.storage_rowsource_identity.allocId(a, ref);
+                const position = positions.get(key) orelse return error.InvalidLogicalRowIdentity;
+                if (seen[position]) return error.InvalidLogicalRowIdentity;
+                seen[position] = true;
+                docs[position] = (try ordering_batch.document(a, selected, &states[position])) orelse return null;
+                self.ordering_rows_fetched += 1;
+                try retained.remember(a, states[position].id, versions[position], docs[position]);
+                found += 1;
+            }
+        }
+        if (found != requested) return error.InvalidLogicalRowIdentity;
+    }
+    const indices = local.introducer.sortedTextDocumentIndicesAlloc(a, docs, fields) catch |err| switch (err) {
+        error.InvalidSegment, error.UnsupportedTypedDocValues => return null,
+        else => return err,
+    };
+    return .{ .states = states, .indices = indices };
+}
+
+const OrderKeys = struct {
+    const codec = @import("lake_ordering_keys.zig");
+    owner: *Build,
+    inputs: ?tree.Cursor = null,
+    cached: ?tree.Cursor = null,
+    candidate: ?tree.Cursor.Record = null,
+    cohort: ?[32]u8,
+    fn init(owner: *Build, a: A, pages: *Pages, fragment: Fragment) !OrderKeys {
+        var result: OrderKeys = .{ .owner = owner, .cohort = owner.ordering_input_cohort };
+        errdefer result.deinit();
+        if (result.cohort) |cohort| {
+            const lower = cohort ++ fragment.prefix;
+            result.inputs = try tree.Cursor.init(a, pages.store(), owner.root.current.input_versions, &lower, null);
+            if (owner.prior_ordering_keys != null) result.cached = try tree.Cursor.init(a, pages.store(), owner.prior_ordering_keys, &fragment.prefix, null);
+        }
+        return result;
+    }
+    fn deinit(self: *@This()) void {
+        if (self.inputs) |*cursor| cursor.deinit();
+        if (self.cached) |*cursor| cursor.deinit();
+    }
+    fn version(self: *@This(), id: [32]u8) !?[32]u8 {
+        const cohort = self.cohort orelse return null;
+        const key = cohort ++ id;
+        const cursor = &self.inputs.?;
+        try cursor.seekForward(&key);
+        const row = (try cursor.next()) orelse return error.InvalidLogicalRowIdentity;
+        if (!std.mem.eql(u8, row.key, &key) or row.value.len != 32) return error.InvalidLogicalRowIdentity;
+        return row.value[0..32].*;
+    }
+    fn restore(self: *@This(), a: A, id: [32]u8, version_: ?[32]u8, fields: []const local.segment.SegmentIndexSortField) !?local.introducer.TextDocument {
+        const expected = version_ orelse return null;
+        const cursor = if (self.cached) |*value| value else return null;
+        if (self.candidate == null or std.mem.order(u8, self.candidate.?.key, &id) == .lt) {
+            try cursor.seekForward(&id);
+            self.candidate = try cursor.next();
+        }
+        const entry = self.candidate orelse return null;
+        if (!std.mem.eql(u8, entry.key, &id)) return null;
+        const cached = try codec.decodeIntoArena(a, entry.value);
+        if (!std.mem.eql(u8, &cached.version, &expected)) return null;
+        return try orderingDocFromTuple(a, id, fields, cached.keys);
+    }
+
+    fn remember(self: *@This(), a: A, id: [32]u8, version_: ?[32]u8, doc: local.introducer.TextDocument) !void {
+        const version_held = version_ orelse return;
+        const values = doc.index_sort_values;
+        if (values.len == 0 or values.len > 32) return;
+        var keys: [32]local.segment.SegmentIndexSortBoundValue = undefined;
+        for (keys[0..values.len], values) |*key, value| key.* = value.value;
+        const bytes = (try codec.encode(a, version_held, keys[0..values.len])) orelse return;
+        try self.owner.ordering_edits.?.addRecord(&id, bytes);
+    }
+};
+
+fn orderingValue(a: A, columns: []const rows.ColumnVector, row: usize, path: []const u8) !std.json.Value {
+    for (columns) |column| if (std.mem.eql(u8, column.name, path)) {
+        if (column.nulls.isNull(row)) return .null;
+        return column.values.jsonAt(a, row);
+    };
+    var parts = std.mem.splitScalar(u8, path, '.');
+    const first = parts.next() orelse return .null;
+    var value = for (columns) |column| {
+        if (!std.mem.eql(u8, column.name, first)) continue;
+        if (column.nulls.isNull(row)) return .null;
+        break try column.values.jsonAt(a, row);
+    } else return .null;
+    while (parts.next()) |part| {
+        if (value != .object) return .null;
+        value = value.object.get(part) orelse return .null;
+    }
+    return value;
 }
 
 fn fragmentFor(fragments: []const Fragment, id: []const u8) !usize {
@@ -352,7 +864,7 @@ fn readFragments(a: A, out: A, pages: *Pages, nav: navigation.Root) ![]Fragment 
         if (version.len != 64) return error.InvalidLogicalRowIdentity;
         var digest: [32]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, version) catch return error.InvalidLogicalRowIdentity;
-        try fragments.append(out, .{ .name = try out.dupe(u8, file.file_id), .prefix = prefix.prefix, .bits = prefix.bits, .count = file.row_count, .digest = digest, .membership_dirty = false });
+        try fragments.append(out, .{ .name = try out.dupe(u8, file.file_id), .prefix = prefix.prefix, .bits = prefix.bits, .count = file.row_count, .digest = digest, .membership_dirty = false, .order_tag = if (file.etag.len != 0) try out.dupe(u8, file.etag) else null });
     }
     std.mem.sort(Fragment, fragments.items, {}, struct {
         fn less(_: void, left: Fragment, right: Fragment) bool {
@@ -372,7 +884,7 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
     var configs = try std.json.parseFromSlice(std.json.Value, a, indexes_json, .{});
     defer configs.deinit();
     const out = self.arena.allocator();
-    const recipes = self.root.current.input_recipes;
+    const recipes = try @import("lake_row_input_recipes.zig").consumers(out, self.root.current.input_recipes);
     const prior_commitments = if (self.prior_navigation != null and previous != null and previous.?.native_space != null) previous.?.native_space.?.input_commitments else null;
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = Build.check, .max_bytes = self.provider.identity_spill_bytes };
     defer manager.deinit();
@@ -448,6 +960,7 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
         defer versions.deinit(a);
         if (previous) |prior| if (self.prior_navigation != null) {
             const prior_name = for (prior.current.input_recipes) |candidate| {
+                if (@import("lake_row_input_recipes.zig").isOrdering(candidate)) continue;
                 if (std.mem.eql(u8, &candidate.digest, &recipe.digest) and vectorRecipe(configs.value, candidate.name) == vectorRecipe(configs.value, recipe.name)) break candidate.name;
             } else recipe.name;
             const space = prior.spaceForIndex(prior_name);
@@ -475,6 +988,7 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
             hash.update("native-lake-logical-coordinate-file-v1");
             hash.update(&self.root.namespace);
             hash.update(fragment.name);
+            if (fragment.order_tag) |tag| hash.update(tag);
             hash.final(digest);
         }
         const files = try out.dupe(local.serverless_external_source_types.FileEntry, self.source.inventory.files);
@@ -522,6 +1036,7 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
     // Retire commitments only when cohort membership or radix layout changes;
     // ordinary sparse refreshes never replay this metadata census.
     const prune = if (previous) |prior| prior.native_space != null and (prior.native_space.?.liveFiles() != self.fragments.len or for (prior.current.input_recipes) |old_recipe| {
+        if (@import("lake_row_input_recipes.zig").isOrdering(old_recipe)) continue;
         if (for (recipes) |recipe| {
             if (std.mem.eql(u8, &recipe.digest, &old_recipe.digest)) break false;
         } else true) break true;
@@ -571,6 +1086,9 @@ fn changedRows(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, reci
     if (for (prior.current.input_recipes) |candidate| {
         if (std.mem.eql(u8, &candidate.digest, &recipe.digest)) break false;
     } else true) return result;
+    const moved = try a.alloc(bool, self.fragments.len);
+    defer a.free(moved);
+    @memset(moved, false);
     const positions = try a.alloc(std.ArrayList(u64), self.fragments.len);
     defer a.free(positions);
     for (positions) |*list| list.* = .empty;
@@ -584,10 +1102,16 @@ fn changedRows(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, reci
         _ = scratch.reset(.retain_capacity);
         const before = (try reader.byId(scratch.allocator(), old, id)) orelse return error.InvalidLogicalRowIdentity;
         const after = (try reader.byId(scratch.allocator(), self.space, id)) orelse return error.InvalidLogicalRowIdentity;
-        if (!std.meta.eql(before.coordinate, after.coordinate) or after.coordinate.file != self.slots[file] or after.coordinate.group != 0) return error.InvalidLogicalRowIdentity;
+        if (after.coordinate.file != self.slots[file] or after.coordinate.group != 0) return error.InvalidLogicalRowIdentity;
+        if (!std.meta.eql(before.coordinate, after.coordinate)) {
+            // A changed sort key legitimately moves coordinates. Rebuild the
+            // complete run rather than patching any retained row address.
+            moved[file] = true;
+            continue;
+        }
         try positions[file].append(a, after.coordinate.row);
     }
-    for (positions, 0..) |*list, file| if (list.items.len != 0) {
+    for (positions, 0..) |*list, file| if (!moved[file] and list.items.len != 0) {
         std.mem.sort(u64, list.items, {}, std.sort.asc(u64));
         result[file] = try out.dupe(u64, list.items);
     };
@@ -595,9 +1119,11 @@ fn changedRows(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, reci
 }
 pub fn indexSpace(self: *const Build, name: []const u8) identity.Space {
     var space = self.space;
-    // Query coordinate views never own the shared input proof census. The
-    // current native space alone retains it for subsequent publications.
+    // Query coordinate views never own the shared input proof census or
+    // ordering-key cache. The current native space retains refresh evidence.
     space.input_commitments = null;
+    space.ordering_keys = null;
+    space.ordering_cohort = null;
     for (self.provider.fragment_views) |view| if (std.mem.eql(u8, view.name, name)) {
         space.navigation = view.navigation;
         break;
@@ -1484,15 +2010,21 @@ test "external lake logical fragments shrink wide Parquet gathers before copying
 }
 
 test "external lake logical fragments route broad Parquet rebuilds through one projected typed spill pass" {
-    try broadSpoolScenario(false, false, false);
+    try broadSpoolScenario(false, false, false, false);
 }
 test "external lake logical fragments reuse verification payloads without another Parquet scan" {
-    try broadSpoolScenario(true, false, false);
+    try broadSpoolScenario(true, false, false, false);
 }
 test "external lake logical fragments reuse captured payloads for selective changed fragments" {
-    try broadSpoolScenario(true, true, false);
+    try broadSpoolScenario(true, true, false, false);
 }
-fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime hashed: bool) !void {
+test "external lake logical fragments sort captured typed keys and preserve physical hydration" {
+    try broadSpoolScenario(true, false, false, true);
+}
+test "external lake logical fragments sort projected keys without verification capture" {
+    try broadSpoolScenario(false, false, false, true);
+}
+fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime hashed: bool, comptime ordered: bool) !void {
     const a = std.testing.allocator;
     const row_count = if (hashed) 8193 else 257;
     var directory = try local.common_test_directory.TestDirectory.init("logical-fragment-spool");
@@ -1516,9 +2048,11 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
     defer a.free(bytes);
     var uploaded = try client.putObject("antfly", "wide.parquet", bytes, .{});
     uploaded.deinit(a);
-    const schema = try std.fmt.allocPrint(a,
-        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"source","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","additionalProperties":false,"properties":{{"id":{{"type":"integer"}},"body":{{"type":"string"}},"price":{{"type":"number","x-antfly-sql-type":"numeric"}}}}}}}}}}}}
+    const raw_schema = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"source","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","additionalProperties":false,"properties":{{"id":{{"type":"integer","x-antfly-field":{{"type":"number","sortable":true}}}},"body":{{"type":"string"}},"price":{{"type":"number","x-antfly-sql-type":"numeric"}}}}}}}}}}}}
     , .{directory.path()});
+    defer a.free(raw_schema);
+    const schema = if (ordered) try std.mem.concat(a, u8, &.{ "{\"index_sort\":[{\"field\":\"id\",\"order\":\"asc\"},{\"field\":\"_id\",\"order\":\"asc\"}],", raw_schema[1..] }) else try a.dupe(u8, raw_schema);
     defer a.free(schema);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
     defer binding.deinit(a);
@@ -1539,7 +2073,11 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
     var reads: u64 = 0;
     var writes: u64 = 0;
     var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
-    const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, &.{.{ .name = "text", .digest = @splat(8), .columns = &.{ "id", "body", "price" } }}, physical.inventory.source_id, physical.inventory.snapshot_id);
+    const recipes: []const @import("lake_row_input_recipes.zig").Recipe = if (ordered) &.{
+        .{ .name = "text", .digest = @splat(8), .columns = &.{ "id", "body", "price" } },
+        .{ .name = @import("lake_row_input_recipes.zig").ordering_name, .digest = @splat(9), .columns = &.{"id"} },
+    } else &.{.{ .name = "text", .digest = @splat(8), .columns = &.{ "id", "body", "price" } }};
+    const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, recipes, physical.inventory.source_id, physical.inventory.snapshot_id);
     defer builder.deinit();
     for (0..row_count) |row| {
         var id: [32]u8 = @splat(3);
@@ -1547,32 +2085,20 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
             id[0] = if (selective) @intCast((row % 16) << 4) else 0;
             std.mem.writeInt(u64, id[24..32], row, .big);
         }
-        try builder.addWithInputs(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = row_count - 1 - row }, &.{@splat(5)});
+        try builder.addWithInputs(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = row_count - 1 - row }, if (ordered) &.{ @splat(5), @splat(5) } else &.{@splat(5)});
     }
     const root = try builder.finish(@splat(1), @splat(2), @splat(3));
-    const native = (try prepare(a, &store, table, &physical, &provider, root, null)).?;
-    defer native.deinit();
-    var selection_arena = std.heap.ArenaAllocator.init(a);
-    defer selection_arena.deinit();
-    if (selective) for (@constCast(native.provider.fragment_views)) |*view| {
-        const files = try selection_arena.allocator().alloc(@import("lake_index_native_state.zig").File, view.files.len);
-        const changed = try selection_arena.allocator().alloc(bool, view.files.len);
-        for (files, changed, 0..) |*file, *flag, i| {
-            file.* = try view.delta.file(i);
-            flag.* = i == 0;
-        }
-        view.delta.selection = null;
-        view.delta.files = files;
-        view.delta.changed = changed;
-    };
-    provider.identity_spill_bytes = 1;
-    try prepareSpool(native, &provider, &store);
-    try std.testing.expect(native.spool == null);
-    provider.identity_spill_bytes = 1024 * 1024 * 1024;
     var captured: ?*@import("lake_row_payloads.zig").Capture = null;
     defer if (captured) |value| value.deinit();
     if (fused) {
         captured = (try @import("lake_row_payloads.zig").Capture.start(a, &provider, &store, &.{ "id", "body", "price" })).?;
+        if (ordered) {
+            var parsed = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
+            defer parsed.deinit(a);
+            const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+            defer local.storage_schema.freeSchema(a, runtime);
+            try captured.?.configureOrdering(runtime, &store);
+        }
         const opening = provider.provider();
         const source = try opening.open_with_cancellation_fn.?(opening.ptr, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .index_config_hash = "test", .column_bindings = &.{ "id", "body", "price" } }, .none);
         defer source.deinit(a);
@@ -1591,6 +2117,26 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
         }
         try captured.?.finish(root.current.rows);
     }
+    const native = (try prepareWithCapture(a, &store, table, &physical, &provider, root, null, captured)).?;
+    defer native.deinit();
+    var selection_arena = std.heap.ArenaAllocator.init(a);
+    defer selection_arena.deinit();
+    if (selective) for (@constCast(native.provider.fragment_views)) |*view| {
+        const files = try selection_arena.allocator().alloc(@import("lake_index_native_state.zig").File, view.files.len);
+        const changed = try selection_arena.allocator().alloc(bool, view.files.len);
+        for (files, changed, 0..) |*file, *flag, i| {
+            file.* = try view.delta.file(i);
+            flag.* = i == 0;
+        }
+        view.delta.selection = null;
+        view.delta.files = files;
+        view.delta.changed = changed;
+    };
+    provider.identity_spill_bytes = 1;
+    try prepareSpool(native, &provider, &store);
+    try std.testing.expect(native.spool == null);
+    provider.identity_spill_bytes = 1024 * 1024 * 1024;
+    if (ordered) try std.testing.expect(std.mem.startsWith(u8, native.fragments[0].order_tag.?, "so1-"));
     try prepareCapturedSpool(native, &provider, &store, captured);
     try std.testing.expect(native.spool != null);
     if (fused) try std.testing.expectEqual(@as(u64, if (selective) 17 else row_count), native.spool.?.adoption_rows);
@@ -1634,8 +2180,13 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
         const hits = native.spool.?.payload_cache_hits;
         const second_batch = (try second.next(a)).?;
         try std.testing.expectEqual(first_batch.rowCount(), second_batch.rowCount());
-        try std.testing.expectEqual(before, native.spool.?.payload_decodes);
-        try std.testing.expect(native.spool.?.payload_cache_hits > hits);
+        // Random identities combined with physical sorting can make this tile
+        // span more than eight payload blocks. Residency is optional; retained
+        // vectors and exact row identity must survive those evictions too.
+        if (!(hashed and ordered)) {
+            try std.testing.expectEqual(before, native.spool.?.payload_decodes);
+            try std.testing.expect(native.spool.?.payload_cache_hits > hits);
+        }
         try std.testing.expectEqual(@as(usize, 2), second_batch.columns.len);
         try std.testing.expectEqual(try first_batch.findColumn("id").?.integerAt(0), try second_batch.findColumn("id").?.integerAt(0));
     }
@@ -1669,7 +2220,7 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
             try std.testing.expect(batch.rowCount() <= 256);
             for (0..batch.rowCount()) |row| {
                 const physical_id = try batch.findColumn("id").?.integerAt(row);
-                if (!hashed) try std.testing.expectEqual(@as(i64, @intCast(row_count - 1 - count * @as(usize, if (selective) 16 else 1))), physical_id);
+                if (!hashed) try std.testing.expectEqual(@as(i64, @intCast(if (ordered) count else row_count - 1 - count * @as(usize, if (selective) 16 else 1))), physical_id);
                 try std.testing.expectEqual(payload.len, (try batch.findColumn("body").?.bytesAt(row)).len);
                 const price = batch.findColumn("price").?.values.decimal128;
                 try std.testing.expectEqual(@as(i32, 18), price.precision);
@@ -1689,6 +2240,82 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
         }
     }
     try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
+    if (ordered and hashed) {
+        const encoded = captured.?.payloads.encoded_pages;
+        try std.testing.expectEqual(@as(u64, 0), native.ordering_rows_fetched);
+        try std.testing.expectEqual(@as(u64, row_count), native.ordering_keys_captured);
+        try std.testing.expectEqual(@as(u64, 0), native.ordering_payload_decodes);
+        std.debug.print("CAPTURED_ORDERING rows={d} blocks={d} fragments={d} decodes={d}\n", .{ row_count, encoded, native.fragments.len, native.ordering_payload_decodes });
+    }
+    if (ordered and !hashed) {
+        try std.testing.expectEqual(@as(u64, if (fused) 0 else row_count), native.ordering_rows_fetched);
+        try std.testing.expect(native.space.ordering_keys != null);
+        try std.testing.expect(indexSpace(native, "unused").ordering_keys == null);
+        var prior = root;
+        prior.native_space = native.space;
+        // Recreate the released JSON cache as the predecessor, then verify
+        // unchanged entries and new binary entries coexist through refresh.
+        var legacy_edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
+        defer legacy_edits.deinit();
+        {
+            var prior_keys = try tree.Cursor.init(a, pages.store(), native.space.ordering_keys, "", null);
+            defer prior_keys.deinit();
+            while (try prior_keys.next()) |record| {
+                const codec = @import("lake_ordering_keys.zig");
+                const decoded = try codec.decodeIntoArena(selection_arena.allocator(), record.value);
+                const legacy = try selection_arena.allocator().alloc(@import("lake_index_sort_bounds.zig").Bound.Value, decoded.keys.len);
+                for (legacy, decoded.keys) |*key, value| key.* = try @import("lake_index_sort_bounds.zig").Bound.Value.from(selection_arena.allocator(), value);
+                const legacy_record = try std.json.Stringify.valueAlloc(selection_arena.allocator(), .{ .version = decoded.version, .keys = legacy }, .{});
+                try legacy_edits.addRecord(record.key, legacy_record);
+            }
+        }
+        prior.native_space.?.ordering_keys = try legacy_edits.finish(null);
+        for (0..4) |step| {
+            const active_recipes = try selection_arena.allocator().dupe(@import("lake_row_input_recipes.zig").Recipe, recipes);
+            if (step >= 2) active_recipes[1].digest = @splat(10);
+            if (step == 3) {
+                prior.native_space.?.ordering_keys = null;
+                prior.native_space.?.ordering_cohort = null;
+            }
+            const refreshed = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, active_recipes, physical.inventory.source_id, physical.inventory.snapshot_id);
+            defer refreshed.deinit();
+            for (0..row_count) |row| {
+                if (step >= 1 and row == 1) continue;
+                var id: [32]u8 = @splat(3);
+                id[0] = 0;
+                std.mem.writeInt(u64, id[24..32], row, .big);
+                try refreshed.addWithInputs(.{ .id = id, .values = @splat(if (row == 0) @as(u8, if (step == 3) 8 else 7) else 4) }, .{ .file = 0, .group = 0, .row = row_count - 1 - row }, &.{ @splat(if (row == 0) @as(u8, 6) else 5), @splat(if (row == 0) @as(u8, if (step == 3) 7 else 6) else 5) });
+            }
+            const updated = try refreshed.finish(@splat(1), @splat(2), @splat(3));
+            const next = (try prepareWithCapture(a, &store, table, &physical, &provider, updated, prior, if (fused and step == 0) captured else null)).?;
+            defer next.deinit();
+            try std.testing.expectEqual(@as(u64, if (step == 0) @as(u64, if (fused) 0 else 1) else if (step == 1) 0 else row_count - 1), next.ordering_rows_fetched);
+            try std.testing.expectEqual(@as(u64, if (step < 2) row_count - 1 else 0), next.ordering_keys_reused);
+            try std.testing.expectEqual(@as(u64, row_count - @as(usize, @min(step, 1))), next.space.ordering_keys.?.records);
+            var retained = updated;
+            retained.native_space = next.space;
+            var dependencies: identity.PageDependencies = .{ .spaces = .{ .root = retained } };
+            var cache_retained = false;
+            while (dependencies.next()) |ref| if (ref.eql(next.space.ordering_keys.?)) {
+                cache_retained = true;
+            };
+            try std.testing.expect(cache_retained);
+            std.debug.print("Ordering refresh: step={d} gathered={d} reused={d} rows={d}\n", .{ step, next.ordering_rows_fetched, next.ordering_keys_reused, next.space.rows });
+            var cursor = try tree.Cursor.init(a, pages.store(), next.space.ordering_keys, "", null);
+            defer cursor.deinit();
+            var seen: usize = 0;
+            while (try cursor.next()) |record| {
+                const ordinal = std.mem.readInt(u64, record.key[24..32], .big);
+                try std.testing.expect(step == 0 or ordinal != 1);
+                seen += 1;
+            }
+            try std.testing.expectEqual(row_count - @as(usize, @min(step, 1)), seen);
+            // Copy durable metadata before closing this build's arena.
+            const encoded = try std.json.Stringify.valueAlloc(selection_arena.allocator(), next.space, .{});
+            prior = updated;
+            prior.native_space = try std.json.parseFromSliceLeaky(identity.Space, selection_arena.allocator(), encoded, .{ .allocate = .alloc_always });
+        }
+    }
 }
 
 test "external lake logical fragments skip unchanged input cohorts and hash only changed leaves" {
@@ -1782,10 +2409,10 @@ test "external lake logical fragments skip unchanged input cohorts and hash only
 }
 
 test "external lake hashed payload capture clusters spilled pages for repeated consumers" {
-    try broadSpoolScenario(true, false, true);
+    try broadSpoolScenario(true, false, true, false);
 }
 test "external lake broad typed spool clusters random coordinates without verification capture" {
-    try broadSpoolScenario(false, false, true);
+    try broadSpoolScenario(false, false, true, false);
 }
 
 test "external lake borrowed fragment leases report complete retained ownership" {
@@ -1953,4 +2580,249 @@ fn cancellingUpdatesScenario(legacy: bool) !void {
         last = next;
         previous = root;
     }
+}
+
+test "external lake logical fragments retain coordinate pages until a layout actually moves" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("logical-layout-retention");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(81), 1, std.testing.io);
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call };
+    defer manager.deinit();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    const Builder = @import("lake_row_identity_delta.zig").Builder;
+    const first = try Builder.createWithScan(a, &manager, &pages, &.{ "a", "b" }, null, null, &.{}, "source", "one", true, null);
+    defer first.deinit();
+    try first.add(.{ .id = @splat(1), .values = @splat(1) }, .{ .file = first.slots[0], .group = 0, .row = 0 });
+    try first.add(.{ .id = @splat(2), .values = @splat(2) }, .{ .file = first.slots[1], .group = 0, .row = 0 });
+    var prior = try first.finish(@splat(1), @splat(2), @splat(3));
+    for (0..3) |step| {
+        const next = try Builder.createWithScan(a, &manager, &pages, &.{ "a", "b" }, prior, null, &.{}, "source", "next", true, &.{ false, false });
+        defer next.deinit();
+        if (step != 0) {
+            try next.rescanFile(0);
+            try next.add(.{ .id = @splat(1), .values = @splat(1) }, .{ .file = next.slots[0], .group = 0, .row = step });
+            if (step == 2) {
+                try next.rescanFile(1);
+                try next.add(.{ .id = @splat(2), .values = @splat(2) }, .{ .file = next.slots[1], .group = 0, .row = step });
+            }
+        }
+        const before = writes;
+        const root = try next.finish(@splat(1), @splat(2), @splat(3));
+        if (step == 0) {
+            try std.testing.expectEqual(before, writes);
+            try std.testing.expectEqual(prior.current.by_id, root.current.by_id);
+        }
+        try std.testing.expectEqual(@as(u64, 2), root.current.rows);
+        var reader: identity.Reader = .{ .root = root, .pages = &pages };
+        const first_row = (try reader.byId(a, root.current, @splat(1))).?;
+        const second_row = (try reader.byId(a, root.current, @splat(2))).?;
+        try std.testing.expectEqual(@as(u64, step), first_row.coordinate.row);
+        try std.testing.expectEqual(@as(u64, if (step == 2) 2 else 0), second_row.coordinate.row);
+        prior = root;
+    }
+}
+
+test "external lake logical fragments bind cached field positions while reusing reversed keys" {
+    const fields = [_]local.segment.SegmentIndexSortField{ .{ .field = "a" }, .{ .field = "b" }, .{ .field = "_id" } };
+    const swapped = [_]local.segment.SegmentIndexSortField{ .{ .field = "b" }, .{ .field = "a" }, .{ .field = "_id" } };
+    const reversed = [_]local.segment.SegmentIndexSortField{ .{ .field = "a", .desc = true }, .{ .field = "b", .desc = true }, .{ .field = "_id" } };
+    const cohort: [32]u8 = @splat(8);
+    try std.testing.expect(!std.meta.eql(orderingKeyRecipe(cohort, &fields), orderingKeyRecipe(cohort, &swapped)));
+    try std.testing.expect(std.meta.eql(orderingKeyRecipe(cohort, &fields), orderingKeyRecipe(cohort, &reversed)));
+    try std.testing.expect(!std.meta.eql(orderingKeyRecipe(cohort, &fields), orderingKeyRecipe(@splat(9), &fields)));
+    try std.testing.expect(orderingKeyRecipe(null, &fields) == null);
+}
+
+test "external lake logical fragments group captured ordering misses across random identities" {
+    try broadSpoolScenario(true, false, true, true);
+}
+
+test "external lake logical fragments bound ordering kernels preserve typed and nested mapping semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema: local.storage_schema.TableSchema = .{ .version = 1, .exact_fields = &.{
+        .{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "title.keyword", .source_field = "title", .mapping = .{ .field_type = .keyword, .doc_values = true } },
+        .{ .field = "enabled", .source_field = "enabled", .mapping = .{ .field_type = .boolean, .doc_values = true } },
+        .{ .field = "nested", .source_field = "payload.rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "literal", .source_field = "literal.rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "at", .source_field = "at", .mapping = .{ .field_type = .datetime, .doc_values = true } },
+    } };
+    const fields = [_]local.segment.SegmentIndexSortField{ .{ .field = "rank" }, .{ .field = "title.keyword" }, .{ .field = "enabled" }, .{ .field = "nested" }, .{ .field = "literal" }, .{ .field = "at" }, .{ .field = "_id" } };
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "title", .values = .{ .dictionary_bytes = .{ .values = &.{ "z", "a" }, .indices = &.{ 1, 0 } } } },
+        .{ .name = "rank", .values = .{ .dictionary_i64 = .{ .values = &.{ std.math.minInt(i64), std.math.maxInt(i64) }, .indices = &.{ 1, 0 } } }, .nulls = .{ .bytes = &.{ 0, 1 } } },
+        .{ .name = "enabled", .values = .{ .bool = &.{ true, false } } },
+        .{ .name = "payload", .values = .{ .json = &.{ "{\"rank\":9007199254740993}", "{}" } } },
+        .{ .name = "literal.rank", .values = .{ .i64 = &.{ 7, 8 } } },
+        .{ .name = "at", .values = .{ .bytes = &.{ "1969-12-31T23:59:59.999999999Z", "1970-01-01T00:00:00.000000001Z" } } },
+    };
+    const sorted = try a.dupe(local.storage_schema.ExactField, schema.exact_fields);
+    std.mem.sort(local.storage_schema.ExactField, sorted, {}, struct {
+        fn less(_: void, l: local.storage_schema.ExactField, r: local.storage_schema.ExactField) bool {
+            return std.mem.order(u8, l.field, r.field) == .lt;
+        }
+    }.less);
+    schema.exact_fields = sorted;
+    const batch = (try OrderingBatch.bind(a, &columns, schema, &fields)).?;
+    const state: identity.logical.State = .{ .id = @splat(3), .values = @splat(3) };
+    for (0..2) |row| {
+        const document = (try batch.document(a, row, &state)).?;
+        for (batch.entries, document.index_sort_values) |entry, actual| {
+            const source = for (schema.exact_fields) |field| {
+                if (std.mem.eql(u8, field.field, entry.field)) break field.source_field;
+            } else unreachable;
+            const raw = try orderingValue(a, &columns, row, source);
+            if (raw == .null) {
+                try std.testing.expect(actual.value == .null_value);
+                continue;
+            }
+            const expected = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, entry.mapping, raw)).?;
+            const bound: local.segment.SegmentIndexSortBoundValue = switch (expected) {
+                .numeric_val => |n| switch (n) {
+                    inline else => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+                },
+                inline .datetime_ns, .bytes_val, .bool_val => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+                else => unreachable,
+            };
+            try std.testing.expectEqualDeep(bound, actual.value);
+        }
+    }
+}
+
+test "external lake logical fragments bound ordering kernel comparison" {
+    const a = std.testing.allocator;
+    const count = 16384;
+    const keys = 8;
+    var schema: local.storage_schema.TableSchema = .{ .version = 1 };
+    var exact: [keys]local.storage_schema.ExactField = undefined;
+    var fields: [keys]local.segment.SegmentIndexSortField = undefined;
+    var names: [32][8]u8 = undefined;
+    var columns: [32]rows.ColumnVector = undefined;
+    const integers = try a.alloc(i64, count);
+    defer a.free(integers);
+    for (integers, 0..) |*integer, i| integer.* = @intCast(i);
+    for (&columns, &names, 0..) |*column, *name, i| {
+        const text = try std.fmt.bufPrint(name, "col{d}", .{i});
+        column.* = .{ .name = text, .values = .{ .i64 = integers } };
+        if (i >= columns.len - keys) {
+            const k = i - (columns.len - keys);
+            fields[k] = .{ .field = text };
+            exact[k] = .{ .field = text, .source_field = text, .mapping = .{ .field_type = .numeric, .doc_values = true } };
+        }
+    }
+    schema.exact_fields = &exact;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var checksums: [2]u64 = @splat(0);
+    var times: [2]u64 = undefined;
+    const state: identity.logical.State = .{ .id = @splat(3), .values = @splat(3) };
+    for (0..2) |mode| {
+        const started = @import("antfly_platform").time.monotonicNs();
+        if (mode == 0) {
+            for (0..count) |row| {
+                _ = region.reset(.retain_capacity);
+                for (fields) |field| {
+                    const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field).?;
+                    const source = for (schema.exact_fields) |mapped| {
+                        if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+                    } else field.field;
+                    const raw = try orderingValue(scratch, &columns, row, source);
+                    const value = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(scratch, resolved.mapping, raw)).?;
+                    checksums[mode] += @intCast(value.numeric_val.i64_val);
+                }
+            }
+        } else {
+            var bindings = std.heap.ArenaAllocator.init(a);
+            defer bindings.deinit();
+            const batch = (try OrderingBatch.bind(bindings.allocator(), &columns, schema, &fields)).?;
+            for (0..count) |row| {
+                _ = region.reset(.retain_capacity);
+                const document = (try batch.document(scratch, row, &state)).?;
+                for (document.index_sort_values) |value| checksums[mode] += @intCast(value.value.i64_val);
+            }
+        }
+        times[mode] = @import("antfly_platform").time.monotonicNs() - started;
+    }
+    try std.testing.expectEqual(checksums[0], checksums[1]);
+    std.debug.print("ORDERING_BIND rows={d} keys={d} columns=32 row_adapter_ns={d} bound_kernel_ns={d} checksum={d}\n", .{ count, keys, times[0], times[1], checksums[0] });
+}
+
+test "external lake logical fragments capture tuples borrow only until encoding" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var title = "owned".*;
+    const columns = [_]rows.ColumnVector{.{ .name = "title", .values = .{ .bytes = &.{&title} } }};
+    const schema: local.storage_schema.TableSchema = .{ .version = 1, .exact_fields = &.{.{ .field = "title", .source_field = "title", .mapping = .{ .field_type = .keyword, .doc_values = true } }} };
+    const batch = (try OrderingBatch.bind(arena.allocator(), &columns, schema, &.{.{ .field = "title" }})).?;
+    var tuple: [1]local.segment.SegmentIndexSortBoundValue = undefined;
+    try std.testing.expect(try batch.tupleInto(arena.allocator(), 0, &tuple));
+    try std.testing.expectEqual(@intFromPtr(&title), @intFromPtr(tuple[0].bytes_val.ptr));
+    const encoded = (try @import("lake_ordering_keys.zig").encode(arena.allocator(), @splat(0), &tuple)).?;
+    @memset(&title, 'x');
+    const decoded = try @import("lake_ordering_keys.zig").decodeIntoArena(arena.allocator(), encoded);
+    try std.testing.expectEqualStrings("owned", decoded.keys[0].bytes_val);
+    try std.testing.expectError(error.InvalidLogicalRowIdentity, batch.tupleInto(arena.allocator(), 0, &.{}));
+}
+
+test "external lake logical fragments capture reuses scratch and encodes identical tuples" {
+    const a = std.testing.allocator;
+    const count = 4096;
+    var bindings = std.heap.ArenaAllocator.init(a);
+    defer bindings.deinit();
+    const integers = try a.alloc(i64, count);
+    defer a.free(integers);
+    for (integers, 0..) |*value_, i| value_.* = @intCast(i);
+    const text = try a.alloc([]const u8, count);
+    defer a.free(text);
+    @memset(text, "capture-key-with-a-long-enough-string-to-observe-copy-cost");
+    const columns = [_]rows.ColumnVector{ .{ .name = "rank", .values = .{ .i64 = integers } }, .{ .name = "title", .values = .{ .bytes = text } } };
+    const schema: local.storage_schema.TableSchema = .{ .version = 1, .exact_fields = &.{
+        .{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "title", .source_field = "title", .mapping = .{ .field_type = .keyword, .doc_values = true } },
+    } };
+    const batch = (try OrderingBatch.bind(bindings.allocator(), &columns, schema, &.{ .{ .field = "rank" }, .{ .field = "title" } })).?;
+    var hashes = [_]std.hash.Wyhash{ .init(0), .init(0) };
+    var capacity: [2]usize = @splat(0);
+    var times: [2]u64 = undefined;
+    const state: identity.logical.State = .{ .id = @splat(3), .values = @splat(3) };
+    for (0..2) |mode| {
+        const started = @import("antfly_platform").time.monotonicNs();
+        var reused = std.heap.ArenaAllocator.init(a);
+        defer reused.deinit();
+        for (0..count) |row| {
+            var per_row = std.heap.ArenaAllocator.init(a);
+            defer per_row.deinit();
+            _ = reused.reset(.retain_capacity);
+            const scratch = if (mode == 0) per_row.allocator() else reused.allocator();
+            var tuple: [2]local.segment.SegmentIndexSortBoundValue = undefined;
+            if (mode == 0) {
+                const doc = (try batch.document(scratch, row, &state)).?;
+                var values: std.ArrayList(local.segment.SegmentIndexSortBoundValue) = .empty;
+                for (doc.index_sort_values) |value_| try values.append(scratch, value_.value);
+                @memcpy(&tuple, values.items);
+            } else try std.testing.expect(try batch.tupleInto(scratch, row, &tuple));
+            const bytes = (try @import("lake_ordering_keys.zig").encode(scratch, @splat(0), &tuple)).?;
+            hashes[mode].update(bytes);
+            if (mode == 0) capacity[mode] += per_row.queryCapacity();
+        }
+        if (mode == 1) capacity[mode] = reused.queryCapacity();
+        times[mode] = @import("antfly_platform").time.monotonicNs() - started;
+    }
+    try std.testing.expectEqual(hashes[0].final(), hashes[1].final());
+    try std.testing.expect(capacity[1] * 100 < capacity[0]);
+    std.debug.print("CAPTURE_TUPLES rows={d} prior_arena_bytes={d} reusable_arena_bytes={d} prior_ns={d} direct_ns={d} checksum={d}\n", .{ count, capacity[0], capacity[1], times[0], times[1], hashes[0].final() });
 }

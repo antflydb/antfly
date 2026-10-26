@@ -335,6 +335,7 @@ const mappings = [_]Mapping{
     .{ .status = .identity_namespace_mismatch, .err = error.DocIdentityNamespaceMismatch },
     .{ .status = .invalid_query, .err = error.InvalidQueryRequest },
     .{ .status = .unsupported_query, .err = error.UnsupportedQueryRequest },
+    .{ .status = .unsupported_exact_sort, .err = error.UnsupportedExactSort },
     .{ .status = .index_not_found, .err = error.IndexNotFound },
     .{ .status = .index_rebuilding, .err = error.IndexRebuilding },
     .{ .status = .incomplete_published_snapshot, .err = error.IncompletePublishedSnapshot },
@@ -1116,4 +1117,14 @@ test "graph start identity requirement survives the compiled query boundary" {
     try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
     try std.testing.expectError(error.GraphStartIdentityRequired, statusToError(failure.status));
     try std.testing.expectEqualStrings("GraphStartIdentityRequired", failure.errorName());
+}
+
+test "logical value exact sort rejection survives both compiled query boundaries" {
+    for ([_]abi.FailureBoundary{ .storage_owner, .local_query }) |boundary| {
+        const failure = failureFromError(error.UnsupportedExactSort, boundary, abi.abi_version, 4);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expect(failure.status != .internal);
+        try std.testing.expectError(error.UnsupportedExactSort, statusToError(failure.status));
+        try std.testing.expectEqualStrings("UnsupportedExactSort", failure.errorName());
+    }
 }

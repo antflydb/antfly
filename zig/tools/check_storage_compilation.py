@@ -133,11 +133,17 @@ def control_catalog_contents() -> str:
         return False
 
     output = []
+    names = set()
     for line in (local / "source_catalog.zig").read_text().splitlines(keepends=True):
         declaration = re.fullmatch(
-            r'pub const \w+ = @import\("([^"\n]+\.zig)"\);\n?', line
+            r'pub const (?P<name>\w+) = @import\("(?P<path>[^"\n]+\.zig)"\);\n?', line
         )
-        if declaration and requires_physical((local / declaration[1]).resolve()):
+        if declaration:
+            name = declaration["name"]
+            if name in names:
+                raise ValueError(f"duplicate source catalog entry: {name}")
+            names.add(name)
+        if declaration and requires_physical((local / declaration["path"]).resolve()):
             continue
         output.append(line)
     output.insert(
