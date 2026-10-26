@@ -68,6 +68,12 @@ class CacheLifetime(unittest.TestCase):
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ZIG / relative, target)
+            # The real Makefile also runs its ownership preflight. Resolve
+            # that authored test's source closure from the real checkout,
+            # while exercising cache retirement against this tiny build.
+            (root / "tools/test_local_test_partitions.py").symlink_to(
+                ZIG / "tools/test_local_test_partitions.py"
+            )
             (root / "probe.zig").write_text(
                 'extern fn library_probe() u32; test "late inventory probe" { try @import("std").testing.expectEqual(@as(u32, 42), library_probe()); }\n'
             )

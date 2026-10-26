@@ -173,8 +173,34 @@ test "lite allocator verification follows only identical certain owner checkpoin
     other.free_pages_verified = false;
     try other.inheritAllocatorVerification(&owner);
     try std.testing.expect(!other.free_pages_verified);
+    try std.testing.expectError(error.EnrichmentWaitCanceled, other.prepareAllocatorVerification(null));
     try borrowed.putDocument("after", "adopted");
     try std.testing.expect((try borrowed.check()).valid);
+}
+
+test "lite allocator detached verification cancels and refuses stale checkpoints" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "detached-proof.aflite");
+    defer a.free(path);
+    var owner = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer owner.close();
+    try owner.putDocument("doc", "before");
+    var captured = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
+    defer captured.close();
+    var cancel: maintenance.CancelToken = .{};
+    cancel.request();
+    try std.testing.expectError(error.MaintenanceCanceled, captured.prepareAllocatorVerification(&cancel));
+    try std.testing.expect(!captured.free_pages_verified);
+    try owner.putDocument("doc", "after");
+    try std.testing.expectError(error.EnrichmentWaitCanceled, captured.prepareAllocatorVerification(null));
+    try std.testing.expect(!captured.free_pages_verified);
+    try captured.adoptIndexPublicationHeader(owner.header);
+    try captured.prepareAllocatorVerification(null);
+    try std.testing.expect(captured.free_pages_verified);
+    try captured.putDocument("next", "verified");
+    try std.testing.expect((try captured.check()).valid);
 }
 
 test "lite allocator v4 small checkpoints bound counter and queue boundary growth" {
@@ -504,6 +530,8 @@ test "lite allocator v4 rejects a durable free bit for a live page" {
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("invalid_allocator", report.issue.?);
     file.free_pages_verified = false;
+    try std.testing.expectError(error.InvalidNativeAllocator, file.prepareAllocatorVerification(null));
+    try std.testing.expect(!file.free_pages_verified);
     // Read-path aliases can append safely even with an untrusted ledger.
     // They cannot reuse the corrupt free claim or authorize an authored write.
     try file.beginArtifactLeaseTransaction();
@@ -512,6 +540,8 @@ test "lite allocator v4 rejects a durable free bit for a live page" {
     try std.testing.expectError(error.InvalidArtifactLeaseMutation, file.putIndexCatalogRecord("index", "refused"));
     try file.putCatalogRecord(NativeFile.artifact_lease_key_prefix ++ "probe", "lease");
     try file.commitTransaction();
+    try std.testing.expect(!file.free_pages_verified);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(1, null);
     try std.testing.expect(!file.free_pages_verified);
     const preserved = (try file.getDocumentAlloc(a, "doc")).?;
     defer a.free(preserved);
@@ -3703,6 +3733,47 @@ pub const NativeFile = struct {
         self.free_pages_verified = true;
     }
 
+    /// Prepare reuse against a separately inode-fenced reader, without holding
+    /// a caller's foreground publication gate. Publication must still compare
+    /// the current inode and both checkpoints before using this proof.
+    pub fn prepareAllocatorVerification(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !void {
+        if (self.free_pages_verified) return;
+        const reader = try self.allocatorVerificationSnapshot(cancel);
+        defer {
+            reader.close();
+            self.allocator.destroy(reader);
+        }
+        try self.inheritAllocatorVerification(reader);
+        if (!self.free_pages_verified) return error.EnrichmentWaitCanceled;
+    }
+
+    /// Owns an inode fence through proof publication. Close and destroy with
+    /// this file's allocator. Keep the reader at a stable address because its
+    /// page-cache reclamation callbacks can borrow it while the walk runs.
+    pub fn allocatorVerificationSnapshot(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !*NativeFile {
+        if (cancel) |token| try token.check();
+        const reader = try self.allocator.create(NativeFile);
+        errdefer self.allocator.destroy(reader);
+        reader.* = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{ .read_only = true, .resource_manager = self.page_cache.resource_manager });
+        errdefer reader.close();
+        reader.page_cache_policy = .metadata_only;
+        reader.allocator_cancel_token = cancel;
+        if (!std.meta.eql(self.header, reader.header) or
+            (try self.file.stat(self.runtime())).inode != (try reader.file.stat(reader.runtime())).inode) return error.EnrichmentWaitCanceled;
+        const checkpoint = reader.activeCheckpoint();
+        if (reader.header.indexed_reclamation) {
+            const state = try reader.loadLedger(checkpoint);
+            if (checkpoint.free_map_root_page != 0) _ = try reader.validateIndexedAllocator(checkpoint, state, cancel);
+        } else {
+            const pages = try reader.readFreePagesAlloc(checkpoint);
+            defer reader.allocator.free(pages);
+            try reader.validateFreePagesSafeForCheckpointSlots(pages);
+        }
+        if (cancel) |token| try token.check();
+        reader.free_pages_verified = true;
+        return reader;
+    }
+
     fn invalidateLedger(self: *NativeFile) void {
         if (self.ledger) |state| {
             state.deinit();
@@ -4326,6 +4397,18 @@ pub const NativeFile = struct {
     }
 
     pub fn reclaimPagesWithCancel(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken) !usize {
+        return self.reclaimPagesImpl(budget, cancel, true);
+    }
+
+    /// Detached housekeeping must not move an open's deferred graph proof
+    /// into its short foreground publication fence. Unverified owners append
+    /// allocator metadata; verified owners retain normal page reuse. Capacity
+    /// limits still require proof/admission before using the free pool.
+    pub fn reclaimPagesForMaintenanceWithCancel(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken) !usize {
+        return self.reclaimPagesImpl(budget, cancel, false);
+    }
+
+    fn reclaimPagesImpl(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken, require_reuse_proof: bool) !usize {
         if (!self.header.indexed_reclamation or self.read_only) return 0;
         if (cancel) |token| try token.check();
         const previous_cancel = self.allocator_cancel_token;
@@ -4337,7 +4420,7 @@ pub const NativeFile = struct {
         const previous_budget = self.retirement_work_pages;
         self.retirement_work_pages = 0;
         defer self.retirement_work_pages = previous_budget;
-        var pages = try self.pageAllocatorFromFreeMap(before);
+        var pages = try self.pageAllocatorFromFreeMapWithProof(before, require_reuse_proof);
         defer pages.deinit();
         if (self.budgetedCheckpointDue(pages.ledger.?)) pages.ledger.?.force_checkpoint = true;
         var work = budget;
@@ -8720,11 +8803,15 @@ pub const NativeFile = struct {
     }
 
     fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
-        // A read lease must not turn an index load into a whole-file proof.
-        // Unverified lease writes only extend the file; no existing page is
+        return self.pageAllocatorFromFreeMapWithProof(checkpoint, !self.artifact_lease_transaction);
+    }
+
+    fn pageAllocatorFromFreeMapWithProof(self: *NativeFile, checkpoint: CheckpointSlot, require_reuse_proof: bool) !PageAllocator {
+        // Read leases and their retirement must not force a whole-file proof.
+        // Unverified housekeeping only extends the file; no existing page is
         // overwritten. Bounded owners retain ordinary proof/admission so a
         // read lease can use their free pool rather than exceed the hard cap.
-        const verify = !self.artifact_lease_transaction or self.max_file_bytes != null;
+        const verify = require_reuse_proof or self.max_file_bytes != null;
         if (self.header.indexed_reclamation) {
             if (self.checkpoint_publication_uncertain) return error.OutcomeUnknown;
             const state = try self.loadLedger(checkpoint);
