@@ -164,12 +164,12 @@ python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton08 --pr
 python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton4b -- ./antfly standalone
 ```
 
-The experimental compact-KV variants allocate attention storage only for full
+The LightOn presets use compact KV, allocating storage only for full
 attention layers. Each recurrent layer retains its own state. Up to 128 physical
 rows use recurrent and attention packets of at most 64. Client concurrency,
 admitted live pages and physical GPU rows remain separate limits.
 
-Partial BF16 prefill options retain F32 residuals and recurrent state and do not
+The optional `--bf16-prefill-ffn` switch retains F32 residuals and recurrent state and does not
 match all of vLLM's BF16 activation boundaries. They remain experimental. CUDA
 LightOn throughput is below the installed vLLM reference; the Florence canonical
 GEMM option remains opt-in while an older rare output mismatch is investigated.

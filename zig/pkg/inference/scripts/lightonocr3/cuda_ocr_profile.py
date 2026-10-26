@@ -45,11 +45,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile", choices=data["profiles"])
     parser.add_argument("--print-env", action="store_true")
+    parser.add_argument(
+        "--bf16-prefill-ffn",
+        action="store_true",
+        help="Experimental BF16 FFN intermediates for large LightOn prefills; F32 decode/state remain unchanged.",
+    )
     argv = sys.argv[1:]
     delimiter = argv.index("--") if "--" in argv else len(argv)
     command = argv[delimiter + 1 :]
     args = parser.parse_args(argv[:delimiter])
+    if args.bf16_prefill_ffn and args.profile == "florence":
+        parser.error("--bf16-prefill-ffn applies only to the LightOn models")
     defaults = profile_environment(data["profiles"], args.profile)
+    if args.profile != "florence":
+        defaults["ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN"] = (
+            "1" if args.bf16_prefill_ffn else "0"
+        )
     env = os.environ.copy()
     for key, value in defaults.items():
         env.setdefault(key, value)
