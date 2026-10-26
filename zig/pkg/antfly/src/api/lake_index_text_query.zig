@@ -1252,7 +1252,10 @@ const Execution = struct {
             hit.source_value = null;
         }
     }
-    fn storedDeliveryUseful(self: *const Execution, pin: search.PinnedTextSource) bool {
+    fn storedDeliveryUseful(self: *const Execution, prefetched: ?*const search.PinnedTextSource) bool {
+        // Only the outer wave owns a pin whose shared owner, tie callbacks and
+        // read capability are independent of the child execution's arena.
+        const pin = prefetched orelse return false;
         if (pin.stored_projection_fields.len == 0) return false;
         const wanted = self.hydration_fields orelse return true;
         for (wanted) |field| for (pin.stored_projection_fields) |available| {
@@ -2589,7 +2592,7 @@ const Execution = struct {
                     total +|= page.total_hits;
                     exact = exact and page.total_hits_relation == .exact;
                     const admissions = winners.admissions;
-                    const useful_delivery = if (child.delivery_pin) |pin| self.storedDeliveryUseful(pin) else false;
+                    const useful_delivery = self.storedDeliveryUseful(prefetched);
                     for (page.hits) |hit| {
                         const location = if (self.use_stored_highlights or useful_delivery) try storedTextLocation(child.delivery_pin.?, &.{id}, hit.native_text_doc_id.?) else null;
                         try winners.addLocated(hit, 0, location);
@@ -2597,7 +2600,7 @@ const Execution = struct {
                     // The last admitted winner belongs to the only possible
                     // common winning pack. Retain one pin, never one per hit.
                     if (useful_delivery and winners.admissions != admissions) {
-                        const pin = try child.delivery_pin.?.clone();
+                        const pin = try prefetched.?.clone();
                         if (retained_delivery) |*old| old.deinit();
                         retained_delivery = pin;
                         retained_pack = id;
@@ -5389,11 +5392,12 @@ test "external lake bounded window profiles native winner delivery binds one sto
     var execution: Execution = undefined;
     const pin: search.PinnedTextSource = .{ .snapshot = undefined, .name = "pack", .text_analysis = .{}, .runtime_schema = null, .stored_projection_fields = &.{"body"} };
     execution.hydration_fields = &.{"id"};
-    try std.testing.expect(!execution.storedDeliveryUseful(pin));
+    try std.testing.expect(!execution.storedDeliveryUseful(&pin));
     execution.hydration_fields = &.{"body"};
-    try std.testing.expect(execution.storedDeliveryUseful(pin));
+    try std.testing.expect(execution.storedDeliveryUseful(&pin));
+    try std.testing.expect(!execution.storedDeliveryUseful(null));
     execution.hydration_fields = null;
-    try std.testing.expect(execution.storedDeliveryUseful(pin));
+    try std.testing.expect(execution.storedDeliveryUseful(&pin));
     var winners = PagedWinners.init(a, 3);
     defer winners.deinit();
     try winners.addLocated(.{ .id = "a", .score = 1, .native_text_doc_id = 99 }, 0, .{ .segment = @splat(1), .document = 7 });
