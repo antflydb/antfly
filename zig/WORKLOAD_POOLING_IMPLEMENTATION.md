@@ -29288,3 +29288,59 @@ owned-allocation failures, partial abort under exhaustion, actual two-SST couple
 publication and selected original/allocation refusal during entry handoff.
 The immutable, pin-index, durable checkpoint, WAL and output-publication regressions
 and 4/45/1/8 boundary companions also pass. No final case fails, skips or leaks.
+
+
+## Quiesced nonempty legacy file-root installation (2026-10-25)
+
+Backend.QuiescedLegacyRootMigration now copies and installs actual nonempty
+legacy SST directory, writer and obsolete roots into coupled registered ownership.
+The caller prepays a stable frame and excludes all Backend access, including
+accounting observation, from capture through joined deinit. Capture retains the
+manifest lane and Backend lifetime, rejects active readers/plans/reclaimers and
+memory-run directories, and saves actual live/durable tree roots, accounts,
+spare identities, generation, next ID and checkpoint lineage. It cannot silently
+adopt legacy roots or use a caller-supplied scalar as ownership proof.
+
+Original-admitted resumable construction copies existing SST metadata through
+registered snapshots, real file pins and independent entry/writer owners.
+Preparation borrows the retained legacy directory account only until the entry
+is taken with its own funded account. Legacy obsolete intents copy their actual
+paths in at most 16 KiB per byte quantum and preserve future deadlines exactly;
+no legacy ledger/path borrow escapes accepted construction. Saved stages retain
+partial ownership across refusal and stop source borrows before abort cleanup.
+
+Installation validates the actual captured source and prepared edit revision
+before a fixed, allocation-free tuple swap. Displaced live and durable RAM roots
+move into the migration frame. Durable files, journal descriptor/sequence and WAL
+logical debt remain unchanged; detached legacy durable RAM views force a fresh
+registered checkpoint before registered cleanup can use durable coverage. The
+native fixture verifies that checkpoint and actual durable reopen.
+
+Old legacy physical destruction remains an explicit joined startup operation.
+Its destructors can free variable-sized data, so this bridge is not a bounded
+production retirement path and does not enable normal maintenance by default.
+Bounded legacy physical retirement, memory-run migration, original-Port forwarding
+through normal maintenance, compaction/recovery adoption and overload/fairness
+qualification remain required. Native ABI 144/storage owner ABI 204 and durable
+formats are unchanged. The full design is incomplete; full Linux qualification
+remains waived.
+
+Six focused native cases cover two real SSTs, 32 KiB obsolete metadata, retained
+values, first registered checkpoint/reopen, source generation/account/spare and
+journal-lineage staleness, prepared-revision changes, final lifetime refusal,
+selected early and late original/OOM retries and aborts, and allocation-free
+installation/joined teardown. Refusal cleanup preserves the legacy root tuple
+and leaves the fault allocator exhausted until registered cleanup has run.
+
+Legacy manifest publication, checkpoint installation and WAL retirement now reject
+registered live roots even before a registered durable checkpoint owner exists.
+This closes the migration-to-first-checkpoint interval: no legacy durability or
+cleanup fallback may bypass registered admission/ownership. The native migration
+cases verify refusal without changing descriptor, sequence or logical debt.
+
+Final legacy-root-migration-v8-fast and -debug receipts pass all five commands
+and 82/82 native build steps each against identical current 5,762-input maps.
+The six migration cases, seven existing-SST snapshot cases, four immutable
+retirement, two pin-index, four durable checkpoint, four WAL and four publication
+cases pass, with the 4/45/1/8 boundary companions. No final case fails, skips or
+leaks. Full GNU qualification remains waived; the full pooling goal stays active.

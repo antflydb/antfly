@@ -900,6 +900,7 @@ pub const ManifestJournal = struct {
     /// already durable. Matching metadata moves before any fallible callback;
     /// stale lineage fences recovery and leaves both prepared roots untouched.
     pub fn installPreparedCheckpoint(self: *@This(), backend: anytype, fence: *const CheckpointFence, descriptor: manifest_set.Descriptor, next_run_id: u64, bytes: u64, directory: *@import("run_directory.zig").Directory, ledger: *ObsoleteLedger) !Result {
+        if (comptime @hasField(@TypeOf(backend.*), "registered_publication")) if (backend.registered_publication.seal != null) return error.ExecutionWaitUnsupported;
         if (comptime @hasField(@TypeOf(backend.*), "registered_manifest_checkpoint")) if (backend.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         if (!fence.matches(backend) or !backend.manifest_publish_in_flight) {
             backend.manifest_recovery_required = true;
@@ -1073,6 +1074,7 @@ pub const ManifestJournal = struct {
     /// descriptor installation are serialized; walking/encoding/fsyncing the
     /// immutable checkpoint runs without the backend mutex.
     pub fn runCheckpoint(self: *@This(), backend: anytype) !bool {
+        if (comptime @hasField(@TypeOf(backend.*), "registered_publication")) if (backend.registered_publication.seal != null) return error.ExecutionWaitUnsupported;
         if (backend.manifest_publish_in_flight or backend.manifest_checkpoint_build_in_flight or self.sequence == null or self.descriptor == null or backend.manifest_directory == null) return false;
         if (self.segment_count == manifest_set.max_segments) {
             // Repeated failed builders can consume the linked-segment bound.
@@ -1257,6 +1259,7 @@ pub const ManifestJournal = struct {
     /// Caller holds the publication lock. The last durable directory owns SST
     /// pins until its successor is durable, independently of reader lifetimes.
     pub fn persist(self: *@This(), backend: anytype, root_dir: []const u8, runs: []const Run) !Result {
+        if (comptime @hasField(@TypeOf(backend.*), "registered_publication")) if (backend.registered_publication.seal != null) return error.ExecutionWaitUnsupported;
         if (comptime @hasField(@TypeOf(backend.*), "registered_manifest_checkpoint")) if (backend.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         return self.persistAttempt(backend, root_dir, runs) catch |err| {
             if (err != error.ManifestEditTooLarge) return err;

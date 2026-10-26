@@ -4714,3 +4714,245 @@ test "physical cache metadata registered file snapshot preserves entry lifetime 
         _ = try FlushPublicationFixture.run(.file_snapshot, at, true, true);
     }
 }
+
+const LegacyMigrationFixture = struct {
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+    const io_mod = @import("antfly_local_sources").storage_lsm_backend_storage_io;
+    const Control = RegisteredOutputFixture.Control;
+    const Stats = struct { checks: usize, allocations: usize, observed: bool };
+    const Mode = enum { install, abort, stale, receipt, lineage, checkpoint, account, install_refusal };
+
+    fn run(mode: Mode, target: ?usize, oom: bool) !Stats {
+        const a = std.testing.allocator;
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const owned = failing.allocator();
+        var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+        defer parent.deinit(a);
+        var budgets = budgets_mod.smartResourceBudgetsForTotal(64 << 20);
+        budgets.options.identity_allocator = owned;
+        var resources = try Resources.initWithBudgetsAndParent(owned, budgets, parent.memoryParentPort());
+        defer resources.deinit();
+        resources.attachResourceManager();
+        defer RegisteredOutputFixture.drain(&resources.resource_manager);
+        var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
+        defer pool.deinit();
+        var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+        defer native.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/legacy-migration", .{tmp.sub_path});
+        defer a.free(root);
+        const options: lsm.Options = .{ .resource_manager = &resources.resource_manager, .storage = native.storage(), .wal_enabled = false, .flush_threshold = 1, .defer_flush_on_commit = true };
+        var backend = try lsm.Backend.open(owned, root, options);
+        var backend_live = true;
+        defer if (backend_live) backend.abandonAfterCrash();
+        for (0..2) |generation| {
+            try ImmutablePinFixture.write(&backend, generation);
+            var attempts: usize = 0;
+            while (backend.activeImmutableMemtableCount() != 0) : (attempts += 1) {
+                try std.testing.expect(attempts < 64);
+                _ = try backend.runMaintenanceStep();
+            }
+        }
+        try backend.persistManifest();
+        backend.close();
+        backend_live = false;
+        backend = try lsm.Backend.open(owned, root, options);
+        backend_live = true;
+        _ = try backend.planningDirectory();
+        try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
+        // Real legacy path allocations exercise import after the source ledger
+        // goes away. A long path requires several cooperative copy quanta.
+        try backend.obsolete_paths.ensureUnusedCapacity(owned, 2);
+        const long_path = try owned.alloc(u8, 32 * 1024 + 3);
+        @memset(long_path, 'x');
+        backend.obsolete_paths.appendAssumeCapacity(.{ .path = long_path, .delete_after_ns = std.math.maxInt(u64) - 1000 });
+        backend.obsolete_paths.appendAssumeCapacity(.{ .path = try owned.dupe(u8, "/legacy-orphan"), .delete_after_ns = std.math.maxInt(u64) - 2000 });
+        try backend.persistManifest();
+        const old_directory = backend.run_directory.?;
+        const old_writer = backend.runs.tree.root;
+        const old_obsolete = backend.obsolete_paths.tree.root;
+        const descriptor = backend.manifest_journal.descriptor;
+        const sequence = backend.manifest_journal.sequence;
+        backend.unpublished_wal_logical_bytes = 37;
+        var control: Control = .{};
+        const payload = control.payload();
+        const original = read_admission.Port.init(&payload);
+        var frame_credit = try resources.resource_manager.reserveWithoutReclaimWithAdmission(.lsm_table_builder_working_set, @sizeOf(lsm.Backend.QuiescedLegacyRootMigration), original);
+        defer frame_credit.release();
+        var migration: lsm.Backend.QuiescedLegacyRootMigration = .{};
+        defer migration.deinit();
+        try migration.captureWithAdmission(&backend, original);
+        var competing: lsm.Backend.QuiescedLegacyRootMigration = .{};
+        defer competing.deinit();
+        try std.testing.expectError(error.ResourceBudgetExceeded, competing.captureWithAdmission(&backend, original));
+        const start = failing.alloc_index;
+        if (oom and target != null) failing.fail_index = start + target.?;
+        control.live = true;
+        control.target = if (oom) null else target;
+        var observed = false;
+        while (true) {
+            migration.resumeWithAdmission(original) catch |cause| {
+                try std.testing.expectError(if (oom) error.OutOfMemory else error.Canceled, @as(anyerror!void, cause));
+                try std.testing.expect(!observed);
+                observed = true;
+                try std.testing.expect(backend.run_directory == old_directory and backend.runs.tree.root == old_writer and backend.obsolete_paths.tree.root == old_obsolete);
+                if (mode == .abort) break;
+                failing.fail_index = std.math.maxInt(usize);
+                continue;
+            };
+            break;
+        }
+        const stats: Stats = .{ .checks = control.calls, .allocations = failing.alloc_index - start, .observed = observed };
+        control.live = false;
+        if (mode == .abort) {
+            migration.deinit(); // Fault allocator stays exhausted through teardown.
+            for (0..512) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+            failing.fail_index = std.math.maxInt(usize);
+            try std.testing.expect(backend.run_directory == old_directory and backend.runs.tree.root == old_writer and backend.obsolete_paths.tree.root == old_obsolete);
+        } else {
+            if (mode == .stale) {
+                backend.run_directory_generation += 1;
+                try std.testing.expectError(error.CompactionPlanningStale, migration.installWithAdmission(original));
+                backend.run_directory_generation -= 1;
+            }
+            if (mode == .lineage) {
+                backend.manifest_journal.next_run_id += 1;
+                try std.testing.expectError(error.CompactionPlanningStale, migration.installWithAdmission(original));
+                backend.manifest_journal.next_run_id -= 1;
+            }
+            if (mode == .account) {
+                try backend.obsolete_paths.ensureUnusedCapacity(owned, 7);
+                try std.testing.expectError(error.CompactionPlanningStale, migration.installWithAdmission(original));
+            }
+            if (mode == .receipt) {
+                try migration.frame.?.appendObsoleteRemovalWithAdmission(0, original);
+                try migration.frame.?.resumeWithAdmission(original);
+                try std.testing.expectError(error.CompactionPlanningStale, migration.installWithAdmission(original));
+            }
+            if (mode == .receipt or mode == .account) {
+                migration.deinit();
+                try std.testing.expect(backend.run_directory == old_directory and backend.runs.tree.root == old_writer and backend.obsolete_paths.tree.root == old_obsolete);
+            } else {
+                if (mode == .install_refusal) {
+                    for (0..3) |offset| {
+                        control.target = control.calls + offset;
+                        control.live = true;
+                        try std.testing.expectError(error.Canceled, migration.installWithAdmission(original));
+                        control.live = false;
+                        try std.testing.expect(backend.run_directory == old_directory and backend.runs.tree.root == old_writer and backend.obsolete_paths.tree.root == old_obsolete);
+                    }
+                }
+                // Fixed installation and joined teardown require no allocation.
+                failing.fail_index = failing.alloc_index;
+                try migration.installWithAdmission(original);
+                try std.testing.expect(backend.registered_publication.seal != null);
+                try std.testing.expect(backend.run_directory != old_directory);
+                try std.testing.expect(backend.manifest_directory == null and backend.manifest_journal.obsolete.count() == 0);
+                try std.testing.expectEqualDeep(descriptor, backend.manifest_journal.descriptor);
+                try std.testing.expectEqual(sequence, backend.manifest_journal.sequence);
+                try std.testing.expectEqual(@as(u64, 37), backend.unpublished_wal_logical_bytes);
+                try std.testing.expect(backend.manifest_dirty and backend.obsolete_manifest_dirty);
+                migration.deinit();
+                failing.fail_index = std.math.maxInt(usize);
+                try std.testing.expectError(error.ExecutionWaitUnsupported, backend.persistManifestLocked());
+                try std.testing.expectError(error.ExecutionWaitUnsupported, backend.manifest_journal.persist(&backend, root, &.{}));
+                try std.testing.expectError(error.ExecutionWaitUnsupported, backend.manifest_journal.runCheckpoint(&backend));
+                backend.options.wal_enabled = true;
+                const legacy_wal = backend.checkpointWalAfterDurableBoundary();
+                backend.options.wal_enabled = false;
+                try std.testing.expectError(error.ExecutionWaitUnsupported, legacy_wal);
+                try std.testing.expectEqualDeep(descriptor, backend.manifest_journal.descriptor);
+                try std.testing.expectEqual(sequence, backend.manifest_journal.sequence);
+                try std.testing.expectEqual(@as(u64, 37), backend.unpublished_wal_logical_bytes);
+                try std.testing.expectEqual(@as(usize, 2), backend.obsolete_paths.count());
+                try std.testing.expectEqualStrings("/legacy-orphan", backend.obsolete_paths.at(0).path);
+                try std.testing.expectEqual(@as(u64, std.math.maxInt(u64) - 2000), backend.obsolete_paths.at(0).delete_after_ns);
+                try std.testing.expectEqual(@as(usize, 32 * 1024 + 3), backend.obsolete_paths.at(1).path.len);
+                try std.testing.expectEqual(@as(u64, std.math.maxInt(u64) - 1000), backend.obsolete_paths.at(1).delete_after_ns);
+            }
+        }
+        failing.fail_index = std.math.maxInt(usize);
+        if (mode == .checkpoint) {
+            const scope = try backend.beginPublicationResourcesWithAdmission(original);
+            defer scope.requestRetirement();
+            try scope.resumeWithAdmission(original);
+            var reservation = try backend.reserveRegisteredCheckpointWithAdmission(original);
+            defer reservation.deinit();
+            const candidate = try scope.preparePublicationWithAdmission(original);
+            var candidate_live = true;
+            defer if (candidate_live) candidate.requestRetirement();
+            try backend.capturePreparedPublicationWithAdmission(candidate, &backend.registered_publication, backend.run_directory_generation, original);
+            try candidate.prepareUnchangedWithAdmission(original);
+            var lineage = lsm.repository.ManifestJournal.CheckpointFence.capture(&backend);
+            const checkpoint = try scope.beginRegisteredCheckpointWithAdmission(backend.options.unpublished_outputs.?, candidate, root, reservation.id, reservation.next_run_id, &lineage, original);
+            defer checkpoint.requestRetirement();
+            try checkpoint.prepareWithAdmission(native.storage(), original);
+            try checkpoint.permitDescriptorWithAdmission(&backend, candidate, original);
+            try checkpoint.finishWithAdmission(original);
+            try backend.installRegisteredCheckpointWithAdmission(checkpoint, candidate, original);
+            candidate_live = false;
+            try std.testing.expect(backend.registered_manifest_checkpoint != null and !backend.manifest_recovery_required);
+            try std.testing.expect(!backend.manifest_dirty and !backend.obsolete_manifest_dirty);
+            try std.testing.expectEqual(@as(u64, 0), backend.unpublished_wal_logical_bytes);
+            try std.testing.expectEqual(@as(usize, 2), backend.manifest_journal.obsolete.count());
+        }
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+        {
+            var reader = try backend.beginReadWithAdmission(original);
+            defer reader.abort();
+            try std.testing.expectEqualStrings("key-000", try reader.getWithAdmission(.{ .name = "docs" }, "key-000", original));
+            try std.testing.expectEqualStrings("key-001", try reader.getWithAdmission(.{ .name = "docs" }, "key-001", original));
+        }
+        backend.abandonAfterCrash();
+        backend_live = false;
+        RegisteredOutputFixture.drain(&resources.resource_manager);
+        try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
+        // Both an uncheckpointed metadata migration and the first registered
+        // checkpoint must reopen with the same values from durable native files.
+        var reopened = try lsm.Backend.open(owned, root, options);
+        defer reopened.abandonAfterCrash();
+        var reader = try reopened.beginRead();
+        defer reader.abort();
+        try std.testing.expectEqualStrings("key-000", try reader.get(.{ .name = "docs" }, "key-000"));
+        try std.testing.expectEqualStrings("key-001", try reader.get(.{ .name = "docs" }, "key-001"));
+        return stats;
+    }
+};
+
+test "physical cache metadata legacy root migration installs real nonempty roots and keeps durable debt" {
+    _ = try LegacyMigrationFixture.run(.install, null, false);
+}
+
+test "physical cache metadata legacy root migration rejects stale source lineage and prepared edits" {
+    for ([_]LegacyMigrationFixture.Mode{ .stale, .receipt, .lineage, .account, .install_refusal }) |mode| _ = try LegacyMigrationFixture.run(mode, null, false);
+}
+
+test "physical cache metadata legacy root migration preserves original refusals and partial abort" {
+    for ([_]usize{ 0, 1, 2, 8, 16, 32, 64, 128, 256, 512 }) |at| {
+        _ = try LegacyMigrationFixture.run(.install, at, false);
+        _ = try LegacyMigrationFixture.run(.abort, at, false);
+    }
+}
+
+test "physical cache metadata legacy root migration retires allocation refusals with source intact" {
+    for ([_]usize{ 0, 1, 2, 4, 8, 16, 32, 64, 128 }) |at| {
+        _ = try LegacyMigrationFixture.run(.install, at, true);
+        _ = try LegacyMigrationFixture.run(.abort, at, true);
+    }
+}
+
+test "physical cache metadata legacy root migration installs first registered durable checkpoint and reopens" {
+    _ = try LegacyMigrationFixture.run(.checkpoint, null, false);
+}
+
+test "physical cache metadata legacy root migration preserves late copy and ledger refusal ownership" {
+    const healthy = try LegacyMigrationFixture.run(.install, null, false);
+    for ([_]usize{ 1, 2, 8, 16, 32, 64 }) |offset| {
+        try std.testing.expect(offset <= healthy.checks and offset <= healthy.allocations);
+        try std.testing.expect((try LegacyMigrationFixture.run(.install, healthy.checks - offset, false)).observed);
+        try std.testing.expect((try LegacyMigrationFixture.run(.abort, healthy.checks - offset, false)).observed);
+        try std.testing.expect((try LegacyMigrationFixture.run(.install, healthy.allocations - offset, true)).observed);
+        try std.testing.expect((try LegacyMigrationFixture.run(.abort, healthy.allocations - offset, true)).observed);
+    }
+}

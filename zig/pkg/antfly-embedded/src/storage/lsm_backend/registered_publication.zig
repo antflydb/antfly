@@ -336,6 +336,18 @@ pub const Candidate = struct {
         self.input_revision += 1;
         self.ready = false;
     }
+    /// Acceptance copies an actual legacy intent without shortening its
+    /// deadline. The controller retains and revalidates the legacy source root.
+    pub fn appendLegacyObsoleteWithAdmission(self: *Candidate, legacy: *const Ledger, rank: usize, original: admission.Port) !void {
+        const current = try self.ledgerSourceForAppend(original);
+        const child = try ObsoleteEdit.startLegacyImport(self.allocator, self.manager, current, legacy, rank, original);
+        const s = self.state.?;
+        s.obsolete_child = child;
+        s.ledger_edit = true;
+        s.obsolete_applied = false;
+        self.input_revision += 1;
+        self.ready = false;
+    }
     fn ledgerSourceForAppend(self: *Candidate, original: admission.Port) !*const Ledger {
         try original.checkpoint();
         if (self.closing or self.published or !self.source_captured or self.state == null) return error.InvalidArgument;

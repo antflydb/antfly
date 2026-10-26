@@ -169,6 +169,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-physical-resource-metadata-test", "Verify fixed cache metadata admission and movable teardown ownership")
         .dependOn(&b.addRunArtifact(physical_metadata_tests).step);
+    const legacy_migration_tests = b.addTest(.{
+        .name = "registered-legacy-migration-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata legacy root migration"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const legacy_migration_run = b.addRunArtifact(legacy_migration_tests);
+    legacy_migration_run.addArg("--require-no-skips");
+    b.step("antfly-registered-legacy-migration-test", "Verify nonempty legacy root installation, refusal and joined ownership")
+        .dependOn(&legacy_migration_run.step);
+
     const file_snapshot_tests = b.addTest(.{
         .name = "registered-file-snapshot-tests",
         .root_module = physical_metadata_root,

@@ -14,7 +14,8 @@
 // limitations under the License.
 
 //! Prepaid immutable obsolete-file edits. New paths come from registered writer
-//! records or captured checkpoint lineage; deadlines never shorten. Anchors survive every
+//! records, captured checkpoint lineage or pinned legacy intents. Deadlines never
+//! shorten. Anchors survive every
 //! descendant root and generic entry drop, without a borrowed backend or port.
 const std = @import("std");
 const resources = @import("../resource_manager.zig");
@@ -106,6 +107,29 @@ pub const Candidate = struct {
         self.payload.path = owned;
         self.allocated = true;
         self.offset = owned.len;
+        return self;
+    }
+    /// Import an actual entry from a quiesced, pinned legacy ledger. Only the
+    /// synchronous constructor borrows that ledger; the registered child owns
+    /// every path byte before acceptance, including on partial-copy refusal.
+    pub fn startLegacyImport(a: std.mem.Allocator, manager: *resources.ResourceManager, source: *const Ledger, legacy: *const Ledger, rank: usize, scope: admission.Port) !*Candidate {
+        var trace: admission.RejectionTrace = .{};
+        const original = trace.bind(scope).?;
+        try validateSource(source, a, original);
+        if (legacy.registered_owner != null or rank >= legacy.count()) return error.InvalidArgument;
+        const entry = legacy.at(rank);
+        const self = try allocate(a, manager, source, entry.path.len, entry.delete_after_ns, original);
+        errdefer self.requestRetirement();
+        try original.checkpoint();
+        const bytes = try a.alloc(u8, entry.path.len);
+        self.payload.path = bytes;
+        self.allocated = true;
+        while (self.offset < bytes.len) {
+            try original.checkpoint();
+            const end = @min(bytes.len, self.offset + 16 * 1024);
+            @memcpy(bytes[self.offset..end], entry.path[self.offset..end]);
+            self.offset = end;
+        }
         return self;
     }
     /// Rank is relative to the pinned source root, not a later live generation.

@@ -5195,7 +5195,7 @@ pub const Backend = struct {
     fn maybeCheckpointWalAfterManifestPublish(self: *Backend) !void {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
-        if (self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
+        if (self.registered_publication.seal != null or self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         if (self.recovery_replaying_wal) return;
         // A newer flush can finish while an older manifest is syncing. Empty
         // memtables alone no longer prove that the WAL is covered durably.
@@ -6537,7 +6537,7 @@ pub const Backend = struct {
 
     /// Caller owns the backend mutex; publication may temporarily release it.
     pub fn persistManifestLocked(self: *Backend) !void {
-        if (self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
+        if (self.registered_publication.seal != null or self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         const root_dir = self.root_dir orelse return;
         // A flush may have already installed its SSTs and retired the mutable
         // generation. Keep publication debt visible even when append/sync
@@ -7219,7 +7219,7 @@ pub const Backend = struct {
     fn resetWalAfterManifestCheckpoint(self: *Backend) !void {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
-        if (self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
+        if (self.registered_publication.seal != null or self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         const start_ns = self.writeStatsNowNs();
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
         defer wal_lock.release();
@@ -7252,7 +7252,7 @@ pub const Backend = struct {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
-        if (self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
+        if (self.registered_publication.seal != null or self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         const saved_budget = self.maintenance_io_budget_remaining;
         self.maintenance_io_budget_remaining = null;
         defer self.maintenance_io_budget_remaining = saved_budget;
@@ -7971,6 +7971,8 @@ pub const Backend = struct {
         self.obsolete_paths = .{};
         self.registered_publication.retire();
     }
+
+    pub const QuiescedLegacyRootMigration = @import("lsm_backend/legacy_root_migration.zig").Migration(Backend);
 
     pub const PublicationResources = @import("lsm_backend/publication_resources.zig").Owner;
     /// Stable controller resources acquire the actual process host before

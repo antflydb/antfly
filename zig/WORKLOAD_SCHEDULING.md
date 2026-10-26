@@ -1696,3 +1696,18 @@ This closes the existing guard retirement escape before semantic predicate
 registration; it does not install compiled range predicates or broaden metadata
 exclusion. Raw-backend/import/peer eligibility and the stronger default guarantees
 remain open. The full design is incomplete; full Linux qualification stays waived.
+
+
+### Quiesced legacy file-root migration (2026-10-25)
+
+The registered maintenance path can now import and install nonempty legacy SST
+roots with copied metadata, independent file pins, exact obsolete deadlines and
+source/revision validation. The first registered checkpoint after migration and
+native reopen are covered. Installation preserves durable lineage and WAL debt.
+The startup caller excludes all Backend access until joined cleanup finishes;
+legacy variable-sized destruction is still unbounded and cannot run on the
+normal admitted maintenance path. Bounded legacy retirement, memory-run import,
+production original-admission forwarding and overload qualification remain open.
+See WORKLOAD_POOLING_IMPLEMENTATION.md for the ownership contract and evidence.
+The full sharing/scheduling/default/session/remote design remains incomplete;
+full Linux qualification stays waived.
