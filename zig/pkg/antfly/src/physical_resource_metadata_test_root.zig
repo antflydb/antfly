@@ -3311,7 +3311,7 @@ const FlushPublicationFixture = struct {
     const Batch = Scope.FlushOutputs;
     const Builder = Scope.FlushBuilder.Owner;
     const Control = RegisteredOutputFixture.Control;
-    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject, wal_retire, wal_replay, wal_prefix, wal_cancel, wal_failure, wal_resume, wal_delete_failure, wal_floor_failure, wal_legacy_replay };
+    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject, wal_retire, wal_replay, wal_prefix, wal_cancel, wal_failure, wal_resume, wal_delete_failure, wal_floor_failure, wal_legacy_replay, immutable_retire, immutable_prefix, immutable_cancel };
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
     const Retry = struct {
         failing: *std.testing.FailingAllocator,
@@ -3334,6 +3334,9 @@ const FlushPublicationFixture = struct {
     };
     const Owners = struct {
         scope: ?*Scope = null,
+        window: ?lsm.Backend.QuiescedImmutableFlush = null,
+        window_credit: ?@import("antfly_local_sources").storage_resource_manager.Reservation = null,
+        immutable_pins: ?[]*const state_mod.State = null,
         checkpoint: ?*Scope.RegisteredCheckpoint = null,
         reservation: ?lsm.Backend.RegisteredCheckpointReservation = null,
         crashed: bool = false,
@@ -3349,6 +3352,18 @@ const FlushPublicationFixture = struct {
         abandoned: usize = 0,
         fn finish(self: *@This(), backend: *lsm.Backend, manager: *ResourceManager, native: io_mod.Storage, failing: *std.testing.FailingAllocator) !usize {
             if (self.done) return self.abandoned;
+            if (self.window) |*window| {
+                try std.testing.expect(backend.mu.tryLock());
+                window.deinit();
+                backend.mu.unlock();
+                self.window = null;
+                self.batch = null;
+                self.builder = null;
+            }
+            if (self.window_credit) |*credit| credit.release();
+            self.window_credit = null;
+            if (self.immutable_pins) |pins| backend.releaseImmutableMemtableSnapshot(pins);
+            self.immutable_pins = null;
             if (self.checkpoint) |owner| owner.requestRetirement();
             self.checkpoint = null;
             if (self.batch) |owner| owner.requestRetirement();
@@ -3415,15 +3430,17 @@ const FlushPublicationFixture = struct {
     }
     fn run(mode: Mode, target: ?usize, oom: bool, abort_on_error: bool) !Stats {
         const a = std.testing.allocator;
+        const immutable_mode = mode == .immutable_retire or mode == .immutable_prefix or mode == .immutable_cancel;
+        const input_count: usize = if (mode == .immutable_retire) 2 else 3;
         const wal_mode = switch (mode) {
             .wal_retire, .wal_replay, .wal_prefix, .wal_cancel, .wal_failure, .wal_resume, .wal_delete_failure, .wal_floor_failure, .wal_legacy_replay => true,
             else => false,
         };
         const checkpoint_mode = switch (mode) {
-            .checkpoint, .checkpoint_abort, .checkpoint_cancel, .checkpoint_rename, .checkpoint_stale, .checkpoint_lineage, .checkpoint_install, .checkpoint_repeat, .checkpoint_install_reject, .wal_retire, .wal_replay, .wal_prefix, .wal_cancel, .wal_failure, .wal_resume, .wal_delete_failure, .wal_floor_failure, .wal_legacy_replay => true,
+            .checkpoint, .checkpoint_abort, .checkpoint_cancel, .checkpoint_rename, .checkpoint_stale, .checkpoint_lineage, .checkpoint_install, .checkpoint_repeat, .checkpoint_install_reject, .wal_retire, .wal_replay, .wal_prefix, .wal_cancel, .wal_failure, .wal_resume, .wal_delete_failure, .wal_floor_failure, .wal_legacy_replay, .immutable_retire, .immutable_prefix, .immutable_cancel => true,
             else => false,
         };
-        const install_checkpoint = mode == .checkpoint_install or mode == .checkpoint_repeat or mode == .checkpoint_install_reject or wal_mode;
+        const install_checkpoint = mode == .checkpoint_install or mode == .checkpoint_repeat or mode == .checkpoint_install_reject or wal_mode or immutable_mode;
         var expected_logical: u64 = 17;
         const late = mode == .ledger or mode == .ledger_mixed or mode == .manifest or checkpoint_mode;
         var failing = std.testing.FailingAllocator.init(a, .{});
@@ -3474,7 +3491,40 @@ const FlushPublicationFixture = struct {
             try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
             return .{ .checks = 0, .allocations = 0, .observed = false };
         }
-        owners.builder = try build(owners.scope.?, queue, native.storage(), root, false, false, original);
+        if (immutable_mode) {
+            owners.crashed = true;
+            backend.root_dir = try owned.dupe(u8, root);
+            backend.options.flush_threshold = 1000;
+            backend.options.defer_flush_on_commit = true;
+            backend.next_run_id = 501;
+            const runs_path = try std.fmt.allocPrint(a, "{s}/runs", .{root});
+            defer a.free(runs_path);
+            try native.storage().createDirPath(runs_path);
+            for (0..input_count) |generation| {
+                var txn = try backend.beginWrite();
+                try txn.put(.{ .name = null }, if (generation == 0) "a" else if (generation == 1) "b" else "c", if (generation == 0) "one" else if (generation == 1) "two" else "tail");
+                try txn.commit();
+                try backend.prepareCurrentScanSnapshot();
+            }
+            try std.testing.expectEqual(input_count, backend.activeImmutableMemtableCount());
+            // Actual WAL range identities remain attached even with WAL off
+            // in this fixture; the retirement decision must preserve the tail.
+            backend.immutable_wal_ranges.items[0] = .{ .first = 11, .last = 11 };
+            backend.immutable_wal_ranges.items[1] = .{ .first = 12, .last = 12 };
+            if (input_count == 3) backend.immutable_wal_ranges.items[2] = .{ .first = 13, .last = 13 };
+            owners.immutable_pins = try backend.snapshotImmutableMemtables();
+            owners.window_credit = try resources.resource_manager.reserveWithoutReclaimWithAdmission(.lsm_table_builder_working_set, @sizeOf(lsm.Backend.QuiescedImmutableFlush), original);
+            owners.window = .{};
+            try std.testing.expect(backend.mu.tryLock());
+            const captured = owners.window.?.captureWithAdmission(&backend, 2, original);
+            backend.mu.unlock();
+            try std.testing.expect(try captured);
+            var competing: lsm.Backend.QuiescedImmutableFlush = .{};
+            try std.testing.expectError(error.ResourceBudgetExceeded, competing.captureWithAdmission(&backend, 1, original));
+            try owners.window.?.buildWithAdmission(.{ .first_id = 0, .end_id = 0, .target_bytes = 0, .max_entries = 1, .max_file_bytes = 1 << 20 }, original);
+            owners.builder = owners.window.?.builder;
+            owners.batch = owners.window.?.batch;
+        } else owners.builder = try build(owners.scope.?, queue, native.storage(), root, false, false, original);
         var start = failing.alloc_index;
         control.live = true;
         control.target = if (oom or late) null else target;
@@ -3488,23 +3538,25 @@ const FlushPublicationFixture = struct {
         var retry: Retry = .{ .failing = &failing, .control = &control, .oom = oom, .abort_on_error = abort_on_error };
         var allocations: usize = 0;
         const result: anyerror!void = work: {
-            owners.batch = retry.call(Scope.beginFlushOutputsWithAdmission, .{ owners.scope.?, owners.builder.?, original }) catch |cause| break :work cause;
+            if (!immutable_mode) owners.batch = retry.call(Scope.beginFlushOutputsWithAdmission, .{ owners.scope.?, owners.builder.?, original }) catch |cause| break :work cause;
             try std.testing.expectError(error.InvalidArgument, owners.builder.?.takeCompletedWithAdmission(quotaControl()));
             try std.testing.expectError(error.InvalidArgument, owners.builder.?.takeCompletedForOwnerWithAdmission(&control, quotaControl()));
             retry.call(Batch.collectWithAdmission, .{ owners.batch.?, original }) catch |cause| break :work cause;
             allocations = failing.alloc_index - start;
             failing.fail_index = std.math.maxInt(usize);
             control.live = false;
-            owners.builder.?.requestRetirement();
-            owners.builder = null;
-            // Two ticket guards plus the batch guard remain. The builder
-            // releases its producer guard after destroying its header, so this
-            // proves subsequent metadata construction cannot borrow the builder.
-            for (0..512) |_| {
-                if (queue.live.load(.acquire) == 3) break;
-                _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+            if (!immutable_mode) {
+                owners.builder.?.requestRetirement();
+                owners.builder = null;
+                // Two ticket guards plus the batch guard remain. The builder
+                // releases its producer guard after destroying its header, so this
+                // proves subsequent metadata construction cannot borrow the builder.
+                for (0..512) |_| {
+                    if (queue.live.load(.acquire) == 3) break;
+                    _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+                }
+                try std.testing.expectEqual(@as(usize, 3), queue.live.load(.acquire));
             }
-            try std.testing.expectEqual(@as(usize, 3), queue.live.load(.acquire));
             if (mode == .identity) {
                 const other_root = try std.fmt.allocPrint(a, "{s}-other", .{root});
                 defer a.free(other_root);
@@ -3559,7 +3611,9 @@ const FlushPublicationFixture = struct {
             {
                 try std.testing.expect(backend.mu.tryLock());
                 defer backend.mu.unlock();
-                retry.call(Batch.installWithAdmission, .{ owners.batch.?, &backend, original }) catch |cause| break :work cause;
+                if (immutable_mode) {
+                    retry.call(lsm.Backend.QuiescedImmutableFlush.installWithAdmission, .{ &owners.window.?, original }) catch |cause| break :work cause;
+                } else retry.call(Batch.installWithAdmission, .{ owners.batch.?, &backend, original }) catch |cause| break :work cause;
             }
             owners.installed = true;
             owners.frame = null;
@@ -3574,8 +3628,10 @@ const FlushPublicationFixture = struct {
             };
             const canceled_payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Canceled.check, .check_lifetime = Canceled.check } };
             try std.testing.expectError(error.Canceled, owners.batch.?.installWithAdmission(&backend, .init(&canceled_payload)));
-            owners.batch.?.requestRetirement();
-            owners.batch = null;
+            if (!immutable_mode) {
+                owners.batch.?.requestRetirement();
+                owners.batch = null;
+            }
             for (0..128) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
             try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
             var read = try backend.beginReadWithAdmission(original);
@@ -3584,9 +3640,15 @@ const FlushPublicationFixture = struct {
             try std.testing.expectEqualStrings("two", try read.getWithAdmission(.{ .name = null }, "b", original));
             if (checkpoint_mode) {
                 owners.crashed = true;
-                backend.root_dir = try owned.dupe(u8, root);
+                if (!immutable_mode) backend.root_dir = try owned.dupe(u8, root);
                 backend.next_run_id = 600;
-                backend.unpublished_wal_logical_bytes = 17;
+                if (!immutable_mode) backend.unpublished_wal_logical_bytes = 17;
+                if (immutable_mode) {
+                    expected_logical = owners.window.?.logical_bytes;
+                    try std.testing.expectEqual(expected_logical, backend.unpublished_wal_logical_bytes);
+                    try std.testing.expectError(error.RecoveryRequired, owners.window.?.validateDurableWithAdmission(original));
+                    try std.testing.expectEqual(input_count, backend.activeImmutableMemtableCount());
+                }
                 const lineage = lsm.repository.ManifestJournal.CheckpointFence.capture(&backend);
                 start = failing.alloc_index;
                 control.calls = 0;
@@ -3649,10 +3711,10 @@ const FlushPublicationFixture = struct {
                     retry.call(Scope.RegisteredCheckpoint.permitDescriptorWithAdmission, .{ owners.checkpoint.?, &backend, owners.frame.?, original }) catch |cause| break :work cause;
                 }
                 try std.testing.expect(backend.manifest_recovery_required and backend.manifest_journal.sequence == null);
-                if (install_checkpoint and !wal_mode) {
+                if (install_checkpoint and !wal_mode and !immutable_mode) {
                     backend.unpublished_wal_logical_bytes += 5;
                     expected_logical = 22;
-                } else if (wal_mode) {} else {
+                } else if (wal_mode or immutable_mode) {} else {
                     owners.frame.?.requestRetirement();
                     owners.frame = null;
                 }
@@ -3701,11 +3763,76 @@ const FlushPublicationFixture = struct {
                     defer backend.mu.unlock();
                     retry.call(lsm.Backend.installRegisteredCheckpointWithAdmission, .{ &backend, owners.checkpoint.?, owners.frame.?, original }) catch |cause| break :work cause;
                     owners.frame = null;
-                    expected_logical = if (wal_mode) 0 else 5;
+                    expected_logical = if (wal_mode or immutable_mode) 0 else 5;
                     try std.testing.expect(!backend.manifest_recovery_required and !backend.manifest_dirty and !backend.obsolete_manifest_dirty);
                     try std.testing.expectEqual(expected_logical, backend.unpublished_wal_logical_bytes);
                     try std.testing.expectEqual(@as(u64, 600), backend.manifest_journal.descriptor.?.checkpoint);
                     try std.testing.expectError(error.ExecutionWaitUnsupported, backend.persistManifestLocked());
+                }
+                if (immutable_mode) {
+                    control.live = false;
+                    const window = &owners.window.?;
+                    try window.validateDurableWithAdmission(original);
+                    const Refuse = struct {
+                        fn check(_: *anyopaque) !void {
+                            return error.Canceled;
+                        }
+                    };
+                    const refused: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Refuse.check, .check_lifetime = Refuse.check } };
+                    try std.testing.expectError(error.Canceled, window.retireInputsWithAdmission(.init(&refused)));
+                    try std.testing.expectEqual(input_count, backend.activeImmutableMemtableCount());
+                    try std.testing.expectEqual(@as(u64, 11), backend.immutable_wal_ranges.items[backend.immutable_head].first);
+                    if (mode == .immutable_prefix) {
+                        backend.immutable_wal_ranges.items[backend.immutable_head].first = 99;
+                        try std.testing.expectError(error.CompactionPlanningStale, window.retireInputsWithAdmission(original));
+                        try std.testing.expectEqual(input_count, backend.activeImmutableMemtableCount());
+                        backend.immutable_wal_ranges.items[backend.immutable_head].first = 11;
+                        backend.invalidateReadVersion();
+                        // This test changes memory-view identity only, keeping
+                        // the exact registered SST directory unchanged.
+                        backend.run_directory_dirty = false;
+                        try std.testing.expectError(error.CompactionPlanningStale, window.retireInputsWithAdmission(original));
+                        try window.validateDurableWithAdmission(original);
+                    }
+                    if (mode != .immutable_cancel) {
+                        // All potentially failing allocator calls are disabled
+                        // across the actual fixed head/ownership publication.
+                        failing.fail_index = failing.alloc_index;
+                        failing.resize_fail_index = failing.resize_index;
+                        try std.testing.expect(backend.mu.tryLock());
+                        const retired = window.retireInputsWithAdmission(original);
+                        backend.mu.unlock();
+                        try retired;
+                        failing.fail_index = std.math.maxInt(usize);
+                        failing.resize_fail_index = std.math.maxInt(usize);
+                        try std.testing.expectEqual(input_count - 2, backend.activeImmutableMemtableCount());
+                        try std.testing.expectEqual(@as(usize, 2), backend.admitted_retired_immutable_count);
+                        try std.testing.expect(!backend.run_directory_dirty and backend.manifest_directory.?.tree.root == backend.run_directory.?.tree.root);
+                        try std.testing.expectEqual(@as(u64, 1), backend.write_stats.immutable_flushes);
+                        try std.testing.expectEqual(@as(u64, 2), backend.write_stats.immutable_flush_input_memtables);
+                        const retained = backend.snapshotMaintenanceStats();
+                        try std.testing.expectEqual(@as(u64, 2), retained.retired_immutable_memtables);
+                        try std.testing.expect(retained.retired_immutable_bytes > 0);
+                        var independent = try owners.immutable_pins.?[input_count - 1].clone(a);
+                        defer independent.deinit(a);
+                        try std.testing.expect(!independent.admitted_retired and independent.admitted_retired_prev == null and independent.admitted_retired_next == null);
+                        if (input_count == 3) {
+                            try std.testing.expectEqual(@as(u64, 13), backend.immutable_wal_ranges.items[backend.immutable_head].first);
+                            var tail = try backend.beginReadWithAdmission(original);
+                            defer tail.abort();
+                            try std.testing.expectEqualStrings("tail", try tail.getWithAdmission(.{ .name = null }, "c", original));
+                        } else try std.testing.expectEqual(@as(usize, 0), backend.immutable_head);
+                    }
+                    try std.testing.expectEqualStrings("one", try read.getWithAdmission(.{ .name = null }, "a", original));
+                    try std.testing.expect(backend.mu.tryLock());
+                    window.deinit();
+                    backend.mu.unlock();
+                    owners.window = null;
+                    owners.builder = null;
+                    owners.batch = null;
+                    if (mode == .immutable_cancel) try std.testing.expectEqual(input_count, backend.activeImmutableMemtableCount());
+                    backend.releaseImmutableMemtableSnapshot(owners.immutable_pins.?);
+                    owners.immutable_pins = null;
                 }
                 allocations = failing.alloc_index - start;
                 control.live = false;
@@ -4067,6 +4194,15 @@ const FlushPublicationFixture = struct {
             try std.testing.expect(retry.observed and abort_on_error);
             try std.testing.expectError(if (oom) error.OutOfMemory else control.failure, @as(anyerror!void, cause));
         }
+        if (immutable_mode and owners.window == null) {
+            try std.testing.expectEqual(@as(usize, 0), backend.admitted_retired_immutable_count);
+            try std.testing.expect(backend.admitted_retired_immutable == null);
+        }
+        if (immutable_mode and owners.window != null) {
+            try std.testing.expectEqual(input_count, backend.activeImmutableMemtableCount());
+            try std.testing.expectEqual(@as(u64, 11), backend.immutable_wal_ranges.items[backend.immutable_head].first);
+            try std.testing.expectEqualStrings("one", owners.immutable_pins.?[input_count - 1].entryAt(0).value);
+        }
         if (!late and (mode != .publish or (retry.observed and abort_on_error))) {
             try std.testing.expect(!owners.installed);
             try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
@@ -4340,5 +4476,43 @@ test "physical cache metadata immutable pin indexes remain atomic on snapshot al
         backend.releaseImmutableMemtableSnapshot(snapshot);
         try std.testing.expectEqual(@as(usize, 0), backend.immutable_memtable_pins.items.len);
         for (backend.immutable_memtables.items[backend.immutable_head..]) |state| try std.testing.expect(state.immutable_pin_index == null);
+    }
+}
+
+test "physical cache metadata immutable durable retirement preserves reader pins and the active WAL tail" {
+    _ = try FlushPublicationFixture.run(.immutable_retire, null, false, false);
+    _ = try FlushPublicationFixture.run(.immutable_prefix, null, false, false);
+}
+
+test "physical cache metadata immutable durable retirement cancellation retains recoverable inputs" {
+    _ = try FlushPublicationFixture.run(.immutable_cancel, null, false, false);
+}
+
+test "physical cache metadata immutable durable retirement keeps input authority through original refusal" {
+    for ([_]usize{ 0, 1, 2, 8, 32, 128 }) |target| {
+        _ = try FlushPublicationFixture.run(.immutable_retire, target, false, false);
+        _ = try FlushPublicationFixture.run(.immutable_retire, target, false, true);
+    }
+}
+
+test "physical cache metadata immutable durable retirement plans flat and arena input memory in credits" {
+    const state_mod = @import("antfly_local_sources").storage_lsm_backend_state;
+    const a = std.testing.allocator;
+    var flat: state_mod.State = .{};
+    defer flat.deinit(a);
+    for ([_][]const u8{ "a", "b", "c" }) |key| try flat.upsert(a, .{ .name = "docs" }, key, "value", false);
+    var arena = try flat.cloneArena(a);
+    defer arena.deinit(a);
+    for ([_]*state_mod.State{ &flat, &arena }) |state| {
+        const expected = state.estimatedMemoryBytes();
+        var freezing: state_mod.State.MemoryPlanning = .{};
+        var steps: usize = 0;
+        while (!freezing.complete) : (steps += 1) {
+            try std.testing.expect(steps < 32);
+            var credits: usize = 1;
+            _ = freezing.step(state, &credits);
+        }
+        try std.testing.expectEqual(expected, freezing.bytes);
+        try std.testing.expect(state.frozen_memory_bytes == null);
     }
 }

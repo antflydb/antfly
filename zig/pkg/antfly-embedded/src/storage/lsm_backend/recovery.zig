@@ -313,7 +313,8 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     backend.mutable.deinit(backend.allocator);
     if (@hasField(BackendType, "immutable_memtables")) {
-        for (backend.immutable_memtables.items) |state| {
+        const head = if (@hasField(BackendType, "immutable_head")) backend.immutable_head else 0;
+        for (backend.immutable_memtables.items[head..]) |state| {
             state.deinit(backend.allocator);
             backend.allocator.destroy(state);
         }
@@ -328,6 +329,14 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
             backend.allocator.destroy(state);
         }
         backend.retired_immutable_memtables.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "admitted_retired_immutable")) {
+        var retired = backend.admitted_retired_immutable;
+        while (retired) |state| {
+            retired = state.admitted_retired_next;
+            state.deinit(backend.allocator);
+            backend.allocator.destroy(state);
+        }
     }
     if (@hasField(BackendType, "immutable_memtable_pins")) {
         backend.immutable_memtable_pins.deinit(backend.allocator);

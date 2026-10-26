@@ -36,7 +36,7 @@ pub const Job = struct {
             .account = if (state.account) |account| account.retain() else null,
             // Flat published generations freeze their charge at publication,
             // not on last-reader release. Never inspect freed entries off-lock.
-            .fallback_bytes = if (state.account == null) state.frozen_memory_bytes.? else 0,
+            .fallback_bytes = if (state.account == null) state.retirement_memory_bytes orelse state.frozen_memory_bytes.? else 0,
             .array_bytes = state.entries.capacity * @sizeOf(@import("state.zig").OwnedEntry),
         };
     }
@@ -54,7 +54,7 @@ pub const Job = struct {
 pub var test_slice_hook: ?*const fn (*anyopaque) void = null;
 
 pub fn retire(backend: anytype, state: *State) void {
-    std.debug.assert(state.account != null or state.frozen_memory_bytes != null);
+    std.debug.assert(state.account != null or state.frozen_memory_bytes != null or state.retirement_memory_bytes != null);
     state.retired_next = null;
     if (backend.retired_memory_tail) |tail| tail.retired_next = state else backend.retired_memory_head = state;
     backend.retired_memory_tail = state;

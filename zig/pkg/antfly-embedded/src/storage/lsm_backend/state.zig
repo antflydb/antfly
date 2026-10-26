@@ -285,6 +285,10 @@ pub const State = struct {
     // unrelated immutable generations.
     immutable_pin_index: ?usize = null,
     immutable_retired_index: ?usize = null,
+    retirement_memory_bytes: ?u64 = null,
+    admitted_retired: bool = false,
+    admitted_retired_prev: ?*State = null,
+    admitted_retired_next: ?*State = null,
     account: ?*memory_account.Account = null,
     entries: std.ArrayListUnmanaged(OwnedEntry) = .empty,
     arena_owner: ?*std.heap.ArenaAllocator = null,
@@ -320,6 +324,47 @@ pub const State = struct {
     pub fn freezeMemoryAccounting(self: *State) void {
         self.frozen_memory_bytes = self.computeMemoryBytes();
     }
+
+    /// Read-only physical-size planning. The caller retains the immutable
+    /// source and later publishes the result into retirement-only metadata.
+    pub const MemoryPlanning = struct {
+        initialized: bool = false,
+        complete: bool = false,
+        index: usize = 0,
+        arena: ArenaAccounting = .{},
+        bytes: u64 = 0,
+        pub fn step(self: *@This(), state: *const State, credits: *usize) bool {
+            if (self.complete) return true;
+            if (!self.initialized) {
+                if (credits.* == 0) return false;
+                credits.* -= 1;
+                self.initialized = true;
+                if (state.frozen_memory_bytes) |bytes| {
+                    self.bytes = bytes;
+                    self.complete = true;
+                    return true;
+                }
+                self.bytes = state.entries.capacity * @sizeOf(OwnedEntry);
+                if (state.ordered_root) |root| {
+                    self.bytes = root.bytes;
+                    self.complete = true;
+                    return true;
+                }
+            }
+            if (state.arena_owner) |arena| {
+                if (!self.arena.step(arena, credits)) return false;
+                self.bytes = state.entries.capacity * @sizeOf(OwnedEntry) +| self.arena.bytes;
+            } else while (self.index < state.entries.items.len) {
+                if (credits.* == 0) return false;
+                credits.* -= 1;
+                const entry = state.entries.items[self.index];
+                self.bytes +|= logicalEntryBytes(entry) - @sizeOf(OwnedEntry) + entry.sharedOverheadBytes();
+                self.index += 1;
+            }
+            self.complete = true;
+            return true;
+        }
+    };
 
     pub fn estimatedMemoryBytes(self: *const State) u64 {
         return self.frozen_memory_bytes orelse self.computeMemoryBytes();

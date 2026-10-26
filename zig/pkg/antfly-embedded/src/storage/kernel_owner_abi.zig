@@ -75,7 +75,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Coupled obsolete-only edit state and funded immutable header forks.
 // Registered durable manifest views and independent physical retirement.
 // Admitted durability grants include bounded range reads and deletion.
-pub const abi_version: u32 = 203;
+// Captured immutable windows and intrusive pinned-input retirement.
+pub const abi_version: u32 = 204;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

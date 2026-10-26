@@ -238,6 +238,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-durable-checkpoint-receipt-test", "Verify durable registered metadata receipt, replacement and exact logical coverage")
         .dependOn(&durable_receipt_run.step);
 
+    const immutable_retirement_tests = b.addTest(.{
+        .name = "immutable-durable-retirement-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata immutable durable retirement"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const immutable_retirement_run = b.addRunArtifact(immutable_retirement_tests);
+    immutable_retirement_run.addArg("--require-no-skips");
+    b.step("antfly-immutable-durable-retirement-test", "Verify durable immutable input retirement, cancellation and retained readers")
+        .dependOn(&immutable_retirement_run.step);
+
     const immutable_pin_tests = b.addTest(.{
         .name = "immutable-pin-index-tests",
         .root_module = physical_metadata_root,

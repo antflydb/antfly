@@ -29158,3 +29158,60 @@ persisted query values, and both snapshot-vector/pin-capacity allocation failure
 Four durable checkpoint receipt cases, four admitted WAL retirement cases and the
 4/45/1/8 boundary companions pass. The five native ABI contract tests also pass;
 no final qualification case fails, skips or leaks.
+
+
+## Captured immutable flush and durable input retirement (2026-10-25)
+
+QuiescedImmutableFlush now connects actual Backend immutable inputs to a retained
+flush builder, its exclusive completed-output batch, live coupled publication
+and the matching registered durable checkpoint receipt. The caller prepays the
+address-stable coordinator, keeps Backend/provider lifetime and quiesces writers,
+other maintenance and accounting until deinit. Capture under Backend.mu copies
+at most 64 input headers and WAL ranges and reserves run IDs from bounded header
+counts. Its lifecycle pin and exclusive build identity survive original refusal.
+No execution port is stored. Builder retirement stops all source-vector borrows
+before the coordinator releases its input authority.
+
+Preparation plans physical memory in bounded row/arena credits without modifying
+shared immutable accounting fields. It records logical input debt exactly once
+in the live-output installation tail. Inputs remain query-visible until an
+admitted scan proves every output's identity and metadata in the actual installed
+durable manifest. Final retirement rechecks the captured source headers/ranges,
+source generation, durable owner and directory identity before any head movement.
+Cancellation, changed ranges and stale coverage retain the inputs. Later durable
+coverage validation can resume after memory-view generation changes.
+
+The successful fixed tail advances only the captured prefix, retaining an active
+tail without copying it. Full consumption clears array lengths in constant work.
+It preserves the unchanged registered SST directory's clean identity after
+invalidating memory read views, so subsequent WAL cleanup still recognizes the
+durable boundary. Reader-pinned inputs enter a new intrusive retirement queue;
+last-reader release unlinks exactly that header before incremental destruction.
+Existing legacy retired arrays remain supported. Maintenance stats, legacy and
+admitted memory observation, and close/recovery teardown include the new queue.
+Teardown skips consumed immutable-array slots, preventing duplicate destruction
+when a retained active tail leaves a nonzero head. Fixed flush counters use the
+batch's aggregate output size/compression receipt. Private native ABI is 144 and
+storage-owner ABI is 204.
+
+The new native fixture builds real Backend snapshot generations into real SSTs,
+installs a registered durable checkpoint, and verifies full/prefix retirement,
+retained reader values and native durable reopen. Its WAL-range checks use
+explicit range identities with WAL disabled; separate admitted WAL cases retain
+actual physical WAL coverage. This is not yet the normal maintenance driver.
+Nonempty legacy-root migration, concurrent production adoption and overload
+qualification remain open. Full Linux qualification remains waived; the full
+pooling design is incomplete.
+
+Final immutable-durable-retirement-v6-fast and -debug receipts pass all five
+commands and 70 native build steps each against identical current 5,760-input
+maps. Four new cases cover actual full/prefix input retirement, active WAL
+range preservation, retained reader values, native checkpoint reopen, stale
+range/generation refusal, original retry/abort, cancellation after durability,
+allocation-free final publication, and read-only flat/arena memory planning.
+Two immutable pin-index, four durable receipt, four admitted WAL, four flush
+publication and seven flush-builder cases pass. The complete existing builder
+original-refusal/allocation/abort/long-partition sweeps finish successfully.
+The 4/45/1/8 boundary companions and five native ABI cases also pass. No
+final case fails, skips or leaks. Production integration and the full design
+remain incomplete.

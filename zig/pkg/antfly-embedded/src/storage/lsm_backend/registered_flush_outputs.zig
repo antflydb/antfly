@@ -58,6 +58,8 @@ pub const Owner = struct {
     builder: ?*Builder.Owner = null,
     range: Builder.Owner.CompletedRange = undefined,
     count: u64 = 0,
+    total_size_bytes: u64 = 0,
+    compression_stats: @FieldType(Run, "compression_stats") = .{},
     collected: bool = false,
     frame: ?*Publication.Candidate = null,
     receipt: ?Publication.Candidate.PreparedReceipt = null,
@@ -130,6 +132,8 @@ pub const Owner = struct {
             }
             const run = &node.run.?;
             if (run.entry_count != node.rows or node.ticket.?.queue != self.queue or !std.mem.eql(u8, run.path.?, node.ticket.?.path)) return error.InvalidArgument;
+            self.total_size_bytes +|= run.size_bytes;
+            self.compression_stats.add(run.compression_stats);
             self.count += 1;
             self.pending = null;
         }
@@ -211,6 +215,36 @@ pub const Owner = struct {
         self.receipt = null;
         self.next_validation = null;
         self.search = null;
+    }
+
+    /// Borrowed validation continuation. The live batch and immutable durable
+    /// directory must outlive it; no execution port or deletion ticket escapes.
+    pub const DurableCoverage = struct {
+        owner: *Owner,
+        directory: *const Directory,
+        next: ?*Node,
+        search: ?Directory.IdSearch = null,
+        complete: bool = false,
+        pub fn resumeWithAdmission(self: *@This(), original: admission.Port) !void {
+            try original.checkpoint();
+            if (self.owner.closing or !self.owner.live) return error.InvalidArgument;
+            while (self.next) |node| {
+                try original.checkpoint();
+                if (self.search == null) self.search = self.directory.locateId(&node.run.?);
+                try self.search.?.resumeWithAdmission(original);
+                const found = (self.search.?.matched orelse return error.CompactionPlanningStale).entry.run;
+                const run = &node.run.?;
+                if (!std.meta.eql(found.read_identity, run.read_identity) or found.level != run.level or found.visibility_id != run.visibility_id or found.size_bytes != run.size_bytes or found.entry_count != run.entry_count) return error.CompactionPlanningStale;
+                self.search = null;
+                self.next = node.next;
+            }
+            self.complete = true;
+        }
+    };
+    pub fn durableCoverageWithAdmission(self: *Owner, directory: *const Directory, original: admission.Port) !DurableCoverage {
+        try original.checkpoint();
+        if (self.closing or !self.live or !self.collected or self.count == 0) return error.InvalidArgument;
+        return .{ .owner = self, .directory = directory, .next = self.head };
     }
 
     /// Final caller access; no builder/frame/backend/execution borrow escapes.

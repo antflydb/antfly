@@ -1796,6 +1796,9 @@ pub const Backend = struct {
     /// that count non-zero forever and retain every flushed generation.
     immutable_memtable_pins: std.ArrayListUnmanaged(ImmutableMemtablePin) = .empty,
     retired_immutable_memtables: std.ArrayListUnmanaged(*State) = .empty,
+    admitted_retired_immutable: ?*State = null,
+    admitted_retired_immutable_count: usize = 0,
+    immutable_flush_owner: ?*QuiescedImmutableFlush = null,
     retired_mutable_snapshots: std.ArrayListUnmanaged(*State) = .empty,
     retired_mutable_snapshot_by_state: std.AutoHashMapUnmanaged(*const State, usize) = .empty,
     bulk_snapshot_accounts: std.AutoHashMapUnmanaged(*state_mod.memory_account.Account, usize) = .empty,
@@ -1944,6 +1947,203 @@ pub const Backend = struct {
     }
 
     pub const QuiescedCheckpointPreparation = @import("lsm_backend/checkpoint_preparation.zig").Preparation(Backend);
+
+    /// Caller-prepaid, address-stable coordinator. Quiesce writers, other
+    /// maintenance and accounting until deinit; keep Backend/provider alive.
+    /// Original admission is supplied afresh on every drive, never retained.
+    pub const QuiescedImmutableFlush = struct {
+        const Builder = @import("lsm_backend/registered_flush_builder.zig");
+        const Batch = @import("lsm_backend/registered_flush_outputs.zig").Owner;
+        const Checkpoint = @import("lsm_backend/registered_manifest_checkpoint.zig").Owner;
+        pub const max_inputs = 64;
+        backend: ?*Backend = null,
+        states: [max_inputs]*const State = undefined,
+        ranges: [max_inputs]WalSegmentRange = undefined,
+        memory_bytes: [max_inputs]u64 = undefined,
+        started_ns: u64 = 0,
+        count: usize = 0,
+        head: usize = 0,
+        first_id: u64 = 0,
+        end_id: u64 = 0,
+        prepared: usize = 0,
+        row: usize = 0,
+        cursor: State.EntryCursor = .{},
+        freezing: State.MemoryPlanning = .{},
+        logical_bytes: u64 = 0,
+        builder: ?*Builder.Owner = null,
+        batch: ?*Batch = null,
+        live: bool = false,
+        retired: bool = false,
+        coverage: ?Batch.DurableCoverage = null,
+        checkpoint: ?*Checkpoint = null,
+        generation: u64 = 0,
+
+        /// Fixed capture under Backend.mu; no input vector allocation or row
+        /// scan. The build flag owns these source headers until deinit, even
+        /// when construction/publication fails. False means no work existed.
+        pub fn captureWithAdmission(self: *@This(), backend: *Backend, limit: usize, original: read_admission.Port) !bool {
+            try original.checkLifetime();
+            if (self.backend != null or limit == 0 or limit > max_inputs) return error.InvalidArgument;
+            if (backend.closing.load(.acquire)) return error.BackendClosing;
+            if (backend.options.backend.read_only) return error.ReadOnly;
+            if (backend.manifest_recovery_required) return error.RecoveryRequired;
+            if (backend.immutable_flush_build_in_flight) return error.ResourceBudgetExceeded;
+            if (backend.root_dir == null or backend.storage == null or backend.options.resource_manager == null or backend.options.unpublished_outputs == null) return error.ExecutionWaitUnsupported;
+            const count = @min(limit, backend.activeImmutableMemtableCount());
+            if (count == 0) return false;
+            var ids: u64 = 0;
+            for (backend.activeImmutableMemtables()[0..count], 0..) |state, index| {
+                ids = std.math.add(u64, ids, state.entryCount()) catch return error.ResourceBudgetExceeded;
+                self.states[count - index - 1] = state;
+                self.ranges[count - index - 1] = backend.immutable_wal_ranges.items[backend.immutable_head + index];
+            }
+            if (ids == 0) return error.EmptyRun;
+            const end = std.math.add(u64, backend.next_run_id, ids) catch return error.ResourceBudgetExceeded;
+            self.count = count;
+            self.head = backend.immutable_head;
+            self.first_id = backend.next_run_id;
+            self.end_id = end;
+            self.backend = backend;
+            self.started_ns = backend.writeStatsNowNs();
+            backend.next_run_id = end;
+            backend.immutable_flush_owner = self;
+            backend.immutable_flush_build_in_flight = true;
+            backend.retainReaderKind(.other);
+            return true;
+        }
+        fn validateInputsFixed(self: *@This()) !*Backend {
+            const backend = self.backend orelse return error.InvalidArgument;
+            if (backend.immutable_flush_owner != self or !backend.immutable_flush_build_in_flight or self.retired) return error.InvalidArgument;
+            if (backend.immutable_head != self.head or backend.activeImmutableMemtableCount() < self.count) return error.CompactionPlanningStale;
+            for (self.states[0..self.count], self.ranges[0..self.count], 0..) |state, range, index| {
+                const source = self.head + self.count - index - 1;
+                if (backend.immutable_memtables.items[source] != state or !std.meta.eql(backend.immutable_wal_ranges.items[source], range)) return error.CompactionPlanningStale;
+            }
+            return backend;
+        }
+        pub fn prepareInputsWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            try original.checkpoint();
+            _ = try self.validateInputsFixed();
+            while (self.prepared < self.count) {
+                try original.checkpoint();
+                const state = self.states[self.prepared];
+                var credits: usize = 64;
+                if (!self.freezing.step(state, &credits)) continue;
+                self.memory_bytes[self.prepared] = self.freezing.bytes;
+                while (self.row < state.entryCount()) {
+                    try original.checkpoint();
+                    const entry = self.cursor.at(state, self.row);
+                    self.logical_bytes +|= @sizeOf(state_mod.OwnedEntry) + entry.key.len + entry.value.len + (if (entry.namespace_name) |name| name.len else @as(usize, 0));
+                    self.row += 1;
+                }
+                self.prepared += 1;
+                self.row = 0;
+                self.cursor = .{};
+                self.freezing = .{};
+            }
+        }
+        /// Config is captured by the first accepted builder construction.
+        /// Reserved IDs and input provenance always come from this window.
+        pub fn buildWithAdmission(self: *@This(), config: Builder.Config, original: read_admission.Port) !void {
+            try self.prepareInputsWithAdmission(original);
+            const backend = try self.validateInputsFixed();
+            if (self.live) return error.InvalidArgument;
+            if (self.builder == null) {
+                var effective = config;
+                effective.first_id = self.first_id;
+                effective.end_id = self.end_id;
+                self.builder = try Builder.Owner.start(backend.allocator, backend.options.resource_manager.?, backend.options.unpublished_outputs.?, backend.root_dir.?, self.states[0..self.count], effective, original);
+            }
+            try self.builder.?.driveWithAdmission(backend.storage.?, original);
+            if (self.batch == null) self.batch = try Batch.start(backend.allocator, backend.options.resource_manager.?, self.builder.?, original);
+            try self.batch.?.collectWithAdmission(original);
+        }
+        /// Caller has bound and validated this batch against a prepared frame.
+        /// Under Backend.mu, logical debt is recorded in the same infallible
+        /// tail as live file ownership; source headers remain query-visible.
+        pub fn installWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            try original.checkLifetime();
+            const backend = try self.validateInputsFixed();
+            if (self.live or self.prepared != self.count) return error.InvalidArgument;
+            if (backend.manifest_recovery_required) return error.RecoveryRequired;
+            try (self.batch orelse return error.InvalidArgument).installWithAdmission(backend, original);
+            self.live = true;
+            const elapsed = backend.writeStatsElapsedNs(self.started_ns);
+            backend.write_stats.flushes +|= 1;
+            backend.write_stats.flush_input_entries +|= self.builder.?.input_entries;
+            backend.write_stats.flush_ns +|= elapsed;
+            backend.write_stats.flush_output_runs +|= self.batch.?.count;
+            backend.write_stats.flush_output_bytes +|= self.batch.?.total_size_bytes;
+            backend.write_stats.table_file_writes +|= self.batch.?.count;
+            backend.write_stats.table_file_bytes +|= self.batch.?.total_size_bytes;
+            backend.recordTableCompressionWriteStats(self.batch.?.compression_stats);
+            backend.write_stats.immutable_flushes +|= 1;
+            backend.write_stats.immutable_flush_input_memtables +|= self.count;
+            backend.write_stats.immutable_flush_entries +|= self.builder.?.input_entries;
+            backend.write_stats.immutable_flush_ns +|= elapsed;
+            backend.unpublished_wal_logical_bytes +|= self.logical_bytes;
+            backend.unpublished_wal_max_batch_logical_bytes = @max(backend.unpublished_wal_max_batch_logical_bytes, self.logical_bytes);
+        }
+        /// Quiesced admitted coverage scan against the installed durable
+        /// snapshot, retaining the actual matching owner as the fixed witness.
+        pub fn validateDurableWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            try original.checkpoint();
+            const backend = try self.validateInputsFixed();
+            if (!self.live) return error.InvalidArgument;
+            if (backend.manifest_recovery_required) return error.RecoveryRequired;
+            const checkpoint = backend.registered_manifest_checkpoint orelse return error.RecoveryRequired;
+            if (!checkpoint.installed or !checkpoint.durable or !backend.manifestCoversCurrentRuns()) return error.RecoveryRequired;
+            const directory = backend.manifest_directory orelse return error.RecoveryRequired;
+            if (self.coverage == null or self.checkpoint != checkpoint or self.generation != backend.run_directory_generation) {
+                self.coverage = try self.batch.?.durableCoverageWithAdmission(directory, original);
+                self.checkpoint = checkpoint;
+                self.generation = backend.run_directory_generation;
+            }
+            try self.coverage.?.resumeWithAdmission(original);
+        }
+        /// Fixed publication tail under Backend.mu. All possible refusals occur
+        /// before head movement. Reader-pinned inputs enter an intrusive queue;
+        /// no allocation, observer scan or tail compaction follows this receipt.
+        pub fn retireInputsWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            try original.checkLifetime();
+            const backend = try self.validateInputsFixed();
+            if (backend.closing.load(.acquire)) return error.BackendClosing;
+            if (!self.live or self.coverage == null or !self.coverage.?.complete) return error.InvalidArgument;
+            if (backend.manifest_recovery_required or backend.registered_manifest_checkpoint != self.checkpoint or backend.run_directory_generation != self.generation or backend.manifest_directory != self.coverage.?.directory or !backend.manifestCoversCurrentRuns()) return error.CompactionPlanningStale;
+            backend.invalidateReadVersion();
+            // Only the memory source set changed. The registered SST directory
+            // is still exactly the durable directory proved above.
+            backend.run_directory_dirty = false;
+            backend.immutable_head += self.count;
+            backend.active_immutable_logical_bytes -|= self.logical_bytes;
+            for (self.states[0..self.count], self.memory_bytes[0..self.count]) |state, bytes| {
+                @constCast(state).retirement_memory_bytes = bytes;
+                backend.retireImmutableMemtableFixed(@constCast(state));
+            }
+            if (backend.immutable_head == backend.immutable_memtables.items.len) {
+                backend.immutable_memtables.items.len = 0;
+                backend.immutable_wal_ranges.items.len = 0;
+                backend.immutable_head = 0;
+            }
+            backend.clearImmutableIdleFlushDeadlineIfEmptyLocked();
+            backend.cached_maintenance_hint.store(1, .release);
+            self.retired = true;
+        }
+        /// Under Backend.mu after accepted physical work has joined. Stopping
+        /// every builder input borrow precedes releasing source ownership.
+        /// Failed/cancelled work preserves input headers and their WAL ranges.
+        pub fn deinit(self: *@This()) void {
+            const backend = self.backend orelse return;
+            std.debug.assert(backend.immutable_flush_owner == self);
+            self.coverage = null;
+            if (self.batch) |batch| batch.requestRetirement();
+            if (self.builder) |builder| builder.requestRetirement();
+            backend.immutable_flush_owner = null;
+            backend.finishImmutableFlushBuildLocked();
+            backend.releaseReaderKind(.other);
+            self.* = .{};
+        }
+    };
 
     pub const QuiescedOutputCleanup = @import("lsm_backend/prepared_output_cleanup.zig").Consumer(Backend);
 
@@ -2356,6 +2556,7 @@ pub const Backend = struct {
             retired_domain_indexes,
             immutable,
             retired_immutable,
+            admitted_immutable,
             bulk_accounts,
             cached,
             retired_mutable,
@@ -2498,6 +2699,16 @@ pub const Backend = struct {
                             else => unreachable,
                         };
                         if (self.index == items.len) self.advance() else if (self.stateStep(items[self.index])) self.index += 1;
+                    },
+                    .admitted_immutable => {
+                        if (!self.initialized) {
+                            self.current = b.admitted_retired_immutable;
+                            self.initialized = true;
+                        }
+                        if (self.current) |raw| {
+                            const value: *State = @ptrCast(@alignCast(raw));
+                            if (self.stateStep(value)) self.current = value.admitted_retired_next;
+                        } else self.advance();
                     },
                     .bulk_accounts => {
                         const accounts = &b.bulk_snapshot_accounts;
@@ -3265,7 +3476,7 @@ pub const Backend = struct {
             .read_snapshot_mutable_rotation_bytes_total = self.read_snapshot_mutable_rotation_bytes_total,
             .read_snapshot_mutable_rotation_peak_bytes = self.read_snapshot_mutable_rotation_peak_bytes,
             .immutable_memtables = @intCast(self.activeImmutableMemtableCount()),
-            .retired_immutable_memtables = @intCast(self.retired_immutable_memtables.items.len),
+            .retired_immutable_memtables = @intCast(self.retired_immutable_memtables.items.len + self.admitted_retired_immutable_count),
             .immutable_pinned_generations = @intCast(self.immutable_memtable_pins.items.len),
             .total_runs = @intCast(self.runs.count()),
             .obsolete_paths = @intCast(self.obsolete_paths.count()),
@@ -3338,6 +3549,11 @@ pub const Backend = struct {
             stats.immutable_bytes += estimateStateBytes(state);
         }
         for (self.retired_immutable_memtables.items) |state| {
+            stats.retired_immutable_entries +|= @intCast(state.entryCount());
+            stats.retired_immutable_bytes +|= estimateStateBytes(state);
+        }
+        var admitted_retired = self.admitted_retired_immutable;
+        while (admitted_retired) |state| : (admitted_retired = state.admitted_retired_next) {
             stats.retired_immutable_entries +|= @intCast(state.entryCount());
             stats.retired_immutable_bytes +|= estimateStateBytes(state);
         }
@@ -3854,6 +4070,8 @@ pub const Backend = struct {
         for (self.retired_immutable_memtables.items) |state| {
             bytes +|= state.accountedMemoryBytes(pass);
         }
+        var admitted_retired = self.admitted_retired_immutable;
+        while (admitted_retired) |state| : (admitted_retired = state.admitted_retired_next) bytes +|= state.accountedMemoryBytes(pass);
         bytes +|= self.bulk_snapshot_unshared_bytes;
         var accounts = self.bulk_snapshot_accounts.keyIterator();
         while (accounts.next()) |account| bytes +|= account.*.chargeOnce(pass);
@@ -4360,6 +4578,17 @@ pub const Backend = struct {
     }
 
     fn reclaimRetiredImmutableMemtable(self: *Backend, state: *const State) void {
+        if (state.admitted_retired) {
+            const owned = @constCast(state);
+            if (state.admitted_retired_prev) |prev| prev.admitted_retired_next = state.admitted_retired_next else self.admitted_retired_immutable = state.admitted_retired_next;
+            if (state.admitted_retired_next) |next| next.admitted_retired_prev = state.admitted_retired_prev;
+            owned.admitted_retired = false;
+            owned.admitted_retired_prev = null;
+            owned.admitted_retired_next = null;
+            self.admitted_retired_immutable_count -= 1;
+            self.destroyImmutableMemtable(owned);
+            return;
+        }
         const index = state.immutable_retired_index orelse return;
         std.debug.assert(self.retired_immutable_memtables.items[index] == state);
         self.destroyImmutableMemtable(self.removeRetiredImmutableMemtable(index));
@@ -4865,6 +5094,20 @@ pub const Backend = struct {
         state.immutable_retired_index = self.retired_immutable_memtables.items.len;
         self.retired_immutable_memtables.appendAssumeCapacity(state);
         self.syncTrackedInMemoryStateUsageCurrentLocked();
+    }
+
+    fn retireImmutableMemtableFixed(self: *Backend, state: *State) void {
+        std.debug.assert(!state.admitted_retired and state.immutable_retired_index == null);
+        if (!self.immutableMemtableIsPinned(state)) {
+            self.destroyImmutableMemtable(state);
+            return;
+        }
+        state.admitted_retired = true;
+        state.admitted_retired_prev = null;
+        state.admitted_retired_next = self.admitted_retired_immutable;
+        if (self.admitted_retired_immutable) |head| head.admitted_retired_prev = state;
+        self.admitted_retired_immutable = state;
+        self.admitted_retired_immutable_count += 1;
     }
 
     fn retireMutableSnapshot(self: *Backend, state: *State) void {

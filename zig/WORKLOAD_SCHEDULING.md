@@ -15,10 +15,9 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The current merge includes `origin/main` through `71aa19359a`
-(Grepstein artifact ingestion), integrated by `de95bf716d`.
+The branch includes main through `9d152a4c78`, integrated by `fd43b11205`.
 
-Private native ABI 138 and kernel-owner ABI 198 fence the current manager,
+Private native ABI 144 and kernel-owner ABI 204 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
 retirement, allocator-host acquisition, publication-resource and registered source-ancestry and yieldable physical output retirement and registered writer-root contracts. Durable reader epochs and peer feature
 barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;
@@ -40,8 +39,13 @@ entry anchors, and survives producer/backend exit. Final entry cleanup retires
 zero-reference pin rows under the original scope, preserving an earlier funder's
 host when another publisher still shares its pin. Prepared publication now captures canonical source/ancestor roots and installs
 the coupled run-store, obsolete-ledger and directory tuple under the Backend
-mutex. Normal flush/compaction drivers, legacy-root migration and durable
-completion still need integration before broader defaults can be qualified.
+mutex. Registered durable checkpoint receipts and admitted primary WAL retirement
+are implemented. The captured immutable-flush coordinator connects actual inputs
+to their output batch and matching durable receipt, with focused native
+Fast and Debug regression evidence in the implementation ledger. These continuations require caller-prepaid memory, retained provider
+lifetime and quiescence. Normal flush/compaction drivers, nonempty legacy-root
+migration and concurrent production adoption remain open before broader defaults
+can be qualified.
 
 Source `4c8ab4ee1a7143dc0e06b1e887475e7b0cb5afb7` adds key-plan derivation from canonical prepared requests
 and every accepted-effect family, with field/action coverage guards, conservative
