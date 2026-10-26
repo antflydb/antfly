@@ -6508,6 +6508,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-large-table-recovery-test", "Verify productive coverage cadence and index-scoped backfill merge admission").dependOn(&addCuratedTestRunArtifact(b, large_table_recovery_tests, large_table_recovery_tests.filters).step);
 
+    const coverage_publication_tests = b.addTest(.{
+        .name = "coverage-publication-tests",
+        .root_module = db_test_mod,
+        .filters = &.{ "db managed admission cannot deadlock replay coverage deletion", "producer readiness local receipt migration", "db completed managed admission emits an initial build clear edge" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-coverage-publication-test", "Verify replay coverage under catalog publication and receipt migration")
+        .dependOn(&addFilteredTestRunArtifact(b, coverage_publication_tests).step);
+
     const producer_maintenance_tests = b.addTest(.{
         .name = "producer-maintenance-tests",
         .root_module = db_test_mod,
