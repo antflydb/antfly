@@ -17483,7 +17483,7 @@ export interface components {
          */
         TableStorageMode: "document" | "relational";
         ExternalLakeCredentialRef: {
-            /** @description Name of a configured external_io connection with lake_read capability. */
+            /** @description Name of a configured external_io connection with lake.read capability. */
             ref: string;
             /** @description Allowed object prefix relative to the configured bucket or filesystem root. */
             scope?: string;
@@ -17697,11 +17697,11 @@ export interface components {
              */
             sortable?: boolean;
             /**
-             * @description Missing/null sort policy. The current production policy rejects missing or null native sort values.
+             * @description Missing/null sort policy. The default missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered for nulls first ascending and last descending, with JSON null cursor components. Nullable native layouts require a complete producer proof.
              * @default missing_rejected
              * @enum {string}
              */
-            missing_null_policy?: "missing_rejected";
+            missing_null_policy?: "missing_rejected" | "nulls_ordered";
         };
         /** @description Executable physical mapping used by a document property's `x-antfly-field` annotation. The mapping must accept the JSON Schema value type. Declarations for the same dotted path across document types must normalize to an identical physical mapping, and present values that cannot be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named mappings are rejected. */
         DocumentFieldMapping: {
@@ -17732,11 +17732,11 @@ export interface components {
              */
             sortable?: boolean;
             /**
-             * @description Missing/null sort policy. The current production policy rejects missing or null native sort values.
+             * @description Missing/null sort policy. The default missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered for nulls first ascending and last descending, with JSON null cursor components. Nullable native layouts require a complete producer proof.
              * @default missing_rejected
              * @enum {string}
              */
-            missing_null_policy?: "missing_rejected";
+            missing_null_policy?: "missing_rejected" | "nulls_ordered";
             /** @description Named one-level multifields emitted from this property's value. For example, a text title can expose a sortable keyword subfield. */
             fields?: {
                 [key: string]: components["schemas"]["DocumentSubfieldMapping"];
@@ -17827,13 +17827,15 @@ export interface components {
              */
             sortable?: boolean;
             /**
-             * @description Missing/null sort policy for this mapped field. The current production
-             *     policy rejects missing or null native sort values so sorted cursors
-             *     remain replayable JSON scalar tuples.
+             * @description Missing/null sort policy for this mapped field. The default missing_rejected
+             *     rejects missing or null native sort values. Opt in to nulls_ordered
+             *     to sort missing/null values first ascending and last descending,
+             *     with JSON null in replayable sort cursor tuples. Native sorting
+             *     requires a complete producer proof for nullable physical layouts.
              * @default missing_rejected
              * @enum {string}
              */
-            missing_null_policy?: "missing_rejected";
+            missing_null_policy?: "missing_rejected" | "nulls_ordered";
         };
         /**
          * @description A rule for mapping dynamically detected fields. Templates are checked in order

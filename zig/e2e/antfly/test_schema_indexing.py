@@ -156,3 +156,231 @@ def test_additional_properties_false_rejects_undeclared_fields(stateful_api):
     assert _hits(stateful_api, table, "body") == 1
     assert _hits(stateful_api, table, "stored_only") == 0
     assert _hits(stateful_api, table, "attachment") == 0
+
+
+def test_disabled_root_subfields_are_scoped_to_document_type(stateful_api):
+    table = f"schema_disabled_subfields_{time.time_ns()}"
+    body = {"type": "string", "x-antfly-field": {"type": "text"}}
+    payload = {
+        "type": "string",
+        "x-antfly-field": {
+            "type": "text",
+            "index": False,
+            "fields": {"exact": {"type": "keyword"}},
+        },
+    }
+    _create_table_with_schema(
+        stateful_api,
+        table,
+        {
+            "default_type": "alpha",
+            "document_schemas": {
+                name: {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"body": body, "payload": mapping},
+                    }
+                }
+                for name, mapping in (
+                    ("alpha", {"type": "string", "x-antfly-index": False}),
+                    ("beta", payload),
+                )
+            },
+        },
+    )
+    stateful_api.batch_write(
+        table,
+        inserts={
+            name: {"_type": name, "body": "quasar", "payload": "hiddenvalue"}
+            for name in ("alpha", "beta")
+        },
+        sync_level="full_text",
+    )
+    for field, expected in (("payload.exact", ["beta"]), ("payload", [])):
+        response = stateful_api.query_table(
+            table,
+            {"full_text_search": {"match": "hiddenvalue", "field": field}, "limit": 5},
+        )
+        assert [h["_id"] for h in response["responses"][0]["hits"]["hits"]] == expected
+
+
+@pytest.mark.parametrize(
+    "match_type,mapping_type",
+    [("number", "number"), ("boolean", "boolean"), ("date", "date")],
+)
+def test_type_filtered_dynamic_exclusions_preserve_declared_text(
+    stateful_api, match_type, mapping_type
+):
+    table = f"schema_dynamic_exclusion_{match_type}_{time.time_ns()}"
+    _create_table_with_schema(
+        stateful_api,
+        table,
+        {
+            "default_type": "doc",
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"body": {"type": "string"}},
+                    }
+                }
+            },
+            "dynamic_templates": [
+                {
+                    "name": "disabled_other_type",
+                    "match": "*",
+                    "match_mapping_type": match_type,
+                    "mapping": {"type": mapping_type, "index": False},
+                }
+            ],
+        },
+    )
+    stateful_api.batch_write(
+        table, inserts={"d1": {"body": WORDS["body"]}}, sync_level="full_text"
+    )
+    assert _hits(stateful_api, table, "body") == 1
+
+
+@pytest.mark.parametrize("root_indexed", [False, True])
+@pytest.mark.parametrize("dynamic_beta", [False, True])
+def test_detailed_exclusion_and_subfields_are_scoped_to_document_type(
+    stateful_api, root_indexed, dynamic_beta
+):
+    table = f"schema_type_policy_{time.time_ns()}"
+    _create_table_with_schema(
+        stateful_api,
+        table,
+        {
+            "default_type": "alpha",
+            "document_schemas": {
+                name: {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "body": {"type": "string"},
+                            **(
+                                {}
+                                if name == "beta" and dynamic_beta
+                                else {"payload": mapping}
+                            ),
+                        },
+                        **(
+                            {
+                                "additionalProperties": True,
+                                "x-antfly-dynamic-indexing": {"mode": "infer_types"},
+                            }
+                            if name == "beta" and dynamic_beta
+                            else {}
+                        ),
+                    }
+                }
+                for name, mapping in (
+                    (
+                        "alpha",
+                        {
+                            "type": "string",
+                            "x-antfly-field": {
+                                "type": "text",
+                                "index": root_indexed,
+                                "fields": {"exact": {"type": "keyword"}},
+                            },
+                        },
+                    ),
+                    ("beta", {"type": "string"}),
+                )
+            },
+        },
+    )
+    stateful_api.batch_write(
+        table,
+        inserts={
+            name: {
+                "_type": name,
+                "body": "control",
+                "payload": "zebrafish",
+            }
+            for name in ("alpha", "beta")
+        },
+        sync_level="full_text",
+    )
+    for field, expected in (
+        ("payload", ["alpha", "beta"] if root_indexed else ["beta"]),
+        ("payload.exact", ["alpha"]),
+    ):
+        response = stateful_api.query_table(
+            table,
+            {
+                "full_text_search": {"match": "zebrafish", "field": field},
+                "limit": 10,
+            },
+        )
+        assert (
+            sorted(hit["_id"] for hit in response["responses"][0]["hits"]["hits"])
+            == expected
+        )
+
+
+def test_nullable_keyword_sort_rejects_conflicted_column(stateful_api):
+    table = f"nullable_conflict_{time.time_ns()}"
+    schema = {
+        "default_type": "doc",
+        "index_sort": [
+            {"field": "rank", "order": "asc"},
+            {"field": "_id", "order": "asc"},
+        ],
+        "dynamic_templates": [
+            {
+                "name": "rank",
+                "path_match": "rank",
+                "mapping": {
+                    "type": "keyword",
+                    "sortable": True,
+                    "missing_null_policy": "nulls_ordered",
+                },
+            }
+        ],
+        "document_schemas": {
+            "doc": {
+                "schema": {"type": "object", "properties": {"body": {"type": "string"}}}
+            }
+        },
+    }
+    _create_table_with_schema(stateful_api, table, schema)
+    stateful_api.batch_write(
+        table,
+        inserts={
+            "a": {"body": "quasar", "rank": ["z"]},
+            "b": {"body": "quasar", "rank": "z"},
+            "c": {"body": "quasar", "rank": "a"},
+        },
+        sync_level="full_text",
+    )
+    request = {"full_text_search": {"match": "quasar", "field": "body"}, "limit": 10}
+    assert (
+        len(stateful_api.query_table(table, request)["responses"][0]["hits"]["hits"])
+        == 3
+    )
+    response = stateful_api._request(
+        "POST", f"/tables/{table}/query", dict(request, order_by=[{"field": "rank"}])
+    )
+    assert response.status_code == 422, (response.text, stateful_api.debug_logs())
+    assert response.json()["error"] == "unsupported_exact_sort"
+
+    # Genuine missing/null rows still publish exact, replayable nullable keys.
+    healthy = table + "_valid"
+    _create_table_with_schema(stateful_api, healthy, schema)
+    stateful_api.batch_write(
+        healthy,
+        inserts={
+            "a": {"body": "quasar", "rank": "z"},
+            "b": {"body": "quasar"},
+            "c": {"body": "quasar", "rank": "a"},
+        },
+        sync_level="full_text",
+    )
+    result = stateful_api.query_table(
+        healthy, dict(request, order_by=[{"field": "rank"}])
+    )
+    hits = result["responses"][0]["hits"]["hits"]
+    assert [hit["_id"] for hit in hits] == ["b", "c", "a"]
+    assert [hit["_sort"][0] for hit in hits] == [None, "a", "z"]

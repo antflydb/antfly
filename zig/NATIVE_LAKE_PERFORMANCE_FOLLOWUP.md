@@ -5899,3 +5899,342 @@ formatting, whitespace, license headers, and the Apache boundary passed.
 The final installed CLI build and version smoke check passed after reclaiming
 completed task-local compiler intermediates. Required repository cache cleanup
 completed; its uv prune was stopped after waiting on the existing cache lock.
+
+### Independent public-ID ordering, complete cutoffs and batched translation
+
+Declared string sources now consult their exact physical mapping for exclusion.
+A numeric-only dynamic template can no longer unconditionally suppress a declared
+string. Exact historical projection witnesses authorize the existing admitted
+leader-owned rebuild; unknown drift remains manual repair debt. Native definition
+revision 11 revalidates bindings and changes only affected whole-document text
+hashes. Selected-field text and vector bindings remain stable; native reader
+protocol 84 fences the semantic transition without changing text metadata v13.
+
+Plain `_id` sorting reuses public-file/current-row/index-by-ID navigation through
+the exact membership collector, including forward/backward cursors. Competitive
+bounds carry the complete winning public ID. Better primary groups retain all
+identities; only equal groups receive the inclusive public endpoint. Optional
+fallback withdraws the complete-order proof and retains completed top-K work.
+Stable-ID and filename translation use bounded authenticated multi-get. Coalesced
+and parallel reads share the optional quota under the owner lock, preserve the
+required-read reserve and retain existing scheduler/memory admission.
+
+The [public-ID evidence](bench/lake/native-public-id-v3-observation.json) retains
+all 48 exact-answer samples, independent oracle derivation, actual binary/source
+identities, workload/environment provenance and full-report hashes. On the same
+16,384 rows/eight files, plain `_id` drops from 16,384 decorations to 21, with 21
+ordered probes. Existing complete forward/reverse and wide-tie controls stay at
+21 decorations. Local Debug warm medians fall from 1,293 ms to 24 ms; timings do
+not isolate attribution or qualify cloud/full-archive throughput.
+
+Separate deterministic regressions reduce a 64-row range to one scanned row with
+a complete public-ID cutoff, and charge 196,760 bytes for 64 batched lookups versus
+12,592,640 for scalar seeks. Tests cover both directions, equal-primary endpoint
+proofs, duplicates/misses, optional row/read exhaustion, required reserve and
+allocation failures. The final CLI passes 209 lake native tests and 93 logical
+projection/query tests, with two benchmark skips and no leaks. Eighteen archive/
+schema E2Es and both full native Parquet/real Iceberg lifecycles pass. An actual
+old-to-new executable upgrade repairs the missing local posting and retains it
+through a second restart; an existing remote Parquet publication remains queryable.
+Relational external schemas reject dynamic templates, so the affected native
+binding migration is independently covered at the planner boundary.
+
+
+## Document-type projection, typed route bounds and refresh-key reuse
+
+The latest refinement scopes physical source exclusions and named text subfields
+to the selected document type, including undeclared dynamic strings. These rules
+are rebound from the authenticated public validator while ASCH epoch bytes stay
+unchanged. Their semantic witness authorizes the ordinary leader-owned shadow
+repair only for known historical provenance. A real old-to-new executable test
+repairs both the missing beta root posting and the leaked beta alias posting,
+then retains the corrected results through another restart.
+
+Reader protocol 85 / native text metadata v14 persist typed first/last bounds in
+routing records. Eligible field-sort windows reject strictly worse primary
+ranges before admitting descriptors or lineage. Equal primary keys remain live
+for public-ID ties; exact counts/full-match evaluation do not prune. Unknown or
+invalid evidence stays eligible. Existing v13 publications remain reusable and
+missing bounds retain ordinary execution. Encoders capture new bounds while the
+segment reader is resident; unsorted segments add no artifact reads.
+
+Cold lineage loads reserve complete logical read charges before submitting
+joined waves of up to eight shared scheduler I/O lanes. Saturation runs required
+reads on the caller; publication-owned execution keeps its serial phase contract.
+Immutable cutoff copies prevent prefetch from borrowing moving winner storage.
+
+Native fragment spaces retain optional per-row typed ordering keys under an
+ordering cohort and exact input-version digest. A separate tuple recipe binds
+emitted field positions, so permuting fields or selecting another alias cannot
+reinterpret cached tuples; reversing directions preserves reusable values.
+Unchanged rows reuse keys when a fragment is sorted again; changed/missing keys gather current ordering columns.
+Deletion removes cache entries, a changed cohort starts a new tree, and older
+publications without keys retain source fallback. Only the current native space
+owns this refresh state; consumer coordinate views do not retain obsolete key
+trees. Existing publication certificates, cloud generation maps, reader leases
+and GC walk the same identity dependency closure. See the [row identity
+contract](../docs/plans/lake-row-identity.md#incremental-ordering-key-state-reader-protocol-85).
+
+The [routing/refresh observation](bench/lake/native-routing-refresh-v3-observation.json)
+retains deterministic work counts and all 48 exact-answer baseline/candidate
+control samples on the same frozen 16,384-row Parquet source. A 257-row fragment
+refresh gathers one changed row and reuses 256 keys; deletion gathers none, while
+changed-cohort and absent-cache controls gather all remaining rows. Eight lineage
+pages reach eight concurrent reads, or one under saturation. Nine real-segment
+routing records retain two admissions and preserve original offsets across seven
+pruned records. These are bounded-work checks, not real-cloud throughput results.
+
+All control queries retain 21 decorated candidates. Warm medians in this run are
+25–27 ms versus 22–24 ms previously; concurrent native/E2E validation prevents
+latency attribution, so this refinement claims no measured latency improvement.
+
+
+Final qualification on the frozen tuple-recipe executable
+(`5128abd173c2b860257e0bb344898050ce31c38543bd53cc83bdf5007947e97d`)
+passes 24 archive/schema/full Parquet/full Iceberg E2Es and an actual old-to-new
+projection-repair/restart check. The complete native integration run passes
+509 server and 237 embedded contracts with no failures or leaks; the final tuple
+recipe also passes the 12 focused fragment contracts. Logical/query, top-K,
+frontier, media, generated-source/error and embedded ownership checks pass.
+Forty-one Python tooling/release tests pass. `origin/main` is merged through
+`03136b096d`; the final fetch reports it current. Repository cache cleanup ran
+with active-output protection.
+
+### Selected-range pruning, endpoint navigation and paged lineage
+
+Reader protocol 86/native text metadata v15 extend competitive sort pruning to
+selected segment windows. An authenticated endpoint directory visits compatible
+sort ranges best-first and stops before dominated routing records. Complete
+layout/count proof is required; historical or mixed layouts keep ordinary
+routing. Unfiltered field-sort windows can resolve native ordinals through paged
+lineage without eagerly expanding every range. Inverse-map consumers explicitly
+admit a bounded complete map and optional tie traversal falls back on pressure.
+Complete-capture refreshes reuse exact ordering keys and group remaining reads by
+payload block. See the [ownership and fallback contract](../docs/plans/lake-row-identity.md#ordered-serving-admission-and-demand-paged-lineage-reader-protocol-86).
+
+
+The [endpoint/lineage qualification](bench/lake/native-endpoint-lineage-v3-observation.json)
+retains the final frozen executable/source identity, full plan, all 48 matching
+samples and report digests. The deterministic endpoint contract admits the best
+of 128 ranges and then stops before dominated ranges; point lineage charges
+349,069 bytes versus 1,070,237 for 65,536 ranges. Complete captured refreshes reuse
+exact keys and group misses by payload block. A discovered admission-lifetime
+bug is fixed by deeply owning compact lineage descriptors and retaining no
+snapshot pointer; the regression frees admission storage before point/inverse
+reads and covers allocation failure. Observed timings are mixed under concurrent
+validation, so no end-to-end latency improvement is claimed.
+
+
+Final refinement validation builds the CLI from clean source `e0bf3799de` and
+freezes executable SHA-256
+`5e265ae425775442638318a778df441545f8d172306b4e1dc17d048b86073e67`.
+The complete integration pass covers 512 server and 237 embedded contracts; the
+subsequent ownership fix passes all 88 server/26 embedded frontier contracts,
+13 fragment contracts, and the focused admission-release/allocation-failure
+regression, with no failures or leaks. Eighteen archive tooling tests pass.
+Control catalog, generated-source/error, embedded boundary (1,014 sources), Ruff,
+formatting and diff checks pass. `origin/main` is merged through `4eedf9add7`;
+the final fetch confirms it is included. `make gc` ran with active-output
+protection; an idle uv prune was interrupted and the remaining cleanup finished.
+
+All 34 E2Es pass on that final frozen executable: 18 archive qualification cases,
+12 schema/indexing cases, both full Parquet/Iceberg lifecycles, and ordered logical
+identity rewrite/refresh cases for both formats (913.25 seconds). The 48-sample
+comparison passes without changing the collector's complete-answer checks.
+
+The final fetch advanced main to `71aa19359a`; merge `26622434b8` incorporated it
+without conflicts. That clean merged source rebuilds the CLI (executable SHA-256
+`c5935ff9743fa433f7922da41fea22d8114b4a18031eaae7e93f59766bc21fbc`),
+passes all five incoming Google embedding catalog contracts, generated error
+checks and the 1,013-source embedded boundary audit. Three post-merge E2Es pass
+in 24.65 seconds: shuffled Parquet bounded native sorting, the full Parquet
+lifecycle and the real Iceberg lifecycle. The 48 benchmark samples and 34-case
+qualification above remain tied to their earlier frozen executable; they are not
+relabelled as measurements of the merge.
+
+
+### Lineage page leases, bounded term probes and binary refresh tuples
+
+Reader protocol 87 reuses verified immutable lineage pages through an eight-page
+operation-local lease cache, traverses result tiles in ordinal order and keeps
+current authority checks on warm hits. Acquisition work and CPU point work have
+separate bounds before complete inverse-map fallback. Sorted membership now
+retains eight position-free term probes under a 2-MiB budget, with exact bitmap
+fallback under pressure. Ordering-key rows use a versioned typed binary codec
+while reading historical JSON entries and preserving incremental mixed trees.
+See the [ownership, compatibility and fallback contract](../docs/plans/lake-row-identity.md#bounded-lineage-leases-term-probes-and-binary-refresh-keys-reader-protocol-87).
+
+
+The [qualification record](bench/lake/native-leases-probes-v3-observation.json)
+pins the final clean executable (`4abddacd7f`), the separately frozen baseline,
+and all 48 matching real-Parquet control samples. Native checks establish five
+page acquisitions for 128 nearby lineage lookups under a 512-KiB lease bound,
+four term-probe opens/252 hits for 256 interleaved checks, exact fallback under
+one-byte probe admission, and 59-byte binary versus 248-byte JSON integer tuples.
+Mixed historical/new cache refresh gathers one changed row and reuses 256 keys.
+All four query controls retain 21 decorations; observed latency is broadly
+similar under concurrent validation, without a claimed overall speedup.
+
+Complete native lake integration passes 514 server and 237 embedded contracts.
+The final focused suites pass 70 embedded top-K contracts (one declared skip),
+32 server top-K contracts and 15 fragment/codec contracts. Lineage/frontier
+checks pass 88 server and 26 embedded contracts. These successful suites report
+no failures or leaks. The broad integration run started during refinement;
+final focused checks cover the subsequent posting-chunk pressure helper and
+probe fixture correction. The record preserves that distinction.
+
+
+All 34 E2Es pass on the final frozen executable in 853.68 seconds: archive and
+schema qualification, full Parquet/real Iceberg lifecycles, and ordered logical
+identity rewrite/refresh for both formats. Eighteen archive tooling tests,
+control catalog/generated error checks, the 1,013-source embedded boundary,
+the 2,251-source Apache product boundary, formatting and diff checks pass.
+The latest `origin/main` (`71aa19359a`) is included; repeated fetch/merge checks
+report up to date. Repository cache cleanup completed with active-output
+protection; only its idle uv-prune child was interrupted.
+
+### Compound predicates, nullable ordering and mixed layout traversal
+
+This refinement implements bounded native Boolean membership probes, explicit
+`missing_null_policy: nulls_ordered` with authenticated typed-coverage witnesses,
+and a complete cohort endpoint directory. The default `missing_rejected` policy
+continues to reject missing/null native sort values and cursors. Compatible layouts retain best-first pruning even
+when other runs must use exact scanning. Historical endpoints migrate through
+one bounded metadata pass; native payloads remain reusable. See the
+[protocol-88 contract](../docs/plans/lake-row-identity.md#compound-probes-nullable-ordering-and-layout-cohorts-reader-protocol-88)
+for total-count semantics, admission, fallback and compatibility.
+
+The [qualification record](bench/lake/native-compound-null-cohorts-v3-observation.json)
+pins the executable built from clean merged source, complete workloads and all
+48 control answers. All four controls retain 21 decorations. Real integer and
+signed-timestamp Parquet flows check 44 additional feature samples, including
+NULL cursor tuples with publication-bound snapshot tokens, before and after
+process restart; ordered queries retain 21–22 candidates out of 4,096 rows.
+Explicitly selected text indexes now reach the same native plans, and composed
+results retain owned profile strings after component cleanup. Timing remains
+observational during concurrent validation and includes the upstream main merge.
+
+Final qualification on merged source `f83dc3694c`: 515 server / 237 embedded
+lake integration contracts; 67 reader/composed, 76 embedded top-K (one declared
+skip) / 32 server top-K, 88 server / 26 embedded frontier, and 171 shared query
+contracts pass without failures or leaks. All 36 E2Es pass against the frozen
+executable, including real Parquet/Iceberg lifecycles and ordered identity reuse
+through rewrites and restart. Schema/API gates, 18 archive tooling tests, 17
+catalog tooling tests, SDK generation/type checks, and both source-boundary
+audits pass. Main `3382e46a74` is included.
+
+## Protocol 89 refinement qualification
+
+The current refinement replaces variable cohort aggregates with bounded interval
+witnesses, prunes segment subtrees against pagination cursors, exposes exact
+metadata membership to ordered candidate probes, and captures native ordering keys
+during the shared verification scan. These preserve native typed storage and the
+publication-bound identity/lease contracts. Nullable projection validity is
+explicit and old nullable witnesses require reconstruction.
+
+Acceptance requires more than first-page latency: seven and forty distinct layouts
+must publish, cursor seeks must preserve overlapping ranges and public ties,
+conflicted keyword values must never become certified NULLs, metadata probes must
+avoid segment materialization for small Top-K, and complete-capture ordering must
+perform zero payload decodes. Measure operation counts independently from wall
+clock timings; representative cloud and full-archive qualification remain separate.
+
+
+The [qualification record](bench/lake/native-interval-probes-capture-v3-observation.json)
+pins clean production source `80fe9777a5`, executable and input hashes. Forty
+layouts publish with 52-byte summaries. A 512-range cursor regression skips
+255–256 ranges and three complete child subtrees in each direction, preserves an
+overlapping [0,1000] interval at cursor 600, and retains primary-key ties. Five
+candidate probes plus two offset checks do not materialize segment membership.
+The existing 8,193-row scattered capture scenario drops ordering payload decodes
+from the documented 144 to zero, with 129 payload blocks and 16 fragments.
+
+The full integration contracts pass (516 server / 237 embedded). The later
+fallback regression passes with 90 server / 26 embedded frontier contracts.
+Final source passes 79 embedded Top-K contracts (one declared skip), 32 server
+Top-K contracts and 83 logical-query contracts (one declared skip). Reader/composed
+and shared query gates pass 67 and 171 contracts. Source-free selected-field
+projections withdraw nullable proofs; exact historical witnesses, including
+selected indexes, require the existing private rebuild. The upgrade fixture waits
+for indexing before directly mutating historical state, preventing a writer-lock
+race with its live producer.
+
+All 48 local before/after control samples retain identical complete answers and
+independently expected IDs. Timings and initial publication intervals remain
+observational; this includes the main merge and concurrent validation, and does
+not qualify cloud transport or full-archive throughput.
+
+
+All 37 E2Es pass on the final executable frozen from clean source `80fe9777a5`
+in 849.51 seconds, including real Parquet/Iceberg lifecycles and ordered logical
+identity reuse through rewrites, updates, deletes and restart. Forty-eight new
+integer/timestamp feature samples retain 21–22 ordered candidates out of 4,096
+rows. Eighteen archive tooling tests, stable control/error catalog checks, format
+checks and embedded/Apache boundary audits (1,014 / 2,486 sources) pass. Main
+`9d152a4c78` is merged; repeated final fetch/merge checks report up to date.
+
+
+The [batch-kernel qualification](bench/lake/native-batch-kernels-v3-observation.json)
+pins clean source `b9e51ad91b` and measures ordering extraction, metadata masks and
+fused compaction provenance. Per-batch binding preserves canonical datetime,
+encoded and nested conversion while flat numeric, Boolean and keyword columns
+use typed kernels. Only plans with a metadata batch producer prefetch 16 ordered
+rows; each buffered row retains its own public tie proof. Boolean masks retain
+minimum-should-match, exclusions, duplicate positions and exact bitmap fallback.
+Typed compaction emits contiguous provenance during existing preparation;
+observer failures still abort the private publication attempt.
+
+All 36 baseline and 36 candidate samples preserve complete answers and expected
+IDs. Local Debug warm medians are about 1–5% lower; metadata prefetch scans 33
+rather than 22 rows in these limit-20 controls while still decorating 21. The
+ordering kernel measures 262 ms versus 8.2 ms with the same checksum. Metadata
+callback count falls from 64 points to one batch; the alternating-run merge
+emits 32 ranges instead of 8,192 point callbacks and avoids an extra plan pass.
+These operations do not qualify cloud or full-archive throughput. Qualification
+passes 343 native test executions (two declared skips), 18 tooling tests, and
+29 real Parquet/Iceberg E2Es covering NULL/date cursors, broad metadata filters,
+identity reuse, schema changes, deletes, pgwire and restart. Main `0c753dc705`
+is merged; compiled runtime ABI 65 covers the added internal batch callback.
+
+
+The [direct-probe qualification](bench/lake/native-direct-probes-v1-observation.json)
+pins source `850290dfaa`. Exact coordinate proofs avoid the source translation
+round trip for native metadata membership. Lazy inventory costing distinguishes
+unloaded directories from empty archives, and batch estimates share internal
+reverse navigation. Dense ordered prefetch follows remaining page demand;
+capture writes identical compact tuples from a fixed typed buffer and reusable
+scratch. Existing scratch/I/O/work budgets and incompatible-layout fallbacks stay
+in force. Reader protocol 89 and internal ABI 65 are unchanged.
+
+Identical-input controls preserve all 48 samples per binary. Metadata scans fall
+33 to 22 at limit 20 and 17 to 3 at limit one; local Debug warm medians fall about
+805 to 404 ms and 806 to 26 ms. Tiny pages use three direct probes, no translations
+and no materialization. Limit-20 diagnostics still observe complete-membership
+fallback; its cause and elimination need separate qualification. Ordinary-query
+timings are mixed under concurrent validation, and these observations establish
+neither cloud nor full-archive throughput. Final checks pass 146 focused native
+tests (one declared skip), 18 tooling tests, and 29 real Parquet/Iceberg E2Es without
+skips. Main `0c753dc705` remains merged after the final fetch.
+
+### Proven winner scoring and representation-aware membership conversion
+
+Sorted page selection binds its native winner IDs, original score expression and
+result to one leased text snapshot. Rescoring reuses that proof instead of
+reopening metadata inclusion/exclusion or live-visibility producers. Explicit
+native document constraints keep their score contribution; Boolean boosts,
+pattern execution, corpus statistics, distributed statistics and cancellation
+still govern scoring. The proof is private to the operation and never enters
+public requests or persisted formats.
+
+Metadata probe admission now includes complete membership conversion in the
+alternative's cost. Matching predicate blocks are counted from authenticated
+tree cardinalities under the same tuple bounds, without decoding their bitmaps.
+Shared coordinate spaces charge per compressed block; translated or unknown
+layouts charge per row. This distinguishes a distinct-ID range from a compact
+categorical selection with the same cardinality. A source scan alternative
+charges row conversion too. Read bytes, scratch, tile size and cancellation stay
+independent hard execution limits, and exhaustion retains the exact fallback.
+
+Both initial eager membership admission and subsequent deferred probe admission
+use this conversion estimate. A small distinct-key range cannot enter the eager
+path merely because its scan-only estimate fits one reverse-tree probe.

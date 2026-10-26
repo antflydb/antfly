@@ -1766,6 +1766,8 @@ pub const Cursor = struct {
     upper: ?[]const u8,
     lower: []const u8 = "",
     reverse: bool = false,
+    /// Optional operation-owned rejection from authenticated child aggregates.
+    pruning: ?struct { ptr: *anyopaque, keep: *const fn (*anyopaque, []const u8) anyerror!bool } = null,
 
     const Frame = struct { page: Page, next: usize, end: ?[]const u8 };
     pub const Record = struct { key: []const u8, value: []const u8 };
@@ -1831,6 +1833,7 @@ pub const Cursor = struct {
             frame.next -= 1;
             const entry = frame.page.entries[frame.next];
             if (entry.child) |child_ptr| {
+                if (self.pruning) |prune| if (!try prune.keep(prune.ptr, entry.aggregate)) continue;
                 const child = child_ptr.*;
                 const end = if (frame.next + 1 < frame.page.entries.len) frame.page.entries[frame.next + 1].key else frame.end;
                 try self.descendReverse(child, null, entry.key, end);
@@ -1983,6 +1986,7 @@ pub const Cursor = struct {
             };
             frame.next += 1;
             if (entry.child) |child_ptr| {
+                if (self.pruning) |prune| if (!try prune.keep(prune.ptr, entry.aggregate)) continue;
                 const child = child_ptr.*;
                 const end = if (frame.next < frame.page.entries.len) frame.page.entries[frame.next].key else frame.end;
                 try self.descend(child, "", entry.key, end);

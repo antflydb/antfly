@@ -231,7 +231,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("query-contract-test", "Run query parsing, worker transport and projection contracts").dependOn(&b.addRunArtifact(query_contract_tests).step);
 
     const logical_field_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = selectTestFilters(b, &.{ "logical value", "logical query", "projection checkpoint external storage" }) });
-    b.step("logical-field-query-test", "Verify logical query parsing, planning and original-value membership").dependOn(&b.addRunArtifact(logical_field_tests).step);
+    b.step("logical-field-query-test", "Verify logical query parsing, planning and original-value membership").dependOn(&addFilteredTestRunArtifact(b, logical_field_tests).step);
 
     const api_http_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_http_runtime_test_root.zig"),
@@ -2934,7 +2934,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, filtered_topk_mod, true, true);
     const filtered_topk_tests = b.addTest(.{
         .root_module = filtered_topk_mod,
-        .filters = &.{ "producer top k", "logical value borrowed", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys", "rank cursors" },
+        .filters = &.{ "producer top k", "logical value borrowed", "deferred membership refines", "PostingsIterator advanceTo", "observed physical ordering", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "public tie row cursors", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys", "rank cursors" },
         .max_rss = 8 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -6236,6 +6236,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lite_query_reader_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{
+            "composed",
             "query reader reuse",
             "native text stats fallback",
             "native text doc values",
