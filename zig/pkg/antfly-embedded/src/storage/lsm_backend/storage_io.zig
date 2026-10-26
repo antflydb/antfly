@@ -370,6 +370,8 @@ pub const DurabilityResources = struct {
         begin_private_write: ?*const fn (*anyopaque, u64, []const u8, read_admission.Port) anyerror!SyncOperation = null,
         begin_private_publish: ?*const fn (*anyopaque, read_admission.Port) anyerror!SyncOperation = null,
         begin_private_discard: ?*const fn (*anyopaque, read_admission.Port) anyerror!SyncOperation = null,
+        begin_delete: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!SyncOperation = null,
+        begin_read_range: ?*const fn (*anyopaque, []const u8, u64, usize, read_admission.Port) anyerror!ControlFileReadOperation = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     /// Appends the frozen bytes prepared with this grant. The caller holds
@@ -399,6 +401,17 @@ pub const DurabilityResources = struct {
     }
     pub fn beginControlRead(self: *DurabilityResources, path: []const u8, limit: usize, original: read_admission.Port) !ControlFileReadOperation {
         return BoundaryAbi.call("begin_read", self.boundary_dispatch, self.vtable.begin_read, .{ self.ptr, path, limit, original });
+    }
+    /// Bounded bytes stay owned by the grant until operation retirement.
+    pub fn beginReadRange(self: *DurabilityResources, path: []const u8, offset: u64, len: usize, original: read_admission.Port) !ControlFileReadOperation {
+        const begin = self.vtable.begin_read_range orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_read_range", self.boundary_dispatch, begin, .{ self.ptr, path, offset, len, original });
+    }
+    /// One owned namespace deletion; absence is idempotent success. Directory
+    /// durability is separately ordered with beginSyncParent.
+    pub fn beginDeleteFile(self: *DurabilityResources, path: []const u8, original: read_admission.Port) !SyncOperation {
+        const begin = self.vtable.begin_delete orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_delete", self.boundary_dispatch, begin, .{ self.ptr, path, original });
     }
     pub fn beginSyncContents(self: *DurabilityResources, path: []const u8, original: read_admission.Port) !SyncOperation {
         return BoundaryAbi.call("begin_sync", self.boundary_dispatch, self.vtable.begin_sync, .{ self.ptr, path, false, original });
@@ -3057,6 +3070,7 @@ pub const NativeSyncTestControl = struct {
     pub var appends: std.atomic.Value(usize) = .init(0);
     pub var metadata: std.atomic.Value(usize) = .init(0);
     pub var control_failure_after_rename: std.atomic.Value(bool) = .init(false);
+    pub var delete_failure: std.atomic.Value(bool) = .init(false);
     pub var append_failure_after: std.atomic.Value(usize) = .init(std.math.maxInt(usize));
     pub var sync_path_hashes: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
     fn observe(read: bool, path: []const u8) void {
@@ -3202,7 +3216,7 @@ fn nativeAppendResourceBytes(_: *anyopaque, len: usize) !u64 {
 
 const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag == .freestanding) struct {} else struct {
     const Phase = enum(u8) { idle, queued, completed, stopping };
-    const Kind = enum { control_read, contents, directory, append, control_replace, create_directory, private_create, private_write, private_publish, private_discard };
+    const Kind = enum { control_read, range_read, delete_file, contents, directory, append, control_replace, create_directory, private_create, private_write, private_publish, private_discard };
     allocator: Allocator,
     permit: NativeFdPermit,
     future: std.Io.Future(void) = undefined,
@@ -3217,6 +3231,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     temporary_len: usize = 0,
     buffer: [max_atomic_write_bytes]u8 = undefined,
     limit: usize = 0,
+    read_offset: u64 = 0,
     result: ControlFileResult = .{ .file_size = 0, .bytes = &.{} },
     failure: ?anyerror = null,
     append_bytes: ?[]u8 = null,
@@ -3229,7 +3244,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     private_final_len: usize = 0,
     private_offset: u64 = 0,
 
-    const vtable: DurabilityResources.VTable = .{ .begin_read = beginRead, .begin_sync = beginSync, .deinit = deinit, .retire_with_admission = retireWithAdmission, .begin_append = beginAppend, .begin_control_replace = beginControlReplace, .begin_create_directory = beginCreateDirectory, .begin_private_create = beginPrivateCreate, .begin_private_write = beginPrivateWrite, .begin_private_publish = beginPrivatePublish, .begin_private_discard = beginPrivateDiscard };
+    const vtable: DurabilityResources.VTable = .{ .begin_read = beginRead, .begin_sync = beginSync, .deinit = deinit, .retire_with_admission = retireWithAdmission, .begin_append = beginAppend, .begin_control_replace = beginControlReplace, .begin_create_directory = beginCreateDirectory, .begin_private_create = beginPrivateCreate, .begin_private_write = beginPrivateWrite, .begin_private_publish = beginPrivatePublish, .begin_private_discard = beginPrivateDiscard, .begin_delete = beginDelete, .begin_read_range = beginRange };
     const sync_vtable: SyncOperation.VTable = .{ .wait_with_admission = wait, .deinit = retireOperation };
     const read_vtable: ControlFileReadOperation.VTable = .{ .wait_with_admission = waitRead, .deinit = retireOperation };
 
@@ -3284,11 +3299,13 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         if (self.private_owned and !private) return error.ResourceBudgetExceeded;
         if (path.len >= self.path.len) return error.NameTooLong;
         if (kind == .control_read and (limit == 0 or limit > max_control_file_bytes)) return error.ResourceBudgetExceeded;
+        if (kind == .range_read and (limit == 0 or limit > max_atomic_write_bytes)) return error.ResourceBudgetExceeded;
         std.debug.assert(self.phase.load(.acquire) == .idle);
         @memcpy(self.path[0..path.len], path);
         self.path_len = path.len;
         self.kind = kind;
         self.limit = limit;
+        self.read_offset = 0;
         self.append_create = create_if_missing;
         self.invalidation_pending = false;
         self.failure = null;
@@ -3367,6 +3384,27 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         return .{ .ptr = self, .vtable = &read_vtable };
     }
 
+    fn beginRange(raw: *anyopaque, path: []const u8, offset: u64, len: usize, original: read_admission.Port) !ControlFileReadOperation {
+        const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
+        try self.prepareCommand(path, .range_read, len, false, original);
+        self.read_offset = offset;
+        self.submit();
+        return .{ .ptr = self, .vtable = &read_vtable };
+    }
+    fn beginDelete(raw: *anyopaque, path: []const u8, original: read_admission.Port) !SyncOperation {
+        const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
+        try self.permit.cache.fencePathRetainingEntries(self.permit.state.cache_namespace, self.permit.io, path, original);
+        try self.prepareCommand(path, .delete_file, 0, false, original);
+        self.invalidation_pending = true;
+        self.submit();
+        return .{ .ptr = self, .vtable = &sync_vtable };
+    }
+    fn deletePath(self: *NativeDurabilityResources, path: []const u8) !void {
+        if (builtin.is_test and NativeSyncTestControl.delete_failure.load(.acquire)) return error.InputOutput;
+        deleteFilePathWithIo(self.permit.io, path) catch |cause| {
+            if (cause != error.FileNotFound) return cause;
+        };
+    }
     fn beginSync(raw: *anyopaque, path: []const u8, parent: bool, original: read_admission.Port) !SyncOperation {
         const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
         if (path.len >= self.path.len) return error.NameTooLong;
@@ -3521,14 +3559,15 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
             if (builtin.is_test) {
                 if (self.kind == .append) {
                     _ = NativeSyncTestControl.appends.fetchAdd(1, .release);
-                } else if (self.kind == .control_replace or self.kind == .create_directory or self.kind == .private_create or self.kind == .private_write or self.kind == .private_publish or self.kind == .private_discard) {
+                } else if (self.kind == .control_replace or self.kind == .create_directory or self.kind == .private_create or self.kind == .private_write or self.kind == .private_publish or self.kind == .private_discard or self.kind == .delete_file) {
                     _ = NativeSyncTestControl.metadata.fetchAdd(1, .release);
-                } else NativeSyncTestControl.observe(self.kind == .control_read, path);
+                } else NativeSyncTestControl.observe(self.kind == .control_read or self.kind == .range_read, path);
             }
             const result = switch (self.kind) {
                 .contents => fs_paths.syncFilePortable(io, path),
                 .directory => fs_paths.syncDirPortable(io, path),
-                .control_read => self.readControl(path),
+                .control_read, .range_read => self.readControl(path),
+                .delete_file => self.deletePath(path),
                 .append => self.appendPrepared(path),
                 .control_replace => self.replaceControl(path),
                 .create_directory => self.createDirectory(path),
@@ -3551,9 +3590,12 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         const file = if (std.fs.path.isAbsolute(path)) try std.Io.Dir.openFileAbsolute(io, path, .{}) else try std.Io.Dir.cwd().openFile(io, path, .{});
         defer file.close(io);
         self.result.file_size = (try file.stat(io)).size;
-        if (self.result.file_size > self.limit) return;
-        const bytes = self.buffer[0..@intCast(self.result.file_size)];
+        if (self.kind == .control_read and self.result.file_size > self.limit) return;
+        const offset = if (self.kind == .range_read) self.read_offset else 0;
+        const len: usize = @intCast(@min(self.limit, self.result.file_size -| offset));
+        const bytes = self.buffer[0..len];
         var reader = file.reader(io, &.{});
+        try reader.seekTo(offset);
         try reader.interface.readSliceAll(bytes);
         self.result.bytes = bytes;
     }

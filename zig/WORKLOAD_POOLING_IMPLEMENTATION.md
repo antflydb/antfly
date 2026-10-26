@@ -29078,3 +29078,52 @@ native ABI contract tests pass; no case fails, skips or leaks.
 Physical WAL completion, immutable retirement and normal maintenance integration
 remain open. Full Linux qualification remains waived and the full pooling design
 is incomplete.
+
+
+## Admitted primary WAL retirement (2026-10-25)
+
+Primary WAL retirement now has an admitted, address-stable continuation backed
+by one prepaid durability grant and the real exclusive WAL publication lock.
+The Backend requires a registered durable manifest covering its live runs, no
+unpublished logical debt and tracked active WAL ranges. Full retirement rotates
+an empty successor before publishing CURRENT; prefix retirement preserves the
+active current segment. A durable checkpoint floor precedes segment deletion,
+followed by directory sync and an acknowledged reclamation watermark. Empty
+current files do not rotate again when no cleanup is owed.
+
+The optional wal/reclaimed.index uses the existing checksummed control envelope
+with appended kind 6 and a cleaned/covered pair. It records deletion progress
+only after directory durability. A missing/older watermark retains cleanup debt,
+including after cancellation between the floor and deletions. Legacy reset's
+checkpoint reset invalidates a watermark from the former ID generation. Existing
+WAL and manifest encodings are unchanged; older readers ignore the new file.
+
+Dedicated replay logs, replay indexes and sequences are preserved. A nonempty
+legacy primary-replay catalog refuses retirement. With no dedicated-layout
+marker, bounded range reads verify canonical record framing and payload CRCs
+before mutation, refusing embedded replay rather than deleting it speculatively.
+
+A Backend WAL-recovery record captures the manifest lineage and source generation
+before mutation. Cancellation or physical uncertainty keeps that recovery fence
+and invalidates sampled primary retention. After accepted work joins, new cleanup
+admission may resume only that matching WAL obligation; it never renews an
+application request's lifetime. Successful publication clears only its matching
+recovery state. Physical range reads and deletion are new optional durability
+capabilities, with private native ABI 142 and storage-owner ABI 202.
+
+`admitted-wal-retirement-v4-fast` and `admitted-wal-retirement-v4-debug`
+pass all five commands and 37 native build steps against identical current
+5,760-input maps. Four new cases cover native full rotation and prefix retention,
+40 KiB canonical-record CRC verification, dedicated replay/sequence preservation,
+empty-current idempotence, selected original refusal with retry or abort, floor
+rename uncertainty, cancellation after floor publication, deletion failure and
+resumption under new cleanup admission. Embedded replay is refused before
+mutation. Four durable-receipt regressions and the 4/45/1/8 boundary companions
+also pass, as do the five native ABI contract tests. No case fails, skips or
+leaks. Legacy WAL reset is rejected for registered durable roots.
+
+The caller still prepays continuation/grant memory, retains Backend/provider
+lifetime and quiesces writers and accounting until join. Production maintenance
+adoption, immutable retirement, nonempty legacy durable-root migration and
+remaining design requirements are open. Full Linux qualification remains waived;
+the full pooling design is incomplete.

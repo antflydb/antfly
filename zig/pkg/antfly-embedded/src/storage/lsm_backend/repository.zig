@@ -864,6 +864,9 @@ pub const ManifestJournal = struct {
             expected.journal.sequence = null;
             return backend.manifest_recovery_required and expected.matchesIdentity(backend);
         }
+        pub fn matchesRecoveryWithoutJournalChange(self: *const @This(), backend: anytype) bool {
+            return backend.manifest_recovery_required and self.matchesIdentity(backend);
+        }
         fn matchesIdentity(self: *const @This(), backend: anytype) bool {
             const current = &backend.manifest_journal;
             const prior = &self.journal;

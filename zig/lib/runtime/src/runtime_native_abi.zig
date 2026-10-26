@@ -133,7 +133,8 @@ const builtin = @import("builtin");
 // Registered flush handoff claims and prepared publication revision receipts.
 // Coupled obsolete-only edit state and funded immutable header forks.
 // Registered durable manifest views and independent physical retirement.
-pub const abi_version: u32 = 141;
+// Admitted durability grants include bounded range reads and deletion.
+pub const abi_version: u32 = 142;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

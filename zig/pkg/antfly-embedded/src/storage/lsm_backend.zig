@@ -1810,6 +1810,7 @@ pub const Backend = struct {
     run_directory: ?*RunDirectory = null,
     manifest_directory: ?*RunDirectory = null,
     registered_manifest_checkpoint: ?*@import("lsm_backend/registered_manifest_checkpoint.zig").Owner = null,
+    wal_retirement_recovery: ?WalRetirementRecovery = null,
     manifest_journal: repository_mod.ManifestJournal = .{},
     run_directory_dirty: bool = true,
     run_directory_generation: u64 = 0,
@@ -2195,6 +2196,96 @@ pub const Backend = struct {
             self.* = .{};
         }
     };
+
+    const WalRetirementRecovery = struct {
+        generation: u64,
+        manifest: *@import("lsm_backend/registered_manifest_checkpoint.zig").Owner,
+        lineage: repository_mod.ManifestJournal.CheckpointFence,
+    };
+    const WalRetirementPublication = struct {
+        backend: *Backend,
+        lock: WalOperationLock,
+        generation: u64,
+        manifest: *@import("lsm_backend/registered_manifest_checkpoint.zig").Owner,
+        lineage: repository_mod.ManifestJournal.CheckpointFence,
+        mutated: bool = false,
+        pub fn noteMutation(self: *@This()) !void {
+            if (self.mutated) return;
+            const b = self.backend;
+            if (b.run_directory_generation != self.generation or b.registered_manifest_checkpoint != self.manifest or !b.manifestCoversCurrentRuns() or b.unpublished_wal_logical_bytes != 0) return error.CompactionPlanningStale;
+            if (!self.lineage.matches(b)) return error.RecoveryRequired;
+            self.backend.wal_retention.invalidatePrimary();
+            self.backend.wal_retirement_recovery = .{ .generation = self.generation, .manifest = self.manifest, .lineage = self.lineage };
+            self.backend.manifest_recovery_required = true;
+            self.mutated = true;
+        }
+        pub fn publishWithAdmission(self: *@This(), _: anytype, original: read_admission.Port) !void {
+            try original.checkpoint();
+            const b = self.backend;
+            if (b.closing.load(.acquire)) return error.BackendClosing;
+            if (b.run_directory_generation != self.generation or b.registered_manifest_checkpoint != self.manifest or !b.manifestCoversCurrentRuns() or b.unpublished_wal_logical_bytes != 0) return error.CompactionPlanningStale;
+            if (!(if (self.mutated) self.lineage.matchesRecoveryWithoutJournalChange(b) else self.lineage.matches(b))) return error.RecoveryRequired;
+            // Only primary retention changed. Dedicated replay state and reset
+            // proof remain untouched; admitted status refresh measures bytes.
+            if (self.mutated) {
+                b.manifest_recovery_required = false;
+                b.wal_retirement_recovery = null;
+            }
+        }
+        pub fn release(self: *@This()) void {
+            self.lock.release();
+        }
+    };
+    pub const QuiescedWalRetirement = wal_mod.CurrentStateRetirement(WalRetirementPublication);
+
+    /// Caller prepays QuiescedWalRetirement.memoryBound(storage), retains this
+    /// Backend/provider and fences writers, maintenance and accounting until
+    /// retirement joins. Physical waits occur outside backend.mu on original
+    /// admission. No roots or implicit lock-file preparation occur here.
+    pub fn tryBeginQuiescedWalRetirementWithAdmission(self: *Backend, preparation: *QuiescedDurabilityPreparation, original: read_admission.Port) !?QuiescedWalRetirement {
+        if (try preparation.resumeRetirement(self, null, original)) return null;
+        try original.checkpoint();
+        if (self.closing.load(.acquire)) return error.BackendClosing;
+        const recovering = self.manifest_recovery_required;
+        if (recovering and self.wal_retirement_recovery == null) return error.RecoveryRequired;
+        if (self.options.backend.read_only) return error.ReadOnly;
+        if (!self.options.wal_enabled or self.root_dir == null or self.storage == null) return error.ExecutionWaitUnsupported;
+        const durable = self.registered_manifest_checkpoint orelse return error.ExecutionWaitUnsupported;
+        if (!self.manifestCoversCurrentRuns() or self.unpublished_wal_logical_bytes != 0) return error.ResourceBudgetExceeded;
+        if (!self.storage.?.supportsNativePathLocks() or self.root_lock_state == null or self.wal_operation_lock_file == null) return error.ExecutionWaitUnsupported;
+        var covered: ?u64 = null;
+        if (self.mutable.entryCount() != 0 or self.activeImmutableMemtableCount() != 0) {
+            if (self.mutable.entryCount() != 0 and !self.mutable_wal_range.isSet()) return error.ExecutionWaitUnsupported;
+            for (self.immutable_memtables.items[self.immutable_head..], self.immutable_wal_ranges.items[self.immutable_head..]) |state, range| {
+                if (state.entryCount() != 0 and !range.isSet()) return error.ExecutionWaitUnsupported;
+            }
+            covered = (self.oldestActiveWalSegment() orelse return error.ExecutionWaitUnsupported) - 1;
+        }
+        var lineage = repository_mod.ManifestJournal.CheckpointFence.capture(self);
+        if (recovering) {
+            const prior = self.wal_retirement_recovery.?;
+            if (prior.generation != self.run_directory_generation or prior.manifest != durable or !prior.lineage.matchesRecoveryWithoutJournalChange(self)) return error.RecoveryRequired;
+            lineage = prior.lineage;
+        }
+        var operation = try QuiescedWalRetirement.prepare(self.root_dir.?, covered);
+        var probe = (try self.tryAcquireWalOperationLockImpl(.exclusive, false)) orelse return null;
+        probe.release();
+        const resources = (try self.storage.?.tryPrepareDurabilityWithAdmission(original)) orelse return null;
+        var lock = (self.tryAcquireWalOperationLockImpl(.exclusive, false) catch |cause| {
+            try preparation.reject(self, null, resources, cause, original);
+            unreachable;
+        }) orelse {
+            try preparation.reject(self, null, resources, null, original);
+            return null;
+        };
+        const publication: WalRetirementPublication = .{ .backend = self, .lock = lock, .generation = self.run_directory_generation, .manifest = durable, .lineage = lineage, .mutated = recovering };
+        operation.start(resources, publication, original) catch |cause| {
+            lock.release();
+            try preparation.reject(self, null, resources, cause, original);
+            unreachable;
+        };
+        return operation;
+    }
 
     pub const QuiescedWalSync = wal_mod.CurrentStateSync(WalOperationLock);
 
@@ -4850,6 +4941,7 @@ pub const Backend = struct {
     fn maybeCheckpointWalAfterManifestPublish(self: *Backend) !void {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
+        if (self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         if (self.recovery_replaying_wal) return;
         // A newer flush can finish while an older manifest is syncing. Empty
         // memtables alone no longer prove that the WAL is covered durably.
@@ -6873,6 +6965,7 @@ pub const Backend = struct {
     fn resetWalAfterManifestCheckpoint(self: *Backend) !void {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
+        if (self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         const start_ns = self.writeStatsNowNs();
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
         defer wal_lock.release();
@@ -6905,6 +6998,7 @@ pub const Backend = struct {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
+        if (self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         const saved_budget = self.maintenance_io_budget_remaining;
         self.maintenance_io_budget_remaining = null;
         defer self.maintenance_io_budget_remaining = saved_budget;

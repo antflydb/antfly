@@ -59,6 +59,7 @@ const ControlKind = enum(u8) {
     replay_index = 3,
     main_replay_segment = 4,
     replay_segment = 5,
+    reclamation = 6,
 };
 pub const default_replay_scratch_retained_cap_bytes: usize = replay_chunk_bytes + @max(record_header_len, replay_record_header_len);
 
@@ -3824,4 +3825,309 @@ test "controlled physical sync WAL append retirement joins accepted writes befor
     try std.testing.expect(!held and recover and publishes == 0 and releases == 1);
     try std.testing.expectEqual(@as(usize, 1), storage_io.NativeSyncTestControl.appends.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), storage_io.NativeSyncTestControl.calls.load(.acquire));
+}
+
+/// Physical primary-WAL retirement on one prepaid durability grant. Publication
+/// supplies noteMutation(), publishWithAdmission(result, original), release().
+/// Its real owner proves durable coverage and excludes appends until retirement.
+/// Dedicated replay data is untouched; legacy embedded replay refuses deletion.
+pub fn CurrentStateRetirement(comptime Publication: type) type {
+    return struct {
+        const Self = @This();
+        const admission = @import("../../common/read_admission.zig");
+        const Stage = enum { current, current_stat, checkpoint, cleanup, catalog, proof_header, proof_payload, rotation_probe, rotation_file, current_replace, floor, remove, directory, marker, ready, published, failed };
+        const Pending = union(enum) { none, read: storage_io.ControlFileReadOperation, physical: storage_io.SyncOperation };
+        pub const Result = struct { current_segment: u64 = 0, oldest_retained_segment: u64 = 1, covered_through_segment: u64 = 0, reclaimed_through_segment: u64 = 0, deletion_completions: u64 = 0 };
+        index: [std.fs.max_path_bytes]u8 = undefined,
+        checkpoint: [std.fs.max_path_bytes]u8 = undefined,
+        cleanup: [std.fs.max_path_bytes]u8 = undefined,
+        catalog: [std.fs.max_path_bytes]u8 = undefined,
+        segment: [std.fs.max_path_bytes]u8 = undefined,
+        lengths: [4]usize = @splat(0),
+        prefix_len: usize,
+        segment_len: usize = 0,
+        covered: ?u64,
+        resources: ?storage_io.DurabilityResources = null,
+        publication: ?Publication = null,
+        pending: Pending = .none,
+        stage: Stage = .current,
+        result: Result = .{},
+        failure: ?anyerror = null,
+        previous_current: u64 = 0,
+        previous_covered: u64 = 0,
+        max_covered: u64 = 0,
+        delete_next: u64 = 1,
+        proof_segment: u64 = 1,
+        record_offset: u64 = 0,
+        record_end: u64 = 0,
+        payload_offset: u64 = 0,
+        expected_crc: u32 = 0,
+        crc: Crc32 = .init(),
+        mutation_started: bool = false,
+
+        pub fn memoryBound(storage: storage_io.Storage) !u64 {
+            return std.math.add(u64, @sizeOf(Self), try storage.appendResourceBytes(0)) catch error.ResourceBudgetExceeded;
+        }
+        /// null retires all covered primary state by rotating a fresh current
+        /// segment; a finite bound always preserves the existing current file.
+        pub fn prepare(root: []const u8, covered_through: ?u64) !Self {
+            var self: Self = .{ .covered = covered_through, .prefix_len = 0 };
+            const prefix = std.fmt.bufPrint(&self.segment, "{s}{s}wal/", .{ root, if (std.mem.endsWith(u8, root, "/")) "" else "/" }) catch return error.NameTooLong;
+            if (prefix.len + 64 >= self.segment.len) return error.NameTooLong;
+            self.prefix_len = prefix.len;
+            self.lengths[0] = (std.fmt.bufPrint(&self.index, "{s}index", .{prefix}) catch unreachable).len;
+            self.lengths[1] = (std.fmt.bufPrint(&self.checkpoint, "{s}checkpoint.index", .{prefix}) catch unreachable).len;
+            self.lengths[2] = (std.fmt.bufPrint(&self.cleanup, "{s}reclaimed.index", .{prefix}) catch unreachable).len;
+            self.lengths[3] = (std.fmt.bufPrint(&self.catalog, "{s}replay-main.segments", .{prefix}) catch unreachable).len;
+            return self;
+        }
+        pub fn start(self: *Self, resources: storage_io.DurabilityResources, publication: Publication, original: admission.Port) !void {
+            if (resources.vtable.begin_delete == null or resources.vtable.begin_read_range == null or resources.vtable.begin_control_replace == null or resources.vtable.retire_with_admission == null) return error.ExecutionWaitUnsupported;
+            var offered = resources;
+            const initial_read = try offered.beginControlRead(self.index[0..self.lengths[0]], control_pair_len, original);
+            self.resources = offered;
+            self.publication = publication;
+            self.pending = .{ .read = initial_read };
+        }
+        fn segmentPath(self: *Self, id: u64) []const u8 {
+            const tail = std.fmt.bufPrint(self.segment[self.prefix_len..], "{d:0>20}.log", .{id}) catch unreachable;
+            self.segment_len = self.prefix_len + tail.len;
+            return self.segment[0..self.segment_len];
+        }
+        const Read = struct { absent: bool = false, file_size: u64 = 0, bytes: []const u8 = &.{} };
+        fn read(self: *Self, path: []const u8, offset: ?u64, len: usize, original: admission.Port) !Read {
+            if (self.pending == .none) self.pending = .{ .read = if (offset) |at| try self.resources.?.beginReadRange(path, at, len, original) else try self.resources.?.beginControlRead(path, len, original) };
+            var trace: admission.RejectionTrace = .{};
+            const value = self.pending.read.waitWithAdmission(trace.bind(original).?) catch |cause| {
+                if (trace.failure) |failure| return failure;
+                self.retirePending();
+                if (cause == error.FileNotFound) return .{ .absent = true };
+                return self.fail(cause);
+            };
+            try original.checkpoint();
+            return .{ .file_size = value.file_size, .bytes = value.bytes };
+        }
+        fn pair(self: *Self, read_result: Read, kind: ControlKind) ![]const u8 {
+            if (read_result.file_size != control_pair_len or read_result.bytes.len != control_pair_len) return self.fail(error.CorruptLsmWalIndex);
+            return decodeControl(read_result.bytes, kind, 16) catch |cause| return self.fail(cause);
+        }
+        fn mutate(self: *Self) !void {
+            if (!self.mutation_started) {
+                try self.publication.?.noteMutation();
+                self.mutation_started = true;
+            }
+        }
+        fn waitPhysical(self: *Self, original: admission.Port) !void {
+            var trace: admission.RejectionTrace = .{};
+            self.pending.physical.waitWithAdmission(trace.bind(original).?) catch |cause| {
+                if (trace.failure) |failure| return failure;
+                return self.fail(cause);
+            };
+            self.retirePending();
+        }
+        fn replace(self: *Self, path: []const u8, kind: ?ControlKind, first: u64, second: u64, original: admission.Port) !void {
+            if (self.pending == .none) {
+                try self.mutate();
+                var payload: [16]u8 = undefined;
+                var raw: [control_pair_len]u8 = undefined;
+                std.mem.writeInt(u64, payload[0..8], first, .little);
+                std.mem.writeInt(u64, payload[8..16], second, .little);
+                if (kind) |tag| encodeControl(&raw, tag, &payload);
+                self.pending = .{ .physical = try self.resources.?.beginControlReplace(path, if (kind != null) &raw else "", original) };
+            }
+            try self.waitPhysical(original);
+        }
+        fn afterProof(self: *Self) void {
+            self.stage = if (self.result.current_segment != self.previous_current) .rotation_probe else .floor;
+        }
+        pub fn waitWithAdmission(self: *Self, original: admission.Port) !Result {
+            _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+            _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+            while (true) {
+                try original.checkpoint();
+                switch (self.stage) {
+                    .ready, .published => return self.result,
+                    .failed => return self.failure.?,
+                    .current => {
+                        const value = try self.read(self.index[0..self.lengths[0]], null, control_pair_len, original);
+                        if (value.absent) {
+                            self.stage = .ready;
+                            continue;
+                        }
+                        const data = try self.pair(value, .current_segment);
+                        self.previous_current = std.mem.readInt(u64, data[0..8], .little);
+                        if (self.previous_current == 0) return self.fail(error.CorruptLsmWalIndex);
+                        self.result.current_segment = self.previous_current;
+                        self.max_covered = if (self.covered) |cap| @min(cap, self.previous_current - 1) else self.previous_current;
+                        self.retirePending();
+                        self.stage = .current_stat;
+                    },
+                    .current_stat => {
+                        const value = try self.read(self.segmentPath(self.previous_current), null, 1, original);
+                        if (value.absent) return self.fail(error.FileNotFound);
+                        if (self.covered == null) {
+                            if (value.file_size == 0) self.max_covered = self.previous_current - 1 else self.result.current_segment = std.math.add(u64, self.previous_current, 1) catch return self.fail(error.ResourceBudgetExceeded);
+                        }
+                        self.retirePending();
+                        self.stage = .checkpoint;
+                    },
+                    .checkpoint => {
+                        const value = try self.read(self.checkpoint[0..self.lengths[1]], null, control_pair_len, original);
+                        if (!value.absent) {
+                            const data = try self.pair(value, .checkpoint);
+                            self.result.oldest_retained_segment = std.mem.readInt(u64, data[0..8], .little);
+                            self.previous_covered = std.mem.readInt(u64, data[8..16], .little);
+                            if (self.result.oldest_retained_segment == 0 or self.previous_covered == std.math.maxInt(u64) or self.previous_covered + 1 < self.result.oldest_retained_segment or self.result.oldest_retained_segment > self.previous_current) return self.fail(error.CorruptLsmWalIndex);
+                        }
+                        self.result.covered_through_segment = @max(self.previous_covered, self.max_covered);
+                        self.retirePending();
+                        self.stage = .cleanup;
+                    },
+                    .cleanup => {
+                        const value = try self.read(self.cleanup[0..self.lengths[2]], null, control_pair_len, original);
+                        if (!value.absent) {
+                            const data = try self.pair(value, .reclamation);
+                            const cleaned = std.mem.readInt(u64, data[0..8], .little);
+                            const covered = std.mem.readInt(u64, data[8..16], .little);
+                            if (cleaned > covered) return self.fail(error.CorruptLsmWalIndex);
+                            // Legacy reset can reuse IDs; its checkpoint reset
+                            // invalidates a watermark from the former generation.
+                            if (covered <= self.previous_covered) self.result.reclaimed_through_segment = cleaned;
+                        }
+                        self.delete_next = self.result.reclaimed_through_segment + 1;
+                        self.proof_segment = self.delete_next;
+                        self.retirePending();
+                        if (self.delete_next > self.max_covered) {
+                            self.result.current_segment = self.previous_current;
+                            self.stage = .ready;
+                        } else self.stage = .catalog;
+                    },
+                    .catalog => {
+                        const value = try self.read(self.catalog[0..self.lengths[3]], null, 1, original);
+                        if (!value.absent and value.file_size != 0) return self.fail(error.ExecutionWaitUnsupported);
+                        self.retirePending();
+                        if (value.absent) self.stage = .proof_header else self.afterProof();
+                    },
+                    .proof_header => {
+                        if (self.proof_segment > self.max_covered) {
+                            self.afterProof();
+                            continue;
+                        }
+                        const value = try self.read(self.segmentPath(self.proof_segment), self.record_offset, record_header_len, original);
+                        if (value.absent or self.record_offset == value.file_size) {
+                            self.retirePending();
+                            self.proof_segment += 1;
+                            self.record_offset = 0;
+                            continue;
+                        }
+                        if (value.bytes.len != record_header_len) return self.fail(error.CorruptLsmWal);
+                        if (std.mem.readInt(u32, value.bytes[0..4], .little) == replay_record_magic) return self.fail(error.ExecutionWaitUnsupported);
+                        if (std.mem.readInt(u32, value.bytes[0..4], .little) != record_magic or std.mem.readInt(u16, value.bytes[4..6], .little) != record_version or std.mem.readInt(u16, value.bytes[6..8], .little) != record_header_len) return self.fail(error.CorruptLsmWal);
+                        const payload_len = std.mem.readInt(u32, value.bytes[8..12], .little);
+                        self.payload_offset = self.record_offset + record_header_len;
+                        self.record_end = std.math.add(u64, self.payload_offset, payload_len) catch return self.fail(error.CorruptLsmWal);
+                        if (payload_len < 4 or self.record_end > value.file_size) return self.fail(error.CorruptLsmWal);
+                        self.expected_crc = std.mem.readInt(u32, value.bytes[12..16], .little);
+                        self.crc = .init();
+                        self.retirePending();
+                        self.stage = .proof_payload;
+                    },
+                    .proof_payload => {
+                        const len: usize = @intCast(@min(16 * 1024, self.record_end - self.payload_offset));
+                        const value = try self.read(self.segmentPath(self.proof_segment), self.payload_offset, len, original);
+                        if (value.absent or value.bytes.len != len) return self.fail(error.CorruptLsmWal);
+                        self.crc.update(value.bytes);
+                        self.payload_offset += len;
+                        self.retirePending();
+                        if (self.payload_offset == self.record_end) {
+                            if (self.crc.final() != self.expected_crc) return self.fail(error.CorruptLsmWal);
+                            self.record_offset = self.record_end;
+                            self.stage = .proof_header;
+                        }
+                    },
+                    .rotation_probe => {
+                        const value = try self.read(self.segmentPath(self.result.current_segment), null, 1, original);
+                        if (!value.absent and value.file_size != 0) return self.fail(error.RecoveryRequired);
+                        self.retirePending();
+                        self.stage = .rotation_file;
+                    },
+                    .rotation_file => {
+                        try self.replace(self.segmentPath(self.result.current_segment), null, 0, 0, original);
+                        self.stage = .current_replace;
+                    },
+                    .current_replace => {
+                        try self.replace(self.index[0..self.lengths[0]], .current_segment, self.result.current_segment, 0, original);
+                        self.stage = .floor;
+                    },
+                    .floor => {
+                        self.result.oldest_retained_segment = @max(self.result.oldest_retained_segment, self.max_covered + 1);
+                        try self.replace(self.checkpoint[0..self.lengths[1]], .checkpoint, self.result.oldest_retained_segment, self.result.covered_through_segment, original);
+                        self.stage = .remove;
+                    },
+                    .remove => {
+                        if (self.delete_next > self.max_covered) {
+                            self.stage = .directory;
+                            continue;
+                        }
+                        if (self.pending == .none) self.pending = .{ .physical = try self.resources.?.beginDeleteFile(self.segmentPath(self.delete_next), original) };
+                        try self.waitPhysical(original);
+                        self.delete_next += 1;
+                        self.result.deletion_completions += 1;
+                    },
+                    .directory => {
+                        if (self.pending == .none) self.pending = .{ .physical = try self.resources.?.beginSyncParent(self.checkpoint[0..self.lengths[1]], original) };
+                        try self.waitPhysical(original);
+                        self.stage = .marker;
+                    },
+                    .marker => {
+                        try self.replace(self.cleanup[0..self.lengths[2]], .reclamation, self.max_covered, self.result.covered_through_segment, original);
+                        self.result.reclaimed_through_segment = self.max_covered;
+                        self.stage = .ready;
+                    },
+                }
+            }
+        }
+        pub fn publishWithAdmission(self: *Self, original: admission.Port) !Result {
+            const result = try self.waitWithAdmission(original);
+            if (self.stage == .published) return result;
+            try self.publication.?.publishWithAdmission(result, original);
+            self.releasePublication();
+            self.stage = .published;
+            return result;
+        }
+        fn fail(self: *Self, cause: anyerror) anyerror {
+            self.retirePending();
+            self.failure = cause;
+            self.stage = .failed;
+            self.releasePublication();
+            return cause;
+        }
+        fn retirePending(self: *Self) void {
+            switch (self.pending) {
+                .read => |*value| value.deinit(),
+                .physical => |*value| value.deinit(),
+                .none => {},
+            }
+            self.pending = .none;
+        }
+        fn releasePublication(self: *Self) void {
+            if (self.publication) |*publication| publication.release();
+            self.publication = null;
+        }
+        pub fn retireWithAdmission(self: *Self, original: admission.Port) !void {
+            try original.checkpoint();
+            if (self.stage != .published and self.stage != .failed) return error.ResourceBudgetExceeded;
+            if (self.resources) |*resources| {
+                try resources.retireWithAdmission(original);
+                self.resources = null;
+            }
+        }
+        /// Quiesced fallback joins accepted work before releasing authority.
+        pub fn deinit(self: *Self) void {
+            self.retirePending();
+            self.releasePublication();
+            if (self.resources) |*resources| resources.deinit();
+            self.* = undefined;
+        }
+    };
 }

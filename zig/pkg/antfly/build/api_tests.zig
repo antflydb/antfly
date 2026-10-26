@@ -238,6 +238,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-durable-checkpoint-receipt-test", "Verify durable registered metadata receipt, replacement and exact logical coverage")
         .dependOn(&durable_receipt_run.step);
 
+    const wal_retirement_tests = b.addTest(.{
+        .name = "admitted-wal-retirement-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata admitted WAL retirement"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const wal_retirement_run = b.addRunArtifact(wal_retirement_tests);
+    wal_retirement_run.addArg("--require-no-skips");
+    b.step("antfly-admitted-wal-retirement-test", "Verify admitted WAL rotation, covered deletion and retained replay/recovery authority")
+        .dependOn(&wal_retirement_run.step);
+
     const socket_child_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/socket_child_cancellation_test_root.zig"),
         .target = target,

@@ -3311,7 +3311,7 @@ const FlushPublicationFixture = struct {
     const Batch = Scope.FlushOutputs;
     const Builder = Scope.FlushBuilder.Owner;
     const Control = RegisteredOutputFixture.Control;
-    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject };
+    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject, wal_retire, wal_replay, wal_prefix, wal_cancel, wal_failure, wal_resume, wal_delete_failure, wal_floor_failure, wal_legacy_replay };
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
     const Retry = struct {
         failing: *std.testing.FailingAllocator,
@@ -3415,11 +3415,15 @@ const FlushPublicationFixture = struct {
     }
     fn run(mode: Mode, target: ?usize, oom: bool, abort_on_error: bool) !Stats {
         const a = std.testing.allocator;
-        const checkpoint_mode = switch (mode) {
-            .checkpoint, .checkpoint_abort, .checkpoint_cancel, .checkpoint_rename, .checkpoint_stale, .checkpoint_lineage, .checkpoint_install, .checkpoint_repeat, .checkpoint_install_reject => true,
+        const wal_mode = switch (mode) {
+            .wal_retire, .wal_replay, .wal_prefix, .wal_cancel, .wal_failure, .wal_resume, .wal_delete_failure, .wal_floor_failure, .wal_legacy_replay => true,
             else => false,
         };
-        const install_checkpoint = mode == .checkpoint_install or mode == .checkpoint_repeat or mode == .checkpoint_install_reject;
+        const checkpoint_mode = switch (mode) {
+            .checkpoint, .checkpoint_abort, .checkpoint_cancel, .checkpoint_rename, .checkpoint_stale, .checkpoint_lineage, .checkpoint_install, .checkpoint_repeat, .checkpoint_install_reject, .wal_retire, .wal_replay, .wal_prefix, .wal_cancel, .wal_failure, .wal_resume, .wal_delete_failure, .wal_floor_failure, .wal_legacy_replay => true,
+            else => false,
+        };
+        const install_checkpoint = mode == .checkpoint_install or mode == .checkpoint_repeat or mode == .checkpoint_install_reject or wal_mode;
         var expected_logical: u64 = 17;
         const late = mode == .ledger or mode == .ledger_mixed or mode == .manifest or checkpoint_mode;
         var failing = std.testing.FailingAllocator.init(a, .{});
@@ -3586,7 +3590,7 @@ const FlushPublicationFixture = struct {
                 const lineage = lsm.repository.ManifestJournal.CheckpointFence.capture(&backend);
                 start = failing.alloc_index;
                 control.calls = 0;
-                control.target = if (oom) null else target;
+                control.target = if (oom or wal_mode) null else target;
                 control.live = true;
                 if (oom) failing.fail_index = start + target.?;
                 {
@@ -3645,10 +3649,10 @@ const FlushPublicationFixture = struct {
                     retry.call(Scope.RegisteredCheckpoint.permitDescriptorWithAdmission, .{ owners.checkpoint.?, &backend, owners.frame.?, original }) catch |cause| break :work cause;
                 }
                 try std.testing.expect(backend.manifest_recovery_required and backend.manifest_journal.sequence == null);
-                if (install_checkpoint) {
+                if (install_checkpoint and !wal_mode) {
                     backend.unpublished_wal_logical_bytes += 5;
                     expected_logical = 22;
-                } else {
+                } else if (wal_mode) {} else {
                     owners.frame.?.requestRetirement();
                     owners.frame = null;
                 }
@@ -3697,9 +3701,9 @@ const FlushPublicationFixture = struct {
                     defer backend.mu.unlock();
                     retry.call(lsm.Backend.installRegisteredCheckpointWithAdmission, .{ &backend, owners.checkpoint.?, owners.frame.?, original }) catch |cause| break :work cause;
                     owners.frame = null;
-                    expected_logical = 5;
+                    expected_logical = if (wal_mode) 0 else 5;
                     try std.testing.expect(!backend.manifest_recovery_required and !backend.manifest_dirty and !backend.obsolete_manifest_dirty);
-                    try std.testing.expectEqual(@as(u64, 5), backend.unpublished_wal_logical_bytes);
+                    try std.testing.expectEqual(expected_logical, backend.unpublished_wal_logical_bytes);
                     try std.testing.expectEqual(@as(u64, 600), backend.manifest_journal.descriptor.?.checkpoint);
                     try std.testing.expectError(error.ExecutionWaitUnsupported, backend.persistManifestLocked());
                 }
@@ -3762,6 +3766,153 @@ const FlushPublicationFixture = struct {
                     for (0..512) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
                     try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
                 }
+                if (wal_mode) {
+                    const wal = local.storage_lsm_backend_wal;
+                    var state: state_mod.State = .{};
+                    defer state.deinit(a);
+                    const large = try a.alloc(u8, 40 * 1024);
+                    defer a.free(large);
+                    @memset(large, 'x');
+                    try state.upsert(a, .{}, "a", large, false);
+                    _ = try wal.appendStateWithOptionsResult(native.storage(), a, root, &state, true, .{ .segment_bytes = 1 });
+                    state.deinit(a);
+                    state = .{};
+                    try state.upsert(a, .{}, "b", "two", false);
+                    _ = try wal.appendStateWithOptionsResult(native.storage(), a, root, &state, true, .{ .segment_bytes = 1 });
+                    state.deinit(a);
+                    state = .{};
+                    try state.upsert(a, .{}, "a", "one", false);
+                    _ = try wal.appendStateWithOptionsResult(native.storage(), a, root, &state, true, .{ .segment_bytes = 1 });
+                    if (mode == .wal_replay or mode == .wal_legacy_replay) _ = try wal.appendReplay(native.storage(), a, root, 1, "retained-replay", true, .{});
+                    if (mode == .wal_legacy_replay) {
+                        const dedicated = try std.fmt.allocPrint(a, "{s}/wal/replay/00000000000000000001.log", .{root});
+                        defer a.free(dedicated);
+                        const raw = try native.storage().readFileAlloc(a, dedicated, 4096);
+                        defer a.free(raw);
+                        const primary = try std.fmt.allocPrint(a, "{s}/wal/00000000000000000001.log", .{root});
+                        defer a.free(primary);
+                        try native.storage().appendFileAbsolute(a, primary, raw, true);
+                        const marker = try std.fmt.allocPrint(a, "{s}/wal/replay-main.segments", .{root});
+                        defer a.free(marker);
+                        try native.storage().deleteFileAbsolute(marker);
+                    }
+                    backend.options.wal_enabled = true;
+                    try std.testing.expectError(error.ExecutionWaitUnsupported, backend.checkpointWalAfterDurableBoundary());
+                    backend.options.native_storage_pool = &pool;
+                    try backend.acquireRootLockState(false);
+                    try backend.acquireRootWriterLock();
+                    try backend.prepareWalOperationLockFile();
+                    if (mode == .wal_prefix) {
+                        try backend.mutable.upsert(owned, .{}, "a", "one", false);
+                        backend.mutable_wal_range = .{ .first = 3, .last = 3 };
+                    }
+                    var preparation: lsm.Backend.QuiescedDurabilityPreparation = .{};
+                    defer preparation.deinit();
+                    control.calls = 0;
+                    control.target = target;
+                    control.live = true;
+                    var credit = retry.call(ResourceManager.reserveWithoutReclaimWithAdmission, .{ &resources.resource_manager, .lsm_table_builder_working_set, try lsm.Backend.QuiescedWalRetirement.memoryBound(native.storage()), original }) catch |cause| break :work cause;
+                    defer {
+                        preparation.deinit();
+                        credit.release();
+                    }
+                    var operation = (retry.call(lsm.Backend.tryBeginQuiescedWalRetirementWithAdmission, .{ &backend, &preparation, original }) catch |cause| break :work cause) orelse return error.TestUnexpectedResult;
+                    var operation_live = true;
+                    defer if (operation_live) operation.deinit();
+                    if (mode == .wal_cancel or mode == .wal_resume) {
+                        control.live = false;
+                        const Stop = struct {
+                            operation: *lsm.Backend.QuiescedWalRetirement,
+                            fn check(raw: *anyopaque) !void {
+                                const stop: *@This() = @ptrCast(@alignCast(raw));
+                                if (std.mem.eql(u8, @tagName(stop.operation.stage), "remove")) return error.Canceled;
+                            }
+                        };
+                        var stop: Stop = .{ .operation = &operation };
+                        var rejected = payload;
+                        rejected.ptr = &stop;
+                        rejected.vtable = &.{ .checkpoint = Stop.check, .check_lifetime = Stop.check, .deadline_ns = Control.deadline };
+                        try std.testing.expectError(error.Canceled, operation.publishWithAdmission(.init(&rejected)));
+                        try std.testing.expect(backend.manifest_recovery_required);
+                    } else if (mode == .wal_floor_failure) {
+                        control.live = false;
+                        const AtFloor = struct {
+                            operation: *lsm.Backend.QuiescedWalRetirement,
+                            fn check(raw: *anyopaque) !void {
+                                const fault: *@This() = @ptrCast(@alignCast(raw));
+                                if (std.mem.eql(u8, @tagName(fault.operation.stage), "floor")) io_mod.NativeSyncTestControl.control_failure_after_rename.store(true, .release);
+                            }
+                        };
+                        var fault: AtFloor = .{ .operation = &operation };
+                        var failing_scope = payload;
+                        failing_scope.ptr = &fault;
+                        failing_scope.vtable = &.{ .checkpoint = AtFloor.check, .check_lifetime = AtFloor.check, .deadline_ns = Control.deadline };
+                        defer io_mod.NativeSyncTestControl.control_failure_after_rename.store(false, .release);
+                        try std.testing.expectError(error.InputOutput, operation.publishWithAdmission(.init(&failing_scope)));
+                        try std.testing.expect(backend.manifest_recovery_required);
+                    } else if (mode == .wal_delete_failure) {
+                        control.live = false;
+                        io_mod.NativeSyncTestControl.delete_failure.store(true, .release);
+                        defer io_mod.NativeSyncTestControl.delete_failure.store(false, .release);
+                        try std.testing.expectError(error.InputOutput, operation.publishWithAdmission(original));
+                        try std.testing.expect(backend.manifest_recovery_required);
+                    } else if (mode == .wal_legacy_replay) {
+                        control.live = false;
+                        try std.testing.expectError(error.ExecutionWaitUnsupported, operation.publishWithAdmission(original));
+                        try std.testing.expect(!backend.manifest_recovery_required);
+                    } else if (mode == .wal_failure) {
+                        control.live = false;
+                        io_mod.NativeSyncTestControl.control_failure_after_rename.store(true, .release);
+                        defer io_mod.NativeSyncTestControl.control_failure_after_rename.store(false, .release);
+                        try std.testing.expectError(error.InputOutput, operation.publishWithAdmission(original));
+                        try std.testing.expect(backend.manifest_recovery_required);
+                    } else {
+                        const retired = retry.call(lsm.Backend.QuiescedWalRetirement.publishWithAdmission, .{ &operation, original }) catch |cause| break :work cause;
+                        try std.testing.expectEqual(@as(u64, if (mode == .wal_prefix) 2 else 3), retired.reclaimed_through_segment);
+                        try std.testing.expect(!backend.manifest_recovery_required);
+                    }
+                    control.live = false;
+                    if (mode == .wal_resume or mode == .wal_delete_failure) {
+                        // The cancelled/failed operation is joined first. New
+                        // cleanup admission resumes only its captured WAL debt.
+                        operation.deinit();
+                        operation_live = false;
+                        try std.testing.expect(backend.wal_retirement_recovery != null);
+                        var resumed = (try backend.tryBeginQuiescedWalRetirementWithAdmission(&preparation, original)).?;
+                        defer resumed.deinit();
+                        const result = try resumed.publishWithAdmission(original);
+                        try resumed.retireWithAdmission(original);
+                        try std.testing.expectEqual(@as(u64, 3), result.reclaimed_through_segment);
+                        try std.testing.expect(!backend.manifest_recovery_required and backend.wal_retirement_recovery == null);
+                    }
+                    // Retirement of the grant is separately admitted. It never
+                    // repeats a completed deletion or changes replay authority.
+                    if (operation_live and mode != .wal_cancel) try operation.retireWithAdmission(original);
+                    const retained = try wal.snapshotRetention(native.storage(), a, root);
+                    try std.testing.expectEqual(@as(u64, if (mode == .wal_prefix or mode == .wal_failure or mode == .wal_legacy_replay) 3 else 4), retained.current_segment);
+                    try std.testing.expectEqual(@as(u64, if (mode == .wal_failure or mode == .wal_legacy_replay) 1 else if (mode == .wal_prefix) 3 else 4), retained.oldest_retained_segment);
+                    var replayed: state_mod.State = .{};
+                    defer replayed.deinit(a);
+                    _ = try wal.replayIntoMutable(native.storage(), a, root, &replayed);
+                    if (mode == .wal_prefix or mode == .wal_failure or mode == .wal_legacy_replay) try std.testing.expectEqualStrings("one", try replayed.get(.{}, "a")) else try std.testing.expectEqual(@as(usize, 0), replayed.entryCount());
+                    if (mode == .wal_replay) {
+                        const entries = try wal.iterateReplayFrom(native.storage(), a, root, 0);
+                        defer a.free(entries);
+                        defer for (entries) |*entry| entry.deinit(a);
+                        try std.testing.expectEqual(@as(usize, 1), entries.len);
+                        try std.testing.expectEqualStrings("retained-replay", entries[0].payload);
+                        try std.testing.expectEqual(@as(u64, 2), wal.nextReplaySequence(native.storage(), a, root, 0));
+                    }
+                    if (mode == .wal_retire or mode == .wal_replay) {
+                        const writes = io_mod.NativeSyncTestControl.metadata.load(.acquire);
+                        var again = (try backend.tryBeginQuiescedWalRetirementWithAdmission(&preparation, original)).?;
+                        defer again.deinit();
+                        const unchanged = try again.publishWithAdmission(original);
+                        try again.retireWithAdmission(original);
+                        try std.testing.expectEqual(@as(u64, 0), unchanged.deletion_completions);
+                        try std.testing.expectEqual(writes, io_mod.NativeSyncTestControl.metadata.load(.acquire));
+                    }
+                }
                 // Reopen the actual native checkpoint/journal/descriptor set,
                 // then read both SST values after its completion owner exits.
                 var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .wal_enabled = false, .backend = .{ .read_only = true } });
@@ -3771,7 +3922,7 @@ const FlushPublicationFixture = struct {
                 try std.testing.expectEqualStrings("one", try recovered.get(.{ .name = null }, "a"));
                 try std.testing.expectEqualStrings("two", try recovered.get(.{ .name = null }, "b"));
                 try std.testing.expectEqual(expected_logical, backend.unpublished_wal_logical_bytes);
-                try std.testing.expectEqual(!install_checkpoint or mode == .checkpoint_install_reject, backend.manifest_recovery_required);
+                try std.testing.expectEqual(!install_checkpoint or mode == .checkpoint_install_reject or mode == .wal_cancel or mode == .wal_failure or mode == .wal_floor_failure, backend.manifest_recovery_required);
             }
             if (mode == .manifest) {
                 // Seed metadata lineage for retirement-name preparation. This
@@ -4054,4 +4205,23 @@ test "physical cache metadata durable checkpoint receipt retires every exhausted
 
 test "physical cache metadata durable checkpoint receipt rejects changed metadata after descriptor durability" {
     _ = try FlushPublicationFixture.run(.checkpoint_install_reject, null, false, false);
+}
+
+test "physical cache metadata admitted WAL retirement rotates canonical state and preserves dedicated replay" {
+    _ = try FlushPublicationFixture.run(.wal_retire, null, false, false);
+    _ = try FlushPublicationFixture.run(.wal_replay, null, false, false);
+}
+
+test "physical cache metadata admitted WAL retirement preserves active current and cancelled physical debt" {
+    for ([_]FlushPublicationFixture.Mode{ .wal_prefix, .wal_cancel, .wal_failure }) |mode| _ = try FlushPublicationFixture.run(mode, null, false, false);
+}
+
+test "physical cache metadata admitted WAL retirement retains original refusal and abort authority" {
+    for ([_]bool{ false, true }) |abort_on_error| {
+        for ([_]usize{ 0, 1, 2, 3, 8, 32, 128, 512 }) |at| _ = try FlushPublicationFixture.run(.wal_retire, at, false, abort_on_error);
+    }
+}
+
+test "physical cache metadata admitted WAL retirement resumes cleanup debt and refuses embedded replay" {
+    for ([_]FlushPublicationFixture.Mode{ .wal_resume, .wal_delete_failure, .wal_floor_failure, .wal_legacy_replay }) |mode| _ = try FlushPublicationFixture.run(mode, null, false, false);
 }
