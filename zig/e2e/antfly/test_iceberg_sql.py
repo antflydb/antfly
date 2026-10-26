@@ -1640,9 +1640,12 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 ordered = call("POST", "/tables/wal_windows/query", sorted_request)
                 expected = (
                     [1000, *range(row_count - 1, row_count - 10, -1)]
-                    if descending else [0, *range(2, 11)]
+                    if descending
+                    else [0, *range(2, 11)]
                 )
-                assert [hit["_source"]["id"] for hit in ordered["hits"]["hits"]] == expected, ordered
+                assert [
+                    hit["_source"]["id"] for hit in ordered["hits"]["hits"]
+                ] == expected, ordered
         failed = False
     finally:
         if failed:
