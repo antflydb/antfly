@@ -21,6 +21,48 @@ const builtin = @import("builtin");
 const resolver = @import("antfly_resolver");
 const A = std.mem.Allocator;
 const heap = if (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64) std.heap.wasm_allocator else if (builtin.single_threaded) std.heap.page_allocator else std.heap.smp_allocator;
+pub const QueryNode = struct { key: []const u8, canonical: []const u8, digest: [64]u8 = @splat(0) };
+pub const NodeIndex = struct {
+    nodes: []const QueryNode,
+    by_key: std.StringHashMapUnmanaged(QueryNode),
+    by_root: std.StringHashMapUnmanaged(std.ArrayList(QueryNode)),
+    pub fn init(a: A, aliases: []const resolver.KeyAlias) !NodeIndex {
+        const redirects = try resolver.curation.RedirectIndex.init(a, aliases);
+        var keys: std.StringHashMapUnmanaged(QueryNode) = .empty;
+        for (aliases) |alias| for ([_][]const u8{ alias.key, alias.target }) |id| {
+            const entry = try keys.getOrPut(a, id);
+            if (entry.found_existing) continue;
+            var digest: [32]u8 = undefined;
+            @import("antfly_hash").Sha256.hash(id, &digest, .{});
+            entry.value_ptr.* = .{ .key = id, .canonical = redirects.canonical(id), .digest = std.fmt.bytesToHex(digest, .lower) };
+        };
+        const nodes = try a.alloc(QueryNode, keys.count());
+        var iterator = keys.valueIterator();
+        for (nodes) |*node| node.* = iterator.next().?.*;
+        std.mem.sort(QueryNode, nodes, {}, struct {
+            fn less(_: void, left: QueryNode, right: QueryNode) bool {
+                return std.mem.lessThan(u8, &left.digest, &right.digest);
+            }
+        }.less);
+        var roots: std.StringHashMapUnmanaged(std.ArrayList(QueryNode)) = .empty;
+        for (nodes) |node| {
+            const entry = try roots.getOrPut(a, node.canonical);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(a, node);
+        }
+        return .{ .nodes = nodes, .by_key = keys, .by_root = roots };
+    }
+    pub fn seek(self: NodeIndex, digest: []const u8, canonical: ?[]const u8) ?QueryNode {
+        const nodes = if (canonical) |root| if (self.by_root.get(root)) |list| list.items else return null else self.nodes;
+        var lo: usize = 0;
+        var hi = nodes.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.lessThan(u8, &nodes[mid].digest, digest)) lo = mid + 1 else hi = mid;
+        }
+        return if (lo == nodes.len) null else nodes[lo];
+    }
+};
 pub const Graph = struct {
     aliases: []const resolver.KeyAlias,
     native_aliases: []const resolver.KeyAlias = &.{},
@@ -29,15 +71,26 @@ pub const Graph = struct {
     composed: bool = false,
 };
 pub const Loader = struct { ptr: *anyopaque, load: *const fn (*anyopaque, A) anyerror!Graph, estimated_bytes: ?usize = null };
+const Budget = struct {
+    allocator: A,
+    references: std.atomic.Value(usize) = .init(1),
+    live: std.atomic.Value(usize) = .init(0),
+    fn release(self: *Budget) void {
+        if (self.references.fetchSub(1, .acq_rel) == 1) self.allocator.destroy(self);
+    }
+};
 pub const Context = struct {
     references: std.atomic.Value(usize) = .init(1),
     arena: std.heap.ArenaAllocator,
     key: [32]u8,
+    accounting: ?*Budget = null,
+    charged: usize = 0,
     composed: bool,
     previous: ?*Context = null,
     next: ?*Context = null,
     static_reverse: std.StringHashMapUnmanaged(std.ArrayList(resolver.KeyAlias)) = .empty,
     static_targets: std.StringHashMapUnmanaged([]const u8) = .empty,
+    nodes: NodeIndex,
     native_targets: std.StringHashMapUnmanaged([]const u8) = .empty,
     removed: std.StringHashMapUnmanaged(void) = .empty,
     redirects: resolver.curation.RedirectIndex,
@@ -45,8 +98,14 @@ pub const Context = struct {
     fn release(self: *Context) void {
         if (self.references.fetchSub(1, .acq_rel) == 1) {
             const owner = self.arena.child_allocator;
+            const budget = self.accounting;
+            const charged = self.charged;
             self.arena.deinit();
             owner.destroy(self);
+            if (budget) |accounting| {
+                _ = accounting.live.fetchSub(charged, .acq_rel);
+                accounting.release();
+            }
         }
     }
     fn build(owner: A, key: [32]u8, loader: Loader) !*Context {
@@ -54,6 +113,7 @@ pub const Context = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         const graph = try loader.load(loader.ptr, a);
+        const nodes = try NodeIndex.init(a, graph.aliases);
         var statics: std.StringHashMapUnmanaged([]const u8) = .empty;
         var natives: std.StringHashMapUnmanaged([]const u8) = .empty;
         var removed: std.StringHashMapUnmanaged(void) = .empty;
@@ -82,7 +142,7 @@ pub const Context = struct {
             }
         }
         const result = try owner.create(Context);
-        result.* = .{ .arena = arena, .key = key, .composed = graph.composed, .static_reverse = reverse, .static_targets = statics, .native_targets = natives, .removed = removed, .redirects = redirects, .pins = pins };
+        result.* = .{ .arena = arena, .key = key, .composed = graph.composed, .static_reverse = reverse, .static_targets = statics, .nodes = nodes, .native_targets = natives, .removed = removed, .redirects = redirects, .pins = pins };
         return result;
     }
 };
@@ -103,6 +163,7 @@ pub const Cache = struct {
     preparing: [64]std.atomic.Mutex = @splat(.unlocked),
     bytes: usize = 0,
     reserved: usize = 0,
+    accounting: ?*Budget = null,
     builds: std.atomic.Value(usize) = .init(0),
     budget_bytes: usize = max_bytes,
     pub const max_bytes = 64 * 1024 * 1024;
@@ -130,6 +191,7 @@ pub const Cache = struct {
         _ = context.references.fetchAdd(1, .monotonic);
         return .{ .context = context };
     }
+    /// Stop builders before teardown; outstanding read leases may finish later.
     pub fn deinit(self: *Cache) void {
         self.lock();
         const first = self.oldest;
@@ -138,7 +200,10 @@ pub const Cache = struct {
         self.bytes = 0;
         self.entries.deinit(self.allocator);
         self.entries = .empty;
+        const budget = self.accounting;
+        self.accounting = null;
         self.mutex.unlock();
+        defer if (budget) |accounting| accounting.release();
         var current = first;
         while (current) |context| {
             current = context.next;
@@ -166,16 +231,41 @@ pub const Cache = struct {
             self.mutex.unlock();
             if (hit) |lease| return lease;
         }
-        const reservation = if (cacheable) loader.estimated_bytes orelse 0 else 0;
-        if (reservation != 0) {
+        self.lock();
+        if (self.accounting == null) {
+            const accounting = self.allocator.create(Budget) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            accounting.* = .{ .allocator = self.allocator };
+            self.accounting = accounting;
+        }
+        const accounting = self.accounting.?;
+        self.mutex.unlock();
+        var reservation = if (cacheable) loader.estimated_bytes orelse 0 else 0;
+        if (reservation > self.budget_bytes) return null;
+        if (reservation != 0) while (true) {
             self.lock();
-            if (reservation > self.budget_bytes -| self.bytes -| self.reserved) {
+            if (reservation <= self.budget_bytes -| accounting.live.load(.acquire) -| self.reserved) {
+                self.reserved += reservation;
+                self.mutex.unlock();
+                break;
+            }
+            // A cache reference is the only reference on an idle context.
+            // Active leases remain charged even after retention eviction.
+            var candidate = self.oldest;
+            const victim = while (candidate) |context| : (candidate = context.next) {
+                if (context.references.load(.acquire) == 1) break context;
+            } else {
                 self.mutex.unlock();
                 return null;
-            }
-            self.reserved += reservation;
+            };
+            self.unlink(victim);
+            _ = self.entries.remove(victim.key);
+            self.bytes -= weight(victim);
             self.mutex.unlock();
-        }
+            victim.release();
+        };
         defer if (reservation != 0) {
             self.lock();
             self.reserved -= reservation;
@@ -185,6 +275,14 @@ pub const Cache = struct {
         errdefer context.release();
         _ = self.builds.fetchAdd(1, .monotonic);
         const bytes = weight(context);
+        self.lock();
+        if (reservation != 0) self.reserved -= reservation;
+        reservation = 0;
+        context.accounting = accounting;
+        context.charged = bytes;
+        _ = accounting.references.fetchAdd(1, .monotonic);
+        _ = accounting.live.fetchAdd(bytes, .release);
+        self.mutex.unlock();
         if (!cacheable or bytes > self.budget_bytes) return .{ .context = context };
         self.lock();
         self.entries.ensureUnusedCapacity(self.allocator, 1) catch |err| {
@@ -344,4 +442,50 @@ test "native resolver authority prepared cache coalesces concurrent misses" {
     started = 0;
     try std.testing.expect(!fixture.failed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), fixture.cache.builds.load(.monotonic));
+}
+
+test "native resolver authority estimated admission reclaims idle contexts and accounts for evicted leases" {
+    const Empty = struct {
+        fn load(_: *anyopaque, _: A) !Graph {
+            return .{ .aliases = &.{} };
+        }
+    };
+    var unused: u8 = 0;
+    const loader: Loader = .{ .ptr = &unused, .load = Empty.load };
+    var cache: Cache = .{ .allocator = std.testing.allocator };
+    defer cache.deinit();
+    const seed = try cache.acquire(@splat(1), true, loader);
+    const charge = Cache.weight(seed.context);
+    seed.release();
+    cache.budget_bytes = charge * 4;
+    for (2..5) |i| {
+        const lease = try cache.acquire(@splat(@intCast(i)), true, loader);
+        lease.release();
+    }
+    const admitted = (try cache.tryAcquire(@splat(5), true, .{ .ptr = &unused, .load = Empty.load, .estimated_bytes = charge * 2 })).?;
+    admitted.release();
+    try std.testing.expectEqual(@as(usize, 5), cache.builds.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 3), cache.entries.count());
+    try std.testing.expect(cache.accounting.?.live.load(.acquire) <= cache.budget_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.reserved);
+    std.debug.print("ESTIMATED ADMISSION old_entries=4 new_builds=1 retained=3 denied=0\n", .{});
+    cache.deinit();
+    cache.budget_bytes = charge * 2;
+    var first: ?Lease = try cache.acquire(@splat(1), true, loader);
+    defer if (first) |lease| lease.release();
+    var second: ?Lease = try cache.acquire(@splat(2), true, loader);
+    defer if (second) |lease| lease.release();
+    const third = try cache.acquire(@splat(3), true, loader);
+    defer third.release();
+    // Retention evicts first, but the active lease still owns its memory.
+    try std.testing.expectEqual(charge * 2, cache.bytes);
+    try std.testing.expectEqual(charge * 3, cache.accounting.?.live.load(.acquire));
+    try std.testing.expect(try cache.tryAcquire(@splat(4), true, .{ .ptr = &unused, .load = Empty.load, .estimated_bytes = charge }) == null);
+    first.?.release();
+    first = null;
+    second.?.release();
+    second = null;
+    const fourth = (try cache.tryAcquire(@splat(4), true, .{ .ptr = &unused, .load = Empty.load, .estimated_bytes = charge })).?;
+    defer fourth.release();
+    try std.testing.expectEqual(charge * 2, cache.accounting.?.live.load(.acquire));
 }

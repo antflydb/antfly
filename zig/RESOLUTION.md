@@ -2363,14 +2363,25 @@ trigger forward qualification. A cold context reads the graph once in bounded
 sequential pages outside writer ownership. The shared cache is limited to 64 MiB
 with access-based byte-budgeted eviction and reference-counted leases across
 pages. Identical concurrent misses share a build; conservative build reservations
-prevent graph compilation under cache pressure. A separate derived graph stamp
+prevent graph compilation under cache pressure. Idle LRU entries are reclaimed
+before denying admission; active payloads remain charged through their last
+lease even after retention eviction. A separate derived graph stamp
 preserves reuse through text/provenance edits while the complete namespace head
 still fences publication. Legacy or mismatched stamps use full lineage.
 
-Oversized or unadmitted graphs use component-indexed queries. Routed queries
-seek a single profile's adjacency and do not load its full declaration; embedded
-queries reuse static forward/reverse maps. Native precedence, incident pin paths,
-forward-only rendering and traversal limits are shared across adapters.
+Oversized or unadmitted graphs use pin-directed queries over immutable profile
+node/component postings and sparse native pin counts. Native edit intersections
+identify components redirected into the requested roots. Only matched pin-bearing
+nodes need effective forward qualification and native pin-child traversal;
+unpinned reverse alias branches are never visited. Returned facts and forward
+path limits match the compiled query path. Embedded and routed adapters share
+this join, preserving native precedence and forward-only rendering.
+
+New enrollments publish node postings and readiness atomically. Older profiles
+use an immutable in-memory node index until enrollment supplies the optional
+projection. Legacy namespaces without propagated pin counts stream distinct
+records until an authorized writer adopts the index. Reads do not bootstrap or
+mutate these projections.
 
 Routed pages reference the enrolled immutable profile instead of retransmitting
 its alias universe. Each page revalidates enrollment, logical target and native

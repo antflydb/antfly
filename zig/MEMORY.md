@@ -2448,7 +2448,11 @@ The shared cache retains at most 64 MiB including charged entry overhead, with
 byte-budgeted access-based eviction rather than a fixed entry count. Sixty-four
 yielding build-lock stripes coalesce identical cold misses; directory locks cover
 only lookup/publication and eviction reclamation runs outside them. Conservative
-compilation reservations account for concurrent builds before graph I/O.
+compilation reservations account for concurrent builds before graph I/O. Admission
+reclaims idle LRU entries before denying a reservation. Retention and live payload
+charges are separate: evicted contexts remain charged until their final lease
+releases them, and their accounting object survives cache teardown. Payload
+reclamation remains outside the directory lock.
 Preparation reads only redirect, removed-alias and distinct records in bounded sequential pages,
 inside a read snapshot and outside writer leases. This cold compilation costs
 O(static aliases + native graph + pins) once per retained profile/graph; warm
@@ -2465,13 +2469,25 @@ lineage. No primary record/reader format changes are needed for these optional
 derived rows; portable backups validate their typed envelope.
 
 Oversized declarations, uncertain legacy admission hints and unavailable build
-budget select component-indexed reads before native graph compilation. Routed
-reads seek only the requested profile's immutable adjacency, without decoding
-the full declaration or mixing another source's aliases. Embedded queries reuse
-static forward/reverse maps through the phase lease. Native overrides and removal
-tombstones still mask static edges; incident distinct endpoints add only forward
-paths. Rendering uses forward-only reads. Work is bounded by the requested
-components and existing traversal limits, rather than unrelated namespace rows.
+budget select pin-directed indexed reads before native graph compilation. Source
+enrollment atomically publishes immutable profile-node postings both by node hash
+and by static canonical component, with an explicit readiness marker. Native
+redirect/removal postings identify which static components can feed a requested
+root. Ordered seeks intersect only those component nodes with propagated native
+pin counts; native pin-child postings then discover incident distinct pairs.
+Unpinned reverse alias branches never become query seeds. Effective forward
+qualification preserves native override/removal precedence and handles edges
+crossing static components. Only requested and incident forward paths consume the
+same traversal allowance as the compiled path, independent of cache state.
+
+Both adapters share this operation. Routed queries use persistent profile-node
+postings; embedded phases use their immutable in-memory node index. Older
+profiles without the new optional projection use the same in-memory index until
+enrollment publishes it. Alias loading verifies the canonical stored definition
+hash while skipping unrelated policy fields. A released namespace without a
+propagated pin directory streams distinct records and qualifies endpoints until
+an authorized writer adopts that directory; it never expands reverse aliases.
+Rendering and namespaces without pins retain forward-only reads.
 
 Routed policy pages carry an immutable profile reference when the existing v10
 directory is ready. Every page checks the active profile and live logical target;
@@ -2488,8 +2504,13 @@ pages. One hundred prepared negative queries then use 400 point reads and no sca
 unrelated rows. A text-only query uses two reads and no scans. Ten unrelated
 text edits then require zero graph rows/scans while old complete heads still
 fail validation. Thirty-three tiny profiles across 66 round-robin requests build
-33 contexts, rather than 66. The oversized native graph regression keeps 4,000
-unrelated pin pairs out of the indexed query's read set.
+33 contexts, rather than 66. The oversized native graph regression performs no primary distinct-record scans
+among 4,000 unrelated pairs. The high-degree fixture has 17,000 unpinned aliases
+and an unrelated distinct pair: fallback discovery succeeds with ten point reads
+and five seeks, instead of failing after 115,922 reads and 32,768 seeks. Embedded
+and persistent-node adapters return equal facts through redirects and removals.
+Estimated admission reclaims idle entries under a full budget and still denies
+builds whose room is occupied by active leases.
 
 Metadata maintains query fingerprints for ordinary destination tables together
 with DDL, before native curation is adopted. Their proof explicitly carries

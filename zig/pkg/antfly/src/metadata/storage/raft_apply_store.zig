@@ -23178,7 +23178,7 @@ pub const RaftApplyStore = struct {
                         }
                     };
                     var loader: Loader = .{ .txn = txn, .root = profile_root, .id = reference.id, .template = read.key_template };
-                    var indexed_profile: StaticProfiles.QueryReader = .{ .backend = store.backend, .root = profile_root, .profile = reference.id };
+                    var indexed_profile: StaticProfiles.QueryReader = .{ .backend = store.backend, .root = profile_root, .profile = reference.id, .indexed = try StaticProfiles.queryNodesReady(a, txn, profile_root, reference.id) };
                     const prepared = (try store.prepareQuery(read.key_template, .{ .id = reference.id, .ptr = &loader, .load = Loader.load, .estimated_bytes = try StaticProfiles.queryEstimatedBytes(a, txn, profile_root, reference.id), .lookup = indexed_profile.lookup() }, read.distinct)) orelse return error.CatalogGenerationChanged;
                     defer prepared.release();
                     const snapshot = try store.queryPrepared(prepared, read.seeds, read.texts, read.distinct);

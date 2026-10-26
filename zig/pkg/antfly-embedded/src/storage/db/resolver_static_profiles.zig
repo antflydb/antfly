@@ -72,6 +72,7 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
             const estimate = (records.Store.InlineQueryProfile{ .aliases = definition.aliases }).estimate();
             try txn.put(size_key, try std.json.Stringify.valueAlloc(a, estimate, .{}));
         }
+        try synchronizeQueryNodes(a, txn, root, id, definition, head.refs != 0);
         if ((prior == 0) == (head.refs == 0)) continue;
         const summary_key = try std.mem.concat(a, u8, &.{ root, "summary" });
         const summary_raw = txn.get(summary_key) catch |err| if (err == error.NotFound) null else return err;
@@ -99,6 +100,30 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
         }
     }
 }
+fn synchronizeQueryNodes(a: A, txn: anytype, root: []const u8, id: []const u8, definition: Definition, active: bool) !void {
+    const marker = try std.fmt.allocPrint(a, "{s}query-nodes-ready/{s}", .{ root, id });
+    const ready = (txn.get(marker) catch |err| if (err == error.NotFound) null else return err) != null;
+    if (ready == active) return;
+    const index = try records.query_context.NodeIndex.init(a, definition.aliases);
+    for (index.nodes) |node| {
+        const direct = try std.fmt.allocPrint(a, "{s}query-node/{s}/{s}", .{ root, id, node.digest });
+        const component = try std.fmt.allocPrint(a, "{s}query-component/{s}/{s}/{s}", .{ root, id, try routes.digest(a, node.canonical), node.digest });
+        if (active) {
+            const value = try std.json.Stringify.valueAlloc(a, .{ .key = node.key, .canonical = node.canonical }, .{});
+            try txn.put(direct, value);
+            try txn.put(component, value);
+        } else {
+            try txn.delete(direct);
+            try txn.delete(component);
+        }
+    }
+    if (active) try txn.put(marker, "1") else try txn.delete(marker);
+}
+pub fn queryNodesReady(a: A, txn: anytype, root: []const u8, id: []const u8) !bool {
+    const raw = txn.get(try std.fmt.allocPrint(a, "{s}query-nodes-ready/{s}", .{ root, id })) catch |err| return if (err == error.NotFound) false else err;
+    // Optional projection versions never change the primary alias semantics.
+    return std.mem.eql(u8, raw, "1");
+}
 /// Only cold namespace adoption needs complete declarations. Warm reads use
 /// adjacency and never decode this separately stored immutable definition.
 pub fn readDefinition(a: A, txn: anytype, root: []const u8, id: []const u8) !Definition {
@@ -118,8 +143,14 @@ pub fn queryReferenceActive(a: A, txn: anytype, root: []const u8, id: []const u8
     return head.refs != 0 and std.mem.eql(u8, head.key_template, template);
 }
 pub fn queryAliases(a: A, txn: anytype, root: []const u8, id: []const u8, template: []const u8) ![]const resolver.KeyAlias {
-    const definition = try readDefinition(a, txn, root, id);
-    if (!std.mem.eql(u8, definition.key_template, template) or !std.mem.eql(u8, id, try definition.identity(a))) return error.InvalidCatalogRecord;
+    // Definitions are published in the same canonical encoding used for
+    // identity. Hash the stored bytes without retaining unrelated policy text.
+    const raw = try txn.get(try std.fmt.allocPrint(a, "{s}definition/{s}", .{ root, id }));
+    var digest: [32]u8 = undefined;
+    @import("antfly_hash").Sha256.hash(raw, &digest, .{});
+    if (!std.mem.eql(u8, id, &std.fmt.bytesToHex(digest, .lower))) return error.InvalidCatalogRecord;
+    const definition = try std.json.parseFromSliceLeaky(struct { key_template: []const u8, aliases: []const resolver.KeyAlias = &.{} }, a, raw, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, definition.key_template, template)) return error.InvalidCatalogRecord;
     return definition.aliases;
 }
 
@@ -135,8 +166,35 @@ pub const QueryReader = struct {
     backend: records.Backend,
     root: []const u8,
     profile: []const u8,
+    indexed: bool = false,
     pub fn lookup(self: *QueryReader) records.AliasLookup {
-        return .{ .ptr = self, .expand = expand };
+        return .{ .ptr = self, .expand = expand, .node = if (self.indexed) node else null, .seek_node = if (self.indexed) seekNode else null };
+    }
+    fn node(ptr: *anyopaque, a: A, id: []const u8) !?records.query_context.QueryNode {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const raw = (try self.backend.get(self.backend.ptr, a, try std.fmt.allocPrint(a, "{s}query-node/{s}/{s}", .{ self.root, self.profile, try routes.digest(a, id) }))) orelse return null;
+        var value = try std.json.parseFromSliceLeaky(records.query_context.QueryNode, a, raw, .{ .allocate = .alloc_always });
+        if (!std.mem.eql(u8, value.key, id)) return error.InvalidCatalogRecord;
+        @memcpy(&value.digest, try routes.digest(a, id));
+        return value;
+    }
+    fn seekNode(ptr: *anyopaque, a: A, digest: []const u8, canonical: ?[]const u8) !?records.query_context.QueryNode {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const prefix = if (canonical) |component|
+            try std.fmt.allocPrint(a, "{s}query-component/{s}/{s}/", .{ self.root, self.profile, try routes.digest(a, component) })
+        else
+            try std.fmt.allocPrint(a, "{s}query-node/{s}/", .{ self.root, self.profile });
+        const before = try std.mem.concat(a, u8, &.{ prefix, digest });
+        before[before.len - 1] -= 1;
+        const page = try self.backend.scan(self.backend.ptr, a, prefix, before, 1);
+        if (page.rows.len == 0) return null;
+        const row = page.rows[0];
+        if (!std.mem.startsWith(u8, row.key, prefix) or row.key.len != prefix.len + 64) return error.InvalidCatalogRecord;
+        var value = try std.json.parseFromSliceLeaky(records.query_context.QueryNode, a, row.value, .{ .allocate = .alloc_always });
+        @memcpy(&value.digest, row.key[prefix.len..]);
+        if (!std.mem.eql(u8, &value.digest, try routes.digest(a, value.key))) return error.InvalidCatalogRecord;
+        if (canonical) |component| if (!std.mem.eql(u8, component, value.canonical)) return error.InvalidCatalogRecord;
+        return value;
     }
     fn expand(ptr: *anyopaque, a: A, id: []const u8, forward_only: bool, mask: records.EdgeMask) ![]const resolver.KeyAlias {
         const self: *@This() = @ptrCast(@alignCast(ptr));
