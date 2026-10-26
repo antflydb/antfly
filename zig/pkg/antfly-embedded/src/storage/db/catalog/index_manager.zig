@@ -50167,7 +50167,8 @@ test "logical query projection upgrade is discovered by the admitted owner turn"
         defer db.close();
         try db.setSchema(schema);
         try db.addIndex(cfg);
-        try db.batch(.{ .writes = docs, .sync_level = .write });
+        // Drain the live producer before manually simulating historical bytes.
+        try db.batch(.{ .writes = docs, .sync_level = .full_index });
         const entry = db.core.index_manager.textIndexEntry(cfg.name).?;
         @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = true;
         try db.core.index_manager.indexBatch(db.core.store, docs);
