@@ -3241,3 +3241,10 @@ change that compiled source closure. No push or deployment is part of this work.
 ### V kernel-source consolidation
 
 The V01–V40 follow-up is recorded in [the V outcome register](unified-execution-v-outcomes.md). It removes a further 242 maintained production lines / 19,948 bytes relative to clean main merge 4eedf47291, excluding earlier campaigns and upstream changes. Shared Metal/CUDA device phases and CPU binary owners preserve specialized schedules; allocation-failure and overflow findings have regression coverage. The final composed and direct validation matrix passes without relaxing gates; the outcome register preserves an initial attention timing failure and its passing diagnostic/full-family confirmation. Earlier campaigns receive no new reduction credit.
+
+### W kernel-source size work
+
+[The W progress record](unified-execution-w-outcomes.md) separates maintained
+source reduction from checked-in generated expansion and physical repository
+size. CPU reaches the 20% maintenance-source target with Mac validation passing;
+the individual CUDA/Metal targets and CUDA device qualification remain pending.

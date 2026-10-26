@@ -26,6 +26,7 @@ extern "C" __global__ void termite_gliner25_boundary_f32(
     const uint gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= work_items) return;
     const uint lane = threadIdx.x & 31u;
+// quant-kernel-codegen:begin shared GPU boundary operators
     uint B=p.dims[0], N=p.dims[1], C=p.dims[2], D=p.dims[3];
     switch (p.kind) {
     case 0u: { out[gid]=a0[gid]+a1[gid%N]; break; }
@@ -272,3 +273,4 @@ extern "C" __global__ void termite_gliner25_boundary_f32(
     }
     }
 }
+// quant-kernel-codegen:end shared GPU boundary operators

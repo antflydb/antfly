@@ -12624,11 +12624,13 @@ test "metal runtime source gates aligned and unrolled Q4 MM to measured shapes" 
     const host_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(host_source);
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_q4_0_linear_mm_sg_aligned("));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_q4_0_linear_mm_sg_aligned_tail("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_MSL_ABI_QUANT_MATRIX(termite_q4_0_linear_mm_sg_aligned)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_MSL_ABI_QUANT_MATRIX(termite_q4_0_linear_mm_sg_aligned_tail)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_ENABLE_Q4_0_MM_SG_ALIGNED"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DISABLE_Q4_0_MM_SG_ALIGNED"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_dequantize_q4_0_4x4_half(x, il0, temp_a);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_sg_dequantize_block(x, il, temp_a);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_dequantize_q4_0_4x4_half(x, il, value);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_dequantize_q4_0_4x4_half(x, il, temp_a);"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "*(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = (half2x4)(*((device const float2x4 *)y));"));
 
     // Measured E4B FFN and projection matrices default to aligned full/tail

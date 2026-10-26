@@ -1,14 +1,24 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 // Intentionally included in native kernels; no include guard.
-// Caller provides exact [4][256] partial storage, codec accumulators and native argmax slots. Preserve tree, suppression and ties.
+// Caller owns partial storage, codec accumulators and native argmax slots.
+// Static policies retain column geometry, row validity, suppression and ties.
+#ifndef TERMITE_QUANT_ARGMAX_COLUMNS
+#define TERMITE_QUANT_ARGMAX_COLUMNS 4u
+#endif
+#ifndef TERMITE_QUANT_ARGMAX_INVALID_COLUMN
+#define TERMITE_QUANT_ARGMAX_INVALID_COLUMN col >= out_dim
+#endif
+#ifndef TERMITE_QUANT_ARGMAX_SLOT
+#define TERMITE_QUANT_ARGMAX_SLOT tile
+#endif
     #pragma unroll
-    for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
+    for (unsigned int c = 0; c < TERMITE_QUANT_ARGMAX_COLUMNS; ++c) partial[c][tid] = acc[c];
     __syncthreads();
     for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
             #pragma unroll
-            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
+            for (unsigned int c = 0; c < TERMITE_QUANT_ARGMAX_COLUMNS; ++c) partial[c][tid] += partial[c][tid + stride];
         }
         __syncthreads();
     }
@@ -16,9 +26,9 @@
         float best_value = -3.402823466e+38f;
         unsigned int best_index = 0xffffffffu;
         #pragma unroll
-        for (unsigned int c = 0; c < 4u; ++c) {
+        for (unsigned int c = 0; c < TERMITE_QUANT_ARGMAX_COLUMNS; ++c) {
             unsigned int col = col_tile + c;
-            if (col >= out_dim) continue;
+            if (TERMITE_QUANT_ARGMAX_INVALID_COLUMN) continue;
             bool suppressed = false;
             for (unsigned int j = 0; j < suppress_count; ++j) {
                 int token_id = suppress_token_ids[j];
@@ -34,6 +44,10 @@
                 best_index = col;
             }
         }
-        partial_values[tile] = best_value;
-        partial_indices[tile] = best_index;
+        partial_values[TERMITE_QUANT_ARGMAX_SLOT] = best_value;
+        partial_indices[TERMITE_QUANT_ARGMAX_SLOT] = best_index;
     }
+
+#undef TERMITE_QUANT_ARGMAX_COLUMNS
+#undef TERMITE_QUANT_ARGMAX_INVALID_COLUMN
+#undef TERMITE_QUANT_ARGMAX_SLOT

@@ -66,6 +66,15 @@ const multiline =
         self.assertEqual(host, prefix + middle + suffix)
         self.assertEqual(len(device) + len(host), len(source))
 
+    def test_secondary_metal_program_is_device_source(self):
+        primary = 'static NSString *termite_metal_shader_source(void) {\n    return @"primary";\n}'
+        secondary = 'static NSString *termite_metal_deberta_training_attention_v1_source(void) {\n    return @"training";\n}'
+        source = 'before\n' + primary + '\nbetween\n' + secondary + '\nafter\n'
+        device, host = accounting.shader(source)
+        self.assertEqual(device, primary + secondary)
+        self.assertEqual(host, 'before\n\nbetween\n\nafter\n')
+        self.assertEqual(len(device) + len(host), len(source))
+
     def test_generated_region_keeps_both_boundary_markers(self):
         generated = '// quant-kernel-codegen:begin fixture\nbody\n// quant-kernel-codegen:end fixture\n'
         authored, emitted = accounting.managed('before\n' + generated + 'after\n')

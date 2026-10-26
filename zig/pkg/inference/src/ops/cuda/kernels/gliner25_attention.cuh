@@ -21,6 +21,7 @@ struct DTParams {
     dt_u64 dropout_stream;
 };
 
+    // quant-kernel-codegen:begin shared GPU training attention helpers
 __device__ __forceinline__ void dt_bad(unsigned int* status, uint code) {
     atomicOr(status, code);
 }
@@ -102,6 +103,7 @@ __device__ __forceinline__ DTAdjoint dt_adjoint(const float* qkv, const float* r
     dt_finite(probability, status);
     return { ds, probability * keep };
 }
+    // quant-kernel-codegen:end shared GPU training attention helpers
 
 
 static_assert(sizeof(DTParams) == 88, "attention descriptor ABI");
@@ -113,7 +115,9 @@ const int* order, unsigned int* status, DTParams p) {
     __shared__ float tile[196];
 const float* input = p.operand == 0u ? qkv : (p.operand == 1u ? relative : dout);
 
+    // quant-kernel-codegen:begin shared GPU training attention validate_f32
     if (gid < p.count) dt_finite(input[p.begin + gid], status);
+    // quant-kernel-codegen:end shared GPU training attention validate_f32
 }
 extern "C" __global__ void termite_gliner25_dt_validate_control(
 const float* qkv, const float* relative, const int* control, const float* dout,
@@ -123,6 +127,7 @@ const int* order, unsigned int* status, DTParams p) {
     __shared__ float tile[196];
 const int* input = control;
 
+    // quant-kernel-codegen:begin shared GPU training attention validate_control
     if (gid >= p.count) return;
     const uint i = p.begin + gid;
     const int value = input[i];
@@ -130,6 +135,7 @@ const int* input = control;
     if (i < 6u + p.batch * p.sequence) {
         if (value != 0 && value != 1) dt_bad(status, 2u);
     } else if (value < 0 || uint(value) >= p.relative_rows) dt_bad(status, 2u);
+    // quant-kernel-codegen:end shared GPU training attention validate_control
 }
 extern "C" __global__ void termite_gliner25_dt_zero(
 const float* qkv, const float* relative, const int* control, const float* dout,
@@ -138,7 +144,9 @@ const int* order, unsigned int* status, DTParams p) {
     const uint tid = threadIdx.x, group = blockIdx.x, gid = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ float tile[196];
 
+    // quant-kernel-codegen:begin shared GPU training attention zero
     if (gid < p.count) output[p.begin + gid] = 0.0f;
+    // quant-kernel-codegen:end shared GPU training attention zero
 }
 
 extern "C" __global__ void termite_gliner25_dt_forward(
@@ -148,6 +156,7 @@ const int* order, unsigned int* status, DTParams p) {
     const uint tid = threadIdx.x, group = blockIdx.x, gid = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ float tile[196];
 
+    // quant-kernel-codegen:begin shared GPU training attention forward
     const uint row = p.begin + group;
     const uint q = row % p.sequence, h = (row / p.sequence) % p.heads, b = row / (p.sequence * p.heads);
     float* score = tile;
@@ -190,6 +199,7 @@ const int* order, unsigned int* status, DTParams p) {
         dt_finite(value, status);
         output[dt_data(p, b, h, q) + tid] = value;
     }
+    // quant-kernel-codegen:end shared GPU training attention forward
 }
 
 extern "C" __global__ void termite_gliner25_dt_rows(
@@ -199,6 +209,7 @@ const int* order, unsigned int* status, DTParams p) {
     const uint tid = threadIdx.x, group = blockIdx.x, gid = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ float tile[196];
 
+    // quant-kernel-codegen:begin shared GPU training attention rows
     const uint row = p.begin + group;
     const uint q = row % p.sequence, h = (row / p.sequence) % p.heads, b = row / (p.sequence * p.heads);
     float* score = tile;
@@ -235,6 +246,7 @@ const int* order, unsigned int* status, DTParams p) {
         dt_finite(state[0], status); dt_finite(state[1], status); dt_finite(delta, status);
         rows[3u * row] = state[0]; rows[3u * row + 1u] = state[1]; rows[3u * row + 2u] = delta;
     }
+    // quant-kernel-codegen:end shared GPU training attention rows
 }
 
 extern "C" __global__ void termite_gliner25_dt_dq(
@@ -244,6 +256,7 @@ const int* order, unsigned int* status, DTParams p) {
     const uint tid = threadIdx.x, group = blockIdx.x, gid = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ float tile[196];
 
+    // quant-kernel-codegen:begin shared GPU training attention dq
     const uint row = p.begin + group;
     const uint q = row % p.sequence, h = (row / p.sequence) % p.heads, b = row / (p.sequence * p.heads);
     float* ds = tile;
@@ -269,6 +282,7 @@ const int* order, unsigned int* status, DTParams p) {
         const float value = cc + rel;
         dt_finite(value, status); output[dt_data(p, b, h, q) + tid] = value;
     }
+    // quant-kernel-codegen:end shared GPU training attention dq
 }
 
 extern "C" __global__ void termite_gliner25_dt_dkdv(
@@ -278,6 +292,7 @@ const int* order, unsigned int* status, DTParams p) {
     const uint tid = threadIdx.x, group = blockIdx.x, gid = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ float tile[196];
 
+    // quant-kernel-codegen:begin shared GPU training attention dkdv
     const uint row = p.begin + group;
     const uint k = row % p.sequence, h = (row / p.sequence) % p.heads, b = row / (p.sequence * p.heads);
     float* ds = tile;
@@ -308,6 +323,7 @@ const int* order, unsigned int* status, DTParams p) {
         output[dt_total(p) + index] = dk;
         output[2u * dt_total(p) + index] = value;
     }
+    // quant-kernel-codegen:end shared GPU training attention dkdv
 }
 
 extern "C" __global__ void termite_gliner25_dt_relative(
@@ -317,6 +333,7 @@ const int* order, unsigned int* status, DTParams p) {
     const uint tid = threadIdx.x, group = blockIdx.x, gid = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ float tile[196];
 
+    // quant-kernel-codegen:begin shared GPU training attention relative
     const uint g = p.group_begin + group;
     const uint bucket = uint(group_rows[g]), h = p.head_index, b = p.batch_index;
     const uint offset = 3u * dt_total(p) + (bucket * p.heads + h) * p.dimension;
@@ -356,4 +373,5 @@ const int* order, unsigned int* status, DTParams p) {
         dt_finite(qr, status); dt_finite(kr, status);
         output[offset + tid] = qr; output[offset + relsize + tid] = kr;
     }
+    // quant-kernel-codegen:end shared GPU training attention relative
 }
