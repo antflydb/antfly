@@ -23572,6 +23572,7 @@ pub const RaftApplyStore = struct {
     }
     pub var test_query_descriptors: std.atomic.Value(usize) = .init(0);
     pub var test_query_producers: std.atomic.Value(usize) = .init(0);
+    pub var test_query_destination_reads: std.atomic.Value(usize) = .init(0);
     pub var test_query_destination_fallbacks: std.atomic.Value(usize) = .init(0);
     pub var test_query_profile_loads: std.atomic.Value(usize) = .init(0);
     fn resolverQueryDescriptorsTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, source: u64, input: @import("../resolver_catalog_read.zig").Request, compact: bool) !QueryDescriptors {
@@ -23763,6 +23764,10 @@ pub const RaftApplyStore = struct {
                     for (descriptors) |cfg| if (!cfg.retired and selected_names.contains(cfg.name)) try selected_groups.put(a, try std.fmt.allocPrint(a, "{s}\x00{s}", .{ cfg.replacement_index, cfg.source_artifact }), {});
                 }
                 var query_hash = @import("antfly_hash").Sha256.init(.{});
+                // Execution scope is part of the proof. Final verification
+                // cannot widen a render cut into an executing sibling cut.
+                query_hash.update("resolver-query-execution-v2");
+                query_hash.update(&try @import("antfly_resolver").fingerprint(a, input.query_execution));
                 var definition = table;
                 definition.indexes_json = "{}";
                 query_hash.update(&if (query_source) |source| source.schema else try @import("../resolver_authority.zig").schemaFingerprint(a, definition));
@@ -23777,10 +23782,11 @@ pub const RaftApplyStore = struct {
                 var heads: std.StringHashMapUnmanaged(?@import("../resolver_authority.zig").records.Head) = .empty;
                 for (descriptors) |*cfg| {
                     if (cfg.retired) continue;
-                    if (input.projection_names != null and !selected_names.contains(cfg.name) and !((input.routing_siblings or input.query_execution) and selected_groups.contains(try std.fmt.allocPrint(a, "{s}\x00{s}", .{ cfg.replacement_index, cfg.source_artifact })))) continue;
+                    if (input.projection_names != null and !selected_names.contains(cfg.name) and !(input.query_execution and selected_groups.contains(try std.fmt.allocPrint(a, "{s}\x00{s}", .{ cfg.replacement_index, cfg.source_artifact })))) continue;
                     query_hash.update(&try @import("antfly_resolver").fingerprint(a, .{ cfg.name, cfg.table, cfg.key_template }));
                     const destination = try destinations.getOrPut(a, cfg.table);
                     if (!destination.found_existing) {
+                        if (builtin.is_test) _ = test_query_destination_reads.fetchAdd(1, .monotonic);
                         // Resolve names at this same cut, even before background
                         // adoption has reached the source's compact binding.
                         const target = try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, a, &txn, group_id, try system_catalog.Target.parse(cfg.table));
@@ -42702,4 +42708,90 @@ test "resolver curation namespace propagation compact execution admits bounded p
     verify.expected_query_fingerprint = compact.query_fingerprint;
     try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, verify));
     std.debug.print("COMPACT QUERY aliases=10000 suppression_entries=100000 response_bytes={d} arena_bytes={d} hydrated_aliases=0 readiness=fenced backfill=v12\n", .{ bytes.len, bounded.queryCapacity() });
+}
+
+test "resolver curation namespace propagation render fences one destination while retaining sibling declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/render-execution-scope", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    const group: u64 = 41;
+    const wire = @import("../resolver_catalog_read.zig");
+    const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
+    const domain = @import("../resolver_authority.zig");
+    const pure = @import("antfly_resolver");
+    const template = "entity/{{_key}}";
+    const Helpers = struct {
+        fn authority(target: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: u64, initial: bool) !void {
+            const table = (try target.getTable(alloc, group_id, id)).?;
+            const before: resolver_curation.Namespace = .{ .key_template = template, .revision = if (initial) 0 else 1 };
+            var after = before;
+            after.revision += 1;
+            if (!initial) after.state.suppress.keys = &.{"entity/suppressed"};
+            const command: domain.Write = .{ .table_id = id, .standalone = true, .catalog_revision = try target.standaloneRevision(), .schema = try domain.schemaFingerprint(alloc, table), .bootstrap = if (initial) .{ .expected_indexes = try pure.fingerprint(alloc, table.indexes_json) } else null, .patches = &.{try domain.records.difference(alloc, before, after)} };
+            try target.applyStandaloneCommand(group_id, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(alloc, command, .{}) });
+        }
+    };
+    const count = 1000;
+    const configs = try a.alloc(Config, count);
+    for (configs, 0..) |*cfg, i| {
+        const name = try std.fmt.allocPrint(a, "target-{d}", .{i});
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = i + 1, .name = name } });
+        const labels = try a.alloc([]const u8, 1);
+        labels[0] = try std.fmt.allocPrint(a, "label-{d}", .{i});
+        cfg.* = .{ .name = try std.fmt.allocPrint(a, "resolver-{d}", .{i}), .table = name, .key_template = template, .source_artifact = "kg", .resolution_artifact = try std.fmt.allocPrint(a, "resolved-{d}", .{i}), .labels = labels, .promote = false };
+    }
+    try Helpers.authority(&store, a, group, 1, true);
+    try Helpers.authority(&store, a, group, 2, true);
+    var source: metadata.TableRecord = .{ .table_id = count + 1, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = configs }, .{}) };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = source });
+    const render: wire.Request = .{ .table_name = "source", .policy_descriptors = true, .projection_names = &.{configs[0].name}, .routing_siblings = true, .query_execution = false, .standalone = true };
+    var reads = RaftApplyStore.test_query_destination_reads.load(.monotonic);
+    const render_page = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, render), .{});
+    try std.testing.expectEqual(@as(usize, 1), RaftApplyStore.test_query_destination_reads.load(.monotonic) - reads);
+    try std.testing.expectEqual(@as(usize, count), render_page.configs.?.len);
+    try std.testing.expectEqual(@as(usize, 1), render_page.query_heads.len);
+    var render_verify = render;
+    render_verify.expected_query_fingerprint = render_page.query_fingerprint;
+    reads = RaftApplyStore.test_query_destination_reads.load(.monotonic);
+    _ = try store.resolverCatalogRead(a, group, render_verify);
+    try std.testing.expectEqual(@as(usize, 1), RaftApplyStore.test_query_destination_reads.load(.monotonic) - reads);
+    var resolve = render;
+    resolve.query_execution = true;
+    reads = RaftApplyStore.test_query_destination_reads.load(.monotonic);
+    const resolve_page = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, resolve), .{});
+    try std.testing.expectEqual(@as(usize, count), RaftApplyStore.test_query_destination_reads.load(.monotonic) - reads);
+    try std.testing.expectEqual(@as(usize, 2), resolve_page.query_heads.len);
+    var resolve_verify = resolve;
+    resolve_verify.expected_query_fingerprint = resolve_page.query_fingerprint;
+    // A render proof cannot be reused as a wider execution proof.
+    var widened = render_verify;
+    widened.query_execution = true;
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, widened));
+    try Helpers.authority(&store, a, group, 2, false);
+    _ = try store.resolverCatalogRead(a, group, render_verify);
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, resolve_verify));
+    const fresh_resolve = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, resolve), .{});
+    resolve_verify.expected_query_fingerprint = fresh_resolve.query_fingerprint;
+    // An ordinary sibling destination schema is also irrelevant to render.
+    var other = (try store.getTable(a, group, 3)).?;
+    other.description = "new schema proof";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = other });
+    _ = try store.resolverCatalogRead(a, group, render_verify);
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, resolve_verify));
+    // Selected native state still fences the result.
+    try Helpers.authority(&store, a, group, 1, false);
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, render_verify));
+    const fresh = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, render), .{});
+    render_verify.expected_query_fingerprint = fresh.query_fingerprint;
+    // Sibling labels remain part of source routing admission.
+    configs[1].labels = &.{"changed-routing-label"};
+    source.indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = configs }, .{});
+    try store.applyStandaloneCommand(group, .{ .upsert_table = source });
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, render_verify));
+    std.debug.print("RENDER EXECUTION siblings=1000 admission_destination_reads=1 verification_destination_reads=1 resolve_destinations=1000 unused_head_and_schema=independent selected_head_and_labels=fenced\n", .{});
 }

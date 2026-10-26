@@ -94,16 +94,20 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
-    const memory_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/memory_policy_test_root.zig"),
-        .imports = &.{
-            .{ .name = "antfly_resolver", .module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/resolver/src/memory_contract.zig"), .target = target, .optimize = optimize }) },
-            .{ .name = "antfly_hash", .module = shared.hash_mod },
-            .{ .name = "antfly_platform", .module = shared.platform_mod },
-        },
-        .target = target,
-        .optimize = optimize,
-    }) });
+    const memory_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/memory_policy_test_root.zig"),
+            .imports = &.{
+                // Native memory also exercises shared query-policy attachment.
+                // Use the real deterministic core; no model/runtime is linked.
+                .{ .name = "antfly_resolver", .module = shared.resolver_mod },
+                .{ .name = "antfly_hash", .module = shared.hash_mod },
+                .{ .name = "antfly_platform", .module = shared.platform_mod },
+            },
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
     b.step("memory-test", "Run native memory policy, temporal, isolation and replay contracts").dependOn(&b.addRunArtifact(memory_tests).step);
     @import("antfly_media").support.addTests(b, b.path("lib/media"), target, optimize);
     @import("antfly_video").support.addTests(b, b.path("lib/video"), target, optimize);

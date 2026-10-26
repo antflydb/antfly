@@ -493,7 +493,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
         const stamp = if (plan.changed) try server.source.replaceTableDefinitionStamped(table.*, replacement) else null;
         return response(alloc, 202, .{ .resolver = resolver_name, .changed = plan.changed, .revision = plan.revision, .replay_sequence = plan.revision, .replay_sequence_kind = "resolver_revision", .metadata_commit = stamp, .applied = false });
     }
-    var query_fence: ?QueryFence = if (server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve)) try QueryFence.init(a, page orelse return error.UnsupportedOperation, resolver_name, op == .render or op == .resolve) else null;
+    var query_fence: ?QueryFence = if (server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve)) try QueryFence.init(a, page orelse return error.UnsupportedOperation, resolver_name, if (op == .render) .render else .resolve) else null;
     const cfg = try findConfig(all, resolver_name);
     if (cfg.retired and (op == .render or op == .resolve or op == .reviews or op == .review)) return error.ResolverNotFound;
     switch (op) {
@@ -1520,16 +1520,17 @@ const QueryFence = struct {
     table_id: u64,
     fingerprint: [32]u8,
     resolver_name: []const u8,
-    routing_siblings: bool,
+    /// Both operations need sibling labels; only resolve executes siblings.
+    execution: enum { render, resolve },
     heads: std.StringHashMapUnmanaged(native_authority.records.Stamp) = .empty,
     profiles: std.StringHashMapUnmanaged(native_authority.QueryProfileReference) = .empty,
-    fn init(a: std.mem.Allocator, page: catalog_read.Page, resolver_name: []const u8, routing_siblings: bool) !QueryFence {
-        var result: QueryFence = .{ .table_name = page.table.name, .table_id = page.table.table_id, .fingerprint = page.query_fingerprint orelse return error.InvalidCatalogRecord, .resolver_name = resolver_name, .routing_siblings = routing_siblings };
+    fn init(a: std.mem.Allocator, page: catalog_read.Page, resolver_name: []const u8, execution: @FieldType(QueryFence, "execution")) !QueryFence {
+        var result: QueryFence = .{ .table_name = page.table.name, .table_id = page.table.table_id, .fingerprint = page.query_fingerprint orelse return error.InvalidCatalogRecord, .resolver_name = resolver_name, .execution = execution };
         for (page.query_heads) |head| try result.heads.put(a, try std.fmt.allocPrint(a, "{d}\x00{s}", .{ head.table_id, head.key_template }), head.stamp);
         if (page.query_profiles) |profiles| {
             for (profiles) |profile| try result.profiles.put(a, profile.name, .{ .target = profile.target, .id = profile.id });
         } else if (page.indexed) if (page.configs) |configs_| for (configs_) |cfg| {
-            if (cfg.retired or (cfg.aliases.len == 0 and cfg.suppress_json.len == 0)) continue;
+            if (cfg.retired or (cfg.aliases.len == 0 and cfg.suppress_json.len == 0) or (execution == .render and !std.mem.eql(u8, cfg.name, resolver_name))) continue;
             const definition: native_authority.records.static_profiles.Definition = .{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json };
             try result.profiles.put(a, cfg.name, .{ .target = cfg.table, .id = try definition.identity(a) });
         };
@@ -1540,7 +1541,7 @@ const QueryFence = struct {
     }
     fn verify(self: *const QueryFence, server: anytype, a: std.mem.Allocator, request: operation.RequestContext) !void {
         try server.authorizeTableReads(a, request, &.{self.table_name});
-        _ = try readResolverCatalog(server, a, .{ .table_name = self.table_name, .table_id = self.table_id, .policy_descriptors = true, .projection_names = &.{self.resolver_name}, .routing_siblings = self.routing_siblings, .expected_query_fingerprint = self.fingerprint }, request);
+        _ = try readResolverCatalog(server, a, .{ .table_name = self.table_name, .table_id = self.table_id, .policy_descriptors = true, .projection_names = &.{self.resolver_name}, .routing_siblings = true, .query_execution = self.execution == .resolve, .expected_query_fingerprint = self.fingerprint }, request);
     }
 };
 
@@ -1792,7 +1793,7 @@ test "resolver curation HTTP policy pages share immutable profile references and
     var page: catalog_read.Page = .{ .version = 1, .revision = 1, .table = .{ .table_id = 2, .name = "source" }, .indexed = true, .configs = &.{cfg}, .query_fingerprint = @splat(1), .query_heads = &.{.{ .table_id = 1, .key_template = cfg.key_template, .stamp = .{ .revision = 3, .fingerprint = @splat(7) } }} };
     const texts = try a.alloc([]const u8, 1024);
     for (texts, 0..) |*text, i| text.* = try std.fmt.allocPrint(a, "mention-{d}", .{i});
-    const fence = try QueryFence.init(a, page, cfg.name, true);
+    const fence = try QueryFence.init(a, page, cfg.name, .resolve);
     _ = try queryConfig(&server, std.testing.allocator, a, cfg, &.{"entity/seed"}, texts, true, .{}, &fence);
     try std.testing.expectEqual(@as(usize, 8), server.source.pages);
     try std.testing.expectEqual(@as(usize, 8), server.source.references);
@@ -1802,7 +1803,7 @@ test "resolver curation HTTP policy pages share immutable profile references and
     std.debug.print("QUERY PROFILE RPC aliases=10000 pages=8 alias_elements=0 text_only_pages=7 wire_bytes={d}\n", .{server.source.bytes});
     // Old snapshots retain inline compatibility on seed pages only.
     page.indexed = false;
-    const legacy = try QueryFence.init(a, page, cfg.name, true);
+    const legacy = try QueryFence.init(a, page, cfg.name, .resolve);
     server.source = .{};
     _ = try queryConfig(&server, std.testing.allocator, a, cfg, &.{"entity/seed"}, texts, true, .{}, &legacy);
     try std.testing.expectEqual(@as(usize, 10000), server.source.aliases);
@@ -2508,7 +2509,7 @@ test "resolver curation HTTP query policy chunks large mention and candidate set
     for (seeds, 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "entity/{d}", .{i});
     for (texts, 0..) |*text_value, i| text_value.* = try std.fmt.allocPrint(a, "mention {d}", .{i});
     const cfg: Config = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .namespace_curation_table_id = 7 };
-    var pinned = try QueryFence.init(a, .{ .version = 1, .revision = 42, .table = .{ .table_id = 1, .name = "source" }, .query_fingerprint = @splat(1), .query_heads = &.{.{ .table_id = 7, .key_template = cfg.key_template, .stamp = .{ .revision = 3, .fingerprint = @splat(1) } }} }, "r", false);
+    var pinned = try QueryFence.init(a, .{ .version = 1, .revision = 42, .table = .{ .table_id = 1, .name = "source" }, .query_fingerprint = @splat(1), .query_heads = &.{.{ .table_id = 7, .key_template = cfg.key_template, .stamp = .{ .revision = 3, .fingerprint = @splat(1) } }} }, "r", .render);
     const current = (try queryConfig(&server, std.testing.allocator, a, cfg, seeds, texts, true, .{}, &pinned)).config;
     try std.testing.expectEqual(@as(usize, 3), server.source.calls);
     try std.testing.expectEqual(seeds.len, server.source.seeds);
@@ -2795,16 +2796,57 @@ test "resolver curation HTTP admitted profile references replace full alias iden
     const cfg: Config = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved" };
     const profile = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const page: catalog_read.Page = .{ .version = 1, .revision = 1, .table = .{ .table_id = 1, .name = "source" }, .indexed = true, .query_fingerprint = @splat(1), .configs = &.{cfg}, .query_profiles = &.{.{ .name = "r", .target = "entities", .id = profile }} };
-    const admitted = try QueryFence.init(a, page, "r", true);
+    const admitted = try QueryFence.init(a, page, "r", .resolve);
     try std.testing.expectEqualStrings(profile, admitted.profiles.get("r").?.id);
     var inline_page = page;
     var inline_cfg = cfg;
     inline_cfg.aliases = &.{.{ .key = "entity/a", .target = "entity/b" }};
     inline_page.configs = &.{inline_cfg};
     inline_page.query_profiles = &.{};
-    const fallback = try QueryFence.init(a, inline_page, "r", true);
+    const fallback = try QueryFence.init(a, inline_page, "r", .resolve);
     try std.testing.expectEqual(@as(usize, 0), fallback.profiles.count());
     inline_page.query_profiles = null;
-    const legacy = try QueryFence.init(a, inline_page, "r", true);
+    const legacy = try QueryFence.init(a, inline_page, "r", .resolve);
     try std.testing.expectEqualStrings(try (native_authority.records.static_profiles.Definition{ .key_template = cfg.key_template, .aliases = inline_cfg.aliases }).identity(a), legacy.profiles.get("r").?.id);
+}
+
+test "resolver curation HTTP query fences preserve render and resolve execution scopes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Source = struct {
+        expected_execution: bool,
+        calls: usize = 0,
+        pub fn systemCatalog(self: *@This(), allocator: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const input = call.resolver_catalog_read;
+            try std.testing.expect(input.policy_descriptors and input.routing_siblings);
+            try std.testing.expectEqual(self.expected_execution, input.query_execution);
+            try std.testing.expectEqualStrings("selected", input.projection_names.?[0]);
+            try std.testing.expectEqual(@as(?[32]u8, @splat(9)), input.expected_query_fingerprint);
+            self.calls += 1;
+            return std.json.Stringify.valueAlloc(allocator, catalog_read.Page{ .version = 1, .revision = 1, .table = .{ .table_id = 1, .name = "source" }, .query_fingerprint = @splat(9) }, .{});
+        }
+    };
+    const Server = struct {
+        source: Source,
+        pub fn authorizeTableReads(_: *@This(), _: std.mem.Allocator, _: operation.RequestContext, names: []const []const u8) !void {
+            try std.testing.expectEqual(@as(usize, 1), names.len);
+            try std.testing.expectEqualStrings("source", names[0]);
+        }
+    };
+    var server: Server = .{ .source = .{ .expected_execution = false } };
+    const cfg: Config = .{ .name = "selected", .table = "entities", .source_artifact = "kg", .resolution_artifact = "out", .key_template = "entity/{{_key}}" };
+    var sibling = cfg;
+    sibling.name = "sibling";
+    sibling.table = "other-entities";
+    sibling.aliases = &.{.{ .key = "entity/old", .target = "entity/new" }};
+    const page: catalog_read.Page = .{ .version = 1, .revision = 1, .table = .{ .table_id = 1, .name = "source" }, .query_fingerprint = @splat(9), .indexed = true, .configs = &.{ cfg, sibling } };
+    const render = try QueryFence.init(a, page, cfg.name, .render);
+    try std.testing.expect(!render.profiles.contains(sibling.name));
+    try render.verify(&server, a, .{});
+    server.source.expected_execution = true;
+    const resolve = try QueryFence.init(a, page, cfg.name, .resolve);
+    try std.testing.expect(resolve.profiles.contains(sibling.name));
+    try resolve.verify(&server, a, .{});
+    try std.testing.expectEqual(@as(usize, 2), server.source.calls);
 }

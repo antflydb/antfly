@@ -2622,3 +2622,12 @@ Derived readiness is fenced before compact admission; inline declarations
 remain the fallback during upgrade. Publication of detached Lite work compares
 pinned native metadata-record identities, with exact content checks only for
 rewritten records, rather than rebuilding catalog hashes under writer locks.
+
+Supersession candidate byte limits select a maximal ranked prefix before output
+allocation. The renderer counts the seed/envelope and each candidate through
+the first excluded item with the same JSON writer used for emission, including
+escaping and the truncation flag. It emits one exact-size buffer, retaining no
+serialized copies of discarded suffixes. Existing retrieval truncation remains
+visible; an oversized seed is refused, and cancellation is checked while sizing
+and before emission. The 64-candidate, 64 KiB-statement regression fits into a
+256 KiB output allocator instead of retaining roughly 191 MB of JSON buffers.

@@ -2647,13 +2647,38 @@ const Run = struct {
         }.less);
         page.truncated = found.more or items.items.len > request.limit;
         page.items = items.items[0..@min(items.items.len, request.limit)];
-        while (true) {
-            const output = try self.encode(page);
-            if (output.len <= request.max_bytes) return output;
-            if (page.items.len == 0) return error.MemoryInputTooLarge;
-            page.items = page.items[0 .. page.items.len - 1];
-            page.truncated = true;
+        return self.renderSupersessionCandidates(page, request.max_bytes);
+    }
+    /// Size the ranked prefix until its first excluded item, then emit once.
+    /// Discarded suffixes never become serialized buffers in the request arena.
+    fn renderSupersessionCandidates(self: *Run, page: t.SupersessionCandidatePage, max_bytes: usize) ![]const u8 {
+        try self.service.context.check();
+        std.debug.assert(page.items.len <= 64);
+        var result = page;
+        result.items = &.{};
+        const original_envelope = try encodedSize(result);
+        result.truncated = true;
+        const trimmed_envelope = if (page.truncated) original_envelope else try encodedSize(result);
+        if (trimmed_envelope > max_bytes) return error.MemoryInputTooLarge;
+        var count: usize = 0;
+        var item_bytes: usize = 0;
+        for (page.items) |item| {
+            try self.service.context.check();
+            const next_bytes = item_bytes + try encodedSize(item);
+            if (trimmed_envelope + next_bytes + count > max_bytes) break;
+            item_bytes = next_bytes;
+            count += 1;
         }
+        const separators = count -| 1;
+        result.truncated = page.truncated or count < page.items.len or original_envelope + item_bytes + separators > max_bytes;
+        const total = (if (result.truncated) trimmed_envelope else original_envelope) + item_bytes + separators;
+        result.items = page.items[0..count];
+        try self.service.context.check();
+        const output = try self.a.alloc(u8, total);
+        var writer: std.Io.Writer = .fixed(output);
+        try std.json.Stringify.value(result, .{}, &writer);
+        std.debug.assert(writer.end == total);
+        return output;
     }
     fn supersessionOpenKey(self: *Run, id: []const u8) ![]const u8 {
         return std.fmt.allocPrint(self.a, "supersession-open/{s}/{s}", .{ try hash(self.a, self.service.context.branch), try hash(self.a, id) });
@@ -7828,4 +7853,59 @@ test "memory admitted verdict snapshot excludes cached overlay redirects" {
     var before = run.admittedViewRun();
     try std.testing.expectEqualStrings("a", (try before.forwardIdentity("a")).canonical);
     try std.testing.expectEqualStrings("b", (try run.forwardIdentity("a")).canonical);
+}
+
+test "memory performance supersession byte caps allocate one bounded page and preserve the maximal ranked prefix" {
+    var inputs = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer inputs.deinit();
+    const a = inputs.allocator();
+    const statement = try a.alloc(u8, t.max_text_bytes);
+    @memset(statement, 'x');
+    // Exercise JSON escaping in exact sizing as well as large plain text.
+    @memcpy(statement[0..4], "\"\\\n\t");
+    const seed: t.ClaimView = .{ .memory = .{ .assertion = .{ .id = "seed", .subject = "entity/subject", .predicate = "property", .value = "value", .statement = statement, .evidence = &.{.{ .id = "source" }} }, .owner = "alice", .recorded_from = 1, .revision = 1, .config_generation = 1 }, .fingerprint = "fingerprint", .config_generation = 1 };
+    const items = try a.alloc(t.SupersessionCandidate, 64);
+    for (items, 0..) |*item, i| {
+        var view = seed;
+        view.memory.assertion.id = try std.fmt.allocPrint(a, "candidate-{d}", .{i});
+        item.* = .{ .view = view, .lexical_score = 1, .semantic_similarity = null };
+    }
+    const page: t.SupersessionCandidatePage = .{ .seed = seed, .items = items, .retrieval = .indexed, .semantic_discovery = .disabled, .truncated = false, .revision = 1 };
+    const storage = try a.alloc(u8, 256 * 1024);
+    var fixed = std.heap.FixedBufferAllocator.init(storage);
+    var run = performanceTestRun(fixed.allocator());
+    const output = try run.renderSupersessionCandidates(page, storage.len);
+    const parsed = try parse(t.SupersessionCandidatePage, a, output);
+    try std.testing.expect(parsed.truncated);
+    try std.testing.expectEqual(@as(usize, 2), parsed.items.len);
+    try std.testing.expectEqualStrings("candidate-0", parsed.items[0].view.memory.assertion.id);
+    try std.testing.expectEqualStrings("candidate-1", parsed.items[1].view.memory.assertion.id);
+    try std.testing.expectEqualStrings(statement, parsed.seed.memory.assertion.statement);
+    try std.testing.expectEqual(output.len, fixed.end_index);
+    const bytes = output.len;
+    // Exact boundary, including the shorter `true` JSON boolean.
+    fixed.reset();
+    try std.testing.expectEqual(bytes, (try run.renderSupersessionCandidates(page, bytes)).len);
+    fixed.reset();
+    const smaller = try parse(t.SupersessionCandidatePage, a, try run.renderSupersessionCandidates(page, bytes - 1));
+    try std.testing.expectEqual(@as(usize, 1), smaller.items.len);
+    var one = page;
+    one.items = items[0..1];
+    fixed.reset();
+    const full = try parse(t.SupersessionCandidatePage, a, try run.renderSupersessionCandidates(one, storage.len));
+    try std.testing.expect(!full.truncated);
+    fixed.reset();
+    try std.testing.expectError(error.MemoryInputTooLarge, run.renderSupersessionCandidates(page, 4096));
+    try std.testing.expectEqual(@as(usize, 0), fixed.end_index);
+    const Cancel = struct {
+        fn check(_: *anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var unused: u8 = 0;
+    run.service.context.check_ptr = &unused;
+    run.service.context.check_fn = Cancel.check;
+    try std.testing.expectError(error.Canceled, run.renderSupersessionCandidates(page, storage.len));
+    try std.testing.expectEqual(@as(usize, 0), fixed.end_index);
+    std.debug.print("SUPERSESSION BYTE CAP candidates=64 max_bytes=262144 kept=2 output_bytes={d} allocated_bytes={d} discarded_page_buffers=0\n", .{ bytes, bytes });
 }

@@ -2656,3 +2656,17 @@ valid, changed or newly present/missing records refuse publication. The pin
 ends with the detached turn, retaining no permanent reclamation frontier.
 Live execution grants, source guards, leases and namespace heads still undergo
 their own publication checks. No authorization or decision is cached.
+
+Topology protocol 58 distinguishes routing declaration admission from execution
+dependencies in query proofs. Both key render and resolve retain sibling headers
+for label ownership and fence the source declaration, authorization and binding.
+Key render qualifies only its selected destination's live binding, schema and
+native head. Resolve qualifies every sibling destination it may execute. The
+controller carries the operation's execution scope into final verification;
+the scope is hashed into the proof, so a render proof cannot qualify a wider
+resolve. Changing an unused sibling destination or its native curation no longer
+invalidates key rendering; changing selected state or sibling routing labels
+still does. Existing indexed-projection readiness and legacy hydration remain
+independent, and this proof change needs no new durable backfill generation.
+With 1,000 sibling destinations, key render performs one destination qualification
+at admission and one at final verification; resolve retains all 1,000 checks.
