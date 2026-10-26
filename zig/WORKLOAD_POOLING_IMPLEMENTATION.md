@@ -28892,3 +28892,44 @@ maintenance still needs to forward this scope through the typed storage-owner
 interface and adopt the registered flush/publication/durable-completion path.
 No broader default eligibility or full-design completion is claimed. Full Linux
 qualification remains waived.
+
+
+## Registered flush output publication handoff (2026-10-25)
+
+A registered batch now exclusively claims all completed files from a flush
+builder. Its funded linked records retain each output creator and unpublished
+cleanup ticket before any subsequent admitted operation can refuse. Collection
+resumes with the same records across rejection or allocation failure. Once
+collection completes, the builder may be destroyed before metadata preparation;
+no builder, backend, execution port or candidate borrow escapes into retirement.
+Unpublished retirement transfers deletion obligations one file per callback.
+
+The batch validates every completed file against the prepared coupled directory,
+including physical read identity and visibility. A candidate edit revision binds
+that validation to the exact prepared edit sequence, so appending or rebuilding
+a candidate invalidates previous coverage. Installation still uses the real
+Backend source-generation and coupled-root checks under publication authority.
+A fixed, infallible receipt immediately after the accepted swap protects every
+file from unpublished deletion. Later caller cancellation cannot reverse it.
+Live-root retirement releases tickets without deleting their files, matching
+Run.commitOutput; registered metadata retains the physical output owners.
+
+This is file-existence protection at the live-root ownership boundary, not a
+manifest durability receipt. Manifest/WAL completion and accepted physical I/O
+need independent retained owners. Immutable input retirement, nonempty legacy
+root migration, compaction and normal maintenance-driver adoption remain open.
+The native ABI is 139 and the storage-owner ABI is 199; durable formats are
+unchanged.
+
+`registered-flush-outputs-v3-fast` and `registered-flush-outputs-v3-debug`
+pass all five commands and 28 native build steps against identical 5,759-input
+source maps. Four focused cases cover actual SST reads after producer and
+builder destruction, cancellation after installation, rejected missing/foreign
+files and revised candidates, every encountered original refusal with retry or
+abort, and allocation exhaustion with retained partial ownership. Empty input
+preserves the builder's EmptyRun result without producing cleanup debt. No test
+fails, skips or leaks. The four existing-path regressions in
+`registered-flush-outputs-v3-regressions` pass for unclaimed builder outputs,
+queue lifetime, coupled multi-edit roots and physical SST reads; the five private
+native ABI contract tests also pass. Full Linux qualification remains waived;
+the complete pooling design remains open.

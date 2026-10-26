@@ -3301,3 +3301,308 @@ test "physical cache metadata flush builder retains queue before first ticket an
     _ = try FlushBuilderFixture.runMode(null, false, false, .queue_join);
     _ = try FlushBuilderFixture.runMode(null, false, false, .pending_join);
 }
+
+const FlushPublicationFixture = struct {
+    const local = @import("antfly_local_sources");
+    const lsm = local.storage_lsm_backend_mod;
+    const state_mod = local.storage_lsm_backend_state;
+    const io_mod = local.storage_lsm_backend_storage_io;
+    const Scope = lsm.Backend.PublicationResources;
+    const Batch = Scope.FlushOutputs;
+    const Builder = Scope.FlushBuilder.Owner;
+    const Control = RegisteredOutputFixture.Control;
+    const Mode = enum { publish, missing, stale, identity, empty };
+    const Stats = struct { checks: usize, allocations: usize, observed: bool };
+    const Retry = struct {
+        failing: *std.testing.FailingAllocator,
+        control: *Control,
+        oom: bool,
+        abort_on_error: bool,
+        observed: bool = false,
+        fn call(self: *@This(), comptime operation: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(operation)).@"fn".return_type.?).error_union.payload {
+            while (true) {
+                return @call(.auto, operation, args) catch |cause| {
+                    try std.testing.expectError(if (self.oom) error.OutOfMemory else self.control.failure, @as(anyerror!void, cause));
+                    try std.testing.expect(!self.observed);
+                    self.observed = true;
+                    if (self.abort_on_error) return cause;
+                    self.failing.fail_index = std.math.maxInt(usize);
+                    continue;
+                };
+            }
+        }
+    };
+    const Owners = struct {
+        scope: ?*Scope = null,
+        builder: ?*Builder = null,
+        other_builder: ?*Builder = null,
+        batch: ?*Batch = null,
+        other_batch: ?*Batch = null,
+        frame: ?*Scope.Publication.Candidate = null,
+        views: [2]?lsm.repository.Run = @splat(null),
+        entries: [2]?Scope.EntryLease = @splat(null),
+        installed: bool = false,
+        done: bool = false,
+        abandoned: usize = 0,
+        fn finish(self: *@This(), backend: *lsm.Backend, manager: *ResourceManager, native: io_mod.Storage, failing: *std.testing.FailingAllocator) !usize {
+            if (self.done) return self.abandoned;
+            if (self.batch) |owner| owner.requestRetirement();
+            self.batch = null;
+            if (self.other_batch) |owner| owner.requestRetirement();
+            self.other_batch = null;
+            if (self.builder) |owner| owner.requestRetirement();
+            self.builder = null;
+            if (self.other_builder) |owner| owner.requestRetirement();
+            self.other_builder = null;
+            if (self.frame) |owner| owner.requestRetirement();
+            self.frame = null;
+            for (&self.views) |*slot| if (slot.*) |*view| {
+                view.deinit(backend.allocator);
+                slot.* = null;
+            };
+            for (&self.entries) |*slot| if (slot.*) |*entry| {
+                entry.deinit(backend.allocator);
+                slot.* = null;
+            };
+            if (self.scope) |owner| owner.requestRetirement();
+            self.scope = null;
+            // Abort cleanup must not allocate even when the fault allocator
+            // remains exhausted. Pinned live roots may defer output retirement.
+            for (0..512) |_| _ = manager.drainPayloadRetirementQuiesced();
+            failing.fail_index = std.math.maxInt(usize);
+            const queue = backend.options.unpublished_outputs.?;
+            while (queue.pop()) |ticket| {
+                defer ticket.destroy();
+                self.abandoned += 1;
+                // The isolated test consumer accepts pre-install deletion
+                // obligations. A live file is always preserved on failure.
+                if (!self.installed) try native.deleteFileAbsolute(ticket.path);
+            }
+            backend.close();
+            self.done = true;
+            RegisteredOutputFixture.drain(manager);
+            return self.abandoned;
+        }
+    };
+    fn build(scope: *Scope, queue: *lsm.repository.OutputCleanup.Queue, storage: io_mod.Storage, root: []const u8, empty: bool, foreign: bool, original: read_admission.Port) !*Builder {
+        const a = std.testing.allocator;
+        const path = try std.fmt.allocPrint(a, "{s}/runs", .{root});
+        defer a.free(path);
+        try storage.createDirPath(path);
+        var state: state_mod.State = .{};
+        defer state.deinit(a);
+        if (!empty) {
+            try state.upsert(a, .{ .name = null }, "a", if (foreign) "foreign" else "one", false);
+            try state.upsert(a, .{ .name = null }, "b", if (foreign) "foreign" else "two", false);
+        }
+        const states = [_]*const state_mod.State{&state};
+        const job = try scope.beginFlushBuilderWithAdmission(queue, root, &states, .{ .first_id = 501, .end_id = 510, .target_bytes = 0, .max_entries = 1, .max_file_bytes = 1 << 20 }, original);
+        errdefer job.requestRetirement();
+        try job.driveWithAdmission(storage, original);
+        return job; // Completed construction no longer reads state/the vector.
+    }
+    fn run(mode: Mode, target: ?usize, oom: bool, abort_on_error: bool) !Stats {
+        const a = std.testing.allocator;
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const owned = failing.allocator();
+        var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+        defer parent.deinit(a);
+        var budgets = budgets_mod.smartResourceBudgetsForTotal(64 << 20);
+        budgets.options.identity_allocator = owned;
+        var resources = try Resources.initWithBudgetsAndParent(owned, budgets, parent.memoryParentPort());
+        defer resources.deinit();
+        resources.attachResourceManager();
+        var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
+        defer pool.deinit();
+        var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+        defer native.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/flush-publication", .{tmp.sub_path});
+        defer a.free(root);
+        var backend = lsm.Backend.init(owned, .{ .resource_manager = &resources.resource_manager, .storage = native.storage(), .wal_enabled = false });
+        var backend_live = true;
+        defer if (backend_live) backend.close();
+        try backend.initOutputCleanup();
+        const queue = backend.options.unpublished_outputs.?;
+        try std.testing.expect(backend.mu.tryLock());
+        const planned = backend.planningDirectory();
+        backend.mu.unlock();
+        const directory = try (try planned).fork(owned);
+        defer directory.destroy(owned);
+        try directory.tree.prepare(owned);
+        var owners: Owners = .{};
+        var control: Control = .{};
+        const payload = control.payload();
+        const original = read_admission.Port.init(&payload);
+        defer {
+            control.live = false;
+            if (!owners.done) _ = owners.finish(&backend, &resources.resource_manager, native.storage(), &failing) catch @panic("flush publication fixture cleanup failed");
+            backend_live = false;
+        }
+        owners.scope = try backend.beginPublicationResourcesWithAdmission(original);
+        try owners.scope.?.resumeWithAdmission(original);
+        if (mode == .empty) {
+            // Empty immutable inputs are rejected by the builder before an
+            // output exists; the publication handoff must not hide that error.
+            try std.testing.expectError(error.EmptyRun, build(owners.scope.?, queue, native.storage(), root, true, false, original));
+            try std.testing.expectEqual(@as(usize, 0), try owners.finish(&backend, &resources.resource_manager, native.storage(), &failing));
+            backend_live = false;
+            try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
+            return .{ .checks = 0, .allocations = 0, .observed = false };
+        }
+        owners.builder = try build(owners.scope.?, queue, native.storage(), root, false, false, original);
+        const start = failing.alloc_index;
+        control.live = true;
+        control.target = if (oom) null else target;
+        control.failure = switch ((target orelse 0) % 4) {
+            0 => error.Canceled,
+            1 => error.DeadlineExceeded,
+            2 => error.ParentMemoryBusy,
+            else => error.FileNotFound,
+        };
+        if (oom) failing.fail_index = start + target.?;
+        var retry: Retry = .{ .failing = &failing, .control = &control, .oom = oom, .abort_on_error = abort_on_error };
+        var allocations: usize = 0;
+        const result: anyerror!void = work: {
+            owners.batch = retry.call(Scope.beginFlushOutputsWithAdmission, .{ owners.scope.?, owners.builder.?, original }) catch |cause| break :work cause;
+            try std.testing.expectError(error.InvalidArgument, owners.builder.?.takeCompletedWithAdmission(quotaControl()));
+            try std.testing.expectError(error.InvalidArgument, owners.builder.?.takeCompletedForOwnerWithAdmission(&control, quotaControl()));
+            retry.call(Batch.collectWithAdmission, .{ owners.batch.?, original }) catch |cause| break :work cause;
+            allocations = failing.alloc_index - start;
+            failing.fail_index = std.math.maxInt(usize);
+            control.live = false;
+            owners.builder.?.requestRetirement();
+            owners.builder = null;
+            // Two ticket guards plus the batch guard remain. The builder
+            // releases its producer guard after destroying its header, so this
+            // proves subsequent metadata construction cannot borrow the builder.
+            for (0..512) |_| {
+                if (queue.live.load(.acquire) == 3) break;
+                _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+            }
+            try std.testing.expectEqual(@as(usize, 3), queue.live.load(.acquire));
+            if (mode == .identity) {
+                const other_root = try std.fmt.allocPrint(a, "{s}-other", .{root});
+                defer a.free(other_root);
+                owners.other_builder = try build(owners.scope.?, queue, native.storage(), other_root, false, true, original);
+                owners.other_batch = try owners.scope.?.beginFlushOutputsWithAdmission(owners.other_builder.?, original);
+                try owners.other_batch.?.collectWithAdmission(original);
+                owners.other_builder.?.requestRetirement();
+                owners.other_builder = null;
+            }
+            owners.frame = try owners.scope.?.preparePublicationWithAdmission(original);
+            {
+                try std.testing.expect(backend.mu.tryLock());
+                defer backend.mu.unlock();
+                try backend.capturePreparedPublicationWithAdmission(owners.frame.?, &backend.registered_publication, backend.run_directory_generation, original);
+            }
+            const candidate_batch = owners.other_batch orelse owners.batch.?;
+            var cursor = try candidate_batch.cursorWithAdmission(original);
+            var index: usize = 0;
+            while (try cursor.nextWithAdmission(original)) |view| : (index += 1) {
+                if (mode == .missing and index == 1) continue;
+                try owners.scope.?.beginEntryFromRegisteredOutputWithAdmission(&backend, directory, view.output, view.metadata, original);
+                owners.entries[index] = try owners.scope.?.takeEntryWithAdmission(original);
+                const record = try owners.scope.?.beginRegisteredWriterWithAdmission(&backend, &owners.entries[index].?, .{}, original);
+                defer record.requestRetirement();
+                owners.views[index] = try record.takeRunWithAdmission(original);
+                try owners.frame.?.appendPutWithAdmission(&owners.entries[index].?, &owners.views[index].?, original);
+                try owners.frame.?.resumeWithAdmission(original);
+            }
+            control.live = true;
+            retry.call(Batch.bindPublicationWithAdmission, .{ owners.batch.?, owners.frame.?, original }) catch |cause| break :work cause;
+            if (mode == .missing or mode == .identity) {
+                control.live = false;
+                try std.testing.expectError(if (mode == .missing) error.InvalidArgument else error.CompactionPlanningStale, owners.batch.?.validatePublicationWithAdmission(original));
+                break :work {};
+            }
+            retry.call(Batch.validatePublicationWithAdmission, .{ owners.batch.?, original }) catch |cause| break :work cause;
+            if (mode == .stale) {
+                control.live = false;
+                const entry = &owners.entries[0].?;
+                try owners.frame.?.appendRemoveWithAdmission(.{ .run = entry.entry.run, .revision = entry.entry.payload.? }, &owners.views[0].?, 1, original);
+                {
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    try std.testing.expectError(error.CompactionPlanningStale, owners.batch.?.installWithAdmission(&backend, original));
+                }
+                try owners.frame.?.resumeWithAdmission(original);
+                try std.testing.expectError(error.CompactionPlanningStale, owners.batch.?.validatePublicationWithAdmission(original));
+                try owners.batch.?.bindPublicationWithAdmission(owners.frame.?, original);
+                try std.testing.expectError(error.InvalidArgument, owners.batch.?.validatePublicationWithAdmission(original));
+                break :work {};
+            }
+            {
+                try std.testing.expect(backend.mu.tryLock());
+                defer backend.mu.unlock();
+                retry.call(Batch.installWithAdmission, .{ owners.batch.?, &backend, original }) catch |cause| break :work cause;
+            }
+            owners.installed = true;
+            owners.frame = null;
+            try std.testing.expect(owners.batch.?.live and backend.manifest_dirty);
+            control.live = false;
+            // A terminal caller cannot turn an accepted metadata swap back
+            // into unpublished deletion debt. Cleanup uses independent scope.
+            const Canceled = struct {
+                fn check(_: *anyopaque) !void {
+                    return error.Canceled;
+                }
+            };
+            const canceled_payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Canceled.check, .check_lifetime = Canceled.check } };
+            try std.testing.expectError(error.Canceled, owners.batch.?.installWithAdmission(&backend, .init(&canceled_payload)));
+            owners.batch.?.requestRetirement();
+            owners.batch = null;
+            for (0..128) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+            try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+            var read = try backend.beginReadWithAdmission(original);
+            defer read.abort();
+            try std.testing.expectEqualStrings("one", try read.getWithAdmission(.{ .name = null }, "a", original));
+            try std.testing.expectEqualStrings("two", try read.getWithAdmission(.{ .name = null }, "b", original));
+        };
+        const checks = control.calls;
+        control.live = false;
+        if (result) |_| {} else |cause| {
+            try std.testing.expect(retry.observed and abort_on_error);
+            try std.testing.expectError(if (oom) error.OutOfMemory else control.failure, @as(anyerror!void, cause));
+        }
+        if (mode != .publish or (retry.observed and abort_on_error)) {
+            try std.testing.expect(!owners.installed);
+            try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+        }
+        const abandoned = try owners.finish(&backend, &resources.resource_manager, native.storage(), &failing);
+        backend_live = false;
+        try std.testing.expectEqual(@as(usize, if (owners.installed or mode == .empty) 0 else if (mode == .identity) 4 else 2), abandoned);
+        try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
+        if (oom) try std.testing.expect(failing.has_induced_failure);
+        if (target) |at| if (!retry.observed) try std.testing.expect(!oom and at >= checks);
+        return .{ .checks = checks, .allocations = allocations, .observed = retry.observed };
+    }
+};
+
+test "physical cache metadata registered flush publication protects actual SSTs after accepted cancellation" {
+    _ = try FlushPublicationFixture.run(.publish, null, false, false);
+    _ = try FlushPublicationFixture.run(.empty, null, false, false);
+}
+
+test "physical cache metadata registered flush publication rejects missing foreign and changed candidate coverage" {
+    for ([_]FlushPublicationFixture.Mode{ .missing, .identity, .stale }) |mode| _ = try FlushPublicationFixture.run(mode, null, false, false);
+}
+
+test "physical cache metadata registered flush publication retains original refusal and abort ownership" {
+    for ([_]bool{ false, true }) |abort_on_error| {
+        var at: usize = 0;
+        while (true) : (at += 1) {
+            const stats = try FlushPublicationFixture.run(.publish, at, false, abort_on_error);
+            if (!stats.observed) break;
+        }
+    }
+}
+
+test "physical cache metadata registered flush publication resumes allocation failures and retires exhausted partial handoffs" {
+    const count = (try FlushPublicationFixture.run(.publish, null, false, false)).allocations;
+    for ([_]bool{ false, true }) |abort_on_error| {
+        for (0..count) |at| _ = try FlushPublicationFixture.run(.publish, at, true, abort_on_error);
+    }
+}

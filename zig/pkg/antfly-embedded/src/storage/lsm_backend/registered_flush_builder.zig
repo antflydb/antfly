@@ -42,7 +42,9 @@ pub const Config = struct {
 };
 /// Sole caller ownership, including the final-file path obligation. This is
 /// construction output, never a durability receipt. The publication controller
-/// must keep the ticket through accepted manifest completion/uncertainty.
+/// retains unpublished deletion authority until an irrevocable live-root handoff
+/// (as in Run.commitOutput) or a resolved publication outcome. Manifest/WAL debt
+/// and accepted physical IO remain owned separately through completion/uncertainty.
 pub const Completed = struct {
     id: u64,
     visibility_id: u64,
@@ -98,6 +100,7 @@ pub const Owner = struct {
     partition: ?Comparison = null,
     stage: enum { plan, initialize, select, prepare, append, advance, finish, done } = .plan,
     closing: bool = false,
+    handoff_owner: ?*anyopaque = null,
     complete: bool = false,
 
     pub fn start(a: std.mem.Allocator, manager: *resources.ResourceManager, queue: *cleanup.Queue, root: []const u8, states: []const *const State, config: Config, scope: admission.Port) !*Owner {
@@ -312,9 +315,34 @@ pub const Owner = struct {
             }
         }
     }
+    pub const CompletedRange = struct { first_id: u64, end_id: u64 };
+
+    /// Exclusive handoff claim. All allocation/registration in the receiver
+    /// precedes this fixed transfer; refusal leaves the builder unclaimed.
+    pub fn claimCompletedWithAdmission(self: *Owner, receiver: *anyopaque, original: admission.Port) !CompletedRange {
+        try original.checkLifetime();
+        if (self.closing or self.stage != .done or self.handoff_owner != null or self.take_next != self.head) return error.InvalidArgument;
+        self.handoff_owner = receiver;
+        return .{ .first_id = self.config.first_id, .end_id = self.next_id };
+    }
+
     /// Returns sole output creator/ticket ownership, never a borrowed header.
     pub fn takeCompletedWithAdmission(self: *Owner, original: admission.Port) !?Completed {
         try original.checkLifetime();
+        if (self.handoff_owner != null) return error.InvalidArgument;
+        return self.takeCompletedFixed();
+    }
+    pub fn takeCompletedForOwnerWithAdmission(self: *Owner, receiver: *anyopaque, original: admission.Port) !?Completed {
+        try original.checkLifetime();
+        if (self.handoff_owner != receiver) return error.InvalidArgument;
+        return self.takeCompletedFixed();
+    }
+    pub fn completedExhaustedForOwnerWithAdmission(self: *Owner, receiver: *anyopaque, original: admission.Port) !bool {
+        try original.checkLifetime();
+        if (self.closing or self.stage != .done or self.handoff_owner != receiver) return error.InvalidArgument;
+        return self.take_next == null;
+    }
+    fn takeCompletedFixed(self: *Owner) !?Completed {
         if (self.closing or self.stage != .done) return error.InvalidArgument;
         const node = self.take_next orelse return null;
         const result: Completed = .{ .id = node.id, .visibility_id = self.next_id - 1, .rows = node.rows, .tombstones = node.tombstones, .output = node.output.?, .ticket = node.ticket.? };

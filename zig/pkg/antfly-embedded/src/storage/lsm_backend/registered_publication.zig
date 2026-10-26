@@ -157,6 +157,7 @@ pub const Candidate = struct {
     returned_ready: std.atomic.Value(bool) = .init(false),
     source_captured: bool = false,
     source_generation: ?u64 = null,
+    input_revision: u64 = 0,
     removing: bool = false,
     deadline: u64 = 0,
     ready: bool = false,
@@ -266,6 +267,18 @@ pub const Candidate = struct {
         if (self.closing or self.published or !self.ready or self.state == null) return error.InvalidArgument;
         return &self.state.?.outputs;
     }
+    /// A synchronous borrow of this exact completed edit sequence. The owner
+    /// remains alive until validation is abandoned or installation finishes.
+    /// Revisions prevent an append/retire/rebuild ABA of private root pointers.
+    pub const PreparedReceipt = struct { owner: *Candidate, revision: u64 };
+    pub fn preparedReceiptWithAdmission(self: *Candidate, original: admission.Port) !PreparedReceipt {
+        _ = try self.preparedRootsWithAdmission(original);
+        return .{ .owner = self, .revision = self.input_revision };
+    }
+    pub fn validatePreparedReceiptFixedWithAdmission(self: *Candidate, receipt: PreparedReceipt, original: admission.Port) !void {
+        try original.checkLifetime();
+        if (receipt.owner != self or receipt.revision != self.input_revision or self.closing or self.published or !self.ready or self.state == null) return error.CompactionPlanningStale;
+    }
     pub fn appendPutWithAdmission(self: *Candidate, lease: *const Directory.EntryLease, run: *const Run, original: admission.Port) !void {
         var held = try lease.retainRegisteredSourceWithAdmission(original);
         errdefer held.releaseWithAdmission(null) catch unreachable;
@@ -281,17 +294,20 @@ pub const Candidate = struct {
     fn appendWithAdmission(self: *Candidate, held: Directory.RegisteredSource, run: *const Run, removing: bool, deadline: u64, original: admission.Port) !void {
         try original.checkpoint();
         if (self.closing or self.published or !self.source_captured or self.state == null or self.state.?.next_input != null) return error.InvalidArgument;
+        if (self.input_revision == std.math.maxInt(u64)) return error.ResourceBudgetExceeded;
         if (self.state.?.run == null) {
             self.state.?.held = held;
             self.state.?.run = run.retainOwned();
             self.removing = removing;
             self.deadline = deadline;
+            self.input_revision += 1;
             return;
         }
         if (!self.ready) return error.InvalidArgument;
         // Capture the complete next input before changing edit state. Retained
         // sources and partial rotation remain registered across every refusal.
         self.state.?.next_input = .{ .held = held, .run = run.retainOwned(), .removing = removing, .deadline = deadline };
+        self.input_revision += 1;
         self.ready = false;
     }
     fn drainDisplaced(self: *Candidate, s: *State, original: admission.Port) !void {

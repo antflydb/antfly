@@ -178,6 +178,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-registered-flush-builder-test", "Verify retained multi-file flush construction, refusal and cleanup")
         .dependOn(&b.addRunArtifact(flush_builder_tests).step);
 
+    const flush_publication_tests = b.addTest(.{
+        .name = "registered-flush-publication-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata registered flush publication"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const flush_publication_run = b.addRunArtifact(flush_publication_tests);
+    flush_publication_run.addArg("--require-no-skips");
+    b.step("antfly-registered-flush-publication-test", "Verify exclusive flush handoff, coupled publication coverage and cancellation-safe file ownership")
+        .dependOn(&flush_publication_run.step);
+
     const socket_child_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/socket_child_cancellation_test_root.zig"),
         .target = target,
