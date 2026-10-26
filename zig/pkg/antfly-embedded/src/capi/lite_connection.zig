@@ -593,6 +593,7 @@ pub const Owner = struct {
     worker: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
     verification_cancel: @FieldType(NativeStore, "maintenance_cancel") = .{},
+    reader_coordinator: *native.ReaderCoordinator = undefined,
     maintenance_pending: bool = false,
     // Replay can move the checkpoint on every turn. Give physical storage a
     // fresh capture between such turns instead of always servicing a stale
@@ -976,6 +977,7 @@ pub const Owner = struct {
         snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
         snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
+        store.file.reader_coordinator = self.reader_coordinator;
         try store.file.inheritAllocatorVerification(file);
         if (self.maintenance_snapshot) |old| {
             try store.file.inheritAllocatorVerification(&old.owned_lite_backend.?.native_docstore.?.file);
@@ -1418,6 +1420,7 @@ pub const Owner = struct {
         self.retired.deinit(alloc);
         self.connections.deinit(alloc);
         self.deinitMaintenanceSchedules();
+        self.reader_coordinator.release();
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
         if (self.owned_models_dir) |directory| alloc.free(directory);
         alloc.destroy(self);
@@ -1430,6 +1433,8 @@ fn compatible(a: api.LiteResolvedOpenOptions, b: api.LiteResolvedOpenOptions) bo
     // This controls an individual caller's admission deadline, not storage.
     left.busy_timeout_ms = 0;
     right.busy_timeout_ms = 0;
+    left.reader_coordinator = null;
+    right.reader_coordinator = null;
     if (left.ttl_cleanup) |*ttl| {
         const other = right.ttl_cleanup orelse return false;
         if (!std.mem.eql(u8, ttl.owner_id, other.owner_id)) return false;
@@ -1642,7 +1647,11 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     errdefer if (existing == null) alloc.destroy(owner);
     if (existing == null) {
         owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir };
+        owner.reader_coordinator = try native.ReaderCoordinator.create(alloc, io);
+        owner.options.reader_coordinator = owner.reader_coordinator;
+        if (initial) |root| root.owned_lite_backend.?.native_docstore.?.file.reader_coordinator = owner.reader_coordinator;
     }
+    errdefer if (existing == null) owner.reader_coordinator.release();
     errdefer if (existing == null) owner.deinitMaintenanceSchedules();
     try owner.connections.ensureUnusedCapacity(alloc, 1);
     errdefer if (existing == null) owner.connections.deinit(alloc);

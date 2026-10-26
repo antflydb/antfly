@@ -4720,6 +4720,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "lite-recovery-capture-tests",
         .root_module = storage_read_admission_root,
         .filters = &.{
+            "lite coordinated",
+            "lite controlled reader fence",
             "lite allocator verification follows only identical certain owner checkpoints",
             "lite allocator detached verification cancels and refuses stale checkpoints",
             "lite allocator v4 rejects a durable free bit for a live page",

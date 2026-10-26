@@ -2179,7 +2179,9 @@ test "TcpListener accept" {
         var value: c_int = 0;
         var size: posix.socklen_t = @sizeOf(c_int);
         try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.getsockopt(result.socket.handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, @ptrCast(&value), &size)));
-        try std.testing.expectEqual(@as(c_int, 1), value);
+        // Boolean socket options are enabled by any nonzero result. Darwin
+        // returns its internal flag value rather than normalizing it to one.
+        try std.testing.expect(value != 0);
     }
 }
 

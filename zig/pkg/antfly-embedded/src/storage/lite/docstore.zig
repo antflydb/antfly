@@ -1700,7 +1700,7 @@ pub const Store = struct {
         if (self.read_generation != null) return;
         const generation = try self.allocator.create(ReadGeneration);
         errdefer self.allocator.destroy(generation);
-        generation.* = .{ .owner_generation = self.assessment_generation, .checkpoint = self.file.activeCheckpoint(), .scoped_reader_lock = self.file.externally_locked, .file = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation or self.file.externally_locked, .resource_manager = self.resource_manager }) };
+        generation.* = .{ .owner_generation = self.assessment_generation, .checkpoint = self.file.activeCheckpoint(), .scoped_reader_lock = self.file.externally_locked, .file = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation or self.file.externally_locked, .reader_coordinator = self.file.reader_coordinator, .resource_manager = self.resource_manager }) };
         self.read_generation = generation;
         self.file.secondary_page_cache = &generation.file.page_cache;
         self.file.reader_frontier = &self.reader_frontier;
@@ -1740,10 +1740,7 @@ pub const Store = struct {
                 // inode fence until exec/close, even after its parent closed
                 // the descriptor. Wait for that fence instead of failing an
                 // otherwise uncontended same-owner read.
-                if (control) |original| {
-                    try original.checkLifetime();
-                    if (!try generation.file.file.tryLock(generation.file.runtime(), .shared)) return error.Backpressured;
-                } else try generation.file.file.lock(generation.file.runtime(), .shared);
+                try generation.file.acquireReaderFenceControlled(pin.sequence, &self.file, control);
             }
             generation.kernel_readers += 1;
         }
@@ -1801,7 +1798,7 @@ pub const Store = struct {
         if (pin.next) |next| next.previous = pin.previous else generation.last_pin = pin.previous;
         if (generation.scoped_reader_lock and pin.kernel_reader) {
             generation.kernel_readers -= 1;
-            if (generation.kernel_readers == 0) generation.file.file.unlock(generation.file.runtime());
+            if (generation.kernel_readers == 0) generation.file.releaseReaderFence();
         }
         generation.references -= 1;
         if (generation.first_pin) |first| generation.pinned_at = first.pinned_at;

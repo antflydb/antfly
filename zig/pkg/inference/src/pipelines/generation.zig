@@ -16774,14 +16774,16 @@ test "speculative verification applies grammar mask before accepting draft token
     defer penalties.deinit(allocator);
     var json_grammar: ?grammar_mod.JsonGrammar = null;
 
-    // WordPiece continuation bytes include the word separator. The grammar
-    // must admit an actual vocabulary piece before it can constrain sampling.
-    var grammar = try grammar_mod.GbnfGrammar.parse(allocator, "root ::= \" hello\"");
+    // The first generated token uses standalone decoding, even after a
+    // prompt. Continuation pieces retain their word separator independently.
+    var grammar = try grammar_mod.GbnfGrammar.parse(allocator, "root ::= \"hello\"");
     defer grammar.deinit();
     var token_table = try grammar_mod.TokenByteTable.init(allocator, pipeline.tokenizer, pipeline.gpt_config.vocab_size);
     defer token_table.deinit(allocator);
-    try std.testing.expectEqualStrings(" hello", token_table.getTokenBytes(4));
-    try std.testing.expectEqualStrings(" world", token_table.getTokenBytes(5));
+    try std.testing.expectEqualStrings("hello", token_table.getTokenBytesAtPosition(4, grammar.at_start));
+    try std.testing.expectEqualStrings("world", token_table.getTokenBytesAtPosition(5, grammar.at_start));
+    try std.testing.expectEqualStrings(" hello", token_table.getTokenBytesAtPosition(4, false));
+    try std.testing.expectEqualStrings(" world", token_table.getTokenBytesAtPosition(5, false));
     const mask = try grammar.allowedTokenMaskFast(allocator, &token_table, pipeline.gpt_config.vocab_size);
     defer allocator.free(mask);
     try std.testing.expect(mask[4]);

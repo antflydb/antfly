@@ -400,6 +400,295 @@ test "lite allocator v4 overwrite reuses pages across reopen" {
     defer a.free(reopened);
     try std.testing.expectEqualSlices(u8, value, reopened);
 }
+test "lite coordinated readers permit reuse while preserving snapshots and foreign fences" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "coordinated-reuse.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.reader_coordinator = &coordinator;
+    var value: [8192]u8 = @splat('a');
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
+    var reader_open = true;
+    defer if (reader_open) reader.close();
+    const before = (try writer.allocatorStats()).?.reused_pages;
+    value[0] = 'b';
+    for (0..20) |_| try writer.putDocument("doc", &value);
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages > before);
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
+    var external = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    const blocked = (try writer.allocatorStats()).?.reused_pages;
+    for (0..4) |_| try writer.putDocument("doc", &value);
+    try std.testing.expectEqual(blocked, (try writer.allocatorStats()).?.reused_pages);
+    external.close();
+    try writer.putDocument("doc", &value);
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages > blocked);
+    try std.testing.expect((try writer.check()).valid);
+    // A writer allocation can evict an idle source synchronously. Its close
+    // must be able to unregister even while the reuse window is active.
+    var pages = try writer.pageAllocatorFromFreeMap(writer.activeCheckpoint());
+    reader.close();
+    reader_open = false;
+    pages.deinit();
+    try writer.putDocument("after-close", "safe");
+    try std.testing.expect((try writer.check()).valid);
+}
+
+test "lite controlled reader fence registers and retries both contention sources" {
+    const Budget = struct {
+        canceled: bool = false,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.canceled) return error.Canceled;
+        }
+        pub const checkLifetime = checkpoint;
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "controlled-reader-fence.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+    defer writer.close();
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true, .reader_coordinator = &coordinator });
+    defer reader.close();
+    var budget = Budget{};
+    var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    const original = read_admission.Port.init(&payload);
+    const sequence = reader.activeCheckpoint().commit_sequence;
+
+    try writer.file.lock(io, .exclusive);
+    const locked_result = reader.acquireReaderFenceControlled(sequence, &writer, original);
+    writer.file.unlock(io);
+    try std.testing.expectError(error.Backpressured, locked_result);
+    try std.testing.expect(reader.reader_fence == null);
+    try std.testing.expectEqual(@as(usize, 0), coordinator.readers.items.len);
+
+    coordinator.mutex.lockUncancelable(io);
+    const registration_result = reader.acquireReaderFenceControlled(sequence, &writer, original);
+    coordinator.mutex.unlock(io);
+    try std.testing.expectError(error.Backpressured, registration_result);
+    // A rejected registration must release its already-acquired shared lock.
+    const exclusive = try writer.file.tryLock(io, .exclusive);
+    if (exclusive) writer.file.unlock(io);
+    try std.testing.expect(exclusive);
+    try std.testing.expect(reader.reader_fence == null);
+
+    budget.canceled = true;
+    try std.testing.expectError(error.Canceled, reader.acquireReaderFenceControlled(sequence, &writer, original));
+    try std.testing.expectEqual(@as(usize, 0), coordinator.readers.items.len);
+    budget.canceled = false;
+    try reader.acquireReaderFenceControlled(sequence, &writer, original);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.readers.items.len);
+    try std.testing.expectEqual(sequence, reader.reader_fence.?.sequence);
+    reader.releaseReaderFence();
+    try std.testing.expectEqual(@as(usize, 0), coordinator.readers.items.len);
+}
+
+test "lite coordinated readers refuse reuse after an unrecognized publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "coordinated-foreign.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.reader_coordinator = &coordinator;
+    var value: [8192]u8 = @splat('a');
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
+    // Simulate another process's writer. It honors the shared inode fence,
+    // but does not know this process's reader retirement frontier.
+    writer.reader_coordinator = null;
+    value[0] = 'b';
+    for (0..4) |_| try writer.putDocument("doc", &value);
+    writer.reader_coordinator = &coordinator;
+    const before = (try writer.allocatorStats()).?.reused_pages;
+    for (0..4) |_| try writer.putDocument("doc", &value);
+    try std.testing.expectEqual(before, (try writer.allocatorStats()).?.reused_pages);
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
+    reader.close();
+    for (0..4) |_| try writer.putDocument("doc", &value);
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages > before);
+    try std.testing.expect((try writer.check()).valid);
+}
+
+test "lite coordinated readers reject late registration after external retirement" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "coordinated-late.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.reader_coordinator = &coordinator;
+    var value: [8192]u8 = @splat('a');
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    writer.reader_coordinator = null;
+    value[0] = 'b';
+    for (0..4) |_| try writer.putDocument("doc", &value);
+    writer.reader_coordinator = &coordinator;
+    try writer.putDocument("doc", &value);
+    reader.reader_coordinator = &coordinator;
+    try reader.acquireReaderFence(reader.activeCheckpoint().commit_sequence, &reader);
+    const before = (try writer.allocatorStats()).?.reused_pages;
+    for (0..4) |_| try writer.putDocument("doc", &value);
+    try std.testing.expectEqual(before, (try writer.allocatorStats()).?.reused_pages);
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
+    reader.close();
+    for (0..4) |_| try writer.putDocument("doc", &value);
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages > before);
+    try std.testing.expect((try writer.check()).valid);
+}
+
+test "lite coordinated data readers retain their coordinator after writer shutdown" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "coordinated-lifetime.aflite");
+    defer a.free(path);
+    const coordinator = try ReaderCoordinator.create(a, io);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    writer.reader_coordinator = coordinator;
+    try writer.putDocument("doc", "retained");
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = coordinator });
+    writer.close();
+    coordinator.release();
+    defer reader.close();
+    const value = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("retained", value);
+}
+
+test "lite allocator packed graph proof reads physical bundles rather than individual records" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "packed-proof.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    var keys: [256][16]u8 = undefined;
+    var mutations: [256]DocumentMutation = undefined;
+    for (&mutations, &keys, 0..) |*mutation, *key, i| mutation.* = .{
+        .key = try std.fmt.bufPrint(key, "packed-{d:0>4}", .{i}),
+        .value = "small inline document",
+    };
+    try file.putDocumentBatch(&mutations);
+    const checkpoint = file.activeCheckpoint();
+    const reference = (try file.lookupDocumentIndexPage(checkpoint, "packed-0000")).?;
+    try std.testing.expect(reference & packed_record_flag != 0);
+    file.page_cache_enabled.store(false, .monotonic);
+    file.page_cache.clear(a);
+    file.test_backing_read_calls.store(0, .monotonic);
+    var graph = try file.indexedGraph(checkpoint, null, null);
+    defer graph.deinit(a);
+    try std.testing.expectEqual(@as(u64, 256), graph.record_count);
+    const reads = file.test_backing_read_calls.load(.monotonic);
+    if (reads >= 64) std.debug.print("packed ownership proof backing reads={d} records=256\n", .{reads});
+    try std.testing.expect(reads < 64);
+}
+
+test "lite coordinator publication cancellation never performs fallible notification IO" {
+    const Fault = struct {
+        var cancel_stat: bool = false;
+        var cancel_write: bool = false;
+        var cancel_after_commit: bool = false;
+        var writes: usize = 0;
+        fn stat(userdata: ?*anyopaque, handle: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+            if (cancel_stat) return error.Canceled;
+            return std.testing.io.vtable.fileStat(userdata, handle);
+        }
+        fn write(userdata: ?*anyopaque, handle: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            writes += 1;
+            if (cancel_write) {
+                cancel_stat = true;
+                return error.Canceled;
+            }
+            const written = try std.testing.io.vtable.fileWritePositional(userdata, handle, header, data, splat, offset);
+            if (cancel_after_commit and offset == active_checkpoint_offset) cancel_stat = true;
+            return written;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "publication-cancel.aflite");
+    defer a.free(path);
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileStat = Fault.stat;
+    vtable.fileWritePositional = Fault.write;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var coordinator = ReaderCoordinator.init(a, std.testing.io);
+    defer coordinator.deinit();
+    var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.reader_coordinator = &coordinator;
+    try file.putDocument("stable", "before");
+    const before = file.header;
+    var checkpoint = file.activeCheckpoint();
+    checkpoint.commit_sequence += 1;
+    defer {
+        Fault.cancel_stat = false;
+        Fault.cancel_write = false;
+        Fault.cancel_after_commit = false;
+    }
+    Fault.writes = 0;
+    Fault.cancel_stat = true;
+    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint));
+    try std.testing.expectEqual(@as(usize, 0), Fault.writes);
+    try std.testing.expectEqualDeep(before, file.header);
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+    Fault.cancel_stat = false;
+    Fault.cancel_write = true;
+    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint));
+    try std.testing.expect(file.checkpoint_publication_uncertain);
+    try std.testing.expectEqualDeep(before, file.header);
+    Fault.cancel_stat = false;
+    Fault.cancel_write = false;
+    file.close();
+    file = try NativeFile.openWithIo(a, io, path, .{ .no_sync = true, .reader_coordinator = &coordinator });
+    try std.testing.expectEqualDeep(before, file.header);
+    // Cancellation after the active-slot write cannot undo a committed result
+    // or make its coordinator notification abort the process.
+    Fault.cancel_after_commit = true;
+    try file.publishCheckpoint(checkpoint);
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+    try std.testing.expectEqual(checkpoint, file.activeCheckpoint());
+    Fault.cancel_after_commit = false;
+    Fault.cancel_stat = false;
+    const value = (try file.getDocumentAlloc(a, "stable")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("before", value);
+    try std.testing.expect((try file.check()).valid);
+}
+
 test "lite allocator v4 long keys shared values incremental deletion and vacuum" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2209,6 +2498,7 @@ const PageAllocator = struct {
     record_page: u64 = 0,
     encoded_record: std.ArrayListUnmanaged(u8) = .empty,
     data_lock_file: ?std.Io.File = null,
+    coordinated_reader_window: bool = false,
     ledger: ?*allocator_v4.State = null,
     ledger_persisted: bool = false,
     can_reuse: bool = false,
@@ -2222,6 +2512,7 @@ const PageAllocator = struct {
         if (self.data_lock_file) |lock_file| {
             lock_file.close(self.file.runtimeIo());
         }
+        if (self.coordinated_reader_window) self.file.endReaderWindow();
         self.file.allocator.free(self.free_pages);
         self.encoded_record.deinit(self.file.allocator);
         self.reused.deinit(self.file.allocator);
@@ -2504,6 +2795,10 @@ pub const LockMode = enum {
 
 pub const OpenOptions = struct {
     externally_locked: bool = false,
+    /// Internal data-reader coordination. The caller holds the path-writer
+    /// lease for every publication; coordinated readers never inspect old
+    /// allocator metadata. Integrity/allocator snapshots retain normal locks.
+    reader_coordinator: ?*ReaderCoordinator = null,
     /// Owner read-only opens wait for in-place service; primitives default to fail-fast.
     wait_for_reader_lock: bool = false,
     internal_reader: bool = false,
@@ -3363,6 +3658,8 @@ pub const VacuumImage = struct {
     }
 };
 
+pub const ReaderCoordinator = @import("reader_coordinator.zig").Coordinator;
+
 pub const NativeFile = struct {
     allocator: Allocator,
     /// The default constructors own this Threaded runtime. Borrowed-I/O
@@ -3378,6 +3675,11 @@ pub const NativeFile = struct {
     writer_lock_file: ?std.Io.File = null,
     /// The embedded connection layer holds the path lease around complete calls.
     externally_locked: bool = false,
+    reader_coordinator: ?*ReaderCoordinator = null,
+    reader_fence: ?*ReaderCoordinator.Fence = null,
+    reader_window_depth: usize = 0,
+    reader_window_lock: ?std.Io.File = null,
+    reader_window_previous_frontier: ?u64 = null,
     header: Header,
     transaction_header: ?Header = null,
     // Lease-only metadata transactions may append without proving free-page
@@ -3514,11 +3816,15 @@ pub const NativeFile = struct {
             .file = file,
             .writer_lock_file = writer_lock_file,
             .externally_locked = opts.externally_locked,
+            .reader_coordinator = opts.reader_coordinator,
             .header = header,
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
             .page_cache_enabled = .init(true),
         };
+        if (opts.read_only and !opts.internal_reader and !opts.externally_locked) {
+            if (opts.reader_coordinator) |coordinator| result.reader_fence = try coordinator.register(file, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
+        }
         if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
     }
@@ -3665,6 +3971,8 @@ pub const NativeFile = struct {
     }
 
     pub fn close(self: *NativeFile) void {
+        std.debug.assert(self.reader_window_depth == 0);
+        if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
         self.transaction_writes = null;
         // Native convenience IO is owned here; once joined, use the process
@@ -3774,6 +4082,64 @@ pub const NativeFile = struct {
         return reader;
     }
 
+    fn headerFingerprint(self: *NativeFile) [32]u8 {
+        var encoded: [header_size]u8 = undefined;
+        encodeHeader(&encoded, self.transaction_header orelse self.header);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(&encoded, &digest, .{});
+        return digest;
+    }
+
+    /// Read-generation locks join the same-owner frontier only while pinned.
+    pub fn acquireReaderFence(self: *NativeFile, sequence: u64, owner: *NativeFile) !void {
+        return self.acquireReaderFenceControlled(sequence, owner, null);
+    }
+    /// Admitted readers never wait for either coordination lock while the
+    /// store's reader mutex is held. Failed registration releases the inode
+    /// fence before the caller retries outside its local locks.
+    pub fn acquireReaderFenceControlled(self: *NativeFile, sequence: u64, owner: *NativeFile, control: ?read_admission.Port) !void {
+        if (control) |original| {
+            try original.checkLifetime();
+            if (!try self.file.tryLock(self.runtime(), .shared)) return error.Backpressured;
+        } else try self.file.lock(self.runtime(), .shared);
+        errdefer self.file.unlock(self.runtime());
+        if (self.reader_coordinator) |coordinator| self.reader_fence = try coordinator.registerControlled(self.file, (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), control != null);
+    }
+    pub fn releaseReaderFence(self: *NativeFile) void {
+        if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
+        self.reader_fence = null;
+        self.file.unlock(self.runtime());
+    }
+    fn beginReaderWindow(self: *NativeFile) !bool {
+        const coordinator = self.reader_coordinator orelse return false;
+        if (self.reader_window_depth != 0) {
+            self.reader_window_depth += 1;
+            return true;
+        }
+        const inode = (try self.file.stat(self.runtime())).inode;
+        const frontier = coordinator.begin(inode, self.headerFingerprint(), self.free_pages_verified);
+        errdefer coordinator.end();
+        self.reader_window_previous_frontier = self.minimum_reader_sequence;
+        if (frontier) |sequence| self.minimum_reader_sequence = @min(self.minimum_reader_sequence orelse sequence, sequence);
+        errdefer self.minimum_reader_sequence = self.reader_window_previous_frontier;
+        const held = if (self.free_pages_verified) acquireDataRewriteLock(self.runtime(), self.path) catch |err| switch (err) {
+            error.WouldBlock => null,
+            else => return err,
+        } else null;
+        self.reader_window_lock = if (held) |lock| lock.file else null;
+        self.reader_window_depth = 1;
+        return true;
+    }
+    fn endReaderWindow(self: *NativeFile) void {
+        std.debug.assert(self.reader_window_depth != 0);
+        self.reader_window_depth -= 1;
+        if (self.reader_window_depth != 0) return;
+        if (self.reader_window_lock) |held| held.close(self.runtime());
+        self.reader_window_lock = null;
+        self.minimum_reader_sequence = self.reader_window_previous_frontier;
+        self.reader_coordinator.?.end();
+    }
+
     fn invalidateLedger(self: *NativeFile) void {
         if (self.ledger) |state| {
             state.deinit();
@@ -3829,11 +4195,15 @@ pub const NativeFile = struct {
         values: std.AutoHashMapUnmanaged(u64, u64) = .empty,
         owners: ?*allocator_v4.State = null,
         record_count: u64 = 0,
+        // Packed record validation borrows one physical page at a time. Never
+        // synthesize and checksum a full page for each inline record.
+        record_reader: RecordPageReader = .{},
         pub fn deinit(graph: *IndexedGraph, a: Allocator) void {
             graph.pages.deinit(a);
             graph.nodes.deinit(a);
             graph.records.deinit(a);
             graph.values.deinit(a);
+            graph.record_reader.deinit(a);
         }
     };
 
@@ -3909,8 +4279,7 @@ pub const NativeFile = struct {
                 if (graph.records.contains(reference)) return error.InvalidDocumentIndex;
                 try graph.records.put(self.allocator, reference, {});
                 try self.indexedMark(graph, checkpoint, reference);
-                const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, reference, kind, checkpoint);
-                defer self.allocator.free(payload);
+                const payload = try graph.record_reader.read(self, self.allocator, checkpoint, reference, kind);
                 const record: CatalogEntry = switch (kind) {
                     .catalog => try decodeCatalogEntry(payload),
                     .document => blk: {
@@ -8821,13 +9190,15 @@ pub const NativeFile = struct {
                 _ = try self.validateIndexedAllocator(checkpoint, state, self.allocator_cancel_token);
                 self.free_pages_verified = true;
             }
-            const lock = if (self.free_pages_verified) acquireDataRewriteLock(self.runtimeIo(), self.path) catch |err| switch (err) {
+            const coordinated = try self.beginReaderWindow();
+            errdefer if (coordinated) self.endReaderWindow();
+            const lock = if (self.free_pages_verified and !coordinated) acquireDataRewriteLock(self.runtimeIo(), self.path) catch |err| switch (err) {
                 error.WouldBlock => null,
                 else => return err,
             } else null;
             errdefer if (lock) |held| held.file.close(self.runtimeIo());
             _ = try self.drainRetirement(state, checkpoint, self.retirement_work_pages);
-            return .{ .file = self, .free_pages = &.{}, .next_page_id = checkpoint.page_count, .ledger = state, .can_reuse = lock != null, .data_lock_file = if (lock) |held| held.file else null };
+            return .{ .file = self, .free_pages = &.{}, .next_page_id = checkpoint.page_count, .ledger = state, .can_reuse = lock != null or (coordinated and self.reader_window_lock != null), .coordinated_reader_window = coordinated, .data_lock_file = if (lock) |held| held.file else null };
         }
         var free_pages = try self.readFreePagesAlloc(checkpoint);
         errdefer self.allocator.free(free_pages);
@@ -9650,6 +10021,12 @@ pub const NativeFile = struct {
             self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
             return;
         }
+        // Capture fallible notification inputs before any checkpoint I/O.
+        // Cancellation during publication must propagate without a second,
+        // cancelable stat turning unwind into a process abort.
+        const publication_inode: ?u64 = if (self.reader_coordinator != null) (try self.file.stat(self.runtime())).inode else null;
+        const previous_tip = self.headerFingerprint();
+        defer if (self.reader_coordinator) |coordinator| coordinator.published(publication_inode.?, previous_tip, self.headerFingerprint(), self.checkpoint_publication_uncertain);
         defer self.notifyPublication();
         if (self.durable_header) |durable| {
             self.header = durable;
