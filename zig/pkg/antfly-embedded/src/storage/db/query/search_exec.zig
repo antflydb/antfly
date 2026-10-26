@@ -12029,7 +12029,7 @@ fn sortAndPageTextDocValueFilterAlloc(
     executor: SearchTextQueryExecutor,
     plan: SortExecutionPlan,
 ) !types.SearchResult {
-    var membership = try buildSortedSegmentDocMembershipMode(alloc, snapshot, filter, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns }, executor.native_count_visibility_exact and !req.count_only and !req.evaluation_matches and req.limit != 0 and (plan.sorted_primary_executor_available or plan.sorted_segment_executor_available or plan.kind == .id_only));
+    var membership = try buildSortedSegmentDocMembershipMode(alloc, snapshot, filter, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns }, executor.native_count_visibility_exact and !req.count_only and !req.evaluation_matches and req.limit != 0 and (plan.sorted_primary_executor_available or plan.sorted_segment_executor_available or plan.kind == .id_only or executor.open_ordered_candidates != null));
     defer membership.deinit(alloc);
     return try sortAndPageTextDocValueCandidatesAlloc(alloc, req, snapshot, &.{}, &membership, executor, plan);
 }
@@ -37511,6 +37511,85 @@ test "producer top k demand sizing caps dense pages and batches sparse boundary 
     try std.testing.expectEqual(@as(usize, 16), demand.width(16, 1));
     try std.testing.expectEqual(@as(usize, 1), demand.width(1, 20));
     std.debug.print("DEMAND_PREFETCH limit=1 initial_tile=2 dense_remaining=5 sparse_tile=16\n", .{});
+}
+
+test "producer top k keeps metadata membership lazy for independent ordered indexes and exact fallback" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const docs = try arena.allocator().alloc(TestSortedPriceDoc, 128);
+    for (docs, 0..) |*doc, i| doc.* = .{ .id = try std.fmt.allocPrint(arena.allocator(), "native-{d:0>4}", .{i}), .price = @floatFromInt(127 - i), .ordinal = @intCast(i) };
+    const bytes = try buildTestSortedPriceSegmentAlloc(a, docs);
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const State = struct {
+        decline: bool = false,
+        materializations: usize = 0,
+        probed: usize = 0,
+        doc: i64 = 127,
+        scanned: u64 = 0,
+        fn many(raw: *anyopaque, _: Allocator, ids: []const u32, allowed: []bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.probed += ids.len;
+            for (ids, allowed) |id, *keep| keep.* = id % 3 == 0;
+        }
+        fn produce(raw: *anyopaque, out: Allocator, base: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.decline) return error.UnexpectedMetadataMaterialization;
+            self.materializations += 1;
+            var result = roaring.RoaringBitmap.init(out);
+            errdefer result.deinit();
+            for (0..count) |i| if ((base + @as(u32, @intCast(i))) % 3 == 0 and (candidates == null or candidates.?.contains(@intCast(i)))) {
+                try result.add(@intCast(i));
+            };
+            return result;
+        }
+        fn open(raw: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: *const index_mod.IndexSnapshot) !?OrderedTextCandidates {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.decline) return null;
+            return .{ .ptr = self, .next = next, .close = close, .scanned_count = scannedCount, .complete_order = true };
+        }
+        fn next(raw: *anyopaque, budget: usize) !?u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.doc < 0) return null;
+            if (budget == 0) return error.OrderedCandidateBudgetExceeded;
+            const doc: u32 = @intCast(self.doc);
+            self.doc -= 1;
+            self.scanned += 1;
+            return doc;
+        }
+        fn scannedCount(raw: *anyopaque) u64 {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).scanned;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state: State = .{};
+    const filter: query_mod.Filter = .{ .bool_filter = .{ .must = &.{ .match_all, .{ .doc_num = .{ .doc_nums = &.{}, .producer = .{ .ptr = &state, .contains_many = State.many, .produce = State.produce } } } }, .should = &.{}, .must_not = &.{} } };
+    const executor: SearchTextQueryExecutor = .{ .ctx = &state, .text_index_entry = undefined, .text_index_is_chunk_backed = undefined, .search_match_all = undefined, .project_stored_search = undefined, .load_stored = testUnexpectedLoadStoredCallback, .postprocess = undefined, .native_count_visibility_exact = true, .open_ordered_candidates = State.open };
+    const req: types.SearchRequest = .{ .include_stored = false, .profile = true, .limit = 12, .order_by = &.{ .{ .field = "price" }, .{ .field = "_id" } } };
+    var schema = testSortedPriceSchema();
+    schema.index_sort = &.{};
+    const plan = try planTextNativeSortFields(req, writer.snapshot(), schema);
+    try std.testing.expect(!plan.sorted_primary_executor_available and !plan.sorted_segment_executor_available);
+    var ordered = try sortAndPageTextDocValueFilterAlloc(a, req, writer.snapshot(), filter, executor, plan);
+    defer ordered.deinit();
+    try std.testing.expectEqual(@as(usize, 12), ordered.hits.len);
+    try std.testing.expect(state.probed > 0 and state.probed < docs.len);
+    try std.testing.expectEqual(@as(usize, 0), state.materializations);
+    try std.testing.expectEqualStrings("ordered_lake_index", ordered.sort_profile.?.candidate_source);
+    state.decline = true;
+    var fallback = try sortAndPageTextDocValueFilterAlloc(a, req, writer.snapshot(), filter, executor, plan);
+    defer fallback.deinit();
+    try std.testing.expectEqual(@as(usize, 1), state.materializations);
+    try std.testing.expectEqual(@as(u32, 43), fallback.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, fallback.total_hits_relation);
+    for (ordered.hits, fallback.hits, 0..) |hit, expected, i| {
+        try std.testing.expectEqualStrings(docs[126 - i * 3].id, hit.id);
+        try std.testing.expectEqualStrings(expected.id, hit.id);
+        try std.testing.expectEqualDeep(expected.sort_values, hit.sort_values);
+    }
 }
 
 test "producer top k proven page scores Boolean winners without probing metadata twice" {

@@ -1472,6 +1472,10 @@ ordered index only when all primary-key directions agree on that reversal;
 public-ID tie direction remains independent. A difference between SQL index and
 search NULL placement is admissible only for a nonnullable column or a required
 scalar predicate proving NULLs absent. Otherwise the ordered plan declines.
+The generic native sorter also admits lazy Boolean membership for an independent
+ordered provider, even when the physical segment order differs. Winning-prefix
+probes stay bounded; a declined provider or exhausted ordered walk resumes the
+complete compressed membership iterator and exact collector.
 Early stopping reports
 a lower-bound total; explicit exact counts still enumerate complete membership.
 The identity-only ordered cursor may also attest the complete compiled filter:
