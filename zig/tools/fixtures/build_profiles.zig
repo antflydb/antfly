@@ -16,6 +16,17 @@
 //! Inspect production module profiles before fixtures substitute entry bodies.
 const std = @import("std");
 
+// Native Nix glibc Zig 0.17.0, stripped GNU Debug ownership audit,
+// run 40380791678: whole-build peak 7,656,402,944 bytes. Only the audit
+// wrapper applies this envelope after identifying the immutable compiler.
+pub const native_linux_audit_compile_cap: u64 = 10 * 1024 * 1024 * 1024;
+
+test "ownership audit claims cover measured peak and retain two job overlap" {
+    const peak: u64 = 7_656_402_944;
+    try std.testing.expect(native_linux_audit_compile_cap >= peak + peak / 4);
+    try std.testing.expect(2 * native_linux_audit_compile_cap <= 20 * 1024 * 1024 * 1024);
+}
+
 /// Tiny entry bodies still consume the production owner's observability inputs.
 pub fn addObservabilityProbe(root: *std.Build.Module, owner: *std.Build.Module) void {
     root.addImport("cache_prometheus", owner.import_table.get("prometheus") orelse

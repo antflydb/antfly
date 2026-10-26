@@ -27,6 +27,7 @@ import argparse
 from collections import deque
 import json
 import os
+import platform
 import re
 import signal
 import shlex
@@ -252,6 +253,50 @@ def active_build_processes(root_pid: int, cwd: Path) -> list[dict]:
     return process_diagnostics(snapshot, root_pid, cwd)
 
 
+# Immutable Nix compiler from native run 40380791678 (glibc-linked Zig 0.17.0).
+# Its complete stripped Debug audit peaked at 7,656,402,944 bytes for the whole
+# process tree. The audit-only 10 GiB cap retains >40% above that upper bound.
+# A different derivation must be measured before opting into this profile.
+QUALIFIED_AUDIT_COMPILER = Path(
+    "/nix/store/3swwykg6la02jblm03z3s4fxhiqdmpsm-zig-0.17.0/bin/zig"
+)
+
+
+def qualified_audit_memory(zig: str, jobs: int = 2) -> bool:
+    if jobs != 2 or sys.platform != "linux" or platform.machine() != "x86_64":
+        return False
+    executable = shutil.which(zig)
+    return (
+        executable is not None
+        and Path(executable).resolve() == QUALIFIED_AUDIT_COMPILER
+    )
+
+
+def cgroup_memory_stat() -> dict[str, int]:
+    """Separate anonymous compiler memory from reclaimable cached file pages."""
+    if sys.platform != "linux":
+        return {}
+    try:
+        fields = dict(
+            line.split()
+            for line in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines()
+        )
+        return {
+            key: int(fields[key])
+            for key in (
+                "anon",
+                "file",
+                "file_mapped",
+                "file_dirty",
+                "inactive_file",
+                "kernel",
+            )
+            if key in fields
+        }
+    except (OSError, ValueError):
+        return {}
+
+
 def bounded_build_command(zig: str, arguments: list[str]) -> list[str]:
     return [
         sys.executable,
@@ -283,6 +328,8 @@ def measured_build(
     min_disk_free = shutil.disk_usage(cwd).free
     timed_out = False
     active_processes = []
+    cgroup = {}
+    peak_anon = peak_file = None
     last_report = started
     with tempfile.TemporaryFile(mode="w+") as output:
         process = subprocess.Popen(
@@ -320,10 +367,18 @@ def measured_build(
                 min_disk_free = min(min_disk_free, shutil.disk_usage(cwd).free)
                 samples += 1
                 if now - last_report >= 30:
+                    cgroup = cgroup_memory_stat()
+                    if "anon" in cgroup:
+                        peak_anon = max(peak_anon or 0, cgroup["anon"])
+                    if "file" in cgroup:
+                        peak_file = max(peak_file or 0, cgroup["file"])
                     if not timed_out:
                         active_processes = active_build_processes(process.pid, cwd)
                     current = {
                         "active_processes": active_processes,
+                        "cgroup_memory_stat": cgroup,
+                        "peak_sampled_cgroup_anon_bytes": peak_anon,
+                        "peak_sampled_cgroup_file_bytes": peak_file,
                         "wall_seconds": round(now - started, 3),
                         "peak_build_tree_rss_bytes": peak_tree,
                         "peak_process_rss_bytes": peak_process,
@@ -351,6 +406,10 @@ def measured_build(
                 "cpu_seconds": round(usage.ru_utime + usage.ru_stime, 3),
                 "cpu_accounting_complete": not timed_out,
                 "active_processes": active_processes,
+                "cgroup_memory_stat": cgroup,
+                "peak_sampled_cgroup_anon_bytes": peak_anon,
+                "peak_sampled_cgroup_file_bytes": peak_file,
+                "cgroup_sample_interval_seconds": 30,
                 "peak_build_tree_rss_bytes": peak_tree,
                 "peak_process_rss_bytes": peak_process,
                 "rss_samples": samples,
@@ -438,6 +497,7 @@ def main() -> None:
             )
         return
     records = []
+    measured_memory = qualified_audit_memory(args.zig, args.jobs)
     if args.jobs <= 0:
         parser.error("--jobs must be positive")
 
@@ -553,9 +613,23 @@ def main() -> None:
                 "--cache-dir",
                 str(local_cache),
             ]
+            if measured_memory:
+                # Keep every qualified axis explicit; other compiler/profile
+                # combinations retain the production reservations unchanged.
+                arguments.extend(
+                    [
+                        "-Dnative-linux-ownership-memory=true",
+                        "-Dcpu=baseline",
+                        "-Dcuda=false",
+                        "-Dinference-optimize=debug",
+                    ]
+                )
             command = bounded_build_command(args.zig, arguments)
             record = {
                 "case": label,
+                "memory_profile": "nix-glibc-0.17-stripped-debug"
+                if measured_memory
+                else "production",
                 "status": "running",
                 "command": command,
                 "disk_free_before_bytes": shutil.disk_usage(work).free,
