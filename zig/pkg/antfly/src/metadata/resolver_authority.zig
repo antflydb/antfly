@@ -27,11 +27,13 @@ pub const AliasProfile = records.AliasProfile;
 /// Private proof captured atomically with the physical table definition.
 /// It is never accepted from public table/index JSON or client actors.
 pub const Admission = struct { table_id: u64, name: []const u8, native: bool, schema: [32]u8, query_schema: ?[32]u8 = null };
+pub const QueryProfileReference = struct { target: []const u8, id: []const u8 };
 pub const Read = struct {
     mode: enum { entity, membership, proposal, proposals, receipt, policy } = .entity,
     key_template: []const u8 = "",
     texts: []const []const u8 = &.{},
     aliases: []const @import("antfly_resolver").KeyAlias = &.{},
+    query_profile: ?QueryProfileReference = null,
     distinct: bool = false,
     expected_head: ?records.Stamp = null,
     key: []const u8 = "",
@@ -51,7 +53,7 @@ pub const Read = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "static_profiles")) self.static_profiles else if (comptime std.mem.eql(u8, field, "heads_only")) self.heads_only else true;
+            const include = if (comptime std.mem.eql(u8, field, "static_profiles")) self.static_profiles else if (comptime std.mem.eql(u8, field, "heads_only")) self.heads_only else if (comptime std.mem.eql(u8, field, "query_profile")) self.query_profile != null else if (comptime std.mem.eql(u8, field, "aliases")) self.query_profile == null else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));

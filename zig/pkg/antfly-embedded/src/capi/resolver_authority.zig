@@ -863,6 +863,7 @@ pub const QuerySession = struct {
     targets: std.StringHashMapUnmanaged(Target) = .empty,
     schemas: std.StringHashMapUnmanaged(SchemaStamp) = .empty,
     legacy: std.StringHashMapUnmanaged([32]u8) = .empty,
+    profiles: std.StringHashMapUnmanaged([]const u8) = .empty,
     fn identity(a: A, table: []const u8, template: []const u8) ![]const u8 {
         return std.fmt.allocPrint(a, "{s}\x00{s}", .{ table, template });
     }
@@ -922,6 +923,7 @@ pub const QuerySession = struct {
         var result: QuerySession = .{ .a = a, .root = root, .database = handle.database(), .selected = selected, .definitions = try declarations(a, configs, selected), .source_schema = try schema(handle.database(), root.alloc) };
         for (configs) |cfg| {
             if (!runs(selected, cfg)) continue;
+            if (cfg.aliases.len != 0) try result.profiles.put(a, cfg.name, try (native.static_profiles.Definition{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json }).identity(a));
             const db = try tables.get(root, cfg.table);
             const key = try identity(a, cfg.table, cfg.key_template);
             if (!result.targets.contains(key)) try result.targets.put(a, key, .{ .table = cfg.table, .template = cfg.key_template, .table_id = db.core.identity_namespace.table_id, .stamp = try namespaceStamp(db, a, cfg.key_template) });
@@ -988,6 +990,16 @@ pub const QuerySession = struct {
         };
         var current = cfg.*;
         if (captured.stamp) |expected| {
+            var prepared: ?native.Store.PreparedQuery = null;
+            defer if (prepared) |query| query.release();
+            if (cfg.aliases.len != 0 and seeds.count() != 0) {
+                var txn = try db.core.store.beginReadTxn();
+                defer txn.abort();
+                var bridge: Bridge = .{ .txn = &txn };
+                var inline_profile: native.Store.InlineQueryProfile = .{ .aliases = cfg.aliases };
+                prepared = (try bridge.store(a, prefix).prepareQuery(cfg.key_template, .{ .id = self.profiles.get(cfg.name) orelse return error.Busy, .ptr = &inline_profile, .load = native.Store.InlineQueryProfile.load }, candidates != null)) orelse return error.Busy;
+                if (prepared.?.stamp.revision != expected.revision or !std.mem.eql(u8, &prepared.?.stamp.fingerprint, &expected.fingerprint)) return error.Busy;
+            }
             var joined: native.QueryPolicyUnion = .{};
             var seed_offset: usize = 0;
             var text_offset: usize = 0;
@@ -1003,7 +1015,7 @@ pub const QuerySession = struct {
                 if (head.revision != expected.revision or !std.mem.eql(u8, &head.fingerprint, &expected.fingerprint)) return error.Busy;
                 const seed_end = @min(seeds.count(), seed_offset + 1024);
                 const text_end = @min(texts.count(), text_offset + 128);
-                const part = (try store.queryPolicy(cfg.key_template, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], cfg.aliases, candidates != null)) orelse return error.Busy;
+                const part = if (prepared) |query| try store.queryPrepared(query, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], candidates != null) else (try store.queryPolicy(cfg.key_template, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], &.{}, candidates != null)) orelse return error.Busy;
                 try joined.add(a, page, part);
                 seed_offset = seed_end;
                 text_offset = text_end;

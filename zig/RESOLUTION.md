@@ -2356,14 +2356,20 @@ format 3 and topology protocol 51 fence writers that cannot maintain this index.
 ### Query policy and destination proof costs
 
 Configured aliases and live native redirects compose at a pinned namespace head.
-Scoring obtains static keys that carry native pin counts through a sorted-key
-intersection with the sparse `pin-count` index. Each bounded seek skips absent
-alias keys and jumps to the next possible posting. Only matching keys need live
-forward path qualification; reverse native pin branches then provide incident
-distinct pairs. Native overrides and removal tombstones take precedence along
-every qualified path. Unrelated configured aliases cause no per-alias policy
-reads, including when an unrelated distinct pair exists in the namespace. The
-same operation serves embedded queries and routed policy pages.
+A prepared immutable context indexes distinct pairs by effective canonical
+component and is keyed by profile identity plus exact native head lineage. Warm
+reads follow only requested/incident paths; unrelated pinned aliases do not
+trigger forward qualification. A cold context reads the graph once in bounded
+sequential pages outside writer ownership. The shared cache is limited to 64 MiB
+and 32 entries, with reference-counted leases across pages and eviction.
+
+Routed pages reference the enrolled immutable profile instead of retransmitting
+its alias universe. Each page revalidates enrollment, logical target and native
+head; full declarations load only on cache misses. The source query fence still
+revalidates schema, binding, incarnation and authorization before returning.
+Protocol 54 qualifies references against the existing v10 directory; missing
+readiness retains inline compatibility. Embedded phases reuse one prepared
+lease. Text-only pages skip identity preparation, aliases and distinct discovery.
 
 Metadata stores ordinary destination query fingerprints atomically with table
 DDL, independently of native curation admission. Initial query admission and

@@ -23153,12 +23153,37 @@ pub const RaftApplyStore = struct {
         result.queue_revision = queue.revision;
         result.proposals.receipt_scope = queue.receipt_scope;
         switch (read.mode) {
-            .policy => {
+            .policy => policy_read: {
                 if (read.expected_head) |expected| {
                     const actual = try store.head(read.key_template) orelse return error.CatalogGenerationChanged;
                     if (actual.revision != expected.revision or !std.mem.eql(u8, &actual.fingerprint, &expected.fingerprint)) return error.CatalogGenerationChanged;
                 }
                 if (read.seeds.len > 16384 or read.texts.len > 4096 or read.key_template.len > 16384) return error.InvalidResolverCurationRequest;
+                if (read.seeds.len != 0) if (read.query_profile) |reference| {
+                    if (read.aliases.len != 0) return error.InvalidResolverCurationRequest;
+                    const binding = (try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, a, txn, group, try system_catalog.Target.parse(reference.target))) orelse return error.CatalogGenerationChanged;
+                    if (binding.table_id != table.table_id) return error.CatalogGenerationChanged;
+                    const target = try resolverTargetPrefix(a, group, try system_catalog.Target.parse(reference.target));
+                    const profile_root = try staticProfileRoot(a, target, read.key_template);
+                    if (!try StaticProfiles.queryReferenceActive(a, txn, profile_root, reference.id, read.key_template)) return error.CatalogGenerationChanged;
+                    const Loader = struct {
+                        txn: *docstore.DocStore.Txn,
+                        root: []const u8,
+                        id: []const u8,
+                        template: []const u8,
+                        fn load(ptr: *anyopaque, allocator: std.mem.Allocator) ![]const @import("antfly_resolver").KeyAlias {
+                            const self_: *@This() = @ptrCast(@alignCast(ptr));
+                            if (builtin.is_test) _ = test_query_profile_loads.fetchAdd(1, .monotonic);
+                            return StaticProfiles.queryAliases(allocator, self_.txn, self_.root, self_.id, self_.template);
+                        }
+                    };
+                    var loader: Loader = .{ .txn = txn, .root = profile_root, .id = reference.id, .template = read.key_template };
+                    const prepared = (try store.prepareQuery(read.key_template, .{ .id = reference.id, .ptr = &loader, .load = Loader.load }, read.distinct)) orelse return error.CatalogGenerationChanged;
+                    defer prepared.release();
+                    const snapshot = try store.queryPrepared(prepared, read.seeds, read.texts, read.distinct);
+                    result.namespaces = try a.dupe(native.Snapshot, &.{snapshot});
+                    break :policy_read;
+                };
                 if (try store.queryPolicy(read.key_template, read.seeds, read.texts, read.aliases, read.distinct)) |snapshot|
                     result.namespaces = try a.dupe(native.Snapshot, &.{snapshot});
             },
@@ -23506,6 +23531,7 @@ pub const RaftApplyStore = struct {
     pub var test_query_descriptors: std.atomic.Value(usize) = .init(0);
     pub var test_query_producers: std.atomic.Value(usize) = .init(0);
     pub var test_query_destination_fallbacks: std.atomic.Value(usize) = .init(0);
+    pub var test_query_profile_loads: std.atomic.Value(usize) = .init(0);
     fn resolverQueryDescriptorsTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, source: u64, input: @import("../resolver_catalog_read.zig").Request) ![]QueryConfig {
         var selected: std.StringArrayHashMapUnmanaged(QueryConfig) = .empty;
         if (input.projection_names) |names| {
@@ -23666,6 +23692,9 @@ pub const RaftApplyStore = struct {
             }
             result.ranges = ranges;
             if (input.policy_descriptors) {
+                // The enrolled immutable profile directory can replace raw
+                // alias arrays on subsequent query-policy pages.
+                result.indexed = try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group_id)) != null;
                 const Descriptor = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
                 const descriptors = if (query_source != null)
                     try resolverQueryDescriptorsTxn(a, &txn, group_id, table.table_id, input)
@@ -42200,6 +42229,84 @@ test "resolver curation namespace propagation duplicate proposals return point r
     try std.testing.expect(receipt.has_consumers == null);
     try std.testing.expect(bytes.len < 2048);
     std.debug.print("RECEIPT namespaces=512 discovered=0 response_bytes={d}\n", .{bytes.len});
+}
+
+test "resolver curation namespace propagation query profile references reuse canonical pins and fence retirement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/query-profile-references", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = path });
+    defer store.deinit();
+    const group: u64 = 41;
+    const domain = @import("../resolver_authority.zig");
+    const pure = @import("antfly_resolver");
+    const wire = @import("../resolver_catalog_read.zig");
+    const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
+    const template = "entity/{{_key}}";
+    const aliases = try a.alloc(pure.KeyAlias, 1000);
+    const pairs = try a.alloc(pure.curation.Pair, 1000);
+    for (aliases, pairs, 0..) |*alias, *pair, i| {
+        alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/routed-{d}", .{i}), .target = "entity/routed-root" };
+        pair.* = .{ .from = alias.key, .to = try std.fmt.allocPrint(a, "entity/routed-other-{d}", .{i}) };
+    }
+    var namespace: resolver_curation.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .distinct = pairs } };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "entities" } });
+    var destination = (try store.getTable(a, group, 1)).?;
+    const bootstrap: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, destination), .bootstrap = .{ .expected_indexes = try pure.fingerprint(a, destination.indexes_json) }, .patches = &.{try domain.records.difference(a, .{ .key_template = template }, namespace)} };
+    try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, bootstrap, .{}) });
+    var cfg: Config = .{ .name = "r", .table = "entities", .key_template = template, .source_artifact = "kg", .resolution_artifact = "resolved", .aliases = aliases, .promote = false };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = &.{cfg} }, .{}) } });
+    var turns: usize = 0;
+    while (try store.pendingResolverNamespaceWork(a, group, true)) |work| {
+        try std.testing.expect(turns < 8);
+        try store.applyStandaloneCommand(group, .{ .advance_resolver_namespace = work.advance });
+        turns += 1;
+    }
+    const source_page = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "source", .policy_descriptors = true, .projection_names = &.{"r"}, .standalone = true }), .{});
+    try std.testing.expect(source_page.indexed);
+    const profile: RaftApplyStore.StaticProfiles.Definition = .{ .key_template = template, .aliases = aliases };
+    var read: domain.Read = .{ .mode = .policy, .key_template = template, .seeds = &.{"entity/seed"}, .distinct = true, .expected_head = source_page.query_heads[0].stamp, .query_profile = .{ .target = "entities", .id = try profile.identity(a) } };
+    const input: wire.Request = .{ .table_name = "entities", .table_id = 1, .mode = .authority, .standalone = true, .authority = read };
+    const loads = RaftApplyStore.test_query_profile_loads.load(.monotonic);
+    const first = try std.json.parseFromSliceLeaky(domain.View, a, try store.resolverCatalogRead(a, group, input), .{});
+    try std.testing.expectEqual(@as(usize, 0), first.namespaces[0].namespace.state.distinct.len);
+    try std.testing.expectEqual(loads + 1, RaftApplyStore.test_query_profile_loads.load(.monotonic));
+    for (0..8) |_| {
+        const response = try store.resolverCatalogRead(a, group, input);
+        try std.testing.expect(response.len < 4096);
+    }
+    try std.testing.expectEqual(loads + 1, RaftApplyStore.test_query_profile_loads.load(.monotonic));
+    read.seeds = &.{"entity/routed-other-17"};
+    var query = input;
+    query.authority = read;
+    const incident = try std.json.parseFromSliceLeaky(domain.View, a, try store.resolverCatalogRead(a, group, query), .{});
+    try std.testing.expectEqual(@as(usize, 1), incident.namespaces[0].namespace.state.distinct.len);
+    var next = namespace;
+    next.revision += 1;
+    next.merges = &.{.{ .key = aliases[17].key, .target = "entity/moved" }};
+    next.state.suppress.keys = &.{"entity/seed"};
+    destination = (try store.getTable(a, group, 1)).?;
+    const update: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, destination), .patches = &.{try domain.records.difference(a, namespace, next)} };
+    try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, update, .{}) });
+    namespace = next;
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, input));
+    const fresh = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "source", .policy_descriptors = true, .projection_names = &.{"r"}, .standalone = true }), .{});
+    read.expected_head = fresh.query_heads[0].stamp;
+    read.seeds = &.{ "entity/moved", "entity/seed" };
+    query.authority = read;
+    const moved = try std.json.parseFromSliceLeaky(domain.View, a, try store.resolverCatalogRead(a, group, query), .{});
+    try std.testing.expectEqual(@as(usize, 1), moved.namespaces[0].namespace.state.distinct.len);
+    try std.testing.expectEqualStrings("entity/seed", moved.namespaces[0].namespace.state.suppress.keys[0]);
+    // A cached context cannot keep a retired source profile enrolled.
+    cfg.aliases = &.{};
+    var source = (try store.getTable(a, group, 2)).?;
+    source.indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = &.{cfg} }, .{});
+    try store.applyStandaloneCommand(group, .{ .upsert_table = source });
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, query));
+    std.debug.print("QUERY PROFILE METADATA aliases=1000 pins=1000 warm_pages=8 profile_reloads=0 retirement=fenced\n", .{});
 }
 
 test "resolver curation namespace propagation ordinary destination query proofs are bounded and backfilled" {

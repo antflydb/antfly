@@ -103,6 +103,20 @@ pub fn readDefinition(a: A, txn: anytype, root: []const u8, id: []const u8) !Def
 pub fn definitionAliases(a: A, txn: anytype, root: []const u8, id: []const u8) ![]const resolver.KeyAlias {
     return (try readDefinition(a, txn, root, id)).aliases;
 }
+/// A query reference must still name an enrolled profile at its read cut.
+/// Validate the scalar head on every page; load full content only on a miss.
+pub fn queryReferenceActive(a: A, txn: anytype, root: []const u8, id: []const u8, template: []const u8) !bool {
+    if (id.len != 64) return error.InvalidResolverCurationRequest;
+    for (id) |byte| if (!std.ascii.isHex(byte)) return error.InvalidResolverCurationRequest;
+    const raw = txn.get(try headKey(a, root, id)) catch |err| return if (err == error.NotFound) false else err;
+    const head = try std.json.parseFromSliceLeaky(Head, a, raw, .{});
+    return head.refs != 0 and std.mem.eql(u8, head.key_template, template);
+}
+pub fn queryAliases(a: A, txn: anytype, root: []const u8, id: []const u8, template: []const u8) ![]const resolver.KeyAlias {
+    const definition = try readDefinition(a, txn, root, id);
+    if (!std.mem.eql(u8, definition.key_template, template) or !std.mem.eql(u8, id, try definition.identity(a))) return error.InvalidCatalogRecord;
+    return definition.aliases;
+}
 
 pub const Reader = struct {
     a: A,

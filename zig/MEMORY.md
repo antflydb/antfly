@@ -2436,18 +2436,38 @@ namespace heads or consumer routes. It retains destination authorization and
 normal duplicate-intent validation. Membership discovery is needed only when a
 new proposal must be admitted.
 
-Scored query policy intersects configured alias keys with the existing sparse
-native pin-count postings by ordered, bounded seeks. A missing alias key jumps
-to the next posting and then to the next possible alias, rather than opening
-every alias's native policy records. Only pin-bearing aliases need their live
-forward paths qualified. Native redirects override configured aliases, removal
-tombstones stop them, and incoming native pin branches remain visible through
-configured chains. Both embedded and routed queries use this same native
-operation. The immutable alias input still costs linear space and sorting; the
-storage join scales with the smaller alias/posting set and actual pinned paths.
-The 10,002-alias negative fixture uses nine point reads and three bounded seeks,
-returning two sparse posting rows. The original 10,000-alias review probe drops
-from 60,022 point reads to nine.
+Scored policy reads use an immutable prepared index keyed by static profile
+identity, namespace template and the exact native head fingerprint/revision.
+It indexes distinct pairs by their effective canonical endpoints, after native
+overrides and removal tombstones are applied. A query looks up only its canonical
+components and loads their forward policy paths; unrelated pinned aliases never
+become query seeds. Static maps can be reused independently of mutable heads for
+rendering or namespaces without pins.
+
+The shared cache retains at most 64 MiB across 32 entries. Preparation reads
+only redirect, removed-alias and distinct records in bounded sequential pages,
+inside a read snapshot and outside writer leases. This cold compilation costs
+O(static aliases + native graph + pins) once per retained profile/head; warm
+pages do not rescan or recompile that state. Reference-counted leases keep active
+pages valid through eviction; response data is copied out before releasing the
+lease. Zero-fingerprint legacy heads cannot qualify a shared composed entry.
+No transactions, execution grants, candidate documents or model results are
+cached. A changed head selects a new entry immediately, and captured queries
+still fail final validation after curation or authorization changes.
+
+Routed policy pages carry an immutable profile reference when the existing v10
+directory is ready. Every page checks the active profile and live logical target;
+only cache misses load and verify the full declaration. Protocol 54 qualifies
+this private reference contract; older snapshots retain inline compatibility.
+Embedded queries prepare once per resolver phase and retain the lease across
+pages. Source/schema/incarnation and namespace-head fences remain unchanged.
+Text-only pages omit alias/profile inputs and perform only native text policy
+lookups, independent of alias and pin population.
+
+The dense regression has 1,000 configured aliases and 1,000 unrelated pins.
+Cold preparation reads those pin records in ten bounded sequential pages. One
+hundred prepared negative queries then use 400 point reads and no scans or
+unrelated rows. A text-only query uses two reads and no scans.
 
 Metadata maintains query fingerprints for ordinary destination tables together
 with DDL, before native curation is adopted. Their proof explicitly carries

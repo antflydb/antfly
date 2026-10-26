@@ -1508,9 +1508,15 @@ const QueryFence = struct {
     resolver_name: []const u8,
     routing_siblings: bool,
     heads: std.StringHashMapUnmanaged(native_authority.records.Stamp) = .empty,
+    profiles: std.StringHashMapUnmanaged(native_authority.QueryProfileReference) = .empty,
     fn init(a: std.mem.Allocator, page: catalog_read.Page, resolver_name: []const u8, routing_siblings: bool) !QueryFence {
         var result: QueryFence = .{ .table_name = page.table.name, .table_id = page.table.table_id, .fingerprint = page.query_fingerprint orelse return error.InvalidCatalogRecord, .resolver_name = resolver_name, .routing_siblings = routing_siblings };
         for (page.query_heads) |head| try result.heads.put(a, try std.fmt.allocPrint(a, "{d}\x00{s}", .{ head.table_id, head.key_template }), head.stamp);
+        if (page.indexed) if (page.configs) |configs_| for (configs_) |cfg| {
+            if (cfg.retired or cfg.aliases.len == 0) continue;
+            const definition: native_authority.records.static_profiles.Definition = .{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json };
+            try result.profiles.put(a, cfg.name, .{ .target = cfg.table, .id = try definition.identity(a) });
+        };
         return result;
     }
     fn expected(self: *const QueryFence, a: std.mem.Allocator, cfg: Config) !native_authority.records.Stamp {
@@ -1529,13 +1535,14 @@ fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, 
     var joined: native_authority.records.QueryPolicyUnion = .{};
     var seed_offset: usize = 0;
     var text_offset: usize = 0;
+    const profile = if (fence) |captured| captured.profiles.get(cfg.name) else null;
     while (true) {
         var page_arena = std.heap.ArenaAllocator.init(owner);
         defer page_arena.deinit();
         const page_allocator = page_arena.allocator();
         const seed_end = @min(seeds.len, seed_offset + 1024);
         const text_end = @min(texts.len, text_offset + 128);
-        const bytes = try server.source.systemCatalog(page_allocator, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .authority = .{ .mode = .policy, .expected_head = if (fence) |pinned| try pinned.expected(a, cfg) else null, .key_template = cfg.key_template, .seeds = seeds[seed_offset..seed_end], .texts = texts[text_offset..text_end], .aliases = cfg.aliases, .distinct = distinct } } });
+        const bytes = try server.source.systemCatalog(page_allocator, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .authority = .{ .mode = .policy, .expected_head = if (fence) |pinned| try pinned.expected(a, cfg) else null, .key_template = cfg.key_template, .seeds = seeds[seed_offset..seed_end], .texts = texts[text_offset..text_end], .aliases = if (profile != null or seed_offset == seed_end) &.{} else cfg.aliases, .query_profile = if (seed_offset != seed_end) profile else null, .distinct = distinct } } });
         const view = try std.json.parseFromSliceLeaky(native_authority.View, page_allocator, bytes, .{});
         if (!view.native or view.table_id != cfg.namespace_curation_table_id or view.namespaces.len != 1) return error.CatalogGenerationChanged;
         try joined.add(a, page_allocator, view.namespaces[0]);
@@ -1727,6 +1734,62 @@ fn response(a: std.mem.Allocator, status: u16, value: anytype) !@import("public_
 }
 fn json(a: std.mem.Allocator, value: anytype) !std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{});
+}
+
+test "resolver curation HTTP policy pages share immutable profile references and omit text-only aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const aliases = try a.alloc(resolver.KeyAlias, 10000);
+    for (aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/noise-{d}", .{i}), .target = "entity/hub" };
+    const cfg: Config = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .aliases = aliases, .namespace_curation_table_id = 1 };
+    const Source = struct {
+        vtable: struct { supports_resolver_authority: bool = true } = .{},
+        pages: usize = 0,
+        references: usize = 0,
+        text_pages: usize = 0,
+        aliases: usize = 0,
+        bytes: usize = 0,
+        pub fn systemCatalog(self: *@This(), allocator: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const read = call.resolver_catalog_read.authority.?;
+            self.pages += 1;
+            self.aliases += read.aliases.len;
+            const wire = try std.json.Stringify.valueAlloc(allocator, call, .{});
+            self.bytes += wire.len;
+            if (read.query_profile) |profile| {
+                self.references += 1;
+                try std.testing.expectEqualStrings("entities", profile.target);
+                try std.testing.expectEqual(@as(usize, 64), profile.id.len);
+                try std.testing.expect(std.mem.indexOf(u8, wire, "\"aliases\"") == null);
+            }
+            if (read.seeds.len == 0) {
+                self.text_pages += 1;
+                try std.testing.expect(read.query_profile == null and read.aliases.len == 0);
+            }
+            const head: native_authority.records.Head = .{ .key_template = "entity/{{_key}}", .revision = 3, .fingerprint = @splat(7) };
+            return std.json.Stringify.valueAlloc(allocator, native_authority.View{ .native = true, .table_id = 1, .namespaces = &.{.{ .head = head, .namespace = .{ .key_template = head.key_template, .revision = head.revision } }} }, .{});
+        }
+    };
+    var server: struct { source: Source = .{} } = .{};
+    var page: catalog_read.Page = .{ .version = 1, .revision = 1, .table = .{ .table_id = 2, .name = "source" }, .indexed = true, .configs = &.{cfg}, .query_fingerprint = @splat(1), .query_heads = &.{.{ .table_id = 1, .key_template = cfg.key_template, .stamp = .{ .revision = 3, .fingerprint = @splat(7) } }} };
+    const texts = try a.alloc([]const u8, 1024);
+    for (texts, 0..) |*text, i| text.* = try std.fmt.allocPrint(a, "mention-{d}", .{i});
+    const fence = try QueryFence.init(a, page, cfg.name, true);
+    _ = try queryConfig(&server, std.testing.allocator, a, cfg, &.{"entity/seed"}, texts, true, .{}, &fence);
+    try std.testing.expectEqual(@as(usize, 8), server.source.pages);
+    try std.testing.expectEqual(@as(usize, 1), server.source.references);
+    try std.testing.expectEqual(@as(usize, 7), server.source.text_pages);
+    try std.testing.expectEqual(@as(usize, 0), server.source.aliases);
+    try std.testing.expect(server.source.bytes < 64 * 1024);
+    std.debug.print("QUERY PROFILE RPC aliases=10000 pages=8 alias_elements=0 text_only_pages=7 wire_bytes={d}\n", .{server.source.bytes});
+    // Old snapshots retain inline compatibility on seed pages only.
+    page.indexed = false;
+    const legacy = try QueryFence.init(a, page, cfg.name, true);
+    server.source = .{};
+    _ = try queryConfig(&server, std.testing.allocator, a, cfg, &.{"entity/seed"}, texts, true, .{}, &legacy);
+    try std.testing.expectEqual(@as(usize, 10000), server.source.aliases);
+    try std.testing.expectEqual(@as(usize, 0), server.source.references);
+    try std.testing.expectEqual(@as(usize, 7), server.source.text_pages);
 }
 
 test "resolver curation HTTP routes keep encoded keys inside one resource and classify reads" {
