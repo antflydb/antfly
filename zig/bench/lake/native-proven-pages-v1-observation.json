@@ -1,0 +1,288 @@
+{
+  "experiment": "proven_winner_scoring_and_representation_aware_membership_v1",
+  "scope": "Local Debug exact-answer controls and operation counts. Sequential runs overlap native/E2E validation; no randomized latency attribution, empty-cache, cloud transport or full-archive throughput qualification.",
+  "causal_latency_qualified": false,
+  "remote_transport_qualified": false,
+  "archive_throughput_qualified": false,
+  "candidate_production_source": {
+    "source_commit": "2436a157e2464f8e771e8daf3b01a64c343ee16e",
+    "source_tree": "57c7a7ca15055448f4fed4d8118622ac55ee57c7",
+    "source_clean": true,
+    "build_mode": "Debug",
+    "zig_version": "0.17.0",
+    "binary_sha256": "d9c6af20a1f8074e6ad306d09abde79a60cafd179c805bb04f585b05dc1c062b"
+  },
+  "baseline_production_source": {
+    "source_commit": "850290dfaaea17d01a8cda6ec5286c993323ee8d",
+    "source_tree": "6effe1df49f3ba6701a8609085e3002f9253ffa5",
+    "source_clean": true,
+    "binary_sha256": "e52b2c602fcb60e58721022b3ae60e58097af2d10fef98e1abb93ddcd35a0aed",
+    "build_mode": "Debug",
+    "zig_version": "0.17.0"
+  },
+  "merged_main": "b0b39178d60c13617ca1f9c79b00f706093da244",
+  "compiled_runtime_abi": 65,
+  "native_reader_protocol": 89,
+  "controls": {
+    "rows": 16384,
+    "source_files": 8,
+    "source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+    "limit_20_cases": 6,
+    "limit_20_samples_per_binary": 36,
+    "limit_1_cases": 2,
+    "limit_1_samples_per_binary": 12,
+    "complete_normalized_answers_and_independent_expected_ids_match": true,
+    "cache_contract": {
+      "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+      "warm": "same query immediately after its process-restarted sample",
+      "empty_cache_qualified": false
+    }
+  },
+  "mechanisms": {
+    "winner_proof": "Private operation-owned selected native IDs, score expression and result share one leased text snapshot; no repeated attached zero-score metadata/visibility checks. Explicit native constraint scores, Boolean boosts, distributed statistics and cancellation remain.",
+    "membership_conversion": "Predicate block count under identical tuple bounds without bitmap decoding. Shared coordinates charge per compressed block; incompatible or unknown coordinates and scan alternatives charge per row. Existing hard I/O/scratch/tile/cancellation bounds and exact fallback remain.",
+    "capabilities": "Canonical lake.read/lake.write; underscore aliases normalized only at configuration load. Bare read/write and unrelated workflows acquire no lake authority."
+  },
+  "warm_observations": [
+    {
+      "case": "complete_forward",
+      "cache_mode": "warm",
+      "baseline_median_ns": 25551291,
+      "candidate_median_ns": 23434166,
+      "candidate_over_baseline": 0.9171421514474553,
+      "baseline_samples": 3,
+      "candidate_samples": 3,
+      "minimum_sample_count_met": true
+    },
+    {
+      "case": "complete_reverse",
+      "cache_mode": "warm",
+      "baseline_median_ns": 25530917,
+      "candidate_median_ns": 23509166,
+      "candidate_over_baseline": 0.9208116574896232,
+      "baseline_samples": 3,
+      "candidate_samples": 3,
+      "minimum_sample_count_met": true
+    },
+    {
+      "case": "wide_forward",
+      "cache_mode": "warm",
+      "baseline_median_ns": 26068292,
+      "candidate_median_ns": 24565333,
+      "candidate_over_baseline": 0.9423453212815017,
+      "baseline_samples": 3,
+      "candidate_samples": 3,
+      "minimum_sample_count_met": true
+    },
+    {
+      "case": "public_id_only",
+      "cache_mode": "warm",
+      "baseline_median_ns": 25117708,
+      "candidate_median_ns": 24463292,
+      "candidate_over_baseline": 0.9739460304260246,
+      "baseline_samples": 3,
+      "candidate_samples": 3,
+      "minimum_sample_count_met": true
+    },
+    {
+      "case": "metadata_complete_forward",
+      "cache_mode": "warm",
+      "baseline_median_ns": 403584958,
+      "candidate_median_ns": 31819083,
+      "candidate_over_baseline": 0.07884110239807303,
+      "baseline_samples": 3,
+      "candidate_samples": 3,
+      "minimum_sample_count_met": true
+    },
+    {
+      "case": "metadata_complete_reverse",
+      "cache_mode": "warm",
+      "baseline_median_ns": 402725542,
+      "candidate_median_ns": 32674375,
+      "candidate_over_baseline": 0.08113310826458581,
+      "baseline_samples": 3,
+      "candidate_samples": 3,
+      "minimum_sample_count_met": true
+    },
+    {
+      "case": "tiny_complete_forward",
+      "cache_mode": "warm",
+      "baseline_median_ns": 19085709,
+      "candidate_median_ns": 20480250,
+      "candidate_over_baseline": 1.073067288199773,
+      "baseline_samples": 3,
+      "candidate_samples": 3,
+      "minimum_sample_count_met": true
+    },
+    {
+      "case": "tiny_metadata_complete_forward",
+      "cache_mode": "warm",
+      "baseline_median_ns": 25997333,
+      "candidate_median_ns": 26724916,
+      "candidate_over_baseline": 1.0279868323416097,
+      "baseline_samples": 3,
+      "candidate_samples": 3,
+      "minimum_sample_count_met": true
+    }
+  ],
+  "page_diagnostics": {
+    "samples_per_cache_state": 1,
+    "queries": 18,
+    "baseline_complete_materializations": 12,
+    "candidate_complete_materializations": 0,
+    "candidate_shared_coordinate_work_budget": 1050888,
+    "baseline_work_budget": 2312,
+    "warm_queries": [
+      {
+        "limit": 1,
+        "direct_rows": 2,
+        "translated_rows": 0,
+        "materialized": false,
+        "ordered_scanned_count": 3,
+        "observed_elapsed_ns": 27730958
+      },
+      {
+        "limit": 4,
+        "direct_rows": 5,
+        "translated_rows": 0,
+        "materialized": false,
+        "ordered_scanned_count": 6,
+        "observed_elapsed_ns": 29032791
+      },
+      {
+        "limit": 8,
+        "direct_rows": 9,
+        "translated_rows": 0,
+        "materialized": false,
+        "ordered_scanned_count": 10,
+        "observed_elapsed_ns": 31413125
+      },
+      {
+        "limit": 12,
+        "direct_rows": 13,
+        "translated_rows": 0,
+        "materialized": false,
+        "ordered_scanned_count": 14,
+        "observed_elapsed_ns": 28310750
+      },
+      {
+        "limit": 16,
+        "direct_rows": 17,
+        "translated_rows": 0,
+        "materialized": false,
+        "ordered_scanned_count": 18,
+        "observed_elapsed_ns": 30898500
+      },
+      {
+        "limit": 20,
+        "direct_rows": 21,
+        "translated_rows": 0,
+        "materialized": false,
+        "ordered_scanned_count": 22,
+        "observed_elapsed_ns": 31041000
+      },
+      {
+        "limit": 24,
+        "direct_rows": 25,
+        "translated_rows": 0,
+        "materialized": false,
+        "ordered_scanned_count": 26,
+        "observed_elapsed_ns": 30868875
+      },
+      {
+        "limit": 32,
+        "direct_rows": 33,
+        "translated_rows": 0,
+        "materialized": false,
+        "ordered_scanned_count": 34,
+        "observed_elapsed_ns": 32459500
+      },
+      {
+        "limit": 64,
+        "direct_rows": 65,
+        "translated_rows": 0,
+        "materialized": false,
+        "ordered_scanned_count": 66,
+        "observed_elapsed_ns": 42197334
+      }
+    ]
+  },
+  "validation": {
+    "focused_native_passed": 154,
+    "declared_native_skips": 1,
+    "native_failures": 0,
+    "native_leaks": 0,
+    "real_parquet_iceberg_e2e_passed": 29,
+    "e2e_skipped": 0,
+    "e2e_passing_executions_in_final_selections": 33,
+    "e2e_test_commit": "395c702466",
+    "e2e_execution": "Nine external rewrite/Iceberg/pgwire cases passed in the initial full selection (13 passing cases total); all 20 archive cases passed after scoping diagnostic assertions to dense queries while allowing selective exact fallback. All use the identical frozen binary.",
+    "e2e_test_sha256": "70a6551bcc29fc75b785ec7da5e6a4eefbde910ffd1ce30a2031900437350ed8",
+    "archive_tooling_tests_passed": 18,
+    "make_generate_passed": true,
+    "control_and_error_catalog_checks_passed": true,
+    "format_and_diff_checks_passed": true
+  },
+  "evidence": [
+    {
+      "path": "/private/tmp/lake-proven-final-e2e.log",
+      "sha256": "c600755951313782027bdb3ed6db3b0090473a9d248705386514c0af6ac9383f"
+    },
+    {
+      "path": "/private/tmp/lake-proven-final-archive-e2e.log",
+      "sha256": "3eaee2cd2545996a1ef9a4facce774289100938e45eaecd6fed1ccdaca776b22"
+    },
+    {
+      "path": "/private/tmp/lake-proven-final-archive-e2e.xml",
+      "sha256": "c1659ff500b0eec09123397f4f6ee2b674ad20136071403c69e750be3dafae0b"
+    },
+    {
+      "path": ".benchmark-results/lake/direct-probes/final-candidate/report.json",
+      "sha256": "e3ee5e89f6899e3e1e9b71f172e312cd0d9b5bef1b4d9d78fe575e61c6b07e8c"
+    },
+    {
+      "path": ".benchmark-results/lake/direct-probes/final-tiny/report.json",
+      "sha256": "3a0ea68ed6036bbb94baf820db74a55e75a65e45a6458be5d36c0c9e35b6984c"
+    },
+    {
+      "path": ".benchmark-results/lake/proven-pages-v2/final-candidate/report.json",
+      "sha256": "9d12d039228ff65cad39c6169a59dec2bee01b5af141e91fca4469ffb0d9c8b6"
+    },
+    {
+      "path": ".benchmark-results/lake/proven-pages-v2/final-tiny/report.json",
+      "sha256": "11e814b5ee1938ef88c726c529a7142b0f1c327a2ec76e44ef02d33f4babb346"
+    },
+    {
+      "path": ".benchmark-results/lake/proven-pages-v2/comparison.json",
+      "sha256": "81f47e95d247e92828d8531aabcb7ad7407c81b002186629fd351585ff48abae"
+    },
+    {
+      "path": ".benchmark-results/lake/proven-pages-v2/tiny-comparison.json",
+      "sha256": "ea7b7758188b4d9683482ed132f7e27302ea8c784d30ce7adea7c48c9d01f3d5"
+    },
+    {
+      "path": ".benchmark-results/lake/proven-pages-v2/limits/report.json",
+      "sha256": "f8839ce9e3c52440db2f901f40a0ffbb81336ce00959a7618a086f1e9a20b73d"
+    },
+    {
+      "path": ".benchmark-results/lake/proven-pages-v2/limits/server.log",
+      "sha256": "39068c9e6de06f2798ba57890090927d8e1db165fdf966baca3ab0980286ebab"
+    },
+    {
+      "path": ".benchmark-results/lake/review-b140/threshold/report.json",
+      "sha256": "3968d9f5f853537a76eb6229d3e36b41f317e547a6988a2999fdc6446e327768"
+    },
+    {
+      "path": ".benchmark-results/lake/review-b140/threshold/server.log",
+      "sha256": "00e6528054f3e93d67d27ed864515cd260ce5ab476b5c7a8d02eb68229c4ec68"
+    },
+    {
+      "path": ".benchmark-results/lake/review-b140/large-threshold/report.json",
+      "sha256": "87c09d01628e3f6bf5f54c3f7151519a4e68bcdfa7a81d8ffadb6abdd5e347ee"
+    },
+    {
+      "path": ".benchmark-results/lake/review-b140/large-threshold/server.log",
+      "sha256": "2712ae7389320bc83dcf7c3e8b89c4fbb8d763c597360061fbc74016f7ea9849"
+    }
+  ]
+}

@@ -6234,3 +6234,7 @@ layouts charge per row. This distinguishes a distinct-ID range from a compact
 categorical selection with the same cardinality. A source scan alternative
 charges row conversion too. Read bytes, scratch, tile size and cancellation stay
 independent hard execution limits, and exhaustion retains the exact fallback.
+
+Both initial eager membership admission and subsequent deferred probe admission
+use this conversion estimate. A small distinct-key range cannot enter the eager
+path merely because its scan-only estimate fits one reverse-tree probe.

@@ -1739,3 +1739,7 @@ row conversion too. Distinct-ID ranges therefore differ from compact categorical
 sets of equal row cardinality. Estimates saturate and only choose a path; existing
 read-byte, scratch, candidate-tile and cancellation limits still force an exact
 complete fallback when exhausted.
+
+Both initial eager membership admission and subsequent deferred probe admission
+use this conversion estimate. A small distinct-key range cannot enter the eager
+path merely because its scan-only estimate fits one reverse-tree probe.

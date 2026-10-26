@@ -508,3 +508,42 @@ process peak memory or publication throughput. Final qualification passes 146
 focused native tests (one declared skip), 18 tooling tests, and 29 real
 Parquet/Iceberg E2Es without skips, including tiny-page scan bounds, rewrites,
 updates, deletes, NULL/date cursors, pgwire and restart. Main `0c753dc705` is merged.
+
+### Proven winner scoring and membership conversion costs
+
+The [proven-page qualification](native-proven-pages-v1-observation.json) pins
+production source `2436a157e2`. Sorted winner scoring binds selected native IDs,
+the original score expression and the result to one leased text snapshot. It
+preserves scoring semantics while avoiding repeated metadata and visibility
+checks already proved during page selection. Full-membership estimates include
+conversion work: matching compressed blocks for shared coordinates, matching rows
+for translated layouts, and row conversion for a source scan alternative. This
+separates distinct-ID ranges from compact categorical predicates. Existing hard
+read-byte, scratch, tile and cancellation limits still enforce exact fallback.
+
+Across identical eight-file / 16,384-row inputs, all 36 limit-20 and 12 limit-one
+samples per binary preserve complete normalized answers, including scores, and
+independent expected IDs. The separate 18-query page-size diagnostic covers
+limits 1, 4, 8, 12, 16, 20, 24, 32 and 64 in process-restarted and warm states.
+Complete materializations fall from 12 to zero. Every candidate query probes
+exactly `limit + 1` metadata rows, translates zero rows, and scans `limit + 2`
+ordered candidates. Neither winner rescoring nor the former 2,312-unit crossover
+causes full materialization in these controls. The representation-aware budget
+is 1,050,888 units for this distinct-ID range; execution quotas remain unchanged.
+
+Local Debug warm limit-20 medians fall from 403.58 to 31.82 ms forward and from
+402.73 to 32.67 ms reverse. Limit-one controls vary by about 3–7%; other limit-20
+warm controls range from roughly 3–8% faster. Sequential measurements
+overlap other validation and do not establish causal latency, empty-cache
+behavior, cloud transport or full-archive throughput. Process-restarted queries
+retain persistent and OS caches and may benefit from startup navigation warming.
+
+Final validation passes 154 focused native test executions (one declared skip,
+no failures or leaks), 18 archive tooling tests, full `make generate`, catalog
+and formatting checks, and 29 unique real Parquet/Iceberg E2E cases without skips.
+The nine external rewrite/Iceberg/pgwire cases passed on the final binary; all
+20 archive cases were rerun after limiting materialization diagnostics to dense
+queries. Selective unmatched prefixes retain their exact fallback. Main
+`b0b39178d6` is merged and the final fetch/merge check is up to date. Canonical
+connection capabilities are `lake.read` and `lake.write`; legacy underscore
+spellings normalize at configuration admission without granting bare read/write.
