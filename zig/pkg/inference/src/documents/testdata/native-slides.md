@@ -18,3 +18,10 @@ external relationships, embedded applications or font dependencies.
 
 ZIP entry timestamps are fixed to 2026-01-01. All visual content uses explicit
 RGB colors and integer EMU extents; the embedded PNG uses ordinary RGBA samples.
+
+`native-themed-text.pptx` adds a master-owned theme, a tinted accent fill and a
+bold text box. Tests check font outlines, wrapped glyph metrics and embedded
+CID-to-Unicode text recovery. `native-chart.pptx`, `native-line-chart.pptx` and
+`native-pie-chart.pptx` use cached series (10, 20) and labels (Jan, Feb); pixel
+tests distinguish bar heights, a stroked line and colored pie sectors. Formula
+strings remain opaque and no workbook is fetched.

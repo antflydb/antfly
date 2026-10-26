@@ -49,6 +49,11 @@ pub const Driver = struct {
     /// Validation must explicitly establish evidence support, not just ask a
     /// model if another model's answer sounds good.
     validate_fn: ?*const fn (*anyopaque, c.Page, ?c.Region, Candidate, *c.Run) anyerror!Validation = null,
+    parallel: ?struct {
+        io: std.Io,
+        prepare_fn: *const fn (*anyopaque, *c.Run) anyerror!bool,
+        fork_fn: *const fn (*anyopaque, A) anyerror!Driver,
+    } = null,
 };
 
 fn meaningful(text: []const u8) bool {
@@ -142,7 +147,9 @@ pub fn readPageReported(a: A, def: c.Definition, driver: Driver, page_index: usi
         const regions = try ir.cloneRegions(a, page.regions, run.limits.max_regions);
         const revisions = try a.alloc(bool, regions.len);
         @memset(revisions, false);
-        for (regions, revisions) |*region, *changed| {
+        if (driver.parallel != null and run.shared != null and run.limits.max_parallel_calls > 1 and regions.len > 1 and try driver.parallel.?.prepare_fn(driver.ptr, run)) {
+            try refineParallel(a, def, driver, page_index, &page, regions, revisions, run);
+        } else for (regions, revisions) |*region, *changed| {
             const revised = try refineTracked(a, def, driver, page_index, page, region.*, run, changed);
             if (revised.status != .complete) page.status = revised.status;
             if (revised.regions.len == 1) region.* = revised.regions[0];
@@ -177,6 +184,95 @@ pub fn readPageReported(a: A, def: c.Definition, driver: Driver, page_index: usi
     const output_bytes = try run.outputJson(page);
     try run.emit(.{ .phase = if (page.status == .complete) .accepted else .unresolved, .source_id = page.source_id, .page_number = page.number });
     return .{ .page = page, .output_bytes = output_bytes };
+}
+
+const RegionTask = struct {
+    arena: std.heap.ArenaAllocator,
+    definition: c.Definition,
+    driver: Driver,
+    page_index: usize,
+    supplied: c.Page,
+    region: c.Region,
+    run: c.Run,
+    permit: c.Run.Permit,
+    changed: bool = false,
+    result: ?c.Page = null,
+    failure: ?anyerror = null,
+    fn execute(self: *RegionTask) std.Io.Cancelable!void {
+        defer self.permit.deinit();
+        self.process() catch |err| {
+            self.failure = err;
+        };
+    }
+    fn process(self: *RegionTask) !void {
+        const a = self.arena.allocator();
+        self.run.event_allocator = a;
+        const driver = try self.driver.parallel.?.fork_fn(self.driver.ptr, a);
+        self.result = try refineTracked(a, self.definition, driver, self.page_index, self.supplied, self.region, &self.run, &self.changed);
+    }
+};
+
+fn refineParallel(a: A, def: c.Definition, driver: Driver, page_index: usize, page: *c.Page, regions: []c.Region, revisions: []bool, run: *c.Run) !void {
+    const parallel = driver.parallel.?;
+    const backing = run.work_allocator orelse a;
+    const width = @min(regions.len, run.limits.max_parallel_calls);
+    const snapshot = page.*;
+    var scope: c.ScopeAccounting = .{ .parent = run.scope, .limits = run.limits, .usage = run.usage };
+    const shared_limits = run.shared.?.limits;
+    const narrower = run.limits.max_model_calls < shared_limits.max_model_calls or run.limits.max_total_tokens < shared_limits.max_total_tokens or run.limits.max_total_pixels < shared_limits.max_total_pixels or run.limits.max_output_bytes < shared_limits.max_output_bytes;
+    const child_scope = if (narrower) &scope else run.scope;
+    var next: usize = 0;
+    while (next < regions.len) {
+        const count = @min(width, regions.len - next);
+        const tasks = try backing.alloc(RegionTask, count);
+        defer backing.free(tasks);
+        var initialized: usize = 0;
+        defer for (tasks[0..initialized]) |*task| {
+            task.permit.deinit();
+            task.run.deinit();
+            task.arena.deinit();
+        };
+        var group: std.Io.Group = .init;
+        defer group.cancel(parallel.io);
+        const baseline = run.usage;
+        for (tasks, 0..) |*task, index| {
+            // Start each admitted task immediately. Acquiring an entire wave
+            // before starting children would deadlock competing page owners.
+            const permit = try run.acquire(parallel.io, true);
+            task.* = .{
+                .arena = .init(backing),
+                .definition = def,
+                .driver = driver,
+                .page_index = page_index,
+                .supplied = snapshot,
+                .region = regions[next + index],
+                .permit = permit,
+                .run = .{ .limits = run.limits, .usage = baseline, .shared = run.shared, .scope = child_scope, .source_count = run.source_count, .source_bytes = run.source_bytes, .work_allocator = backing, .control = .{ .ptr = run.control.ptr, .check_fn = run.control.check_fn } },
+            };
+            initialized += 1;
+            group.concurrent(parallel.io, RegionTask.execute, .{task}) catch task.execute() catch unreachable;
+        }
+        try group.await(parallel.io);
+        for (tasks, 0..) |*task, index| {
+            if (task.failure) |err| return err;
+            const revised = task.result.?;
+            if (revised.status != .complete and page.status != .truncated) page.status = revised.status;
+            if (revised.regions.len == 1) regions[next + index] = (try ir.cloneRegions(a, revised.regions, run.limits.max_regions))[0];
+            revisions[next + index] = task.changed;
+            for (revised.findings) |finding| try ir.finding(a, page, finding, true);
+            for (task.run.events.items) |event| {
+                try run.control.emit(event);
+                try run.retainEvent(event);
+            }
+            // Shared admission has already charged each worker. Accumulate
+            // only its local delta so an enclosing child keeps its own ceiling.
+            inline for (@typeInfo(c.Usage).@"struct".field_names) |field| {
+                @field(run.usage, field) += @field(task.run.usage, field) - @field(baseline, field);
+            }
+        }
+        next += count;
+        if (ir.hasFinding(page.*, "model_call_budget_exhausted")) break;
+    }
 }
 
 fn annotate(a: A, page: *c.Page) !void {
@@ -255,7 +351,7 @@ fn refineInto(a: A, def: c.Definition, driver: Driver, page_index: usize, page: 
                 .page = page.*,
                 .region = current.*,
                 .allowed = allowed[0..count],
-                .remaining_calls = run.limits.max_model_calls - run.usage.model_calls,
+                .remaining_calls = run.remainingCalls(),
             }, run);
         }
         try run.emit(.{ .phase = .decision, .source_id = page.source_id, .page_number = page.number, .model = if (r.router) |name| (try def.binding(name, .decide)).model else null, .region_id = if (current.*) |v| v.id else null, .action = action });
@@ -311,6 +407,91 @@ fn refineInto(a: A, def: c.Definition, driver: Driver, page_index: usize, page: 
         }
         page.status = .unresolved;
         try run.emit(.{ .phase = .unresolved, .source_id = page.source_id, .page_number = page.number, .region_id = if (current.*) |v| v.id else null, .model = binding.model, .status = .unresolved, .finding = "replacement_not_supported_by_source" });
+    }
+}
+
+test "document independent regions overlap leaf calls and merge revisions events and usage in order" {
+    const Shared = struct {
+        entered: std.atomic.Value(usize) = .init(0),
+        ready: std.Io.Event = .unset,
+        fail: bool = false,
+    };
+    const Fake = struct {
+        io: std.Io,
+        state: *Shared,
+        fn read(raw: *anyopaque, _: A, binding: c.Binding, _: usize, box: ?[4]f64, run: *c.Run) !Candidate {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var permit = try run.acquire(self.io, false);
+            defer permit.deinit();
+            run.physicalCall();
+            if (std.mem.eql(u8, binding.model, "fast")) return .{ .text = "a b", .regions = &.{
+                .{ .id = 0, .text = "a", .bbox = .{ 0, 0, 10, 10 }, .confidence = 0 },
+                .{ .id = 1, .text = "b", .bbox = .{ 10, 0, 20, 10 }, .confidence = 0 },
+            } };
+            if (self.state.entered.fetchAdd(1, .acq_rel) == 1) self.state.ready.set(self.io);
+            try self.state.ready.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } });
+            if (self.state.fail and box.?[0] == 0) return error.ReadTransientFailure;
+            try run.tokens(1, 1);
+            return .{ .text = if (box.?[0] == 0) "alpha" else "beta" };
+        }
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !Validation {
+            return .source_supported;
+        }
+        fn prepare(_: *anyopaque, _: *c.Run) !bool {
+            return true;
+        }
+        fn fork(raw: *anyopaque, a: A) !Driver {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = try a.create(@This());
+            child.* = self.*;
+            return .{ .ptr = child, .read_fn = read, .validate_fn = validate };
+        }
+    };
+    const backing = std.testing.allocator;
+    var pool = std.Io.Threaded.init(backing, .{});
+    defer pool.deinit();
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    for ([_]enum { normal, failure, nested_budget }{ .normal, .failure, .nested_budget }) |mode| {
+        const fail = mode == .failure;
+        var state = Shared{ .fail = fail };
+        if (mode == .nested_budget) state.ready.set(pool.io());
+        var fake = Fake{ .io = pool.io(), .state = &state };
+        const limits: c.Limits = .{ .max_parallel_calls = 2, .max_model_calls = if (mode == .nested_budget) 2 else 50 };
+        var ledger = c.SharedAccounting{ .limits = .{ .max_parallel_calls = 2, .max_model_calls = 50 }, .usage = .{}, .event_count = 0 };
+        var run = c.Run{ .limits = limits, .shared = &ledger, .work_allocator = backing, .event_allocator = arena.allocator() };
+        defer run.deinit();
+        const definition: c.Definition = .{ .models = &.{ .{ .name = "fast", .model = "fast", .operation = .read }, .{ .name = "accurate", .model = "accurate", .operation = .read } }, .read = .{ .reader = "fast", .accurate_reader = "accurate" } };
+        const invocation = readPage(arena.allocator(), definition, .{ .ptr = &fake, .read_fn = Fake.read, .validate_fn = Fake.validate, .parallel = .{ .io = pool.io(), .prepare_fn = Fake.prepare, .fork_fn = Fake.fork } }, 0, .{ .source_id = "receipt", .number = 1, .kind = .image }, &run);
+        if (fail) {
+            try std.testing.expectError(error.ReadTransientFailure, invocation);
+            try std.testing.expectEqual(@as(usize, 0), ledger.active_calls);
+            try std.testing.expectEqual(@as(usize, 0), ledger.active_regions);
+            continue;
+        }
+        const page = try invocation;
+        if (mode == .nested_budget) {
+            try std.testing.expectEqual(c.Status.unresolved, page.status);
+            try std.testing.expectEqual(@as(usize, 2), run.usage.model_calls);
+            try std.testing.expectEqual(@as(usize, 2), ledger.usage.model_calls);
+            try std.testing.expectEqual(@as(usize, 2), ledger.usage.physical_model_calls);
+            try std.testing.expectEqual(@as(usize, 0), ledger.active_calls);
+            try std.testing.expectEqual(@as(usize, 0), ledger.active_regions);
+            continue;
+        }
+        try std.testing.expectEqualStrings("alpha beta", page.text);
+        try std.testing.expectEqual(c.Status.complete, page.status);
+        try std.testing.expectEqual(@as(usize, 3), run.usage.model_calls);
+        try std.testing.expectEqual(@as(usize, 3), ledger.usage.physical_model_calls);
+        try std.testing.expectEqual(@as(u64, 4), run.usage.total_tokens);
+        try std.testing.expectEqual(@as(u64, 4), ledger.usage.total_tokens);
+        try std.testing.expectEqual(@as(usize, 0), ledger.active_calls);
+        try std.testing.expectEqual(@as(usize, 0), ledger.active_regions);
+        var previous: usize = 0;
+        for (run.events.items) |event| if (event.region_id) |id| {
+            try std.testing.expect(id >= previous);
+            previous = id;
+        };
     }
 }
 

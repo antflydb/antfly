@@ -116,6 +116,13 @@ pub const Tag = struct {
     pub fn local(self: Tag) []const u8 {
         return if (std.mem.indexOfScalar(u8, self.name, ':')) |i| self.name[i + 1 ..] else self.name;
     }
+    pub fn hasPresentationAttributes(self: Tag) !bool {
+        var attrs = Attributes{ .raw = self.raw, .index = self.name.len };
+        while (try attrs.next()) |attr_value| {
+            if (!std.mem.eql(u8, attr_value.name, "xmlns") and !std.mem.startsWith(u8, attr_value.name, "xmlns:")) return true;
+        }
+        return false;
+    }
     /// Visibility metadata must not silently use the first of contradictory
     /// attributes or treat malformed attributes as an absent/default flag.
     pub fn uniqueAttr(self: Tag, wanted: []const u8) !?[]const u8 {
@@ -494,7 +501,7 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
     var ns = Namespaces{};
     defer ns.deinit(scratch);
     const Kind = enum { ordinary, alternate, choice, fallback };
-    const Role = enum { other, presentation, slide_list, shape, body, paragraph, run, table_data, table, row, cell };
+    const Role = enum { other, presentation, slide_list, shape, body, paragraph, run, table_data, chart_data, table, row, cell };
     const Frame = struct {
         kind: Kind = .ordinary,
         role: Role = .other,
@@ -640,7 +647,8 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
         // `ext` is an extension container; local-name filtering erased shape
         // dimensions before native rendering could inspect the checked view.
         const is_metadata = core and (std.mem.eql(u8, local, "extLst") or (vocabulary == .presentation and std.mem.eql(u8, local, "ext")) or std.mem.eql(u8, local, "custDataLst"));
-        var excluded = is_metadata or (!core and vocabulary != .fragment);
+        const chart_reference = vocabulary == .chart and std.mem.eql(u8, local, "chart") and parent.role == .chart_data;
+        var excluded = is_metadata or (!core and vocabulary != .fragment and !chart_reference);
         if (mode == .part and !excluded) {
             if (presentation_signals.has(local) and vocabulary != .presentation) excluded = true;
             if (drawing_signals.has(local) and vocabulary != .drawing) excluded = true;
@@ -663,6 +671,7 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
             } else if (std.mem.eql(u8, local, "graphicData") and vocabulary == .drawing) {
                 const uri = (try tag.uniqueAttr("uri")) orelse "";
                 if (try isTableUri(uri)) frame.role = .table_data;
+                if (try decodedEqual(uri, "http://schemas.openxmlformats.org/drawingml/2006/chart") or try decodedEqual(uri, "http://purl.oclc.org/ooxml/drawingml/chart")) frame.role = .chart_data;
             } else if (std.mem.eql(u8, local, "tbl") and vocabulary == .drawing) {
                 excluded = parent.role != .table_data;
                 frame.role = .table;
@@ -806,10 +815,10 @@ test "document native drawing tokens preserve scoped namespaces and qualified re
     try std.testing.expectError(error.InvalidDocumentXml, duplicate.attribute(tag, .office_relationships, "embed"));
 }
 
-pub const RelationshipKind = enum { slide, layout, master, notes, image, chart, theme, other };
+pub const RelationshipKind = enum { slide, layout, master, notes, image, chart, theme, theme_override, other };
 pub const Relationship = struct { target: []const u8, kind: RelationshipKind, external: bool };
 fn relationshipKind(raw: []const u8) !RelationshipKind {
-    inline for (.{ .{ "slide", RelationshipKind.slide }, .{ "slideLayout", RelationshipKind.layout }, .{ "slideMaster", RelationshipKind.master }, .{ "notesSlide", RelationshipKind.notes }, .{ "image", RelationshipKind.image }, .{ "chart", RelationshipKind.chart }, .{ "theme", RelationshipKind.theme } }) |entry| {
+    inline for (.{ .{ "slide", RelationshipKind.slide }, .{ "slideLayout", RelationshipKind.layout }, .{ "slideMaster", RelationshipKind.master }, .{ "notesSlide", RelationshipKind.notes }, .{ "image", RelationshipKind.image }, .{ "chart", RelationshipKind.chart }, .{ "theme", RelationshipKind.theme }, .{ "themeOverride", RelationshipKind.theme_override } }) |entry| {
         if (try decodedEqual(raw, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/" ++ entry[0]) or
             try decodedEqual(raw, "http://purl.oclc.org/ooxml/officeDocument/relationships/" ++ entry[0])) return entry[1];
     }

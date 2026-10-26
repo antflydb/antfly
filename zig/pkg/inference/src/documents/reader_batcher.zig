@@ -82,11 +82,12 @@ pub fn Batcher(comptime Node: type) type {
         fn compatible(left: *const Ticket, right: *const Ticket) bool {
             const shared = left.run.shared orelse return false;
             // Aggregate usage has no trustworthy per-item attribution. Share
-            // it only within one owner and its full token ceiling. A narrower
+            // it only within one owner and its shared token ceiling. A narrower
             // child must retain its own physical call/usage report; charging
             // the entire batch to one child could exhaust its allowance while
             // letting a sibling spend uncharged tokens on a later call.
-            if (right.run.shared != shared or left.run.limits.max_total_tokens != shared.limits.max_total_tokens or right.run.limits.max_total_tokens != shared.limits.max_total_tokens) return false;
+            const ceiling = if (left.run.scope) |scope| scope.limits.max_total_tokens else shared.limits.max_total_tokens;
+            if (right.run.scope != left.run.scope or right.run.shared != shared or left.run.limits.max_total_tokens != ceiling or right.run.limits.max_total_tokens != ceiling) return false;
             return std.mem.eql(u8, left.model, right.model) and
                 std.meta.eql(left.request.prompt, right.request.prompt) and
                 left.request.max_tokens == right.request.max_tokens and
@@ -229,34 +230,42 @@ test "document ready reader batching groups compatible work and charges aggregat
     const a = std.testing.allocator;
     var pool = std.Io.Threaded.init(a, .{});
     defer pool.deinit();
-    var node = Fake{};
-    const Batch = Batcher(Fake);
-    var batch = Batch{ .io = pool.io(), .node = &node, .backing = a, .stopping = true, .max_parallel = 1 };
-    var ledger = c.SharedAccounting{ .limits = .{}, .usage = .{}, .event_count = 0 };
-    var runs = [_]c.Run{ .{ .limits = .{}, .shared = &ledger }, .{ .limits = .{}, .shared = &ledger }, .{ .limits = .{}, .shared = &ledger } };
-    const images = [_]readers.EncodedImage{
-        .{ .bytes = "first", .mime_type = "image/png", .item_id = "page-one", .page_number = 1 },
-        .{ .bytes = "second", .mime_type = "image/png", .item_id = "page-two", .page_number = 2 },
-        .{ .bytes = "third", .mime_type = "image/png", .item_id = "page-three", .page_number = 3 },
-    };
-    var tickets: [3]Batch.Ticket = undefined;
-    for (&tickets, &runs, 0..) |*ticket, *run, i| {
-        try run.call();
-        ticket.* = .{ .allocator = a, .model = if (i == 2) "other-model" else "same-model", .request = .{ .images = images[i..][0..1] }, .control = .{}, .run = run };
-        batch.pending[i] = ticket;
-    }
-    batch.count = tickets.len;
-    try batch.execute();
-    defer for (&tickets) |*ticket| if (ticket.result) |*result| result.deinit(a);
-    try std.testing.expectEqual(@as(usize, 2), node.calls);
-    try std.testing.expectEqual(@as(usize, 3), ledger.usage.model_calls);
-    try std.testing.expectEqual(@as(usize, 2), ledger.usage.physical_model_calls);
-    try std.testing.expectEqual(@as(u64, 26), ledger.usage.total_tokens);
-    for (&tickets, images) |ticket, input| {
-        try std.testing.expect(ticket.failure == null);
-        try std.testing.expectEqualStrings(input.item_id, ticket.result.?.items[0].text);
-        try std.testing.expectEqual(input.page_number, ticket.result.?.items[0].page_number);
-        try std.testing.expect(ticket.result.?.usage == null);
+    for ([_]bool{ false, true }) |child_budget| {
+        var node = Fake{};
+        const Batch = Batcher(Fake);
+        var batch = Batch{ .io = pool.io(), .node = &node, .backing = a, .stopping = true, .max_parallel = 1 };
+        var ledger = c.SharedAccounting{ .limits = .{}, .usage = .{}, .event_count = 0 };
+        const local_limits: c.Limits = if (child_budget) .{ .max_total_tokens = 100 } else .{};
+        var scope = c.ScopeAccounting{ .limits = local_limits, .usage = .{} };
+        var runs = [_]c.Run{ .{ .limits = local_limits, .shared = &ledger }, .{ .limits = local_limits, .shared = &ledger }, .{ .limits = local_limits, .shared = &ledger } };
+        if (child_budget) for (&runs) |*run| {
+            run.scope = &scope;
+        };
+        const images = [_]readers.EncodedImage{
+            .{ .bytes = "first", .mime_type = "image/png", .item_id = "page-one", .page_number = 1 },
+            .{ .bytes = "second", .mime_type = "image/png", .item_id = "page-two", .page_number = 2 },
+            .{ .bytes = "third", .mime_type = "image/png", .item_id = "page-three", .page_number = 3 },
+        };
+        var tickets: [3]Batch.Ticket = undefined;
+        for (&tickets, &runs, 0..) |*ticket, *run, i| {
+            try run.call();
+            ticket.* = .{ .allocator = a, .model = if (i == 2) "other-model" else "same-model", .request = .{ .images = images[i..][0..1] }, .control = .{}, .run = run };
+            batch.pending[i] = ticket;
+        }
+        batch.count = tickets.len;
+        try batch.execute();
+        defer for (&tickets) |*ticket| if (ticket.result) |*result| result.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), node.calls);
+        try std.testing.expectEqual(@as(usize, 3), ledger.usage.model_calls);
+        try std.testing.expectEqual(@as(usize, 2), ledger.usage.physical_model_calls);
+        try std.testing.expectEqual(@as(u64, 26), ledger.usage.total_tokens);
+        for (&tickets, images) |ticket, input| {
+            try std.testing.expect(ticket.failure == null);
+            try std.testing.expectEqualStrings(input.item_id, ticket.result.?.items[0].text);
+            try std.testing.expectEqual(input.page_number, ticket.result.?.items[0].page_number);
+            try std.testing.expect(ticket.result.?.usage == null);
+        }
+        if (child_budget) try std.testing.expectEqual(ledger.usage, scope.usage);
     }
 }
 
@@ -278,18 +287,23 @@ test "document incompatible ready batches preserve concurrent calls and independ
     const a = std.testing.allocator;
     var pool = std.Io.Threaded.init(a, .{});
     defer pool.deinit();
-    for ([_]bool{ false, true }) |child_budget| {
+    for ([_]enum { different_models, child_budget, different_scopes }{ .different_models, .child_budget, .different_scopes }) |mode| {
+        const child_budget = mode == .child_budget;
         var node = Fake{ .io = pool.io() };
         const Batch = Batcher(Fake);
         var batch = Batch{ .io = pool.io(), .node = &node, .backing = a, .stopping = true, .max_parallel = 2 };
         var ledger = c.SharedAccounting{ .limits = .{ .max_parallel_calls = 2, .max_total_tokens = 100 }, .usage = .{}, .event_count = 0 };
         const local_limits: c.Limits = .{ .max_parallel_calls = 2, .max_total_tokens = if (child_budget) 20 else 100 };
+        var scopes = [_]c.ScopeAccounting{ .{ .limits = local_limits, .usage = .{} }, .{ .limits = local_limits, .usage = .{} } };
         var runs = [_]c.Run{ .{ .limits = local_limits, .shared = &ledger }, .{ .limits = local_limits, .shared = &ledger } };
+        if (mode == .different_scopes) for (&runs, &scopes) |*run, *scope| {
+            run.scope = scope;
+        };
         const input = [_]readers.EncodedImage{.{ .bytes = "image", .mime_type = "image/png" }};
         var tickets: [2]Batch.Ticket = undefined;
         for (&tickets, &runs, 0..) |*ticket, *run, index| {
             try run.call();
-            ticket.* = .{ .allocator = a, .model = if (child_budget or index == 0) "ocr-fast" else "ocr-tables", .request = .{ .images = &input }, .control = .{}, .run = run };
+            ticket.* = .{ .allocator = a, .model = if (mode != .different_models or index == 0) "ocr-fast" else "ocr-tables", .request = .{ .images = &input }, .control = .{}, .run = run };
             batch.pending[index] = ticket;
         }
         batch.count = tickets.len;
@@ -302,6 +316,7 @@ test "document incompatible ready batches preserve concurrent calls and independ
         try std.testing.expectEqual(@as(usize, 2), ledger.usage.physical_model_calls);
         try std.testing.expectEqual(@as(u64, 26), ledger.usage.total_tokens);
         for (runs) |run| try std.testing.expectEqual(@as(u64, 13), run.usage.total_tokens);
+        if (mode == .different_scopes) for (scopes) |scope| try std.testing.expectEqual(@as(u64, 13), scope.usage.total_tokens);
     }
 }
 

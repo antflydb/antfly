@@ -26,7 +26,7 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-const adapter_version = "antfly-documents-v2";
+const adapter_version = "antfly-documents-v3";
 
 pub const ReadRequest = struct {
     model: []const u8,
@@ -185,10 +185,37 @@ pub fn Service(comptime Node: type) type {
         source: *sources.Source,
         number: usize,
         native_regions: []const c.Region = &.{},
+        native_page: ?c.Page = null,
         prompt: ?[]const u8,
         max_tokens: ?i64,
         decoded: ?@import("../pipelines/image.zig").Image = null,
         rendered: ?struct { bytes: []const u8, mime_type: []const u8, width: u32, height: u32, effective_dpi: u16, raster_to_source: c.Transform } = null,
+
+        fn ioFor(node: *Node, control: Control) ?std.Io {
+            return control.io orelse if (@hasDecl(Node, "documentIo")) node.documentIo() else null;
+        }
+        fn driver(self: *Self) executor.Driver {
+            return .{ .ptr = self, .read_fn = read, .decide_fn = decide, .validate_fn = validate, .parallel = if (ioFor(self.node, self.control)) |io| .{ .io = io, .prepare_fn = prepareRegions, .fork_fn = forkRegion } else null };
+        }
+        fn prepareRegions(raw: *anyopaque, run: *c.Run) !bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            try run.control.check();
+            if (self.rendered == null) return false;
+            // Materialize crop pixels once before workers borrow this view.
+            if (self.rendered) |view| if (self.decoded == null) {
+                self.decoded = try @import("../pipelines/image.zig").decodeRgba(self.work_allocator, view.bytes);
+            };
+            return true;
+        }
+        fn forkRegion(raw: *anyopaque, a: A) !executor.Driver {
+            const parent: *Self = @ptrCast(@alignCast(raw));
+            const fork = try a.create(Self);
+            fork.* = parent.*;
+            fork.work_allocator = a;
+            var result = fork.driver();
+            result.parallel = null;
+            return result;
+        }
 
         pub fn readJson(node: *Node, backing: A, bytes: []const u8, supplied: Control) ![]u8 {
             return readJsonWithRun(node, backing, bytes, supplied, null, null, null, .read);
@@ -327,11 +354,11 @@ pub fn Service(comptime Node: type) type {
                         run.provider_deinit_fn = accounting.provider_deinit_fn;
                     }
                     const Batch = @import("reader_batcher.zig").Batcher(Node);
-                    var batcher = if (io) |executor_io| Batch{ .io = executor_io, .node = node, .backing = backing, .max_parallel = @min(width, run.limits.max_parallel_calls) } else undefined;
+                    var batcher = if (io) |executor_io| Batch{ .io = executor_io, .node = node, .backing = backing, .max_parallel = run.limits.max_parallel_calls } else undefined;
                     var batch_group: std.Io.Group = .init;
                     var batch_enabled = false;
                     if (@hasDecl(Node, "documentBatching")) {
-                        if (io != null and filled > 1 and node.documentBatching()) {
+                        if (io != null and run.limits.max_parallel_calls > 1 and node.documentBatching()) {
                             batch_enabled = if (batch_group.concurrent(io.?, Batch.execute, .{&batcher})) |_| true else |_| false;
                         }
                     }
@@ -347,6 +374,7 @@ pub fn Service(comptime Node: type) type {
                             .source_count = run.source_count,
                             .source_bytes = run.source_bytes,
                             .shared = &accounting,
+                            .scope = run.scope,
                             .event_allocator = task.arena.allocator(),
                             .work_allocator = backing,
                             .control = .{ .ptr = run.control.ptr, .check_fn = run.control.check_fn },
@@ -520,14 +548,14 @@ pub fn Service(comptime Node: type) type {
                     return err;
                 };
                 if (self.original_number) |number| page.number = number;
-                var context = Self{ .node = self.node, .definition = self.definition, .work_allocator = sa, .reader_batcher = self.reader_batcher, .graph = self.graph, .control = self.control, .source = source, .number = self.number, .native_regions = page.regions, .prompt = self.request.prompt, .max_tokens = self.request.max_tokens };
+                var context = Self{ .node = self.node, .definition = self.definition, .work_allocator = sa, .reader_batcher = self.reader_batcher, .graph = self.graph, .control = self.control, .source = source, .number = self.number, .native_regions = page.regions, .native_page = page, .prompt = self.request.prompt, .max_tokens = self.request.max_tokens };
                 var reading: executor.Result = if (std.mem.eql(u8, self.request.model, "antfly/native-document")) native: {
                     var native_page = page;
                     native_page.text = page.native_text;
                     native_page.status = if (page.findings.len == 0 and page.kind != .image) .complete else .unresolved;
                     const output_bytes = try self.run.outputJson(native_page);
                     break :native .{ .page = native_page, .output_bytes = output_bytes };
-                } else executor.readPageReported(sa, self.definition, .{ .ptr = &context, .read_fn = read, .decide_fn = decide, .validate_fn = validate }, self.number - 1, page, &self.run) catch |err| switch (err) {
+                } else executor.readPageReported(sa, self.definition, context.driver(), self.number - 1, page, &self.run) catch |err| switch (err) {
                     error.DocumentRendererUnavailable, error.DocumentBudgetExhausted => blk: {
                         var unresolved = page;
                         unresolved.text = page.native_text;
@@ -578,7 +606,7 @@ pub fn Service(comptime Node: type) type {
             const encoded_limit = @min(run.limits.max_source_bytes, self.definition.budget.max_source_bytes, if (child_definition) |child| child.budget.max_source_bytes else std.math.maxInt(usize));
             if (std.mem.eql(u8, binding.model, "antfly/native-document")) {
                 if (bbox != null) return error.DocumentCapabilityMismatch;
-                const native = try self.source.analyzeWithRegionLimit(a, self.number, run.limits.max_regions, run.control);
+                const native = self.native_page orelse try self.source.analyzeWithRegionLimit(a, self.number, run.limits.max_regions, run.control);
                 return .{ .model = binding.model, .origin = .native, .text = native.native_text, .regions = native.regions, .tables = native.tables, .status = if (native.findings.len == 0 and native.kind != .image) .complete else .unresolved };
             }
             if (self.rendered == null) {
@@ -636,6 +664,8 @@ pub fn Service(comptime Node: type) type {
             if (data.len > encoded_limit) return error.DocumentSourceLimitExceeded;
             if (binding.provider == .cloudflare) {
                 if (!cf.routing.visionModel(binding.model)) return error.DocumentCapabilityMismatch;
+                var permit = try run.acquire(ioFor(self.node, self.control), false);
+                defer permit.deinit();
                 const max_tokens = self.max_tokens orelse 1024;
                 const payload = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, .{
                     .model = binding.model,
@@ -673,6 +703,7 @@ pub fn Service(comptime Node: type) type {
                 };
                 run.control = .{ .ptr = &nested.control, .check_fn = ChildProbe.check };
                 nested.native_regions = &.{};
+                nested.native_page = null;
                 nested.source = &nested_source;
                 nested.rendered = .{ .bytes = data, .mime_type = mime, .width = raster_width, .height = raster_height, .effective_dpi = 0, .raster_to_source = .{} };
                 const page = try executor.readPage(a, child, .{ .ptr = &nested, .read_fn = read, .decide_fn = decide, .validate_fn = validate }, 0, .{ .source_id = self.source.input.id, .number = self.number, .kind = .image }, run);
@@ -697,6 +728,8 @@ pub fn Service(comptime Node: type) type {
                 .prompt = self.prompt,
                 .max_tokens = self.max_tokens,
             };
+            var permit = try run.acquire(ioFor(self.node, self.control), false);
+            defer permit.deinit();
             const batch = if (self.reader_batcher) |batcher| try batcher.read(a, pinned.path, request, self.control, run) else direct: {
                 run.physicalCall();
                 break :direct try self.node.readEncodedImagesReportedDirectWithContext(a, pinned.path, request, self.control.deadline_ns, .{ .ptr = &self.control, .is_cancelled_fn = Cancel.cancelled });
@@ -743,6 +776,8 @@ pub fn Service(comptime Node: type) type {
             try cf.put(a, &q, "criteria", criteria);
             var questions = cf.object();
             try cf.put(a, &questions, "action", q);
+            var permit = try run.acquire(ioFor(self.node, self.control), false);
+            defer permit.deinit();
             if (binding.provider == .cloudflare) {
                 run.physicalCall();
                 const response = try self.node.invokeCloudflare(a, binding, try cf.request(a, binding.model, state, "questions", questions), self.control, run);
@@ -967,6 +1002,8 @@ pub fn Service(comptime Node: type) type {
             var scratch = std.heap.ArenaAllocator.init(run.work_allocator orelse a);
             defer scratch.deinit();
             const work = scratch.allocator();
+            var permit = try run.acquire(ioFor(node, control), false);
+            defer permit.deinit();
             run.physicalCall();
             const native_plan = if (binding.provider == .cloudflare) try cf.extractionSchema(work, schema) else null;
             var item: V = undefined;

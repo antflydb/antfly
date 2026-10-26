@@ -378,6 +378,9 @@ pub const SharedAccounting = struct {
     limits: Limits,
     usage: Usage,
     event_count: usize,
+    active_calls: usize = 0,
+    active_regions: usize = 0,
+    capacity_changed: std.Io.Event = .unset,
     provider_state: ?*anyopaque = null,
     provider_deinit_fn: ?*const fn (?*anyopaque) void = null,
     mutex: std.atomic.Mutex = .unlocked,
@@ -385,9 +388,27 @@ pub const SharedAccounting = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 };
+/// All siblings refining a nested agent share that agent's absolute ceilings.
+/// Protected by the enclosing SharedAccounting mutex; scopes form a stack of
+/// structured lifetimes and are destroyed only after every child has joined.
+pub const ScopeAccounting = struct {
+    parent: ?*ScopeAccounting = null,
+    limits: Limits,
+    usage: Usage,
+    fn remaining(self: *ScopeAccounting, comptime field: []const u8, comptime limit: []const u8) u64 {
+        var result: u64 = @field(self.limits, limit) -| @field(self.usage, field);
+        if (self.parent) |parent| result = @min(result, parent.remaining(field, limit));
+        return result;
+    }
+    fn add(self: *ScopeAccounting, comptime field: []const u8, count: u64) void {
+        @field(self.usage, field) += @intCast(count);
+        if (self.parent) |parent| parent.add(field, count);
+    }
+};
 pub const Run = struct {
     limits: Limits,
     shared: ?*SharedAccounting = null,
+    scope: ?*ScopeAccounting = null,
     usage: Usage = .{},
     source_count: usize = 0,
     source_bytes: usize = 0,
@@ -397,6 +418,44 @@ pub const Run = struct {
     provider_state: ?*anyopaque = null,
     provider_deinit_fn: ?*const fn (?*anyopaque) void = null,
     events: std.ArrayList(Event) = .empty,
+    pub const Permit = struct {
+        shared: ?*SharedAccounting = null,
+        io: ?std.Io = null,
+        region: bool = false,
+        pub fn deinit(self: *Permit) void {
+            const shared = self.shared orelse return;
+            shared.lock();
+            const count = if (self.region) &shared.active_regions else &shared.active_calls;
+            std.debug.assert(count.* > 0);
+            count.* -= 1;
+            shared.mutex.unlock();
+            if (self.io) |io| shared.capacity_changed.set(io);
+            self.shared = null;
+        }
+    };
+    /// Scheduler capacity is distinct from model admission. Acquire call
+    /// capacity only at leaf dispatch; composite parents never hold it while
+    /// invoking children. Region capacity bounds live refinement scratch.
+    pub fn acquire(self: *Run, io: ?std.Io, region: bool) !Permit {
+        const shared = self.shared orelse return .{};
+        while (true) {
+            try self.control.check();
+            shared.lock();
+            const count = if (region) &shared.active_regions else &shared.active_calls;
+            if (count.* < shared.limits.max_parallel_calls) {
+                count.* += 1;
+                shared.mutex.unlock();
+                return .{ .shared = shared, .io = io, .region = region };
+            }
+            shared.capacity_changed.reset();
+            shared.mutex.unlock();
+            const runtime = io orelse return error.DocumentBudgetExhausted;
+            shared.capacity_changed.waitTimeout(runtime, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {},
+                else => return err,
+            };
+        }
+    }
     pub fn deinit(self: *Run) void {
         if (self.provider_deinit_fn) |release| release(self.provider_state);
         self.provider_state = null;
@@ -459,15 +518,28 @@ pub const Run = struct {
             defer shared.mutex.unlock();
             if (shared.usage.output_bytes >= shared.limits.max_output_bytes) return error.DocumentOutputTooLarge;
             if (shared.usage.model_calls >= shared.limits.max_model_calls) return error.DocumentBudgetExhausted;
+            if (self.scope) |scope| if (scope.remaining("model_calls", "max_model_calls") == 0) return error.DocumentBudgetExhausted;
             shared.usage.model_calls += 1;
+            if (self.scope) |scope| scope.add("model_calls", 1);
         }
         self.usage.model_calls += 1;
+    }
+    pub fn remainingCalls(self: *const Run) usize {
+        const local = self.limits.max_model_calls -| self.usage.model_calls;
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            const scoped: usize = if (self.scope) |scope| @intCast(scope.remaining("model_calls", "max_model_calls")) else local;
+            return @min(local, scoped, shared.limits.max_model_calls -| shared.usage.model_calls);
+        }
+        return local;
     }
     pub fn physicalCall(self: *Run) void {
         if (self.shared) |shared| {
             shared.lock();
             defer shared.mutex.unlock();
             shared.usage.physical_model_calls += 1;
+            if (self.scope) |scope| scope.add("physical_model_calls", 1);
         }
         self.usage.physical_model_calls += 1;
     }
@@ -479,6 +551,12 @@ pub const Run = struct {
             shared.lock();
             defer shared.mutex.unlock();
             if (count > shared.limits.max_total_tokens -| shared.usage.total_tokens) return error.DocumentTokenLimitExceeded;
+            if (self.scope) |scope| if (count > scope.remaining("total_tokens", "max_total_tokens")) return error.DocumentTokenLimitExceeded;
+            if (self.scope) |scope| {
+                scope.add("prompt_tokens", input);
+                scope.add("completion_tokens", output_tokens);
+                scope.add("total_tokens", count);
+            }
             shared.usage.prompt_tokens += input;
             shared.usage.completion_tokens += output_tokens;
             shared.usage.total_tokens += count;
@@ -495,7 +573,9 @@ pub const Run = struct {
             shared.lock();
             defer shared.mutex.unlock();
             if (count > shared.limits.max_total_pixels -| shared.usage.rendered_pixels) return error.DocumentPixelLimitExceeded;
+            if (self.scope) |scope| if (count > scope.remaining("rendered_pixels", "max_total_pixels")) return error.DocumentPixelLimitExceeded;
             shared.usage.rendered_pixels += count;
+            if (self.scope) |scope| scope.add("rendered_pixels", count);
         }
         self.usage.rendered_pixels += count;
     }
@@ -505,7 +585,9 @@ pub const Run = struct {
             shared.lock();
             defer shared.mutex.unlock();
             if (count > shared.limits.max_output_bytes -| shared.usage.output_bytes) return error.DocumentOutputTooLarge;
+            if (self.scope) |scope| if (count > scope.remaining("output_bytes", "max_output_bytes")) return error.DocumentOutputTooLarge;
             shared.usage.output_bytes += count;
+            if (self.scope) |scope| scope.add("output_bytes", count);
         }
         self.usage.output_bytes += count;
     }
@@ -514,7 +596,8 @@ pub const Run = struct {
         if (self.shared) |shared| {
             shared.lock();
             defer shared.mutex.unlock();
-            return @min(local, shared.limits.max_output_bytes -| shared.usage.output_bytes);
+            const scoped: usize = if (self.scope) |scope| @intCast(scope.remaining("output_bytes", "max_output_bytes")) else local;
+            return @min(local, scoped, shared.limits.max_output_bytes -| shared.usage.output_bytes);
         }
         return local;
     }
@@ -671,4 +754,35 @@ test "document parallel accounting shares admission while child ceilings remain 
     var scoped = Run{ .limits = .{ .max_model_calls = 1 }, .shared = &accounting };
     scoped.usage.model_calls = 1;
     try std.testing.expectError(error.DocumentBudgetExhausted, scoped.call());
+}
+
+test "document concurrent siblings share nested ceilings without partially charging denied work" {
+    var ledger = SharedAccounting{ .limits = .{}, .usage = .{}, .event_count = 0 };
+    var parent = ScopeAccounting{ .limits = .{ .max_model_calls = 2, .max_total_tokens = 10, .max_total_pixels = 10, .max_output_bytes = 10 }, .usage = .{} };
+    var left_scope = ScopeAccounting{ .parent = &parent, .limits = .{}, .usage = .{} };
+    var right_scope = ScopeAccounting{ .parent = &parent, .limits = .{}, .usage = .{} };
+    var left = Run{ .limits = .{}, .shared = &ledger, .scope = &left_scope };
+    var right = Run{ .limits = .{}, .shared = &ledger, .scope = &right_scope };
+    try left.call();
+    try right.call();
+    try std.testing.expectEqual(@as(usize, 0), left.remainingCalls());
+    try std.testing.expectError(error.DocumentBudgetExhausted, left.call());
+    try left.tokens(4, 2);
+    try std.testing.expectError(error.DocumentTokenLimitExceeded, right.tokens(3, 2));
+    try right.tokens(2, 2);
+    try left.pixels(6);
+    try std.testing.expectError(error.DocumentPixelLimitExceeded, right.pixels(5));
+    try right.pixels(4);
+    try left.output(6);
+    try std.testing.expectEqual(@as(usize, 4), right.remainingOutput());
+    try std.testing.expectError(error.DocumentOutputTooLarge, right.output(5));
+    try right.output(4);
+    try std.testing.expectEqual(@as(usize, 0), left.remainingOutput());
+    try std.testing.expectEqual(@as(usize, 2), ledger.usage.model_calls);
+    try std.testing.expectEqual(@as(u64, 10), ledger.usage.total_tokens);
+    try std.testing.expectEqual(@as(u64, 10), ledger.usage.rendered_pixels);
+    try std.testing.expectEqual(@as(usize, 10), ledger.usage.output_bytes);
+    try std.testing.expectEqual(@as(u64, 6), left_scope.usage.total_tokens);
+    try std.testing.expectEqual(@as(u64, 4), right_scope.usage.total_tokens);
+    try std.testing.expectEqual(ledger.usage, parent.usage);
 }

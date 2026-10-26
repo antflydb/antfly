@@ -18,6 +18,7 @@ const std = @import("std");
 const c = @import("contract.zig");
 const xml = @import("ooxml.zig");
 const A = std.mem.Allocator;
+const Theme = @import("drawingml_theme.zig").Theme;
 const Role = @FieldType(c.InheritedPart, "role");
 const Part = struct {
     path: []const u8,
@@ -36,6 +37,15 @@ pub const Cache = struct {
     parts: std.StringHashMapUnmanaged(*Part) = .{},
     max_regions: usize = 65536,
     relationships: std.StringHashMapUnmanaged(*xml.Relationships) = .{},
+    themes: std.StringHashMapUnmanaged(*Theme) = .{},
+    pub fn themeForPart(self: *Cache, a: A, archive: xml.Archive, path: []const u8) !?Theme {
+        const target = (try self.relatedPath(a, archive, path, .theme)) orelse return null;
+        if (self.themes.get(target)) |known| return known.*;
+        const parsed = try a.create(Theme);
+        parsed.* = try Theme.parse(a, try archive.get(a, target), archive.control);
+        try self.themes.put(a, target, parsed);
+        return parsed.*;
+    }
     pub fn renderView(self: *const Cache, path: []const u8) !xml.View {
         return (self.parts.get(path) orelse return error.MissingDocumentPart).render_view;
     }

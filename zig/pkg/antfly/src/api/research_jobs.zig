@@ -155,10 +155,15 @@ pub const Store = struct {
             outer = try std.json.parseFromSliceLeaky(Record, a, bytes, .{ .allocate = .alloc_always });
             if (!std.mem.eql(u8, outer.owner, next.owner)) return false;
             const previous = try std.json.parseFromSliceLeaky(@TypeOf(next), a, outer.request, .{});
+            // Tombstones are permanent fencing records, never reusable IDs.
+            if (previous.retired or next.retention_until_ms != previous.retention_until_ms) return false;
+            if (!std.meta.eql(previous.identity, next.identity) or !std.meta.eql(previous.limits, next.limits)) return error.InvalidDocumentCheckpoint;
             if (!std.meta.eql(previous.version(), expected.?) or next.revision != expected.?.revision + 1) return false;
             // Recheck at the metadata linearization point. Artifact IO may
             // have outlived the timestamp used to prepare this transition.
             const now = now_fn();
+            if (!next.retired and next.retention_until_ms != 0 and now >= next.retention_until_ms) return error.DocumentRunExpired;
+            if (next.retired and (next.retention_until_ms == 0 or now < next.retention_until_ms)) return error.DocumentRunRetentionActive;
             if (previous.state == .running) {
                 if (next.attempt == previous.attempt and next.state != .cancelled and now >= previous.lease_until_ms) return error.DocumentRunLeaseLost;
                 if (next.attempt > previous.attempt and now < previous.lease_until_ms) return error.DocumentRunBusy;
@@ -402,6 +407,10 @@ pub const Store = struct {
     }
 
     pub fn cleanupExpiredJobs(self: *Store) void {
+        // Document roots must first be tombstoned and their artifact namespaces
+        // swept. Generic job cleanup would lose reachability and late-upload
+        // fencing evidence, leaving permanent orphans.
+        if (self.cfg.namespace == .documents) return;
         const now = nowMillis();
         lock(&self.mutex);
         defer self.mutex.unlock();

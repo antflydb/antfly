@@ -23,6 +23,13 @@ pub const text_encoding = @import("text_encoding.zig");
 pub const reader = @import("reader.zig");
 pub const syntax = @import("syntax.zig");
 pub const render = @import("render.zig");
+/// Native layout producers use the same immutable faces and metrics as the
+/// rasterizer, avoiding platform font dependencies and layout/render drift.
+pub const native_fonts = struct {
+    pub const sfnt = @import("antfly_font").sfnt;
+    pub const regular = @import("pdf_standard_fonts").regular;
+    pub const bold = @import("pdf_standard_fonts").bold;
+};
 
 const Allocator = std.mem.Allocator;
 

@@ -34,7 +34,7 @@ fn selectedPage(selection: ?[]const usize, number: usize) bool {
         }
     }.order) != null;
 }
-pub const Slide = struct { path: []const u8, view: ?ooxml.View = null, hidden: bool = false, notes: ?ooxml.View = null, inherited: []const c.InheritedPart = &.{} };
+pub const Slide = struct { path: []const u8, view: ?ooxml.View = null, hidden: bool = false, notes: ?ooxml.View = null, inherited: []const c.InheritedPart = &.{}, theme: @import("drawingml_theme.zig").Theme = .{}, theme_supported: bool = true };
 pub const Source = struct {
     input: Input,
     fingerprint: [64]u8,
@@ -109,6 +109,29 @@ pub const Source = struct {
                         }
                     }
                     slide.inherited = try inheritance.inherited(a, archive, path, xml);
+                    for (0..slide.inherited.len) |index| {
+                        const part = slide.inherited[slide.inherited.len - index - 1];
+                        if (try inheritance.relatedPath(a, archive, part.path, .theme_override) != null) slide.theme_supported = false;
+                        const part_theme = inheritance.themeForPart(a, archive, part.path) catch |err| switch (err) {
+                            error.DocumentRendererUnavailable => unsupported: {
+                                slide.theme_supported = false;
+                                break :unsupported null;
+                            },
+                            else => return err,
+                        };
+                        if (part_theme) |theme| slide.theme = theme;
+                        slide.theme = try slide.theme.withMapping(a, try inheritance.renderView(part.path), control);
+                    }
+                    const own_theme = inheritance.themeForPart(a, archive, path) catch |err| switch (err) {
+                        error.DocumentRendererUnavailable => unsupported: {
+                            slide.theme_supported = false;
+                            break :unsupported null;
+                        },
+                        else => return err,
+                    };
+                    if (own_theme) |theme| slide.theme = theme;
+                    if (try inheritance.relatedPath(a, archive, path, .theme_override) != null) slide.theme_supported = false;
+                    slide.theme = try slide.theme.withMapping(a, slide.view.?, control);
                     if (input.include_notes and (!slide.hidden or input.include_hidden)) if (try inheritance.relatedPath(a, archive, path, .notes)) |notes_path| {
                         slide.notes = try ooxml.View.initWithControl(a, try archive.get(a, notes_path), control);
                         try slide.notes.?.requirePart(.notes);
@@ -297,6 +320,7 @@ pub const Source = struct {
                 if (slide.hidden and !self.input.include_hidden) return error.HiddenDocumentPage;
                 // Composition is only admitted when every visible layer has
                 // native display support. Never OCR an incomplete slide image.
+                if (!slide.theme_supported) return error.DocumentRendererUnavailable;
                 const size = slides.size orelse return error.DocumentRendererUnavailable;
                 var scratch = std.heap.ArenaAllocator.init(a);
                 defer scratch.deinit();
@@ -308,9 +332,9 @@ pub const Source = struct {
                     const part = slide.inherited[slide.inherited.len - index - 1];
                     if (part.conditional_content) return error.DocumentRendererUnavailable;
                     if (!part.shapes_visible and !part.background_visible) continue;
-                    try layers.append(work, .{ .path = part.path, .view = try slides.inheritance.renderView(part.path), .shapes = part.shapes_visible, .background = part.background_visible });
+                    try layers.append(work, .{ .path = part.path, .view = try slides.inheritance.renderView(part.path), .shapes = part.shapes_visible, .background = part.background_visible, .theme = slide.theme });
                 }
-                try layers.append(work, .{ .path = slide.path, .view = slide.view orelse return error.InvalidDocumentSelection, .background = true });
+                try layers.append(work, .{ .path = slide.path, .view = slide.view orelse return error.InvalidDocumentSelection, .background = true, .theme = slide.theme });
                 const bytes = try drawingml.compile(work, slides.archive, size, layers.items, run);
                 var native = try Source.init(scratch.allocator(), .{ .id = self.input.id, .url = "", .media_type = "application/pdf" }, bytes, run.limits, run.control);
                 defer native.deinit();
@@ -431,6 +455,83 @@ test "document native nested slide groups compose child extents without shifting
         const x: usize = @intFromFloat(sample.x * @as(f64, @floatFromInt(decoded.width)));
         const y: usize = @intFromFloat(sample.y * @as(f64, @floatFromInt(decoded.height)));
         try expectNativeRgb(sample.color, decoded.data[(y * decoded.width + x) * 4 ..][0..3]);
+    }
+}
+
+test "document native themed slide paints font outlines above inherited colors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source = try Source.init(a, .{ .id = "theme", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @embedFile("testdata/native-themed-text.pptx"), .{}, .{});
+    defer source.deinit();
+    const page = try source.analyze(a, 1, .{});
+    try std.testing.expect(std.mem.indexOf(u8, page.native_text, "Invoice €12.50") != null);
+    var run = c.Run{ .limits = .{} };
+    defer run.deinit();
+    const raster = try source.render(a, 1, &run);
+    const decoded = try @import("../pipelines/image.zig").decodeRgba(a, raster.bytes);
+    defer decoded.deinit(a);
+    const pixel = decoded.data[(@as(usize, decoded.height) * 3 / 4 * decoded.width + decoded.width / 4) * 4 ..][0..3];
+    try expectNativeRgb(.{ 128, 192, 255 }, pixel);
+    var ink: usize = 0;
+    for (0..decoded.height / 3) |y| for (0..decoded.width / 2) |x| {
+        const sample = decoded.data[(y * decoded.width + x) * 4 ..][0..3];
+        if (sample[0] < 32 and sample[1] < 32 and sample[2] < 32) ink += 1;
+    };
+    try std.testing.expect(ink > 30 and ink < @as(usize, decoded.width) * decoded.height / 8);
+}
+
+test "document native cached chart values become correctly scaled colored bars" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source = try Source.init(a, .{ .id = "chart", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @embedFile("testdata/native-chart.pptx"), .{}, .{});
+    defer source.deinit();
+    var run = c.Run{ .limits = .{} };
+    defer run.deinit();
+    const raster = try source.render(a, 1, &run);
+    const decoded = try @import("../pipelines/image.zig").decodeRgba(a, raster.bytes);
+    defer decoded.deinit(a);
+    const samples = [_]struct { x: f64, y: f64, rgb: [3]u8 }{
+        .{ .x = 0.35, .y = 0.63, .rgb = .{ 0, 128, 255 } },
+        .{ .x = 0.35, .y = 0.23, .rgb = .{ 255, 255, 255 } },
+        .{ .x = 0.75, .y = 0.23, .rgb = .{ 0, 128, 255 } },
+    };
+    for (samples) |sample| {
+        const x: usize = @intFromFloat(sample.x * @as(f64, @floatFromInt(decoded.width)));
+        const y: usize = @intFromFloat(sample.y * @as(f64, @floatFromInt(decoded.height)));
+        try expectNativeRgb(sample.rgb, decoded.data[(y * decoded.width + x) * 4 ..][0..3]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), run.usage.physical_model_calls);
+}
+
+test "document native line and pie charts render their distinct cached data geometry" {
+    inline for (.{ .{ @embedFile("testdata/native-line-chart.pptx"), false }, .{ @embedFile("testdata/native-pie-chart.pptx"), true } }) |fixture| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var source = try Source.init(a, .{ .id = "chart", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, fixture[0], .{}, .{});
+        defer source.deinit();
+        var run = c.Run{ .limits = .{} };
+        defer run.deinit();
+        const raster = try source.render(a, 1, &run);
+        const decoded = try @import("../pipelines/image.zig").decodeRgba(a, raster.bytes);
+        defer decoded.deinit(a);
+        if (fixture[1]) {
+            const x = decoded.width * 65 / 100;
+            const y = decoded.height / 4;
+            try expectNativeRgb(.{ 0, 128, 255 }, decoded.data[(@as(usize, y) * decoded.width + x) * 4 ..][0..3]);
+            const ox = decoded.width * 45 / 100;
+            const oy = decoded.height * 55 / 100;
+            try expectNativeRgb(.{ 255, 128, 0 }, decoded.data[(@as(usize, oy) * decoded.width + ox) * 4 ..][0..3]);
+        } else {
+            var blue: usize = 0;
+            for (0..@as(usize, decoded.width) * decoded.height) |i| {
+                const pixel = decoded.data[i * 4 ..][0..3];
+                if (pixel[0] < 32 and pixel[1] > 96 and pixel[1] < 160 and pixel[2] > 224) blue += 1;
+            }
+            try std.testing.expect(blue > 50 and blue < 2000);
+        }
     }
 }
 

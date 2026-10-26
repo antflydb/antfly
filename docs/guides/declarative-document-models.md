@@ -273,14 +273,22 @@ rectangles, ellipses and lines with explicit RGB fills/strokes; and solid RGB
 backgrounds. Nested groups compose child coordinates, scaling, rotation and flips.
 Visible master/layout decorations compose behind slide drawings,
 with the nearest selected background beneath all shapes and template placeholders
-excluded. Text rendering, charts, theme-dependent styles and
-effects remain unsupported. Unsupported content is reported
+excluded. Text boxes support per-run size, bold/italic, color/opacity, spacing,
+wrapping and paragraph alignment/vertical anchoring. Layout and rendering share
+bundled Roboto SFNT metrics and outlines; other Latin font names use this
+deterministic fallback. Theme color schemes, color maps and ordered tint/shade,
+luminance and opacity transforms resolve from source-owned metadata. Basic
+bar/line/pie charts render cached series, category/value labels and legends
+without fetching workbooks or evaluating formulas. Complex-script shaping,
+placeholder geometry inheritance, theme overrides and format-style references,
+stacked/3D/manual-layout charts and additional effects remain unsupported.
+Unsupported content is reported
 explicitly. XML inspection recognizes drawings independently of namespace prefixes,
 including vector shapes, pictures, charts and embedded content. A slide with
 unsupported visual content remains unresolved. Slide layouts and masters are
 parsed once per source and shared across slides. Inherited parts retain their
 source identity and visibility metadata; template prompts are excluded. Visible
-inherited text, conditional footer content, and unsupported drawing styles keep
+conditional footer content and unsupported drawing styles keep
 the slide unresolved. Incomplete slide images are never sent to OCR. PDF native inspection checks
 painting operators without decoding images or materializing vector paths;
 text-bearing pages with drawings still require visual inspection. PDF annotation
@@ -397,12 +405,16 @@ without a shared executor run serially. Each PDF page has an independent reader
 fork and scratch arena. All workers share cumulative call/token/pixel/output
 admission and one hosted HTTP pool. Results and retained events merge in source
 order, so completion order cannot reorder document output. At most one wave of
-completed pages is buffered. Compatible ready crops from independent pages
+completed pages is buffered. Independent regional refinement uses bounded waves
+with worker-owned scratch, immutable crop pixels and canonical revision/event
+assembly. A run-wide region gate bounds live refinement tasks; a separate leaf
+call gate enforces total call concurrency across pages and regions. Composite
+parents hold no leaf call capacity while invoking children. Compatible ready crops
 coalesce into shared reader invocations; incompatible groups dispatch concurrently
 within the call ceiling. Token usage is charged once for each physical batch.
 Narrower child token budgets retain separate physical reports when aggregate
 batch usage cannot be attributed safely to individual children.
-Region refinement within each page remains ordered. Model discovery reports
+Attempts within each region remain ordered. Model discovery reports
 the effective parallel-call ceiling.
 
 Initial OCR output and accepted revisions must retain trustworthy native text
@@ -537,8 +549,14 @@ durable before dispatch; interrupted work retains conservative charges across
 attempts. The executor facade replays accepted stages from a bounded index, and
 event chunks commit atomically with their stage results and receive stable
 sequence cursors. Actual artifact/metadata close-and-reopen tests cover recovery.
+Retention uses an absolute deadline that lease renewal and replay cannot extend.
+Expiry first persists a tombstone, which fences publication and retains the last
+upload attempt. Artifact collection deletes a bounded batch from that run's scoped
+namespace, retries after restart, and revisits tombstones to catch late orphan
+uploads. Generic research-job cleanup never deletes document roots. Close/reopen
+tests cover collection between batches and isolation from another owner's runs.
 This foundation is not yet connected to document requests or public job routes;
-source snapshot admission, task lifecycle/GC and streamed HTTP events remain
+source snapshot admission, maintenance scheduling and streamed HTTP events remain
 integration work. Process-local reading handles retain their existing lifetime.
 
 `max_output_bytes` admits full structured pages, extraction payloads and retained

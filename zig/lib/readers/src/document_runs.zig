@@ -58,6 +58,12 @@ pub const Record = struct {
     used: Charge = .{},
     /// Conservative charges for calls dispatched by superseded attempts.
     uncertain: Charge = .{},
+    /// Absolute retention deadline. Zero is reserved for legacy internal runs.
+    /// Renewing a lease or replaying a result never extends retention.
+    retention_until_ms: u64 = 0,
+    /// A durable tombstone fences uploads before artifact collection starts.
+    /// Keep this marker after collection so late uploads remain discoverable.
+    retired: bool = false,
     inputs: []const Ref,
     head: ?Ref = null,
     sequence: u64 = 0,
@@ -87,6 +93,18 @@ pub const Store = struct {
     get_fn: *const fn (*anyopaque, A, Ref, usize) anyerror![]u8,
 
     pub fn load(self: Store, a: A, id: []const u8, owner: []const u8) !Record {
+        const record = try self.inspect(a, id, owner);
+        if (record.retired) return error.DocumentRunExpired;
+        return record;
+    }
+    /// Public status/result/event reads must check the deadline even when
+    /// maintenance has not yet retired the run or deletion is unavailable.
+    pub fn loadAt(self: Store, a: A, id: []const u8, owner: []const u8, now_ms: u64) !Record {
+        const record = try self.load(a, id, owner);
+        if (record.retention_until_ms != 0 and now_ms >= record.retention_until_ms) return error.DocumentRunExpired;
+        return record;
+    }
+    fn inspect(self: Store, a: A, id: []const u8, owner: []const u8) !Record {
         const record = (try self.load_fn(self.ptr, a, id, owner)) orelse return error.DocumentRunNotFound;
         if (record.format != 1 or !std.mem.eql(u8, record.run_id, id) or !std.mem.eql(u8, record.owner, owner)) return error.DocumentRunNotFound;
         if (record.revision == 0 or !record.used.within(record.limits) or record.pending.len > 64) return error.InvalidDocumentCheckpoint;
@@ -113,7 +131,7 @@ pub const Store = struct {
         return ref;
     }
     pub fn create(self: Store, record: Record) !void {
-        if (record.format != 1 or record.run_id.len == 0 or record.owner.len == 0 or record.attempt != 0 or record.revision != 1 or record.state != .queued or record.head != null or record.sequence != 0 or record.result != null or record.pending.len != 0 or !std.meta.eql(record.used, Charge{}) or !std.meta.eql(record.uncertain, Charge{})) return error.InvalidDocumentCheckpoint;
+        if (record.format != 1 or record.run_id.len == 0 or record.owner.len == 0 or record.attempt != 0 or record.revision != 1 or record.state != .queued or record.retired or record.head != null or record.sequence != 0 or record.result != null or record.pending.len != 0 or !std.meta.eql(record.used, Charge{}) or !std.meta.eql(record.uncertain, Charge{})) return error.InvalidDocumentCheckpoint;
         if (!try self.cas_fn(self.ptr, null, record)) return error.DocumentRunExists;
     }
     pub fn claim(self: Store, a: A, id: []const u8, owner: []const u8, identity: Identity, now_ms: u64, lease_ms: u64) !Lease {
@@ -122,7 +140,7 @@ pub const Store = struct {
         self.nonce_fn(self.ptr, &nonce);
         if (std.mem.allEqual(u8, &nonce, 0)) return error.InvalidDocumentCheckpoint;
         for (0..16) |_| {
-            var record = try self.load(a, id, owner);
+            var record = try self.loadAt(a, id, owner, now_ms);
             if (!std.meta.eql(identity, record.identity)) return error.DocumentModelRevisionMismatch;
             if (record.state == .succeeded or record.state == .cancelled or record.state == .failed) return error.DocumentRunTerminal;
             if (record.state == .running and now_ms < record.lease_until_ms) return error.DocumentRunBusy;
@@ -131,6 +149,7 @@ pub const Store = struct {
             record.attempt = std.math.add(u64, record.attempt, 1) catch return error.InvalidDocumentCheckpoint;
             record.revision = std.math.add(u64, previous, 1) catch return error.InvalidDocumentCheckpoint;
             record.lease_until_ms = std.math.add(u64, now_ms, lease_ms) catch return error.InvalidDocumentCheckpoint;
+            if (record.retention_until_ms != 0) record.lease_until_ms = @min(record.lease_until_ms, record.retention_until_ms);
             record.state = .running;
             record.nonce = nonce;
             // Old in-flight steps may no longer be chosen by an adaptive
@@ -142,7 +161,7 @@ pub const Store = struct {
         return error.DocumentRunBusy;
     }
     fn current(self: Store, a: A, lease: Lease, now_ms: u64) !Record {
-        const record = try self.load(a, lease.run_id, lease.owner);
+        const record = try self.loadAt(a, lease.run_id, lease.owner, now_ms);
         if (record.state != .running or record.attempt != lease.attempt or !std.mem.eql(u8, &record.nonce, &lease.nonce) or now_ms >= record.lease_until_ms) return error.DocumentRunLeaseLost;
         return record;
     }
@@ -226,6 +245,7 @@ pub const Store = struct {
             const expected = record.version();
             const previous = record.revision;
             record.lease_until_ms = std.math.add(u64, now_ms, lease_ms) catch return error.InvalidDocumentCheckpoint;
+            if (record.retention_until_ms != 0) record.lease_until_ms = @min(record.lease_until_ms, record.retention_until_ms);
             record.revision = std.math.add(u64, previous, 1) catch return error.InvalidDocumentCheckpoint;
             if (try self.cas_fn(self.ptr, expected, record)) return;
         }
@@ -241,6 +261,29 @@ pub const Store = struct {
             record.lease_until_ms = 0;
             record.revision = std.math.add(u64, previous, 1) catch return error.InvalidDocumentCheckpoint;
             if (try self.cas_fn(self.ptr, expected, record)) return;
+        }
+        return error.DocumentRunBusy;
+    }
+    /// Expiry and loss of publication authority precede deletion. A tombstone
+    /// retains run identity and the highest upload attempt, allowing bounded
+    /// collectors to retry after a crash or an upload finishing late.
+    pub fn retire(self: Store, a: A, id: []const u8, owner: []const u8, now_ms: u64) !Record {
+        for (0..16) |_| {
+            var record = try self.inspect(a, id, owner);
+            if (record.retired) return record;
+            if (record.retention_until_ms == 0 or now_ms < record.retention_until_ms) return error.DocumentRunRetentionActive;
+            const expected = record.version();
+            record.retired = true;
+            record.state = .cancelled;
+            record.lease_until_ms = 0;
+            for (record.pending) |pending| record.uncertain = try record.uncertain.plus(pending.upper);
+            record.pending = &.{};
+            record.inputs = &.{};
+            record.head = null;
+            record.sequence = 0;
+            record.result = null;
+            record.revision = std.math.add(u64, record.revision, 1) catch return error.InvalidDocumentCheckpoint;
+            if (try self.cas_fn(self.ptr, expected, record)) return record;
         }
         return error.DocumentRunBusy;
     }
@@ -739,4 +782,37 @@ test "document durable events commit atomically with stages and replay by stable
     try std.testing.expectEqual(@as(u64, 2), page2[0].sequence);
     try std.testing.expectEqual(@as(usize, 0), (try index.eventsAfter(page2[0].sequence, 1)).len);
     try std.testing.expectError(error.InvalidDocumentCheckpoint, index.eventsAfter(4, 1));
+}
+
+test "document durable retention fences leases and tombstones permanently preserve upload authority" {
+    const a = std.testing.allocator;
+    var memory = TestStore{ .a = a };
+    defer memory.deinit();
+    const store = memory.interface();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const identity: Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    const initial: Record = .{ .run_id = "expires", .owner = "alice", .identity = identity, .retention_until_ms = 100, .limits = .{ .calls = 4, .output_bytes = 1024 }, .inputs = &.{} };
+    try store.create(initial);
+    const lease = try store.claim(work, "expires", "alice", identity, 1, 1000);
+    try std.testing.expectEqual(@as(u64, 100), (try store.load(work, "expires", "alice")).lease_until_ms);
+    try store.renew(work, lease, 2, 1000);
+    try std.testing.expectEqual(@as(u64, 100), (try store.load(work, "expires", "alice")).lease_until_ms);
+    try std.testing.expect(try store.reserve(work, lease, @splat(1), .{ .calls = 1, .output_bytes = 64 }, 3));
+    _ = try store.complete(work, lease, @splat(1), .{ .calls = 1, .output_bytes = 8 }, "accepted", 4);
+    try std.testing.expect(try store.reserve(work, lease, @splat(2), .{ .calls = 1 }, 5));
+    try std.testing.expectError(error.DocumentRunNotFound, store.retire(work, "expires", "bob", 100));
+    try std.testing.expectError(error.DocumentRunRetentionActive, store.retire(work, "expires", "alice", 99));
+    try std.testing.expectError(error.DocumentRunExpired, store.complete(work, lease, @splat(2), .{ .calls = 1 }, "", 100));
+    try std.testing.expectError(error.DocumentRunExpired, store.loadAt(work, "expires", "alice", 100));
+    const tombstone = try store.retire(work, "expires", "alice", 100);
+    try std.testing.expect(tombstone.retired);
+    try std.testing.expectEqual(lease.attempt, tombstone.attempt);
+    try std.testing.expectEqual(@as(u64, 2), tombstone.used.calls);
+    try std.testing.expectEqual(@as(u64, 1), tombstone.uncertain.calls);
+    try std.testing.expect(tombstone.head == null and tombstone.result == null and tombstone.pending.len == 0);
+    try std.testing.expectEqual(tombstone.version(), (try store.retire(work, "expires", "alice", 101)).version());
+    try std.testing.expectError(error.DocumentRunExpired, store.claim(work, "expires", "alice", identity, 101, 10));
+    try std.testing.expectError(error.DocumentRunExists, store.create(initial));
 }

@@ -22227,10 +22227,10 @@ pub const Node = struct {
                 },
                 .executor = if (definition != null) "declarative_composite" else "native_document",
                 .remote_execution = if (definition) |def| def.allow_remote else false,
-                .max_parallel_calls = @as(u32, if (self.session_manager.io != null) @intCast(@min(limits.max_parallel_pages, limits.max_parallel_calls)) else 1),
+                .max_parallel_calls = @as(u32, if (self.session_manager.io != null) @intCast(limits.max_parallel_calls) else 1),
                 .document_formats = .{
                     .pdf = .{ .native_text = true, .visual_rendering = true, .annotation_rendering = true },
-                    .pptx = .{ .native_text = true, .visual_rendering = true, .native_pictures = true, .basic_vector_shapes = true, .solid_backgrounds = true, .group_transforms = true, .chart_rendering = false, .text_rendering = false, .speaker_notes = true, .hidden_slide_policy = true },
+                    .pptx = .{ .native_text = true, .visual_rendering = true, .native_pictures = true, .basic_vector_shapes = true, .solid_backgrounds = true, .group_transforms = true, .chart_rendering = true, .native_chart_types = .{ "bar", "line", "pie" }, .text_rendering = true, .theme_colors = true, .font_policy = "bundled_roboto_sfnt", .complex_script_shaping = false, .speaker_notes = true, .hidden_slide_policy = true },
                     .images = .{ .formats = .{ "image/png", "image/jpeg", "image/webp" }, .perspective_correction = true },
                 },
                 .artifact_reuse = .{ .retention = "process_local", .max_ttl_ms = @as(u32, 300000), .durable_resume = false },
@@ -40831,7 +40831,7 @@ test "document direct read accepts whole PDF and ordered PPTX without model admi
     defer catalog.deinit();
     const native = catalog.value.object.get("readers").?.object.get("antfly/native-document").?;
     try std.testing.expect(native.object.get("inference_capabilities").?.object.get("document_formats").?.object.get("pptx").?.object.get("visual_rendering").?.bool);
-    try std.testing.expect(!native.object.get("inference_capabilities").?.object.get("document_formats").?.object.get("pptx").?.object.get("chart_rendering").?.bool);
+    try std.testing.expect(native.object.get("inference_capabilities").?.object.get("document_formats").?.object.get("pptx").?.object.get("chart_rendering").?.bool);
 }
 
 test "document model dispatch preserves client errors for invalid ordinary model names" {
