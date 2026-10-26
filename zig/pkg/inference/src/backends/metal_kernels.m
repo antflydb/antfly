@@ -7127,6 +7127,70 @@ typedef struct termite_metal_conv2d_f32_params {
 #define TERMITE_MSL_RELATIVE_QUERY_SCALAR(Row, Offset) \
     TERMITE_MSL_RELATIVE_QUERY_PREFIX(Row, Offset) "float qx = q[q_base + x]; acc" #Row " += qx * kx + qx * k_r[rel_base + x] + q_r[rel_base + x] * kx; }\n"
 
+// Additional native ABI families cover multiline declarations and paired
+// specializations. Each consumer retains its original names, slots and layout.
+#define TERMITE_MSL_ABI_QUANT_PAIR_PROJECTION_REDUCE(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_RELATIVE_ATTENTION(Kernel) "kernel void " #Kernel "(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *q_r [[buffer(3)]], device const float *k_r [[buffer(4)]], device const float *mask [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_disentangled_relative_attention_f32_params &p [[buffer(7)]], device const float *relative_index [[buffer(8)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_Q8_PAIR_MATRIX(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device uchar *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_F16(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device half *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_Q8_KV_PAIR_MATRIX(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device const uchar *weight_k [[buffer(1)]], device const uchar *weight_v [[buffer(2)]], device float *output_k [[buffer(3)]], device float *output_v [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_DENSE_CAUSAL_ATTENTION(Kernel) "kernel void " #Kernel "(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_f32_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_BF16_GATE_UP_MATRIX(Kernel) "kernel void " #Kernel "(\n    device const float *x [[buffer(0)]], device const ushort *wg [[buffer(1)]], device const ushort *wu [[buffer(2)]],\n    device const float *bg [[buffer(3)]], device const float *bu [[buffer(4)]], device float *out [[buffer(5)]],\n    constant termite_metal_linear_params &p [[buffer(6)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_GROUPED_SHORT_ATTENTION(Kernel) "kernel void " #Kernel "(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const uint *ranges [[buffer(3)]], device const int *qpos [[buffer(4)]], device const int *kpos [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_sdpa_segments_f32_params &p [[buffer(7)]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_BF16_LINEAR_MATRIX(Kernel) "kernel void " #Kernel "(\n    device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]],\n    device const float *bias [[buffer(2)]], device float *output [[buffer(3)]],\n    constant termite_metal_linear_params &p [[buffer(4)]],\n    ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],\n    uint2 tg [[threadgroup_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_QUANT_PAIR_PROJECTION(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_COMPRESSED_ATTENTION_SPAN(Kernel) "kernel void " #Kernel "(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_span_params &p [[buffer(4)]], uint h [[thread_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_DENSE_EMBEDDING_16(Kernel) "kernel void " #Kernel "(device const ushort *weight [[buffer(0)]], device const uint *ids [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_embedding_lookup_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_DOT_2D(Kernel) "kernel void " #Kernel "(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_COMPRESSED_KEY_SCORES(Kernel) "kernel void " #Kernel "(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device float *scores [[buffer(2)]], constant termite_metal_key_scores_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_CUMULATIVE_BYTE_SUM(Kernel) "kernel void " #Kernel "(device const uchar *input [[buffer(0)]], device uchar *output [[buffer(1)]], constant termite_scan_params &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_CLAMP_ACTIVATION(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_gemma4_audio_clamp_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_AUDIO_ROWS(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_gemma4_audio_rows_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_FLORENCE_WINDOW(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_florence_window_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_COMPRESSED_KEY_ENCODING(Kernel) "kernel void " #Kernel "(device const float *k [[buffer(0)]], device uchar *encoded_key [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {"
+
+// quant-kernel-codegen:begin Metal attention phase owners
+#define TERMITE_MSL_ATTENTION_STAGING \
+    "    threadgroup half *sq = (threadgroup half *)shmem;\n" \
+    "    threadgroup half *skv = sq + 8u * hd;\n" \
+    "    threadgroup char *fb = shmem + (8u + 32u) * hd * 2u;\n" \
+    "    threadgroup float *ss = (threadgroup float *)fb;\n" \
+    "    threadgroup half *sp = (threadgroup half *)(fb + 1024u);\n"
+#define TERMITE_MSL_ATTENTION_ACCUMULATORS \
+    "    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; sq[i] = qi < p.q_len ? half(q[qi * q_stride + h * hd + d] * scale) : half(0.0f); }\n" \
+    "    if (tid < 8u) { sM[tid] = -3.402823466e+38f; sS[tid] = 0.0f; }\n" \
+    "    if (tid < 64u) sdiag[tid] = 0.0f;\n" \
+    "    const uint dslice = uint(sgitg) * (hd / 4u);\n" \
+    "    simdgroup_float8x8 mo[8];\n" \
+    "    for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n" \
+    "    const uint d_tiles = hd / 32u;\n"
+#define TERMITE_MSL_ATTENTION_SCORE_ROWS \
+    "        simdgroup_store(ms, ss + uint(sgitg) * 8u, 32u, 0, false);\n" \
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
+    "        for (uint jj = 0u; jj < 2u; ++jj) {\n" \
+    "            uint j = uint(sgitg) + jj * 4u; uint qi = q0 + j; uint query_pos = p.query_position_offset + qi; uint kk = uint(lane); uint ki = kc + kk;\n"
+#define TERMITE_MSL_ATTENTION_ONLINE_WEIGHTS \
+    "            if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }\n" \
+    "            float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f;\n" \
+    "            float m_old; float m_new; float corr; float row_sum;\n" \
+    "            antfly_attention_online_row32(sc, sM, j, sp, j * 32u + kk, m_old, m_new, corr, row_sum);\n" \
+    "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; }\n" \
+    "        }\n" \
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
+    "        simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u);\n" \
+    "        for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; }\n" \
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+#define TERMITE_MSL_ATTENTION_PUBLISH \
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
+    "    if (tid < 8u) { float denom = sS[tid]; sdiag[uint(tid) * 8u + uint(tid)] = denom > 0.0f ? 1.0f / denom : 0.0f; }\n" \
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
+    "    simdgroup_float8x8 minv; simdgroup_load(minv, sdiag, 8u);\n" \
+    "    threadgroup float *so = (threadgroup float *)skv;\n" \
+    "    for (uint dt = 0u; dt < d_tiles; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[dt]); simdgroup_store(scaled, so + uint(sgitg) * (8u * (hd / 4u)) + dt * 8u, hd / 4u, 0, false); }\n" \
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
+    "    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (8u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n"
+// quant-kernel-codegen:end Metal attention phase owners
+
 static NSString *termite_metal_shader_source(void) {
     return @"#include <metal_stdlib>\n"
            "using namespace metal;\n"
@@ -7443,7 +7507,7 @@ static NSString *termite_metal_shader_source(void) {
            "    output_a[r * p.out_dim + o] = acc_a;\n"
            "    output_b[r * p.out_dim + o] = acc_b;\n"
            "}\n"
-           "kernel void termite_q4_0_pair_linear_1x_reduce(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_QUANT_PAIR_PROJECTION_REDUCE(termite_q4_0_pair_linear_1x_reduce) "\n"
            "    const uint NR0 = 2u; const uint NSG = 4u; const uint NQ = 16u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * 8u; uint ib0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; float acc_a0 = 0.0f; float acc_a1 = 0.0f; float acc_b0 = 0.0f; float acc_b1 = 0.0f;\n"
            "    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float yl[16]; float sumy = 0.0f; uint in_off = in_row + b * 32u + il; for (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 18u + b * 18u; ushort bits_a = (ushort(weight_a[off + 1]) << 8) | ushort(weight_a[off]); ushort bits_b = (ushort(weight_b[off + 1]) << 8) | ushort(weight_b[off]); float d_a = float(as_type<half>(bits_a)); float d_b = float(as_type<half>(bits_b)); const device ushort *qs_a = reinterpret_cast<const device ushort *>(weight_a + off + 2u) + (il >> 1); const device ushort *qs_b = reinterpret_cast<const device ushort *>(weight_b + off + 2u) + (il >> 1); float qacc_a = 0.0f; float qacc_b = 0.0f; for (uint i = 0u; i < 8u; i += 2u) { uint packed_a = uint(qs_a[i >> 1]); uint packed_b = uint(qs_b[i >> 1]); qacc_a += yl[i] * float(packed_a & 0x000Fu); qacc_a += yl[i + 1u] * float(packed_a & 0x0F00u); qacc_a += yl[i + 8u] * float(packed_a & 0x00F0u); qacc_a += yl[i + 9u] * float(packed_a & 0xF000u); qacc_b += yl[i] * float(packed_b & 0x000Fu); qacc_b += yl[i + 1u] * float(packed_b & 0x0F00u); qacc_b += yl[i + 8u] * float(packed_b & 0x00F0u); qacc_b += yl[i + 9u] * float(packed_b & 0xF000u); } if (row == 0u) { acc_a0 += d_a * (qacc_a - 8.0f * sumy); acc_b0 += d_b * (qacc_b - 8.0f * sumy); } else { acc_a1 += d_a * (qacc_a - 8.0f * sumy); acc_b1 += d_b * (qacc_b - 8.0f * sumy); } } }\n"
@@ -7582,7 +7646,7 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_PAIR_REDUCE(termite_q4_0_pair_activation_1x_reduce) "\n"
            "    termite_q4_0_pair_activation_reduce<float>(input, weight_gate, weight_up, output, p, ap, shmem, lane, sgitg, tg);\n"
            "}\n"
-           "kernel void termite_q4_0_pair_activation_1x_reduce_out_f16(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device half *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_F16(termite_q4_0_pair_activation_1x_reduce_out_f16) "\n"
            "    termite_q4_0_pair_activation_reduce<half>(input, weight_gate, weight_up, output, p, ap, shmem, lane, sgitg, tg);\n"
            "}\n"
            "kernel void termite_q4_0_pair_activation_rms_scale_1x_reduce_out_f16(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device half *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], device const float *norm_weight [[buffer(6)]], device const float *inv_scale [[buffer(7)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
@@ -7832,7 +7896,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint col = gid - (gid / p.out_dim) * p.out_dim;\n"
            "    output[gid] += bias[col];\n"
            "}\n"
-           "kernel void termite_q8_0_pair_linear(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_QUANT_PAIR_PROJECTION(termite_q8_0_pair_linear) "\n"
            "    weight_a += p.weight_offset; weight_b += p.second_weight_offset;\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; uint r = gid / p.out_dim; uint o = gid % p.out_dim; uint row_offset = o * p.row_blocks * 34u; float acc_a = 0.0f; float acc_b = 0.0f;\n"
            "    for (uint b = 0; b < p.row_blocks; ++b) { uint off = row_offset + b * 34u; float d_a = termite_q8_0_block_scale(weight_a, off); float d_b = termite_q8_0_block_scale(weight_b, off); float block_acc_a = 0.0f; float block_acc_b = 0.0f; uint in_off = r * p.in_dim + b * 32u; for (uint i = 0; i < 32; ++i) { float x = input[in_off + i]; block_acc_a += x * termite_q8_0_block_value(weight_a, off, i); block_acc_b += x * termite_q8_0_block_value(weight_b, off, i); } acc_a += d_a * block_acc_a; acc_b += d_b * block_acc_b; }\n"
@@ -8925,8 +8989,8 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_PAIR_MATRIX_32X64_TRAVERSE("k", "xk", "v", "xv", "", "v", "termite_dequantize_q8_0_4x4_half", "termite_q8_0_sg_v2_load(y)")
            "    const uint tile_base = 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); if (!tail) { device float *K = output_k + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; device float *V = output_v + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) { const uint off = 8u * uint(i % 4) + 8u * p.out_dim * uint(i / 4); simdgroup_store(k_acc[i], K + off, p.out_dim, 0, false); simdgroup_store(v_acc[i], V + off, p.out_dim, 0, false); } return; } threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + tile_base; TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) simdgroup_store(k_acc[i], temp_str + 8u * uint(i % 4) + 8u * uint(NR0) * uint(i / 4), uint(NR0), 0, false); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output_k[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; } threadgroup_barrier(mem_flags::mem_threadgroup); TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) simdgroup_store(v_acc[i], temp_str + 8u * uint(i % 4) + 8u * uint(NR0) * uint(i / 4), uint(NR0), 0, false); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output_v[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; }\n"
            "}\n"
-           "kernel void termite_q8_0_kv_pair_mm_sg(device const float *input [[buffer(0)]], device const uchar *weight_k [[buffer(1)]], device const uchar *weight_v [[buffer(2)]], device float *output_k [[buffer(3)]], device float *output_v [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q8_0_kv_pair_mm_sg_impl(input, weight_k, weight_v, output_k, output_v, p, shmem, tiitg, sgitg, tg, false); }\n"
-           "kernel void termite_q8_0_kv_pair_mm_sg_tail(device const float *input [[buffer(0)]], device const uchar *weight_k [[buffer(1)]], device const uchar *weight_v [[buffer(2)]], device float *output_k [[buffer(3)]], device float *output_v [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q8_0_kv_pair_mm_sg_impl(input, weight_k, weight_v, output_k, output_v, p, shmem, tiitg, sgitg, tg, true); }\n"
+           TERMITE_MSL_ABI_Q8_KV_PAIR_MATRIX(termite_q8_0_kv_pair_mm_sg) " termite_q8_0_kv_pair_mm_sg_impl(input, weight_k, weight_v, output_k, output_v, p, shmem, tiitg, sgitg, tg, false); }\n"
+           TERMITE_MSL_ABI_Q8_KV_PAIR_MATRIX(termite_q8_0_kv_pair_mm_sg_tail) " termite_q8_0_kv_pair_mm_sg_impl(input, weight_k, weight_v, output_k, output_v, p, shmem, tiitg, sgitg, tg, true); }\n"
            "inline void termite_q8_0_pair_activation_mm_sg_v2_impl(device const float *input, device const uchar *weight_gate, device const uchar *weight_up, device uchar *output, constant termite_metal_linear_params &p, constant termite_metal_apply_activation_params &ap, threadgroup char *shmem, ushort tiitg, ushort sgitg, uint3 tg, bool output_f16) {\n"
            "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset; threadgroup half *sa = (threadgroup half *)shmem; threadgroup half *sb = (threadgroup half *)(shmem + 4096u); const short NR0 = 64; const short NR1 = 32; const short NK = 32; const short NL0 = 2; const short NL1 = 4;\n"
            "    const uint r0 = tg.x * uint(NR0); const uint r1 = tg.y * uint(NR1); const uint nr1 = min(uint(NR1), p.rows - r1); const short lr0 = short(tiitg) / NL0; const short lr1 = short(min(uint(short(tiitg) / NL1), nr1 - 1u)); const short il0 = short(tiitg) % NL0; const short iy = 8 * (short(tiitg) % NL1);\n"
@@ -8937,8 +9001,8 @@ static NSString *termite_metal_shader_source(void) {
                "TERMITE_FOR_UNROLL",
                "for (uint index = uint(tiitg); index < nr1 * 64u; index += 128u) { const uint row = index / 64u; const uint col = index - row * 64u; const uint output_index = (r1 + row) * p.out_dim + r0 + col; const float value = termite_gated_activation_product(gate_tile[index], up_tile[index], ap.activation_kind); if (output_f16) ((device half *)output)[output_index] = half(value); else ((device float *)output)[output_index] = value; }\n")
            "}\n"
-           "kernel void termite_q8_0_pair_activation_mm_sg_v2(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device uchar *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q8_0_pair_activation_mm_sg_v2_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, false); }\n"
-           "kernel void termite_q8_0_pair_activation_mm_sg_v2_out_f16(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device uchar *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q8_0_pair_activation_mm_sg_v2_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, true); }\n"
+           TERMITE_MSL_ABI_Q8_PAIR_MATRIX(termite_q8_0_pair_activation_mm_sg_v2) " termite_q8_0_pair_activation_mm_sg_v2_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, false); }\n"
+           TERMITE_MSL_ABI_Q8_PAIR_MATRIX(termite_q8_0_pair_activation_mm_sg_v2_out_f16) " termite_q8_0_pair_activation_mm_sg_v2_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, true); }\n"
            "template<typename Input> inline void termite_q8_0_scalar_matrix_impl(device const Input *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg) {\n"
            "    weight += p.weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint RPTG = 8u; const uint CHPT = 4u; const uint OPG = 2u;\n"
@@ -8969,7 +9033,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_q8_0_pair_activation_multiply_mm_out_f16(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device half *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    termite_q8_0_pair_scalar_matrix_impl<half>(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg);\n"
            "}\n"
-           "kernel void termite_q8_0_pair_linear_mmv(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_QUANT_PAIR_PROJECTION_REDUCE(termite_q8_0_pair_linear_mmv) "\n"
            "    termite_q8_0_mmv_pair(input, weight_a + p.weight_offset, weight_b + p.second_weight_offset, output_a, output_b, p.rows, p.in_dim, p.out_dim, p.row_blocks, shmem, lane, sgitg, tg.x * 2u, tg.y);\n"
            "}\n"
            TERMITE_MSL_ABI_QUANT_PAIR_SIMD(termite_q8_0_pair_linear_r2_ext) " termite_q8_0_ext_projection<2u, true, false>(input, weight_a, weight_b, output_a, output_b, p, 0u, lane, sgitg, tg); }\n"
@@ -9263,7 +9327,7 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_i2_s_linear) "\n"
            "    termite_i2_s_projection<false, false >(input, weight, nullptr, nullptr, output, nullptr, p, gid);\n"
            "}\n"
-           "kernel void termite_i2_s_pair_linear(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_QUANT_PAIR_PROJECTION(termite_i2_s_pair_linear) "\n"
            "    termite_i2_s_projection<true, false >(input, weight_a, weight_b, nullptr, output_a, output_b, p, gid);\n"
            "}\n"
            "kernel void termite_quantize_rows_i8(device const float *input [[buffer(0)]], device char *qinput [[buffer(1)]], device float *scales [[buffer(2)]], constant termite_metal_quantize_rows_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -9790,10 +9854,7 @@ static NSString *termite_metal_shader_source(void) {
            "        a[(k / 8u * 8u + r / 8u) * 64u + r % 8u * 8u + k % 8u] = row0 + r < p.rows && k0 + k < p.in_dim ? input[(row0 + r) * p.in_dim + k0 + k] : 0.0f;\n"
            "    }\n"
            "}\n"
-           "kernel void termite_apply_bf16_gate_up_mm_m64_n32_vec4(\n"
-           "    device const float *x [[buffer(0)]], device const ushort *wg [[buffer(1)]], device const ushort *wu [[buffer(2)]],\n"
-           "    device const float *bg [[buffer(3)]], device const float *bu [[buffer(4)]], device float *out [[buffer(5)]],\n"
-           "    constant termite_metal_linear_params &p [[buffer(6)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_BF16_GATE_UP_MATRIX(termite_apply_bf16_gate_up_mm_m64_n32_vec4) "\n"
            "    threadgroup float4 storage[1024];\n"
            "    threadgroup float *shared=reinterpret_cast<threadgroup float *>(storage);\n"
            "    threadgroup float *a=shared, *g=shared+2048, *u=g+1024;\n"
@@ -9828,10 +9889,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            TERMITE_MSL_BF16_GATE_UP_PUBLISH
            "}\n"
-           "kernel void termite_apply_bf16_gate_up_mm_m64_n32(\n"
-           "    device const float *x [[buffer(0)]], device const ushort *wg [[buffer(1)]], device const ushort *wu [[buffer(2)]],\n"
-           "    device const float *bg [[buffer(3)]], device const float *bu [[buffer(4)]], device float *out [[buffer(5)]],\n"
-           "    constant termite_metal_linear_params &p [[buffer(6)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_BF16_GATE_UP_MATRIX(termite_apply_bf16_gate_up_mm_m64_n32) "\n"
            "    // Share exact F32 activations across two BF16 projections; accumulate in F32.\n"
            "    // Eight simdgroups cover a 64x32 tile. Reuse the 16 KiB staging area for\n"
            "    // both results before the precise SiLU/multiply epilogue. No global temporaries.\n"
@@ -9853,12 +9911,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            TERMITE_MSL_BF16_GATE_UP_PUBLISH
            "}\n"
-           "kernel void termite_apply_linear_bf16_mm_m64_n32_vec4(\n"
-           "    device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]],\n"
-           "    device const float *bias [[buffer(2)]], device float *output [[buffer(3)]],\n"
-           "    constant termite_metal_linear_params &p [[buffer(4)]],\n"
-           "    ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],\n"
-           "    uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_BF16_LINEAR_MATRIX(termite_apply_linear_bf16_mm_m64_n32_vec4) "\n"
            "    // Preserve the production M64/N32/8-SG layout and F32 accumulation order.\n"
            "    threadgroup float4 storage[768];\n"
            "    threadgroup float *shared = reinterpret_cast<threadgroup float *>(storage);\n"
@@ -9895,12 +9948,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            TERMITE_MSL_BF16_LINEAR_PUBLISH
            "}\n"
-           "kernel void termite_apply_linear_bf16_mm_m64_n32(\n"
-           "    device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]],\n"
-           "    device const float *bias [[buffer(2)]], device float *output [[buffer(3)]],\n"
-           "    constant termite_metal_linear_params &p [[buffer(4)]],\n"
-           "    ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],\n"
-           "    uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_BF16_LINEAR_MATRIX(termite_apply_linear_bf16_mm_m64_n32) "\n"
            "    // BF16 is expanded exactly to F32; activations and accumulators remain F32.\n"
            "    // Eight simdgroups each own a 16x16 region of the 64x32 result tile.\n"
            "    threadgroup float shared[3072];\n"
@@ -11042,13 +11090,13 @@ static NSString *termite_metal_shader_source(void) {
            "    if (p.flags) { value=value-bias[channel]; value=value*scale[channel]; }\n"
            "    output[i]=value;\n"
            "}\n"
-           "kernel void termite_clamp_silu(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_gemma4_audio_clamp_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_CLAMP_ACTIVATION(termite_clamp_silu) "\n"
            "    if (gid >= p.total) return; float v = input[gid];\n"
            "    if ((p.flags & 1u) != 0u) v = max(v, p.min_value);\n"
            "    if ((p.flags & 2u) != 0u) v = min(v, p.max_value);\n"
            "    output[gid] = v / (1.0f + exp(-v));\n"
            "}\n"
-           "kernel void termite_gemma4_audio_clamp(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_gemma4_audio_clamp_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_CLAMP_ACTIVATION(termite_gemma4_audio_clamp) "\n"
            "    if (gid >= p.total) return;\n"
            "    float v = input[gid];\n"
            "    if ((p.flags & 1u) != 0u) v = max(v, p.min_value);\n"
@@ -11081,7 +11129,7 @@ static NSString *termite_metal_shader_source(void) {
 "for(uint len=2;len<=512;len*=2) { uint span=len/2,j=tid%span,a=(tid/span)*len+j,b=a+span,w=j*(512/len);float2 x=values[a],y=values[b];float2 v=float2(y.x*tw[2*w]-y.y*tw[2*w+1],y.x*tw[2*w+1]+y.y*tw[2*w]);values[a]=x+v;values[b]=x-v;threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
 "for(uint i=tid;i<257;i+=256) { float2 x=values[i];out[frame*257+i]=sqrt(x.x*x.x+x.y*x.y); }\n"
 "}\n"
-"kernel void termite_gemma4_audio_glu_rows(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_gemma4_audio_rows_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_AUDIO_ROWS(termite_gemma4_audio_glu_rows) "\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
            "    uint row = gid / p.dim; uint col = gid - row * p.dim;\n"
            "    float a = input[row * 2u * p.dim + col]; float g = input[row * 2u * p.dim + p.dim + col];\n"
@@ -11100,7 +11148,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    output[gid] = sum;\n"
            "}\n"
-           "kernel void termite_gemma4_audio_flatten_ctf(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_gemma4_audio_rows_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_AUDIO_ROWS(termite_gemma4_audio_flatten_ctf) "\n"
            "    uint time_steps = p.rows; uint freq_bins = p.dim; uint channels = p.extra;\n"
            "    uint total = time_steps * freq_bins * channels; if (gid >= total) return;\n"
            "    uint per_step = freq_bins * channels;\n"
@@ -11349,7 +11397,7 @@ static NSString *termite_metal_shader_source(void) {
            "    output_b[r * p.out_dim + o] = acc_b;\n"
            "}\n"
            "__attribute__((always_inline)) inline float2 termite_q4k_pair_dot8(thread const float *x, device const uchar *weight_a, device const uchar *weight_b, uint row_blocks, uint o, uint b, uint sub, uint chunk, bool high, uint j0) { uint off = o * row_blocks * 144u + b * 144u; ushort d_bits_a = (ushort(weight_a[off + 1]) << 8) | ushort(weight_a[off]); ushort dmin_bits_a = (ushort(weight_a[off + 3]) << 8) | ushort(weight_a[off + 2]); ushort d_bits_b = (ushort(weight_b[off + 1]) << 8) | ushort(weight_b[off]); ushort dmin_bits_b = (ushort(weight_b[off + 3]) << 8) | ushort(weight_b[off + 2]); float d_a = float(as_type<half>(d_bits_a)); float dmin_a = float(as_type<half>(dmin_bits_a)); float d_b = float(as_type<half>(d_bits_b)); float dmin_b = float(as_type<half>(dmin_bits_b)); const device uchar *scales_a = weight_a + off + 4u; const device uchar *scales_b = weight_b + off + 4u; const device uchar *qs_a = weight_a + off + 16u; const device uchar *qs_b = weight_b + off + 16u; float dsc_a = d_a * q4k_scale_at(scales_a, sub); float dmn_a = dmin_a * q4k_min_at(scales_a, sub); float dsc_b = d_b * q4k_scale_at(scales_b, sub); float dmn_b = dmin_b * q4k_min_at(scales_b, sub); uint q_off = chunk * 32u + j0; float block_a = 0.0f; float block_b = 0.0f; for (uint i = 0; i < 8u; ++i) { uchar packed_a = qs_a[q_off + i]; uchar packed_b = qs_b[q_off + i]; float q_a = high ? float(packed_a >> 4) : float(packed_a & 0x0Fu); float q_b = high ? float(packed_b >> 4) : float(packed_b & 0x0Fu); block_a += x[i] * (dsc_a * q_a - dmn_a); block_b += x[i] * (dsc_b * q_b - dmn_b); } return float2(block_a, block_b); }\n"
-           "kernel void termite_q4_k_pair_linear_1x_reduce(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_QUANT_PAIR_PROJECTION_REDUCE(termite_q4_k_pair_linear_1x_reduce) "\n"
            "    const uint NR0 = 2u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint sb0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; uint total_subblocks = p.row_blocks * 8u; float acc_a0 = 0.0f; float acc_a1 = 0.0f; float acc_b0 = 0.0f; float acc_b1 = 0.0f;\n"
            "    for (uint sb = sb0; sb < total_subblocks; sb += NSG * NQ) { uint b = sb >> 3; uint sub = sb & 7u; uint chunk = sub >> 1; bool high = (sub & 1u) != 0u; uint j0 = il * NQ; uint input_off = in_row + b * 256u + sub * 32u + j0; float x[8]; for (uint i = 0; i < NQ; ++i) { x[i] = input[input_off + i]; } for (uint row = 0; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; float2 block = termite_q4k_pair_dot8(x, weight_a, weight_b, p.row_blocks, o, b, sub, chunk, high, j0); if (row == 0u) { acc_a0 += block.x; acc_b0 += block.y; } else { acc_a1 += block.x; acc_b1 += block.y; } } }\n"
@@ -11365,7 +11413,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { shmem[sgitg] = gate0; shmem[32u + sgitg] = up0; shmem[64u + sgitg] = gate1; shmem[96u + sgitg] = up1; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total_gate0 = simd_sum(shmem[lane]); float total_up0 = simd_sum(shmem[32u + lane]); float total_gate1 = simd_sum(shmem[64u + lane]); float total_up1 = simd_sum(shmem[96u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = termite_gated_activation_product(total_gate0, total_up0, ap.activation_kind); if (first_o + 1u < p.out_dim) output[idx + 1u] = termite_gated_activation_product(total_gate1, total_up1, ap.activation_kind); }\n"
            "}\n"
-           "kernel void termite_q4_k_pair_activation_1x_reduce_out_f16(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device half *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_F16(termite_q4_k_pair_activation_1x_reduce_out_f16) "\n"
            "    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint sb0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; uint total_subblocks = p.row_blocks * 8u; float gate[4] = {0.0f, 0.0f, 0.0f, 0.0f}; float up[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n"
            "    for (uint sb = sb0; sb < total_subblocks; sb += NSG * NQ) { uint b = sb >> 3; uint sub = sb & 7u; uint chunk = sub >> 1; bool high = (sub & 1u) != 0u; uint j0 = il * NQ; uint input_off = in_row + b * 256u + sub * 32u + j0; float x[8]; for (uint i = 0; i < NQ; ++i) { x[i] = input[input_off + i]; } for (uint row = 0; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; float2 block = termite_q4k_pair_dot8(x, weight_gate, weight_up, p.row_blocks, o, b, sub, chunk, high, j0); gate[row] += block.x; up[row] += block.y; } }\n"
@@ -11519,12 +11567,12 @@ static NSString *termite_metal_shader_source(void) {
            "    if (p.two_cols != 0u) { uint tail_base = p.three_value_len + p.three_sign_len; uint tail_pair_count = p.two_cols / 2u; uint tail_row_outer = o / 32u; uint tail_row_in_bm = o % 32u; uint tail_row_group = tail_row_in_bm / 8u; uint tail_row_offset = tail_row_in_bm % 8u; uint tail_final_group = tail_row_group == 1u ? 2u : (tail_row_group == 2u ? 1u : tail_row_group); for (uint pair_col = 0; pair_col < tail_pair_count; ++pair_col) { uint col_block = pair_col / 16u; uint col_in_block = pair_col % 16u; uint by_block = col_in_block / 2u; uint pair_in_by = col_in_block % 2u; uint tail_col_blocks = p.two_cols / 32u; uint index = (((tail_row_outer * tail_col_blocks + col_block) * 8u + by_block) * 32u + tail_final_group * 8u + tail_row_offset); uchar packed = weight[tail_base + index]; uint code = pair_in_by == 0u ? uint(packed >> 4) : uint(packed & 0x0Fu); float w0 = floor(float(code) / 3.0f) - 1.0f; float w1 = float(code % 3u) - 1.0f; uint col = p.three_cols + pair_col * 2u; float a0 = clamp(round(input[input_base + col] / act_scale), -127.0f, 127.0f) * act_scale; float a1 = clamp(round(input[input_base + col + 1u] / act_scale), -127.0f, 127.0f) * act_scale; acc += a0 * w0 + a1 * w1; } }\n"
            "    output[r * p.out_dim + o] = acc * weight_scale;\n"
            "}\n"
-           "kernel void termite_polar4_key_scores(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device float *scores [[buffer(2)]], constant termite_metal_key_scores_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_COMPRESSED_KEY_SCORES(termite_polar4_key_scores) "\n"
            "    uint total = p.num_heads * p.q_len * p.block_tokens; if (gid >= total) return; uint ki = gid % p.block_tokens; uint tmp = gid / p.block_tokens; uint qi = tmp % p.q_len; uint h = tmp / p.q_len; uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint kv_head_off = kv_h * p.head_dim; uint q_base = qi * p.num_heads * p.head_dim + h * p.head_dim; uint k_base = ki * p.key_row_bytes; float acc = 0.0f;\n"
            "    for (uint d = 0; d < p.head_dim; ++d) { uint value_index = kv_head_off + d; uchar packed = encoded_key[k_base + (value_index >> 1)]; uint code = ((value_index & 1u) == 0u) ? uint(packed & 0x0Fu) : uint((packed >> 4) & 0x0Fu); float k = float(code) / 7.5f - 1.0f; acc += q[q_base + d] * k; }\n"
            "    scores[h * p.q_len * p.block_tokens + qi * p.block_tokens + ki] = acc;\n"
            "}\n"
-           "kernel void termite_turbo3_key_scores(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device float *scores [[buffer(2)]], constant termite_metal_key_scores_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_COMPRESSED_KEY_SCORES(termite_turbo3_key_scores) "\n"
            "    uint total = p.num_heads * p.q_len * p.block_tokens; if (gid >= total) return; uint ki = gid % p.block_tokens; uint tmp = gid / p.block_tokens; uint qi = tmp % p.q_len; uint h = tmp / p.q_len; uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint kv_head_off = kv_h * p.head_dim; uint q_base = qi * p.num_heads * p.head_dim + h * p.head_dim; uint k_base = ki * p.key_row_bytes; uint base_key_row_bytes = (p.num_kv_heads * p.head_dim * 3u + 7u) / 8u; uint residual_base = k_base + base_key_row_bytes; thread float residual_projection[32];\n"
            "    for (uint projection = 0; projection < 32u; ++projection) { float projected_query = 0.0f; for (uint d = 0; d < p.head_dim; ++d) { ulong x = (ulong(kv_h + 1u) * 0x9e3779b97f4a7c15UL); x ^= (ulong(projection + 1u) * 0xbf58476d1ce4e5b9UL); x ^= (ulong(d + 1u) * 0x94d049bb133111ebUL); x ^= x >> 30; x *= 0xbf58476d1ce4e5b9UL; x ^= x >> 27; x *= 0x94d049bb133111ebUL; x ^= x >> 31; float sign = ((x & 1UL) == 0UL) ? 1.0f : -1.0f; projected_query += sign * q[q_base + d]; } residual_projection[projection] = projected_query; }\n"
            "    float acc = 0.0f; for (uint d = 0; d < p.head_dim; ++d) { uint value_index = kv_head_off + d; uint bit_offset = value_index * 3u; uint byte_index = k_base + (bit_offset >> 3); uint shift = bit_offset & 7u; uint bits = uint(encoded_key[byte_index]) >> shift; if (shift > 5u) bits |= uint(encoded_key[byte_index + 1u]) << (8u - shift); float k = float(bits & 0x07u) / 3.5f - 1.0f; acc += q[q_base + d] * k; }\n"
@@ -11535,10 +11583,10 @@ static NSString *termite_metal_shader_source(void) {
            "inline uint termite_encode_turbo3_scalar(float value) { float clipped = clamp(value, -1.0f, 1.0f); return uint(clamp(round((clipped + 1.0f) * 3.5f), 0.0f, 7.0f)); }\n"
            "inline float termite_decode_turbo3_scalar(uint code) { return float(code & 0x07u) / 3.5f - 1.0f; }\n"
            "inline float termite_random_sign(uint kv_h, uint projection, uint d) { ulong x = (ulong(kv_h + 1u) * 0x9e3779b97f4a7c15UL); x ^= (ulong(projection + 1u) * 0xbf58476d1ce4e5b9UL); x ^= (ulong(d + 1u) * 0x94d049bb133111ebUL); x ^= x >> 30; x *= 0xbf58476d1ce4e5b9UL; x ^= x >> 27; x *= 0x94d049bb133111ebUL; x ^= x >> 31; return ((x & 1UL) == 0UL) ? 1.0f : -1.0f; }\n"
-           "kernel void termite_encode_polar4_key(device const float *k [[buffer(0)]], device uchar *encoded_key [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_COMPRESSED_KEY_ENCODING(termite_encode_polar4_key) "\n"
            "    uint row_bytes = p.base_key_row_bytes; uint total = p.rows * row_bytes; if (gid >= total) return; uint row = gid / row_bytes; uint byte_in_row = gid - row * row_bytes; uint row_values = p.num_kv_heads * p.head_dim; uint value0 = byte_in_row * 2u; uint k_base = row * row_values; uint lo = value0 < row_values ? termite_encode_polar4_scalar(k[k_base + value0]) : 0u; uint hi = (value0 + 1u) < row_values ? termite_encode_polar4_scalar(k[k_base + value0 + 1u]) : 0u; encoded_key[row * p.key_row_bytes + byte_in_row] = uchar(lo | (hi << 4));\n"
            "}\n"
-           "kernel void termite_encode_turbo3_key(device const float *k [[buffer(0)]], device uchar *encoded_key [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_COMPRESSED_KEY_ENCODING(termite_encode_turbo3_key) "\n"
            "    uint base_bytes = p.base_key_row_bytes; uint residual_bytes = (p.num_kv_heads * 32u + 7u) / 8u; uint row_work = base_bytes + residual_bytes; uint total = p.rows * row_work; if (gid >= total) return; uint row = gid / row_work; uint local = gid - row * row_work; uint row_values = p.num_kv_heads * p.head_dim; uint k_base = row * row_values; uint encoded_base = row * p.key_row_bytes;\n"
            "    if (local < base_bytes) { uint out = 0u; uint bit_base = local * 8u; for (uint bit = 0; bit < 8u; ++bit) { uint packed_bit = bit_base + bit; uint value_index = packed_bit / 3u; if (value_index >= row_values) continue; uint code_bit = packed_bit - value_index * 3u; uint code = termite_encode_turbo3_scalar(k[k_base + value_index]); out |= ((code >> code_bit) & 1u) << bit; } encoded_key[encoded_base + local] = uchar(out); return; }\n"
            "    uint residual_byte = local - base_bytes; uint out = 0u; for (uint bit = 0; bit < 8u; ++bit) { uint residual_bit = residual_byte * 8u + bit; if (residual_bit >= p.num_kv_heads * 32u) continue; uint kv_h = residual_bit / 32u; uint projection = residual_bit - kv_h * 32u; uint head_base = kv_h * p.head_dim; float projected_residual = 0.0f; for (uint d = 0; d < p.head_dim; ++d) { float value = k[k_base + head_base + d]; uint code = termite_encode_turbo3_scalar(value); float decoded = termite_decode_turbo3_scalar(code); projected_residual += termite_random_sign(kv_h, projection, d) * (value - decoded); } if (projected_residual >= 0.0f) out |= 1u << bit; } encoded_key[encoded_base + base_bytes + residual_byte] = uchar(out);\n"
@@ -12004,7 +12052,7 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup ulong totals[256];\n"
            "    termite_cumulative_sum_impl<ulong>(input, output, p, tid, row, totals);\n"
            "}\n"
-           "kernel void termite_cumulative_sum_i8(device const uchar *input [[buffer(0)]], device uchar *output [[buffer(1)]], constant termite_scan_params &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_CUMULATIVE_BYTE_SUM(termite_cumulative_sum_i8) "\n"
            "    threadgroup uchar totals[256];\n"
            "    termite_cumulative_sum_impl<uchar>(input, output, p, tid, row, totals);\n"
            "}\n"
@@ -12012,7 +12060,7 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup ushort totals[256];\n"
            "    termite_cumulative_sum_impl<ushort>(input, output, p, tid, row, totals);\n"
            "}\n"
-           "kernel void termite_cumulative_sum_u8(device const uchar *input [[buffer(0)]], device uchar *output [[buffer(1)]], constant termite_scan_params &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_CUMULATIVE_BYTE_SUM(termite_cumulative_sum_u8) "\n"
            "    threadgroup uchar totals[256];\n"
            "    termite_cumulative_sum_impl<uchar>(input, output, p, tid, row, totals);\n"
            "}\n"
@@ -12451,8 +12499,8 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    TERMITE_FOR_UNROLL(uint d = 0; d < count; ++d) output[row * hidden + h * D + d * 32u + L] = denominator > 0 ? ov[d] / denominator : 0;\n"
            "}\n"
-           "kernel void termite_sdpa_f32_grouped_short256(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const uint *ranges [[buffer(3)]], device const int *qpos [[buffer(4)]], device const int *kpos [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_sdpa_segments_f32_params &p [[buffer(7)]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) { termite_sdpa_f32_grouped_short_impl<256>(q,k,v,ranges,qpos,kpos,output,p,lane,tg); }\n"
-           "kernel void termite_sdpa_f32_grouped_short512(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const uint *ranges [[buffer(3)]], device const int *qpos [[buffer(4)]], device const int *kpos [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_sdpa_segments_f32_params &p [[buffer(7)]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) { termite_sdpa_f32_grouped_short_impl<512>(q,k,v,ranges,qpos,kpos,output,p,lane,tg); }\n"
+           TERMITE_MSL_ABI_GROUPED_SHORT_ATTENTION(termite_sdpa_f32_grouped_short256) " termite_sdpa_f32_grouped_short_impl<256>(q,k,v,ranges,qpos,kpos,output,p,lane,tg); }\n"
+           TERMITE_MSL_ABI_GROUPED_SHORT_ATTENTION(termite_sdpa_f32_grouped_short512) " termite_sdpa_f32_grouped_short_impl<512>(q,k,v,ranges,qpos,kpos,output,p,lane,tg); }\n"
            TERMITE_MSL_ABI_SEGMENTS_MATRIX(termite_sdpa_f32_grouped_matrix64) "\n"
            "    constexpr uint BQ = 16u, BK = 64u, D = 512u;\n"
            "    threadgroup float partial[4096], weights[1024], diagonal[128], mrow[BQ], lrow[BQ], alpha[BQ];\n"
@@ -13326,7 +13374,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    output[q_base + uint(lane)] = denom > 0.0f ? acc0 / denom : 0.0f; output[q_base + uint(lane) + 32u] = denom > 0.0f ? acc1 / denom : 0.0f;\n"
            "}\n"
-           "kernel void termite_florence_window_pack_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_florence_window_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_FLORENCE_WINDOW(termite_florence_window_pack_f32) "\n"
            "    uint total = p.window_count * p.window_area * p.dim; if (gid >= total || p.dim == 0u || p.window_size == 0u) return;\n"
            "    uint c = gid % p.dim; uint token = gid / p.dim; uint pos = token % p.window_area; uint win = token / p.window_area;\n"
            "    uint windows_w = p.padded_w / p.window_size; uint windows_h = p.padded_h / p.window_size; uint windows_per_batch = windows_h * windows_w;\n"
@@ -13334,7 +13382,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint dy = pos / p.window_size; uint dx = pos - dy * p.window_size; uint y = wh * p.window_size + dy; uint x = ww * p.window_size + dx;\n"
            "    output[gid] = (b < p.batch && y < p.height && x < p.width) ? input[((b * p.height + y) * p.width + x) * p.dim + c] : 0.0f;\n"
            "}\n"
-           "kernel void termite_florence_window_unpack_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_florence_window_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_FLORENCE_WINDOW(termite_florence_window_unpack_f32) "\n"
            "    uint total = p.batch * p.height * p.width * p.dim; if (gid >= total || p.dim == 0u || p.window_size == 0u) return;\n"
            "    uint c = gid % p.dim; uint token = gid / p.dim; uint x = token % p.width; uint tmp = token / p.width; uint y = tmp % p.height; uint b = tmp / p.height;\n"
            "    uint windows_w = p.padded_w / p.window_size; uint windows_h = p.padded_h / p.window_size; uint wh = y / p.window_size; uint ww = x / p.window_size;\n"
@@ -13392,7 +13440,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    output[gid] = sum > 0.0f ? accum / sum : 0.0f;\n"
            "}\n"
-           "kernel void termite_disentangled_relative_attention_f32_tg(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *q_r [[buffer(3)]], device const float *k_r [[buffer(4)]], device const float *mask [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_disentangled_relative_attention_f32_params &p [[buffer(7)]], device const float *relative_index [[buffer(8)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_RELATIVE_ATTENTION(termite_disentangled_relative_attention_f32_tg) "\n"
            "    if (p.seq_len == 0u || p.head_dim == 0u || p.num_heads == 0u) return;\n"
            "    uint qi = tg.x; uint h = tg.y; uint b = tg.z; if (qi >= p.seq_len || h >= p.num_heads || b >= p.batch) return;\n"
            "    uint hidden = p.num_heads * p.head_dim; uint head_off = h * p.head_dim; uint q_base = (b * p.seq_len + qi) * hidden + head_off; float scale = rsqrt(float(p.head_dim) * 3.0f);\n"
@@ -13417,7 +13465,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; scores[ki] = s > -3.0e38f ? exp(s - best) * inv_sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint d = lid; d < p.head_dim; d += width) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint k_base = (b * p.seq_len + ki) * hidden + head_off; accum += scores[ki] * v[k_base + d]; } output[(b * p.seq_len + qi) * hidden + head_off + d] = accum; }\n"
            "}\n"
-           "kernel void termite_disentangled_relative_attention_f32_flash4(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *q_r [[buffer(3)]], device const float *k_r [[buffer(4)]], device const float *mask [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_disentangled_relative_attention_f32_params &p [[buffer(7)]], device const float *relative_index [[buffer(8)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_RELATIVE_ATTENTION(termite_disentangled_relative_attention_f32_flash4) "\n"
            "    if (p.seq_len == 0u || p.head_dim == 0u || p.num_heads == 0u) return;\n"
            "    uint q0 = tg.x * 4u; uint h = tg.y; uint b = tg.z; if (q0 >= p.seq_len || h >= p.num_heads || b >= p.batch) return;\n"
            "    uint block_m = min(4u, p.seq_len - q0); uint lid = uint(tid); uint width = uint(tpg.x); uint hidden = p.num_heads * p.head_dim; uint head_off = h * p.head_dim; float scale = rsqrt(float(p.head_dim) * 3.0f);\n"
@@ -13545,7 +13593,7 @@ static NSString *termite_metal_shader_source(void) {
            "    const uint oy = tg.x * 32u + tid.y;\n"
            "    if (ox < R && oy < C) output[base + oy * R + ox] = tile[tid.x][tid.y];\n"
            "}\n"
-           "kernel void termite_dot_general_2d_f32(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_DOT_2D(termite_dot_general_2d_f32) "\n"
            "    uint total = p.m * p.n; if (gid >= total || p.k == 0u) return; uint row = gid / p.n; uint col = gid - row * p.n; float acc = 0.0f;\n"
            "    for (uint kk = 0u; kk < p.k; ++kk) { float r = p.rhs_contract_axis == 0u ? rhs[kk * p.n + col] : rhs[col * p.k + kk]; acc += lhs[row * p.k + kk] * r; }\n"
            "    output[gid] = acc;\n"
@@ -13595,7 +13643,7 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_DOT_SMALL_ROWS(termite_dot_general_2d_f32_small_m_rows4_cols16) "\n"
            "    termite_small_m_rows4_dot<16u>(lhs, rhs, output, p, partials, tid, tpg, tg);\n"
            "}\n"
-           "kernel void termite_dot_general_rank1_outer_f32(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_DOT_2D(termite_dot_general_rank1_outer_f32) "\n"
            "    uint total = p.m * p.n; if (gid >= total || p.k != 1u) return; uint row = gid / p.n; uint col = gid - row * p.n; output[gid] = lhs[row] * rhs[col];\n"
            "}\n"
            "kernel void termite_dot_general_rank1_reduce_f32(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
@@ -13770,7 +13818,7 @@ static NSString *termite_metal_shader_source(void) {
            "    output[gid] = weight[idx * p.dim + col];\n"
            "}\n"
            "static inline float termite_embedding_bf16_to_f32(ushort bits) { return as_type<float>((uint(bits) << 16u)); }\n"
-           "kernel void termite_embedding_lookup_bf16(device const ushort *weight [[buffer(0)]], device const uint *ids [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_embedding_lookup_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_DENSE_EMBEDDING_16(termite_embedding_lookup_bf16) "\n"
            "    uint total = p.total * p.dim;\n"
            "    if (gid >= total) return;\n"
            "    uint row = gid / p.dim;\n"
@@ -13778,7 +13826,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint idx = ids[row];\n"
            "    output[gid] = termite_embedding_bf16_to_f32(weight[idx * p.dim + col]);\n"
            "}\n"
-           "kernel void termite_embedding_lookup_f16(device const ushort *weight [[buffer(0)]], device const uint *ids [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_embedding_lookup_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_DENSE_EMBEDDING_16(termite_embedding_lookup_f16) "\n"
            "    uint total = p.total * p.dim;\n"
            "    if (gid >= total) return;\n"
            "    uint row = gid / p.dim;\n"
@@ -14159,26 +14207,16 @@ static NSString *termite_metal_shader_source(void) {
            // 8-query tiles x 32-key chunks with online softmax and simdgroup
            // matmuls, staging f32 K/V to f16 in threadgroup memory. Constant
            // threadgroup footprint, so no kv-length ceiling. 128 threads/TG.
-           "kernel void termite_attention_f32_dense_causal_sg(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_f32_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_DENSE_CAUSAL_ATTENTION(termite_attention_f32_dense_causal_sg) "\n"
            "    const uint hd = p.head_dim; const uint q0 = tg.x * 8u; const uint h = tg.y;\n"
            "    if (q0 >= p.q_len || h >= p.num_heads || p.num_kv_heads == 0u || hd % 32u != 0u || p.has_bias != 0u || p.has_mask != 0u) return;\n"
            "    const float scale = rsqrt(float(hd)); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n"
            "    const uint q_stride = p.num_heads * hd; const uint kv_stride = p.num_kv_heads * hd;\n"
-           "    threadgroup half *sq = (threadgroup half *)shmem;\n"
-           "    threadgroup half *skv = sq + 8u * hd;\n"
-           "    threadgroup char *fb = shmem + (8u + 32u) * hd * 2u;\n"
-           "    threadgroup float *ss = (threadgroup float *)fb;\n"
-           "    threadgroup half *sp = (threadgroup half *)(fb + 1024u);\n"
+           TERMITE_MSL_ATTENTION_STAGING
            "    threadgroup float *sM = (threadgroup float *)(fb + 1536u);\n"
            "    threadgroup float *sS = (threadgroup float *)(fb + 1568u);\n"
            "    threadgroup float *sdiag = (threadgroup float *)(fb + 1600u);\n"
-           "    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; sq[i] = qi < p.q_len ? half(q[qi * q_stride + h * hd + d] * scale) : half(0.0f); }\n"
-           "    if (tid < 8u) { sM[tid] = -3.402823466e+38f; sS[tid] = 0.0f; }\n"
-           "    if (tid < 64u) sdiag[tid] = 0.0f;\n"
-           "    const uint dslice = uint(sgitg) * (hd / 4u);\n"
-           "    simdgroup_float8x8 mo[8];\n"
-           "    for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "    const uint d_tiles = hd / 32u;\n"
+           TERMITE_MSL_ATTENTION_ACCUMULATORS
            "    const uint last_query_pos = p.query_position_offset + min(q0 + 7u, p.q_len - 1u);\n"
            "    for (uint kc = 0u; kc < p.kv_len; kc += 32u) {\n"
            "        if (p.kv_position_offset + kc > last_query_pos) break;\n"
@@ -14187,33 +14225,14 @@ static NSString *termite_metal_shader_source(void) {
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "        for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, skv + uint(sgitg) * 8u * hd + d, hd, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); }\n"
-           "        simdgroup_store(ms, ss + uint(sgitg) * 8u, 32u, 0, false);\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint jj = 0u; jj < 2u; ++jj) {\n"
-           "            uint j = uint(sgitg) + jj * 4u; uint qi = q0 + j; uint query_pos = p.query_position_offset + qi; uint kk = uint(lane); uint ki = kc + kk;\n"
+           TERMITE_MSL_ATTENTION_SCORE_ROWS
            "            bool allowed = ki < p.kv_len && qi < p.q_len;\n"
-           "            if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }\n"
-           "            float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f;\n"
-           "            float m_old; float m_new; float corr; float row_sum;\n"
-           "            antfly_attention_online_row32(sc, sM, j, sp, j * 32u + kk, m_old, m_new, corr, row_sum);\n"
-           "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; }\n"
-           "        }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u);\n"
-           "        for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           TERMITE_MSL_ATTENTION_ONLINE_WEIGHTS
            "        for (uint i = uint(tid); i < 32u * hd; i += 128u) { uint kk = i / hd; uint d = i - kk * hd; uint ki = kc + kk; skv[i] = ki < p.kv_len ? half(v[ki * kv_stride + kv_head_base + d]) : half(0.0f); }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); simdgroup_load(mv, skv + kk8 * 8u * hd + d8, hd); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; }\n"
            "    }\n"
-           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    if (tid < 8u) { float denom = sS[tid]; sdiag[uint(tid) * 8u + uint(tid)] = denom > 0.0f ? 1.0f / denom : 0.0f; }\n"
-           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    simdgroup_float8x8 minv; simdgroup_load(minv, sdiag, 8u);\n"
-           "    threadgroup float *so = (threadgroup float *)skv;\n"
-           "    for (uint dt = 0u; dt < d_tiles; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[dt]); simdgroup_store(scaled, so + uint(sgitg) * (8u * (hd / 4u)) + dt * 8u, hd / 4u, 0, false); }\n"
-           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (8u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n"
+           TERMITE_MSL_ATTENTION_PUBLISH
            "}\n"
            // 16-query variant: halves K/V traffic per token versus the 8-query
            // tile. Two 8-row simdgroup blocks per SG cap head_dim at 128 (8
@@ -14271,7 +14290,7 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint i = uint(tid); i < 16u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (16u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n"
            "}\n"
-           "kernel void termite_attention_f32_dense_causal_sg_q16(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_f32_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_DENSE_CAUSAL_ATTENTION(termite_attention_f32_dense_causal_sg_q16) "\n"
            "    termite_attention_dense_q16_impl<float, false, 0u>(q, k, v, output, p, shmem, tid, lane, sgitg, tg);\n"
            "}\n"
            // f16-K/V variant of the q16 kernel: K/V arrive as device half (the
@@ -14616,10 +14635,10 @@ static NSString *termite_metal_shader_source(void) {
            "        output[h * p.head_dim + d] *= inv_sum;\n"
            "    }\n"
            "}\n"
-           "kernel void termite_polar4_attention_span(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_span_params &p [[buffer(4)]], uint h [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_COMPRESSED_ATTENTION_SPAN(termite_polar4_attention_span) "\n"
            "    termite_compressed_attention_span<termite_polar4_span_codec>(q, encoded_key, v, output, p, h);\n"
            "}\n"
-           "kernel void termite_turbo3_attention_span(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_span_params &p [[buffer(4)]], uint h [[thread_position_in_grid]]) {\n"
+           TERMITE_MSL_ABI_COMPRESSED_ATTENTION_SPAN(termite_turbo3_attention_span) "\n"
            "    termite_compressed_attention_span<termite_turbo3_span_codec>(q, encoded_key, v, output, p, h);\n"
            "}\n";
 }

@@ -22,6 +22,7 @@ const cpu_k_projection_renderer = @import("graph/quant_kernel_cpu_k_projection_r
 const source_regions = @import("graph/quant_kernel_source_regions.zig");
 const gpu_training_renderer = @import("graph/quant_kernel_gpu_training_attention_renderer.zig");
 const gpu_operator_renderer = @import("graph/quant_kernel_gpu_operator_renderer.zig");
+const metal_attention_phases = @import("graph/quant_kernel_metal_attention_phases.zig");
 const cpu_activation_renderer = @import("graph/quant_kernel_cpu_activation_pipeline_renderer.zig");
 const cpu_q8_dot_renderer = @import("graph/quant_kernel_cpu_q8_dot_renderer.zig");
 const cpu_panel_dot_renderer = @import("graph/quant_kernel_cpu_panel_dot_renderer.zig");
@@ -173,7 +174,7 @@ fn nativeSourceOwners(comptime owner_types: anytype) [owner_types.len]NativeSour
     return result;
 }
 const cpu_source_owners = nativeSourceOwners(cpu_source_owner_types);
-const metal_source_owners = nativeSourceOwners(.{gpu_operator_renderer.owners[0]} ++ gpu_training_renderer.metal_owners) ++ [_]NativeSourceOwner{
+const metal_source_owners = nativeSourceOwners(.{ gpu_operator_renderer.owners[0], metal_attention_phases.Owner } ++ gpu_training_renderer.metal_owners) ++ [_]NativeSourceOwner{
     .{ .begin = metal_runtime_region_begin_marker, .render = quant_kernel_compiler.renderMetalRuntimeQuantRegion, .split = splitMetalRuntimeRegion, .validate = checkMetalRuntimeExternalHelpers },
     nativeSourceOwner("           // quant-kernel-codegen:begin compatibility Metal attention (do not edit; run: zig build quant-kernel-codegen -- --write)", "           // quant-kernel-codegen:end compatibility Metal attention", quant_kernel_compiler.renderMetalRuntimeCompatibilityAttentionRegion),
     .{ .begin = metal_launch_region_begin_marker, .render = quant_kernel_compiler.renderMetalLaunchShapeRegion, .split = splitMetalLaunchRegion },

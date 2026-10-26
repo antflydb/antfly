@@ -31,6 +31,7 @@ const std = @import("std");
 const compiler = @import("quant_kernel_compiler.zig");
 const quant_kernel_op = @import("quant_kernel_op.zig");
 const quant_matmul = @import("quant_matmul.zig");
+const attention_phases = @import("quant_kernel_metal_attention_phases.zig");
 
 const Epilogue = compiler.Epilogue;
 const KernelSchedule = compiler.KernelSchedule;
@@ -468,7 +469,9 @@ fn renderCompatibilityPrefillBody(allocator: std.mem.Allocator, out: *std.ArrayL
         if (abi == .runtime) "termite_metal_paged_attention_params" else "antfly_paged_attention_1x_params",
         if (abi == .runtime) "termite_attention_page_token" else "antfly_paged_attention_1x_page_token",
     });
-    try out.appendSlice(allocator, compatibility_prefill_source);
+    const body = try attention_phases.expand(allocator, compatibility_prefill_source);
+    defer allocator.free(body);
+    try out.appendSlice(allocator, body);
     try out.appendSlice(allocator, "#undef ANTFLY_COMPAT_PAGE_TOKEN\n#undef ANTFLY_COMPAT_PREFILL_PARAMS\n#undef ANTFLY_COMPAT_PREFILL_KERNEL\n");
 }
 
@@ -564,11 +567,9 @@ fn renderPrefillFlashBody(
     try out.appendSlice(allocator, "    const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n");
     try out.appendSlice(allocator, "    const device half *k_half = reinterpret_cast<const device half *>(encoded_key);\n");
     try out.appendSlice(allocator, "    for (uint i = uint(tid); i < 8u * 256u; i += 128u) { uint j = i / 256u; uint d = i - j * 256u; uint qi = q0 + j; sq[i] = qi < p.q_len ? half(q[qi * q_stride + h * 256u + d] * scale) : half(0.0f); }\n");
-    try out.appendSlice(allocator, "    if (tid < 8u) { sM[tid] = -3.402823466e+38f; sS[tid] = 0.0f; }\n");
-    try out.appendSlice(allocator, "    if (tid < 64u) sdiag[tid] = 0.0f;\n");
+    try out.appendSlice(allocator, attention_phases.online_init);
     try out.appendSlice(allocator, "    const uint dslice = uint(sgitg) * 64u;\n");
-    try out.appendSlice(allocator, "    simdgroup_float8x8 mo[8];\n");
-    try out.appendSlice(allocator, "    for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n");
+    try out.appendSlice(allocator, attention_phases.accumulator_init);
 
     // ---- per-chunk online-softmax loop ----
     // For SWA, start at the chunk containing the first key that can be live for
@@ -608,10 +609,7 @@ fn renderPrefillFlashBody(
         try out.appendSlice(allocator, "        for (uint jj = 0u; jj < 2u; ++jj) {\n");
         try out.appendSlice(allocator, "            uint j = uint(sgitg) + jj * 4u; uint qi = q0 + j; uint query_pos = p.query_position_offset + qi; uint kk = uint(lane); uint ki = kc + kk;\n");
         try out.appendSlice(allocator, "            bool allowed = ki < p.kv_tokens && qi < p.q_len && sphys[kk] != 0xffffffffu;\n");
-        try out.appendSlice(allocator, "            if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }\n");
-        try out.appendSlice(allocator, "            float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f;\n");
-        try out.appendSlice(allocator, "            float m_old; float m_new; float corr; float row_sum;\n");
-        try out.appendSlice(allocator, "            antfly_attention_online_row32(sc, sM, j, sp, j * 32u + kk, m_old, m_new, corr, row_sum);\n");
+        try out.appendSlice(allocator, attention_phases.row32_update);
         if (skip) {
             try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; if (m_new > m_old) atomic_fetch_or_explicit(schanged, 1u, memory_order_relaxed); }\n");
         } else {
@@ -665,10 +663,7 @@ fn renderPrefillFlashBody(
 
     // ---- epilogue: final inverse-sum normalise + direct strided store. The
     // partial query tile reuses one hd/4-wide threadgroup output tile. ----
-    try out.appendSlice(allocator, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
-    try out.appendSlice(allocator, "    if (tid < 8u) { float denom = sS[tid]; sdiag[uint(tid) * 8u + uint(tid)] = denom > 0.0f ? 1.0f / denom : 0.0f; }\n");
-    try out.appendSlice(allocator, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
-    try out.appendSlice(allocator, "    simdgroup_float8x8 minv; simdgroup_load(minv, sdiag, 8u);\n");
+    try out.appendSlice(allocator, attention_phases.normalization);
     try out.appendSlice(allocator, "    for (uint dt = 0u; dt < 8u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[dt]); mo[dt] = scaled; }\n");
     try out.appendSlice(allocator, "    if (q0 + 8u <= p.q_len) { for (uint dt = 0u; dt < 8u; ++dt) simdgroup_store(mo[dt], output + q0 * q_stride + h * 256u + dslice + dt * 8u, q_stride); return; }\n");
     try out.appendSlice(allocator, "    const uint valid_rows = p.q_len - q0; for (uint owner = 0u; owner < 4u; ++owner) { threadgroup_barrier(mem_flags::mem_threadgroup); if (uint(sgitg) == owner) for (uint dt = 0u; dt < 8u; ++dt) simdgroup_store(mo[dt], so + dt * 8u, 64u); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint i = uint(tid); i < valid_rows * 64u; i += 128u) { uint j = i / 64u; uint d = i - j * 64u; output[(q0 + j) * q_stride + h * 256u + owner * 64u + d] = so[i]; } }\n");
