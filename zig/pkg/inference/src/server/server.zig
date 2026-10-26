@@ -8453,11 +8453,7 @@ pub const Node = struct {
         const ceiling = try runtime.tier.memory.reserveGptGenerationAtLargestChunk(&local_budget, &components, estimate.token_count, @intCast(max_tokens), estimate.token_count);
         if (ceiling != estimate.token_count) return error.MemoryBudgetExceeded;
         const resource = try runtime.tier.memory.estimateGptGeneration(backend, kv_dtype, cfg, estimate.token_count, @intCast(max_tokens), ceiling);
-        var features = LightOnStreamContext.ExecutionFeatures.fromEnvironmentForModel(cfg);
-        if (backend == .cuda and features.packed_mixed) {
-            const prefill_limit = generation.NativeGenerationPipeline.packedQwenPrefillItemLimit(.cuda, platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES"));
-            features.packed_prefill_items = @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS") orelse 1, 1), prefill_limit));
-        }
+        const features = LightOnStreamContext.ExecutionFeatures.resolve(cfg, backend);
         const prepared_decode = features.prepared;
         // Page-local KV, projected inputs and recurrent histories stay fully
         // additive. Shared execution storage optionally has its own epoch lease.
@@ -41773,8 +41769,10 @@ test "LightOnOCR3 logical64 isolates physical rows and bounds multi-image worker
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[3], "48", 1));
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[4], "56", 1));
     const partial = Node.LightOnStreamContext.ExecutionFeatures.fromEnvironmentForModel(.{});
-    try std.testing.expectEqual(@as(u8, if (eligible) 64 else 16), partial.prepared_rows);
-    try std.testing.expectEqual(@as(u8, if (eligible) 48 else 16), partial.scheduling_rows);
+    // An unspecified model cannot opt into accelerated epoch resources.
+    try std.testing.expectEqual(@as(u8, 0), partial.prepared_rows);
+    try std.testing.expectEqual(@as(u8, 0), partial.scheduling_rows);
+    try std.testing.expect(!partial.prepared and !partial.needsAuxiliary());
     try std.testing.expectEqual(@as(usize, if (eligible) 56 else 32), effectiveLightOnReadWindow());
 }
 
@@ -43716,47 +43714,6 @@ test "LightOnOCR3 decoder peak ownership preserves caps across failed growth and
     try std.testing.expectEqual(@as(usize, 8), controller.snapshot().backend_kv_bytes);
 }
 
-test "LightOnOCR3 shared decoder scratch admits bounded prefill and requires GPU-only state" {
-    if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const Env = struct {
-        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
-        extern "c" fn unsetenv([*:0]const u8) c_int;
-    };
-    const names = [_][:0]const u8{ "ANTFLY_LIGHTONOCR3_EPOCH_AUX", "ANTFLY_LIGHTONOCR3_PREPARED_DECODE", "ANTFLY_LIGHTONOCR3_PREFILL_BATCH", "ANTFLY_LIGHTONOCR3_SHARED_DECODER_SCRATCH", "ANTFLY_LIGHTONOCR3_PREFILL_BATCH_ITEMS", "ANTFLY_LIGHTONOCR3_VISION_BATCH", "ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS" };
-    var old: [names.len]?[:0]u8 = @splat(null);
-    var saved: usize = 0;
-    defer for (names[0..saved], old[0..saved]) |name, value| {
-        if (value) |v| {
-            _ = Env.setenv(name, v, 1);
-            a.free(v);
-        } else _ = Env.unsetenv(name);
-    };
-    for (names, 0..) |name, index| {
-        if (platform.env.getenv(name)) |value| old[index] = try a.dupeSentinel(u8, value, 0);
-        saved += 1;
-    }
-    for (names) |name| try std.testing.expectEqual(@as(c_int, 0), Env.setenv(name, "1", 1));
-    const Features = Node.LightOnStreamContext.ExecutionFeatures;
-    const cfg = gpt_model_mod.Config{ .qwen35_device_only_state = true };
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[4], "2", 1));
-    const batched = Features.fromEnvironmentForModel(cfg);
-    try std.testing.expectEqual(metal_runtime.qualifiedM4DeviceDefault(), batched.shared_decoder_scratch);
-    try std.testing.expectEqual(@as(u8, 2), batched.prefill_batch_items);
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[6], "99", 1));
-    try std.testing.expectEqual(@as(u8, 4), Features.fromEnvironmentForModel(cfg).vision_batch_items);
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[4], "8", 1));
-    try std.testing.expectEqual(@as(u8, 8), Features.fromEnvironmentForModel(cfg).prefill_batch_items);
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[4], "99", 1));
-    try std.testing.expectEqual(@as(u8, 8), Features.fromEnvironmentForModel(cfg).prefill_batch_items);
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[2], "0", 1));
-    try std.testing.expectEqual(@as(u8, 1), Features.fromEnvironmentForModel(cfg).prefill_batch_items);
-    try std.testing.expectEqual(metal_runtime.qualifiedM4DeviceDefault(), Features.fromEnvironmentForModel(cfg).shared_decoder_scratch);
-    try std.testing.expect(!Features.fromEnvironmentForModel(.{}).shared_decoder_scratch);
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[1], "0", 1));
-    try std.testing.expect(!Features.fromEnvironmentForModel(cfg).shared_decoder_scratch);
-}
-
 test "LightOnOCR3 device recurrent admission preserves GPU state KV and per-page outputs" {
     const cfg = gpt_model_mod.Config{ .family = .qwen3_5, .hidden_size = 2560, .vocab_size = 248320, .num_hidden_layers = 32, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 16, .qwen35_linear_num_value_heads = 32, .qwen35_linear_key_head_dim = 128, .qwen35_linear_value_head_dim = 128, .qwen35_linear_conv_kernel_dim = 4 };
     const decoder = runtime.tier.memory.AdmissionAmounts{ .backend_kv_bytes = 1234, .backend_scratch_bytes = 5678 };
@@ -43942,29 +43899,6 @@ test "LightOnOCR3 epoch admission owns shared scratch across page retirement and
 }
 
 test "LightOnOCR3 shared side-weight storage requires an epoch resource owner" {
-    const a = std.testing.allocator;
-    const Env = struct {
-        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
-        extern "c" fn unsetenv([*:0]const u8) c_int;
-    };
-    const names = [_][:0]const u8{ "ANTFLY_LIGHTONOCR3_EPOCH_AUX", "ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS" };
-    var old: [2]?[:0]u8 = @splat(null);
-    var saved: usize = 0;
-    defer for (names[0..saved], old[0..saved]) |name, value| {
-        if (value) |v| {
-            _ = Env.setenv(name, v, 1);
-            a.free(v);
-        } else _ = Env.unsetenv(name);
-    };
-    for (names, 0..) |name, i| {
-        if (platform.env.getenv(name)) |value| old[i] = try a.dupeSentinel(u8, value, 0);
-        saved += 1;
-    }
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[0], "0", 1));
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[1], "1", 1));
-    try std.testing.expect(!Node.LightOnStreamContext.ExecutionFeatures.fromEnvironment().shared_core_weights);
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[0], "1", 1));
-    try std.testing.expect(Node.LightOnStreamContext.ExecutionFeatures.fromEnvironment().shared_core_weights);
     const features = Node.LightOnStreamContext.ExecutionFeatures{ .epoch_auxiliary = true, .shared_core_weights = true };
     try std.testing.expect(features.needsAuxiliary());
     const amounts = features.auxiliaryAmounts();
@@ -43996,84 +43930,6 @@ test "LightOnOCR3 batched attention reserves two disjoint frame scratch banks" {
     const amounts = features.auxiliaryAmounts();
     try std.testing.expectEqual(@as(usize, 18 * 1024 * 1024), amounts.backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), amounts.host_scratch_bytes);
-}
-
-test "LightOnOCR3 throughput preset preserves explicit overrides and resource ownership" {
-    if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const Env = struct {
-        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
-        extern "c" fn unsetenv([*:0]const u8) c_int;
-    };
-    const names = [_][:0]const u8{
-        "ANTFLY_LIGHTONOCR3_THROUGHPUT",             "ANTFLY_LIGHTONOCR3_EPOCH_AUX",
-        "ANTFLY_LIGHTONOCR3_PREPARED_DECODE",        "ANTFLY_LIGHTONOCR3_ACTIVATION_POOL",
-        "ANTFLY_LIGHTONOCR3_EXECUTOR",               "ANTFLY_LIGHTONOCR3_BATCH_ATTENTION",
-        "ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS",    "ANTFLY_LIGHTONOCR3_WIDE_DECODE",
-        "ANTFLY_LIGHTONOCR3_BATCH_ROWS",             "ANTFLY_LIGHTONOCR3_BATCH_WINDOW",
-        "ANTFLY_LIGHTONOCR3_SINGLE_FRAME",           "ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS",
-        "ANTFLY_LIGHTONOCR3_CPU_PREPROCESS",         "ANTFLY_LIGHTONOCR3_VISION_BATCH",
-        "ANTFLY_LIGHTONOCR3_PHYSICAL32",             "ANTFLY_LIGHTONOCR3_LOGICAL64",
-        "ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE", "ANTFLY_LIGHTONOCR3_SHARED_DECODER_SCRATCH",
-        "ANTFLY_LIGHTONOCR3_PREFILL_BATCH",          "ANTFLY_LIGHTONOCR3_PHYSICAL64",
-        "ANTFLY_LIGHTONOCR3_PREFILL_BATCH_ITEMS",    "ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS",
-        "ANTFLY_LIGHTONOCR3_VISION_LATE_SEAL",       "ANTFLY_LIGHTONOCR3_PREFILL_LATE_SEAL",
-        "ANTFLY_LIGHTONOCR3_KEEP_VISION_WORKSPACE",  "ANTFLY_LIGHTONOCR3_GPU_GREEDY_STREAM",
-        "ANTFLY_LIGHTONOCR3_STREAM_CHUNKS",
-    };
-    var old: [names.len]?[:0]u8 = @splat(null);
-    var saved: usize = 0;
-    defer for (names[0..saved], old[0..saved]) |name, value| {
-        if (value) |v| {
-            _ = Env.setenv(name, v, 1);
-            a.free(v);
-        } else _ = Env.unsetenv(name);
-    };
-    for (names, 0..) |name, i| {
-        if (platform.env.getenv(name)) |value| old[i] = try a.dupeSentinel(u8, value, 0);
-        saved += 1;
-        try std.testing.expectEqual(@as(c_int, 0), Env.unsetenv(name));
-    }
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[0], "1", 1));
-    const eligible = metal_runtime.qualifiedM4DeviceDefault();
-    const Features = Node.LightOnStreamContext.ExecutionFeatures;
-    const small = Features.fromEnvironmentForModel(.{ .hidden_size = 1024 });
-    const large = Features.fromEnvironmentForModel(.{ .hidden_size = 2560 });
-    try std.testing.expectEqual(eligible, small.prepared and small.worker and small.activation_pool and small.epoch_auxiliary and small.batch_attention);
-    try std.testing.expect(!small.shared_core_weights and !small.single_frame and small.stream_first_layers == 0);
-    try std.testing.expectEqual(eligible, large.shared_core_weights);
-    try std.testing.expectEqual(eligible, small.cpu_preprocess);
-    try std.testing.expectEqual(@as(u8, 1), small.vision_batch_items);
-    try std.testing.expectEqual(@as(u8, 16), small.prepared_rows);
-    if (eligible) {
-        try std.testing.expectEqual(@as(usize, 16), effectiveLightOnReadRows());
-        try std.testing.expectEqual(@as(usize, 16), effectiveLightOnReadWindow());
-        const amounts = large.auxiliaryAmounts();
-        try std.testing.expect(amounts.backend_scratch_bytes >= 34 * 1024 * 1024);
-        try std.testing.expect(amounts.host_scratch_bytes >= 35 * 1024 * 1024);
-        try std.testing.expectEqual(@as(c_int, 0), Env.setenv("ANTFLY_LIGHTONOCR3_PHYSICAL32", "1", 1));
-        try std.testing.expectEqual(@as(usize, 32), effectiveLightOnReadRows());
-        try std.testing.expectEqual(@as(usize, 32), effectiveLightOnReadWindow());
-        const wider = Features.fromEnvironmentForModel(.{ .hidden_size = 2560 });
-        try std.testing.expectEqual(@as(u8, 32), wider.prepared_rows);
-        try std.testing.expectEqual(amounts.backend_scratch_bytes + 4 * 1024 * 1024, wider.auxiliaryAmounts().backend_scratch_bytes);
-        try std.testing.expectEqual(@as(c_int, 0), Env.setenv("ANTFLY_LIGHTONOCR3_BATCH_ROWS", "24", 1));
-        try std.testing.expectEqual(@as(usize, 24), effectiveLightOnReadRows());
-        try std.testing.expectEqual(@as(c_int, 0), Env.setenv("ANTFLY_LIGHTONOCR3_PHYSICAL32", "0", 1));
-        try std.testing.expectEqual(@as(usize, 16), effectiveLightOnReadRows());
-        try std.testing.expectEqual(@as(u8, 16), Features.fromEnvironment().prepared_rows);
-        try std.testing.expectEqual(@as(c_int, 0), Env.unsetenv("ANTFLY_LIGHTONOCR3_BATCH_ROWS"));
-    }
-    // An explicit false changes the feature and its required shared owner.
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[1], "0", 1));
-    const separate = Features.fromEnvironmentForModel(.{ .hidden_size = 2560 });
-    try std.testing.expect(!separate.epoch_auxiliary and !separate.batch_attention and !separate.shared_core_weights);
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[2], "0", 1));
-    try std.testing.expect(!Features.fromEnvironment().prepared);
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[8], "4", 1));
-    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[9], "2", 1));
-    try std.testing.expectEqual(@as(usize, 4), effectiveLightOnReadRows());
-    try std.testing.expectEqual(@as(usize, 2), effectiveLightOnReadWindow());
 }
 
 test "LightOnOCR3 microbatch GPU gate parks and preserves group cancellation" {

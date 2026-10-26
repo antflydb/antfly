@@ -16,9 +16,7 @@
 const std = @import("std");
 const platform = @import("antfly_platform");
 const metal_runtime = @import("../backends/metal_runtime.zig");
-const generation = @import("../pipelines/generation.zig");
 const gpt_model_mod = @import("../models/gpt.zig");
-const qwen3vl_projector = @import("../architectures/qwen3vl_projector.zig");
 const runtime = @import("../runtime/root.zig");
 
 /// One immutable serving configuration shared by admission and execution.
@@ -59,123 +57,86 @@ pub fn Features(comptime Hooks: type) type {
         packed_shared_frame: bool = false,
         shared_decoder_scratch: bool = false,
 
-        pub fn fromEnvironment() @This() {
-            const epoch_auxiliary = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EPOCH_AUX");
-            const prepared = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PREPARED_DECODE");
-            const prefill_batch = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PREFILL_BATCH");
-            const physical_rows = Hooks.effectiveLightOnReadRows();
+        pub const Profile = enum {
+            conservative,
+            metal_lighton08,
+            metal_lighton4b,
+            cuda_lighton08,
+            cuda_lighton4b,
+        };
+
+        /// Select only model/backend combinations with a complete execution
+        /// and admission contract; partial feature switches do not form modes.
+        pub fn selectProfile(cfg: gpt_model_mod.Config, backend: runtime.kv.pool.BackendKind, cuda_requested: bool, metal_qualified: bool, metal_requested: bool) Profile {
+            if (!cfg.hasQwen35VisionArchitectureContract() or !cfg.qwen35_device_only_state or
+                (cfg.hidden_size != 1024 and cfg.hidden_size != 2560)) return .conservative;
+            if (backend == .cuda and cuda_requested)
+                return if (cfg.hidden_size == 1024) .cuda_lighton08 else .cuda_lighton4b;
+            if (backend == .metal and metal_qualified and metal_requested and cfg.qwen35_metal_resident_vision)
+                return if (cfg.hidden_size == 1024) .metal_lighton08 else .metal_lighton4b;
+            return .conservative;
+        }
+
+        /// A profile is resolved once for the epoch. Operator row limits can
+        /// shrink it; no profile changes byte limits or selects extra branches.
+        pub fn forProfile(profile: Profile, cfg: gpt_model_mod.Config, requested_rows: usize) @This() {
+            if (profile == .conservative) return .{ .prepared_rows = 0, .resident_vision_budget = cfg.qwen35_metal_resident_vision };
+            const cuda = profile == .cuda_lighton08 or profile == .cuda_lighton4b;
+            const large = profile == .cuda_lighton4b or profile == .metal_lighton4b;
+            const rows = std.math.clamp(requested_rows, 1, if (cuda) @as(usize, 128) else 64);
             return .{
-                .cpu_preprocess = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_CPU_PREPROCESS"),
-                .vision_batch_items = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_VISION_BATCH")) @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS") orelse 4, 1), 4)) else 1,
-                .prefill_batch_items = if (prefill_batch) @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_BATCH_ITEMS") orelse 4, 1), generation.NativeGenerationPipeline.default_prepared_qwen_prefill_items)) else 1,
-                .vision_frame_blocks = if (metal_runtime.qualifiedM4DeviceDefault() and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_CPU_PREPROCESS")) @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_FRAME_BLOCKS") orelse 1, 1), 4)) else 1,
-                .prepared = prepared,
-                .prefill_batch = prefill_batch,
-                .queued_phase_priority = epoch_auxiliary and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_QUEUED_PHASE_PRIORITY"),
-                .vision_late_seal = epoch_auxiliary and metal_runtime.qualifiedM4DeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_VISION_LATE_SEAL"),
-                .prefill_late_seal = epoch_auxiliary and metal_runtime.qualifiedM4DeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PREFILL_LATE_SEAL"),
-                .shared_decoder_scratch = metal_runtime.qualifiedM4DeviceDefault() and epoch_auxiliary and prepared and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_SHARED_DECODER_SCRATCH"),
-                .prepared_rows = if (physical_rows > 64) 128 else if (physical_rows > 32) 64 else if (physical_rows > 16) 32 else 16,
-                .scheduling_rows = @intCast(physical_rows),
-                .activation_pool = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_ACTIVATION_POOL"),
-                .worker = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EXECUTOR"),
-                .epoch_auxiliary = epoch_auxiliary,
-                .batch_attention = epoch_auxiliary and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_BATCH_ATTENTION"),
-                .shared_core_weights = epoch_auxiliary and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS"),
-                .stream_first_layers = if (epoch_auxiliary and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PREPARED_DECODE")) @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS") orelse 0, 16)) else 0,
-                .single_frame = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_SINGLE_FRAME"),
-                .prefill_decode_streak = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_DECODE_STREAK") orelse 4, 16)),
+                .prepared = true,
+                .prepared_rows = if (rows > 64) 128 else if (rows > 32) 64 else if (rows > 16) 32 else 16,
+                .scheduling_rows = @intCast(rows),
+                .cpu_preprocess = true,
+                .vision_batch_items = if (cuda and !large) 8 else 1,
+                .vision_frame_blocks = if (cuda) 1 else if (large) 3 else 4,
+                .prefill_decode_streak = 0,
+                .activation_pool = !cuda,
+                .worker = true,
+                .epoch_auxiliary = true,
+                .single_frame = !cuda,
+                .gpu_token_burst = !cuda,
+                .gpu_token_burst_width = 4,
+                .vision_workspace_cache = !cuda,
+                .vision_late_seal = cuda,
+                .prefill_late_seal = cuda,
+                .queued_phase_priority = cuda,
+                .resident_vision_budget = cfg.qwen35_metal_resident_vision,
+                .shared_core_weights = !cuda,
+                .batch_attention = !cuda,
+                .packed_mixed = true,
+                .packed_prefill_items = if (!cuda) 1 else if (large) 4 else 8,
+                .prepared_prefill_chunk_rows = if (cuda and large) 256 else 0,
+                .packed_shared_frame = !cuda,
+                .shared_decoder_scratch = true,
             };
         }
+
+        pub fn fromEnvironment() @This() {
+            // Without a model and backend there is no qualified epoch profile.
+            return .{};
+        }
+
         pub fn fromEnvironmentForModel(cfg: gpt_model_mod.Config) @This() {
-            var features = fromEnvironment();
-            features.resident_vision_budget = cfg.qwen35_metal_resident_vision;
-            if (Hooks.cudaLightOnBatchProfileEnabled() and cfg.hasQwen35VisionArchitectureContract() and cfg.qwen35_device_only_state) {
-                // CUDA shares the portable epoch, stage brokers and worker.
-                // Metal encoder, prepared-tail and activation-pool flags
-                // remain independently qualified backend features.
-                features.worker = platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_EXECUTOR", true);
-                // CUDA's portable packed path uses the same decode
-                // workspace, without requiring a separate Metal preset.
-                // Preserve an explicit prepared-workspace disable.
-                if ((platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_PACKED_MIXED") and
-                    platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PACKED_MIXED")) or platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"))
-                    features.prepared = platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_PREPARED_DECODE", true);
-                features.vision_batch_items = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_VISION_BATCH")) @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS") orelse 4, 1), qwen3vl_projector.maxResidentVisionBatchItems(.cuda))) else 1;
-                if (features.prefill_batch and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES"))
-                    features.prefill_batch_items = @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_BATCH_ITEMS") orelse 4, 1), generation.NativeGenerationPipeline.max_prepared_qwen_prefill_items));
-                features.epoch_auxiliary = true;
-                features.shared_decoder_scratch = true;
-                features.cpu_preprocess = platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_CPU_PREPROCESS", true);
-                features.queued_phase_priority = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_QUEUED_PHASE_PRIORITY");
-                features.vision_late_seal = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_VISION_LATE_SEAL");
-                features.prefill_late_seal = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PREFILL_LATE_SEAL");
-            }
-            features.shared_decoder_scratch = features.shared_decoder_scratch and cfg.qwen35_device_only_state;
-            features.gpu_greedy_stream = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_GREEDY_STREAM") and
-                metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
-                cfg.qwen35_device_only_state and features.epoch_auxiliary and features.prepared and
-                features.activation_pool and features.batch_attention and features.stream_first_layers != 0 and
-                !features.single_frame;
-            features.gpu_token_burst = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST") and
-                metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
-                cfg.qwen35_device_only_state and features.shared_decoder_scratch and features.epoch_auxiliary and
-                features.prepared and features.worker and features.activation_pool and features.batch_attention and
-                features.single_frame and features.stream_first_layers == 0 and
-                !platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME");
-            if (Hooks.cudaLightOnBatchProfileEnabled() and cfg.hasQwen35VisionArchitectureContract() and cfg.qwen35_device_only_state) {
-                features.gpu_token_burst = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST") and
-                    features.shared_decoder_scratch and features.epoch_auxiliary and features.prepared and features.worker and
-                    !features.gpu_greedy_stream and features.stream_first_layers == 0;
-                if (features.gpu_token_burst) {
-                    // A conservative second full F32 head plus all token
-                    // IDs remains charged under the original byte caps.
-                    features.cuda_burst_extra_bytes = @as(usize, cfg.vocab_size) * features.prepared_rows * @sizeOf(f32) +
-                        generation.NativeGenerationPipeline.max_gpu_token_burst_width * 64 * @sizeOf(u32);
-                }
-            }
-            features.gpu_token_burst_width = @intCast(std.math.clamp(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH") orelse 2, 2, generation.NativeGenerationPipeline.max_gpu_token_burst_width));
-            features.pipeline_vision = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PIPELINE_VISION") and
-                metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
-                features.resident_vision_budget and features.cpu_preprocess and features.epoch_auxiliary and
-                features.vision_batch_items == 1 and features.vision_frame_blocks <= 2 and
-                !platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME") and
-                !platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN35_VISION_FRAME") and
-                !platform.env.getenvBool("TERMITE_QWEN3VL_PROFILE") and
-                platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") == null;
-            features.stream_chunks = features.gpu_greedy_stream and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_STREAM_CHUNKS");
-            features.vision_workspace_cache = features.epoch_auxiliary and metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
-                !platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK") and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_KEEP_VISION_WORKSPACE");
-            features.shared_core_weights = features.epoch_auxiliary and platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS", metal_runtime.lightOnThroughputProfileEnabled() and cfg.hidden_size == 2560);
-            if (metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
-                cfg.qwen35_device_only_state and features.shared_decoder_scratch and features.shared_core_weights and
-                features.epoch_auxiliary and features.prepared and features.worker and features.activation_pool and
-                features.prefill_batch_items == 1 and
-                !platform.env.getenvBool("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PACK_REUSE") and
-                !platform.env.getenvBool("TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH") and
-                !platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"))
-                features.prefill_stream_layers = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_STREAM_LAYERS") orelse 0, 16));
-            features.packed_mixed = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PACKED_MIXED") and
-                (metal_runtime.qualifiedM4DeviceDefault() or
-                    (Hooks.cudaLightOnBatchProfileEnabled() and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_PACKED_MIXED"))) and cfg.hasQwen35VisionArchitectureContract() and
-                cfg.qwen35_device_only_state and features.shared_decoder_scratch and features.prepared and
-                features.worker and features.epoch_auxiliary and features.prefill_batch_items == 1 and
-                !features.gpu_greedy_stream;
-            features.prefill_activation_pool = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PREFILL_ACTIVATION_POOL") and
-                metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
-                features.epoch_auxiliary and features.activation_pool and features.prepared and
-                features.worker and cfg.qwen35_device_only_state and features.shared_decoder_scratch;
-            if (features.packed_mixed) features.packed_prefill_items = @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS") orelse 1, 1), generation.NativeGenerationPipeline.default_prepared_qwen_prefill_items));
-            if (features.packed_mixed) {
-                const rows = platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS") orelse 0;
-                features.prepared_prefill_chunk_rows = if (rows == 0) 0 else @intCast(@min(@max(rows, 64), 1024));
-            }
-            features.packed_shared_frame = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PACKED_SHARED_FRAME") and
-                metal_runtime.qualifiedM4DeviceDefault() and features.packedSharedFrameEligible(cfg) and
-                !platform.env.getenvBool("TERMITE_QWEN3VL_PROFILE") and
-                platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") == null and
-                !platform.env.getenvBool("TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH");
-            return features;
+            return resolve(cfg, if (Hooks.cudaLightOnBatchProfileEnabled()) .cuda else .metal);
+        }
+
+        pub fn resolve(cfg: gpt_model_mod.Config, backend: runtime.kv.pool.BackendKind) @This() {
+            const profile = selectProfile(cfg, backend, Hooks.cudaLightOnBatchProfileEnabled(), metal_runtime.qualifiedM4DeviceDefault(), metal_runtime.lightOnThroughputProfileEnabled());
+            // Profiling and concurrent planned dispatch do not share the
+            // selected frame/lifetime contract. Fall back as one complete mode.
+            const restricted_metal_mode = backend == .metal and
+                (platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME") or
+                    platform.env.getenvBool("TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH") or
+                    platform.env.getenvBool("TERMITE_QWEN3VL_PROFILE") or
+                    platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") != null);
+            if (!platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_PREPARED_DECODE", true) or restricted_metal_mode)
+                return forProfile(.conservative, cfg, 1);
+            var result = forProfile(profile, cfg, Hooks.effectiveLightOnReadRows());
+            if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK"))
+                result.vision_workspace_cache = false;
+            return result;
         }
         pub fn packedSharedFrameEligible(features: @This(), cfg: gpt_model_mod.Config) bool {
             return features.packed_mixed and features.single_frame and
@@ -223,4 +184,64 @@ pub fn Features(comptime Hooks: type) type {
             return features.epoch_auxiliary and (features.prepared or features.activation_pool or features.worker or features.shared_core_weights or features.stream_first_layers != 0 or features.batch_attention);
         }
     };
+}
+
+test "LightOnOCR3 supported reader profiles isolate models backends and conservative fallback" {
+    const Hooks = struct {
+        pub fn effectiveLightOnReadRows() usize {
+            return 128;
+        }
+        pub fn cudaLightOnBatchProfileEnabled() bool {
+            return true;
+        }
+    };
+    const F = Features(Hooks);
+    for ([_][]const u8{ @embedFile("../models/testdata/lightonocr3/config.json"), @embedFile("../models/testdata/lightonocr3/config-4b.json") }) |json| {
+        var cfg = try gpt_model_mod.parseConfig(std.testing.allocator, json);
+        cfg.qwen35_device_only_state = true;
+        cfg.qwen35_metal_resident_vision = true;
+        const large = cfg.hidden_size == 2560;
+        try std.testing.expectEqual(if (large) F.Profile.cuda_lighton4b else F.Profile.cuda_lighton08, F.selectProfile(cfg, .cuda, true, true, true));
+        try std.testing.expectEqual(if (large) F.Profile.metal_lighton4b else F.Profile.metal_lighton08, F.selectProfile(cfg, .metal, true, true, true));
+        try std.testing.expectEqual(F.Profile.conservative, F.selectProfile(cfg, .native, true, true, true));
+        try std.testing.expectEqual(F.Profile.conservative, F.selectProfile(cfg, .cuda, false, true, true));
+        try std.testing.expectEqual(F.Profile.conservative, F.selectProfile(cfg, .metal, true, false, true));
+        cfg.qwen35_device_only_state = false;
+        try std.testing.expectEqual(F.Profile.conservative, F.selectProfile(cfg, .cuda, true, true, true));
+    }
+    try std.testing.expectEqual(F.Profile.conservative, F.selectProfile(.{}, .cuda, true, true, true));
+}
+
+test "LightOnOCR3 selected reader profiles retain admission ownership row caps and CUDA chunking" {
+    const Hooks = struct {
+        pub fn effectiveLightOnReadRows() usize {
+            return 128;
+        }
+        pub fn cudaLightOnBatchProfileEnabled() bool {
+            return true;
+        }
+    };
+    const F = Features(Hooks);
+    for ([_]F.Profile{ .metal_lighton08, .metal_lighton4b, .cuda_lighton08, .cuda_lighton4b }) |profile| {
+        const cfg = gpt_model_mod.Config{ .qwen35_device_only_state = true, .qwen35_metal_resident_vision = true };
+        const selected = F.forProfile(profile, cfg, 999);
+        const cuda = profile == .cuda_lighton08 or profile == .cuda_lighton4b;
+        try std.testing.expectEqual(if (cuda) @as(u8, 128) else 64, selected.scheduling_rows);
+        try std.testing.expect(selected.needsAuxiliary());
+        try std.testing.expect(selected.packed_mixed and selected.prepared and selected.worker and selected.shared_decoder_scratch);
+        try std.testing.expect(!selected.gpu_greedy_stream and !selected.stream_chunks and !selected.prefill_activation_pool and selected.stream_first_layers == 0 and selected.prefill_stream_layers == 0);
+        const full = selected.auxiliaryAmounts();
+        const partial = F.forProfile(profile, cfg, 48);
+        try std.testing.expectEqual(@as(u8, 64), partial.prepared_rows);
+        try std.testing.expectEqual(@as(u8, 48), partial.scheduling_rows);
+        const limited = F.forProfile(profile, cfg, 8);
+        try std.testing.expectEqual(@as(u8, 8), limited.scheduling_rows);
+        try std.testing.expect(limited.auxiliaryAmounts().backend_scratch_bytes <= full.backend_scratch_bytes);
+        var controller = runtime.tier.memory.AdmissionController{};
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, .{ .backend_limit_bytes = full.backend_scratch_bytes - 1 }, full, false));
+        var lease = try controller.tryAcquire(.gpu, .{ .backend_limit_bytes = full.backend_scratch_bytes, .host_limit_bytes = full.host_scratch_bytes }, full, false);
+        lease.release();
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+        try std.testing.expectEqual(@as(u16, if (profile == .cuda_lighton4b) 256 else 0), selected.prepared_prefill_chunk_rows);
+    }
 }
