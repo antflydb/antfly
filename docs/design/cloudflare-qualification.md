@@ -1182,3 +1182,27 @@ bodies and eight receipts with no request errors. Candidate read/write p95 was
 limits; reads still fail. The next comparison uses the hot coordinator snapshot
 path by default, with local reader observation opt-in. A complete strict gate
 still requires all three one-hour trials and their unused cold epochs.
+
+
+The compact-intent hot-RPC diagnostic completed with candidate read/write p95
+1,281 / 2,571 ms versus 4,708 / 5,534 ms, without request errors. Seven historical
+metadata-collection DLQ messages still invalidated that run. Each was recovered
+through its authoritative job ID, proved complete, then acknowledged using its
+exact lease and retained body hash. A subsequent audit showed zero DLQ messages;
+the original failed report remains unchanged.
+
+Confirmed immutable publication hints and variant-aware pool recycling pass
+175 Node checks and all six persisted Worker checks (239.6 seconds). Merging
+`origin/main` at `0c753dc705` also passes 656 native checks with six skips; the
+rebuilt full, compact and observer WASM hashes are unchanged, preserving the
+existing frozen ANN and 50k fixture binding.
+
+The seeded five-minute hint diagnostic (`trial-2-smoke.json`) verified all 2,052
+body/count checks and eight receipts per side. Candidate read/write p95 was
+1,212 / 2,761 ms versus 6,398 / 6,509 ms. One candidate write returned HTTP 409
+with an opaque Cloudflare internal-error reference after 11,436 ms. This remains
+failed evidence: read latency exceeds one second and zero errors are required.
+The run used the hint changes before variant-aware recycling was deployed. No
+reserved physical cold epochs were consumed. Fresh live traces are required to
+attribute hint hits and classify the infrastructure failure; it is not evidence
+of an out-of-memory cause or of a successful strict gate.

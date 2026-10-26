@@ -23,6 +23,8 @@ export class RequestPool {
   if(!this.slots.length)return Promise.reject(new Error("RuntimeCapabilityUnsupported"));
   job.reservationBytes=job.options.memoryReservationBytes??this.reservationBytes;job.hostKey=job.options.kernelVariant??this.defaultKernelVariant;
   if(!Number.isSafeInteger(job.reservationBytes)||job.reservationBytes<0||job.reservationBytes>this.maxReservedBytes||Number.isFinite(this.maxReservedBytes)&&job.reservationBytes===0)return Promise.reject(new Error("InvalidKernelMemoryReservation"));
+  try{job.recycleBytes=typeof this.recycleBytes==="function"?this.recycleBytes(job):this.recycleBytes;}catch(error){return Promise.reject(error);}
+  if(typeof job.recycleBytes!=="number"||Number.isNaN(job.recycleBytes)||job.recycleBytes<0)return Promise.reject(Error("InvalidKernelRecycleBudget"));
   if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))return Promise.reject(new Error("DeadlineExceeded"));
   if(this.pending.length>=this.maxQueued)return Promise.reject(new Error("CoordinatorCommitBusy"));
   return new Promise((resolve,reject)=>{
@@ -64,7 +66,7 @@ export class RequestPool {
   stage("kernel_queue",job.queuedAt);
   try{await new Promise(resolve=>setTimeout(resolve,0));if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");if(!slot.host){const start=performance.now();slot.host=await this.create(job);slot.hostKey=job.hostKey;slot.hostReservationBytes=job.reservationBytes;stage("wasm_instantiate",start);}if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");job.resolve(await (job.run?job.run(slot.host):slot.host.request(job.input,job.options)));}
   catch(error){job.reject(error);}
-  finally{if(slot.host&&(!slot.host.usable()||slot.host.memoryBytes()>=this.recycleBytes))slot.host=null;this.reservedBytes-=job.reservationBytes;slot.activeReservationBytes=0;slot.busy=false;this.drain();}
+  finally{if(slot.host&&(!slot.host.usable()||slot.host.memoryBytes()>=job.recycleBytes))slot.host=null;this.reservedBytes-=job.reservationBytes;slot.activeReservationBytes=0;slot.busy=false;this.drain();}
  }
  memoryBytes(){return this.slots.reduce((n,slot)=>n+(slot.host?.memoryBytes()??0),0);}
 }

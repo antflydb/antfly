@@ -75,7 +75,7 @@ export class R2CommitCoordinator extends DurableObject {
       return(this.env.READ_ONLY_SNAPSHOTS==="false"?Promise.reject(Error("ReadSnapshotNeedsAdmission")):this.store.readOnly(capture,{traceId:options.trace_id,traceIds})).catch(error=>{
         if(!/ReadSnapshotNeeds(?:Admission|Pin)/.test(String(error)))throw error;
         return this.transaction(capture,{traceId:options.trace_id});
-      });
+      }).then(view=>this.store.readHints?.version===view.version?{...view,immutable:structuredClone(this.store.readHints.records)}:view);
     },options.trace_id);
   }
   async nativePublication(tx,op,lease,owner=lease?.owner){
@@ -95,9 +95,9 @@ export class R2CommitCoordinator extends DurableObject {
       return{format:2,lease,budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};
     },{priority:"maintenance"});
   }
-  async finalizePublication(batch,observation){
+  async finalizePublication(batch,observation,readHints){
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
-    return this.transaction(async tx=>{
+    const result=await this.transaction(async tx=>{
       await this.nativePublication(tx,"publication_validate",batch?.lease);
       const entries=await publicationSnapshot(tx,keys);
       await applyPublication(tx,entries.map(([key])=>key),batch);
@@ -112,6 +112,9 @@ export class R2CommitCoordinator extends DurableObject {
       }
       return{committed:true};
     },{priority:"maintenance"});
+    const head=batch.writes.find(([key])=>key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`);
+    if(head)this.store.setReadHints(this.env.ANTFLY_INCARNATION,new TextDecoder().decode(head[1].body).trim(),readHints);
+    return result;
   }
   abortPublication(lease){return this.transaction(tx=>this.nativePublication(tx,"publication_release",lease),{priority:"maintenance"});}
   transaction(run,options) {
@@ -166,18 +169,22 @@ export class R2CommitCoordinator extends DurableObject {
     });
   }
   collection(op, args) {return this.journal.rpc(op, args);}
-  objectCall(request, body) {
+  async objectCall(request, body,readHints) {
     if (!(/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key ?? "") || /\/progress\//.test(request.key ?? ""))) return {status: 3};
     if (body.byteLength > 4096) return {status: 4};
-    return this.transaction(tx=>this.objectCallInTransaction(tx,request,body));
+    const result=await this.transaction(tx=>this.objectCallInTransaction(tx,request,body));
+    if(result.status===0&&request.op==="put"&&request.key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`)this.store.setReadHints(this.env.ANTFLY_INCARNATION,new TextDecoder().decode(body).trim(),readHints);
+    return result;
   }
   async openPublication(maximum) {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
     return this.transaction(async tx=>{await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION));return{budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};},{priority:"maintenance"});
   }
-  async publicationCall(request,body,expected) {
+  async publicationCall(request,body,expected,readHints) {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
-    return this.transaction(tx=>publicationCall(tx,keys,(...args)=>this.objectCallInTransaction(...args),request,body,expected),{priority:"maintenance"});
+    const response=await this.transaction(tx=>publicationCall(tx,keys,(...args)=>this.objectCallInTransaction(...args),request,body,expected),{priority:"maintenance"});
+    if(response.result.status===0&&request.op==="put"&&request.key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`)this.store.setReadHints(this.env.ANTFLY_INCARNATION,new TextDecoder().decode(body).trim(),readHints);
+    return response;
   }
   async objectCallInTransaction(tx,request,body){
     const result=await metadataObjectCall(tx,request,body,(tx,collection)=>this.journal.valid(tx,collection));

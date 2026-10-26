@@ -417,3 +417,41 @@ test("one idle commit advances the native recovery floor without delaying its ac
  await store.transaction(tx=>tx.put('value',1));const revision=store.state.revision,checkpoint=()=>JSON.parse(new TextDecoder().decode(bucket.objects.get(store.base+'/CHECKPOINT').body));assert.ok(checkpoint().state.revision<revision);
  now+=1001;await new Promise(resolve=>setTimeout(resolve,0));assert.equal(work.length,1);await Promise.all(work);assert.equal(checkpoint().state.revision,revision);assert.equal(store.idleCheckpoint.last,revision);assert.equal(await store.readOnly(tx=>tx.get('value')),1);
 });
+
+test("publication hints retain only confirmed immutable objects within the existing admission charge",async()=>{
+ const{PublicationReadHints,normalizeReadHints,readHintBudget}=await import('../publication-read-hints.mjs');const hints=new PublicationReadHints('hints'),key='antfly/artifacts/sha256/aa/'+'b'.repeat(62);let fail=false;
+ const transport=hints.wrap(async(request,body)=>{if(fail)throw Error('ambiguous upload');return{json:{etag:'confirmed',content_length:body?.byteLength},body};});
+ await transport({op:'put',key,if_none_match:true},utf8.encode('immutable'));await transport({op:'put',key:'antfly/progress/hints/HEAD',if_none_match:true},utf8.encode('7'));assert.equal(hints.entries.size,1);
+ fail=true;await assert.rejects(transport({op:'put',key:'antfly/artifacts/sha256/cc/'+'d'.repeat(62),if_none_match:true},utf8.encode('unconfirmed')),/ambiguous/);assert.equal(hints.entries.size,1);fail=false;
+ for(let i=0;i<20;i++)await transport({op:'put',key:'antfly/artifacts/sha256/aa/'+i.toString(16).padStart(62,'0'),if_none_match:true},new Uint8Array(1024));assert.ok(hints.bytes<=readHintBudget);assert.ok(hints.entries.size<=8);assert.ok(normalizeReadHints('hints','7',hints.forVersion('7')));
+ assert.equal(hints.forHead({op:'put',key:'antfly/progress/other/HEAD'},utf8.encode('7')),undefined);assert.equal(hints.forVersion('18446744073709551616'),undefined);
+});
+
+test("publication hints prioritize the current manifest and native facts root over small page churn",async()=>{
+ const{PublicationReadHints,normalizeReadHints}=await import('../publication-read-hints.mjs'),hints=new PublicationReadHints('priority'),manifest='antfly/manifests/priority/manifests/7.bin',facts='antfly/artifacts/sha256/aa/'+'b'.repeat(62),root=new Uint8Array(576);root.set(utf8.encode('AFDFACTA'));
+ const transport=hints.wrap(async()=>({json:{etag:'durable'}}));await transport({op:'put',key:manifest,if_none_match:true},new Uint8Array(1000));await transport({op:'put',key:facts,if_none_match:true},root);
+ for(let i=0;i<30;i++)await transport({op:'put',key:'antfly/artifacts/graph/'+'a'.repeat(64)+'/'+'b'.repeat(32)+'/'+i.toString(16).padStart(64,'0'),if_none_match:true},new Uint8Array(1024));
+ const records=new Map(hints.forVersion('7').records);assert.ok(records.has(manifest)&&records.has(facts));assert.equal(normalizeReadHints('priority','8',hints.forVersion('7')),null);assert.ok(!new Map(hints.forVersion('8').records).has(manifest));
+});
+
+test("immutable read hints preserve conditional ranges, deadlines and fresh mutable authority",async()=>{
+ const key='antfly/artifacts/sha256/aa/'+'b'.repeat(62),manifest='antfly/manifests/hinted/manifests/7.bin';let fallbacks=0;const view={format:1,version:'7',entries:[['antfly/progress/hinted/HEAD',record('7')]],immutable:[[key,{etag:'immutable',body:utf8.encode('abcdef'),contentType:null}],[manifest,{etag:'manifest',body:utf8.encode('manifest'),contentType:null}]]};
+ const transport=withReadView(async()=>{fallbacks++;return{};},{},'hinted',{initial:view});const result=await transport({op:'get',bucket:'database',key,range:{offset:2,length:2},if_match_etag:'immutable'});assert.equal(new TextDecoder().decode(result.body),'cd');assert.equal(result.json.content_length,6);assert.equal((await transport({op:'head',key,max_response_bytes:0})).json.etag,'immutable');
+ await assert.rejects(transport({op:'get',key,if_match_etag:'wrong'}),error=>error.status===2);await assert.rejects(transport({op:'get',key,max_response_bytes:2}),error=>error.status===4);await assert.rejects(transport({op:'get',key,range:{offset:6,length:1}}),error=>error.status===3);assert.equal(fallbacks,0);await transport({op:'get',key,bucket:'unbound'});assert.equal(fallbacks,1);
+ const expired=withReadView(async()=>{throw Error('expired hints must not fall back');},{},'hinted',{initial:view,admittedAt:performance.now()-30001});await assert.rejects(expired({op:'get',key}),error=>error.status===8);
+ const poisoned={...view,immutable:[['antfly/progress/hinted/HEAD',record('999')]]},safe=withReadView(async()=>{fallbacks++;return{};},{},'hinted',{initial:poisoned});assert.equal(new TextDecoder().decode((await safe({op:'get',key:'antfly/progress/hinted/HEAD'})).body),'7');await safe({op:'get',key});assert.equal(fallbacks,2);
+});
+
+test("advisory immutable hints share the bounded row cache and discard uncharged fields",async()=>{
+ const{store}=fixture(),key='antfly/artifacts/sha256/aa/'+'b'.repeat(62),hints={version:'7',records:[[key,{etag:'confirmed',body:new Uint8Array(2048),contentType:null,extra:()=>{throw Error('must never clone');}}]]};
+ for(let i=0;i<256;i++)store.remember('row/'+i,{text:'x'.repeat(2048)});assert.ok(store.setReadHints('cache','7',hints));assert.ok(store.rowBytes+store.hintBytes<=512*1024);assert.equal(store.readHints.records[0][1].extra,undefined);hints.records[0][1].body[0]=99;assert.equal(store.readHints.records[0][1].body[0],0);
+ assert.equal(store.setReadHints('cache','6',{version:'6',records:[]}),false);assert.equal(store.readHints.version,'7');assert.equal(store.setReadHints('cache','8',{version:'8',records:[['antfly/progress/cache/HEAD',record('8')]]}),false);
+});
+
+test("variant recycling retires compact kernels below their hard cap without changing accepted results",async()=>{
+ const{RequestPool}=await import('../request-pool.mjs');let created=0;
+ const pool=new RequestPool(async job=>{created++;let bytes=job.hostKey==='full'?20:8;return{usable:()=>true,memoryBytes:()=>bytes,grow:value=>{bytes=value;}};},1,{maxReservedBytes:32,reservationBytes:16,defaultKernelVariant:'compact',recycleBytes:job=>job.hostKey==='full'?24:12});
+ assert.equal(await pool.withHost(()=> 'accepted'),'accepted');assert.equal(created,1);assert.equal(await pool.withHost(host=>{host.grow(13);return 'accepted';}),'accepted');assert.equal(created,1);assert.equal(pool.memoryBytes(),0);assert.equal(pool.reservedBytes,0);
+ await pool.withHost(()=>{});assert.equal(created,2);const full={kernelVariant:'full',memoryReservationBytes:32};await pool.withHost(()=>{},full);assert.equal(created,3);assert.equal(pool.memoryBytes(),20);await pool.withHost(host=>host.grow(25),full);assert.equal(pool.memoryBytes(),0);assert.equal(pool.reservedBytes,0);
+ const invalid=new RequestPool(()=>{throw Error('must not instantiate');},1,{recycleBytes:()=>{throw Error('invalid recycle policy');}});await assert.rejects(invalid.withHost(()=>{}),/invalid recycle policy/);assert.equal(invalid.reservedBytes,0);assert.equal(invalid.pending.length,0);
+});

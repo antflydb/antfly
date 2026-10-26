@@ -737,3 +737,30 @@ The subsequent [shared vector-block design](cloudflare-vector-blocks.md) replace
 repeated base rewrites with bounded sorted runs and checkpointed residual repacks,
 and adds certified deferred refinement. Its qualification must account for the
 complete read, publication and maintenance costs against unchanged controls.
+
+
+## Confirmed publication bytes in fresh read views
+
+After publication, the writer may retain up to eight confirmed immutable objects
+under an 8 KiB charged budget, included within its existing 512 KiB metadata-row
+cache. Capture accepts only successful full reads and create-only writes. The
+newest manifest and facts root take priority over small copy-on-write pages.
+Mutable HEADs, negative results, conditional overwrites and ambiguous uploads
+never enter this cache. Keys, ETags and JavaScript record overhead count toward
+the budget. Eviction removes hints along with their metadata store.
+
+A fresh native committed-prefix observation still authenticates each read view,
+including its generation, retirement floor and pin. Only hints bound to that
+generation accompany the view. Readers validate their scope and size and use
+them for conditional or ranged immutable reads during the existing 30-second
+view lifetime. Native digest and structure checks remain in force. Missing or
+invalid hints use ordinary R2 reads; hints never replace mutable authority.
+Physical telemetry records `snapshot_immutable_reads` separately from metadata
+snapshot reads and actual R2 calls. This removes repeated small immutable GETs
+without another publication-time fetch or a stale frontier cache.
+
+Pool recycling now depends on the selected kernel: full writer/builder kernels
+recycle at 24 MiB, compact kernels at 12 MiB, and 8 MiB observation kernels at
+7 MiB. Previously a threshold above a variant's maximum could prevent its
+recycling. These are retention thresholds within the existing hard reservations;
+no worker memory or request budget increases. Accepted results survive recycling.

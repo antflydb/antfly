@@ -14,6 +14,7 @@
 // limitations under the License.
 
 // Cloudflare-independent adapter for the shared native ordered metadata store.
+import {normalizeReadHints} from "./publication-read-hints.mjs";
 import {RequestPool} from "./request-pool.mjs";
 import {recoveryReadAhead} from "./recovery-read-ahead.mjs";
 import {CriticalPath} from "./trace.mjs";
@@ -38,7 +39,7 @@ export class R2CoordinatorStore {
     this.rawTransport=raw;this.snapshotKernel=readKernel??kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;
     this.transport = this.cache.wrap(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body), `coordinator/${namespace}`);
     this.pending = []; this.running = false; this.state = null;
-    this.rows=new Map();this.rowBytes=0;this.rowRevision=null;this.acquired=false;
+    this.rows=new Map();this.rowBytes=0;this.hintBytes=0;this.readHints=null;this.rowRevision=null;this.acquired=false;
     if(background)this.idleCheckpoint=new IdleCheckpoint({revision:()=>this.state?.revision??0,isIdle:()=>!this.running&&!this.pending.length,background,onError:error=>{try{this.onMetrics?.({event:"antfly.checkpoint_deferred",error:String(error)});}catch{}},checkpoint:()=>this.transaction(async tx=>{if(this.pending.length)return{busy:true};const revision=tx.snapshot().revision;return{done:await tx.checkpoint(),revision};},{priority:"maintenance"})});
   }
   async native(coordinate) {
@@ -91,12 +92,19 @@ export class R2CoordinatorStore {
     } finally {await cleanup();if (this.host&&(!this.host.usable() || this.host.memoryBytes() >= 24 * 1024 * 1024)) this.host = null;}
   }
   chargeMetrics(sample){this.nativeCpuMs=(this.nativeCpuMs??0)+Math.max(0,(sample.elapsed_ms??0)-(sample.io_wait_ms??0));this.usedOperations=(this.usedOperations??0)+sample.operations;this.usedBytes=(this.usedBytes??0)+sample.transferred_bytes;try{this.onMetrics?.(sample);}catch{}}
+  setReadHints(namespace,generation,hints){
+    const accepted=normalizeReadHints(namespace,generation,hints);
+    if(!accepted||this.readHints&&BigInt(accepted.version)<BigInt(this.readHints.version))return false;
+    this.boundRows?.(this);this.readHints=structuredClone(accepted);this.hintBytes=accepted.charge;
+    while(this.rows.size&&this.rowBytes+this.hintBytes>512*1024){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
+    return true;
+  }
   remember(key,value){
     this.boundRows?.(this);
     const previous=this.rows.get(key);if(previous)this.rowBytes-=previous.bytes;this.rows.delete(key);
     const bytes=utf8.encode(key).length+(value===undefined?0:utf8.encode(encode(value)).length)+128;
-    if(bytes>512*1024)return;
-    while(this.rows.size>=256||this.rowBytes+bytes>512*1024){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
+    if(bytes>512*1024-this.hintBytes)return;
+    while(this.rows.size>=256||this.rowBytes+this.hintBytes+bytes>512*1024){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
     this.rows.set(key,{value:structuredClone(value),bytes});this.rowBytes+=bytes;
   }
   async readOnly(run,{traceId,traceIds=[]}={}){

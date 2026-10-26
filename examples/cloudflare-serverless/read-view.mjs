@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {normalizeReadHints} from "./publication-read-hints.mjs";
 import {unsupportedRpc} from "./performance.mjs";
 import {ObjectStoreError} from "../../zig/lib/objectstore/wasm/r2.mjs";
 const utf8=new TextEncoder(),text=new TextDecoder();
@@ -46,7 +47,7 @@ export async function captureReadView(tx,keys,{version}={},now=Date.now){
 // One operation owns this view. Its native deadline bounds use of captured WAL
 // roots inside the collector's grace period. Never share it across requests.
 export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{},initial,admittedAt=performance.now()}={}){
- const mapView=view=>{if(view.format!==1)throw new Error("InvalidReadView");return new Map(view.entries);};
+ const mapView=view=>{if(view.format!==1)throw new Error("InvalidReadView");return {records:new Map(view.entries),immutable:new Map(normalizeReadHints(namespace,view.version,{version:view.version,records:view.immutable})?.records??[])};};
  let pending=initial?Promise.resolve(mapView(initial)):null,hint;const started=admittedAt;
  const progress=`antfly/progress/${namespace}/`,manifest=`antfly/manifests/${namespace}/manifests/`;
  return async(request,body)=>{
@@ -56,13 +57,24 @@ export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{},i
   if((request.op==="get"||request.op==="head")&&(request.key?.startsWith(progress)||/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key??""))){
    if(performance.now()-started>=30000)throw new ObjectStoreError(8,"read view deadline exceeded");
    pending??=coordinator.openReadView(hint==null?{}:{version:hint}).then(mapView).catch(error=>{if(unsupportedRpc(error,"openReadView"))return null;throw error;});
-   const records=await pending;
+   const records=(await pending)?.records;
    if(records?.has(request.key)){
     const record=records.get(request.key);onMetrics({snapshot_reads:1});
     if(!record)throw new ObjectStoreError(1,"snapshot object not found");
     if(request.max_response_bytes!=null&&record.body.byteLength>request.max_response_bytes)throw new ObjectStoreError(4,"snapshot response exceeds budget");
     if(request.if_match_etag!=null&&request.if_match_etag!==record.etag)throw new ObjectStoreError(2,"snapshot condition failed");
     return {json:{bucket:request.bucket,key:request.key,etag:record.etag,content_length:record.body.byteLength,content_type:record.contentType},body:request.op==="get"?record.body.slice():undefined};
+   }
+  }
+  if((request.op==="get"||request.op==="head")&&pending&&(request.bucket==null||request.bucket==="database")){
+   const record=(await pending)?.immutable.get(request.key);
+   if(record){
+    if(performance.now()-started>=30000)throw new ObjectStoreError(8,"read view deadline exceeded");
+    if(request.if_match_etag!=null&&request.if_match_etag!==record.etag)throw new ObjectStoreError(2,"immutable hint condition failed");
+    let bytes=record.body;
+    if(request.op==="get"&&request.range!=null){const {offset,length}=request.range;if(!Number.isSafeInteger(offset)||offset<0||length!=null&&(!Number.isSafeInteger(length)||length<=0)||offset>=bytes.byteLength)throw new ObjectStoreError(3,"invalid immutable hint range");bytes=bytes.subarray(offset,length==null?undefined:offset+length);}
+    if(request.op==="get"&&bytes.byteLength>(request.max_response_bytes??Infinity))throw new ObjectStoreError(4,"immutable hint response exceeds budget");
+    onMetrics({snapshot_immutable_reads:1});return{json:{bucket:request.bucket,key:request.key,etag:record.etag,content_length:record.body.byteLength,content_type:record.contentType},body:request.op==="get"?bytes.slice():undefined};
    }
   }
   return transport(request,body);

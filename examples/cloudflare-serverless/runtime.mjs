@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {PublicationReadHints} from "./publication-read-hints.mjs";
 import {PreparedPublication} from "./prepared-publication.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {publicationCoordinator} from "./publication-view.mjs";
@@ -73,9 +74,9 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
     const maxPutBytes = Number(env.OBJECT_MAX_PUT_BYTES ?? 4 * 1024 * 1024);
     if (!Number.isSafeInteger(maxPutBytes) || maxPutBytes < 1 || maxPutBytes > 8 * 1024 * 1024) throw new Error("InvalidHostedObjectBudget");
     const physical=readAdmission?.physical??{};
-    const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
+    const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION),readHints=env.COORDINATOR_BACKEND==="r2"&&["publish","compact","reindex"].includes(input.op)?new PublicationReadHints(env.ANTFLY_INCARNATION):null;
     const rpc=async(method,...args)=>{physical.rpc_calls=(physical.rpc_calls??0)+1;if(method==="publicationCall"||method==="objectCall")countMetadataRpc(physical,args[0]);const start=performance.now();try{return await trace.span("rpc:"+method,()=>stub[method](...args));}finally{physical.rpc_wait_ms=(physical.rpc_wait_ms??0)+performance.now()-start;}};
-    const coordinator={objectCall:(...args)=>rpc("objectCall",...args),openReadView:options=>rpc("openReadView",{...options,trace_id:trace.id})};
+    const coordinator={objectCall:(request,body)=>rpc("objectCall",request,body,readHints?.forHead(request,body)),openReadView:options=>rpc("openReadView",{...options,trace_id:trace.id})};
     let publicationView;
     if(env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)){
       if(input.op==="publish"&&env.BATCHED_PUBLICATION!=="false"){
@@ -86,8 +87,9 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
       catch(error){if(!unsupportedRpc(error,"openPublication"))throw error;}
     }
     let transport = cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),physical),
-      env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)?preparedPublication??publicationCoordinator({objectCall:coordinator.objectCall,publicationCall:(...args)=>rpc("publicationCall",...args)},publicationView):coordinator, collection), env.ANTFLY_INCARNATION);
-    if(env.COORDINATOR_BACKEND==="r2"&&!readAdmission?.legacy&&["lookup","list","count","search","status","latest"].includes(input.op))transport=withReadView(transport,coordinator,env.ANTFLY_INCARNATION,{initial:readAdmission?.view,admittedAt:readAdmission?.started,onMetrics:()=>{physical.snapshot_reads=(physical.snapshot_reads??0)+1;}});
+      env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)?preparedPublication??publicationCoordinator({objectCall:coordinator.objectCall,publicationCall:(request,body,expected)=>rpc("publicationCall",request,body,expected,readHints?.forHead(request,body))},publicationView):coordinator, collection), env.ANTFLY_INCARNATION);
+    if(readHints)transport=readHints.wrap(transport);
+    if(env.COORDINATOR_BACKEND==="r2"&&!readAdmission?.legacy&&["lookup","list","count","search","status","latest"].includes(input.op))transport=withReadView(transport,coordinator,env.ANTFLY_INCARNATION,{initial:readAdmission?.view,admittedAt:readAdmission?.started,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});
     const publicationBudget = publicationView?.budget??(["publish", "reindex"].includes(input.op) ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16);
     const settings = input.op === "latest" ? {} : { wal_inline_tail:env.WAL_INLINE_TAIL==="true", coarse_probes:Number(input.coarse_probes??env.ANN_COARSE_PROBES??0), enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
       publication_lease:preparedPublication?.lease??null,
@@ -114,7 +116,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
         emitOperationMetrics=()=>{if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: "antfly.operation", trace_id:trace.id, op: input.op, exact_scan:input.exact_scan===true, role, ...metrics, operation_outcome:operationSucceeded?"ok":"error", operation_elapsed_ms:performance.now()-runtimeStarted, physical,
           ...resources(),cache_retained_bytes: cache.retainedBytes(), wasm_linear_total_bytes: kernel?kernel.memoryBytes(): Object.values(lanes).reduce((sum, instance) => sum + (instance?.memoryBytes() ?? 0), 0)}));};
       } });
-    if(preparedPublication){await rpc("finalizePublication",preparedPublication.batch(),{records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes});publicationFinalized=true;}
+    if(preparedPublication){const batch=preparedPublication.batch(),head=batch.writes.find(([key])=>key===`antfly/progress/${env.ANTFLY_INCARNATION}/HEAD`);await rpc("finalizePublication",batch,{records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes},head?readHints?.forHead({op:"put",key:head[0]},head[1].body):undefined);publicationFinalized=true;}
     operationSucceeded=true;return result;
   } catch (error) {
     if (/IntegrityMismatch/.test(String(error))) cache.clear();
