@@ -1599,7 +1599,9 @@ test "relational runtime-only and mixed schema epochs survive portable restore" 
 }
 
 test "relational rows snapshot streams flushed companion families without point probes" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var tmp = try TestDirectory.init("relational-primary-stream");
     defer tmp.cleanup();
     {
@@ -3652,7 +3654,9 @@ test "relational columnar missing bootstrap checkpoint cannot claim complete cov
 }
 
 test "relational columnar byte costing retains wide clean rows and switches for dense replacement" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     const t = try TestDb.open(alloc, .{ .start_optional_runtimes = false });
     defer t.deinit();
     const db = &t.db;
@@ -4197,7 +4201,9 @@ test "relational columnar prepared ownership aggregates and aborts atomically" {
 }
 
 test "relational columnar production LSM staging snapshot benchmark" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     defer lsm_backend_mod.Backend.test_deep_mutable_snapshots = false;
@@ -4581,7 +4587,9 @@ test "relational columnar cleanup resumes published pages without rebuilding or 
 }
 
 test "relational columnar delete waves coalesce adjacent underfilled ranges" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -4731,7 +4739,9 @@ test "relational columnar clean coalescing preserves typed cells without primary
 }
 
 test "relational columnar deleted insertion burst has bounded cleanup and complete coverage" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     const t = try TestDb.open(alloc, .{ .start_optional_runtimes = false });
     defer t.deinit();
     const db = &t.db;

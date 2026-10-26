@@ -1586,10 +1586,8 @@ pub fn loadStoredSearchDocumentProbe(self: *DB, alloc: Allocator, key: []const u
     defer alloc.free(store_key);
     var txn = try self.core.store.beginProbeTxn();
     defer txn.abort();
-    const raw = txn.get(store_key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
+    const raw = (try @import("artifact/chunk_generation.zig").readMember(alloc, &txn, store_key)) orelse return null;
+    if (internal_keys.mediaWindowIndex(store_key)) |index| return try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(alloc, raw, index);
     return try self.core.index_manager.materializeStoredValueAlloc(alloc, store_key, raw);
 }
 
@@ -1757,7 +1755,9 @@ test "db query capture retains settled terminal repair debt without acknowledgin
 }
 
 test "db search structured expansion filters cancel inside dictionary scans" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var directory = try TestDirectory.init("db");
     defer directory.cleanup();
     var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false });

@@ -589,6 +589,10 @@ pub const Owner = struct {
     worker: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
     maintenance_pending: bool = false,
+    // Replay can move the checkpoint on every turn. Give physical storage a
+    // fresh capture between such turns instead of always servicing a stale
+    // pre-replay snapshot that reclamation must correctly refuse.
+    maintenance_storage_pending: bool = false,
     // Owner lifetime, rather than DB-runtime lifetime: snapshot refreshes must
     // not reset a table's replay/construction alternation.
     maintenance_schedules: std.AutoHashMapUnmanaged(MaintenanceKey, MaintenanceSchedule) = .empty,
@@ -618,7 +622,6 @@ pub const Owner = struct {
     embedding_memo: ?memo_mod.QueryEmbeddingCache = null,
     embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
     test_after_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
-    test_captures: if (h.builtin.is_test) usize else void = if (h.builtin.is_test) 0 else {},
 
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
@@ -961,6 +964,13 @@ pub const Owner = struct {
             // Policy scheduling and telemetry belong to this connection;
             // assessment caches and page roots belong to the new generation.
             store.maintenance_policy = old.owned_lite_backend.?.native_docstore.?.maintenance_policy;
+            const previous_store = old.owned_lite_backend.?.native_docstore.?;
+            // These cursors belong to the path, not its checkpoint. Transfer
+            // ownership before closing the old snapshot so bounded sweeps
+            // make progress across continuously changing replay snapshots.
+            store.artifact_cleanup_cursor = previous_store.artifact_cleanup_cursor;
+            store.artifact_marker_sweep = previous_store.artifact_marker_sweep;
+            previous_store.artifact_marker_sweep = .{};
             closeMaintenanceSnapshot(old);
         }
         if (comptime h.builtin.is_test) {
@@ -1017,6 +1027,13 @@ pub const Owner = struct {
     /// Native writer admission below revalidates inode and checkpoint for every
     /// short publication, including staged artifacts and index segments.
     fn maintenanceTurn(self: *Owner) !bool {
+        if (self.options.profile == .native and self.maintenance_storage_pending) {
+            // A physical maintenance error must remain observable without
+            // preventing subsequent replay turns from making progress.
+            self.maintenance_storage_pending = false;
+            self.maintenance_storage_pending = !try self.storageMaintenanceTurn();
+            return true;
+        }
         const io = h.handleLockIo();
         if (self.stopping.load(.acquire)) return false;
         // Yield briefly to foreground work, then join the fair queue. Capture
@@ -1195,10 +1212,7 @@ pub const Owner = struct {
         self.gate.mutex.unlock(io);
         gate_locked = false;
 
-        if (comptime h.builtin.is_test) {
-            self.test_captures += 1;
-            if (self.test_after_capture) |hook| hook.notify(hook.ptr, root);
-        }
+        if (comptime h.builtin.is_test) if (self.test_after_capture) |hook| hook.notify(hook.ptr, root);
         const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
         var maintenance_error: ?anyerror = null;
         // A shadow owns disjoint unpublished index inputs. Give it a bounded
@@ -1229,7 +1243,8 @@ pub const Owner = struct {
             root.db.closeImmutableSnapshot();
             root.db_live = false;
         }
-        store.maintainOnce(false) catch {
+        store.maintainOnce(false) catch |err| {
+            if (maintenance_error == null) maintenance_error = err;
             pending = true;
         };
 
@@ -1254,6 +1269,7 @@ pub const Owner = struct {
         // Retaining the serving runtime does not hide physical progress. Run
         // another bounded storage turn before declaring cleanup quiescent.
         if (independent and !run_database) try self.adoptIdleMaintenanceCheckpoint(foreground, foreground_header, store);
+        if (independent and run_database) self.maintenance_storage_pending = true;
         // A moved physical tip requires a prompt refresh, not another DB
         // replay pass. Reader leases/index housekeeping also move that tip;
         // treating them as enrichment debt makes idle runtime opens perpetual.
@@ -1272,24 +1288,49 @@ pub const Owner = struct {
             self.maintenance_round_pending = false;
         }
         self.collectRetired();
-        return self.maintenance_pending or self.maintenance_table_cursor != 0 or changed or ttl_pending;
+        return self.maintenance_storage_pending or self.maintenance_pending or self.maintenance_table_cursor != 0 or changed or ttl_pending;
+    }
+
+    /// A storage-only capture has no provider calls or long-lived replay read
+    /// pins. Every write still uses the usual inode/checkpoint admission, and
+    /// prepared vacuum images keep their existing publication validation.
+    fn storageMaintenanceTurn(self: *Owner) !bool {
+        const io = h.handleLockIo();
+        if (self.stopping.load(.acquire)) return true;
+        if (!acquireMaintenanceCapture(&self.gate.mutex, &self.maintenance_capture_misses)) return false;
+        var gate_locked = true;
+        defer if (gate_locked) self.gate.mutex.unlock(io);
+        var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
+        var lease_held = true;
+        defer if (lease_held) lease.close();
+        const foreground = try self.refresh();
+        if (needsOutcomeReconciliation(foreground)) return true;
+        const entry_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
+        const root = try self.refreshMaintenanceSnapshot(foreground, false);
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        root.maintenance_references += 1;
+        root.maintenance_owner = self;
+        root.maintenance_publication = null;
+        store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
+        lease.close();
+        lease_held = false;
+        self.gate.mutex.unlock(io);
+        gate_locked = false;
+        const result = store.maintainOnce(false);
+        self.gate.mutex.lockUncancelable(io);
+        gate_locked = true;
+        store.writer_admission = null;
+        root.maintenance_owner = null;
+        root.maintenance_references -= 1;
+        inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
+        try self.adoptIdleMaintenanceCheckpoint(foreground, entry_header, store);
+        try result;
+        return true;
     }
 
     pub fn maintenanceTurnForTest(self: *Owner) !bool {
         std.debug.assert(h.builtin.is_test);
         return self.maintenanceTurn();
-    }
-
-    /// Runs turns until one captures the maintenance snapshot. A turn may
-    /// first run bounded group-source work; the schedule alternates the two.
-    pub fn capturedMaintenanceTurnForTest(self: *Owner) !bool {
-        std.debug.assert(h.builtin.is_test);
-        for (0..4) |_| {
-            const before = self.test_captures;
-            const pending = try self.maintenanceTurn();
-            if (self.test_captures != before) return pending;
-        }
-        return error.TestUnexpectedResult;
     }
 
     fn maintenanceLoop(self: *Owner) void {
@@ -1319,7 +1360,7 @@ pub const Owner = struct {
             // A scheduling quantum belongs to a fair round, not each idle
             // namespace. Otherwise 45 unrelated tables add 4.5 seconds to
             // every activation, delivery, claim and publication observation.
-            next_wait_ms = if (self.maintenance_table_cursor != 0) 0 else if (pending) 100 else 1000;
+            next_wait_ms = if (self.maintenance_storage_pending or self.maintenance_table_cursor != 0) 0 else if (pending) 100 else 1000;
             earliest_turn_ns = std.Io.Clock.awake.now(io).nanoseconds + if (pending) @as(i96, next_wait_ms) * std.time.ns_per_ms else 0;
         }
     }

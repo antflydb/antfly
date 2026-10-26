@@ -72,6 +72,7 @@ pub const Shared = struct {
     antfly_bin_name: []const u8,
     inference_enable_metal: bool,
     inference_enable_cuda: bool,
+    native_cpu_debug_test_profile: bool,
     antfly_version: []const u8,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
     platform_test_step: *std.Build.Step,
@@ -1166,6 +1167,15 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const darwin_shared_storage_sdk27 = darwin_release_profile and shared_inference_core and
         @import("antfly_platform").macosSdkMatchesVersion(b, target, "27.0");
     const darwin_release_memory = darwin_shared_storage_sdk27;
+    const native_cpu_debug_test_profile = optimize == .debug and !strip and !sanitize_thread and link_libc and
+        lmdb_backend == .zig and !lmdb_evented_async_io and !with_tla and
+        inference_optimize == .fast and inference_enable_system_blas and
+        !inference_enable_metal and !inference_enable_cuda and !inference_enable_pjrt and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        target.result.os.tag == .macos and target.result.cpu.arch == .aarch64 and
+        target.result.cpu.model == baseline_cpu.model and target.result.cpu.features.eql(baseline_cpu.features) and
+        @import("antfly_platform").macosSdkMatchesVersion(b, target, "27.0");
     const engine_options = b.addOptions();
     engine_options.addOption(bool, "shared_inference_core", shared_inference_core);
     const inference_engine_mod = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine.zig"), .target = target, .optimize = optimize });
@@ -1389,6 +1399,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .antfly_bin_name = antfly_bin_name,
         .inference_enable_metal = inference_enable_metal,
         .inference_enable_cuda = inference_enable_cuda,
+        .native_cpu_debug_test_profile = native_cpu_debug_test_profile,
         .build_info = build_info,
         .antfly_version = antfly_version,
         .platform_test_step = platform_test_step,

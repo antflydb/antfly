@@ -290,6 +290,34 @@ fn projectWithSelectionAndOutput(alloc: Allocator, output: Allocator, doc_key: [
     return document_query.serializeWithOutput(scratch, output, projected);
 }
 
+test "nested artifact selectors hydrate and project without loading legacy aliases" {
+    const Fixture = struct {
+        calls: usize = 0,
+        fn artifacts(raw: ?*anyopaque, alloc: Allocator, _: []const u8) !?std.json.Value {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"output\":{\"value\":7,\"other\":8},\"unselected\":9}", .{});
+            defer parsed.deinit();
+            return try cloneJsonValue(alloc, parsed.value);
+        }
+        fn unexpected(_: ?*anyopaque, _: Allocator, _: []const u8) !?std.json.Value {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture: Fixture = .{};
+    const loader: SpecialFieldLoader = .{ .ctx = &fixture, .load_artifacts = Fixture.artifacts, .load_chunks = Fixture.unexpected, .load_embeddings = Fixture.unexpected };
+    const projected = try projectLookupStoredBytes(alloc, "doc", "{\"title\":\"retained\"}", .{ .fields = &.{"_artifacts.output.value"}, .include_all_fields = false }, loader);
+    defer alloc.free(projected);
+    try std.testing.expectEqualStrings("{\"_artifacts\":{\"output\":{\"value\":7}}}", projected);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    fixture.calls = 0;
+    const excluded = try projectLookupStoredBytes(alloc, "doc", "{\"title\":\"retained\"}", .{ .fields = &.{"-_artifacts.output.value"}, .include_all_fields = true }, loader);
+    defer alloc.free(excluded);
+    try std.testing.expectEqualStrings("{\"title\":\"retained\"}", excluded);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+}
+
 test "ordered artifact inventory public projections transfer nested ownership across allocation faults" {
     const Harness = struct {
         fn load(_: ?*anyopaque, alloc: Allocator, _: []const u8) !?std.json.Value {

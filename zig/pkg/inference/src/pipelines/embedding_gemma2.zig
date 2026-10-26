@@ -377,6 +377,8 @@ pub const MediaTimings = struct {
     device_owned_peak_bytes: ?u64 = null,
 };
 pub const Options = struct {
+    video_prepared_frames: ?[]const @import("embedding_gemma2_video.zig").PreparedFrame = null,
+    video_observer: ?@import("antfly_video").preparation.FrameObserver = null,
     video_coefficients: ?*const @import("antfly_video").preparation.CoefficientCache = null,
     video_inspection_scope: ?*@import("embedding_gemma2_video.zig").InspectionScope = null,
     video_cache_pins: ?*@import("embedding_gemma2_video.zig").CachePins = null,
@@ -962,7 +964,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
         prefetched = ahead.producer;
         if (prefetched) |producer| options.video_coefficients = producer.coefficients;
     }
-    if (has_video and prefetched == null) {
+    if (has_video and prefetched == null and options.video_observer == null and options.video_prepared_frames == null) {
         const context = try factory.videoPreparationContext(session, command_slots != 0);
         options.video_coefficients = context.coefficients;
         if (effective.io orelse context.io) |io| {
@@ -1070,7 +1072,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
 /// Decode remains ordered so retained codec continuations can advance safely.
 /// No queue fill delay: callers pass only already available windows (max four).
 pub const VideoBatchResult = struct { vectors: [][]f32, input_tokens: []usize, execution: BatchExecution.Execution, shared_vision_batches: usize = 0 };
-pub const VideoBatchItem = struct { movie: SampledVideo, caption: ?[]const u8 = null, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*VideoAhead = null };
+pub const VideoBatchItem = struct { prepared_frames: ?[]const @import("embedding_gemma2_video.zig").PreparedFrame = null, movie: SampledVideo, caption: ?[]const u8 = null, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*VideoAhead = null };
 fn releaseVideoBatchPreparations(items: []const VideoBatchItem, producers: []const *@import("embedding_gemma2_video.zig").Prefetch) void {
     const Prefetch = @import("embedding_gemma2_video.zig").Prefetch;
     var owned: [4]*Prefetch = undefined;
@@ -1121,7 +1123,10 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     var vision_workspace: usize = 0;
     const preparation_context = try factory.videoPreparationContext(session, false);
     const cohort_io = control.io orelse preparation_context.io;
-    const cohort = items.len > 1 and cohort_io != null and !@import("builtin").single_threaded and !@import("builtin").cpu.arch.isWasm() and (session.backend() == .metal or session.backend() == .native);
+    const prepared_inputs = for (items) |item| {
+        if (item.prepared_frames != null) break true;
+    } else false;
+    const cohort = !prepared_inputs and items.len > 1 and cohort_io != null and !@import("builtin").single_threaded and !@import("builtin").cpu.arch.isWasm() and (session.backend() == .metal or session.backend() == .native);
     // Admission/compatibility can decline before ordinary producers start.
     // A running later row must not retain the decoder lease during fallback.
     errdefer if (cohort) releaseVideoBatchPreparations(items, &.{});
@@ -1246,6 +1251,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
             try validateGroup(group, self.options);
             var row_options = self.options;
             row_options.video_encoded = encoded;
+            row_options.video_prepared_frames = item.prepared_frames;
             self.rows[index] = try prepareGroupWithBudget(self.a, self.cb, self.tokenizer, group, row_options, self.control, self.pool, if (encoded == null and item.ahead != null) item.ahead.?.producer else null, self.cache);
             self.prepared[index] = true;
             if (self.options.video_composition) |owner| {
@@ -2365,7 +2371,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                 } else if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encodeAllocStaged(a, cb, cb.embedding_stage);
-                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
+                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .prepared_frames = options.video_prepared_frames, .observer = options.video_observer, .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
                 defer encoded.deinit(a);
                 var count_video: usize = 0;
                 for (encoded.frame_tokens) |frame_count| count_video += frame_count;

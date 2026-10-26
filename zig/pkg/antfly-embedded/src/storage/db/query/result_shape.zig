@@ -910,6 +910,7 @@ fn chunkStorageKeyForArtifactRefAlloc(alloc: Allocator, artifact_ref: types.Arti
         .name = source.name,
         .kind = .chunk,
         .chunk_id = source.chunk_id,
+        .window_index = source.window_index,
         .unit_id = source.unit_id,
     };
     return try artifact_ids.internalKeyForArtifactRefAlloc(alloc, chunk_ref);

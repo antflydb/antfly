@@ -87,9 +87,18 @@ fn optional(txn: anytype, key: []const u8) !?[]const u8 {
     return try missingAsNull(txn.get(key));
 }
 
+const VectorSetFence = struct {
+    embedding: []const u8,
+    producer: []const u8,
+    digest: []const u8,
+    rows: []const struct { chunk_id: u32, sub_index: u32 },
+};
 pub const UpstreamFence = struct {
+    vector_set: ?VectorSetFence = null,
     key: []const u8,
     requires_value: bool,
+    expected_chunk_count: ?u32 = null,
+    selected_chunk_head: ?[]const u8 = null,
     certificate: ?@import("producer_provenance.zig").ArtifactCertificate = null,
     prepared: bool = false,
 
@@ -102,6 +111,51 @@ pub const UpstreamFence = struct {
         var input = try @import("extraction_generation.zig").captureInput(alloc, txn, self.key);
         defer input.deinit();
         if (self.requires_value and input.value == null) return error.EnrichmentSourceChanged;
+        if (self.vector_set) |set| {
+            const vector_set = @import("vector_set.zig");
+            const manifest = try @import("chunk_manifest.zig").Manifest.decode(input.value orelse return error.EnrichmentSourceChanged);
+            var digest = std.crypto.hash.sha2.Sha256.init(.{});
+            digest.update(&manifest.content_digest);
+            var row: usize = 0;
+            const document = command.sources[0].document_key;
+            // The manifest fence names its configured upstream chunk producer.
+            const producer = set.producer;
+            for (0..manifest.count) |ordinal| {
+                const member = try keys.chunkArtifactKeyAlloc(alloc, document, producer, @intCast(ordinal));
+                defer alloc.free(member);
+                const payload = (try @import("chunk_generation.zig").readMember(alloc, txn, member)) orelse return error.EnrichmentSourceChanged;
+                const indices = try vector_set.storedIndices(alloc, txn, member, set.embedding, payload);
+                defer alloc.free(indices);
+                for (indices) |index| {
+                    if (row >= set.rows.len or set.rows[row].chunk_id != ordinal or set.rows[row].sub_index != index) return error.InvalidBatchRequest;
+                    row += 1;
+                    const child = if (indices.len > 1) try keys.mediaWindowChildKeyAlloc(alloc, member, index) else try keys.mediaWindowKeyAlloc(alloc, member, index);
+                    defer alloc.free(child);
+                    const vector = try keys.derivedEmbeddingArtifactKeyAlloc(alloc, child, set.embedding);
+                    defer alloc.free(vector);
+                    const raw = txn.get(vector) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+                    vector_set.update(&digest, vector, raw);
+                    _ = try @import("producer_provenance.zig").certifyInheritedArtifact(alloc, txn, vector, raw, command);
+                }
+            }
+            if (row != set.rows.len or !std.mem.eql(u8, &std.fmt.bytesToHex(digest.finalResult(), .lower), set.digest)) return error.EnrichmentSourceChanged;
+        }
+        if (self.expected_chunk_count) |expected| {
+            const manifest = try @import("chunk_manifest.zig").Manifest.decode(input.value orelse return error.EnrichmentSourceChanged);
+            if (manifest.count != expected) return error.EnrichmentSourceChanged;
+            if (self.selected_chunk_head) |head| {
+                const raw = txn.get(head) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+                const generations = @import("chunk_generation.zig");
+                const spec = try generations.Spec.decode(raw);
+                var plan = try generations.Plan.init(alloc, self.key, spec);
+                defer plan.deinit();
+                const state = try plan.load(txn);
+                if (state.retiring or !std.meta.eql(state.progress, spec.output) or !std.meta.eql(manifest, spec.output)) return error.EnrichmentSourceChanged;
+                self.certificate = try @import("producer_provenance.zig").certifyInheritedArtifact(alloc, txn, head, raw, command);
+                self.prepared = true;
+                return;
+            }
+        }
         if (input.proofValue() != null) self.certificate = try @import("producer_provenance.zig").certifyInheritedArtifact(alloc, txn, input.proofKey(self.key), input.proofValue(), command);
         self.prepared = true;
     }
@@ -152,12 +206,139 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
         const source = command.sources[effect.source_index];
         const expected = try keys.artifactNamedPrefixAlloc(owned, source.document_key, "asset", config.name);
         if (effect.family != .document_artifact or !std.mem.eql(u8, expected, effect.key)) return error.InvalidBatchRequest;
-        try requireUpstream(owned, command, config, effect, extraction_source);
+        if (producer.type == .media_output) {
+            if (source.exists) {
+                const set = try requireMediaOutput(owned, command, config, configs, effect);
+                try fences.append(owned, set);
+                for (command.artifact_sources) |guard| {
+                    if (guard.source_index == effect.source_index and keys.isChunkArtifactRecordKey(guard.key)) try fences.append(owned, .{ .key = guard.key, .requires_value = true });
+                }
+            }
+        } else if (producer.type == .vector_labels) {
+            if (source.exists) {
+                const set = try requireVectorLabels(owned, command, config, configs, effect);
+                try fences.append(owned, set);
+                // Bytes alone cannot authorize a classifier over an imported
+                // or stale vector. Every selected vector carries its accepted
+                // causal certificate through preparation and final apply.
+                for (command.artifact_sources) |guard| {
+                    if (guard.source_index != effect.source_index or !keys.isDerivedEmbeddingArtifactKey(guard.key)) continue;
+                    if (keys.matchesDerivedEmbeddingArtifactName(guard.key, config.source_artifact_name))
+                        try fences.append(owned, .{ .key = guard.key, .requires_value = true });
+                }
+            }
+        } else try requireUpstream(owned, command, config, effect, extraction_source);
         if (extraction_source and source.exists) try fences.append(owned, .{ .key = try keys.artifactNamedPrefixAlloc(owned, source.document_key, "asset", config.source_artifact_name), .requires_value = effect.value != null });
     }
     var prepared = try prepareTextEffects(&arena, command, catalogs, config, configs, command.mutations, null, true);
     prepared.asset_upstream_fences = fences.items;
     return prepared;
+}
+
+/// Compile membership once per source; repeated row checks do no linear scans.
+const GuardLookup = std.StringHashMap(void);
+fn guardedKeys(a: std.mem.Allocator, command: publication.Command, source_index: u32) !GuardLookup {
+    var result = GuardLookup.init(a);
+    errdefer result.deinit();
+    for (command.artifact_sources) |guard| {
+        if (guard.source_index == source_index and guard.content_digest != null) try result.put(guard.key, {});
+    }
+    return result;
+}
+
+fn requireMediaOutput(alloc: std.mem.Allocator, command: publication.Command, config: @import("../catalog/enrichment_catalog.zig").EnrichmentConfig, configs: []const @import("../catalog/enrichment_catalog.zig").EnrichmentConfig, effect: publication.Mutation) !UpstreamFence {
+    const source = command.sources[effect.source_index];
+    const upstream = for (configs) |entry| {
+        if (entry.kind == .chunk and std.mem.eql(u8, entry.name, config.source_artifact_name)) break entry;
+    } else return error.InvalidBatchRequest;
+    var producer = try @import("../enrichment/asset_producer.zig").parseProducerConfig(alloc, config.producer_json);
+    defer producer.deinit(alloc);
+    var consumer = try @import("../enrichment/media_output.zig").parse(alloc, producer.config_json);
+    defer consumer.deinit();
+    var chunk_config = try @import("../../../chunking/types.zig").parseConfigFromSlice(alloc, upstream.chunker_json);
+    defer chunk_config.deinit(alloc);
+    const outputs = try std.json.parseFromSliceLeaky(@import("inference_chunker").outputs.Config, alloc, chunk_config.outputs_json, .{});
+    const target = for (outputs.targets) |value| {
+        if (std.mem.eql(u8, value.name, consumer.value.output_name)) break value;
+    } else return error.InvalidBatchRequest;
+    const Output = struct { object: []const u8, source_artifact_name: []const u8, output_name: []const u8, chunks: []const struct { chunk_id: u32, outputs: []const @import("inference_chunker").outputs.Result } };
+    const result = try std.json.parseFromSliceLeaky(Output, alloc, effect.value orelse return error.InvalidBatchRequest, .{ .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, result.object, "media.output.list") or !std.mem.eql(u8, result.source_artifact_name, upstream.name) or !std.mem.eql(u8, result.output_name, target.name)) return error.InvalidBatchRequest;
+    const manifest = try @import("chunk_manifest.zig").keyAlloc(alloc, source.document_key, upstream.name);
+    var guards = try guardedKeys(alloc, command, effect.source_index);
+    defer guards.deinit();
+    if (!guards.contains(manifest)) return error.InvalidBatchRequest;
+    const head = try alloc.dupe(u8, manifest);
+    head[keys.findComponentTerminator(head, 1).? + 2] = keys.producer_generation_head_kind;
+    const selected_head: ?[]const u8 = if (guards.contains(head)) head else null;
+    for (result.chunks, 0..) |row, ordinal| {
+        if (row.chunk_id != ordinal or row.outputs.len == 0) return error.InvalidBatchRequest;
+        for (row.outputs, 0..) |value, sub_index| {
+            try value.validate(target);
+            if (value.status == .complete) {
+                const recipe = try target.recipeIdentity(alloc, value.model_identity, value.model_revision);
+                if (!std.mem.eql(u8, &recipe, value.recipe_id)) return error.InvalidBatchRequest;
+            }
+            if (value.sub_index != sub_index or (value.required and value.status != .complete and !value.terminal)) return error.InvalidBatchRequest;
+        }
+        const member = try keys.chunkArtifactKeyAlloc(alloc, source.document_key, upstream.name, @intCast(ordinal));
+        if (selected_head == null and !guards.contains(member)) return error.InvalidBatchRequest;
+    }
+    const claimed = try std.json.parseFromSliceLeaky(@import("../enrichment/media_output.zig").Projection, alloc, effect.value.?, .{ .ignore_unknown_fields = true });
+    const projection_rows = try alloc.alloc(@import("../enrichment/media_output.zig").Row, result.chunks.len);
+    for (result.chunks, projection_rows) |row, *dest| dest.* = .{ .chunk_id = row.chunk_id, .outputs = row.outputs };
+    const projected = try @import("../enrichment/media_output.zig").project(alloc, projection_rows);
+    const expected_projection = try std.json.Stringify.valueAlloc(alloc, projected, .{ .emit_null_optional_fields = false });
+    const claimed_projection = try std.json.Stringify.valueAlloc(alloc, claimed, .{ .emit_null_optional_fields = false });
+    if (!std.mem.eql(u8, expected_projection, claimed_projection)) return error.InvalidBatchRequest;
+    return .{ .key = manifest, .requires_value = true, .expected_chunk_count = std.math.cast(u32, result.chunks.len) orelse return error.InvalidBatchRequest, .selected_chunk_head = selected_head };
+}
+
+fn requireVectorLabels(alloc: std.mem.Allocator, command: publication.Command, config: @import("../catalog/enrichment_catalog.zig").EnrichmentConfig, configs: []const @import("../catalog/enrichment_catalog.zig").EnrichmentConfig, effect: publication.Mutation) !UpstreamFence {
+    const source = command.sources[effect.source_index];
+    const upstream = for (configs) |entry| {
+        if (entry.kind == .embedding and std.mem.eql(u8, entry.name, config.source_artifact_name)) break entry;
+    } else return error.InvalidBatchRequest;
+    const Output = struct { object: []const u8, embedding_name: []const u8, parent_count: ?u32 = null, vector_digest: ?[]const u8 = null, chunks: []const struct { chunk_id: u32, sub_index: u32 = 0, labels: []const @import("../enrichment/vector_labels.zig").Score } };
+    const result = try std.json.parseFromSliceLeaky(Output, alloc, effect.value orelse return error.InvalidBatchRequest, .{});
+    if (!std.mem.eql(u8, result.object, "vector.labels") or !std.mem.eql(u8, result.embedding_name, upstream.name)) return error.InvalidBatchRequest;
+    var producer = try @import("../enrichment/asset_producer.zig").parseProducerConfig(alloc, config.producer_json);
+    defer producer.deinit(alloc);
+    var vocabulary = try @import("../enrichment/vector_labels.zig").parse(alloc, producer.config_json);
+    defer vocabulary.deinit();
+    const manifest = try @import("chunk_manifest.zig").keyAlloc(alloc, source.document_key, upstream.source_artifact_name);
+    var guards = try guardedKeys(alloc, command, effect.source_index);
+    defer guards.deinit();
+    if (!guards.contains(manifest)) return error.InvalidBatchRequest;
+    var names = std.StringHashMap(void).init(alloc);
+    defer names.deinit();
+    for (vocabulary.value.labels) |label| try names.put(label.label, {});
+    const aggregate = result.vector_digest != null;
+    if (!aggregate and result.parent_count != null) return error.InvalidBatchRequest;
+    if (aggregate) {
+        const witness = try @import("vector_set.zig").keyAlloc(alloc, source.document_key, upstream.name);
+        if (!guards.contains(witness) or result.vector_digest.?.len != 64 or result.parent_count == null) return error.InvalidBatchRequest;
+    }
+    for (result.chunks, 0..) |row, ordinal| {
+        if ((!aggregate and row.chunk_id != ordinal) or row.labels.len > vocabulary.value.top_k) return error.InvalidBatchRequest;
+        for (row.labels, 0..) |score, i| {
+            if (!std.math.isFinite(score.score)) return error.InvalidBatchRequest;
+            if (!names.contains(score.label)) return error.InvalidBatchRequest;
+            if (i != 0 and row.labels[i - 1].score < score.score) return error.InvalidBatchRequest;
+        }
+        if (!aggregate) {
+            const member = try keys.chunkArtifactKeyAlloc(alloc, source.document_key, upstream.source_artifact_name, @intCast(ordinal));
+            const vector = try keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, upstream.name);
+            if (!guards.contains(vector)) return error.InvalidBatchRequest;
+        }
+    }
+    var set: ?VectorSetFence = null;
+    if (result.vector_digest) |digest| {
+        const rows = try alloc.alloc(@typeInfo(@FieldType(VectorSetFence, "rows")).pointer.child, result.chunks.len);
+        for (rows, result.chunks) |*dest, row| dest.* = .{ .chunk_id = row.chunk_id, .sub_index = row.sub_index };
+        set = .{ .embedding = upstream.name, .producer = upstream.source_artifact_name, .digest = digest, .rows = rows };
+    }
+    return .{ .key = manifest, .requires_value = true, .vector_set = set, .expected_chunk_count = result.parent_count orelse (std.math.cast(u32, result.chunks.len) orelse return error.InvalidBatchRequest) };
 }
 
 fn sourceIsExtraction(alloc: std.mem.Allocator, configs: []const @import("../catalog/enrichment_catalog.zig").EnrichmentConfig, name: []const u8) !bool {
@@ -262,4 +443,154 @@ pub fn prepareTextEffects(arena: *std.heap.ArenaAllocator, command: publication.
 
 fn defaultTextConsumer(alloc: std.mem.Allocator, config: @import("../catalog/enrichment_catalog.zig").EnrichmentConfig) !bool {
     return config.full_text_index or (config.kind == .chunk and try @import("../../../chunking/types.zig").parseHasFullTextIndexFromSlice(alloc, config.chunker_json));
+}
+
+test "model aware media vector label publication requires the complete guarded embedding set" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const Config = @import("../catalog/enrichment_catalog.zig").EnrichmentConfig;
+    const config = Config{ .name = "labels", .kind = .asset, .source_field = "", .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}" };
+    const configs = [_]Config{ config, .{ .name = "vectors", .kind = .embedding, .source_field = "body", .source_artifact_name = "clips", .expected_dims = 2 } };
+    const manifest = try @import("chunk_manifest.zig").keyAlloc(owned, "doc", "clips");
+    const member = try keys.chunkArtifactKeyAlloc(owned, "doc", "clips", 0);
+    const vector = try keys.derivedEmbeddingArtifactKeyAlloc(owned, member, "vectors");
+    const effect = publication.Mutation{ .family = .document_artifact, .key = "unused", .source_index = 0, .value = "{\"object\":\"vector.labels\",\"embedding_name\":\"vectors\",\"chunks\":[{\"chunk_id\":0,\"labels\":[{\"label\":\"speech\",\"score\":0.9}]}]}" };
+    const source = [_]publication.Source{.{ .document_key = "doc", .exists = true, .timestamp = 1, .content_digest = @splat(1), .input_position = null }};
+    const guards = [_]publication.ArtifactSource{ .{ .key = manifest, .content_digest = @splat(2), .input_position = null, .source_index = 0 }, .{ .key = vector, .content_digest = @splat(3), .input_position = null, .source_index = 0 } };
+    var command = publication.Command{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "labels", .producer_generation = 1, .sources = &source, .artifact_sources = &guards, .mutations = &.{effect}, .publication_digest = @splat(0) };
+    const fence = try requireVectorLabels(owned, command, config, &configs, effect);
+    try std.testing.expectEqual(@as(?u32, 1), fence.expected_chunk_count);
+    command.artifact_sources = guards[0..1];
+    try std.testing.expectError(error.InvalidBatchRequest, requireVectorLabels(owned, command, config, &configs, effect));
+    command.artifact_sources = guards[1..];
+    try std.testing.expectError(error.InvalidBatchRequest, requireVectorLabels(owned, command, config, &configs, effect));
+    const witness = try @import("vector_set.zig").keyAlloc(owned, "doc", "vectors");
+    const aggregate_guards = [_]publication.ArtifactSource{ guards[0], .{ .key = witness, .content_digest = @splat(4), .input_position = null, .source_index = 0 } };
+    command.artifact_sources = &aggregate_guards;
+    const Row = struct { chunk_id: u32, sub_index: u32 = 0, labels: []const @import("../enrichment/vector_labels.zig").Score };
+    const rows = try owned.alloc(Row, 5000);
+    for (rows, 0..) |*row, ordinal| row.* = .{ .chunk_id = @intCast(ordinal), .labels = &.{.{ .label = "speech", .score = 0.9 }} };
+    var large_effect = effect;
+    const digest: [64]u8 = @splat('1');
+    large_effect.value = try std.json.Stringify.valueAlloc(owned, .{ .object = "vector.labels", .embedding_name = "vectors", .parent_count = 5000, .vector_digest = @as([]const u8, &digest), .chunks = rows }, .{});
+    const large = try requireVectorLabels(owned, command, config, &configs, large_effect);
+    try std.testing.expectEqual(@as(?u32, 5000), large.expected_chunk_count);
+    try std.testing.expectEqual(@as(usize, 5000), large.vector_set.?.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), command.artifact_sources.len);
+    command.artifact_sources = aggregate_guards[0..1];
+    try std.testing.expectError(error.InvalidBatchRequest, requireVectorLabels(owned, command, config, &configs, large_effect));
+}
+
+test "model aware media selected chunk heads authorize downstream outputs without legacy member guards" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const C = @import("../catalog/enrichment_catalog.zig").EnrichmentConfig;
+    const config = C{ .name = "speech", .kind = .asset, .source_field = "", .source_artifact_name = "clips", .producer_json = "{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}" };
+    const configs = [_]C{ config, .{ .name = "clips", .kind = .chunk, .source_field = "body", .chunker_json = "{\"provider\":\"antfly\",\"outputs\":{\"boundary_model\":\"speech\",\"targets\":[{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"whisper\"}]}}" } };
+    const manifest = try @import("chunk_manifest.zig").keyAlloc(a, "doc", "clips");
+    const member = try keys.chunkArtifactKeyAlloc(a, "doc", "clips", 0);
+    const head = try a.dupe(u8, manifest);
+    head[keys.findComponentTerminator(head, 1).? + 2] = keys.producer_generation_head_kind;
+    const O = @import("inference_chunker").outputs;
+    const rows = [_]O.Row{.{ .chunk_id = 0, .outputs = &.{.{ .name = "speech", .kind = .transcribe, .required = true, .model = "whisper", .model_identity = "", .model_revision = "", .recipe_id = "", .status = .failed, .code = "Unavailable", .terminal = true }} }};
+    const projection = try O.project(a, &rows);
+    const value = try std.json.Stringify.valueAlloc(a, .{ .object = "media.output.list", .source_artifact_name = "clips", .output_name = "speech", .chunks = rows, .text = projection.text, .transcript_spans = projection.transcript_spans, .complete_chunks = projection.complete_chunks, .failed_chunks = projection.failed_chunks, .terminal_chunks = projection.terminal_chunks, .status = projection.status }, .{ .emit_null_optional_fields = false });
+    const effect = publication.Mutation{ .family = .document_artifact, .key = "unused", .source_index = 0, .value = value };
+    const sources = [_]publication.Source{.{ .document_key = "doc", .timestamp = 1, .content_digest = @splat(1), .input_position = null }};
+    var guards = [_]publication.ArtifactSource{ .{ .key = manifest, .content_digest = @splat(2), .input_position = null, .source_index = 0 }, .{ .key = member, .content_digest = @splat(3), .input_position = null, .source_index = 0 } };
+    var command = publication.Command{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "speech", .producer_generation = 1, .sources = &sources, .artifact_sources = &guards, .mutations = &.{effect}, .publication_digest = @splat(0) };
+    try std.testing.expect((try requireMediaOutput(a, command, config, &configs, effect)).selected_chunk_head == null);
+    guards[1].key = head;
+    const selected = try requireMediaOutput(a, command, config, &configs, effect);
+    try std.testing.expectEqualStrings(head, selected.selected_chunk_head.?);
+    guards[1].content_digest = null;
+    try std.testing.expectError(error.InvalidBatchRequest, requireMediaOutput(a, command, config, &configs, effect));
+    guards[1].content_digest = @splat(3);
+    guards[1].key = try keys.chunkArtifactKeyAlloc(a, "another-doc", "clips", 0);
+    try std.testing.expectError(error.InvalidBatchRequest, requireMediaOutput(a, command, config, &configs, effect));
+    command.artifact_sources = guards[1..];
+    try std.testing.expectError(error.InvalidBatchRequest, requireMediaOutput(a, command, config, &configs, effect));
+}
+
+test "model aware media ordered labels accept an authenticated scalar over obsolete failed parent receipts" {
+    const a = std.testing.allocator;
+    const provenance = @import("producer_provenance.zig");
+    const vector_set = @import("vector_set.zig");
+    var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    var erased = try @import("../../backend_erased.zig").storeFrom(a, store);
+    defer erased.deinit();
+    const member = try keys.chunkArtifactKeyAlloc(a, "doc", "clips", 0);
+    defer a.free(member);
+    const scalar = try keys.derivedEmbeddingArtifactKeyAlloc(a, member, "vectors");
+    defer a.free(scalar);
+    const manifest_key = try @import("chunk_manifest.zig").keyAlloc(a, "doc", "clips");
+    defer a.free(manifest_key);
+    const O = @import("inference_chunker").outputs;
+    const raw_receipts = try std.json.Stringify.valueAlloc(a, [_]O.Result{.{ .name = "embedding", .kind = .embedding, .required = true, .model = "old", .model_identity = "", .model_revision = "", .recipe_id = "", .status = .failed, .terminal = true, .code = "OldFailure" }}, .{});
+    defer a.free(raw_receipts);
+    const metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .text }, .input_tokens = 1 }, .inference_id = "plan:0", .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .model = "old", .model_identity = "", .model_revision = "", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .outputs_json = raw_receipts };
+    const payload = try std.json.Stringify.valueAlloc(a, .{ .body = "retained text", ._chunk = metadata }, .{});
+    defer a.free(payload);
+    var builder = @import("chunk_manifest.zig").Builder.init();
+    try builder.append(0, payload);
+    const manifest = builder.finish();
+    const encoded_manifest = manifest.encode();
+    const vector = try @import("../enrichment/artifact_codec.zig").encodeDenseEmbeddingAlloc(a, 123, &.{ 1, 0 });
+    defer a.free(vector);
+    const document = try keys.documentKeyAlloc(a, "doc");
+    defer a.free(document);
+    const ttl = try keys.ttlKeyAlloc(a, "doc");
+    defer a.free(ttl);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &digest, .{});
+    const sources = [_]publication.Source{.{ .document_key = "doc", .exists = true, .timestamp = 1, .content_digest = digest, .input_position = null }};
+    var producer = publication.Command{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "vectors", .producer_artifact_name = "vectors", .producer_generation = 1, .sources = &sources, .mutations = &.{ .{ .family = .document_artifact, .key = member, .value = payload, .source_index = 0 }, .{ .family = .document_artifact, .key = manifest_key, .value = &encoded_manifest, .source_index = 0 }, .{ .family = .derived_vector, .key = scalar, .value = vector, .source_index = 0 } }, .publication_digest = @splat(0) };
+    producer.publication_digest = producer.digest();
+    var proof = try provenance.fromCommand(a, producer);
+    defer proof.deinit();
+    const encoded_proof = try provenance.encodeAlloc(a, proof.proof);
+    defer a.free(encoded_proof);
+    {
+        var write = try erased.beginWrite();
+        errdefer write.abort();
+        try publication.stageAuthority(&write, .{ .mode = .activate, .namespace = producer.namespace, .authority_epoch = 1, .catalog_digest = producer.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try write.put(document, "{}");
+        var timestamp: [8]u8 = undefined;
+        std.mem.writeInt(u64, &timestamp, 1, .little);
+        try write.put(ttl, &timestamp);
+        for (producer.mutations) |mutation| try write.put(mutation.key, mutation.value.?);
+        const position = publication.Position{ .raft = .{ .term = 1, .index = 1 } };
+        try publication.stageArtifactRevisions(a, &write, producer, position);
+        try provenance.stage(&write, producer, encoded_proof, position);
+        try write.commit();
+    }
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(&manifest.content_digest);
+    vector_set.update(&hash, scalar, vector);
+    const vector_digest = std.fmt.bytesToHex(hash.finalResult(), .lower);
+    const consumer = publication.Command{ .namespace = producer.namespace, .authority_epoch = 1, .catalog_digest = producer.catalog_digest, .producer_name = "labels", .producer_generation = 1, .sources = &sources, .mutations = &.{}, .publication_digest = @splat(0) };
+    var fence = UpstreamFence{ .key = manifest_key, .requires_value = true, .expected_chunk_count = 1, .vector_set = .{ .embedding = "vectors", .producer = "clips", .digest = &vector_digest, .rows = &.{.{ .chunk_id = 0, .sub_index = 0 }} } };
+    {
+        var read = try erased.beginProbe();
+        defer read.abort();
+        try fence.bind(a, &read, consumer);
+        try fence.requireCurrent(&read);
+    }
+    // Topology selection never grants an imported/replaced vector its missing
+    // causal acceptance: a stale payload still fails receiver preparation.
+    {
+        var write = try erased.beginWrite();
+        errdefer write.abort();
+        try write.put(scalar, "unaccepted replacement");
+        try write.commit();
+    }
+    var read = try erased.beginProbe();
+    defer read.abort();
+    try std.testing.expectError(error.EnrichmentSourceChanged, fence.bind(a, &read, consumer));
 }

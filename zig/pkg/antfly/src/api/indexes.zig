@@ -2933,6 +2933,8 @@ fn aggregateEnrichmentStats(
     dst.error_count +|= src.error_count;
     dst.retryable_error_count +|= src.retryable_error_count;
     dst.fatal_error_count +|= src.fatal_error_count;
+    dst.output_counts = dst.output_counts.add(src.output_counts);
+    dst.output_counts_available = if (first_observation) src.output_counts_available else dst.output_counts_available and src.output_counts_available;
     dst.consecutive_retry_count = @max(dst.consecutive_retry_count, src.consecutive_retry_count);
     // This field answers when the next shard becomes eligible, so aggregate
     // the earliest retrying observation. A later "all shards eligible" time is
@@ -3480,6 +3482,12 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try appendIntValue(alloc, out, stats.retryable_error_count);
     try out.appendSlice(alloc, ",\"fatal_error_count\":");
     try appendIntValue(alloc, out, stats.fatal_error_count);
+    if (stats.output_counts_available) {
+        try out.appendSlice(alloc, ",\"output_counts\":");
+        const counts_json = try std.json.Stringify.valueAlloc(alloc, stats.output_counts, .{});
+        defer alloc.free(counts_json);
+        try out.appendSlice(alloc, counts_json);
+    }
     try out.appendSlice(alloc, ",\"consecutive_retry_count\":");
     try appendIntValue(alloc, out, stats.consecutive_retry_count);
     try out.appendSlice(alloc, ",\"next_retry_at_ms\":");
@@ -7710,6 +7718,10 @@ fn consumerTests() type {
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.AudioChunkOptions, .chunker_audio);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkEmbeddingTarget, .chunker_embedding);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.MediaChunkPolicy, .chunker_policy);
+            try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkOutputs, .chunker_outputs);
+            try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkOutputTarget, .chunker_output_target);
+            // Inline skip-window items are generated as std.json.Value. Their
+            // closed projection is exercised through the response encoder below.
             try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
 
@@ -7738,6 +7750,11 @@ fn consumerTests() type {
                 .chunker_audio,
                 .chunker_embedding,
                 .chunker_policy,
+                .chunker_outputs,
+                .chunker_output_targets,
+                .chunker_output_target,
+                .chunker_output_windows,
+                .chunker_output_window,
                 .index_execution,
                 .execution_policy,
             }) |shape| {
@@ -7762,6 +7779,43 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(i64, 8), policy.get("max_frames").?.integer);
             try std.testing.expect(!policy.contains("target_tokens"));
             try std.testing.expect(!policy.contains("settings"));
+        }
+
+        test "public index config encoders preserve named media outputs with closed nested schemas" {
+            const a = std.testing.allocator;
+            const config =
+                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","outputs":{"boundary_model":"embedding","api_key":"private-root","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT","settings":{"token":"private-settings"}},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true,"api_key":"private-target"},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295,"client_value":"private-window"}]}]}}}
+            ;
+            const encoded = try encodeCreatedIndexConfig(a, "media", config);
+            defer a.free(encoded);
+            var decoded = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+            defer decoded.deinit();
+            const outputs = decoded.value.object.get("chunker").?.object.get("outputs").?;
+            const actual = try std.json.Stringify.valueAlloc(a, outputs, .{});
+            defer a.free(actual);
+            try ant_json.testing.expectEqualJsonText(a,
+                \\{"boundary_model":"embedding","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT"},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295}]}]}
+            , actual);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "private-") == null);
+
+            // A persisted malformed required target cannot become a partial
+            // public output recipe. Keep the surrounding valid chunker config.
+            for ([_][]const u8{
+                \\{"boundary_model":"embedding","targets":[]}
+                ,
+                \\{"boundary_model":"embedding","targets":[{"name":"bad","kind":"unknown","model":"encoder"}]}
+                ,
+                \\{"boundary_model":"embedding","targets":[{"name":"bad","kind":"embedding"}]}
+                ,
+            }) |invalid| {
+                const bad = try std.fmt.allocPrint(a, "{{\"type\":\"embeddings\",\"dimension\":2,\"chunker\":{{\"provider\":\"antfly\",\"outputs\":{s}}}}}", .{invalid});
+                defer a.free(bad);
+                const response = try encodeCreatedIndexConfig(a, "media", bad);
+                defer a.free(response);
+                var parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+                defer parsed.deinit();
+                try std.testing.expect(!parsed.value.object.get("chunker").?.object.contains("outputs"));
+            }
         }
 
         test "public index config encoders redact nested credentials" {
@@ -8304,6 +8358,26 @@ fn consumerTests() type {
                 error.InvalidEnrichmentConfig,
                 validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, removed),
             );
+        }
+
+        test "runtime status media output counters aggregate saturating and omit unavailable rolling upgrade observations" {
+            const alloc = std.testing.allocator;
+            var aggregate = db_mod.types.EnrichmentStats{};
+            aggregateEnrichmentStats(&aggregate, .{ .output_counts = .{ .embedding = .{ .complete = 4 } } }, true);
+            aggregateEnrichmentStats(&aggregate, .{ .output_counts = .{ .embedding = .{ .complete = 3 }, .transcribe = .{ .terminal = 1 } } }, false);
+            try std.testing.expectEqual(@as(u64, 7), aggregate.output_counts.embedding.complete);
+            var out = std.ArrayListUnmanaged(u8).empty;
+            defer out.deinit(alloc);
+            try appendEnrichmentRuntimeStatus(alloc, &out, aggregate);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.object.contains("output_counts"));
+            aggregateEnrichmentStats(&aggregate, .{ .output_counts_available = false }, false);
+            out.clearRetainingCapacity();
+            try appendEnrichmentRuntimeStatus(alloc, &out, aggregate);
+            var unavailable = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+            defer unavailable.deinit();
+            try std.testing.expect(!unavailable.value.object.contains("output_counts"));
         }
 
         test "index encoders expose local shard runtime status" {

@@ -365,15 +365,11 @@ pub fn loadArtifactFieldValueTxn(
     read_txn: ?*docstore_mod.DocStore.Txn,
     artifact_catalog: ?*const index_manager_mod.IndexManager.AssetContentTypeSnapshot,
 ) !?std.json.Value {
-    const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
-    defer alloc.free(prefix);
-
-    const artifacts = if (read_txn) |txn|
-        try docstore_mod.DocStore.scanPrefixTxn(alloc, txn, prefix)
-    else
-        try self.core.scanStorePrefix(alloc, prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
-
+    if (read_txn == null) {
+        var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        return loadArtifactFieldValueTxn(self, alloc, doc_key, &read, artifact_catalog);
+    }
     var artifacts_obj = std.json.ObjectMap.empty;
     errdefer {
         var it = artifacts_obj.iterator();
@@ -385,15 +381,56 @@ pub fn loadArtifactFieldValueTxn(
     }
 
     var artifact_count: usize = 0;
-    for (artifacts) |entry| {
-        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
-        defer artifact_ref.deinit(alloc);
-
-        var artifact_value = try artifactProjectionValue(self, alloc, artifact_ref, entry.value, artifact_catalog);
-        errdefer freeJsonValue(alloc, &artifact_value);
-
-        try appendArtifactProjectionValue(alloc, &artifacts_obj, artifact_ref.name, artifact_ref.kind, artifact_value);
-        artifact_count += 1;
+    // Preserve the physical family order for legacy names shared across kinds.
+    // Only the logical cursor may enumerate chunks: legacy rows can be hidden
+    // by a selected generation (including an empty replacement).
+    for ([_]types.ArtifactKind{ .asset, .chunk, .embedding }) |kind| {
+        if (kind == .chunk) {
+            var chunks = try @import("artifact/chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).open(alloc, read_txn.?, doc_key);
+            defer chunks.close();
+            while (try chunks.next()) |entry| {
+                var ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse return error.ArtifactCatalogCorrupt;
+                defer ref.deinit(alloc);
+                var value = try artifactProjectionValue(self, alloc, ref, entry.value, artifact_catalog);
+                errdefer freeJsonValue(alloc, &value);
+                try appendArtifactProjectionValue(alloc, &artifacts_obj, ref.name, ref.kind, value);
+                artifact_count += 1;
+            }
+            // Derived vectors live beneath logical chunk keys, outside the
+            // root embedding family. Enumerate them once in the same snapshot
+            // and exclude windows/ordinals hidden by the selected generation.
+            const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "chunk");
+            defer alloc.free(prefix);
+            var vectors = try read_txn.?.openPhysicalKeyCursorAdapter();
+            defer vectors.close();
+            var next = try vectors.seekAtOrAfter(prefix);
+            while (next) |entry| : (next = try vectors.next()) {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(alloc, entry.key)) orelse continue;
+                defer alloc.free(base);
+                if ((try @import("artifact/chunk_generation.zig").readMember(alloc, read_txn.?, base)) == null) continue;
+                var ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
+                defer ref.deinit(alloc);
+                const payload = try read_txn.?.get(entry.key);
+                var value = try artifactProjectionValue(self, alloc, ref, payload, artifact_catalog);
+                errdefer freeJsonValue(alloc, &value);
+                try appendArtifactProjectionValue(alloc, &artifacts_obj, ref.name, ref.kind, value);
+                artifact_count += 1;
+            }
+        } else {
+            const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, @tagName(kind));
+            defer alloc.free(prefix);
+            const artifacts = try docstore_mod.DocStore.scanPrefixTxn(alloc, read_txn.?, prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+            for (artifacts) |entry| {
+                var ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
+                defer ref.deinit(alloc);
+                var value = try artifactProjectionValue(self, alloc, ref, entry.value, artifact_catalog);
+                errdefer freeJsonValue(alloc, &value);
+                try appendArtifactProjectionValue(alloc, &artifacts_obj, ref.name, ref.kind, value);
+                artifact_count += 1;
+            }
+        }
     }
 
     if (artifact_count == 0) {
@@ -534,6 +571,8 @@ pub fn artifactRefJsonValue(alloc: Allocator, artifact_ref: types.ArtifactRef) !
     if (artifact_ref.chunk_id) |chunk_id| {
         try putOwnedValue(alloc, &obj, "chunk_id", .{ .integer = @intCast(chunk_id) });
     }
+    if (artifact_ref.window_index) |index| try putOwnedValue(alloc, &obj, "window_index", .{ .integer = index });
+    if (artifact_ref.unit_id) |unit| try putClonedValue(alloc, &obj, "unit_id", .{ .string = unit });
     if (artifact_ref.source) |source| {
         var source_obj = std.json.ObjectMap.empty;
         errdefer {
@@ -545,6 +584,8 @@ pub fn artifactRefJsonValue(alloc: Allocator, artifact_ref: types.ArtifactRef) !
         if (source.chunk_id) |chunk_id| {
             try putOwnedValue(alloc, &source_obj, "chunk_id", .{ .integer = @intCast(chunk_id) });
         }
+        if (source.window_index) |index| try putOwnedValue(alloc, &source_obj, "window_index", .{ .integer = index });
+        if (source.unit_id) |unit| try putClonedValue(alloc, &source_obj, "unit_id", .{ .string = unit });
         try putOwnedValue(alloc, &obj, "source", .{ .object = source_obj });
     }
     return .{ .object = obj };
@@ -690,11 +731,13 @@ test "artifact projection reference releases all failed allocations" {
                 .name = @constCast("embedding"),
                 .kind = .embedding,
                 .chunk_id = 7,
-                .source = .{ .name = @constCast("chunks"), .kind = .chunk, .chunk_id = 3 },
+                .source = .{ .name = @constCast("chunks"), .kind = .chunk, .chunk_id = 3, .window_index = 0, .unit_id = @constCast("unit") },
             });
             defer freeJsonValue(alloc, &value);
             try std.testing.expectEqualStrings("document", value.object.get("document_id").?.string);
             try std.testing.expectEqualStrings("chunks", value.object.get("source").?.object.get("name").?.string);
+            try std.testing.expectEqual(@as(i64, 0), value.object.get("source").?.object.get("window_index").?.integer);
+            try std.testing.expectEqualStrings("unit", value.object.get("source").?.object.get("unit_id").?.string);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
@@ -976,4 +1019,11 @@ test "public graph metric borrowed wire selected embeddings retain only selected
         std.debug.print("SELECTED_EMBEDDINGS case={d} compact_peak={d} lazy_peak={d}\n", .{ c, peaks[0], peaks[1] });
         try std.testing.expect(peaks[1] < peaks[0] / 4);
     }
+}
+
+test "model aware media artifact projection retains root window zero" {
+    const a = std.testing.allocator;
+    var value = try artifactRefJsonValue(a, .{ .document_id = @constCast("doc"), .name = @constCast("clips"), .kind = .chunk, .chunk_id = 0, .window_index = 0 });
+    defer freeJsonValue(a, &value);
+    try std.testing.expectEqual(@as(i64, 0), value.object.get("window_index").?.integer);
 }

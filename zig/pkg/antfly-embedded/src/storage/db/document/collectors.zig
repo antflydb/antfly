@@ -223,6 +223,9 @@ pub fn collectDocumentWritesProfiled(
     }
     const read_start_ns = if (profile != null) monotonicTimeNs() else 0;
     try txn.getManySorted(read_keys, read_values);
+    var members = @import("../artifact/chunk_generation.zig").MemberReader.init(alloc);
+    defer members.deinit();
+    for (read_keys, read_values) |key, *value| value.* = try members.override(&txn, key, value.*);
     if (profile) |p| p.read_ns = monotonicTimeNs() - read_start_ns;
 
     const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
@@ -382,6 +385,9 @@ pub fn collectTextDocumentWritesForIndex(
         read_keys[i] = item.store_key;
     }
     try txn.getManySorted(read_keys, read_values);
+    var members = @import("../artifact/chunk_generation.zig").MemberReader.init(alloc);
+    defer members.deinit();
+    for (read_keys, read_values) |key, *value| value.* = try members.override(&txn, key, value.*);
 
     const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
     try result.docs.ensureTotalCapacityPrecise(alloc, try std.math.add(usize, result.docs.items.len, available_values));

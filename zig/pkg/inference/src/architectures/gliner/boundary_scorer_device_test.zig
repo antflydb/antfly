@@ -120,3 +120,86 @@ test "gliner boundary device Metal pinned base full inference pipeline parity" {
 test "gliner boundary device Metal pinned multi full inference pipeline parity" {
     try parity("multi", "ANTFLY_GLINER25_MULTI_MODEL_DIR", "pipeline_cases_multi.json");
 }
+
+fn cudaParity(comptime variant: []const u8, comptime environment: [:0]const u8, comptime fixture_name: []const u8, comptime transformers_wrapper: bool) !void {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const directory = @import("antfly_platform").env.getenv(environment) orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bytes = try fixtures.fixtureBytes(a, fixture_name);
+    defer a.free(bytes);
+    const capture = try std.json.parseFromSlice(pipeline.ReferenceFixture, a, bytes, .{});
+    defer capture.deinit();
+    try std.testing.expectEqual(@as(u32, 2), capture.value.format_version);
+    try std.testing.expectEqualStrings("3c913c7369301133d3b7699252074c4303ada50e", capture.value.source_commit);
+    try std.testing.expectEqualStrings(variant, capture.value.model);
+    const reference = try fixtures.fixtureBytes(a, variant ++ "_reference/capture.json");
+    defer a.free(reference);
+    try expectPin(.{ .sha256 = capture.value.reference_sha256, .size_bytes = reference.len }, reference);
+    const requests = try fixtures.fixtureBytes(a, "requests.json");
+    defer a.free(requests);
+    try expectPin(.{ .sha256 = capture.value.requests_sha256, .size_bytes = requests.len }, requests);
+    const path = try std.fs.path.join(a, &.{ directory, "model.safetensors" });
+    defer a.free(path);
+    var weights = fixtures.TensorFixture{ .allocator = a, .reader = try @import("../../models/safetensors.zig").MMapReader.openFileAbsolute(a, path) };
+    defer weights.deinit();
+    try expectPin(capture.value.model_files.@"model.safetensors", weights.reader.file_bytes);
+    const tokenizer_bytes = try readPinned(a, directory, "tokenizer.json", capture.value.model_files.@"tokenizer.json");
+    defer a.free(tokenizer_bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    const config_pin: pipeline.PublishedModelPin = if (transformers_wrapper) .{
+        .sha256 = &@import("../../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1_transformers.sidecars[0].sha256,
+        .size_bytes = @import("../../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1_transformers.sidecars[0].size_bytes,
+    } else capture.value.model_files.@"config.json";
+    const config_bytes = try readPinned(a, directory, "config.json", config_pin);
+    defer a.free(config_bytes);
+    const encoder_bytes = try readPinned(a, directory, "encoder_config/config.json", capture.value.model_files.@"encoder_config/config.json");
+    defer a.free(encoder_bytes);
+    const config = try model.parseConfig(a, config_bytes, encoder_bytes);
+    const factory = @import("../session_factory.zig");
+    const session = try factory.createGlinerCudaSessionWithPrecision(a, directory, .fp32);
+    defer session.close();
+    // Offline evidence gathering uses the same CUDA session and device pipeline;
+    // this does not widen the production serving qualification table.
+    var cb = try factory.getComputeBackend(session, a);
+    defer cb.deinit();
+    for (capture.value.cases, 0..) |case, case_index| {
+        errdefer std.debug.print(variant ++ " resident pipeline case: {s}\n", .{case.id});
+        const schema_json = try std.json.Stringify.valueAlloc(a, case.schema, .{});
+        defer a.free(schema_json);
+        var schema = try @import("../../pipelines/extraction_schema.zig").compile(a, schema_json, .{});
+        defer schema.deinit();
+        var prepared = try @import("../../pipelines/gliner_boundary_processor.zig").prepare(a, tokenizer.tokenizer(), &.{.{ .text = case.text, .schema = &schema }}, .{});
+        defer prepared.deinit();
+        var encoded = try engine.encodeDevice(&cb, a, &config, &prepared, .{});
+        defer encoded.deinit();
+        var headed: ?head.Result = if (prepared.query_width > 0) try head.forwardDevice(&cb, a, &config, try encoded.asHeadInput(null), .{}) else null;
+        defer if (headed) |*value| value.deinit();
+        try std.testing.expectEqual(@as(usize, 0), encoded.stats().result_download_calls);
+        var scorer = try adapter.Context.init(a, &config, &encoded, if (headed) |*value| value else null, .{});
+        defer scorer.deinit();
+        var result = try pipeline.runScored(a, &config, &prepared, &.{&schema}, scorer.scores, scorer.scorer(), .{ .offset_unit = .unicode_codepoints });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.samples.len);
+        try pipeline.expectSample(case.expected, result.samples[0], pipeline.fp32_confidence_tolerance);
+        // The only encoder-owner readback is the scalar classification output.
+        try std.testing.expectEqual(@as(usize, @intFromBool(prepared.classification_width > 0)), encoded.stats().result_download_calls);
+        const stats = try scorer.stats();
+        try std.testing.expect(stats.result_download_bytes <= scorer.limits.max_result_download_bytes);
+        if (case_index == 0) {
+            // Admission rejects cumulative transfers before copying a tensor.
+            const before = try scorer.stats();
+            scorer.limits.max_result_download_bytes = before.result_download_bytes;
+            if (prepared.classification_width > 0) try std.testing.expectError(error.ResourceLimitExceeded, scorer.scorer().classify(a, .{}, null));
+            try std.testing.expectEqual(before.result_download_bytes, (try scorer.stats()).result_download_bytes);
+        }
+    }
+}
+
+test "gliner boundary device CUDA pinned base full inference pipeline parity" {
+    try cudaParity("base", "ANTFLY_GLINER25_BASE_MODEL_DIR", "pipeline_cases_base.json", false);
+}
+
+test "gliner boundary device CUDA pinned Transformers base full inference pipeline parity" {
+    try cudaParity("base", "ANTFLY_GLINER25_BASE_TRANSFORMERS_MODEL_DIR", "pipeline_cases_base.json", true);
+}

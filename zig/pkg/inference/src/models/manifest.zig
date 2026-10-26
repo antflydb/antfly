@@ -341,6 +341,9 @@ pub const ModelManifest = struct {
 
     // Architecture (from config.json)
     hidden_size: u32 = 768,
+    /// True only after reading the selected artifact/config geometry. The
+    /// compatibility default must never become an advertised vector width.
+    hidden_size_resolved: bool = false,
     intermediate_size: u32 = 3072,
     max_position_embeddings: u32 = 512,
     num_hidden_layers: u32 = 12,
@@ -373,6 +376,7 @@ pub const ModelManifest = struct {
     vision_resample: VisionResample = .bilinear,
 
     // Classification / NER
+    media_classifier: ?@import("media_classifier_profile.zig").Profile = null,
     num_labels: u32 = 0,
     id2label: ?[][]const u8 = null,
 
@@ -427,6 +431,21 @@ pub const ModelManifest = struct {
     pad_token: []const u8 = "",
     add_bos_token: bool = false,
     add_eos_token: bool = false,
+
+    /// Only publish geometry proved by resolved metadata. In particular,
+    /// hidden_size's compatibility default is not evidence of output width.
+    pub fn denseEmbeddingOutput(self: *const ModelManifest) ?struct { native_dimensions: u32, minimum_dimensions: u32 } {
+        if (self.model_type != .embedder or !self.hidden_size_resolved) return null;
+        const dimensions = switch (self.embedding_style) {
+            // EmbeddingGemma's validated config stores the final projection
+            // width in hidden_size; a pooling sidecar is not executor geometry.
+            .embedding_gemma2, .qwen3_embedding, .jina_v5 => self.hidden_size,
+            else => return null,
+        };
+        const minimum: u32 = if (self.embedding_style == .qwen3_embedding) 32 else 1;
+        if (dimensions < minimum) return null;
+        return .{ .native_dimensions = dimensions, .minimum_dimensions = minimum };
+    }
 
     pub fn maxTextSequenceLength(self: *const ModelManifest) usize {
         if (self.embedding_style == .embedding_gemma2)
@@ -2148,8 +2167,10 @@ fn applyGgufTokenizerMetadata(
                 }) |field| {
                     const geometry_key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ arch, field[0] }) catch unreachable;
                     if (view.getU64(geometry_key)) |value| {
-                        if (value > 0 and value <= std.math.maxInt(u32))
+                        if (value > 0 and value <= std.math.maxInt(u32)) {
                             @field(manifest.*, field[1]) = @intCast(value);
+                            if (comptime std.mem.eql(u8, field[1], "hidden_size")) manifest.hidden_size_resolved = true;
+                        }
                     }
                 }
                 // Without this the manifest keeps its BERT-era default of 512
@@ -2625,7 +2646,10 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
     applyVisionTargetFromModelConfig(manifest, obj);
 
     if (obj.get("hidden_size")) |v| {
-        if (jsonU32(v)) |val| manifest.hidden_size = val;
+        if (jsonU32(v)) |val| {
+            manifest.hidden_size = val;
+            manifest.hidden_size_resolved = true;
+        }
     }
     if (obj.get("intermediate_size")) |v| {
         if (jsonU32(v)) |val| manifest.intermediate_size = val;
@@ -2808,6 +2832,7 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             manifest.embedding_style = .embedding_gemma2;
             manifest.model_type = .embedder;
             manifest.hidden_size = @intCast(cfg.embedding_dim);
+            manifest.hidden_size_resolved = true;
             manifest.intermediate_size = @intCast(cfg.intermediate_size);
             manifest.num_hidden_layers = @intCast(cfg.num_hidden_layers);
             manifest.num_attention_heads = @intCast(cfg.num_attention_heads);
@@ -3224,6 +3249,13 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
         .object => |object| object,
         else => return error.InvalidModelManifest,
     };
+
+    if (obj.get("media_classifier")) |value| {
+        var profile = std.json.parseFromValue(@import("media_classifier_profile.zig").Profile, allocator, value, .{}) catch return error.InvalidMediaClassifierProfile;
+        defer profile.deinit();
+        try profile.value.validate();
+        manifest.media_classifier = profile.value;
+    }
 
     // Discovery metadata only. Runtime admission always binds actual bytes.
     if (obj.get("qualified_limits")) |value| {
@@ -8371,4 +8403,30 @@ test "ModernBERT span discovery withholds unevaluated extraction capabilities" {
     try std.testing.expect(!manifest.hasCapability("extraction"));
     try std.testing.expect(manifest.hasCapability("classification"));
     try std.testing.expect(manifest.hasCapability("typed_decisions"));
+}
+
+test "dense embedding output geometry requires resolved metadata" {
+    var manifest: ModelManifest = undefined;
+    manifest.model_type = .generator;
+    manifest.embedding_dimension = 0;
+    manifest.embedding_style = .none;
+    manifest.hidden_size = 768;
+    manifest.hidden_size_resolved = false;
+    try std.testing.expect(manifest.denseEmbeddingOutput() == null);
+    manifest.model_type = .embedder;
+    // The default hidden size is never advertised as a proved output.
+    try std.testing.expect(manifest.denseEmbeddingOutput() == null);
+    manifest.embedding_style = .embedding_gemma2;
+    manifest.embedding_dimension = 512;
+    try std.testing.expect(manifest.denseEmbeddingOutput() == null);
+    manifest.hidden_size_resolved = true;
+    const gemma = manifest.denseEmbeddingOutput().?;
+    try std.testing.expectEqual(@as(u32, 768), gemma.native_dimensions);
+    try std.testing.expectEqual(@as(u32, 1), gemma.minimum_dimensions);
+    manifest.embedding_style = .qwen3_embedding;
+    manifest.embedding_dimension = 0;
+    manifest.hidden_size = 1024;
+    const qwen = manifest.denseEmbeddingOutput().?;
+    try std.testing.expectEqual(@as(u32, 1024), qwen.native_dimensions);
+    try std.testing.expectEqual(@as(u32, 32), qwen.minimum_dimensions);
 }

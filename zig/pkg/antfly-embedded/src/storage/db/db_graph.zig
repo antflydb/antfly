@@ -5913,7 +5913,9 @@ test "db graph index reloads on reopen for neighbor queries with durable lsm pri
 }
 
 test "db graph reverse rebuild resumes after interrupted reopen" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -6886,7 +6888,9 @@ test "graph projection preserves numeric literals through field artifacts repair
 }
 
 test "db graph endpoint cleanup pages are replicated bounded and restartable" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var directory = try TestDirectory.init("endpoint-cleanup-pages");
     defer directory.cleanup();
     var follower_directory = try TestDirectory.init("endpoint-cleanup-follower");
@@ -8480,7 +8484,9 @@ test "db graph fact generated projection wakes endpoint context" {
 }
 
 test "db graph fact refresh bounds artifact work within one large record" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var tmp = try TestDirectory.init("review-large-record-refresh");
     defer tmp.cleanup();
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });

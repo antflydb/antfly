@@ -236,6 +236,42 @@ test "list indexes response timeout bounds readiness preflight" {
 test "personal connections polling accommodates slow status and explicit deadlines" {
     const a = std.testing.allocator;
     const io = std.testing.io;
+    // Observe the admitted transport deadline directly instead of sleeping
+    // past the ordinary 15-second default to infer the polling policy.
+    const Probe = struct {
+        deadline_ms: ?i64 = null,
+        calls: usize = 0,
+        fn before(raw: *anyopaque, context: httpx.AttemptObserver.Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.deadline_ms = context.deadline_ms;
+            self.calls += 1;
+            return error.RequestPolicyObserved;
+        }
+        fn after(_: *anyopaque, _: ?*const httpx.Response) void {
+            unreachable; // Rejected admission never starts a transport attempt.
+        }
+    };
+    for ([_]?u64{ null, 2500 }) |explicit| {
+        var probe: Probe = .{};
+        var http = httpx.Client.initWithConfig(a, io, .{
+            .timeouts = .{ .request_ms = 1 },
+            .attempt_observer = .{ .ptr = &probe, .before = Probe.before, .after = Probe.after },
+        });
+        defer http.deinit();
+        var client = try AntflyClient.init(a, &http, "http://example.invalid");
+        defer client.deinit();
+        const before_ms: i64 = @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
+        if (explicit) |timeout| {
+            try std.testing.expectError(error.RequestPolicyObserved, client.getChatGPTAttemptWithTimeout("attempt-1", timeout));
+        } else {
+            try std.testing.expectError(error.RequestPolicyObserved, client.getChatGPTAttempt("attempt-1"));
+        }
+        const after_ms: i64 = @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
+        const duration_ms: i64 = @intCast(explicit orelse 60_000);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        const deadline = probe.deadline_ms orelse return error.MissingRequestDeadline;
+        try std.testing.expect(deadline >= before_ms + duration_ms and deadline <= after_ms + duration_ms);
+    }
     const Assert = struct {
         var test_io: std.Io = undefined;
         var delay_ms: i64 = 0;
@@ -244,8 +280,8 @@ test "personal connections polling accommodates slow status and explicit deadlin
         }
     };
     Assert.test_io = io;
-    for ([_]i64{ 16_000, 200 }) |delay| {
-        Assert.delay_ms = delay;
+    for ([_]enum { default_budget, explicit_budget }{ .default_budget, .explicit_budget }) |mode| {
+        Assert.delay_ms = if (mode == .default_budget) 100 else 200;
         var server = try httpx.TestServer.start(a, io, &.{.{
             .method = .GET,
             .path = "/db/v1/connections/chatgpt/attempts/attempt-1",
@@ -255,11 +291,11 @@ test "personal connections polling accommodates slow status and explicit deadlin
         defer server.deinit();
         var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
         defer serving.cancel(io) catch {};
-        var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false, .timeouts = .{ .request_ms = 1 } });
         defer http.deinit();
         var client = try AntflyClient.init(a, &http, server.baseUrl());
         defer client.deinit();
-        if (delay == 16_000) {
+        if (mode == .default_budget) {
             var response = try client.getChatGPTAttempt("attempt-1");
             defer response.deinit();
             try std.testing.expectEqualStrings("connected", response.data.?.value.status);
