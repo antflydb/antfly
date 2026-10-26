@@ -323,12 +323,24 @@ func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inve
 	incremental := false
 	switch c.ProviderName {
 	case ProviderSlack:
+		var capturedBytes int64
+		var capturedObjects int
 		refs, err = c.slackRefs(ctx, config, func(ref collaborationRef, message *slackMessage) error {
 			if c.ContentStore == nil {
 				return nil
 			}
-			_, captureErr := c.hydrate(ctx, r, config, ref, message)
-			return captureErr
+			inputs, captureErr := c.hydrate(ctx, r, config, ref, message)
+			if captureErr != nil {
+				return captureErr
+			}
+			for _, input := range inputs {
+				capturedBytes += input.Size
+				capturedObjects++
+			}
+			if capturedBytes > 10<<30 || capturedObjects > maxCollaborationSourceObjects {
+				return ErrInventoryIncomplete
+			}
+			return nil
 		})
 	case ProviderDiscord:
 		refs, err = c.discordRefs(ctx, config)
