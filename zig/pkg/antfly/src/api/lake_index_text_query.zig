@@ -410,7 +410,7 @@ const Execution = struct {
     hydration_ns: u64 = 0,
     use_stored_highlights: bool = false,
     highlight_index: ?[]const u8 = null,
-    highlight_locations: std.StringHashMapUnmanaged(StoredHighlightLocation) = .empty,
+    highlight_locations: std.StringHashMapUnmanaged(StoredTextLocation) = .empty,
     text_stores_source: std.StringHashMapUnmanaged(bool) = .empty,
     highlight_pins: std.ArrayList(search.PinnedTextSource) = .empty,
     delivery_pin: ?search.PinnedTextSource = null,
@@ -1191,7 +1191,7 @@ const Execution = struct {
     /// Sort a compact permutation, retaining result order and only one reader
     /// and decoded stored block. Hidden source is released after each snippet.
     fn attachLocatedHighlights(self: *Execution, a: A, prepared: *const search.PreparedHighlights, hits: []types.SearchHit) !void {
-        const Winner = struct { index: usize, location: StoredHighlightLocation };
+        const Winner = struct { index: usize, location: StoredTextLocation };
         const winners = try a.alloc(Winner, hits.len);
         defer a.free(winners);
         for (hits, winners, 0..) |hit, *winner, index| winner.* = .{ .index = index, .location = self.highlight_locations.get(hit.id) orelse return error.InvalidNativeLakeTextCorpus };
@@ -1251,6 +1251,14 @@ const Execution = struct {
             if (hit.source_value) |*source| types.deinitJsonValue(self.result_allocator, source);
             hit.source_value = null;
         }
+    }
+    fn storedDeliveryUseful(self: *const Execution, pin: search.PinnedTextSource) bool {
+        if (pin.stored_projection_fields.len == 0) return false;
+        const wanted = self.hydration_fields orelse return true;
+        for (wanted) |field| for (pin.stored_projection_fields) |available| {
+            if (std.mem.eql(u8, field, available)) return true;
+        };
+        return false;
     }
     fn hydrateTyped(self: *Execution, a: A, req: types.SearchRequest, hits: []types.SearchHit) !void {
         if (hits.len == 0) return;
@@ -2216,7 +2224,7 @@ const Execution = struct {
             total +|= page.total_hits;
             for (page.hits) |hit| {
                 const ordinal = std.math.add(u64, window.doc_offset, hit.native_text_doc_id orelse return error.InvalidNativeLakeTextCorpus) catch return error.InvalidNativeLakeTextCorpus;
-                const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, window.identities, hit.native_text_doc_id.?) else null;
+                const location = if (self.use_stored_highlights) try storedTextLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, window.identities, hit.native_text_doc_id.?) else null;
                 const identities: ?*const @import("lake_index_text_predicate.zig").Identities = if (ordering == null and !recent_window) archive: {
                     const pin = child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus;
                     break :archive @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
@@ -2488,6 +2496,9 @@ const Execution = struct {
         var order = ordering;
         var winners = PagedWinners.initOrdered(a, target, &order);
         defer winners.deinit();
+        var retained_delivery: ?search.PinnedTextSource = null;
+        defer if (retained_delivery) |*pin| pin.deinit();
+        var retained_pack: ?[32]u8 = null;
         var budget: local.sql_memory_budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
         var scratch = std.heap.ArenaAllocator.init(budget.allocator());
         defer scratch.deinit();
@@ -2577,9 +2588,19 @@ const Execution = struct {
                     try attempt.observe(page.sort_profile);
                     total +|= page.total_hits;
                     exact = exact and page.total_hits_relation == .exact;
+                    const admissions = winners.admissions;
+                    const useful_delivery = if (child.delivery_pin) |pin| self.storedDeliveryUseful(pin) else false;
                     for (page.hits) |hit| {
-                        const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin.?, &.{id}, hit.native_text_doc_id.?) else null;
+                        const location = if (self.use_stored_highlights or useful_delivery) try storedTextLocation(child.delivery_pin.?, &.{id}, hit.native_text_doc_id.?) else null;
                         try winners.addLocated(hit, 0, location);
+                    }
+                    // The last admitted winner belongs to the only possible
+                    // common winning pack. Retain one pin, never one per hit.
+                    if (useful_delivery and winners.admissions != admissions) {
+                        const pin = try child.delivery_pin.?.clone();
+                        if (retained_delivery) |*old| old.deinit();
+                        retained_delivery = pin;
+                        retained_pack = id;
                     }
                 }
                 pack_position = pack_end;
@@ -2605,7 +2626,11 @@ const Execution = struct {
         if (req.profile) try result.setOwnedSortProfile(.{ .selection_reason = "bounded_ordered_lake_index", .candidate_source = "ordered_lake_index", .selected_count = winners.heap.items.len -| paging.offset });
         // Publish borrowed highlight keys only after every other allocation has
         // succeeded; an optional-plan fallback must leave no dangling keys.
+        const native_delivery = if (retained_pack) |pack| winners.restoreNativeDocuments(pack) else false;
         result.hits = try winners.finishLocated(paging.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena);
+        if (self.delivery_pin) |*old| old.deinit();
+        self.delivery_pin = if (native_delivery) retained_delivery else null;
+        if (native_delivery) retained_delivery = null;
         return result;
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
@@ -4334,8 +4359,8 @@ test "external lake sparse predicate planning preflights effective windows and p
 
 /// Global score ties use the immutable corpus ordinal, never the physical file
 /// name or a window-local doc number. Retains only offset + limit owned hits.
-const StoredHighlightLocation = struct { segment: [32]u8, document: u32 };
-fn storedHighlightLocation(pin: search.PinnedTextSource, ids: []const [32]u8, document: u32) !StoredHighlightLocation {
+const StoredTextLocation = struct { segment: [32]u8, document: u32 };
+fn storedTextLocation(pin: search.PinnedTextSource, ids: []const [32]u8, document: u32) !StoredTextLocation {
     if (pin.snapshot.segments.len != ids.len) return error.InvalidNativeLakeTextCorpus;
     var lower: u32 = 0;
     const admitted = if (pin.provider_metadata) |raw| @as(*const @import("lake_index_text_predicate.zig").Identities, @ptrCast(@alignCast(raw))).segment_ids else &.{};
@@ -4431,7 +4456,7 @@ const PagedWinners = struct {
         hit: types.SearchHit,
         ordinal: u64,
         position: ?@import("lake_index_text_directory.zig").Position = null,
-        highlight: ?StoredHighlightLocation = null,
+        highlight: ?StoredTextLocation = null,
         fn worst(ordering: ?*const local.storage_db_query_search_exec.SearchHitOrder, l: Winner, r: Winner) std.math.Order {
             if (ordering) |typed| {
                 const compared = typed.compare(l.hit, r.hit);
@@ -4484,10 +4509,10 @@ const PagedWinners = struct {
     fn add(self: *PagedWinners, hit: types.SearchHit, ordinal: u64) !void {
         return self.addLocated(hit, ordinal, null);
     }
-    fn addLocated(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, highlight: ?StoredHighlightLocation) !void {
+    fn addLocated(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, highlight: ?StoredTextLocation) !void {
         return self.addWinner(hit, ordinal, null, highlight);
     }
-    fn addWindowHit(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, identities: ?*const @import("lake_index_text_predicate.zig").Identities, recent: bool, highlight: ?StoredHighlightLocation) !void {
+    fn addWindowHit(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, identities: ?*const @import("lake_index_text_predicate.zig").Identities, recent: bool, highlight: ?StoredTextLocation) !void {
         if (self.heap.context != null) return self.addLocated(hit, ordinal, highlight);
         const doc = hit.native_text_doc_id orelse return error.InvalidNativeLakeTextCorpus;
         const position: @import("lake_index_text_directory.zig").Position = if (recent)
@@ -4496,10 +4521,10 @@ const PagedWinners = struct {
             try (identities orelse return error.InvalidNativeLakeTextCorpus).logicalPosition(doc);
         return self.addPositioned(hit, position, highlight);
     }
-    fn addPositioned(self: *PagedWinners, hit: types.SearchHit, position: @import("lake_index_text_directory.zig").Position, highlight: ?StoredHighlightLocation) !void {
+    fn addPositioned(self: *PagedWinners, hit: types.SearchHit, position: @import("lake_index_text_directory.zig").Position, highlight: ?StoredTextLocation) !void {
         return self.addWinner(hit, 0, position, highlight);
     }
-    fn addWinner(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, position: ?@import("lake_index_text_directory.zig").Position, highlight: ?StoredHighlightLocation) !void {
+    fn addWinner(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, position: ?@import("lake_index_text_directory.zig").Position, highlight: ?StoredTextLocation) !void {
         if (self.limit == 0) return;
         if (!std.math.isFinite(hit.score orelse 0)) return error.InvalidNativeLakeTextCorpus;
         if (self.heap.context) |order| try order.validate(hit);
@@ -4520,10 +4545,22 @@ const PagedWinners = struct {
         self.admissions +|= 1;
         self.peak = @max(self.peak, self.heap.items.len);
     }
+    /// Native ordinals become usable again only with one retained pack pin.
+    /// Validate the complete heap before changing any hit, including OFFSET
+    /// entries, so a mixed/unlocated result cannot inherit an unrelated source.
+    fn restoreNativeDocuments(self: *PagedWinners, pack: [32]u8) bool {
+        if (self.heap.items.len == 0) return false;
+        for (self.heap.items) |winner| {
+            const location = winner.highlight orelse return false;
+            if (!std.mem.eql(u8, &location.segment, &pack)) return false;
+        }
+        for (self.heap.items) |*winner| winner.hit.native_text_doc_id = winner.highlight.?.document;
+        return true;
+    }
     fn finish(self: *PagedWinners, offset: usize) ![]types.SearchHit {
         return self.finishLocated(offset, null, self.a);
     }
-    fn finishLocated(self: *PagedWinners, offset: usize, locations: ?*std.StringHashMapUnmanaged(StoredHighlightLocation), metadata: A) ![]types.SearchHit {
+    fn finishLocated(self: *PagedWinners, offset: usize, locations: ?*std.StringHashMapUnmanaged(StoredTextLocation), metadata: A) ![]types.SearchHit {
         const count = self.heap.items.len;
         const skip = @min(offset, count);
         if (locations) |map| try map.ensureUnusedCapacity(metadata, std.math.cast(u32, count - skip) orelse return error.QueryCandidateBudgetExceeded);
@@ -4621,7 +4658,7 @@ test "external lake paged stored highlights retain only returned winner location
     var heap = PagedWinners.init(a, 2);
     defer heap.deinit();
     for ([_][]const u8{ "a", "b", "c" }, 0..) |id, ordinal| try heap.addLocated(.{ .id = @constCast(id), .score = @floatFromInt(3 - ordinal) }, ordinal, .{ .segment = @splat(@intCast(ordinal)), .document = @intCast(ordinal + 7) });
-    var locations: std.StringHashMapUnmanaged(StoredHighlightLocation) = .empty;
+    var locations: std.StringHashMapUnmanaged(StoredTextLocation) = .empty;
     defer locations.deinit(a);
     const hits = try heap.finishLocated(1, &locations, a);
     defer a.free(hits);
@@ -5345,4 +5382,27 @@ test "external lake metadata navigation sparse ordered pages reuse exact batch p
     try std.testing.expectEqual(@as(usize, 0), memo.builds);
     try std.testing.expect(memo.entries[0].?.probe != null);
     try std.testing.expect(memo.hits >= 2);
+}
+
+test "external lake bounded window profiles native winner delivery binds one stored pack after replacement" {
+    const a = std.testing.allocator;
+    var execution: Execution = undefined;
+    const pin: search.PinnedTextSource = .{ .snapshot = undefined, .name = "pack", .text_analysis = .{}, .runtime_schema = null, .stored_projection_fields = &.{"body"} };
+    execution.hydration_fields = &.{"id"};
+    try std.testing.expect(!execution.storedDeliveryUseful(pin));
+    execution.hydration_fields = &.{"body"};
+    try std.testing.expect(execution.storedDeliveryUseful(pin));
+    execution.hydration_fields = null;
+    try std.testing.expect(execution.storedDeliveryUseful(pin));
+    var winners = PagedWinners.init(a, 3);
+    defer winners.deinit();
+    try winners.addLocated(.{ .id = "a", .score = 1, .native_text_doc_id = 99 }, 0, .{ .segment = @splat(1), .document = 7 });
+    try winners.addLocated(.{ .id = "b", .score = 1, .native_text_doc_id = 99 }, 1, .{ .segment = @splat(1), .document = 8 });
+    try winners.addLocated(.{ .id = "c", .score = 0, .native_text_doc_id = 99 }, 2, .{ .segment = @splat(2), .document = 7 });
+    try std.testing.expect(!winners.restoreNativeDocuments(@splat(1)));
+    for (winners.heap.items) |winner| try std.testing.expect(winner.hit.native_text_doc_id == null);
+    try winners.addLocated(.{ .id = "d", .score = 2 }, 3, .{ .segment = @splat(1), .document = 9 });
+    try std.testing.expect(!winners.restoreNativeDocuments(@splat(2)));
+    try std.testing.expect(winners.restoreNativeDocuments(@splat(1)));
+    for (winners.heap.items) |winner| try std.testing.expectEqual(winner.highlight.?.document, winner.hit.native_text_doc_id.?);
 }

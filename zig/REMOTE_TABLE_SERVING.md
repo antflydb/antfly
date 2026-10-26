@@ -1593,3 +1593,14 @@ Saturation leaves required opens inline. Every task joins or cancels before
 its results, publication callback or read context can be released. A prefetch
 failure remains optional and retries through the authoritative reader. All
 packs in the current metadata page finish before its boundary can stop traversal.
+
+
+When all final ordered winners share one stored-source pack, the coordinator
+retains the last admitted winner's shared pin and validates the complete winning
+heap's pack identity before restoring any native document numbers. It transfers
+that single pin only after the optional ordered plan succeeds. Mixed/unlocated
+winners retain physical hydration. The pin is useful only when its authenticated
+stored-field coverage intersects the requested projection; normal coverage
+splitting and native-key verification still apply. This avoids an extra physical
+source lookup after sorting without pinning one source per winner or allowing a
+failed attempt to change fallback delivery state.
