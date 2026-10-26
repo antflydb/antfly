@@ -47,7 +47,7 @@ before their fixes.
 ## Release prerequisites
 
 Publish/pin the portable sources module and Cloud CLI/SDK revision, then deploy the
-matching Colony API, worker and dashboard with migrations 124–127. Colony must pin this published module revision; final release checks must use
+matching Colony API, worker and dashboard with migrations 125–128. Colony must pin this published module revision; final release checks must use
 `GOWORK=off` with that dependency. Drain older workers for the unreleased provider migration.
 
 Register the exact backend callback for each enabled provider:
