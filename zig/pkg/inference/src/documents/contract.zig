@@ -518,7 +518,7 @@ pub const Run = struct {
         self.usage.total_tokens += count;
         if (self.durable) |session| {
             const key = self.durable_stage orelse return error.InvalidDocumentCheckpoint;
-            try self.touchCost(try session.measure(key, .{ .prompt_tokens = input, .completion_tokens = output_tokens }));
+            try self.touchCost(try session.measureModelTokens(key, input, output_tokens));
         }
     }
     pub fn abandonPixels(self: *Run) void {

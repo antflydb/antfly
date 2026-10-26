@@ -797,6 +797,31 @@ pub const Session = struct {
         hash.update(description);
         return hash.finalResult();
     }
+    /// Checkpoints use stable logical keys; physical model work uses the
+    /// captured execution tenure. One stage can dispatch at most once per
+    /// attempt. Include the nonce as well as the attempt so metadata rollback
+    /// cannot alias an earlier physical call. Batch dependents share this key.
+    pub fn modelCostKey(self: *const Session, stage: Digest) Digest {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-document-model-cost-v1");
+        var number: [8]u8 = undefined;
+        for ([_][]const u8{ self.lease.run_id, self.lease.owner }) |part| {
+            std.mem.writeInt(u64, &number, @intCast(part.len), .big);
+            hash.update(&number);
+            hash.update(part);
+        }
+        hash.update(&stage);
+        std.mem.writeInt(u64, &number, self.lease.attempt, .big);
+        hash.update(&number);
+        hash.update(&self.lease.nonce);
+        return hash.finalResult();
+    }
+    pub fn measureModelTokens(self: *Session, stage: Digest, prompt: u64, completion: u64) !CostReceipt {
+        return self.measure(self.modelCostKey(stage), .{ .prompt_tokens = prompt, .completion_tokens = completion });
+    }
+    pub fn modelTokenReceipt(self: *Session, stage: Digest) ?CostReceipt {
+        return self.measuredReceipt(self.modelCostKey(stage));
+    }
     pub fn ensureCapacity(self: *Session, capacity: usize) !void {
         if (capacity > 100000) return error.DocumentOutputTooLarge;
         self.lock();
@@ -1156,6 +1181,13 @@ test "document durable attempt nonces fence old workers after metadata rollback"
     _ = try store.claim(work, "run", "alice", identity, 1, 10);
     const backup = try a.dupe(u8, memory.metadata.?);
     const old = try store.claim(work, "run", "alice", identity, 12, 10);
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 12;
+        }
+    };
+    var old_session = try Session.init(a, store, old, identity, .{ .now_fn = Clock.now }, 8, 4096);
+    defer old_session.deinit();
     var late = try store.load(work, "run", "alice");
     const expected = late.version();
     late.revision += 1;
@@ -1164,6 +1196,13 @@ test "document durable attempt nonces fence old workers after metadata rollback"
     const current = try store.claim(work, "run", "alice", identity, 12, 10);
     try std.testing.expectEqual(old.attempt, current.attempt);
     try std.testing.expect(!std.mem.eql(u8, &old.nonce, &current.nonce));
+    var current_session = try Session.init(a, store, current, identity, .{ .now_fn = Clock.now }, 8, 4096);
+    defer current_session.deinit();
+    const stage = old_session.key("same-model-input");
+    try std.testing.expectEqual(stage, current_session.key("same-model-input"));
+    const old_cost = old_session.modelCostKey(stage);
+    const current_cost = current_session.modelCostKey(stage);
+    try std.testing.expect(!std.mem.eql(u8, &old_cost, &current_cost));
     try std.testing.expect(!try memory.interface().cas_fn(&memory, expected, late));
     try std.testing.expectError(error.DocumentRunLeaseLost, store.reserve(work, old, @splat(9), .{ .calls = 1 }, 13));
     try std.testing.expect(try store.reserve(work, current, @splat(9), .{ .calls = 1 }, 13));

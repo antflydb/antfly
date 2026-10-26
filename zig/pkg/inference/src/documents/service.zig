@@ -26,7 +26,7 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-const adapter_version = "antfly-documents-v6";
+const adapter_version = "antfly-documents-v7";
 const durable = @import("durable.zig");
 
 pub const ReadRequest = struct {

@@ -216,7 +216,7 @@ pub fn Batcher(comptime Node: type) type {
                 // that receipt on all item/page checkpoints, regardless of which
                 // ticket reported it or which page is restored first.
                 if (first.run.durable) |session| {
-                    const receipt = session.measuredReceipt(first.run.durable_stage orelse return error.InvalidDocumentCheckpoint) orelse return error.InvalidDocumentCheckpoint;
+                    const receipt = session.modelTokenReceipt(first.run.durable_stage orelse return error.InvalidDocumentCheckpoint) orelse return error.InvalidDocumentCheckpoint;
                     for (tickets[1..]) |ticket| try ticket.run.touchCost(receipt);
                 }
             }
@@ -405,10 +405,132 @@ test "document durable native batch attaches one measured receipt to every depen
     for (children[0..2]) |*child| {
         const receipts = try child.measured_costs.snapshot(work);
         try std.testing.expectEqual(@as(usize, 1), receipts.len);
-        try std.testing.expectEqual(keys[0], receipts[0].key);
+        try std.testing.expectEqual(session.modelCostKey(keys[0]), receipts[0].key);
         try std.testing.expectEqual(@as(u64, 10), receipts[0].measured.prompt_tokens);
         try std.testing.expectEqual(@as(u64, 3), receipts[0].measured.completion_tokens);
     }
     const other = try children[2].measured_costs.snapshot(work);
-    try std.testing.expectEqual(keys[2], other[0].key);
+    try std.testing.expectEqual(session.modelCostKey(keys[2]), other[0].key);
+}
+
+test "document durable native batch costs survive failed reporter retries in either replay order" {
+    const runs = readers.document_runs;
+    const Fake = struct {
+        fn readEncodedImagesReportedDirectWithContext(_: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            const items = try a.alloc(readers.Result, req.images.len);
+            for (items) |*item| item.* = .{ .text = "Text" };
+            return .{ .items = items, .execution = .{ .requested_items = items.len, .native_batches = 1, .native_items = items.len }, .usage = .{ .prompt_tokens = 10, .completion_tokens = 3, .total_tokens = 13 } };
+        }
+    };
+    const Retry = struct { prompt: u64, completion: u64 };
+    for ([_]Retry{ .{ .prompt = 10, .completion = 3 }, .{ .prompt = 3, .completion = 10 }, .{ .prompt = 4, .completion = 2 } }) |retry| {
+        for ([_]bool{ true, false }) |replay_first| {
+            const a = std.testing.allocator;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const work = arena.allocator();
+            var memory = readers.testing.Store{ .a = a };
+            defer memory.deinit();
+            const store = memory.interface();
+            const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+            try store.create(.{ .run_id = "batch-retry", .owner = "alice", .identity = identity, .limits = .{ .calls = 3, .tokens = 300, .output_bytes = 1048576 }, .inputs = &.{} });
+            const Clock = struct {
+                fn now(_: ?*anyopaque) u64 {
+                    return 1;
+                }
+            };
+            const lease = try store.claim(work, "batch-retry", "alice", identity, 1, 100);
+            var session = try runs.Session.init(a, store, lease, identity, .{ .now_fn = Clock.now }, 16, 32768);
+            defer session.deinit();
+            var pool = std.Io.Threaded.init(a, .{});
+            defer pool.deinit();
+            const Batch = Batcher(Fake);
+            var node = Fake{};
+            var batch = Batch{ .io = pool.io(), .node = &node, .backing = a, .stopping = true, .max_parallel = 1 };
+            const keys = [_]runs.Digest{ @splat(7), @splat(8) };
+            const upper: runs.Charge = .{ .calls = 1, .tokens = 100, .output_bytes = 4096 };
+            var ledger = c.SharedAccounting{ .limits = .{}, .usage = .{}, .event_count = 0 };
+            var children = [_]c.Run{
+                .{ .limits = .{}, .durable = &session, .durable_stage = keys[0], .shared = &ledger },
+                .{ .limits = .{}, .durable = &session, .durable_stage = keys[1], .shared = &ledger },
+            };
+            defer for (&children) |*child| child.deinit();
+            const images = [_]readers.EncodedImage{.{ .bytes = "image", .mime_type = "image/png" }};
+            var tickets = [_]Batch.Ticket{
+                .{ .allocator = a, .model = "same", .request = .{ .images = &images }, .control = .{}, .run = &children[0] },
+                .{ .allocator = a, .model = "same", .request = .{ .images = &images }, .control = .{}, .run = &children[1] },
+            };
+            defer for (&tickets) |*ticket| if (ticket.result) |*result| result.deinit(a);
+            for (&tickets, 0..) |*ticket, index| {
+                try ticket.run.call();
+                batch.pending[index] = ticket;
+            }
+            batch.count = 2;
+            try session.beginIntent(keys[1], upper);
+            const Saved = struct { usage: c.Usage, costs: []const c.costs.Receipt };
+            const Context = struct {
+                batch: *Batch,
+                child: *c.Run,
+                session: *runs.Session,
+                key: runs.Digest,
+                fn invoke(self: @This(), alloc: A) !runs.Session.Output {
+                    try self.batch.execute();
+                    for (self.batch.pending[0..2]) |ticket| if (ticket.failure) |err| return err;
+                    const bytes = try std.json.Stringify.valueAlloc(alloc, Saved{ .usage = self.child.usage, .costs = try self.child.measured_costs.snapshot(alloc) }, .{});
+                    _ = try self.session.commitIntent(alloc, self.key, .{ .calls = 1, .output_bytes = bytes.len }, bytes, "");
+                    // The sibling accepted its result, but the reporting item's decode
+                    // failed after aggregate usage had been measured for the batch.
+                    return error.InvalidDocumentModelResult;
+                }
+            };
+            try std.testing.expectError(error.InvalidDocumentModelResult, session.execute(work, keys[0], upper, 4096, Context{ .batch = &batch, .child = &children[1], .session = &session, .key = keys[1] }, Context.invoke));
+            try std.testing.expectEqual(@as(u64, 13), ledger.usage.total_tokens);
+            try store.yieldLease(work, lease, 1);
+            const next = try store.claim(work, "batch-retry", "alice", identity, 1, 100);
+            var resumed = try runs.Session.init(a, store, next, identity, .{ .now_fn = Clock.now }, 16, 32768);
+            defer resumed.deinit();
+            const expected_tokens = 13 + retry.prompt + retry.completion;
+            var fresh = c.Run{ .limits = .{ .max_total_tokens = expected_tokens, .max_model_calls = 2 }, .durable = &resumed, .durable_stage = keys[0] };
+            defer fresh.deinit();
+            const cached = (try resumed.replay(work, keys[1], 4096)).?;
+            const saved = try std.json.parseFromSliceLeaky(Saved, work, cached.bytes, .{});
+            if (replay_first) try fresh.restoreCosts(saved.usage, saved.costs);
+            try resumed.beginIntent(keys[0], upper);
+            try fresh.call();
+            fresh.physicalCall();
+            try fresh.tokens(retry.prompt, retry.completion);
+            const current_cost = resumed.modelTokenReceipt(keys[0]).?;
+            try std.testing.expectEqual(@as(usize, 1), saved.costs.len);
+            try std.testing.expect(!std.mem.eql(u8, &saved.costs[0].key, &current_cost.key));
+            const current_usage: c.Usage = .{ .model_calls = 1, .prompt_tokens = retry.prompt, .completion_tokens = retry.completion, .total_tokens = retry.prompt + retry.completion };
+            const payload = try std.json.Stringify.valueAlloc(work, Saved{ .usage = current_usage, .costs = &.{current_cost} }, .{});
+            _ = try resumed.commitIntent(work, keys[0], .{ .calls = 1, .tokens = current_usage.total_tokens, .output_bytes = payload.len }, payload, "");
+            if (!replay_first) try fresh.restoreCosts(saved.usage, saved.costs);
+            try std.testing.expectEqual(expected_tokens, fresh.usage.total_tokens);
+            try std.testing.expectEqual(10 + retry.prompt, fresh.usage.prompt_tokens);
+            try std.testing.expectEqual(3 + retry.completion, fresh.usage.completion_tokens);
+            try std.testing.expectEqual(@as(usize, 2), fresh.usage.model_calls);
+            try std.testing.expectEqual(@as(usize, 1), fresh.usage.physical_model_calls);
+            const record = try store.load(work, "batch-retry", "alice");
+            try std.testing.expectEqual(@as(u64, 200), record.uncertain.tokens);
+            try std.testing.expectEqual(200 + current_usage.total_tokens, record.used.tokens);
+            try store.yieldLease(work, next, 1);
+            const again = try store.claim(work, "batch-retry", "alice", identity, 1, 100);
+            var final_session = try runs.Session.init(a, store, again, identity, .{ .now_fn = Clock.now }, 16, 32768);
+            defer final_session.deinit();
+            var final_run = c.Run{ .limits = fresh.limits, .durable = &final_session };
+            defer final_run.deinit();
+            // A second handoff replays both accepted receipts, including the
+            // original sibling, without remapping their execution identities.
+            const order = if (replay_first) [_]usize{ 0, 1 } else [_]usize{ 1, 0 };
+            for (order) |index| {
+                const accepted = (try final_session.replay(work, keys[index], 4096)).?;
+                const value = try std.json.parseFromSliceLeaky(Saved, work, accepted.bytes, .{});
+                try final_run.restoreCosts(value.usage, value.costs);
+            }
+            try std.testing.expectEqual(expected_tokens, final_run.usage.total_tokens);
+            try std.testing.expectEqual(@as(usize, 2), final_run.usage.model_calls);
+            try std.testing.expectEqual(@as(usize, 0), final_run.usage.physical_model_calls);
+        }
+    }
 }

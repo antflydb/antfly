@@ -781,16 +781,25 @@ denied replay cannot make a later attempt free. Logical model calls, page work
 and output limits remain additive. Failed or ambiguous physical work retains
 its conservative durable charge.
 
+Model cost identities include the logical stage, run/owner, captured attempt and
+lease nonce. Accepted checkpoints keep their original receipts across handoff,
+while retrying a failed stage produces a distinct physical cost. A successful
+sibling from an earlier native batch and a retried reporting item are therefore
+charged independently, in either replay order. The nonce also prevents receipt
+collisions if metadata rollback reuses an attempt number. Pixel grants already
+have independent random identities. These cost identities do not change the
+stable logical keys used to find reusable checkpoints.
+
 Raster checkpoints store scalar JSON metadata separately from a versioned
 binary receipt section. Fixed-width receipts avoid JSON expansion and fit within
 the existing checkpoint frame ceiling; count admission uses the session's stage
 capacity. The decoder validates frame lengths, version and receipt count before
 allocating the receipt list, and can read the bounded older raster format.
 
-The pinned document adapter identity is v6. Runs already prepared with an older
+The pinned document adapter identity is v7. Runs already prepared with an older
 adapter must be resubmitted; request/source snapshots that have not been prepared
 still use the existing storage format. The adapter pin prevents older executors
-from taking over runs that can contain the new raster frames.
+from taking over runs that use the current frame and physical-cost semantics.
 
 Known failed workers settle their reservations into durable uncertainty without
 refunding physical usage, allowing accepted partial results to finish. If storage
