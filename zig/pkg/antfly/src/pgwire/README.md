@@ -20,7 +20,8 @@ are bounded scalar expressions; column references, parameters, and subqueries
 are not an argument-evaluation escape hatch into table reads. These commands
 do not create durable HTTP prepared-statement resources.
 
-SQL `DECLARE [NO SCROLL|SCROLL] CURSOR [WITH|WITHOUT HOLD]`, `FETCH`, `MOVE`,
+SQL `DECLARE [BINARY] [ASENSITIVE|INSENSITIVE] [NO SCROLL|SCROLL] CURSOR
+[WITH|WITHOUT HOLD]`, `FETCH`, `MOVE`,
 and `CLOSE` retain one eligible native pull snapshot. SCROLL supports forward,
 backward, absolute, relative, first/last and current-row positioning. Scroll and
 hold rows are copied as typed cells into a connection-owned spool: at most
@@ -35,8 +36,21 @@ buffered rows retain a small authorization capsule. Every fetch rechecks current
 credentials, scoped table identities, read grants and row filters. Held rows
 survive later transaction boundaries, not disconnect or node restart. Rollback
 to a savepoint closes cursors created after that savepoint without rewinding
-earlier cursor positions. Blocking plans without a native pull stream remain
-unsupported for SQL DECLARE.
+earlier cursor positions. Blocking read plans materialize once under the
+ordinary statement result cap before entering the shared cursor spool. DECLARE
+requires the native binder to identify a read query before opening or executing
+it; mutation RETURNING columns cannot grant cursor eligibility.
+
+Simple-query FETCH uses the declaration's text or binary format. Extended-query
+DECLARE, FETCH, MOVE and CLOSE use Parse/Bind/Execute, and Bind's result formats
+always override BINARY, including an empty format vector meaning text. An
+extended FETCH evaluates the whole requested range once before its first output
+page, matching PostgreSQL cursor-position semantics. Execute can then suspend and
+resume those results independently of later cursor movement or CLOSE. Existing
+scroll pages are retained by reference in constant space; streaming cursors copy
+only the fetched result into the same bounded typed-store budget. Portal closure
+and disconnect release those references. Binary encoding uses precise temporal,
+array, NUMERIC and range identities; SQL NULL remains distinct from JSON null.
 
 `SET [SESSION|LOCAL] statement_timeout`, `SHOW statement_timeout`, and
 `RESET statement_timeout` work with both simple and extended queries. Values

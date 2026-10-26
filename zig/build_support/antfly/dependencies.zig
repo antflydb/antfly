@@ -1397,6 +1397,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_test_mod.addImport("antfly-json", json_mod);
     sql_test_mod.addImport("antfly_platform", platform_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    pgwire_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     sql_test_mod.addImport("antfly_regex", regex_mod);
     sql_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
     // Native wire parameter frames share the SQL scalar/type owner.

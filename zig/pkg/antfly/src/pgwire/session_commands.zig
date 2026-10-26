@@ -23,7 +23,7 @@ pub const Command = union(enum) {
     prepare: struct { name: []const u8, types: []const Type, descriptors: []const @import("backend.zig").Parameter, statement: []const u8 },
     execute: struct { name: []const u8, expressions: []const []const u8 },
     deallocate: ?[]const u8,
-    declare_cursor: struct { name: []const u8, statement: []const u8, scroll: bool = false, hold: bool = false },
+    declare_cursor: struct { name: []const u8, statement: []const u8, scroll: bool = false, hold: bool = false, binary: bool = false },
     fetch_cursor: Fetch,
     close_cursor: ?[]const u8,
 };
@@ -686,12 +686,30 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
         const name = try p.name();
         try p.space();
         if (p.pos == input.len or input[p.pos] == ';') return error.InvalidSqlSyntax;
-        const modifier = try p.word();
-        const scroll = std.ascii.eqlIgnoreCase(modifier, "scroll");
-        if (std.ascii.eqlIgnoreCase(modifier, "no")) {
-            if (!std.ascii.eqlIgnoreCase(try p.word(), "scroll")) return error.InvalidSqlSyntax;
-        } else if (!scroll and !std.ascii.eqlIgnoreCase(modifier, "cursor")) return error.InvalidSqlSyntax;
-        if ((scroll or std.ascii.eqlIgnoreCase(modifier, "no")) and !std.ascii.eqlIgnoreCase(try p.word(), "cursor")) return error.InvalidSqlSyntax;
+        // PostgreSQL permits these options in any order. Keep the complete
+        // declaration intent; formatting is selected at FETCH, never baked
+        // into the typed cursor spool.
+        var binary = false;
+        var sensitivity: ?bool = null;
+        var scroll = false;
+        var scroll_seen = false;
+        while (true) {
+            const modifier = try p.word();
+            if (std.ascii.eqlIgnoreCase(modifier, "cursor")) break;
+            if (std.ascii.eqlIgnoreCase(modifier, "binary")) {
+                binary = true;
+            } else if (std.ascii.eqlIgnoreCase(modifier, "asensitive") or std.ascii.eqlIgnoreCase(modifier, "insensitive")) {
+                const asensitive = std.ascii.eqlIgnoreCase(modifier, "asensitive");
+                if (sensitivity) |previous| if (previous != asensitive) return error.InvalidCursorDefinition;
+                sensitivity = asensitive;
+            } else if (std.ascii.eqlIgnoreCase(modifier, "scroll") or std.ascii.eqlIgnoreCase(modifier, "no")) {
+                const next = std.ascii.eqlIgnoreCase(modifier, "scroll");
+                if (scroll_seen and scroll != next) return error.InvalidCursorDefinition;
+                scroll_seen = true;
+                scroll = next;
+                if (!scroll and !std.ascii.eqlIgnoreCase(try p.word(), "scroll")) return error.InvalidSqlSyntax;
+            } else return error.InvalidSqlSyntax;
+        }
         var following = try p.word();
         var hold = false;
         if (std.ascii.eqlIgnoreCase(following, "with") or std.ascii.eqlIgnoreCase(following, "without")) {
@@ -706,7 +724,7 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
         if (p.pos == input.len) return error.InvalidSqlSyntax;
         const statement = std.mem.trim(u8, input[p.pos..], " \r\n\t;");
         if (statement.len == 0) return error.InvalidSqlSyntax;
-        return .{ .declare_cursor = .{ .name = name, .statement = statement, .scroll = scroll, .hold = hold } };
+        return .{ .declare_cursor = .{ .name = name, .statement = statement, .scroll = scroll, .hold = hold, .binary = binary } };
     }
     if (std.ascii.eqlIgnoreCase(verb, "fetch") or std.ascii.eqlIgnoreCase(verb, "move")) {
         var fetch: Fetch = .{ .name = "", .move = std.ascii.eqlIgnoreCase(verb, "move") };
@@ -951,4 +969,32 @@ test "pgwire canonical read settings parse receipts and reject unsupported visib
     try std.testing.expectError(error.UnsupportedReadVisibility, settingCommand(a, "SET antfly.read_requirements = '{\"visibility\":\"published\"}'"));
     try std.testing.expectError(error.InvalidReadRequirements, settingCommand(a, "SET antfly.read_requirements = '{\"wait_ms\":60001}'"));
     try std.testing.expectError(error.InvalidParameter, settingCommand(a, "SET antfly.read_requirements = '{\"through\":{}}'"));
+}
+
+test "pgwire cursor declaration options retain binary identity in every PostgreSQL order" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "BINARY SCROLL",             "SCROLL BINARY",                         "BINARY INSENSITIVE SCROLL",
+        "INSENSITIVE SCROLL BINARY", "SCROLL BINARY ASENSITIVE",              "ASENSITIVE BINARY SCROLL",
+        "BINARY BINARY SCROLL",      "INSENSITIVE INSENSITIVE BINARY SCROLL", "SCROLL SCROLL BINARY",
+    }) |options| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const sql = try std.fmt.allocPrint(arena.allocator(), "DECLARE c {s} CURSOR WITH HOLD FOR SELECT 1", .{options});
+        const declaration = (try parse(arena.allocator(), sql, 0)).?.declare_cursor;
+        try std.testing.expect(declaration.binary and declaration.scroll and declaration.hold);
+        try std.testing.expectEqualStrings("SELECT 1", declaration.statement);
+    }
+    for ([_][]const u8{ "SCROLL NO SCROLL", "NO SCROLL SCROLL", "ASENSITIVE INSENSITIVE" }) |options| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const sql = try std.fmt.allocPrint(arena.allocator(), "DECLARE c {s} CURSOR FOR SELECT 1", .{options});
+        try std.testing.expectError(error.InvalidCursorDefinition, parse(arena.allocator(), sql, 0));
+    }
+    for ([_][]const u8{ "NO BINARY", "BINARY CURSOR SCROLL" }) |options| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const sql = try std.fmt.allocPrint(arena.allocator(), "DECLARE c {s} CURSOR FOR SELECT 1", .{options});
+        try std.testing.expectError(error.InvalidSqlSyntax, parse(arena.allocator(), sql, 0));
+    }
 }

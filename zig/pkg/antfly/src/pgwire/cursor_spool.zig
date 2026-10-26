@@ -24,6 +24,7 @@ const ColumnPayload = union(enum) {
     json: struct { values: []std.json.Value, nulls: []bool, encoded: []?[]const u8, frozen: []?@import("antfly_local_sources").sql_execution_batch.FrozenJson },
     array: []?*const @import("antfly_local_sources").sql_array_value.Value,
     numeric: []?*const @import("antfly_local_sources").sql_numeric_value.Value,
+    range: []?*const @import("antfly_local_sources").sql_range_value.Value,
 };
 const Page = struct {
     arena: std.heap.ArenaAllocator,
@@ -34,7 +35,7 @@ const Page = struct {
 // Identity is valid only during one append lease. Entries point to page-owned
 // copies; the fixed table bounds scratch independently of page cardinality.
 const PayloadMemo = struct {
-    const Key = struct { pointer: usize, length: usize, kind: enum { frozen, json, array, numeric }, flags: u8 = 0 };
+    const Key = struct { pointer: usize, length: usize, kind: enum { frozen, json, array, numeric, range }, flags: u8 = 0 };
     const Entry = struct { key: Key, value: backend.Cell };
     entries: [64]?Entry = @splat(null),
     fn slot(key: Key) usize {
@@ -58,6 +59,33 @@ const PayloadMemo = struct {
         self.entries[slot(key)] = .{ .key = key, .value = value };
     }
 };
+/// Connection-local references share immutable pages between a SQL cursor and
+/// an extended FETCH portal. CLOSE releases its reference; a suspended portal
+/// retains the already evaluated result. All storage and handle bytes count
+/// against the same connection cursor budget. No cross-thread atomics needed.
+pub const Shared = struct {
+    refs: usize = 1,
+    store: Store,
+    pub fn create(budget: *Budget) !*Shared {
+        const owned = try budget.allocator().create(Shared);
+        owned.* = .{ .store = Store.init(budget) };
+        return owned;
+    }
+    pub fn retain(self: *Shared) *Shared {
+        self.refs += 1;
+        return self;
+    }
+    pub fn release(self: *Shared) void {
+        std.debug.assert(self.refs != 0);
+        self.refs -= 1;
+        if (self.refs == 0) {
+            const alloc = self.store.budget.allocator();
+            self.store.deinit();
+            alloc.destroy(self);
+        }
+    }
+};
+
 pub const Store = struct {
     budget: *Budget,
     pages: std.ArrayList(*Page) = .empty,
@@ -101,6 +129,7 @@ pub const Store = struct {
             .json => |data| if (data.frozen.len != 0 and data.frozen[index] != null) .{ .frozen_json = data.frozen[index], .sql_null = false } else if (data.encoded.len != 0 and data.encoded[index] != null) .{ .json_bytes = data.encoded[index], .sql_null = false } else .{ .value = data.values[index], .sql_null = data.nulls[index] },
             .array => |values| if (values[index]) |value| .{ .array = value, .sql_null = false } else .{ .sql_null = true },
             .numeric => |values| if (values[index]) |value| .{ .numeric = value, .sql_null = false } else .{ .sql_null = true },
+            .range => |values| if (values[index]) |value| .{ .range = value, .sql_null = false } else .{ .sql_null = true },
         };
     }
     pub fn append(self: *Store, result: backend.Result, max_rows: usize) !void {
@@ -108,7 +137,7 @@ pub const Store = struct {
         if (count > max_rows -| self.row_count) return error.ProgramLimitExceeded;
         if (self.columns) |definitions| {
             if (definitions.len != result.columns.len) return error.InvalidResult;
-            for (definitions, result.columns) |old, next| if (old.type != next.type or old.element_type != next.element_type or !std.meta.eql(old.numeric_modifier, next.numeric_modifier) or !std.mem.eql(u8, old.name, next.name)) return error.InvalidResult;
+            for (definitions, result.columns) |old, next| if (!backend.sameColumnType(old, next) or !std.mem.eql(u8, old.name, next.name)) return error.InvalidResult;
         }
         if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
         if (count == 0) return;
@@ -130,16 +159,16 @@ pub const Store = struct {
         const sources = @import("antfly_local_sources");
         for (definitions, page.columns) |definition, *payload| {
             _ = try @import("values.zig").columnOid(definition);
-            payload.* = if (definition.type == .array) .{ .array = try a.alloc(?*const sources.sql_array_value.Value, count) } else if (definition.type == .number and definition.element_type == .numeric) .{ .numeric = try a.alloc(?*const sources.sql_numeric_value.Value, count) } else .{ .json = .{ .values = try a.alloc(std.json.Value, count), .nulls = try a.alloc(bool, count), .encoded = if (definition.type == .json) try a.alloc(?[]const u8, count) else &.{}, .frozen = if (definition.type == .json) try a.alloc(?sources.sql_execution_batch.FrozenJson, count) else &.{} } };
+            payload.* = if (sources.sql_range_value.kindFromType(definition.type) != null) .{ .range = try a.alloc(?*const sources.sql_range_value.Value, count) } else if (definition.type == .array) .{ .array = try a.alloc(?*const sources.sql_array_value.Value, count) } else if (definition.type == .number and definition.element_type == .numeric) .{ .numeric = try a.alloc(?*const sources.sql_numeric_value.Value, count) } else .{ .json = .{ .values = try a.alloc(std.json.Value, count), .nulls = try a.alloc(bool, count), .encoded = if (definition.type == .json) try a.alloc(?[]const u8, count) else &.{}, .frozen = if (definition.type == .json) try a.alloc(?sources.sql_execution_batch.FrozenJson, count) else &.{} } };
         }
         var memo: PayloadMemo = .{};
         for (0..count) |row| for (definitions, page.columns, 0..) |definition, *payload, column| {
             const value = try result.cell(a, row, column);
-            if (value.sql_null and (value.value != .null or value.array != null or value.numeric != null or value.json_bytes != null or value.frozen_json != null)) return error.InvalidResult;
-            if (value.frozen_json != null and (definition.type != .json or value.value != .null or value.array != null or value.numeric != null or value.json_bytes != null)) return error.InvalidResult;
+            if (value.sql_null and (value.value != .null or value.array != null or value.numeric != null or value.range != null or value.json_bytes != null or value.frozen_json != null)) return error.InvalidResult;
+            if (value.frozen_json != null and (definition.type != .json or value.value != .null or value.array != null or value.numeric != null or value.range != null or value.json_bytes != null)) return error.InvalidResult;
             switch (payload.*) {
                 .json => |data| {
-                    if (value.array != null or value.numeric != null) return error.InvalidResult;
+                    if (value.array != null or value.numeric != null or value.range != null) return error.InvalidResult;
                     if (data.frozen.len != 0) data.frozen[row] = null;
                     if (value.frozen_json) |frozen| {
                         var owned = frozen;
@@ -166,7 +195,7 @@ pub const Store = struct {
                         values[row] = null;
                         continue;
                     }
-                    if (value.numeric != null) return error.InvalidResult;
+                    if (value.numeric != null or value.range != null) return error.InvalidResult;
                     var view: ?sources.sql_array_wire.Borrowed = null;
                     defer if (view) |*owned| owned.deinit();
                     const array = if (value.array) |native| native else decoded: {
@@ -190,12 +219,38 @@ pub const Store = struct {
                         values[row] = (try sources.sql_operators.cloneDatum(a, .{ .array = &validated, .sql_null = false })).array.?;
                     }
                 },
+                .range => |values| {
+                    if (value.sql_null) {
+                        values[row] = null;
+                        continue;
+                    }
+                    if (value.array != null or value.numeric != null or value.json_bytes != null or value.frozen_json != null) return error.InvalidResult;
+                    const ranges = sources.sql_range_value;
+                    var context: ranges.Context = .{ .alloc = a };
+                    const kind = ranges.kindFromType(definition.type) orelse return error.InvalidResult;
+                    if (value.range) |range| {
+                        if (value.value != .null or range.kind != kind) return error.InvalidResult;
+                        const key: PayloadMemo.Key = .{ .pointer = @intFromPtr(range), .length = 0, .kind = .range };
+                        if (memo.get(key)) |cached| {
+                            values[row] = cached.range.?;
+                        } else {
+                            var canonical = try ranges.canonical(&context, range.*);
+                            values[row] = (try sources.sql_operators.cloneDatum(a, sources.sql_scalar.Datum.typedRange(&canonical))).range().?;
+                            memo.put(key, .{ .range = values[row], .sql_null = false });
+                        }
+                    } else {
+                        if (value.value != .string) return error.InvalidResult;
+                        const parsed = try a.create(ranges.Value);
+                        parsed.* = try ranges.parseLeaky(&context, kind, value.value.string);
+                        values[row] = parsed;
+                    }
+                },
                 .numeric => |values| {
                     if (value.sql_null) {
                         values[row] = null;
                         continue;
                     }
-                    if (value.array != null) return error.InvalidResult;
+                    if (value.array != null or value.range != null) return error.InvalidResult;
                     if (value.numeric) |number| {
                         if (value.value != .null) return error.InvalidResult;
                         const key: PayloadMemo.Key = .{ .pointer = @intFromPtr(number), .length = 0, .kind = .numeric };
@@ -536,4 +591,69 @@ test "pgwire prepared array validation memo measurement" {
         }
         std.debug.print("PGWIRE_PREPARED_ARRAY_MEMO rows={} elements=65536 iterations=5 elapsed_ns={} one_owned_copy=true\n", .{ count, elapsed });
     }
+}
+
+test "pgwire shared cursor pages retain FETCH rows after CLOSE without copying or escaping the budget" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var budget: Budget = .{ .child = a, .limit = 1024 * 1024 };
+            const cursor = try Shared.create(&budget);
+            var cursor_live = true;
+            defer if (cursor_live) cursor.release();
+            try cursor.store.append(.{
+                .columns = &.{.{ .name = "n", .type = .integer }},
+                .rows = &.{ &.{.{ .integer = 9007199254740993 }}, &.{.null} },
+                .command_tag = "SELECT 2",
+            }, 2);
+            const used = budget.used;
+            // Each portal retains the existing pages in O(1) space; no row,
+            // payload, directory or reference allocation occurs on capture.
+            var portals: [64]*Shared = undefined;
+            for (&portals) |*portal| portal.* = cursor.retain();
+            try std.testing.expectEqual(used, budget.used);
+            cursor_live = false;
+            cursor.release();
+            for (portals) |portal| {
+                const cell = try portal.store.cell(0, 0);
+                try std.testing.expectEqual(@as(i64, 9007199254740993), cell.value.integer);
+                try std.testing.expect(!cell.sql_null);
+                try std.testing.expect((try portal.store.cell(1, 0)).sql_null);
+                portal.release();
+            }
+            try std.testing.expectEqual(@as(usize, 0), budget.used);
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "pgwire cursor spool owns native range endpoints and preserves empty and SQL NULL" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    const ranges = sources.sql_range_value;
+    var budget: Budget = .{ .child = a, .limit = 1024 * 1024 };
+    var spool = Store.init(&budget);
+    defer spool.deinit();
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var context: ranges.Context = .{ .alloc = arena.allocator() };
+        var range = try ranges.parseLeaky(&context, .numrange, "[1.12345678901234567890,99.001)");
+        const Rows = struct {
+            range: *const ranges.Value,
+            fn read(raw: *anyopaque, _: std.mem.Allocator, row: usize, _: usize) !backend.Cell {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return if (row == 0) .{ .range = self.range, .sql_null = false } else .{ .sql_null = true };
+            }
+        };
+        var rows: Rows = .{ .range = &range };
+        try spool.append(.{ .columns = &.{.{ .name = "r", .type = .numrange }}, .cells = .{ .context = &rows, .count = 2, .width = 1, .read = Rows.read }, .command_tag = "SELECT 2" }, 3);
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var context: ranges.Context = .{ .alloc = arena.allocator() };
+    try std.testing.expectEqualStrings("[1.12345678901234567890,99.001)", try ranges.formatLeaky(&context, (try spool.cell(0, 0)).range.?.*));
+    try std.testing.expect((try spool.cell(1, 0)).sql_null);
+    try spool.append(.{ .columns = &.{.{ .name = "r", .type = .numrange }}, .rows = &.{&.{.{ .string = "empty" }}}, .command_tag = "SELECT 1" }, 3);
+    try std.testing.expect((try spool.cell(2, 0)).range.?.empty);
 }

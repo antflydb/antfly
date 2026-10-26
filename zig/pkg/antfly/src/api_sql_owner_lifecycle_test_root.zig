@@ -46,6 +46,7 @@ test {
     _ = @import("api/sql_document_alias_integration_test.zig");
     _ = @import("api/sql_document_generated_integration_test.zig");
     _ = @import("api/sql_temporal_bin_integration_test.zig");
+    _ = @import("api/sql_cursor_lifecycle_integration_test.zig");
     _ = @import("api/sql_view_domain_integration_test.zig");
     _ = @import("api/sql_collection_integration_test.zig");
     _ = @import("system_catalog/views.zig");

@@ -3377,6 +3377,43 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-binary-cursor-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-cursor-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-binary-cursor-protocol-debug": {
+      "command": [
+        "zig",
+        "build",
+        "pgwire-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-binary-cursor-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_cursor_reference.py",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -4171,8 +4208,25 @@
     },
     {
       "id": "sql-0049",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The historical catalog/admin mutation plan is replaced by an authenticated connection-owned PostgreSQL binary scroll/hold cursor. The unchanged original DECLARE executes through native typed-row storage under explicit READ COMMITTED setup before and after cold metadata/data-owner recovery. PostgreSQL independently verifies exact column OIDs, text/binary formats, row bytes, positioning, end-of-cursor results and completion tags. Extended Bind overrides the declaration format; a suspended FETCH evaluates one immutable range before emitting rows, survives later movement/CLOSE/name reuse without replay, and rejects continuation in an aborted transaction. Existing scroll pages are shared under the same connection budget rather than copied; quota, allocation-fault, precise temporal/range identity, read-only declaration admission, revocation and ambiguous-commit regressions remain independently gated.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_cursor_lifecycle_integration_test.zig",
+          "test": "mounted SQL original binary cursor preserves PostgreSQL scroll hold formats and cold owners",
+          "gate": "sql-qualified-binary-cursor-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/pgwire/protocol_test.zig",
+          "test": "pgwire PostgreSQL cursor oracle preserves binary scroll hold and Bind format overrides",
+          "gate": "sql-qualified-binary-cursor-protocol-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_cursor_lifecycle_integration_test.zig",
+          "test": "mounted SQL original binary cursor preserves PostgreSQL scroll hold formats and cold owners",
+          "gate": "sql-qualified-binary-cursor-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0050",

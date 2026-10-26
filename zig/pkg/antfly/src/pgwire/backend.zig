@@ -27,6 +27,14 @@ pub const Column = struct {
     element_type: ?@import("antfly_local_sources").sql_array_value.ElementType = null,
     numeric_modifier: ?@import("antfly_local_sources").sql_scalar.NumericModifier = null,
 };
+/// Physical output identity shared by prepared plans, stream pages and cursor
+/// spools. Names may change under cached-plan rebinding; wire types may not.
+pub fn sameColumnType(a: Column, b: Column) bool {
+    return a.type == b.type and a.element_type == b.element_type and
+        (a.type != .datetime or (a.temporal_kind orelse .timestamp_tz) == (b.temporal_kind orelse .timestamp_tz)) and
+        @import("antfly_local_sources").sql_scalar.NumericModifier.eql(a.numeric_modifier, b.numeric_modifier);
+}
+
 pub const TransactionStatus = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 
 pub const Identity = struct {
@@ -106,6 +114,9 @@ pub const Diagnostic = struct {
 pub const MutationOutcome = enum { committed, committed_pending, committed_repair_required, committed_graph_metric_materialization_rejected };
 
 pub const Description = struct {
+    /// Authoritative binder approval for DECLARE's query body. Result columns
+    /// alone cannot distinguish SELECT from a mutation with RETURNING.
+    cursor_readable: bool = false,
     copy_out: ?@import("antfly_local_sources").sql_ast.CopyOptions = null,
     columns: []const Column = &.{},
     parameter_types: []const Type = &.{},

@@ -23,6 +23,7 @@ const formatting = @import("formatting.zig");
 const commands = @import("session_commands.zig");
 const settings_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const Spool = @import("cursor_spool.zig").Store;
+const SharedSpool = @import("cursor_spool.zig").Shared;
 const Budget = @import("budget.zig").Budget;
 
 pub const Limits = struct {
@@ -75,6 +76,28 @@ const Portal = struct {
     stream_complete: bool = false,
     offset: usize = 0,
     failed: bool = false,
+    cursor_command: ?commands.Command = null,
+    cursor_rows: u64 = 0,
+    cursor_complete: bool = false,
+    cursor_capture: ?CapturedFetch = null,
+};
+
+/// A FETCH is one utility statement: PostgreSQL advances the cursor for its
+/// whole requested range before Execute emits the first continuation page.
+/// Keep an immutable range over typed pages, independent of cursor position or
+/// CLOSE, instead of reparsing/reexecuting or copying an existing scroll spool.
+const CapturedFetch = struct {
+    rows: ?*SharedSpool = null,
+    first: usize = 0,
+    backward: bool = false,
+    count: usize = 0,
+    fn deinit(self: *CapturedFetch) void {
+        if (self.rows) |rows| rows.release();
+        self.* = .{};
+    }
+    fn index(self: CapturedFetch, offset: usize) usize {
+        return if (self.backward) self.first - offset else self.first + offset;
+    }
 };
 
 const SqlCursor = struct {
@@ -85,9 +108,10 @@ const SqlCursor = struct {
     session_id: []const u8,
     fetched: u64 = 0,
     exhausted: bool = false,
-    spool: ?Spool = null,
+    spool: ?*SharedSpool = null,
     scroll: bool = false,
     hold: bool = false,
+    binary: bool = false,
     committed: bool = false,
     database: ?[]const u8 = null,
     namespace: ?[]const u8 = null,
@@ -393,6 +417,30 @@ pub const Session = struct {
                 .discard_all, .discard_sequences => &.{},
             } };
         }
+        if (try commands.parse(alloc, statement, self.limits.parameters)) |command_| switch (command_) {
+            .fetch_cursor => |fetch| {
+                if (types.len != 0) return error.InvalidParameter;
+                const opened = self.sql_cursors.getPtr(fetch.name) orelse return error.InvalidCursorName;
+                const columns = try cloneColumns(alloc, if (fetch.move) &.{} else opened.description.columns);
+                return .{ .columns = columns };
+            },
+            .declare_cursor => |declaration| {
+                if (types.len != 0) return error.InvalidParameter;
+                const body = try self.describeNative(alloc, declaration.statement, &.{}, &.{});
+                if (!body.cursor_readable or body.copy_out != null) return error.InvalidSqlSyntax;
+                if (body.parameter_types.len != 0) return error.InvalidParameter;
+                return .{ .columns = &.{} };
+            },
+            .close_cursor => {
+                if (types.len != 0) return error.InvalidParameter;
+                return .{ .columns = &.{} };
+            },
+            else => {},
+        };
+        return self.describeNative(alloc, statement, types, descriptors);
+    }
+
+    fn describeNative(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type, descriptors: []const backend.Parameter) !backend.Description {
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
@@ -995,6 +1043,7 @@ pub const Session = struct {
                 try cursor.finish();
                 const text = try a.dupe(u8, statement.statement);
                 const description = backend.Description{
+                    .cursor_readable = current.cursor_readable,
                     .copy_out = current.copy_out,
                     .columns = current.columns,
                     .parameter_types = types,
@@ -1014,6 +1063,10 @@ pub const Session = struct {
                 portal.description = description;
                 portal.namespace = namespace;
                 portal.search_path = statement.search_path;
+                if (try commands.parse(a, text, self.limits.parameters)) |command_| switch (command_) {
+                    .fetch_cursor, .declare_cursor, .close_cursor => portal.cursor_command = command_,
+                    else => {},
+                };
                 // Complete every fallible preparation before retiring an
                 // existing unnamed portal. Publication itself cannot allocate.
                 try self.portals.ensureUnusedCapacity(self.alloc, 1);
@@ -1070,6 +1123,11 @@ pub const Session = struct {
                     stream.close(stream.context);
                     portal.stream = null;
                 };
+                if (portal.cursor_command != null) {
+                    try self.executeCursorPortal(portal, @intCast(requested));
+                    portal.failed = false;
+                    return;
+                }
                 if (!portal.stream_opened) {
                     self.read_receipt_budget = .{};
                     portal.description = try self.rebindCached(portal.arena.allocator(), portal.statement, portal.description);
@@ -1209,11 +1267,11 @@ pub const Session = struct {
                 return true;
             },
             .declare_cursor => |declaration| {
-                try self.declareCursor(declaration.name, declaration.statement, declaration.scroll, declaration.hold);
+                try self.declareCursor(declaration.name, declaration.statement, declaration.scroll, declaration.hold, declaration.binary);
                 return true;
             },
             .fetch_cursor => |fetch| {
-                self.fetchCursor(fetch) catch |err| {
+                _ = self.fetchCursor(fetch, .{}) catch |err| {
                     self.removeSqlCursor(fetch.name);
                     return err;
                 };
@@ -1236,7 +1294,7 @@ pub const Session = struct {
         return true;
     }
 
-    fn declareCursor(self: *Session, name: []const u8, statement: []const u8, scroll: bool, hold: bool) !void {
+    fn declareCursor(self: *Session, name: []const u8, statement: []const u8, scroll: bool, hold: bool, binary: bool) !void {
         if (self.status == .failed) return error.SqlTransactionAborted;
         if (!hold and (self.status != .in_transaction or self.session_id == null)) return error.CursorMustBeInTransaction;
         if (self.sql_cursors.contains(name)) return error.DuplicateCursorName;
@@ -1245,7 +1303,7 @@ pub const Session = struct {
         var arena_moved = false;
         defer if (!arena_moved) arena.deinit();
         const description = try self.describe(arena.allocator(), statement, &.{});
-        if (description.copy_out != null) return error.InvalidSqlSyntax;
+        if (!description.cursor_readable or description.copy_out != null) return error.InvalidSqlSyntax;
         if (description.parameter_types.len != 0) return error.InvalidParameter;
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
@@ -1258,21 +1316,14 @@ pub const Session = struct {
         const stream = if (self.source.vtable.open_stream) |open| try open(self.source.context, self.alloc, identity, req) else null;
         var stream_moved = false;
         defer if (!stream_moved) if (stream) |opened| opened.close(opened.context);
-        var spool: ?Spool = null;
+        var spool: ?*SharedSpool = null;
         var spool_moved = false;
-        defer if (!spool_moved) if (spool) |*owned| owned.deinit();
+        defer if (!spool_moved) if (spool) |owned| owned.release();
         if (stream) |opened| {
             if (!columnsEqual(description.columns, opened.columns)) return error.InvalidResult;
             if (scroll or hold) if (opened.validate == null or opened.detach == null) return error.UnsupportedSqlExecution;
         }
-        if (stream == null or scroll or hold) {
-            if (self.cursor_budget == null) {
-                const budget = try self.alloc.create(Budget);
-                budget.* = .{ .child = self.alloc, .limit = @min(self.limits.cursor_bytes, self.limits.connection_bytes) };
-                self.cursor_budget = budget;
-            }
-            spool = Spool.init(self.cursor_budget.?);
-        }
+        if (stream == null or scroll or hold) spool = try self.newCursorSpool();
         if (stream == null) {
             // Blocking sorts/aggregates decline pull execution. Materialize
             // once under the statement row cap, then copy into the shared
@@ -1286,7 +1337,7 @@ pub const Session = struct {
             if (!columnsEqual(description.columns, result.columns) or !std.mem.startsWith(u8, result.command_tag, "SELECT") or
                 result.mutation_outcome != null or result.ddl_receipt_json != null or result.catalog_receipt_json != null or result.continuation != null or
                 result.transaction_status != self.status or !same_session or result.rowCount() > self.limits.result_rows) return error.InvalidResult;
-            spool.?.append(result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
+            spool.?.store.append(result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
         }
         const owned_statement = try arena.allocator().dupe(u8, statement);
         const session_id = try arena.allocator().dupe(u8, self.session_id orelse "");
@@ -1296,7 +1347,7 @@ pub const Session = struct {
         const database = if (self.database) |value| try arena.allocator().dupe(u8, value) else null;
         const namespace = try arena.allocator().dupe(u8, self.request_namespace orelse self.effectiveNamespace());
         self.cursor_epoch = std.math.add(u64, self.cursor_epoch, 1) catch return error.ProgramLimitExceeded;
-        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .search_path = self.effectiveSearchPath(), .creation_epoch = self.cursor_epoch });
+        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .binary = binary, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .search_path = self.effectiveSearchPath(), .creation_epoch = self.cursor_epoch });
         key_moved = true;
         arena_moved = true;
         stream_moved = true;
@@ -1306,7 +1357,78 @@ pub const Session = struct {
         try self.command("DECLARE CURSOR");
     }
 
-    fn fetchCursor(self: *Session, fetch: commands.Fetch) !void {
+    const FetchOutput = struct {
+        /// null means simple-query formatting follows DECLARE BINARY. Bind's
+        /// explicit (even empty/text) vector always overrides the declaration.
+        formats: ?[]const u16 = null,
+        describe: bool = true,
+        command: bool = true,
+        capture: ?*CapturedFetch = null,
+    };
+
+    fn newCursorSpool(self: *Session) !*SharedSpool {
+        if (self.cursor_budget == null) {
+            const budget = try self.alloc.create(Budget);
+            budget.* = .{ .child = self.alloc, .limit = @min(self.limits.cursor_bytes, self.limits.connection_bytes) };
+            self.cursor_budget = budget;
+        }
+        return SharedSpool.create(self.cursor_budget.?) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
+    }
+
+    fn executeCursorPortal(self: *Session, portal: *Portal, requested: u32) !void {
+        if (self.status == .failed) return error.SqlTransactionAborted;
+        const command_ = portal.cursor_command.?;
+        if (command_ != .fetch_cursor) {
+            if (!portal.cursor_complete) {
+                _ = try self.sessionCommand(portal.arena.allocator(), portal.statement);
+                portal.cursor_complete = true;
+            } else try self.command(if (command_ == .declare_cursor) "DECLARE CURSOR" else "CLOSE CURSOR");
+            return;
+        }
+        const fetch = command_.fetch_cursor;
+        if (!portal.cursor_complete) {
+            const opened = self.sql_cursors.getPtr(fetch.name) orelse return error.InvalidCursorName;
+            if (!fetch.move and !columnsEqual(portal.description.columns, opened.description.columns)) return error.ResultShapeChanged;
+            var capture: CapturedFetch = .{};
+            errdefer capture.deinit();
+            portal.cursor_rows = self.fetchCursor(fetch, .{ .describe = false, .command = false, .capture = if (fetch.move) null else &capture }) catch |err| {
+                self.removeSqlCursor(fetch.name);
+                return err;
+            };
+            portal.cursor_capture = capture;
+            portal.cursor_complete = true;
+        }
+        var tag: [64]u8 = undefined;
+        if (fetch.move) return self.command(try std.fmt.bufPrint(&tag, "MOVE {d}", .{portal.cursor_rows}));
+        const capture = portal.cursor_capture.?;
+        const count = if (requested == 0) capture.count - portal.offset else @min(requested, capture.count - portal.offset);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        const req = self.request(portal.statement, &.{}, &.{});
+        var row_bytes = std.Io.Writer.Allocating.init(self.alloc);
+        defer row_bytes.deinit();
+        for (0..count) |i| {
+            try req.check();
+            try self.cursorRow(&row_bytes, portal.description.columns, portal.formats, &capture.rows.?.store, capture.index(portal.offset + i));
+            if ((i + 1) % 256 == 0) try self.writer.flush();
+        }
+        portal.offset += count;
+        if (portal.offset < capture.count) return self.message('s', "");
+        // PostgreSQL's utility portal reports the rows emitted by this Execute,
+        // including FETCH 0 when an already exhausted portal is executed again.
+        try self.command(try std.fmt.bufPrint(&tag, "FETCH {d}", .{count}));
+    }
+
+    fn cursorRow(self: *Session, bytes: *std.Io.Writer.Allocating, columns: []const backend.Column, formats: []const u16, spool: *Spool, row: usize) !void {
+        bytes.writer.end = 0;
+        try bytes.writer.writeInt(u16, @intCast(columns.len), .big);
+        for (columns, 0..) |column, i| try self.appendDataCell(bytes, self.alloc, column, formatAt(formats, i), try spool.cell(row, i), columns.len - i);
+        if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
+        try self.message('D', bytes.written());
+        self.trimRowBuffer(bytes);
+    }
+
+    fn fetchCursor(self: *Session, fetch: commands.Fetch, output: FetchOutput) !u64 {
         if (self.status == .failed) return error.SqlTransactionAborted;
         const cursor = self.sql_cursors.getPtr(fetch.name) orelse return error.InvalidCursorName;
         if (!cursor.committed and (self.status != .in_transaction or self.session_id == null or !std.mem.eql(u8, cursor.session_id, self.session_id.?))) return error.CursorMustBeInTransaction;
@@ -1321,13 +1443,13 @@ pub const Session = struct {
         req.search_path = cursor.search_path;
         try req.check();
         if (cursor.spool != null) {
-            self.fetchSpooled(cursor, fetch, req) catch |err| {
+            return self.fetchSpooled(cursor, fetch, req, output) catch |err| {
                 self.removeSqlCursor(fetch.name);
                 return err;
             };
-            return;
         }
         if (fetch.direction != .forward) return error.CursorNotScrollable;
+        if (output.capture) |capture| capture.rows = try self.newCursorSpool();
         var completed = false;
         const fetched_before = cursor.fetched;
         errdefer if (!completed) {
@@ -1336,7 +1458,8 @@ pub const Session = struct {
                 stream.close(stream.context);
             }
         };
-        if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
+        const formats: []const u16 = output.formats orelse if (cursor.binary) &.{1} else &.{};
+        if (!fetch.move and output.describe) try self.rowDescription(cursor.description.columns, formats);
         var remaining: usize = if (fetch.count == std.math.maxInt(u32)) std.math.maxInt(usize) else fetch.count;
         while (!cursor.exhausted and remaining != 0) {
             try req.check();
@@ -1357,7 +1480,10 @@ pub const Session = struct {
                 if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
                 if (page.result.rowCount() == 0 and !page.exhausted) return error.InvalidResult;
                 if (page.result.sql_nulls) |flags| if (flags.len != page.result.rowCount()) return error.InvalidResult;
-                if (!fetch.move) try self.dataResult(page.result, &.{});
+                if (output.capture) |capture| {
+                    capture.rows.?.store.append(page.result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
+                    capture.count += page.result.rowCount();
+                } else if (!fetch.move) try self.dataResult(page.result, formats);
                 cursor.fetched += page.result.rowCount();
                 remaining -= page.result.rowCount();
                 cursor.exhausted = page.exhausted;
@@ -1371,8 +1497,10 @@ pub const Session = struct {
             }
         }
         var tag: [64]u8 = undefined;
-        try self.command(try std.fmt.bufPrint(&tag, "{s} {d}", .{ if (fetch.move) "MOVE" else "FETCH", cursor.fetched - fetched_before }));
+        const emitted = cursor.fetched - fetched_before;
+        if (output.command) try self.command(try std.fmt.bufPrint(&tag, "{s} {d}", .{ if (fetch.move) "MOVE" else "FETCH", emitted }));
         completed = true;
+        return emitted;
     }
 
     fn markTransactionFailed(self: *Session, statement: []const u8) void {
@@ -1393,7 +1521,7 @@ pub const Session = struct {
     }
 
     fn fillCursor(self: *Session, cursor: *SqlCursor, through: usize) !void {
-        const spool = &cursor.spool.?;
+        const spool = &cursor.spool.?.store;
         const req = self.cursorRequest(cursor);
         while (!cursor.exhausted and spool.row_count < through) {
             try req.check();
@@ -1419,12 +1547,12 @@ pub const Session = struct {
         while (iterator.next()) |cursor| if (cursor.hold and !cursor.committed) try self.fillCursor(cursor, std.math.maxInt(usize));
     }
 
-    fn fetchSpooled(self: *Session, cursor: *SqlCursor, fetch: commands.Fetch, req: backend.Request) !void {
+    fn fetchSpooled(self: *Session, cursor: *SqlCursor, fetch: commands.Fetch, req: backend.Request, output: FetchOutput) !u64 {
         if (!cursor.scroll and fetch.direction != .forward) return error.CursorNotScrollable;
         var validation = std.heap.ArenaAllocator.init(self.alloc);
         defer validation.deinit();
         try self.validateSpooledCursor(cursor, validation.allocator(), req);
-        const spool = &cursor.spool.?;
+        const spool = &cursor.spool.?.store;
         if (fetch.direction == .absolute and fetch.offset < 0) try self.fillCursor(cursor, std.math.maxInt(usize));
         var target: i64 = switch (fetch.direction) {
             .forward => spool.position +| @as(i64, if (fetch.count == 0) 0 else 1),
@@ -1434,7 +1562,12 @@ pub const Session = struct {
         };
         const single = fetch.direction == .absolute or fetch.direction == .relative or fetch.count == 0;
         var remaining: u64 = if (single) 1 else fetch.count;
-        if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
+        const formats: []const u16 = output.formats orelse if (cursor.binary) &.{1} else &.{};
+        if (!fetch.move and output.describe) try self.rowDescription(cursor.description.columns, formats);
+        if (output.capture) |capture| {
+            capture.rows = cursor.spool.?.retain();
+            capture.backward = fetch.direction == .backward;
+        }
         var emitted: u64 = 0;
         var row_bytes = std.Io.Writer.Allocating.init(self.alloc);
         defer row_bytes.deinit();
@@ -1451,21 +1584,18 @@ pub const Session = struct {
                 _ = validation.reset(.retain_capacity);
                 try self.validateSpooledCursor(cursor, validation.allocator(), req);
             }
-            if (!fetch.move) {
-                row_bytes.writer.end = 0;
-                try row_bytes.writer.writeInt(u16, @intCast(cursor.description.columns.len), .big);
-                for (cursor.description.columns, 0..) |column, index| try self.appendDataCell(&row_bytes, self.alloc, column, 0, try spool.cell(@intCast(target - 1), index), cursor.description.columns.len - index);
-                if (row_bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
-                try self.message('D', row_bytes.written());
-                self.trimRowBuffer(&row_bytes);
-            }
+            if (output.capture) |capture| {
+                if (capture.count == 0) capture.first = @intCast(target - 1);
+                capture.count += 1;
+            } else if (!fetch.move) try self.cursorRow(&row_bytes, cursor.description.columns, formats, spool, @intCast(target - 1));
             emitted += 1;
             if (emitted % 256 == 0) try self.writer.flush();
             if (single) break;
             target += if (fetch.direction == .backward) @as(i64, -1) else 1;
         }
         var tag: [64]u8 = undefined;
-        try self.command(try std.fmt.bufPrint(&tag, "{s} {d}", .{ if (fetch.move) "MOVE" else "FETCH", emitted }));
+        if (output.command) try self.command(try std.fmt.bufPrint(&tag, "{s} {d}", .{ if (fetch.move) "MOVE" else "FETCH", emitted }));
+        return emitted;
     }
 
     fn validateSpooledCursor(self: *Session, cursor: *SqlCursor, alloc: std.mem.Allocator, req: backend.Request) !void {
@@ -1516,7 +1646,7 @@ pub const Session = struct {
             self.alloc.free(entry.key);
             var cursor = entry.value;
             if (cursor.stream) |stream| stream.close(stream.context);
-            if (cursor.spool) |*spool| spool.deinit();
+            if (cursor.spool) |spool| spool.release();
             cursor.arena.deinit();
         }
     }
@@ -1526,7 +1656,7 @@ pub const Session = struct {
         while (iterator.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
             if (entry.value_ptr.stream) |stream| stream.close(stream.context);
-            if (entry.value_ptr.spool) |*spool| spool.deinit();
+            if (entry.value_ptr.spool) |spool| spool.release();
             entry.value_ptr.arena.deinit();
         }
         self.sql_cursors.clearRetainingCapacity();
@@ -1556,6 +1686,7 @@ pub const Session = struct {
             if (value.stream) |stream| stream.close(stream.context);
             if (value.result) |*result| result.deinit();
             if (value.parameter_owner) |owner| owner.release();
+            if (value.cursor_capture) |*capture| capture.deinit();
             value.arena.deinit();
             self.alloc.destroy(value);
         }
@@ -1569,6 +1700,7 @@ pub const Session = struct {
             if (portal.stream) |stream| stream.close(stream.context);
             if (portal.result) |*result| result.deinit();
             if (portal.parameter_owner) |owner| owner.release();
+            if (portal.cursor_capture) |*capture| capture.deinit();
             portal.arena.deinit();
             self.alloc.destroy(portal);
         }
@@ -1975,14 +2107,13 @@ fn cloneColumns(alloc: std.mem.Allocator, columns: []const backend.Column) ![]co
 }
 fn cachedColumnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
     if (a.len != b.len) return false;
-    for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or
-        !@import("antfly_local_sources").sql_scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier)) return false;
+    for (a, b) |left, right| if (!backend.sameColumnType(left, right)) return false;
     return true;
 }
 
 fn columnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
     if (a.len != b.len) return false;
-    for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or !@import("antfly_local_sources").sql_scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) or !std.mem.eql(u8, left.name, right.name)) return false;
+    for (a, b) |left, right| if (!backend.sameColumnType(left, right) or !std.mem.eql(u8, left.name, right.name)) return false;
     return true;
 }
 
@@ -2016,6 +2147,9 @@ test "pgwire NUMERIC result identity fences precision scale and unconstrained re
 }
 
 test "pgwire typed parameter failures retain actionable PostgreSQL SQLSTATEs" {
+    try std.testing.expectEqualStrings("25P02", sqlstate(error.SqlTransactionAborted));
+    try std.testing.expectEqualStrings("42804", sqlstate(error.SqlAssignmentTypeMismatch));
+    try std.testing.expectEqualStrings("0A000", sqlstate(error.SqlRangeTrackingRequired));
     try std.testing.expectEqualStrings("22P02", sqlstate(error.SqlInvalidTextRepresentation));
     try std.testing.expectEqualStrings("22P03", sqlstate(error.InvalidSqlBinaryRepresentation));
     try std.testing.expectEqualStrings("42804", sqlstate(error.SqlBinaryTypeMismatch));
@@ -2050,6 +2184,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.InvalidStatementName => "26000",
         error.InvalidPortalName => "34000",
         error.InvalidCursorName => "34000",
+        error.InvalidCursorDefinition => "42P11",
         error.DuplicatePreparedStatement => "42P05",
         error.DuplicatePortal => "42P03",
         error.DuplicateCursorName => "42P03",
@@ -2082,7 +2217,10 @@ fn sqlstate(err: anyerror) []const u8 {
         error.PortalExecutionFailed => "55000",
         error.TooManyConnections, error.SqlWriteCapacityUnavailable => "53300",
         error.CachedPlanResultTypeChanged, error.UnsupportedParameterType, error.UnsupportedParameterFormat, error.UnsupportedResultFormat, error.UnsupportedProtocolMessage, error.UnsupportedContinuation, error.UnsupportedResultPrecision, error.UnsupportedStatement, error.ResultShapeChanged => "0A000",
-        else => "XX000",
+        // Native SQL failures share one diagnostic authority with HTTP. A
+        // protocol-local operation (including a captured cursor continuation)
+        // must not turn a native 25P02/42804/etc. into an internal error.
+        else => @import("antfly_local_sources").sql_errors.describe(err).code,
     };
 }
 
@@ -2096,4 +2234,18 @@ fn sqlMessage(err: anyerror) []const u8 {
     if (std.mem.eql(u8, code, "0A000")) return "The request requires an unsupported PostgreSQL protocol feature.";
     if (std.mem.startsWith(u8, code, "28")) return "PostgreSQL authentication failed.";
     return "The PostgreSQL protocol request could not be completed.";
+}
+
+test "pgwire cursor prepared and page identities fence all precise temporal kinds" {
+    const Kind = @import("antfly_local_sources").sql_temporal_value.Kind;
+    const kinds = [_]Kind{ .date, .time, .time_tz, .timestamp, .timestamp_tz, .interval };
+    for (kinds) |left| for (kinds) |right| {
+        const a = [_]backend.Column{.{ .name = "t", .type = .datetime, .temporal_kind = left }};
+        const b = [_]backend.Column{.{ .name = "t", .type = .datetime, .temporal_kind = right }};
+        try std.testing.expectEqual(left == right, columnsEqual(&a, &b));
+        try std.testing.expectEqual(left == right, cachedColumnsEqual(&a, &b));
+    };
+    const implicit = [_]backend.Column{.{ .name = "t", .type = .datetime }};
+    const explicit = [_]backend.Column{.{ .name = "t", .type = .datetime, .temporal_kind = .timestamp_tz }};
+    try std.testing.expect(columnsEqual(&implicit, &explicit));
 }

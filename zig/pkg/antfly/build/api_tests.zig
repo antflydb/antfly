@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [20]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [21]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -2284,6 +2284,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original resource comments preserve identities authorization and cold owners",
             "mounted SQL original calendar intervals preserve typed results and cold rows",
             "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+            "mounted SQL original binary cursor preserves PostgreSQL scroll hold formats and cold owners",
             "mounted SQL temporal originals and mutation assignments preserve diagnostics precise kinds and cold postimages",
             "mounted SQL temporal view domains survive nested replacement and cold owners",
             "mounted SQL ordinary aggregates preserve PostgreSQL ordering distinct filters and cold rows",
@@ -2439,6 +2440,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     view_domain_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-view-domain-lifecycle-test", "Verify exact view domains and immutable envelope identity across owner recovery")
         .dependOn(&view_domain_run.step);
+    const cursor_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original binary cursor preserves PostgreSQL scroll hold formats and cold owners"});
+    cursor_lifecycle_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-cursor-lifecycle-test", "Verify PostgreSQL cursor formats and lifetimes through authenticated cold native owners")
+        .dependOn(&cursor_lifecycle_run.step);
     const temporal_domain_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL temporal originals and mutation assignments preserve diagnostics precise kinds and cold postimages"});
     temporal_domain_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-temporal-domain-lifecycle-test", "Verify original temporal source domains and complete native cold mutation postimages")
@@ -2921,7 +2926,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run },
+        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

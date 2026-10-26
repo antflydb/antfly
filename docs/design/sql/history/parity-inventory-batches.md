@@ -1804,3 +1804,31 @@ column OIDs and full postimages. All rejecting cases share one cluster lifecycle
 each still executes and verifies its unchanged images before and after the same
 owner restart. The focused gate avoids rerunning unrelated SQL fault campaigns.
 Durable DATE/TIME column-layout activation remains the separate typed-value boundary.
+
+
+## Binary and extended SQL cursor execution
+
+The `sql-0049` cohort replaces the historical catalog-mutation plan with the
+unchanged `BINARY SCROLL CURSOR WITH HOLD` declaration through authenticated
+native owners. The independent PostgreSQL oracle verifies six text/binary,
+forward/scroll/hold profiles, including explicit READ COMMITTED setup, column
+OIDs, wire formats, row bytes, positioning and completion tags. The same
+production campaign runs all profiles before and after cold metadata/data-owner
+recovery; held connection resources themselves do not survive restart.
+
+Raw PostgreSQL frames also establish extended FETCH semantics: evaluate its
+entire requested range before output suspension; retain those rows independently
+of later cursor movement, CLOSE and name reuse; report each final Execute's
+emitted-row count; and reject continuation after an intervening transaction
+failure. Shared transcripts exercise these behaviors through the protocol mock
+and real native owners. Scroll pages are retained by reference in constant space;
+forward streams materialize only their FETCH result under the same quotas.
+
+Additional regressions require native read-query admission before DECLARE,
+preserve exact temporal and range output identities, reject quota exhaustion
+before extended FETCH emits partial rows, and cover revocation and uncertain
+commit. Allocation-fault checks retain 64 references to one typed store without
+allocating copies and verify final budget reclamation. Only the original cursor
+case receives disposition credit; supplemental protocol/domain probes add none.
+The qualified native Debug, protocol Debug and PostgreSQL gates are recorded in
+the inventory ledger. The remaining inventory report stays authoritative.

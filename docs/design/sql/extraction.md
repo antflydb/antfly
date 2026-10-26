@@ -145,6 +145,25 @@ source-authority observations until the named v20 profile is ready.
 
 ## Statement execution
 
+### Cursor protocol and retained output
+
+SQL cursors use the same authenticated typed reads as ordinary queries. DECLARE
+requires an explicit native read-query descriptor; result columns alone cannot
+authorize execution, because mutations may have RETURNING columns. BINARY,
+SCROLL, sensitivity spelling and WITH HOLD compose without changing stored row
+representations. Simple FETCH follows BINARY; extended Bind controls its own
+format vector.
+
+Extended FETCH evaluates its requested range as one statement before sending
+continuation pages, preserving PostgreSQL's cursor-position and completion-count
+semantics. A portal retains an immutable range over connection-budgeted typed
+pages. Existing scroll rows are shared rather than copied; forward-only streams
+materialize only the FETCH result under the same row/byte quotas. Results remain
+valid after cursor CLOSE and name reuse. Shared references do not retain native
+read snapshots after exhaustion. Cold-owner tests compare exact original SQL,
+column OIDs, formats, row bytes and completion tags against PostgreSQL; allocation
+fault tests verify ownership and budget reclamation.
+
 ### Reads and operators
 
 - Ordinal-bound scalar programs, three-valued predicates, bounded top-K,

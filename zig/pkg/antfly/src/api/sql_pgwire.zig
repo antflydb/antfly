@@ -1103,6 +1103,7 @@ const Job = struct {
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
             for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             self.description = .{
+                .cursor_readable = compiled.statement == .select,
                 .copy_out = if (compiled.statement == .copy_to) try compiled.statement.copy_to.options.clone(self.alloc) else null,
                 .columns = columns,
                 .parameter_types = parameter_types,

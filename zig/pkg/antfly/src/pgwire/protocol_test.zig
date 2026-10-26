@@ -56,6 +56,8 @@ const Mock = struct {
     entered: ?*std.Io.Event = null,
     blocked: bool = false,
     stream_rows: usize = 0,
+    stream_definitions: ?[]const backend.Column = null,
+    cursor_readable: bool = true,
     copy_out: ?@import("copy_out.zig").Options = null,
     stream_text: ?[]const u8 = null,
     stream_cells: bool = false,
@@ -165,6 +167,7 @@ const Mock = struct {
         return .{ .context = self, .columns = self.streamColumns(), .next = nextPage, .close = closeStream, .detach = detachStream, .validate = validateStream, .copy_out = self.copy_out };
     }
     fn streamColumns(self: *Mock) []const backend.Column {
+        if (self.stream_definitions) |columns| return columns;
         return if (self.stream_text != null) &.{.{ .name = "n", .type = .string }} else &.{.{ .name = "n", .type = .integer }};
     }
     fn detachStream(raw: *anyopaque) void {
@@ -197,13 +200,13 @@ const Mock = struct {
             self.stream_page_begin = self.stream_offset;
             self.stream_offset += count;
             self.stream_live_pages += 1;
-            return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .cells = .{ .context = self, .count = count, .width = 1, .read = streamCell }, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
+            return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = self.streamColumns(), .cells = .{ .context = self, .count = count, .width = 1, .read = streamCell }, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
         }
         const rows = try alloc.alloc([]const std.json.Value, count);
         for (rows, 0..) |*row, i| row.* = try alloc.dupe(std.json.Value, &.{.{ .integer = @intCast(self.stream_offset + i) }});
         self.stream_offset += count;
         self.stream_live_pages += 1;
-        return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .rows = rows, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
+        return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = self.streamColumns(), .rows = rows, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
     }
     fn releaseStreamPage(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -241,9 +244,10 @@ const Mock = struct {
         if (self.cursor_revoked) return error.Forbidden;
         if (self.ddl_pending or self.ddl_unknown) return .{ .columns = &.{} };
         if (self.expected_result_tag != null) return .{ .columns = &.{}, .binding_guard = "immutable-catalog-binding" };
+        if (self.stream_definitions) |columns| if (std.mem.startsWith(u8, request.statement, "SELECT")) return .{ .columns = columns, .cursor_readable = self.cursor_readable };
         if (self.json_null_results) return .{ .columns = &.{.{ .name = "j", .type = .json }} };
         if (self.array_results) return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }} };
-        return .{ .copy_out = self.copy_out, .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
+        return .{ .cursor_readable = self.cursor_readable, .copy_out = self.copy_out, .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -268,7 +272,7 @@ const Mock = struct {
             self.lake_log[self.lake_count] = request.lake_visibility;
             self.lake_count += 1;
         }
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "begin")) return .{ .command_tag = "BEGIN", .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "begin") or std.mem.eql(u8, request.statement, "BEGIN ISOLATION LEVEL READ COMMITTED")) return .{ .command_tag = "BEGIN", .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "commit")) {
             if (self.unknown_commit) {
                 request.diagnostics.?.transaction_status = .idle;
@@ -2894,5 +2898,235 @@ test "pgwire typed cells match column-aware materialized text and binary frames"
         defer a.free(failures);
         try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, failures, "D"));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, failures, "E"));
+    }
+}
+
+test "pgwire PostgreSQL cursor oracle preserves binary scroll hold and Bind format overrides" {
+    const oracle = @import("cursor_reference_test_support.zig");
+    const a = std.testing.allocator;
+    const reference = try std.json.parseFromSlice(oracle.Reference, a, oracle.bytes, .{});
+    defer reference.deinit();
+    try std.testing.expectEqualStrings("sql-0049", reference.value.original_id);
+    for (reference.value.profiles) |profile| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try oracle.input(a, &input.writer, profile, "tester", "secret", "db");
+        var mock: Mock = .{ .stream_rows = 5, .stream_definitions = &.{.{ .name = "id", .type = .integer }} };
+        var output = try run(&mock, input.written(), .{ .result_rows = 2 });
+        defer output.deinit();
+        try oracle.verify(a, output.written(), profile);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
+        try std.testing.expectEqual(@as(usize, @intFromBool(profile.scroll or profile.hold)), mock.stream_detaches);
+    }
+}
+
+test "pgwire extended FETCH suspends without duplicating scroll rows and MOVE ignores row limit" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |binary| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        try frame(&input.writer, 'Q', if (binary) "DECLARE rows BINARY SCROLL CURSOR FOR SELECT n FROM t\x00" else "DECLARE rows SCROLL CURSOR FOR SELECT n FROM t\x00");
+        try parse(&input.writer, "fetch", "FETCH FORWARD 4 FROM rows", false);
+        try bind(&input.writer, "fetch_portal", "fetch", null);
+        try frame(&input.writer, 'D', "Pfetch_portal\x00");
+        try execute(&input.writer, "fetch_portal", 2);
+        try execute(&input.writer, "fetch_portal", 1);
+        try execute(&input.writer, "fetch_portal", 2);
+        try parse(&input.writer, "back", "FETCH BACKWARD 3 FROM rows", false);
+        try bind(&input.writer, "back_portal", "back", null);
+        try execute(&input.writer, "back_portal", 1);
+        try execute(&input.writer, "back_portal", 1);
+        try execute(&input.writer, "back_portal", 1);
+        try parse(&input.writer, "move", "MOVE FORWARD 4 FROM rows", false);
+        try bind(&input.writer, "move_portal", "move", null);
+        try execute(&input.writer, "move_portal", 1);
+        try frame(&input.writer, 'Q', "FETCH NEXT FROM rows\x00");
+        try frame(&input.writer, 'Q', "ROLLBACK\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 8 };
+        var output = try run(&mock, input.written(), .{ .result_rows = 2 });
+        defer output.deinit();
+        var messages: protocol.Cursor = .{ .bytes = output.written() };
+        const expected = [_]i64{ 0, 1, 2, 3, 2, 1, 0, 5 };
+        var rows: usize = 0;
+        var suspended: usize = 0;
+        var fetches: usize = 0;
+        var moves: usize = 0;
+        while (messages.offset < messages.bytes.len) {
+            const tag = try messages.int(u8);
+            const size = try messages.int(u32);
+            var body: protocol.Cursor = .{ .bytes = try messages.take(size - 4) };
+            try std.testing.expect(tag != 'E');
+            if (tag == 's') suspended += 1;
+            if (tag == 'C') {
+                const command = try body.string();
+                if (std.mem.eql(u8, command, "FETCH 1")) fetches += 1;
+                if (std.mem.eql(u8, command, "MOVE 4")) moves += 1;
+            }
+            if (tag == 'D') {
+                try std.testing.expect(rows < expected.len);
+                try std.testing.expectEqual(@as(u16, 1), try body.int(u16));
+                const len = try body.int(u32);
+                const value = if (rows == expected.len - 1 and !binary)
+                    try std.fmt.parseInt(i64, try body.take(len), 10)
+                else value: {
+                    try std.testing.expectEqual(@as(u32, 8), len);
+                    break :value try body.int(i64);
+                };
+                try std.testing.expectEqual(expected[rows], value);
+                rows += 1;
+            }
+        }
+        try std.testing.expectEqual(expected.len, rows);
+        try std.testing.expectEqual(@as(usize, 4), suspended);
+        try std.testing.expectEqual(@as(usize, 3), fetches);
+        try std.testing.expectEqual(@as(usize, 1), moves);
+    }
+}
+
+test "pgwire suspended FETCH retains evaluated rows after cursor close and name reuse" {
+    const oracle = @import("cursor_reference_test_support.zig");
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |scroll| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try oracle.suspendedInput(a, &input.writer, scroll, "tester", "secret", "db");
+        var mock: Mock = .{ .stream_rows = 5, .stream_definitions = &.{.{ .name = "id", .type = .integer }} };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try oracle.verifySuspended(output.written());
+        try std.testing.expectEqual(@as(usize, 2), mock.stream_closes);
+    }
+}
+
+test "pgwire binary held cursor extended FETCH preserves revocation and commit ambiguity fences" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |unknown| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        try frame(&input.writer, 'Q', "DECLARE rows BINARY SCROLL CURSOR WITH HOLD FOR SELECT n FROM t\x00");
+        try parse(&input.writer, "fetch", "FETCH ALL FROM rows", false);
+        try frame(&input.writer, 'Q', "COMMIT\x00");
+        try bind(&input.writer, "fetch_portal", "fetch", null);
+        try execute(&input.writer, "fetch_portal", 1);
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 5, .unknown_commit = unknown, .revoke_after_commit = !unknown };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(a, output.written());
+        defer a.free(messages);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "D"));
+        try std.testing.expect(std.mem.count(u8, messages, "E") >= 1);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
+    }
+}
+
+test "pgwire DECLARE rejects mutation result shapes before any execution or stream admission" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |extended| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        const declaration = "DECLARE rows BINARY SCROLL CURSOR FOR DELETE FROM t RETURNING n";
+        if (extended) {
+            try parse(&input.writer, "bad", declaration, false);
+            try bind(&input.writer, "bad_portal", "bad", null);
+            try execute(&input.writer, "bad_portal", 0);
+            try frame(&input.writer, 'S', "");
+        } else {
+            const terminated = try std.fmt.allocPrint(a, "{s}\x00", .{declaration});
+            defer a.free(terminated);
+            try frame(&input.writer, 'Q', terminated);
+        }
+        try frame(&input.writer, 'Q', "ROLLBACK\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .cursor_readable = false };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "42601") != null);
+        try std.testing.expectEqual(@as(usize, 2), mock.executions);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_pulls);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_closes);
+    }
+}
+
+test "pgwire extended DECLARE and CLOSE retain native cursor ownership without replay" {
+    const a = std.testing.allocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try parse(&input.writer, "decl", "DECLARE rows BINARY SCROLL CURSOR FOR SELECT n FROM t", false);
+    try bind(&input.writer, "declaration", "decl", null);
+    try execute(&input.writer, "declaration", 0);
+    try frame(&input.writer, 'S', "");
+    try parse(&input.writer, "fetch", "FETCH FORWARD 2 FROM rows", false);
+    try bind(&input.writer, "fetch_portal", "fetch", null);
+    try execute(&input.writer, "fetch_portal", 1);
+    try execute(&input.writer, "fetch_portal", 0);
+    try parse(&input.writer, "close", "CLOSE rows", false);
+    try bind(&input.writer, "close_portal", "close", null);
+    try execute(&input.writer, "close_portal", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 4 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(a, output.written());
+    defer a.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, messages, "D"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "s"));
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expectEqual(@as(usize, 2), mock.executions);
+}
+
+test "pgwire extended FETCH quota failure exposes no partial rows or successful completion" {
+    const a = std.testing.allocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "DECLARE rows BINARY NO SCROLL CURSOR FOR SELECT n FROM t\x00");
+    try parse(&input.writer, "fetch", "FETCH ALL FROM rows", false);
+    try bind(&input.writer, "fetch_portal", "fetch", null);
+    try execute(&input.writer, "fetch_portal", 1);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 100 };
+    var output = try run(&mock, input.written(), .{ .cursor_rows = 3, .result_rows = 2 });
+    defer output.deinit();
+    const messages = try tags(a, output.written());
+    defer a.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "D"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "FETCH ") == null);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
+}
+
+test "pgwire materialized FETCH cannot emit continuation rows in a failed transaction" {
+    const oracle = @import("cursor_reference_test_support.zig");
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |scroll| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try oracle.failedInput(a, &input.writer, scroll, "tester", "secret", "db");
+        var mock: Mock = .{ .stream_rows = 5, .stream_definitions = &.{.{ .name = "id", .type = .integer }} };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try oracle.verifyFailed(output.written());
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
     }
 }
