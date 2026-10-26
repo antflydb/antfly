@@ -15,7 +15,7 @@
 
 // Recovery hints run after foreground drain, never as a condition of its ACK.
 export class IdleCheckpoint {
- constructor({revision,isIdle,checkpoint,background,onError=()=>{},every=8,delay=250,retryDelay=1100}){Object.assign(this,{revision,isIdle,checkpoint,background,onError,every,delay,retryDelay});this.last=0;this.pending=false;}
+ constructor({revision,isIdle,checkpoint,background,onError=()=>{},every=1,delay=250,retryDelay=1100}){Object.assign(this,{revision,isIdle,checkpoint,background,onError,every,delay,retryDelay});this.last=0;this.pending=false;}
  schedule(){
   if(this.pending||!this.isIdle()||this.revision()-this.last<this.every)return;
   this.pending=true;

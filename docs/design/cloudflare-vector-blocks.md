@@ -411,3 +411,14 @@ while the old writer must reject even an idempotent mutation replay. The fixture
 also checks three local read preparations start while two native queries are
 held, with no additional writer RPC, and asserts the reader's four slots remain
 inside its original 32 MiB reservation bound.
+
+Idle recovery checkpointing starts after one new committed revision rather than
+eight, once the foreground queue drains. It remains an asynchronous hint after
+the caller's acknowledgement, with one coalesced task, a 250 ms idle delay and
+one bounded retry after native throttling. Native checkpoint CAS and its
+one-successful-overwrite-per-second limit remain authoritative. Busy writers
+continue relying on bounded log recovery and their existing periodic hint
+attempts. This spends additional metadata GETs/PUTs during quiet write traffic
+to avoid repeatedly replaying a larger metadata tail for later readers. A test
+proves a single acknowledged commit advances the durable recovery floor without
+requiring another foreground commit.

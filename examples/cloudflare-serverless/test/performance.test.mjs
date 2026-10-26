@@ -411,3 +411,9 @@ test("point reads keep stable bounded placement across app isolate restarts",asy
  const{readerSlot}=await import('../runtime-routing.mjs');for(const slots of[1,2,3,4]){const seen=new Set();for(let i=0;i<512;i++){const input={op:'lookup',doc_id:'gate/'+i},slot=readerSlot(input,slots,i);assert.ok(slot>=0&&slot<slots);assert.equal(readerSlot(input,slots,0),slot);assert.equal(readerSlot(input,slots,123456),slot);seen.add(slot);}assert.equal(seen.size,slots);}
  for(let i=0;i<512;i+=2)assert.notEqual(readerSlot({op:'lookup',doc_id:'gate/'+i},2),readerSlot({op:'lookup',doc_id:'gate/'+(i+1)},2));assert.equal(readerSlot({op:'count'},2,3),1);assert.equal(readerSlot({op:'lookup',doc_id:'😀/é'},4),readerSlot({op:'lookup',doc_id:'😀/é'},4,9));
 });
+
+test("one idle commit advances the native recovery floor without delaying its acknowledgement",async()=>{
+ const bucket=new Bucket(),work=[];let now=Date.now();const store=new R2CoordinatorStore(module,bucket,'one-idle-commit',{clock:()=>now,background:promise=>work.push(promise)});
+ await store.transaction(tx=>tx.put('value',1));const revision=store.state.revision,checkpoint=()=>JSON.parse(new TextDecoder().decode(bucket.objects.get(store.base+'/CHECKPOINT').body));assert.ok(checkpoint().state.revision<revision);
+ now+=1001;await new Promise(resolve=>setTimeout(resolve,0));assert.equal(work.length,1);await Promise.all(work);assert.equal(checkpoint().state.revision,revision);assert.equal(store.idleCheckpoint.last,revision);assert.equal(await store.readOnly(tx=>tx.get('value')),1);
+});
