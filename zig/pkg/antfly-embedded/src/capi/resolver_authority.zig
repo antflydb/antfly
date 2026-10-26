@@ -894,6 +894,9 @@ pub const QuerySession = struct {
             defer if (view) |*pinned| pinned.release();
             return .{ .instance = database.querySchemaIdentity(), .core = @intFromPtr(database.core), .namespace = database.core.identity_namespace, .catalog = database.core.index_manager.writePlanGeneration(), .schema_generation = generation, .schema_version = if (view) |pinned| pinned.tableSchema().version else null, .digest = undefined };
         }
+        fn epoch(self: SchemaStamp) h.db_mod.DB.ResolverQuerySchemaEpoch {
+            return .{ .instance = self.instance, .core = self.core, .namespace = self.namespace, .catalog = self.catalog, .schema_generation = self.schema_generation, .schema_version = self.schema_version };
+        }
         fn matchesEpoch(self: SchemaStamp, database: *h.db_mod.DB) bool {
             const now = current(database);
             return self.instance == now.instance and self.core == now.core and std.meta.eql(self.namespace, now.namespace) and self.catalog == now.catalog and self.schema_generation == now.schema_generation and self.schema_version == now.schema_version;
@@ -906,16 +909,25 @@ pub const QuerySession = struct {
         }
     };
     fn schema(database: *h.db_mod.DB, owner: A) !SchemaStamp {
+        @import("antfly_platform").sync.lockYielding(&database.resolver_query_schema_mutex);
+        defer database.resolver_query_schema_mutex.unlock();
+        var result = SchemaStamp.current(database);
+        if (database.resolver_query_schema_epoch) |epoch| if (std.meta.eql(epoch, result.epoch())) {
+            result.digest = database.resolver_query_schema_digest;
+            if (!result.matchesEpoch(database)) return error.Busy;
+            return result;
+        };
         var scratch = std.heap.ArenaAllocator.init(owner);
         defer scratch.deinit();
         const a = scratch.allocator();
-        var result = SchemaStamp.current(database);
         const indexes = try database.listIndexes(a);
         defer h.db_mod.types.freeIndexConfigs(a, indexes);
         const enrichments = try database.listEnrichments(a);
         defer h.db_mod.types.freeEnrichmentConfigs(a, enrichments);
         result.digest = try resolver.fingerprint(a, .{ database.core.identity_namespace, try database.getSchemaJson(a), indexes, enrichments });
         if (!result.matchesEpoch(database)) return error.Busy;
+        database.resolver_query_schema_digest = result.digest;
+        database.resolver_query_schema_epoch = result.epoch();
         return result;
     }
     const Admission = @import("../storage/db/catalog/index_manager.zig").IndexManager.QueryAdmission;
@@ -941,7 +953,7 @@ pub const QuerySession = struct {
                 const legacy = try currentConfig(root, handle.database(), a, cfg, null);
                 try result.legacy.put(a, cfg.name, try resolver.fingerprint(a, .{ legacy.merges, legacy.curation_json, legacy.curation_revision }));
             }
-            if (!result.schemas.contains(cfg.table)) try result.schemas.put(a, cfg.table, try schema(db, root.alloc));
+            if (!result.schemas.contains(cfg.table)) try result.schemas.put(a, cfg.table, if (db == handle.database()) result.source_schema else try schema(db, root.alloc));
         }
         return result;
     }
@@ -1674,4 +1686,47 @@ test "capi resolver curation initial routing admission excludes unrelated policy
     try std.testing.expect(!std.mem.eql(u8, &before, &try manager.resolverQueryDeclarationsFingerprint(selected)));
     try std.testing.expect(snapshot[1].min_confidence == null);
     std.debug.print("INITIAL ROUTING ADMISSION unrelated_aliases=999000 returned=2 warm_requests=10 arena_bytes_per_request<16384 lookup_builds=1\n", .{});
+}
+
+test "capi resolver curation schema captures reuse owner proofs across large unrelated catalogs" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("query-schema-owner-proof");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    defer h.closeHandle(root);
+    const manager = root.db.core.index_manager;
+    const text = try a.alloc(u8, 20000);
+    defer a.free(text);
+    @memset(text, 'x');
+    const Enrichment = @import("../storage/db/catalog/enrichment_catalog.zig").EnrichmentConfig;
+    for (0..1000) |i| {
+        const name = try std.fmt.allocPrint(a, "unrelated-{d}", .{i});
+        defer a.free(name);
+        var owned = try Enrichment.clone(manager.alloc, .{ .name = name, .kind = .embedding, .source_field = "body", .source_template = text });
+        errdefer owned.deinit(manager.alloc);
+        try manager.enrichments.append(manager.alloc, owned);
+    }
+    manager.invalidateWritePlanSnapshot();
+    var captured = try QuerySession.schema(&root.db, a);
+    var bytes: [1]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    for (0..1000) |_| {
+        const warm = try QuerySession.schema(&root.db, bounded.allocator());
+        try std.testing.expectEqualSlices(u8, &captured.digest, &warm.digest);
+    }
+    // Catalog replacement requalifies content once; cached content cannot
+    // mask an enrichment change, even when schema version stays identical.
+    manager.enrichments.items[0].full_text_index = true;
+    manager.invalidateWritePlanSnapshot();
+    try std.testing.expectError(error.Busy, captured.verify(&root.db, a));
+    const updated = try QuerySession.schema(&root.db, bounded.allocator());
+    try std.testing.expect(!std.mem.eql(u8, &captured.digest, &updated.digest));
+    root.db.query_schema_identity.store(0, .release);
+    try std.testing.expect(!updated.matchesEpoch(&root.db));
+    try std.testing.expectError(error.OutOfMemory, QuerySession.schema(&root.db, bounded.allocator()));
+    const reopened = try QuerySession.schema(&root.db, a);
+    try std.testing.expectEqualSlices(u8, &updated.digest, &reopened.digest);
+    try std.testing.expect(updated.instance != reopened.instance);
+    std.debug.print("OWNER SCHEMA PROOF templates=1000 bytes=20000000 warm_captures=1000 scratch_bytes=0 content_and_incarnation=fenced\n", .{});
 }

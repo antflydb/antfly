@@ -456,7 +456,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     // All resolver resources use the same scoped source cut. Full snapshots
     // remain only for sources without the private catalog-read capability.
     const page: ?catalog_read.Page = if (server.source.vtable.supports_resolver_catalog_read)
-        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .render or op == .resolve, .query_execution = op == .resolve, .policy_descriptors = server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve), .authority_admission = server.source.vtable.supports_resolver_authority and (entity_mutation or op == .entity_redirects or op == .entity_progress or op == .proposals or op == .proposal) }, request)
+        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .render or op == .resolve, .query_execution = op == .resolve, .compact_query = server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve), .policy_descriptors = server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve), .authority_admission = server.source.vtable.supports_resolver_authority and (entity_mutation or op == .entity_redirects or op == .entity_progress or op == .proposals or op == .proposal) }, request)
     else
         null;
     const adoption_revision = if (page) |value| @as(?u64, value.revision) else if (entity_mutation and server.source.vtable.linearizable_routing_snapshot != null) blk: {
@@ -1516,7 +1516,9 @@ const QueryFence = struct {
     fn init(a: std.mem.Allocator, page: catalog_read.Page, resolver_name: []const u8, routing_siblings: bool) !QueryFence {
         var result: QueryFence = .{ .table_name = page.table.name, .table_id = page.table.table_id, .fingerprint = page.query_fingerprint orelse return error.InvalidCatalogRecord, .resolver_name = resolver_name, .routing_siblings = routing_siblings };
         for (page.query_heads) |head| try result.heads.put(a, try std.fmt.allocPrint(a, "{d}\x00{s}", .{ head.table_id, head.key_template }), head.stamp);
-        if (page.indexed) if (page.configs) |configs_| for (configs_) |cfg| {
+        if (page.query_profiles) |profiles| {
+            for (profiles) |profile| try result.profiles.put(a, profile.name, .{ .target = profile.target, .id = profile.id });
+        } else if (page.indexed) if (page.configs) |configs_| for (configs_) |cfg| {
             if (cfg.retired or (cfg.aliases.len == 0 and cfg.suppress_json.len == 0)) continue;
             const definition: native_authority.records.static_profiles.Definition = .{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json };
             try result.profiles.put(a, cfg.name, .{ .target = cfg.table, .id = try definition.identity(a) });
@@ -2742,4 +2744,25 @@ test "resolver curation HTTP proposal admission uses point receipts and warm mem
     try std.testing.expectEqual(@as(u16, 202), accepted.status);
     try std.testing.expectEqual(@as(usize, 3), server.source.point_reads);
     try std.testing.expectEqual(@as(usize, 2), server.source.membership_reads);
+}
+
+test "resolver curation HTTP admitted profile references replace full alias identities and qualify fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg: Config = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved" };
+    const profile = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const page: catalog_read.Page = .{ .version = 1, .revision = 1, .table = .{ .table_id = 1, .name = "source" }, .indexed = true, .query_fingerprint = @splat(1), .configs = &.{cfg}, .query_profiles = &.{.{ .name = "r", .target = "entities", .id = profile }} };
+    const admitted = try QueryFence.init(a, page, "r", true);
+    try std.testing.expectEqualStrings(profile, admitted.profiles.get("r").?.id);
+    var inline_page = page;
+    var inline_cfg = cfg;
+    inline_cfg.aliases = &.{.{ .key = "entity/a", .target = "entity/b" }};
+    inline_page.configs = &.{inline_cfg};
+    inline_page.query_profiles = &.{};
+    const fallback = try QueryFence.init(a, inline_page, "r", true);
+    try std.testing.expectEqual(@as(usize, 0), fallback.profiles.count());
+    inline_page.query_profiles = null;
+    const legacy = try QueryFence.init(a, inline_page, "r", true);
+    try std.testing.expectEqualStrings(try (native_authority.records.static_profiles.Definition{ .key_template = cfg.key_template, .aliases = inline_cfg.aliases }).identity(a), legacy.profiles.get("r").?.id);
 }

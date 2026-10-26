@@ -3108,7 +3108,20 @@ const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacemen
 var next_query_schema_identity: std.atomic.Value(u64) = .init(1);
 
 pub const DB = struct {
+    /// Content-only proof for this physical owner and immutable catalog cut.
+    /// Native heads, grants and live logical bindings are validated separately.
+    pub const ResolverQuerySchemaEpoch = struct {
+        instance: u64,
+        core: usize,
+        namespace: DocIdentityNamespace,
+        catalog: u64,
+        schema_generation: u64,
+        schema_version: ?u32,
+    };
     query_schema_identity: std.atomic.Value(u64) = .init(0),
+    resolver_query_schema_mutex: std.atomic.Mutex = .unlocked,
+    resolver_query_schema_epoch: ?ResolverQuerySchemaEpoch = null,
+    resolver_query_schema_digest: [32]u8 = undefined,
     /// Installed only after immutable query-cut admission. Never persisted.
     retained_value_scope: ?@import("../../search/value_membership.zig").Scope = null,
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,

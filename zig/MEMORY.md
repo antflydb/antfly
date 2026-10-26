@@ -2590,7 +2590,7 @@ Schema and index edits update the proof atomically and invalidate older queries.
 Query producer projections are serialized once per distinct source artifact,
 independent of the number of referring resolvers. Declaration removal retires
 unused producer rows in the same transaction. A 1,000-resolver regression shares
-one 256 KiB producer and uses 31,071,451 bytes of a bounded 64 MiB writer arena.
+one 256 KiB producer within a bounded 64 MiB writer arena.
 
 Native resolver execution now uses topology protocol 55's opt-in complete alias
 projection. The owner composes only requested and incident paths through ready
@@ -2603,3 +2603,14 @@ across inference and catalog retirement. Warm admission uses 2,296 bytes at
 phases without loading the full profile. Existing native-head, schema, binding,
 incarnation and authorization checks remain independent of these immutable
 lifetimes. See `RESOLUTION.md` for the execution and compatibility contract.
+
+HTTP resolver admission uses protocol 56 and the v11 bootstrap generation to
+return compact execution descriptors with owner-qualified static profile IDs.
+Ready queries transfer no configured alias body and perform no alias identity
+hash in the API layer. Missing native heads, enrollment or node readiness retain
+the selected descriptor fallback. Null and explicitly empty profile lists retain
+distinct legacy and qualified-inline semantics. In-flight older bootstrap jobs
+restart their cursors before v11 readiness can be published. Lite also reuses a
+single physical-owner schema digest across requests, qualified by instance,
+namespace, core, catalog and schema epochs. These optimizations do not cache
+authorization or weaken native-head and binding revalidation.

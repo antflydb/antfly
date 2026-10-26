@@ -17,6 +17,7 @@
 const std = @import("std");
 const metadata = @import("table_manager.zig");
 pub const QueryHead = struct { table_id: u64, key_template: []const u8, stamp: @import("../metadata/resolver_authority.zig").records.Stamp };
+pub const QueryProfile = struct { name: []const u8, target: []const u8, id: []const u8 };
 pub const Request = struct {
     table_name: []const u8,
     table_id: u64 = 0,
@@ -38,6 +39,7 @@ pub const Request = struct {
     routing_siblings: bool = false,
     /// Query execution hydrates only mention/candidate policy through authority reads.
     policy_descriptors: bool = false,
+    compact_query: bool = false,
     /// Resolve executes routing siblings for identity-template dependencies;
     /// render only needs their label declarations. Verification reads headers.
     query_execution: bool = true,
@@ -48,7 +50,7 @@ pub const Request = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "authority_admission")) self.authority_admission else if (comptime std.mem.eql(u8, field, "identity_only")) self.identity_only else if (comptime std.mem.eql(u8, field, "query_execution")) !self.query_execution else if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
+            const include = if (comptime std.mem.eql(u8, field, "compact_query")) self.compact_query else if (comptime std.mem.eql(u8, field, "authority_admission")) self.authority_admission else if (comptime std.mem.eql(u8, field, "identity_only")) self.identity_only else if (comptime std.mem.eql(u8, field, "query_execution")) !self.query_execution else if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -61,6 +63,8 @@ pub const Page = struct {
     version: u8,
     query_fingerprint: ?[32]u8 = null,
     query_heads: []const QueryHead = &.{},
+    /// null is a legacy reply; an empty set explicitly qualifies inline fallback.
+    query_profiles: ?[]const QueryProfile = null,
     admission: ?@import("resolver_authority.zig").Admission = null,
     revision: u64,
     table: metadata.TableRecord,
@@ -78,7 +82,12 @@ pub const Page = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "admission")) {
+            if (comptime std.mem.eql(u8, field, "query_profiles")) {
+                if (self.query_profiles) |profiles| {
+                    try writer.objectField(field);
+                    try writer.write(profiles);
+                }
+            } else if (comptime std.mem.eql(u8, field, "admission")) {
                 if (self.admission) |proof| {
                     try writer.objectField(field);
                     try writer.write(proof);

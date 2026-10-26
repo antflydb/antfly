@@ -2034,6 +2034,35 @@ A one-resolver warm admission uses 2,296 bytes of request arena capacity at
 1,000, 10,000 and 100,000 selected aliases, rather than copying up to 12 MB of
 selected aliases and recomputing their identities on every request.
 
+HTTP query admission uses topology protocol 56's opt-in compact execution rows.
+The owner writes each stripped execution descriptor and static profile identity
+atomically with its source declaration. Initial reads return those rows only
+after v11 bootstrap readiness and same-cut native-head, profile-enrollment and
+persistent-node checks. Alias bodies and source-projected curation stay out of
+the warm response; scorer, embedding, routing and other execution options remain.
+The API consumes the supplied identities without rehashing the source aliases.
+A null profile list denotes a legacy response; an empty qualified list explicitly
+selects inline fallback and must not synthesize a potentially inactive reference.
+Missing heads or node readiness hydrate only the selected legacy descriptor.
+Version-one source rows remain readable until the leader's bounded walk publishes
+version-two execution rows. Old in-flight bootstrap cursors rewind for the new
+generation in both work previews and committed advancement. The 10,000-alias
+regression returns a 1,906-byte response with 19,078 bytes of request arena
+capacity and zero hydrated aliases; compact and full reads have identical query
+fingerprints, and policy replacement invalidates the captured proof.
+
+Lite schema capture retains one content digest on its physical DB owner, keyed
+by the process-local instance, core, document namespace, catalog epoch, schema
+generation and schema version. Cold captures coalesce and publish only after
+rechecking the epoch. Warm requests neither copy nor serialize unrelated index
+or enrichment bodies. Source and destination captures share the same proof when
+they address the same DB. A changed catalog or incarnation requalifies content;
+unchanged content may update its stamp, while changed content fences old queries.
+Native heads, live bindings, authorization and declaration checks are independent
+of this content-only cache. The large-catalog regression captures 1,000 unrelated
+20 KB templates once and reuses the owner proof for 1,000 subsequent captures
+with no scratch allocation. Nothing is retained across a new physical owner.
+
 Lite key rendering uses the same policy preparation and final fences as query
 resolution, rather than rebuilding the entire configured redirect index for
 one key. It observes sibling label declarations without executing sibling
