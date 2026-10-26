@@ -59191,6 +59191,11 @@ fn implementationTests() type {
             defer status_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             defer source.deinit();
+            // Keep both callback targets alive until the DB workers drain.
+            defer {
+                source.quiesce();
+                write_cache.closeAllDbsLocked() catch @panic("create fixture retained DB leases");
+            }
             source.write_cache = &write_cache;
             source.runtime_status_cache = &status_cache;
 
