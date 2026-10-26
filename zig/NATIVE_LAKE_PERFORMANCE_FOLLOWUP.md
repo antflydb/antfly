@@ -6195,3 +6195,23 @@ passes 343 native test executions (two declared skips), 18 tooling tests, and
 29 real Parquet/Iceberg E2Es covering NULL/date cursors, broad metadata filters,
 identity reuse, schema changes, deletes, pgwire and restart. Main `0c753dc705`
 is merged; compiled runtime ABI 65 covers the added internal batch callback.
+
+
+The [direct-probe qualification](bench/lake/native-direct-probes-v1-observation.json)
+pins source `850290dfaa`. Exact coordinate proofs avoid the source translation
+round trip for native metadata membership. Lazy inventory costing distinguishes
+unloaded directories from empty archives, and batch estimates share internal
+reverse navigation. Dense ordered prefetch follows remaining page demand;
+capture writes identical compact tuples from a fixed typed buffer and reusable
+scratch. Existing scratch/I/O/work budgets and incompatible-layout fallbacks stay
+in force. Reader protocol 89 and internal ABI 65 are unchanged.
+
+Identical-input controls preserve all 48 samples per binary. Metadata scans fall
+33 to 22 at limit 20 and 17 to 3 at limit one; local Debug warm medians fall about
+805 to 404 ms and 806 to 26 ms. Tiny pages use three direct probes, no translations
+and no materialization. Limit-20 diagnostics still observe complete-membership
+fallback; its cause and elimination need separate qualification. Ordinary-query
+timings are mixed under concurrent validation, and these observations establish
+neither cloud nor full-archive throughput. Final checks pass 146 focused native
+tests (one declared skip), 18 tooling tests, and 29 real Parquet/Iceberg E2Es without
+skips. Main `0c753dc705` remains merged after the final fetch.

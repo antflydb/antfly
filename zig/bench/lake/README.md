@@ -478,3 +478,33 @@ Qualification passes 343 native test executions with two declared skips,
 checks, and 29 real Parquet/Iceberg E2Es without skips. The native count includes
 the compiled error-identity test. Main `0c753dc705` is merged. Reader protocol 89
 and existing durable key formats remain; the internal compiled runtime ABI is 65.
+
+
+### Proven coordinate probes and demand-aware prefetch
+
+The [direct-probe qualification](native-direct-probes-v1-observation.json) pins
+clean production source `850290dfaa`. Matching authenticated row maps and file
+dictionaries admit metadata probes in original index coordinates; incompatible
+layouts retain translation. Unloaded lazy inventories retain unknown scan costs,
+so a missing eager file list cannot force full materialization with a zero-cost
+estimate. Batch costs amortize internal reverse-tree navigation without relaxing
+execution quotas. Dense ordered prefetch follows remaining page demand; sparse
+predicates and unresolved public ties keep bounded larger batches.
+
+Across identical eight-file / 16,384-row controls, all 36 limit-20 and 12 limit-one
+samples per binary preserve complete answers and independent expected IDs.
+Metadata scans fall from 33 to 22 at limit 20 and from 17 to 3 at limit one.
+Local Debug warm medians are about 805 to 404 ms and 806 to 26 ms respectively.
+Ordinary limit-20 timings vary by roughly 3–6% in the other direction; concurrent
+validation and sequential runs do not qualify causal latency or archive throughput.
+The tiny-page diagnostic observes three direct probes, zero translations and no
+complete materialization. Limit-20 diagnostics retain a complete-membership
+fallback; further elimination and its triggering consumer are not qualified here.
+
+Capture encodes identical tuples directly from live typed columns using reusable
+scratch: 4,096 rows allocate about 2.95 MB cumulative per-row arena capacity versus
+208 bytes retained by one arena. This is an allocation/kernel observation, not
+process peak memory or publication throughput. Final qualification passes 146
+focused native tests (one declared skip), 18 tooling tests, and 29 real
+Parquet/Iceberg E2Es without skips, including tiny-page scan bounds, rewrites,
+updates, deletes, NULL/date cursors, pgwire and restart. Main `0c753dc705` is merged.
