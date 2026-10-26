@@ -50,6 +50,7 @@ pub const Record = struct {
     owner: []const u8,
     operation: enum { read, extract } = .read,
     connection: []const u8 = "local-inference",
+    artifact_namespace: ?Digest = null,
     error_code: ?[]const u8 = null,
     revision: u64 = 1,
     attempt: u64 = 0,
@@ -80,6 +81,19 @@ pub const Record = struct {
         return .{ .revision = self.revision, .attempt = self.attempt, .nonce = self.nonce };
     }
 };
+/// Immutable request/model and budget contract shared by public jobs and
+/// index-owned invocations. Only the initial preparation seal may narrow limits.
+pub fn validateIdentityTransition(previous: Record, next: Record) !void {
+    if (!std.mem.eql(u8, previous.run_id, next.run_id) or !std.mem.eql(u8, previous.owner, next.owner) or previous.operation != next.operation or !std.mem.eql(u8, previous.connection, next.connection) or previous.retention_until_ms != next.retention_until_ms) return error.InvalidDocumentCheckpoint;
+    if (previous.artifact_namespace != null and !std.meta.eql(previous.artifact_namespace, next.artifact_namespace)) return error.DocumentModelRevisionMismatch;
+    const preparing = !previous.prepared and next.prepared and previous.used.calls == 0 and previous.pending.len == 0 and previous.attempt == next.attempt and previous.state == .running and next.state == .running;
+    if (!preparing and (!std.meta.eql(previous.identity, next.identity) or !std.meta.eql(previous.limits, next.limits))) return error.InvalidDocumentCheckpoint;
+    if (previous.prepared and !next.prepared) return error.InvalidDocumentCheckpoint;
+    if (preparing) {
+        if (!std.mem.eql(u8, &previous.identity.request, &next.identity.request) or !std.meta.eql(previous.used, next.used)) return error.InvalidDocumentCheckpoint;
+        inline for (@typeInfo(Charge).@"struct".field_names) |field| if (@field(next.limits, field) > @field(previous.limits, field) or @field(next.used, field) > @field(next.limits, field)) return error.InvalidDocumentCheckpoint;
+    }
+}
 pub const Version = struct { revision: u64, attempt: u64, nonce: [8]u8 };
 pub const Scope = struct { run_id: []const u8, owner: []const u8, attempt: u64, nonce: [8]u8 };
 pub const Lease = Scope;

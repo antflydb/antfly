@@ -3968,7 +3968,7 @@ pub const ApiHttpServer = struct {
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     document_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{ .namespace = .documents } },
     document_artifact_files: ?@import("../serverless/artifacts/fs_store.zig").FsStore = null,
-    document_artifact_object: ?*@import("../serverless/artifacts/object_store.zig").ObjectStore = null,
+    document_artifact_configured: ?*@import("lake_index_store.zig").Store = null,
     document_work_in_flight: std.atomic.Value(usize) = .init(0),
     document_cursor: usize = 0,
     document_schedule_mutex: std.atomic.Mutex = .unlocked,
@@ -4723,15 +4723,25 @@ pub const ApiHttpServer = struct {
             try server.document_job_store.attachOpenedStore(opened);
         }
         if (cfg.document_artifact_store == null) {
-            const uri = if (cfg.node_config) |config| config.public_inference.document_artifact_uri else null;
-            if (uri) |value| {
-                const ObjectStore = @import("../serverless/artifacts/object_store.zig").ObjectStore;
-                const object = try alloc.create(ObjectStore);
-                errdefer alloc.destroy(object);
-                object.* = try ObjectStore.initRemoteUri(alloc, value);
-                server.document_artifact_object = object;
-                server.cfg.document_artifact_store = object.artifactStore();
-            }
+            if (cfg.node_config) |config| if (config.storage.artifacts.connection != null) {
+                const Configured = @import("lake_index_store.zig").Store;
+                const configured = try alloc.create(Configured);
+                errdefer alloc.destroy(configured);
+                configured.* = try Configured.open(alloc, config, cfg.secret_store, false);
+                errdefer configured.deinit();
+                const namespace = try std.fmt.allocPrint(alloc, "{s}/document-jobs", .{configured.implementation.prefix});
+                alloc.free(configured.implementation.prefix);
+                configured.implementation.prefix = namespace;
+                configured.implementation.shared_namespace = configured.opened.s3_client != null or configured.opened.gcs_client != null;
+                const locator = configured.locator;
+                const identity = try std.json.Stringify.valueAlloc(alloc, .{ .protocol = locator.protocol, .bucket = locator.bucket, .prefix = namespace, .root = locator.root, .tls = locator.tls }, .{});
+                defer alloc.free(identity);
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(identity, &digest, .{});
+                configured.implementation.namespace_identity = digest;
+                server.document_artifact_configured = configured;
+                server.cfg.document_artifact_store = configured.artifactStore();
+            };
         }
         if (server.cfg.document_artifact_store == null) {
             if (cfg.document_artifact_path orelse cfg.document_job_store_path orelse cfg.research_job_store_path orelse cfg.session_store_path orelse cfg.native_lake_artifact_base_dir) |base_path| {
@@ -4849,9 +4859,9 @@ pub const ApiHttpServer = struct {
         self.research_job_store.deinit();
         self.document_job_store.deinit();
         if (self.document_artifact_files) |*files| files.deinit();
-        if (self.document_artifact_object) |object| {
-            object.deinit();
-            self.alloc.destroy(object);
+        if (self.document_artifact_configured) |configured| {
+            configured.deinit();
+            self.alloc.destroy(configured);
         }
         self.repair_job_store.deinit();
         self.restore_job_store.deinit();
@@ -5478,7 +5488,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn documentJobsFailoverSafe(self: *const ApiHttpServer) bool {
-        return self.document_job_store.replicated != null and (if (self.cfg.document_artifact_store) |store| store.shared_across_owners else false);
+        return self.document_job_store.replicated != null and (if (self.cfg.document_artifact_store) |store| store.shared_across_owners and store.namespace_identity != null else false);
     }
     pub fn documentExecutionPermitted(self: *ApiHttpServer) bool {
         if (self.cfg.deployment_mode == .distributed and (self.cfg.restore_execution_guard == null or !self.documentJobsFailoverSafe())) return false;

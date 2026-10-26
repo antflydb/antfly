@@ -733,6 +733,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
+    const index_document_producer_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/asset_producer_runtime.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, index_document_producer_mod, true, true);
+    index_document_producer_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const index_document_producer_tests = b.addTest(.{ .root_module = index_document_producer_mod, .filters = &.{"index document checkpoint producer"} });
+    b.step("antfly-index-document-producer-test", "Verify native indexed document checkpoint propagation and final replay").dependOn(&b.addRunArtifact(index_document_producer_tests).step);
+    const index_document_checkpoint_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/enrichment/document_checkpoints.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, index_document_checkpoint_mod, true, true);
+    const index_document_checkpoint_tests = b.addTest(.{ .root_module = index_document_checkpoint_mod, .filters = &.{"index document checkpoint"} });
+    b.step("antfly-index-document-checkpoint-test", "Verify index-owned document replay, fencing and bounded collection").dependOn(&b.addRunArtifact(index_document_checkpoint_tests).step);
     const api_document_runs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = selectTestFilters(b, &.{ "document artifact run", "research job" }),
@@ -6693,6 +6702,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_merge_cutover_step = b.step("antfly-storage-db-merge-cutover-test", "Run the merge cutover enrichment reopen DB test");
     db_merge_cutover_step.dependOn(&run_db_merge_cutover_tests.step);
 
+    const index_document_native_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"index document checkpoint native storage"} });
+    b.step("antfly-index-document-native-test", "Verify indexed document source guards, cleanup and native lease takeover").dependOn(&addFilteredTestRunArtifact(b, index_document_native_tests).step);
     const db_shared_embedding_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{"db shared embedding enrichment feeds multiple dense indexes"},

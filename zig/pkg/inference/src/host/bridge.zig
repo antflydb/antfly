@@ -24,7 +24,7 @@ const native_abi = @import("antfly_runtime_abi").native_abi;
 const antfly_image = @import("antfly_image");
 
 // Version 32 carries a retained, invocation-scoped document store capability.
-pub const abi_version: u32 = 32;
+pub const abi_version: u32 = 33;
 pub const DocumentStoreView = @import("antfly_runtime_abi").document_abi.View;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
@@ -180,6 +180,8 @@ pub const ProviderOperation = enum(c_int) {
     /// Documents as ordered content parts; binary parts travel as payloads
     /// whose refs index the parts flattened in document order.
     rerank_documents = 22,
+    document_read = 23,
+    document_extract = 24,
 };
 
 pub const ProviderBinaryPayload = extern struct {

@@ -373,6 +373,8 @@ pub const AntflyProvider = struct {
         context: ?RequestContext,
     ) anyerror![]u8 = null,
 
+    document_json: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, bool, RequestContext) anyerror![]u8 = null,
+
     pub fn decideJson(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
         const callback = self.decide_json orelse return error.UnsupportedDecisionProvider;
         return AntflyProviderBoundary.call("decide_json", self.boundary_dispatch, callback, .{ self.ptr, alloc, body, context });

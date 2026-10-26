@@ -1296,6 +1296,12 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             const result = try localModelCapabilities(&state.node, state.io, parsed.value.model, parsed.value.task);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
+        .document_read, .document_extract => blk: {
+            break :blk if (operation == .document_read)
+                try state.node.readDocumentsJsonWithControl(alloc, request_json, execution_control)
+            else
+                try state.node.extractDocumentsJsonWithControl(alloc, request_json, execution_control);
+        },
         .read_images => blk: {
             var parsed = try std.json.parseFromSlice(ReadImagesRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();

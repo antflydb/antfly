@@ -552,6 +552,7 @@ pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) i
         .classify_texts = inferenceProviderClassifyTexts,
         .generate_json = inferenceProviderGenerateJson,
         .decide_json = inferenceProviderDecideJson,
+        .document_json = inferenceProviderDocumentJson,
         .read_images = inferenceProviderReadImages,
         .read_images_with_context = inferenceProviderReadImagesWithContext,
         .read_encoded_images = inferenceProviderReadEncodedImages,
@@ -679,6 +680,7 @@ pub fn invokeInferenceProviderWithBinaryContext(
             .{ .context = &request_context, .is_cancelled = RequestCancellation.requested }
         else
             .{},
+        .document_store = if (request_context) |active| active.document_store else .{},
         .progress = if (request_context != null and request_context.?.progress != null)
             .{ .context = @constCast(&request_context), .update_progress = RequestProgress.update }
         else
@@ -710,6 +712,9 @@ pub fn invokeInferenceProviderWithBinaryContext(
                 return rows[0];
             }
         }
+    }
+    if (comptime Result == []u8) {
+        if (operation == .document_read or operation == .document_extract) return alloc.dupe(u8, response_json.slice());
     }
     return try std.json.parseFromSliceLeaky(Result, alloc, response_json.slice(), .{
         .allocate = .alloc_always,
@@ -2004,4 +2009,14 @@ pub fn inferenceProviderListModelsJson(
     alloc: std.mem.Allocator,
 ) anyerror![]u8 {
     return try invokeInferenceProvider([]u8, alloc, handle, .list_models_json, .{}, null);
+}
+
+fn inferenceProviderDocumentJson(ptr: *anyopaque, a: std.mem.Allocator, bytes: []const u8, extract: bool, context: inference.RequestContext) ![]u8 {
+    const Raw = struct {
+        bytes: []const u8,
+        pub fn jsonStringify(self: @This(), stream: anytype) !void {
+            try stream.print("{s}", .{self.bytes});
+        }
+    };
+    return invokeInferenceProvider([]u8, a, ptr, if (extract) .document_extract else .document_read, Raw{ .bytes = bytes }, context);
 }

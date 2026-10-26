@@ -172,15 +172,10 @@ pub const Store = struct {
             outer = try std.json.parseFromSliceLeaky(Record, a, bytes, .{ .allocate = .alloc_always });
             if (!std.mem.eql(u8, outer.owner, next.owner)) return false;
             const previous = try std.json.parseFromSliceLeaky(@TypeOf(next), a, outer.request, .{});
+            if (previous.artifact_namespace != null and !std.meta.eql(previous.artifact_namespace, next.artifact_namespace)) return error.DocumentModelRevisionMismatch;
             // Tombstones are permanent fencing records, never reusable IDs.
             if (previous.retired or previous.operation != next.operation or !std.mem.eql(u8, previous.connection, next.connection) or next.retention_until_ms != previous.retention_until_ms) return false;
-            const preparing = !previous.prepared and next.prepared and previous.used.calls == 0 and previous.pending.len == 0 and previous.attempt == next.attempt and previous.state == .running and next.state == .running;
-            if (!preparing and (!std.meta.eql(previous.identity, next.identity) or !std.meta.eql(previous.limits, next.limits))) return error.InvalidDocumentCheckpoint;
-            if (previous.prepared and !next.prepared) return error.InvalidDocumentCheckpoint;
-            if (preparing) {
-                if (!std.mem.eql(u8, &previous.identity.request, &next.identity.request) or !std.meta.eql(previous.used, next.used)) return error.InvalidDocumentCheckpoint;
-                inline for (@typeInfo(@TypeOf(next.limits)).@"struct".field_names) |name| if (@field(next.limits, name) > @field(previous.limits, name) or @field(next.used, name) > @field(next.limits, name)) return error.InvalidDocumentCheckpoint;
-            }
+            try @import("antfly_readers").document_runs.validateIdentityTransition(previous, next);
             if (!std.meta.eql(previous.version(), expected.?) or next.revision != expected.?.revision + 1) return false;
             // Recheck at the metadata linearization point. Artifact IO may
             // have outlived the timestamp used to prepare this transition.

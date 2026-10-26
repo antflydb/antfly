@@ -1091,6 +1091,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    inference_execution_control_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     inference_execution_control_mod.addImport("antfly_platform", platform_mod);
     inference_execution_control_mod.addImport("antfly_cancellation", cancellation_mod);
     const inference_execution_context_mod = b.createModule(.{

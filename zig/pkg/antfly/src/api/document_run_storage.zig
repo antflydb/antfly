@@ -93,13 +93,20 @@ pub const Context = struct {
         const self: *Context = @ptrCast(@alignCast(raw));
         try self.cancellation.check();
         const record = (try self.metadata.load(a, id, owner)) orelse return null;
-        return try std.json.parseFromSliceLeaky(runs.Record, a, record.request, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
+        const run = try std.json.parseFromSliceLeaky(runs.Record, a, record.request, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
+        if (run.artifact_namespace) |identity| {
+            const configured = self.artifacts.namespace_identity orelse return error.DocumentModelRevisionMismatch;
+            if (!std.mem.eql(u8, &identity, &configured)) return error.DocumentModelRevisionMismatch;
+        }
+        return run;
     }
     fn cas(raw: *anyopaque, expected: ?runs.Version, next: runs.Record) !bool {
         const self: *Context = @ptrCast(@alignCast(raw));
         try self.cancellation.check();
         try self.checkAuthority();
-        return self.metadata.compareDocumentRunInTerm(expected, next, self.now_fn, self.leadership_term);
+        var bound = next;
+        bound.artifact_namespace = self.artifacts.namespace_identity;
+        return self.metadata.compareDocumentRunInTerm(expected, bound, self.now_fn, self.leadership_term);
     }
     pub fn domain(run_id: []const u8, owner: []const u8) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -560,4 +567,38 @@ test "document artifact run shared owners recover checkpoints and fence partitio
         visited += 1;
     }
     try std.testing.expectEqual(@as(usize, 66), visited);
+}
+
+test "document artifact run refuses namespace redirection before replay while allowing the same namespace" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/namespaced-document-state", .{tmp.sub_path});
+    defer a.free(path);
+    const artifacts_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/namespaced-document-artifacts", .{tmp.sub_path});
+    defer a.free(artifacts_path);
+    var metadata = jobs.Store.init(a, .{ .namespace = .documents });
+    defer metadata.deinit();
+    const opened = try a.create(jobs.OpenedStore);
+    opened.* = try jobs.OpenedStore.open(a, path);
+    try metadata.attachOpenedStore(opened);
+    var files = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, artifacts_path);
+    defer files.deinit();
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    var artifact_store = files.artifactStore();
+    artifact_store.namespace_identity = @splat(1);
+    var context = Context{ .metadata = &metadata, .artifacts = artifact_store, .io = io_impl.io() };
+    const store = try context.interface();
+    try store.create(.{ .run_id = "pinned", .owner = "alice", .identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) }, .inputs = &.{}, .limits = .{ .calls = 1 } });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const original = try store.load(arena.allocator(), "pinned", "alice");
+    try std.testing.expectEqual(@as(?runs.Digest, @splat(1)), original.artifact_namespace);
+    context.artifacts.namespace_identity = @splat(2);
+    try std.testing.expectError(error.DocumentModelRevisionMismatch, store.load(arena.allocator(), "pinned", "alice"));
+    context.artifacts.namespace_identity = null;
+    try std.testing.expectError(error.DocumentModelRevisionMismatch, store.load(arena.allocator(), "pinned", "alice"));
+    context.artifacts.namespace_identity = @splat(1);
+    _ = try store.load(arena.allocator(), "pinned", "alice");
 }

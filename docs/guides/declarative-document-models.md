@@ -612,6 +612,51 @@ reading handles keep their existing five-minute lifetime.
 A durable extraction snapshots a retained reading before
 using it, so subsequent handle expiry does not break resume.
 
+### Durable document processing inside an index
+
+Indexed reader and extractor producers invoke the same document executor with
+an enrichment-owned persistence capability. They do not submit public jobs or
+acquire an independently scheduled job owner. `/read/jobs` and `/extract/jobs`
+are optional asynchronous APIs for requests independent of a table or index;
+“independent” does not mean the standalone deployment mode.
+
+For Antfly reader and extractor models, the invocation binds the exact request
+to the document, producer, source sequence, reprocess generation and captured
+catalog/source authority. The existing enrichment lease owns scheduling. Every
+checkpoint mutation validates that captured tenure and source/catalog proof in
+the same native storage transaction. Source bytes, renders, decisions, accepted
+pages, extraction stages and final responses use the existing document
+checkpoint protocol, stored with private enrichment preparation state. A
+replacement invocation replays accepted stages and retains charges for unknown
+provider calls. Local and remote inference receive the same retained capability;
+remote calls use the existing duplex protocol with table routing, deadlines,
+remaining-token admission and no transport replay.
+
+Independent document invocations run in cohorts of at most four on the existing
+runtime I/O executor. Their outputs publish in source order through the ordinary
+asset publication path; its accepted source/catalog receipt advances enrichment
+progress and feeds downstream chunk and embedding producers. A completed
+inference response remains replayable while publication is pending. Other
+providers and existing media-page batching retain their established paths.
+
+Indexed checkpoints use the existing enrichment lease, including its heartbeat,
+without a second job lease. They retain the complete causal source and upstream
+artifact proof, including grouped inputs. Indexed checkpoints have no public-job
+TTL. Acceptance retires intermediates; source replacement/deletion, producer
+removal, and catalog/reprocess changes
+invalidate previous preparation. The existing maintenance scheduler rotates
+through bounded root pages and deletes at most 32 blobs per root per pass,
+including while source replay is idle. A retirement marker fences writes before
+deletion. Retained callbacks and responses use a lifetime-owned, bounded,
+synchronized allocator and drain before their enrichment context is released.
+
+A reader may receive a JSON document descriptor containing `documents` to
+preserve media type, page selection, slide notes and visibility. PDF/PPTX source
+URIs can also be inferred from their suffix or explicit media type. Extractor
+producers support one document source per indexed invocation, while ordinary
+text extraction keeps its existing response representation. Job APIs retain
+their broader request forms and independent result/event retention.
+
 ### Ownership, recovery and shared artifacts
 
 Document jobs reuse `BackendRuntime.durable_jobs` for bounded execution and the
@@ -640,22 +685,45 @@ Collectors retain tombstones and revisit completed namespaces after a minute
 to catch uploads that finish after ownership loss. Completed history is not
 loaded into memory or scanned for ordinary job dispatch.
 
-Configure a shared artifact namespace before submitting jobs that must survive
-HA promotion:
+Configure the existing artifact lane before submitting independent jobs that
+must survive HA promotion. Document jobs use a `document-jobs` subnamespace:
 
 ```json
 {
-  "public_inference": {
-    "enabled": true,
-    "document_artifact_uri": "s3://my-bucket/my-deployment/document-jobs"
+  "public_inference": { "enabled": true },
+  "connections": {
+    "artifacts": {
+      "kind": "external_io",
+      "capabilities": ["storage.primary"],
+      "external_io": {
+        "protocol": "s3",
+        "buckets": ["my-bucket"],
+        "prefix": "my-deployment"
+      }
+    }
+  },
+  "storage": {
+    "artifacts": {
+      "connection": "artifacts",
+      "bucket": "my-bucket",
+      "prefix": "my-deployment/artifacts"
+    }
   }
 }
 ```
 
-`gs://bucket/prefix` is also supported. All replacement owners must use the
-same namespace and have access through the existing object-store credential
-providers. `file://` and the default local artifact directory retain local
-ownership semantics. Changing the URI does not migrate existing payloads.
+GCS is supported through an equivalent `gcs` connection. The configured opener
+resolves secrets and refreshable credentials and enforces capability, bucket,
+prefix and provisioning policy. Source download credentials remain separate
+from this artifact writer. Remote executors receive scoped persistence
+capabilities and cannot delete artifacts or obtain storage credentials.
+
+Replacement owners must use the same artifact namespace. Jobs pin its protocol,
+endpoint, bucket and prefix; changing the target rejects replay before reading
+payloads. Credential rotation does not change that identity. The default local
+artifact directory retains local ownership semantics. Changing placement does
+not migrate existing payloads. The draft `document_artifact_uri` setting has
+been removed in favor of this existing configuration.
 
 HA job mutation is admitted only with authoritative metadata and a shared
 artifact backend. Existing primary write gates fence demoted owners, and

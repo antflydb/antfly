@@ -231,3 +231,16 @@ pub const Client = struct {
         return a.dupe(u8, response.body.slice());
     }
 };
+
+/// Invocation-scoped storage supplied by an existing workflow owner. It creates
+/// no public job or scheduler registration. The returned binding owns its borrow.
+pub const Factory = struct {
+    const Callbacks = struct { bind: *const fn (*anyopaque, A, []const u8, bool) anyerror!*OwnedServer };
+    const Boundary = runtime.callback_abi.Boundary(Callbacks);
+    ptr: *anyopaque,
+    bind_fn: *const fn (*anyopaque, A, []const u8, bool) anyerror!*OwnedServer,
+    dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+    pub fn bind(self: Factory, a: A, bytes: []const u8, extract: bool) !*OwnedServer {
+        return Boundary.call("bind", self.dispatch, self.bind_fn, .{ self.ptr, a, bytes, extract });
+    }
+};

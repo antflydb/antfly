@@ -54,6 +54,7 @@ const enrichment_lease = @import("enrichment_lease.zig");
 const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
 const asset_producer_mod = @import("asset_producer.zig");
+const document_checkpoints = @import("document_checkpoints.zig");
 const inference_work = @import("antfly_inference_work");
 const chunk_provider = @import("../../../chunking/provider.zig");
 const document_extraction_mod = @import("document_extraction.zig");
@@ -2217,6 +2218,15 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         => .fatal_worker,
 
         error.RequiredMediaOutputFailed,
+        error.DocumentModelRevisionMismatch,
+        error.DocumentBudgetExhausted,
+        error.InvalidDocumentCheckpoint,
+        error.InvalidDocumentSource,
+        error.InvalidDocumentSelection,
+        error.UnsupportedDocumentFormat,
+        error.DocumentMediaTypeMismatch,
+        error.DocumentPageLimitExceeded,
+        error.DocumentOutputTooLarge,
         error.InvalidAssetProducerConfig,
         error.ModelNotFound,
         error.GenerateBatchItemRejected,
@@ -3506,6 +3516,7 @@ fn scopedAssetProducer(
             .is_cancelled_fn = AssetInvocationCancellation.isCancelled,
         },
         .max_response_bytes = producer.invocation_context.max_response_bytes,
+        .document_checkpoints = producer.invocation_context.document_checkpoints,
         .progress = producer.invocation_context.progress orelse
             inference_request_context.ProgressSink{ .ptr = runtime, .update_fn = noteInferenceProgress },
     });
@@ -6317,6 +6328,11 @@ const PlatformEnrichmentRuntime = struct {
     /// wrapper preserves the existing `io()` call sites while removing the
     /// production dependency on `std.Io.Threaded` and enabling VoprIo.
     io_impl: ?IoBackend,
+    document_checkpoint_gc_mutex: std.atomic.Mutex = .unlocked,
+    document_checkpoints_present: std.atomic.Value(bool) = .init(false),
+    document_checkpoint_gc_pending: std.atomic.Value(bool) = .init(false),
+    document_checkpoint_gc_after: [192]u8 = @splat(0),
+    document_checkpoint_gc_after_len: usize = 0,
     store: backend_erased.Store,
     owns_store: bool,
     artifact_store: ?*docstore_mod.DocStore = null,
@@ -8481,13 +8497,17 @@ test "rejected chunk embedding publication records its request for stale cleanup
 }
 
 fn workerStep(runtime: *EnrichmentRuntime) ?u64 {
+    if (runtime.shutdown_requested.load(.acquire)) return null;
+    maintainIndexDocumentCheckpoints(runtime) catch |err| {
+        if (err != error.EnrichmentLeaseFenceLost and err != error.WriterLocked) std.log.debug("document checkpoint maintenance deferred err={s}", .{@errorName(err)});
+    };
     const io = runtime.io_impl.?.io();
     runtime.mutex.lockUncancelable(io);
     if (runtime.shutdown or ((runtime.worker_failed or runtime.last_error_name != null) and !runtime.graph_stage_recovery_pending) or
         (runtime.target_sequence <= runtime.applied_sequence and !runtime.retrying and !runtime.graph_stage_recovery_pending))
     {
         runtime.mutex.unlock(io);
-        return null;
+        return if (runtime.shutdown) null else if (runtime.document_checkpoint_gc_pending.load(.acquire)) 1000 else if (runtime.document_checkpoints_present.load(.acquire)) 30_000 else null;
     }
     if (runtime.replay_pass_active) {
         runtime.mutex.unlock(io);
@@ -8681,6 +8701,8 @@ fn runForegroundCatchUpPassOwned(
     // documents all share this tenure. Keep the exact admitted epoch alive
     // for the entire pass, including draining already-dispatched lanes.
     // Per-write durable fences still reject results after a real takeover.
+    try maintainIndexDocumentCheckpoints(runtime);
+
     var replay_lease_guard = RuntimeLeaseHeartbeatGuard.init(runtime);
     try replay_lease_guard.start();
     defer replay_lease_guard.stop();
@@ -13783,6 +13805,7 @@ fn processAsset(
         try finishAcceptedAssetGraph(runtime, request);
         try settleAcceptedMediaOutput(runtime, request, window);
         try retireMediaPassForAssetRequest(runtime, request);
+        try retireIndexDocumentCheckpoint(runtime, request);
         return;
     }
     // Accepted provenance already validates the saved causal guards. In
@@ -13800,6 +13823,7 @@ fn processAsset(
         prior_input = try @import("group_prior_input.zig").capture(runtime.alloc, runtime.artifact_store orelse return error.ArtifactCatalogDrift, request, observed.?, if (context) |*value| value else null, .{ .ptr = runtime, .render = Render.render });
     }
     const raw = observed orelse {
+        try retireIndexDocumentCheckpoint(runtime, request);
         if (context) |*value| {
             std.log.debug("producer retirement replay artifact={s}", .{requestArtifactName(request)});
             const artifact = requestArtifactName(request);
@@ -14452,6 +14476,9 @@ fn flushAssetProducerBatchItems(
     defer runtime.alloc.free(requests);
     for (items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
+    if (try indexDocumentProducerRequired(runtime.alloc, items[0]))
+        return flushIndexDocumentBatch(runtime, producer, items, window, scope);
+
     const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
         return try flushAssetProducerBatchSequential(runtime, producer, items, window, scope);
@@ -14507,6 +14534,80 @@ fn flushAssetProducerBatchItems(
                 produced.result = .{ .value = &.{} };
             },
         }
+    }
+    if (retry_error) |err| return err;
+}
+
+fn indexDocumentProducerRequired(a: Allocator, item: AssetProducerBatchItem) !bool {
+    if (item.producer_type != .reader and item.producer_type != .extractor) return false;
+    if (item.producer_type == .extractor and try @import("antfly_structured").extraction.isGenerated(a, item.config_json)) return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, item.config_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const provider = parsed.value.object.get("provider") orelse return item.producer_type == .extractor;
+    return provider == .string and std.mem.eql(u8, provider.string, "antfly");
+}
+fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer_mod.Producer, items: []AssetProducerBatchItem, window: *GeneratedReplayWindow, scope: *FailureScope) !void {
+    const Task = struct {
+        runtime: *EnrichmentRuntime,
+        producer: asset_producer_mod.Producer,
+        item: *AssetProducerBatchItem,
+        fn run(self: *@This()) anyerror![]u8 {
+            var context = try IndexDocumentCheckpoint.init(self.runtime, self.item);
+            var owner = context.owner();
+            defer owner.drain();
+            var invocation = self.producer.invocation_context;
+            invocation.document_checkpoints = owner.factory();
+            return assetProducerProduceGuarded(self.runtime, self.producer.withInvocationContext(invocation), self.runtime.alloc, self.item.asRequest());
+        }
+    };
+    const io = runtime.config.io orelse runtime.io_impl.?.io();
+    var retry_error: ?anyerror = null;
+    var offset: usize = 0;
+    while (offset < items.len) {
+        const count = @min(@as(usize, 4), items.len - offset);
+        var tasks: [4]Task = undefined;
+        var futures: [4]?std.Io.Future(anyerror![]u8) = @splat(null);
+        var inline_results: [4]anyerror![]u8 = undefined;
+        for (0..count) |index| {
+            tasks[index] = .{ .runtime = runtime, .producer = producer, .item = &items[offset + index] };
+            futures[index] = if (count == 1) null else io.concurrent(Task.run, .{&tasks[index]}) catch null;
+            if (futures[index] == null) inline_results[index] = tasks[index].run();
+        }
+        // Drain the complete cohort before publication or propagating errors.
+        var results: [4]anyerror![]u8 = undefined;
+        for (0..count) |index| results[index] = if (futures[index]) |*future| future.await(io) else inline_results[index];
+        defer for (results[0..count]) |result| {
+            const bytes = result catch continue;
+            runtime.alloc.free(bytes);
+        };
+        for (results[0..count], items[offset..][0..count]) |result, *item| {
+            scope.enter(requestFailureFingerprint(item.request));
+            const bytes = result catch |err| {
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+                if (scope.shouldYield(runtime, err)) {
+                    if (retry_error == null) {
+                        retry_error = err;
+                        scope.deferRetry(err);
+                    }
+                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+                continue;
+            };
+            applyAssetProducerBatchOutput(runtime, item, bytes, window) catch |err| {
+                if (err == error.ArtifactPublicationPending) {
+                    if (retry_error == null) retry_error = err;
+                    continue;
+                }
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+                if (scope.shouldYield(runtime, err)) {
+                    if (retry_error == null) {
+                        retry_error = err;
+                        scope.deferRetry(err);
+                    }
+                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, requestAttemptNumberFor(runtime, scope.fingerprint));
+            };
+        }
+        offset += count;
     }
     if (retry_error) |err| return err;
 }
@@ -15213,6 +15314,228 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     try applyAssetProducerBatchOutput(runtime, &item, produced, window);
 }
 
+const IndexDocumentCheckpoint = struct {
+    runtime: *EnrichmentRuntime,
+    fence: ?GeneratedWriteFence,
+    item: ?*AssetProducerBatchItem = null,
+    binding: document_checkpoints.Binding = undefined,
+    for_gc: bool = false,
+    catalog_generation: u64 = 0,
+    fn init(runtime: *EnrichmentRuntime, item: *AssetProducerBatchItem) !@This() {
+        const authority = if (item.producer_context) |*token| try token.command(&.{}) else null;
+        const authority_json = if (authority) |command| try std.json.Stringify.valueAlloc(item.producer_context.?.arena.allocator(), command, .{}) else null;
+        return .{ .runtime = runtime, .fence = try requiredRuntimeStoreWriteFence(runtime), .item = item, .catalog_generation = runtime.index_manager.writePlanGeneration(), .binding = .{
+            .document = item.request.doc_key,
+            .producer = requestArtifactName(item.request),
+            .source_key = item.request.doc_key,
+            .source_digest = sourceRecordDigest(item.raw_doc),
+            .producer_digest = document_checkpoints.hash(item.request.producer_json),
+            .catalog_digest = if (item.producer_context) |token| token.catalog_digest else @splat(0),
+            .namespace = if (item.producer_context) |token| token.namespace else @splat(0),
+            .authority_digest = if (authority) |command| command.publication_digest else @splat(0),
+            .authority_json = authority_json,
+            .catalog_epoch = if (item.producer_context) |token| token.epoch else 0,
+            .source_sequence = item.request.sequence,
+            .generation = item.request.reprocess_generation,
+        } };
+    }
+    fn backend(self: *@This()) document_checkpoints.Backend {
+        return .{ .ptr = self, .get = get, .mutate = mutate, .keys = keys };
+    }
+    fn owner(self: *@This()) document_checkpoints.Owner {
+        return .{ .allocator = self.runtime.alloc, .backend = self.backend(), .binding = self.binding, .io = self.runtime.config.io orelse self.runtime.io_impl.?.io(), .cancellation = self.runtime.config.cancellation };
+    }
+    fn get(raw: *anyopaque, a: Allocator, key: []const u8) !?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var store = try RuntimePublicationStore.init(self.runtime);
+        defer store.deinit();
+        var read = try store.store(self.runtime).beginRead();
+        defer read.abort();
+        const bytes = read.get(key) catch |err| if (err == error.NotFound) return null else return err;
+        return try a.dupe(u8, bytes);
+    }
+    fn keys(raw: *anyopaque, a: Allocator, prefix: []const u8, limit: usize) ![][]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var store = try RuntimePublicationStore.init(self.runtime);
+        defer store.deinit();
+        return (try backend_scan.scanPrefixKeysPage(a, store.store(self.runtime), prefix, limit)).keys;
+    }
+    fn mutate(raw: *anyopaque, key: []const u8, expected: ?[]const u8, writes: []const document_checkpoints.Write, deletes: []const []const u8) !bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const runtime = self.runtime;
+        try heartbeatEnrichmentLease(runtime);
+        if (self.fence) |fence| {
+            const current = currentGeneratedWriteFence(runtime) orelse return error.EnrichmentLeaseFenceLost;
+            if (fence.epoch != current.epoch or !std.mem.eql(u8, fence.owner_id, current.owner_id)) return error.EnrichmentLeaseFenceLost;
+        }
+        var store = try RuntimePublicationStore.init(runtime);
+        defer store.deinit();
+        const live = store.store(runtime);
+        if (store.lease) |lease| {
+            try lease.guard_key(lease.ptr, key);
+            for (writes) |write| try lease.guard_key(lease.ptr, write.key);
+            for (deletes) |deleted| try lease.guard_key(lease.ptr, deleted);
+        }
+        var txn = try live.beginWrite();
+        errdefer txn.abort();
+        try validateRuntimeStoreWriteFenceTxn(runtime, &txn, self.fence);
+        const old = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+        if ((old == null) != (expected == null)) {
+            txn.abort();
+            return false;
+        }
+        if (old) |bytes| if (!std.mem.eql(u8, bytes, expected.?)) {
+            txn.abort();
+            return false;
+        };
+        if (!self.for_gc) {
+            const item = self.item orelse return error.EnrichmentSourceChanged;
+            if (item.producer_context) |*token| try token.validate(runtime.alloc, &txn) else {
+                const source_key = try documentSourceStoreKeyAlloc(runtime, item.request.doc_key);
+                defer runtime.alloc.free(source_key);
+                const value = txn.get(source_key) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+                const logical = try materializeProducerInput(runtime.index_manager, runtime.alloc, source_key, value);
+                defer runtime.alloc.free(logical);
+                if (!std.mem.eql(u8, &sourceRecordDigest(logical), &self.binding.source_digest)) return error.EnrichmentSourceChanged;
+                if (runtime.index_manager.writePlanGeneration() != self.catalog_generation) return error.EnrichmentSourceChanged;
+            }
+        }
+        for (writes) |write| try txn.put(write.key, write.value);
+        for (deletes) |deleted| txn.delete(deleted) catch |err| if (err != error.NotFound) return err;
+        try validateRuntimeStoreWriteFenceTxn(runtime, &txn, self.fence);
+        try txn.commit();
+        try live.sync(false);
+        runtime.document_checkpoints_present.store(true, .release);
+        if (runtime.backend_runtime) |background| background.wakeMaintenance(runtime);
+        return true;
+    }
+};
+fn retireIndexDocumentCheckpoint(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
+    var arena = std.heap.ArenaAllocator.init(runtime.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = try document_checkpoints.scope(a, request.doc_key, requestArtifactName(request));
+    var context = IndexDocumentCheckpoint{ .runtime = runtime, .fence = try requiredRuntimeStoreWriteFence(runtime), .for_gc = true };
+    if (!try document_checkpoints.collect(context.backend(), a, try document_checkpoints.rootKey(a, id), try document_checkpoints.blobScope(a, id), 32)) runtime.document_checkpoint_gc_pending.store(true, .release);
+}
+fn maintainIndexDocumentCheckpoints(runtime: *EnrichmentRuntime) !void {
+    if (!runtime.document_checkpoint_gc_mutex.tryLock()) return;
+    defer runtime.document_checkpoint_gc_mutex.unlock();
+    // Discovery is a bounded read even before acquiring the enrichment lease.
+    // This wakes retired spools after restart when the replay watermark is idle.
+    const probe = probe: {
+        var live = try RuntimePublicationStore.init(runtime);
+        defer live.deinit();
+        break :probe try backend_scan.scanPrefixKeysPage(runtime.alloc, live.store(runtime), document_checkpoints.root_prefix, 1);
+    };
+    defer {
+        for (probe.keys) |key| runtime.alloc.free(key);
+        runtime.alloc.free(probe.keys);
+    }
+    runtime.document_checkpoints_present.store(probe.keys.len != 0, .release);
+    if (probe.keys.len == 0) {
+        runtime.document_checkpoint_gc_pending.store(false, .release);
+        return;
+    }
+    if (runtime.lease_fencing_enabled and runtime.ownership.lease_owned) {
+        const io = runtime.io_impl.?.io();
+        runtime.mutex.lockUncancelable(io);
+        const acquired = runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()) catch |err| {
+            runtime.mutex.unlock(io);
+            return err;
+        };
+        runtime.mutex.unlock(io);
+        if (!acquired) return;
+    }
+    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    runtime.document_checkpoint_gc_pending.store(false, .release);
+    var context = IndexDocumentCheckpoint{ .runtime = runtime, .fence = fence, .for_gc = true };
+    var arena = std.heap.ArenaAllocator.init(runtime.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Copy only a bounded root-key page. Blob history is a separate namespace.
+    var keys: std.ArrayList([]const u8) = .empty;
+    {
+        var store = try RuntimePublicationStore.init(runtime);
+        defer store.deinit();
+        var read = try store.store(runtime).beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const after = runtime.document_checkpoint_gc_after[0..runtime.document_checkpoint_gc_after_len];
+        var entry = try cursor.seekAtOrAfter(if (after.len > 0) after else document_checkpoints.root_prefix);
+        while (entry) |value| {
+            if (!std.mem.startsWith(u8, value.key, document_checkpoints.root_prefix) or keys.items.len == 32) break;
+            if (!std.mem.eql(u8, value.key, after)) try keys.append(a, try a.dupe(u8, value.key));
+            entry = try cursor.next();
+        }
+    }
+    if (keys.items.len == 32) {
+        runtime.document_checkpoint_gc_pending.store(true, .release);
+        const last = keys.items[keys.items.len - 1];
+        if (last.len > runtime.document_checkpoint_gc_after.len) return error.InvalidDocumentCheckpoint;
+        @memcpy(runtime.document_checkpoint_gc_after[0..last.len], last);
+        runtime.document_checkpoint_gc_after_len = last.len;
+    } else runtime.document_checkpoint_gc_after_len = 0;
+    var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    for (keys.items) |key| {
+        // Decoded causal proofs and collected payloads live for one root only.
+        var root_arena = std.heap.ArenaAllocator.init(runtime.alloc);
+        defer root_arena.deinit();
+        const root_alloc = root_arena.allocator();
+        const raw = (try context.backend().get(&context, root_alloc, key)) orelse continue;
+        const root = try std.json.parseFromSliceLeaky(document_checkpoints.Root, root_alloc, raw, .{});
+        var obsolete = root.run.retired;
+        if (!obsolete and root.binding.catalog_epoch == 0) {
+            var matching = false;
+            for (plan.plan().generated_templates) |recipe| {
+                if (recipe.kind == .asset and std.mem.eql(u8, requestArtifactName(recipe), root.binding.producer) and std.mem.eql(u8, &document_checkpoints.hash(recipe.producer_json), &root.binding.producer_digest)) {
+                    matching = true;
+                    break;
+                }
+            }
+            obsolete = !matching;
+        }
+        if (!obsolete) {
+            if (root.binding.authority_json) |encoded| {
+                const command = try std.json.parseFromSliceLeaky(ordered_publication.Command, root_alloc, encoded, .{});
+                var live_store = try RuntimePublicationStore.init(runtime);
+                defer live_store.deinit();
+                var transaction = try live_store.store(runtime).beginRead();
+                defer transaction.abort();
+                const authority = try ordered_publication.authority(&transaction);
+                obsolete = authority == null or authority.?.epoch != root.binding.catalog_epoch or !std.mem.eql(u8, &authority.?.namespace, &root.binding.namespace) or !std.mem.eql(u8, &authority.?.catalog_digest, &root.binding.catalog_digest);
+                if (!obsolete) validateCheckpointSources(root_alloc, &transaction, command) catch |err| switch (err) {
+                    error.EnrichmentSourceChanged, error.ArtifactCatalogDrift => obsolete = true,
+                    else => return err,
+                };
+                if (!obsolete and root.run.state == .succeeded) for (command.sources) |source| {
+                    if (!std.mem.eql(u8, source.document_key, root.binding.document)) continue;
+                    if (try @import("../artifact_producer_provenance.zig").readCurrentForSource(root_alloc, &transaction, command, source)) |_| obsolete = true;
+                    break;
+                };
+            } else {
+                const source_key = try documentSourceStoreKeyWithAllocator(runtime, root_alloc, root.binding.document);
+                var live = try RuntimePublicationStore.init(runtime);
+                defer live.deinit();
+                var read = try live.store(runtime).beginRead();
+                defer read.abort();
+                const source = read.get(source_key) catch |err| if (err == error.NotFound) null else return err;
+                const logical = if (source) |bytes| try materializeProducerInput(runtime.index_manager, root_alloc, source_key, bytes) else null;
+                obsolete = logical == null or !std.mem.eql(u8, &sourceRecordDigest(logical.?), &root.binding.source_digest);
+            }
+        }
+        if (obsolete and !try document_checkpoints.collect(context.backend(), root_alloc, key, try document_checkpoints.blobScope(root_alloc, key[document_checkpoints.root_prefix.len..]), 32)) runtime.document_checkpoint_gc_pending.store(true, .release);
+    }
+}
+
+fn validateCheckpointSources(a: Allocator, txn: anytype, command: ordered_publication.Command) !void {
+    try ordered_publication.validateSources(a, txn, command.namespace, command.sources);
+    try ordered_publication.validateArtifactSources(a, txn, command.namespace, command.sources, command.artifact_sources);
+    try ordered_publication.validateArtifactSources(a, txn, command.namespace, command.sources, command.mutation_preconditions);
+}
+
 fn applyAssetProducerBatchOutput(
     runtime: *EnrichmentRuntime,
     item: *AssetProducerBatchItem,
@@ -15237,6 +15560,7 @@ fn applyAssetProducerBatchOutput(
     try materializeGraphAssetForRuntime(runtime, item.request, produced, item.raw_doc, window);
     recordArtifactBytes(runtime, .asset, produced.len);
     try queueArtifactCoverageOutcomeForRequest(runtime, window, item.request, .produced);
+    try retireIndexDocumentCheckpoint(runtime, item.request);
 }
 
 /// Use the same completed-state gate for metadata fingerprints known before a
@@ -40655,4 +40979,130 @@ test "model aware media label subwindows verify within bounded parent metadata a
         try std.testing.expectEqual(identity_bytes, parent.outputs_json.?.len);
     }
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+}
+
+test "index document checkpoint native storage rejects changed sources and superseded enrichment owners" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/checkpoint-indexes", .{tmp.sub_path});
+    defer a.free(path);
+    const data_path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/checkpoint-primary", .{tmp.sub_path}, 0);
+    defer a.free(data_path);
+    var durable = try docstore_mod.DocStore.open(a, data_path, .{});
+    var durable_open = true;
+    defer if (durable_open) durable.close();
+    var erased = durable.runtime_store;
+    var indexes = try index_manager_mod.IndexManager.init(a, path);
+    defer indexes.deinit();
+    const definition = "{\"type\":\"reader\",\"config\":{\"provider\":\"antfly\",\"model\":\"agent\"}}";
+    try indexes.addEnrichment(&erased, .{ .name = "reading", .kind = .asset, .field = "url", .producer_json = definition });
+    var runtime: EnrichmentRuntime = .{
+        .alloc = a,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = erased,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &indexes,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = try ownership_mod.State.init(a, &erased, enrichment_lease.default_lease_key, .{ .lease_owned = true, .owner_id = "first" }),
+        .lease_fencing_enabled = true,
+    };
+    defer runtime.ownership.deinit(a);
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    const source_key = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer a.free(source_key);
+    const before = "{\"url\":\"https://example.test/first.pdf\"}";
+    const after = "{\"url\":\"https://example.test/second.pdf\"}";
+    {
+        var txn = try erased.beginWrite();
+        errdefer txn.abort();
+        try txn.put(source_key, before);
+        try txn.commit();
+    }
+    var item: AssetProducerBatchItem = .{
+        .request = .{ .kind = .asset, .index_name = "reading", .artifact_name = "reading", .doc_key = "doc", .source_field = "url", .producer_json = definition, .sequence = 1 },
+        .producer_type = .reader,
+        .config_json = @constCast("{}"),
+        .raw_doc = @constCast(before),
+        .source_text = "source",
+        .artifact_key = @constCast("output"),
+        .state_key = @constCast("state"),
+        .state_value = @constCast("value"),
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    // Commit a page, destroy the native backend and reopen it before any
+    // result publication. The next source owner must recover the exact page.
+    {
+        var context = try IndexDocumentCheckpoint.init(&runtime, &item);
+        var owner = context.owner();
+        defer owner.drain();
+        const endpoint = try owner.factory().bind(a, "request", false);
+        defer endpoint.view().release();
+        var client = try @import("antfly_readers").document_rpc.Client.initBound(a, endpoint.view(), std.testing.io);
+        defer client.deinit();
+        const store = client.store();
+        const record = try store.load(scratch, client.id, client.owner);
+        const lease: @import("antfly_readers").document_runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+        try store.prepare(scratch, lease, record.identity, record.limits, record.inputs, document_checkpoints.now());
+        try std.testing.expect(try store.reserve(scratch, lease, @splat(7), .{ .calls = 1, .output_bytes = 32 }, document_checkpoints.now()));
+        _ = try store.complete(scratch, lease, @splat(7), .{ .calls = 1, .output_bytes = 13 }, "accepted page", document_checkpoints.now());
+    }
+    durable.close();
+    durable_open = false;
+    durable = try docstore_mod.DocStore.open(a, data_path, .{});
+    durable_open = true;
+    erased = durable.runtime_store;
+    runtime.store = erased;
+    {
+        var context = try IndexDocumentCheckpoint.init(&runtime, &item);
+        var owner = context.owner();
+        defer owner.drain();
+        const endpoint = try owner.factory().bind(a, "request", false);
+        defer endpoint.view().release();
+        var client = try @import("antfly_readers").document_rpc.Client.initBound(a, endpoint.view(), std.testing.io);
+        defer client.deinit();
+        const store = client.store();
+        const record = try store.load(scratch, client.id, client.owner);
+        const upload: @import("antfly_readers").document_runs.Scope = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+        var recovered = try @import("antfly_readers").document_runs.Index.init(a, store, record, 512, 32 * 1024 * 1024);
+        defer recovered.deinit();
+        const checkpoint = recovered.get(@splat(7)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("accepted page", try store.read(scratch, checkpoint, 1024));
+        try std.testing.expectEqual(@as(u64, 1), record.used.calls);
+        {
+            var txn = try erased.beginWrite();
+            errdefer txn.abort();
+            try txn.put(source_key, after);
+            try txn.commit();
+        }
+        try std.testing.expectError(error.DocumentRunLeaseLost, store.put_fn(store.ptr, scratch, upload, "stale page"));
+        try maintainIndexDocumentCheckpoints(&runtime);
+        try std.testing.expectError(error.DocumentRunNotFound, store.read(scratch, checkpoint, 1024));
+    }
+    item.raw_doc = @constCast(after);
+    item.request.sequence = 2;
+    {
+        var context = try IndexDocumentCheckpoint.init(&runtime, &item);
+        var owner = context.owner();
+        defer owner.drain();
+        const endpoint = try owner.factory().bind(a, "new request", false);
+        defer endpoint.view().release();
+        var client = try @import("antfly_readers").document_rpc.Client.initBound(a, endpoint.view(), std.testing.io);
+        defer client.deinit();
+        const store = client.store();
+        const record = try store.load(scratch, client.id, client.owner);
+        const upload: @import("antfly_readers").document_runs.Scope = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+        var replacement = try ownership_mod.State.init(a, &erased, enrichment_lease.default_lease_key, .{ .lease_owned = true, .owner_id = "replacement" });
+        defer replacement.deinit(a);
+        try std.testing.expect(try replacement.ensureLease(runtime.clock.nowRealtimeMs() + runtime.config.lease_ttl_ms + 1));
+        try std.testing.expectError(error.DocumentRunLeaseLost, store.put_fn(store.ptr, scratch, upload, "superseded page"));
+    }
 }

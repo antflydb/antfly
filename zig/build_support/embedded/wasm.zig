@@ -274,6 +274,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    inference_execution_control_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     inference_execution_control_mod.addImport("antfly_platform", wasm_platform_mod);
     inference_execution_control_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
     const inference_execution_context_mod = b.createModule(.{
