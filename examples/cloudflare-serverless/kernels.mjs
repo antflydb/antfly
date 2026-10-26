@@ -29,13 +29,15 @@ const standaloneBuildKernel=new RequestPool(job=>instantiateHost(job.options.ker
 export let buildKernel=standaloneBuildKernel;
 const writerKernel=new RequestPool(job=>instantiateHost(job.hostKey==="full"?full:compact,null),0,{maxReservedBytes:48*1024*1024,reservationBytes:16*1024*1024,defaultKernelVariant:"compact",recycleBytes:job=>(job.hostKey==="full"?24:12)*1024*1024});
 let runtimeRole="shared";
-const roles={shared:[2,1,1,0,0,80],writer:[0,0,0,2,3,64],reader:[4,0,0,0,0,32],builder:[0,0,1,0,0,32],app:[0,0,0,0,0,0]};
+const roles={shared:[2,1,1,0,0,80],writer:[0,0,0,2,3,64],reader:[4,0,0,0,0,32],builder:[0,0,1,0,0,32],app:[0,0,0,0,0,0],"app-reader":[4,0,0,0,0,32]};
 export function configureKernels(role){
- const layout=roles[role];if(!layout)throw new Error("InvalidRuntimeRole");if(runtimeRole!=="shared"&&runtimeRole!==role)throw new Error("RuntimeRoleMismatch");
+ const layout=roles[role];if(!layout)throw new Error("InvalidRuntimeRole");if(runtimeRole!=="shared"&&runtimeRole!==role&&!(runtimeRole==="app"&&role==="app-reader"))throw new Error("RuntimeRoleMismatch");
  for(const[pool,index]of[[readerKernel,0],[standaloneMetadataKernel,1],[standaloneBuildKernel,2],[snapshotKernel,3],[writerKernel,4]]){if(pool.pending.length||pool.slots.some(slot=>slot.host||slot.busy))throw new Error("RuntimeAlreadyStarted");pool.slots=Array.from({length:layout[index]},()=>({host:null,busy:false}));}
  metadataKernel=role==="writer"?writerKernel:standaloneMetadataKernel;buildKernel=role==="writer"?writerKernel:standaloneBuildKernel;
  runtimeRole=role;
 }
+// Upgrade only the app profile, before any kernel has admitted work.
+export function enableAppReads(){if(runtimeRole==="app-reader")return;if(runtimeRole!=="app")throw Error("DirectReaderRequiresSplitApp");configureKernels("app-reader");}
 const stores=new Map();
 export function boundRows(store){stores.delete(store);stores.set(store,true);while(stores.size>8){const oldest=stores.keys().next().value;oldest.rows.clear();oldest.rowBytes=0;oldest.hintBytes=0;oldest.readHints=null;stores.delete(oldest);}}
 

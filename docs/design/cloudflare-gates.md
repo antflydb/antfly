@@ -385,3 +385,12 @@ Full immutable cache entries may satisfy a conditional range read only after
 validating their digest and requested ETag. Cache-enabled profiles pin a UUID
 cache scope for the physical R2 bucket incarnation across all four roles, in
 addition to the native logical namespace and deployment profile.
+
+
+The optional direct app reader still obtains a fresh native coordinator read
+view and uses the existing compact query module and 8 MiB working budget. Its
+32 MiB app kernel limit, selection and coordinator cohort setting are recorded
+in the sealed profile. The reserved physical epochs exercise coordinator
+recovery; complete app Worker isolate eviction remains an explicit limitation.
+The local restart fixture separately verifies recovery with platform storage
+erased and the optional edge cache disabled.

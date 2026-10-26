@@ -864,3 +864,45 @@ read admissions use distinct cohort keys. Older publishers and missing hints
 fall back to ordinary immutable reads. Prepared and legacy HEAD publication both
 commit the optional hint record atomically; rollback and fresh physical actor
 recovery are exercised by native-store and persisted Worker fixtures.
+
+
+## Optional reads in the app Worker
+
+`DIRECT_READS=true` in the split R2 profile executes HTTP reads in the app Worker
+and removes the app-to-reader-actor hop. Mutations, publication and collection
+keep their existing writer/build actors. The app still obtains a fresh native
+read view from the coordinator before acquiring a query kernel; this mode
+requires `LOCAL_METADATA_READS=false`. It does not cache mutable heads or reuse
+a read view across requests. Existing exact-scan cursors, visibility fences,
+read pins and retirement checks pass through the same native engine.
+
+The app upgrades its unused zero-slot profile once to a 32 MiB weighted reader
+pool. Compact query instances reserve 16 MiB each, admit at most two running
+queries and retain at most 32 MiB of kernels. The existing ingress/input budgets
+remain, with an additional 32 KiB charge per admitted read view. A single
+30-second read signal retains the original deadline through metadata waiting,
+kernel queueing and exact-scan steps within the HTTP operation. Provider I/O may
+finish after cancellation; an expired signal prevents subsequent kernel
+admission. Background entrypoints retain their existing
+actor routing. The feature defaults off and its selection is sealed in gate
+provenance. Coordinator read-view cohorts can use the existing bounded
+`READ_VIEW_BATCH_MS` setting (up to 10 ms), which is also sealed.
+
+```mermaid
+flowchart LR
+  Client --> App[App Worker: bounded Antfly query kernels]
+  App -->|fresh native read view| Writer[Writer coordinator]
+  Writer --> R2[(Authoritative Antfly data in R2)]
+  App --> Cache[Optional immutable Cache API]
+  App -->|immutable cache miss| R2
+  App -->|mutation| Writer
+  Builder[Publication and GC actors] --> Writer
+  Builder --> R2
+```
+
+Reserved cold epochs still create fresh physical coordinator actors and recover
+the same R2 metadata. App Worker isolate eviction is not forced by those epochs,
+as with the existing shared-kernel limitation. The local integration additionally
+restarts all isolates, erases platform storage and disables edge caching before
+checking tenant data and replaying receipts from R2. It uses a reader actor that
+throws on execution, proving that HTTP queries use the app path.

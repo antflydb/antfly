@@ -1403,3 +1403,33 @@ disqualifies that diagnostic even though its HTTP workload completed without
 request/resource errors. The report remains unchanged while those messages are
 inspected and recovered. Formal trials must reseed after these measured
 diagnostics; setup-only replay is no longer valid for their modified corpora.
+
+
+The bounded range-cache RPC diagnostic (`range-cache-rpc-smoke-2.json`, revision
+`e5690b6b6c`) completed 120 reads and 40 writes per side with no final HTTP or
+resource errors, 80 verified bodies and eight receipts overall. Candidate
+read/write p95 was 1,692 / 8,256 ms versus 5,391 / 6,381 ms for the control.
+Both absolute targets remain unmet. The control still had a dead letter in its
+last sample, independently disqualifying the run. The original two inspected
+control messages were durably replayed with unchanged maintenance tickets and
+acknowledged only after accepted enqueue responses and fresh fenced 512-row
+counts for all four tenants. Their message hashes, replay and acknowledgment
+proofs remain local. This does not rewrite any failed diagnostic.
+
+A transport-only probe measured version-endpoint p50/p95 46 / 200 ms. A separate
+paired idle probe measured p50/p95 50 / 225 ms with persistent connections versus
+97 / 283 ms with default connections after a 5.5-second idle gap. These are
+diagnostics, not database qualification. The paired client now pins Undici
+7.29.1 and retains connections for 60 seconds, with capacity for 128 concurrent
+connections per origin. Both sides use the identical transport policy, recorded
+in their reports; fixed arrivals, retry accounting, deadlines and cold single-
+attempt requirements are unchanged.
+
+The optional direct app reader removes one actor hop while retaining fresh
+coordinator admission and the same native kernels. All 200 Node checks pass and
+all ten persisted Worker checks pass in 289.0 seconds. The new fixture proves
+concurrent tenant isolation, fresh physical coordinator recovery, old-writer
+fencing and the 32 MiB app budget without invoking a reader actor. It then
+restarts every isolate, erases platform storage, disables the edge cache and
+verifies data and receipts again. Native module hashes and frozen ANN evidence
+remain unchanged; live direct-reader performance is not yet qualified.

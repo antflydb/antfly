@@ -17,7 +17,7 @@ import{readFile}from'node:fs/promises';
 import{resolve,basename,dirname}from'node:path';
 import{createHash}from'node:crypto';
 import{isDeepStrictEqual}from'node:util';
-export function runtimePlacement(config){return config.vars?.RUNTIME_GENERATION!=null||config.vars?.R2_LOCATION_HINT!=null||config.vars?.EDGE_IMMUTABLE_CACHE!=null?{generation:config.vars?.RUNTIME_GENERATION??null,location_hint:config.vars?.R2_LOCATION_HINT??null,...(config.vars?.EDGE_IMMUTABLE_CACHE!=null?{immutable_cache:config.vars.EDGE_IMMUTABLE_CACHE==="true",immutable_cache_scope:config.vars.EDGE_IMMUTABLE_CACHE_SCOPE??null,local_metadata_reads:config.vars.LOCAL_METADATA_READS==="true"}:{})}:null;}
+export function runtimePlacement(config){return config.vars?.RUNTIME_GENERATION!=null||config.vars?.R2_LOCATION_HINT!=null||config.vars?.EDGE_IMMUTABLE_CACHE!=null||config.vars?.DIRECT_READS!=null||config.vars?.READ_VIEW_BATCH_MS!=null?{generation:config.vars?.RUNTIME_GENERATION??null,location_hint:config.vars?.R2_LOCATION_HINT??null,...(config.vars?.EDGE_IMMUTABLE_CACHE!=null?{immutable_cache:config.vars.EDGE_IMMUTABLE_CACHE==="true",immutable_cache_scope:config.vars.EDGE_IMMUTABLE_CACHE_SCOPE??null,local_metadata_reads:config.vars.LOCAL_METADATA_READS==="true"}:{}),...(config.vars?.DIRECT_READS!=null?{direct_reads:config.vars.DIRECT_READS==="true"}:{}),...(config.vars?.READ_VIEW_BATCH_MS!=null?{read_view_batch_ms:Number(config.vars.READ_VIEW_BATCH_MS)}:{})}:null;}
 export async function verifySealedRun(run){
  const errors=[];
  for(const service of run.services??[]){

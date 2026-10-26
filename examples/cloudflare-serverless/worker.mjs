@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {reserveInput} from "./request-pool.mjs";
+import {enableAppReads,readerKernel,sharedCache,kernelMetrics} from "./kernels.mjs";
 import {exactSearch,isExactSearch,rejectPrivateScanInput} from "./exact-search.mjs";
 import {publicationFailureReducesBudget} from "./publication-budget.mjs";
 import {IngressBudget} from "./ingress-budget.mjs";
@@ -20,7 +22,7 @@ import {CriticalPath} from "./trace.mjs";
 import {tenantEnv,tenantEnvs} from "./tenants.mjs";
 import {managedMaintenance} from "./maintenance-tickets.mjs";
 import {createRuntime,Busy} from "./runtime.mjs";
-import {runtimeName,readerSlots,readerSlot} from "./runtime-routing.mjs";
+import {runtimeName,readerSlots,readerSlot,readOperations} from "./runtime-routing.mjs";
 import {unsupportedRpc,retryableRuntimeFailure} from "./performance.mjs";
 import {collect} from "./collect.mjs";
 import {pruneEmbeddingCheckpoints} from "./embedding-checkpoints.mjs";
@@ -28,14 +30,26 @@ export {configureKernels} from "./kernels.mjs";
 export {R2ReadRuntime,R2BuildRuntime} from "./runtime-actors.mjs";
 export { R2CommitCoordinator } from "./r2-coordinator.mjs";
 export { CommitCoordinator } from "./coordinator.mjs";
-const localRuntime=createRuntime();
+const localRuntime=createRuntime(),appReadRuntime=createRuntime({kernel:readerKernel,sharedCache,resources:kernelMetrics});
 let admitted=0,readerCursor=0;const ingressBudget=new IngressBudget();
-async function run(env,input,signal,collection,trace){
- if(isExactSearch(env,input))return exactSearch(env,input,next=>runStep(env,next,signal,collection,trace),{signal});
- return runStep(env,input,signal,collection,trace);
+async function run(env,input,signal,collection,trace,direct=false){
+ let timer;
+ if(direct&&env.DIRECT_READS==="true"&&readOperations.has(input.op)){
+  const deadline=new AbortController();timer=setTimeout(()=>deadline.abort(),30000);
+  signal=AbortSignal.any(signal?[signal,deadline.signal]:[deadline.signal]);
+ }
+ try{
+  if(isExactSearch(env,input))return await exactSearch(env,input,next=>runStep(env,next,signal,collection,trace,direct),{signal});
+  return await runStep(env,input,signal,collection,trace,direct);
+ }finally{clearTimeout(timer);}
 }
-async function runStep(env,input,signal,collection,trace){
- const read=["lookup","list","search","count","status","latest"].includes(input.op);
+async function runStep(env,input,signal,collection,trace,direct){
+ const read=readOperations.has(input.op);
+ if(read&&direct&&env.DIRECT_READS==="true"){
+  if(env.COORDINATOR_BACKEND!=="r2"||env.SPLIT_RUNTIME!=="true"||env.LOCAL_METADATA_READS==="true")throw Error("InvalidDirectReaderProfile");
+  enableAppReads();const release=reserveInput(32768);
+  try{return await appReadRuntime.run(env,input,signal,collection,undefined,trace);}finally{release();}
+ }
  const binding=read?env.READERS:env.BUILDERS;
  if(env.COORDINATOR_BACKEND==="r2"&&input.op!=="mutate"&&binding){
   const slot=read?readerSlot(input,readerSlots(env),readerCursor++):0;
@@ -125,7 +139,7 @@ export default {
       }
       if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "compact", "enrich", "latest", "reindex"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
       rejectPrivateScanInput(args);
-      const result = await trace.span("dispatch",()=>run(env, args, request.signal,undefined,trace));
+      const result = await trace.span("dispatch",()=>run(env, args, request.signal,undefined,trace,true));
       if (args.op === "reindex" && result.has_more && args.reindex_action !== "status") {
         try { result.maintenance_pending = !await enqueue(env, "reindex", result.job_id); }
         catch { result.maintenance_pending = true; }

@@ -13,9 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{Agent}from'undici';
 import{assertGateRun}from'./gate-scope.mjs';
 import{verifySealedRun}from'./gate-provenance.mjs';
 import {readFile} from 'node:fs/promises';
+// Keep connections across the fixed 30-second arrivals, identically for both sides.
+const transportPolicy=Object.freeze({keep_alive_ms:60000,max_connections:128});
+const dispatcher=new Agent({connections:transportPolicy.max_connections,keepAliveTimeout:transportPolicy.keep_alive_ms,keepAliveMaxTimeout:transportPolicy.keep_alive_ms});
+const pooledFetch=(url,options)=>globalThis.fetch(url,{...options,dispatcher});
 // Replaying an acknowledged setup is safe only before any workload mutation.
 // This avoids adding another corpus-sized WAL prefix after a setup interruption.
 export function resumeSeedExecution(report,baseline,candidate){
@@ -31,7 +36,7 @@ export function resumeSeedExecution(report,baseline,candidate){
 }
 export class GateClient {
  static async open(path){const run=JSON.parse(await readFile(path));assertGateRun(run);const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));if(run.deployed!==true||run.deleted||!run.token_installed||!run.origin||!run.version||!/^antfly-1278-g-/.test(run.id)||!new URL(run.origin).hostname.startsWith(run.id+'.')||!new URL(run.origin).hostname.endsWith('.workers.dev'))throw Error('invalid ready gate profile');return new GateClient(run,(await readFile(run.token_file,'utf8')).trim());}
- constructor(run,token,{fetch:fetchImpl=globalThis.fetch}={}){this.fetch=fetchImpl;this.run=run;this.token=token;this.executionId=crypto.randomUUID();this.samples=[];this.errors=[];this.receipts={};this.seeds={};this.expected=new Map();this.documentLsns=new Map();this.lag=[];this.queue=[];this.cold=[];this.resourceErrors=[];}
+ constructor(run,token,{fetch:fetchImpl=pooledFetch}={}){this.fetch=fetchImpl;this.run=run;this.token=token;this.executionId=crypto.randomUUID();this.samples=[];this.errors=[];this.receipts={};this.seeds={};this.expected=new Map();this.documentLsns=new Map();this.lag=[];this.queue=[];this.cold=[];this.resourceErrors=[];}
  async call(tenant,input,phase,{epoch=this.physicalEpochs?.[tenant]??0,scheduled=Date.now(),path='/api'}={}){
   let attempts=0,last;const started=Date.now();
   const idempotent=["lookup","list","search","count","status","latest"].includes(input.op)||input.op==="mutate"&&typeof input.operation_id==="string"&&input.operation_id.length>0||path==="/_qualification/queue";
@@ -93,5 +98,5 @@ export class GateClient {
   for(const outcome of outcomes)if(outcome.status==='rejected')throw outcome.reason;
   this.verification={passed:true,bodies,receipts};
  }
- report(){return{execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,runtime_placement:this.run.runtime_placement??null,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
+ report(){return{execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,runtime_placement:this.run.runtime_placement??null,transport_policy:transportPolicy,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
 }
