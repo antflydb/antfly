@@ -116,6 +116,9 @@ const Payload = struct {
     release_pin: *const fn (*anyopaque, *Run) void,
     account: *Account,
     bytes: usize,
+    // Prepaid with the physical payload, not duplicated in each index's
+    // reclaimer. Only the exclusive final entry owner may use this workspace.
+    retirement: ?@import("run_snapshot_clone.zig").Retirement = null,
 };
 
 const Entry = struct {
@@ -142,6 +145,64 @@ const Entry = struct {
         payload.account.discharge(payload.bytes);
         allocator.destroy(payload);
     }
+    /// Retain the detached payload/account until the last physical byte is
+    /// retired. Generic registered drops remain fixed and never claim its anchor.
+    pub const Retirement = struct {
+        payload: ?*Payload,
+        claimed: bool = false,
+        pin_released: bool = false,
+        pub fn init(entry: Entry) @This() {
+            return .{ .payload = entry.payload };
+        }
+        pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+            if (self.payload == null) return true;
+            while (credits.* != 0) {
+                if (self.stepWithAdmission(allocator, credits, null) catch unreachable) return true;
+            }
+            return false;
+        }
+        pub fn stepWithAdmission(self: *@This(), allocator: std.mem.Allocator, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            comptime std.debug.assert(@sizeOf(Payload) <= 16 * 1024);
+            const payload = self.payload orelse return true;
+            if (credits.* == 0) return false;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            if (!self.claimed) {
+                self.claimed = true;
+                if (payload.refs.fetchSub(1, .acq_rel) != 1) {
+                    self.payload = null;
+                    return true;
+                }
+                std.debug.assert(payload.registered_anchor == null);
+            }
+            var isolated = payload.run;
+            isolated.version_ref_pinned = false;
+            // Completed physical work may already have freed a shared-memory
+            // header. Never inspect that original descriptor again on retry.
+            const supported = payload.retirement != null or @import("run_snapshot_clone.zig").Retirement.supports(isolated);
+            if (original != null and (!supported or !@import("../lsm_backend.zig").Backend.isDirectorySnapshotPin(payload.release_pin))) return error.ExecutionWaitUnsupported;
+            if (!self.pin_released) {
+                payload.release_pin(payload.owner, &payload.run);
+                payload.run.version_ref_pinned = false;
+                self.pin_released = true;
+            }
+            if (supported) {
+                if (payload.retirement == null) payload.retirement = try @import("run_snapshot_clone.zig").Retirement.init(payload.run);
+                if (!try payload.retirement.?.step(allocator, original)) return false;
+            } else {
+                // Unknown legacy providers retain their explicit joined path;
+                // admitted callers refuse before invoking that destructor.
+                payload.run.deinit(allocator);
+            }
+            if (original) |port| try port.checkpoint();
+            const account = payload.account;
+            const bytes = payload.bytes;
+            allocator.destroy(payload);
+            account.discharge(bytes);
+            self.payload = null;
+            return true;
+        }
+    };
     pub fn retainedBytes(_: Entry) usize {
         return 0;
     }
@@ -309,7 +370,10 @@ pub const Directory = struct {
             return .{ .directory = directory, .tree = .init(directory.tree), .ids = .init(directory.ids), .bounds = .init(directory.bounds), .ends = .init(directory.ends), .levels = .init(directory.levels), .generations = .init(directory.generations) };
         }
         pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
-            return self.tree.step(allocator, credits) and self.ids.step(allocator, credits) and self.bounds.step(allocator, credits) and self.ends.step(allocator, credits) and self.levels.step(allocator, credits) and self.generations.step(allocator, credits);
+            return self.stepWithAdmission(allocator, credits, null) catch unreachable;
+        }
+        pub fn stepWithAdmission(self: *@This(), allocator: std.mem.Allocator, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            return try self.tree.stepWithAdmission(allocator, credits, original) and try self.ids.stepWithAdmission(allocator, credits, original) and try self.bounds.stepWithAdmission(allocator, credits, original) and try self.ends.stepWithAdmission(allocator, credits, original) and try self.levels.stepWithAdmission(allocator, credits, original) and try self.generations.stepWithAdmission(allocator, credits, original);
         }
         /// Only after step reports completion, back under the accounting lock.
         pub fn finish(self: *@This(), allocator: std.mem.Allocator) void {

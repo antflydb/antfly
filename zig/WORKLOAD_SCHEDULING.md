@@ -1711,3 +1711,14 @@ production original-admission forwarding and overload qualification remain open.
 See WORKLOAD_POOLING_IMPLEMENTATION.md for the ownership contract and evidence.
 The full sharing/scheduling/default/session/remote design remains incomplete;
 full Linux qualification stays waived.
+
+
+### Incremental legacy metadata retirement (2026-10-26)
+
+Migrated legacy directories and obsolete ledgers now retire through saved
+original-admission cursors, including physical metadata and spare-vector byte
+credits. Partial abort joins those exact cursors. Physical workspace lives in
+prepaid payload storage; native/storage-owner ABIs are 145/205. Legacy writer
+RunOwner pin/parent retirement, memory-run migration and production maintenance
+integration remain required before default rollout. The full goal remains active;
+full Linux qualification remains waived.

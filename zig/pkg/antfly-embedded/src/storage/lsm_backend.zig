@@ -8030,6 +8030,9 @@ pub const Backend = struct {
         run.version_ref_pinned = false;
     }
     /// Fail closed before interpreting a foreign/legacy opaque pin owner.
+    pub fn isDirectorySnapshotPin(release: *const fn (*anyopaque, *Run) void) bool {
+        return release == releaseDirectorySnapshotPin;
+    }
     pub fn beginDirectorySnapshotRetirement(lease: *RunDirectory.EntryLease, original: @import("../common/read_admission.zig").Port) !RunDirectory.EntryLease.Retirement {
         return lease.beginRetirementForPinWithAdmission(releaseDirectorySnapshotPin, directorySnapshotPinRetirement(), original);
     }

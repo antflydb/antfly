@@ -97,6 +97,10 @@ pub fn Migration(comptime Backend: type) type {
         old_obsolete: ?Ledger = null,
         old_durable_directory: ?*Directory = null,
         old_durable_obsolete: ?Ledger = null,
+        directory_cleanup: ?Directory.Reclaimer = null,
+        durable_directory_cleanup: ?Directory.Reclaimer = null,
+        obsolete_cleanup: ?Ledger.Reclaimer = null,
+        durable_obsolete_cleanup: ?Ledger.Reclaimer = null,
 
         fn validateQuiescence(b: *const Backend, reserved: bool) !void {
             if (b.closing.load(.acquire)) return error.BackendClosing;
@@ -256,6 +260,48 @@ pub fn Migration(comptime Backend: type) type {
             self.phase = .installed;
         }
 
+        /// Off-lock while startup exclusion remains held. The original port
+        /// reaches every detached node and physical metadata quantum. Writer
+        /// RunOwner retirement is separate; it still requires joined teardown.
+        pub fn retireOldDirectoriesAndLedgersWithAdmission(self: *Self, original: admission.Port) !void {
+            const b = self.backend orelse return error.InvalidArgument;
+            if (self.phase != .installed) return error.InvalidArgument;
+            while (self.old_directory != null) {
+                try original.checkpoint();
+                if (self.directory_cleanup == null) self.directory_cleanup = .init(self.old_directory.?);
+                var credits: usize = 1;
+                if (!try self.directory_cleanup.?.stepWithAdmission(b.allocator, &credits, original)) continue;
+                self.directory_cleanup.?.finish(b.allocator);
+                self.directory_cleanup = null;
+                self.old_directory = null;
+            }
+            while (self.old_durable_directory != null) {
+                try original.checkpoint();
+                if (self.durable_directory_cleanup == null) self.durable_directory_cleanup = .init(self.old_durable_directory.?);
+                var credits: usize = 1;
+                if (!try self.durable_directory_cleanup.?.stepWithAdmission(b.allocator, &credits, original)) continue;
+                self.durable_directory_cleanup.?.finish(b.allocator);
+                self.durable_directory_cleanup = null;
+                self.old_durable_directory = null;
+            }
+            while (self.old_obsolete != null) {
+                try original.checkpoint();
+                if (self.obsolete_cleanup == null) self.obsolete_cleanup = .init(self.old_obsolete.?);
+                var credits: usize = 1;
+                if (!try self.obsolete_cleanup.?.stepWithAdmission(b.allocator, &credits, original)) continue;
+                self.obsolete_cleanup = null;
+                self.old_obsolete = null;
+            }
+            while (self.old_durable_obsolete != null) {
+                try original.checkpoint();
+                if (self.durable_obsolete_cleanup == null) self.durable_obsolete_cleanup = .init(self.old_durable_obsolete.?);
+                var credits: usize = 1;
+                if (!try self.durable_obsolete_cleanup.?.stepWithAdmission(b.allocator, &credits, original)) continue;
+                self.durable_obsolete_cleanup = null;
+                self.old_durable_obsolete = null;
+            }
+        }
+
         /// Joined startup teardown under Backend.mu. Stop all source borrows
         /// before freeing old roots; it is deliberately NOT the production
         /// admitted retirement path. Accounting observers remain excluded until
@@ -271,6 +317,25 @@ pub fn Migration(comptime Backend: type) type {
             self.scope = null;
             if (self.frame) |owner| owner.requestRetirement();
             self.frame = null;
+            // A rejected physical step may already have consumed some nodes.
+            // Join that exact cursor; never run a fresh destructor on its header.
+            inline for (.{ .{ "directory_cleanup", "old_directory" }, .{ "durable_directory_cleanup", "old_durable_directory" } }) |fields| {
+                if (@field(self, fields[0])) |*job| {
+                    var credits: usize = std.math.maxInt(usize);
+                    std.debug.assert(job.step(b.allocator, &credits));
+                    job.finish(b.allocator);
+                    @field(self, fields[0]) = null;
+                    @field(self, fields[1]) = null;
+                }
+            }
+            inline for (.{ .{ "obsolete_cleanup", "old_obsolete" }, .{ "durable_obsolete_cleanup", "old_durable_obsolete" } }) |fields| {
+                if (@field(self, fields[0])) |*job| {
+                    var credits: usize = std.math.maxInt(usize);
+                    std.debug.assert(job.step(b.allocator, &credits));
+                    @field(self, fields[0]) = null;
+                    @field(self, fields[1]) = null;
+                }
+            }
             if (self.old_store) |*store| store.deinit(b.allocator);
             if (self.old_directory) |directory| directory.destroy(b.allocator);
             if (self.old_obsolete) |*ledger| ledger.deinit(b.allocator);

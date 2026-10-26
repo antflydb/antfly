@@ -53,6 +53,46 @@ pub const Entry = struct {
         allocator.free(payload.path);
         allocator.destroy(payload);
     }
+    /// The tree transfers its final entry reference into this prepaid cursor.
+    /// A large path cannot turn one node credit into an unbounded destructor.
+    pub const Retirement = struct {
+        payload: ?*Payload = null,
+        offset: usize = 0,
+        pub fn init(entry: Entry) @This() {
+            const payload = entry.payload orelse return .{};
+            const previous = payload.refs.fetchSub(1, .acq_rel);
+            if (payload.registered != null) {
+                std.debug.assert(previous > 1);
+                return .{};
+            }
+            return if (previous == 1) .{ .payload = payload } else .{};
+        }
+        pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+            if (self.payload == null) return true;
+            while (credits.* != 0) {
+                if (self.stepWithAdmission(allocator, credits, null) catch unreachable) return true;
+            }
+            return false;
+        }
+        pub fn stepWithAdmission(self: *@This(), allocator: std.mem.Allocator, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            const payload = self.payload orelse return true;
+            if (credits.* == 0) return false;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            const end = @min(payload.path.len, self.offset + 16 * 1024);
+            @memset(payload.path[self.offset..end], undefined);
+            self.offset = end;
+            if (end != payload.path.len) return false;
+            const account = payload.account.?;
+            const bytes = payload.path.len;
+            allocator.rawFree(payload.path, .of(u8), @returnAddress());
+            allocator.destroy(payload);
+            account.discharge(bytes);
+            account.discharge(@sizeOf(Payload));
+            self.payload = null;
+            return true;
+        }
+    };
     pub fn retainedBytes(_: Entry) usize {
         return 0;
     }
@@ -91,20 +131,35 @@ pub const Ledger = struct {
         tree: Tree.Reclaimer,
         spare: std.ArrayListUnmanaged(*Payload),
         account: ?*Account,
+        spare_offset: usize = 0,
         pub fn init(ledger: Ledger) Reclaimer {
             return .{ .tree = .init(ledger.tree), .spare = ledger.spare, .account = ledger.tree.account };
         }
         pub fn step(self: *Reclaimer, allocator: std.mem.Allocator, credits: *usize) bool {
+            return self.stepWithAdmission(allocator, credits, null) catch unreachable;
+        }
+        pub fn stepWithAdmission(self: *Reclaimer, allocator: std.mem.Allocator, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            if (original) |port| try port.checkpoint();
             while (credits.* != 0) {
+                if (original) |port| try port.checkpoint();
                 const payload = self.spare.pop() orelse break;
                 credits.* -= 1;
                 self.account.?.discharge(@sizeOf(Payload));
                 allocator.destroy(payload);
             }
             if (self.spare.items.len != 0) return false;
-            self.spare.deinit(allocator);
+            const vector = std.mem.sliceAsBytes(self.spare.allocatedSlice());
+            while (self.spare_offset < vector.len) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                const end = @min(vector.len, self.spare_offset + 16 * 1024);
+                @memset(vector[self.spare_offset..end], undefined);
+                self.spare_offset = end;
+            }
+            if (vector.len != 0) allocator.rawFree(vector, .of(*Payload), @returnAddress());
             self.spare = .empty;
-            return self.tree.step(allocator, credits);
+            return self.tree.stepWithAdmission(allocator, credits, original);
         }
     };
 

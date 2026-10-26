@@ -239,11 +239,21 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                 return out;
             }
             pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+                return self.stepWithAdmission(allocator, credits, null) catch unreachable;
+            }
+            /// The original port reaches physical entry work as well as node
+            /// release. Refusal retains the detached node and entry cursor.
+            pub fn stepWithAdmission(self: *@This(), allocator: std.mem.Allocator, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+                if (original) |port| try port.checkpoint();
                 if (self.complete) return true;
                 while (true) {
                     if (comptime @hasDecl(Entry, "Retirement")) {
                         if (self.retiring_node) |node| {
-                            if (!self.retiring_entry.?.step(allocator, credits)) return false;
+                            const finished = if (comptime @hasDecl(Entry.Retirement, "stepWithAdmission"))
+                                if (original != null) try self.retiring_entry.?.stepWithAdmission(allocator, credits, original) else self.retiring_entry.?.step(allocator, credits)
+                            else
+                                self.retiring_entry.?.step(allocator, credits);
+                            if (!finished) return false;
                             if (node.account) |account| account.discharge(@sizeOf(Node));
                             allocator.destroy(node);
                             self.retiring_node = null;
@@ -251,6 +261,7 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                         }
                     }
                     if (credits.* == 0 or self.len == 0) break;
+                    if (original) |port| try port.checkpoint();
                     credits.* -= 1;
                     self.len -= 1;
                     const node = self.pending[self.len];
@@ -274,6 +285,7 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                 }
                 if (self.len != 0) return false;
                 while (credits.* != 0) {
+                    if (original) |port| try port.checkpoint();
                     const node = self.owned.spare.pop() orelse break;
                     credits.* -= 1;
                     if (self.owned.account) |account| account.discharge(@sizeOf(Node));
@@ -283,6 +295,7 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                 const vector = std.mem.sliceAsBytes(self.owned.spare.allocatedSlice());
                 while (self.spare_offset < vector.len) {
                     if (credits.* == 0) return false;
+                    if (original) |port| try port.checkpoint();
                     credits.* -= 1;
                     const end = @min(vector.len, self.spare_offset + 16 * 1024);
                     @memset(vector[self.spare_offset..end], undefined);

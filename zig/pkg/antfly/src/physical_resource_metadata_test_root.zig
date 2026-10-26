@@ -4720,7 +4720,7 @@ const LegacyMigrationFixture = struct {
     const io_mod = @import("antfly_local_sources").storage_lsm_backend_storage_io;
     const Control = RegisteredOutputFixture.Control;
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
-    const Mode = enum { install, abort, stale, receipt, lineage, checkpoint, account, install_refusal };
+    const Mode = enum { install, abort, stale, receipt, lineage, checkpoint, account, install_refusal, retire_dirs, retire_abort };
 
     fn run(mode: Mode, target: ?usize, oom: bool) !Stats {
         const a = std.testing.allocator;
@@ -4786,10 +4786,11 @@ const LegacyMigrationFixture = struct {
         var competing: lsm.Backend.QuiescedLegacyRootMigration = .{};
         defer competing.deinit();
         try std.testing.expectError(error.ResourceBudgetExceeded, competing.captureWithAdmission(&backend, original));
+        const retire_mode = mode == .retire_dirs or mode == .retire_abort;
         const start = failing.alloc_index;
         if (oom and target != null) failing.fail_index = start + target.?;
         control.live = true;
-        control.target = if (oom) null else target;
+        control.target = if (oom or retire_mode) null else target;
         var observed = false;
         while (true) {
             migration.resumeWithAdmission(original) catch |cause| {
@@ -4803,7 +4804,7 @@ const LegacyMigrationFixture = struct {
             };
             break;
         }
-        const stats: Stats = .{ .checks = control.calls, .allocations = failing.alloc_index - start, .observed = observed };
+        var stats: Stats = .{ .checks = control.calls, .allocations = failing.alloc_index - start, .observed = observed };
         control.live = false;
         if (mode == .abort) {
             migration.deinit(); // Fault allocator stays exhausted through teardown.
@@ -4853,6 +4854,27 @@ const LegacyMigrationFixture = struct {
                 try std.testing.expectEqual(sequence, backend.manifest_journal.sequence);
                 try std.testing.expectEqual(@as(u64, 37), backend.unpublished_wal_logical_bytes);
                 try std.testing.expect(backend.manifest_dirty and backend.obsolete_manifest_dirty);
+                if (retire_mode) {
+                    control.calls = 0;
+                    control.target = target;
+                    control.live = true;
+                    observed = false;
+                    const retire_start = failing.alloc_index;
+                    while (true) {
+                        migration.retireOldDirectoriesAndLedgersWithAdmission(original) catch |cause| {
+                            try std.testing.expectError(error.Canceled, @as(anyerror!void, cause));
+                            try std.testing.expect(!observed);
+                            observed = true;
+                            if (mode == .retire_abort) break;
+                            continue;
+                        };
+                        break;
+                    }
+                    stats = .{ .checks = control.calls, .allocations = failing.alloc_index - retire_start, .observed = observed };
+                    try std.testing.expectEqual(@as(usize, 0), stats.allocations);
+                    control.live = false;
+                    if (mode == .retire_dirs) try std.testing.expect(migration.old_directory == null and migration.old_durable_directory == null and migration.old_obsolete == null and migration.old_durable_obsolete == null);
+                }
                 migration.deinit();
                 failing.fail_index = std.math.maxInt(usize);
                 try std.testing.expectError(error.ExecutionWaitUnsupported, backend.persistManifestLocked());
@@ -4954,5 +4976,165 @@ test "physical cache metadata legacy root migration preserves late copy and ledg
         try std.testing.expect((try LegacyMigrationFixture.run(.abort, healthy.checks - offset, false)).observed);
         try std.testing.expect((try LegacyMigrationFixture.run(.install, healthy.allocations - offset, true)).observed);
         try std.testing.expect((try LegacyMigrationFixture.run(.abort, healthy.allocations - offset, true)).observed);
+    }
+}
+
+test "physical cache metadata bounded legacy retirement consumes actual directory and ledger roots" {
+    _ = try LegacyMigrationFixture.run(.retire_dirs, null, false);
+}
+
+test "physical cache metadata bounded legacy retirement resumes every original rejection and joins partial abort" {
+    const healthy = try LegacyMigrationFixture.run(.retire_dirs, null, false);
+    for (0..healthy.checks) |at| {
+        try std.testing.expect((try LegacyMigrationFixture.run(.retire_dirs, at, false)).observed);
+        try std.testing.expect((try LegacyMigrationFixture.run(.retire_abort, at, false)).observed);
+    }
+}
+
+const LegacyLedgerRetirementFixture = struct {
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+    fn run(target: ?usize, abort: bool) !usize {
+        const a = std.testing.allocator;
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const owned = failing.allocator();
+        var ledger: lsm.repository.ObsoleteLedger = .{};
+        var ledger_live = true;
+        defer if (ledger_live) ledger.deinit(owned);
+        try ledger.ensureUnusedCapacity(owned, 1);
+        const path = try owned.alloc(u8, 96 * 1024 + 7);
+        @memset(path, 0x31);
+        ledger.appendAssumeCapacity(.{ .path = path, .delete_after_ns = std.math.maxInt(u64) });
+        const account = ledger.tree.account.?.retain();
+        defer account.release();
+        var job: lsm.repository.ObsoleteLedger.Reclaimer = .init(ledger);
+        ledger_live = false;
+        var complete = false;
+        defer if (!complete) {
+            var credits: usize = std.math.maxInt(usize);
+            std.debug.assert(job.step(owned, &credits));
+        };
+        failing.fail_index = failing.alloc_index;
+        const before = failing.alloc_index;
+        var control: RegisteredOutputFixture.Control = .{ .live = true, .target = target };
+        const payload = control.payload();
+        const original = read_admission.Port.init(&payload);
+        var iterations: usize = 0;
+        var rejected = false;
+        while (true) : (iterations += 1) {
+            try std.testing.expect(iterations < 128);
+            const prior_bytes = account.bytes.load(.acquire);
+            var credits: usize = 1;
+            const finished = job.stepWithAdmission(owned, &credits, original) catch |cause| {
+                try std.testing.expectError(error.Canceled, @as(anyerror!void, cause));
+                try std.testing.expect(!rejected);
+                rejected = true;
+                try std.testing.expect(account.bytes.load(.acquire) <= prior_bytes);
+                if (job.tree.retiring_entry) |retiring| if (retiring.payload != null) try std.testing.expect(account.bytes.load(.acquire) >= path.len);
+                if (abort) break;
+                continue;
+            };
+            if (finished) {
+                complete = true;
+                break;
+            }
+        }
+        if (target != null) try std.testing.expect(rejected);
+        if (complete) {
+            try std.testing.expect(iterations >= 7);
+            try std.testing.expect(account.bytes.load(.acquire) < 1024);
+        }
+        try std.testing.expectEqual(before, failing.alloc_index);
+        return control.calls;
+    }
+};
+
+test "physical cache metadata bounded legacy retirement limits long path cleanup to physical byte credits" {
+    const checks = try LegacyLedgerRetirementFixture.run(null, false);
+    for (0..checks) |at| {
+        _ = try LegacyLedgerRetirementFixture.run(at, false);
+        _ = try LegacyLedgerRetirementFixture.run(at, true);
+    }
+}
+
+const LegacyMemoryRetirementFixture = struct {
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+    const State = @import("antfly_local_sources").storage_lsm_backend_state.State;
+    const Directory = @typeInfo(@typeInfo(@FieldType(lsm.Backend, "run_directory")).optional.child).pointer.child;
+    fn run(target: ?usize, abort: bool) !usize {
+        const a = std.testing.allocator;
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const owned = failing.allocator();
+        var backend = lsm.Backend.init(owned, .{});
+        defer backend.close();
+        var state: State = .{};
+        var state_live = true;
+        defer if (state_live) state.deinit(owned);
+        const value = try a.alloc(u8, 32 * 1024 + 3);
+        defer a.free(value);
+        @memset(value, 0x71);
+        try state.upsert(owned, .{ .name = "docs" }, "key", value, false);
+        var source: lsm.repository.Run = .{
+            .id = 1,
+            .level = 0,
+            .size_bytes = 0,
+            .path = null,
+            .smallest_namespace_name = try owned.dupe(u8, "docs"),
+            .smallest_key = try owned.dupe(u8, "key"),
+            .largest_namespace_name = try owned.dupe(u8, "docs"),
+            .largest_key = try owned.dupe(u8, "key"),
+            .entry_count = 1,
+            .bloom_filter = null,
+            .state = state,
+        };
+        state_live = false;
+        var source_live = true;
+        defer if (source_live) source.deinit(owned);
+        try source.shareMemory(owned);
+        const directory = try Directory.create(owned);
+        var directory_live = true;
+        defer if (directory_live) directory.destroy(owned);
+        try directory.put(&backend, source);
+        source.deinit(owned);
+        source_live = false;
+        var job = Directory.Reclaimer.init(directory);
+        directory_live = false;
+        var finished = false;
+        defer if (!finished) {
+            var credits: usize = std.math.maxInt(usize);
+            std.debug.assert(job.step(owned, &credits));
+            job.finish(owned);
+        };
+        failing.fail_index = failing.alloc_index;
+        const before = failing.alloc_index;
+        var control: RegisteredOutputFixture.Control = .{ .live = true, .target = target };
+        const payload = control.payload();
+        const original = read_admission.Port.init(&payload);
+        var rejected = false;
+        while (true) {
+            var credits: usize = 1;
+            const complete = job.stepWithAdmission(owned, &credits, original) catch |cause| {
+                try std.testing.expectError(error.Canceled, @as(anyerror!void, cause));
+                try std.testing.expect(!rejected);
+                rejected = true;
+                if (abort) break;
+                continue;
+            };
+            if (complete) {
+                job.finish(owned);
+                finished = true;
+                break;
+            }
+        }
+        if (target != null) try std.testing.expect(rejected);
+        try std.testing.expectEqual(before, failing.alloc_index);
+        return control.calls;
+    }
+};
+
+test "physical cache metadata bounded legacy retirement retains shared memory completion through refusal" {
+    const checks = try LegacyMemoryRetirementFixture.run(null, false);
+    for (0..checks) |at| {
+        _ = try LegacyMemoryRetirementFixture.run(at, false);
+        _ = try LegacyMemoryRetirementFixture.run(at, true);
     }
 }

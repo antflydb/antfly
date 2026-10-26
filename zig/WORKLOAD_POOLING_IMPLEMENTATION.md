@@ -29344,3 +29344,55 @@ The six migration cases, seven existing-SST snapshot cases, four immutable
 retirement, two pin-index, four durable checkpoint, four WAL and four publication
 cases pass, with the 4/45/1/8 boundary companions. No final case fails, skips or
 leaks. Full GNU qualification remains waived; the full pooling goal stays active.
+
+
+## Incremental legacy directory and ledger retirement (2026-10-26)
+
+Persistent-index reclamation now forwards original admission into entry cleanup,
+including spare-node and spare-vector release. A detached node retains its entry
+cursor across rejection. Legacy directory entries claim the final payload before
+releasing an actual Backend-issued file pin; unknown issuers or unsupported
+physical ownership refuse admitted cleanup. Physical snapshot cleanup takes one
+16 KiB byte quantum per credit. Its workspace is prepaid in the payload allocation,
+so each of the four directory indexes does not duplicate a large cursor in every
+checkpoint/publication owner. Generic registered drops stay non-final and fixed.
+
+Legacy obsolete-path entries retain their payload/account until all path bytes
+have been physically retired. Both path and spare-pointer vector cleanup use
+16 KiB byte credits, preserving offsets through original rejection. Fixed
+payload/header destruction precedes charge return. Explicit joined calls retain
+their existing fallback for unknown legacy providers; admitted calls do not
+invoke that fallback. Native ABI 145 and storage-owner ABI 205 fence the expanded
+reclaimer/payload layouts; durable formats and the kernel API ABI are unchanged.
+
+QuiescedLegacyRootMigration can now retire displaced live/durable directories
+and obsolete ledgers off-lock under its original port. The startup caller still
+excludes all Backend access/accounting until joined deinit. Abort joins the exact
+partially consumed cursor; it never restarts destruction from stale owning
+headers. Writer RunOwner retirement remains separate and still joins legacy
+physical cleanup. Its path-based version-pin release/forgetting and revision
+parent chains need bounded ownership before the production default driver can
+adopt this bridge. Memory-run migration, maintenance admission forwarding and
+the full design remain open; full Linux qualification stays waived.
+
+Four focused cases exercise actual migrated native SST roots, every recorded
+original cleanup rejection with retry and partial abort, no owned allocations
+during retirement, native value/reopen preservation, and a 96 KiB legacy path
+retired in byte credits. The physical workspace is paid at construction and its
+header has a compile-time 16 KiB destruction limit.
+
+Legacy path frees use rawFree after the credited wipe, avoiding a second
+whole-buffer poison in Allocator.free. Directory retries use the saved physical
+workspace after initialization; once physical completion has freed a shared-memory
+header, a later original refusal cannot cause that old descriptor to be inspected
+again. The fourth case retires a real shared-memory State after its producer exits
+and sweeps every original refusal with retry and joined abort. This qualifies
+physical cleanup, not memory-run migration into registered live roots.
+
+Final bounded-legacy-retirement-v5-fast and -debug receipts pass all five
+commands and 91/91 native build steps each against identical current 5,762-input
+maps. Four new cleanup cases and the six migration, seven snapshot, four
+immutable retirement, two pin-index, four durable checkpoint, four WAL and four
+publication cases pass. The 4/45/1/8 boundary companions and five native ABI cases
+also pass. No final case fails, skips or leaks. Legacy writer pin/parent cleanup
+and production/default integration remain open; the full goal remains active.

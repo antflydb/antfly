@@ -169,6 +169,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-physical-resource-metadata-test", "Verify fixed cache metadata admission and movable teardown ownership")
         .dependOn(&b.addRunArtifact(physical_metadata_tests).step);
+    const legacy_retirement_tests = b.addTest(.{
+        .name = "bounded-legacy-retirement-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata bounded legacy retirement"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const legacy_retirement_run = b.addRunArtifact(legacy_retirement_tests);
+    legacy_retirement_run.addArg("--require-no-skips");
+    b.step("antfly-bounded-legacy-retirement-test", "Verify admitted legacy directory/path retirement and saved-cursor abort")
+        .dependOn(&legacy_retirement_run.step);
+
     const legacy_migration_tests = b.addTest(.{
         .name = "registered-legacy-migration-tests",
         .root_module = physical_metadata_root,

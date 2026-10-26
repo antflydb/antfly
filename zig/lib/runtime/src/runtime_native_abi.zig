@@ -135,7 +135,7 @@ const builtin = @import("builtin");
 // Registered durable manifest views and independent physical retirement.
 // Admitted durability grants include bounded range reads and deletion.
 // Captured immutable windows and intrusive pinned-input retirement.
-pub const abi_version: u32 = 144;
+pub const abi_version: u32 = 145;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
