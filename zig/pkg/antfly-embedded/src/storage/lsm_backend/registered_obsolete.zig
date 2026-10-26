@@ -14,7 +14,7 @@
 // limitations under the License.
 
 //! Prepaid immutable obsolete-file edits. New paths come from registered writer
-//! records; deadlines never shorten. Node and path final anchors survive every
+//! records or captured checkpoint lineage; deadlines never shorten. Anchors survive every
 //! descendant root and generic entry drop, without a borrowed backend or port.
 const std = @import("std");
 const resources = @import("../resource_manager.zig");
@@ -83,6 +83,29 @@ pub const Candidate = struct {
         errdefer self.requestRetirement();
         try original.checkpoint();
         self.held = run.retainOwned();
+        return self;
+    }
+    /// Capture one bounded filename from a checkpoint's retained lineage.
+    /// All path bytes are owned before success; neither fence nor root escapes.
+    /// The publication driver validates that lineage and waits for descriptor
+    /// durability before making finite retirement intent eligible for cleanup.
+    pub fn startManifestRetirement(a: std.mem.Allocator, manager: *resources.ResourceManager, source: *const Ledger, fence: *const @import("repository.zig").ManifestJournal.CheckpointFence, root: []const u8, index: usize, deadline: u64, scope: admission.Port) !*Candidate {
+        var trace: admission.RejectionTrace = .{};
+        const original = trace.bind(scope).?;
+        try validateSource(source, a, original);
+        if (index >= fence.retiredPathCount()) return error.InvalidArgument;
+        if (root.len > 4096) return error.NameTooLong;
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try fence.retiredPathAt(root, index, &buffer);
+        if (path.len > 4096) return error.NameTooLong;
+        const self = try allocate(a, manager, source, path.len, deadline, original);
+        errdefer self.requestRetirement();
+        try original.checkpoint();
+        const owned = try a.alloc(u8, path.len);
+        @memcpy(owned, path); // One bounded copy; no fallible work follows it.
+        self.payload.path = owned;
+        self.allocated = true;
+        self.offset = owned.len;
         return self;
     }
     /// Rank is relative to the pinned source root, not a later live generation.

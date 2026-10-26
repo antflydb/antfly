@@ -28965,3 +28965,37 @@ This enables registered reclamation preparation; manifest checkpoint
 retirement-path insertion, durable completion receipts, immutable retirement and
 production driver adoption remain open. Full Linux qualification remains waived
 and the complete pooling design remains open.
+
+
+## Captured manifest-retirement intent (2026-10-25)
+
+Coupled publication can now append private obsolete-file intent for a filename
+from a captured checkpoint lineage. The registered obsolete owner derives and
+funds the exact bounded filename, copies its bytes before accepting input, and
+keeps no fence or caller-root borrow. Failed construction leaves the candidate's
+edit sequence unchanged. Successful acceptance advances its prepared revision;
+resumption and abort retain the same funded child and private root obligations.
+The same coupled edit path preserves writer/directory contents and supports
+subsequent ledger removal or file edits.
+
+Repeated filenames preserve the later deletion deadline. Empty lineage and an
+out-of-range retired-file index are rejected; the active manifest.bin descriptor
+is never a retired filename. These methods do not authorize physical deletion or
+acknowledge descriptor/WAL durability. The controller still must validate its
+captured manifest lineage before descriptor I/O and publish finite retirement
+intent only under the required durable completion authority.
+
+`manifest-retirement-intent-v3-fast` and `manifest-retirement-intent-v3-debug`
+pass all five commands and 46 native build steps against identical current
+5,759-input maps. Three new cases cover a six-path captured metadata lineage,
+caller-buffer/fence destruction after acceptance, empty/out-of-range rejection,
+monotone deadlines, prepared revision fencing, every encountered original refusal
+with retry or abort, and allocation exhaustion. Four coupled-ledger and four
+flush-publication regressions preserve actual SST readers; the 4/45/1/8 boundary
+companions also pass. No test fails, skips or leaks. The seeded manifest metadata
+fixture tests planning and ownership, not a durable descriptor publication.
+Native layouts and durable formats are unchanged.
+
+The registered durable checkpoint controller, WAL completion, immutable input
+retirement and production-driver adoption remain open. Full Linux qualification
+remains waived and the complete pooling design remains open.

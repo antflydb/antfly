@@ -297,21 +297,40 @@ pub const Candidate = struct {
     /// and durable acceptance are separate authorities owned by the driver.
     /// Unlike a file edit this keeps the writer and directory contents intact.
     pub fn appendObsoleteRemovalWithAdmission(self: *Candidate, rank: usize, original: admission.Port) !void {
-        try original.checkpoint();
-        if (self.closing or self.published or !self.source_captured or self.state == null) return error.InvalidArgument;
-        const s = self.state.?;
-        if (s.next_input != null or (!self.ready and (s.run != null or s.ledger_edit))) return error.InvalidArgument;
-        if (s.outputs.directory == null and s.source_seal == null) return error.InvalidArgument;
-        const current = if (s.outputs.obsolete.tree.account != null) &s.outputs.obsolete else &s.obsolete;
+        const current = try self.ledgerSourceForAppend(original);
         if (rank >= current.count()) return error.InvalidArgument;
-        if (self.input_revision == std.math.maxInt(u64)) return error.ResourceBudgetExceeded;
+        const s = self.state.?;
         s.ledger_edit = true;
         s.obsolete_remove_rank = rank;
         s.obsolete_applied = false;
         self.input_revision += 1;
         self.ready = false;
     }
-    fn resumeLedgerRemoval(self: *Candidate, s: *State, original: admission.Port) !void {
+    /// Append private retirement intent for one captured manifest filename.
+    /// The caller validates checkpoint lineage and owns durable publication;
+    /// this edit supplies no permission to delete an active manifest file.
+    pub fn appendManifestRetirementWithAdmission(self: *Candidate, fence: *const @import("repository.zig").ManifestJournal.CheckpointFence, root: []const u8, index: usize, deadline: u64, original: admission.Port) !void {
+        const current = try self.ledgerSourceForAppend(original);
+        const child = try ObsoleteEdit.startManifestRetirement(self.allocator, self.manager, current, fence, root, index, deadline, original);
+        // Fixed acceptance receipt. Failed construction has not changed the
+        // edit sequence; the registered child owns all captured input bytes.
+        const s = self.state.?;
+        s.obsolete_child = child;
+        s.ledger_edit = true;
+        s.obsolete_applied = false;
+        self.input_revision += 1;
+        self.ready = false;
+    }
+    fn ledgerSourceForAppend(self: *Candidate, original: admission.Port) !*const Ledger {
+        try original.checkpoint();
+        if (self.closing or self.published or !self.source_captured or self.state == null) return error.InvalidArgument;
+        const s = self.state.?;
+        if (s.next_input != null or (!self.ready and (s.run != null or s.ledger_edit))) return error.InvalidArgument;
+        if (s.outputs.directory == null and s.source_seal == null) return error.InvalidArgument;
+        if (self.input_revision == std.math.maxInt(u64)) return error.ResourceBudgetExceeded;
+        return if (s.outputs.obsolete.tree.account != null) &s.outputs.obsolete else &s.obsolete;
+    }
+    fn resumeLedgerEdit(self: *Candidate, s: *State, original: admission.Port) !void {
         // These funded headers own immutable forks. No mutable Backend view or
         // publication seal is borrowed by the new tuple's cleanup continuation.
         if (s.outputs.directory == null) {
@@ -392,7 +411,7 @@ pub const Candidate = struct {
             s.writer_applied = false;
             s.obsolete_applied = false;
         }
-        if (s.ledger_edit) return self.resumeLedgerRemoval(s, original);
+        if (s.ledger_edit) return self.resumeLedgerEdit(s, original);
         if (s.run == null) return error.InvalidArgument;
         if (!self.removing and !s.checked_id) {
             if (s.id_search == null) s.id_search = (s.outputs.directory orelse &s.directory).locateId(&s.run.?);

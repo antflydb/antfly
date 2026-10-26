@@ -202,6 +202,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-coupled-ledger-publication-test", "Verify independent obsolete intent removal preserves coupled file roots and physical readers")
         .dependOn(&coupled_ledger_run.step);
 
+    const manifest_intent_tests = b.addTest(.{
+        .name = "manifest-retirement-intent-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata manifest retirement"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const manifest_intent_run = b.addRunArtifact(manifest_intent_tests);
+    manifest_intent_run.addArg("--require-no-skips");
+    b.step("antfly-manifest-retirement-intent-test", "Verify coupled manifest retirement intent retains lineage paths and original refusal ownership")
+        .dependOn(&manifest_intent_run.step);
+
     const socket_child_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/socket_child_cancellation_test_root.zig"),
         .target = target,

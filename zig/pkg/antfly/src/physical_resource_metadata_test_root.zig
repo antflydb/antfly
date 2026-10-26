@@ -3311,7 +3311,7 @@ const FlushPublicationFixture = struct {
     const Batch = Scope.FlushOutputs;
     const Builder = Scope.FlushBuilder.Owner;
     const Control = RegisteredOutputFixture.Control;
-    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed };
+    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest };
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
     const Retry = struct {
         failing: *std.testing.FailingAllocator,
@@ -3403,6 +3403,7 @@ const FlushPublicationFixture = struct {
     }
     fn run(mode: Mode, target: ?usize, oom: bool, abort_on_error: bool) !Stats {
         const a = std.testing.allocator;
+        const late = mode == .ledger or mode == .ledger_mixed or mode == .manifest;
         var failing = std.testing.FailingAllocator.init(a, .{});
         const owned = failing.allocator();
         var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
@@ -3454,14 +3455,14 @@ const FlushPublicationFixture = struct {
         owners.builder = try build(owners.scope.?, queue, native.storage(), root, false, false, original);
         var start = failing.alloc_index;
         control.live = true;
-        control.target = if (oom or (mode == .ledger or mode == .ledger_mixed)) null else target;
+        control.target = if (oom or late) null else target;
         control.failure = switch ((target orelse 0) % 4) {
             0 => error.Canceled,
             1 => error.DeadlineExceeded,
             2 => error.ParentMemoryBusy,
             else => error.FileNotFound,
         };
-        if (oom and mode != .ledger and mode != .ledger_mixed) failing.fail_index = start + target.?;
+        if (oom and !late) failing.fail_index = start + target.?;
         var retry: Retry = .{ .failing = &failing, .control = &control, .oom = oom, .abort_on_error = abort_on_error };
         var allocations: usize = 0;
         const result: anyerror!void = work: {
@@ -3559,6 +3560,77 @@ const FlushPublicationFixture = struct {
             defer read.abort();
             try std.testing.expectEqualStrings("one", try read.getWithAdmission(.{ .name = null }, "a", original));
             try std.testing.expectEqualStrings("two", try read.getWithAdmission(.{ .name = null }, "b", original));
+            if (mode == .manifest) {
+                // Seed metadata lineage for retirement-name preparation. This
+                // fixture does not publish or acknowledge a durable descriptor.
+                backend.manifest_journal.descriptor = .{ .checkpoint = 31, .first_segment = 31, .sequence = 0 };
+                backend.manifest_journal.segments[0] = 31;
+                backend.manifest_journal.segments[1] = 44;
+                backend.manifest_journal.segment_count = 2;
+                backend.manifest_journal.sequence = 9;
+                const fence = lsm.repository.ManifestJournal.CheckpointFence.capture(&backend);
+                try std.testing.expectEqual(@as(usize, 6), fence.retiredPathCount());
+                const writer_root = backend.runs.tree.root;
+                const directory_root = backend.run_directory.?.tree.root;
+                var expected: [6][std.fs.max_path_bytes]u8 = undefined;
+                var lengths: [6]usize = undefined;
+                for (&expected, &lengths, 0..) |*buffer, *len, path_index| len.* = (try fence.retiredPathAt(root, path_index, buffer)).len;
+                start = failing.alloc_index;
+                control.calls = 0;
+                control.target = if (oom) null else target;
+                control.live = true;
+                if (oom) failing.fail_index = start + target.?;
+                owners.frame = retry.call(Scope.preparePublicationWithAdmission, .{ owners.scope.?, original }) catch |cause| break :work cause;
+                {
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    retry.call(lsm.Backend.capturePreparedPublicationWithAdmission, .{ &backend, owners.frame.?, &backend.registered_publication, backend.run_directory_generation, original }) catch |cause| break :work cause;
+                }
+                var empty_fence = fence;
+                empty_fence.journal.descriptor = null;
+                try std.testing.expectError(error.InvalidArgument, owners.frame.?.appendManifestRetirementWithAdmission(&empty_fence, root, 0, 1000, quotaControl()));
+                try std.testing.expectError(error.InvalidArgument, owners.frame.?.appendManifestRetirementWithAdmission(&fence, root, 6, 1000, quotaControl()));
+                for (0..6) |path_index| {
+                    var input_root: [std.fs.max_path_bytes]u8 = undefined;
+                    @memcpy(input_root[0..root.len], root);
+                    var input_fence = fence;
+                    retry.call(Scope.Publication.Candidate.appendManifestRetirementWithAdmission, .{ owners.frame.?, &input_fence, input_root[0..root.len], path_index, @as(u64, 1000), original }) catch |cause| break :work cause;
+                    @memset(&input_root, 0xa5);
+                    input_fence.journal.descriptor = null;
+                    try std.testing.expectError(error.InvalidArgument, owners.frame.?.appendObsoleteRemovalWithAdmission(0, quotaControl()));
+                    retry.call(Scope.Publication.Candidate.resumeWithAdmission, .{ owners.frame.?, original }) catch |cause| break :work cause;
+                }
+                const receipt = try owners.frame.?.preparedReceiptWithAdmission(quotaControl());
+                for ([_]u64{ 500, 2000 }) |deadline| {
+                    retry.call(Scope.Publication.Candidate.appendManifestRetirementWithAdmission, .{ owners.frame.?, &fence, root, @as(usize, 0), deadline, original }) catch |cause| break :work cause;
+                    try std.testing.expectError(error.CompactionPlanningStale, owners.frame.?.validatePreparedReceiptFixedWithAdmission(receipt, quotaControl()));
+                    retry.call(Scope.Publication.Candidate.resumeWithAdmission, .{ owners.frame.?, original }) catch |cause| break :work cause;
+                    const private = try owners.frame.?.preparedRootsWithAdmission(quotaControl());
+                    try std.testing.expectEqual(@as(u64, if (deadline == 500) 1000 else 2000), private.obsolete.get(expected[0][0..lengths[0]]).?.delete_after_ns);
+                }
+                const private = try owners.frame.?.preparedRootsWithAdmission(quotaControl());
+                try std.testing.expectEqual(@as(usize, 6), private.obsolete.count());
+                for (&expected, lengths, 0..) |*buffer, len, path_index| {
+                    try std.testing.expectEqual(@as(u64, if (path_index == 0) 2000 else 1000), private.obsolete.get(buffer[0..len]).?.delete_after_ns);
+                    try std.testing.expect(!std.mem.eql(u8, std.fs.path.basename(buffer[0..len]), "manifest.bin"));
+                }
+                try std.testing.expect(fence.matches(&backend));
+                try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
+                {
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    retry.call(lsm.Backend.installRegisteredPublicationWithAdmission, .{ &backend, owners.frame.?, original }) catch |cause| break :work cause;
+                }
+                owners.frame = null;
+                allocations = failing.alloc_index - start;
+                control.live = false;
+                try std.testing.expectEqual(@as(usize, 6), backend.obsolete_paths.count());
+                try std.testing.expect(backend.runs.tree.root == writer_root and backend.run_directory.?.tree.root == directory_root);
+                try std.testing.expectEqualStrings("one", try read.getWithAdmission(.{ .name = null }, "a", original));
+                var current = try backend.beginReadWithAdmission(original);
+                defer current.abort();
+                try std.testing.expectEqualStrings("two", try current.getWithAdmission(.{ .name = null }, "b", original));
+            }
             if ((mode == .ledger or mode == .ledger_mixed)) {
                 // First create real obsolete intent by removing a physical SST.
                 // The earlier read pins the old generation across both swaps.
@@ -3631,13 +3703,17 @@ const FlushPublicationFixture = struct {
             try std.testing.expect(retry.observed and abort_on_error);
             try std.testing.expectError(if (oom) error.OutOfMemory else control.failure, @as(anyerror!void, cause));
         }
-        if (mode != .ledger and mode != .ledger_mixed and (mode != .publish or (retry.observed and abort_on_error))) {
+        if (!late and (mode != .publish or (retry.observed and abort_on_error))) {
             try std.testing.expect(!owners.installed);
             try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
         }
         if ((mode == .ledger or mode == .ledger_mixed) and retry.observed and abort_on_error) {
             try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.count());
             try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+        }
+        if (mode == .manifest and retry.observed and abort_on_error) {
+            try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
+            try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
         }
         const abandoned = try owners.finish(&backend, &resources.resource_manager, native.storage(), &failing);
         backend_live = false;
@@ -3699,4 +3775,25 @@ test "physical cache metadata coupled ledger removal retires allocation exhausti
 
 test "physical cache metadata coupled ledger removal composes file edits and invalidates old receipts" {
     _ = try FlushPublicationFixture.run(.ledger_mixed, null, false, false);
+}
+
+test "physical cache metadata manifest retirement captures lineage paths deadlines and caller borrows" {
+    _ = try FlushPublicationFixture.run(.manifest, null, false, false);
+}
+
+test "physical cache metadata manifest retirement retains original refusal and abort ownership" {
+    for ([_]bool{ false, true }) |abort_on_error| {
+        var at: usize = 0;
+        while (true) : (at += 1) {
+            const stats = try FlushPublicationFixture.run(.manifest, at, false, abort_on_error);
+            if (!stats.observed) break;
+        }
+    }
+}
+
+test "physical cache metadata manifest retirement retires allocation exhaustion" {
+    const count = (try FlushPublicationFixture.run(.manifest, null, false, false)).allocations;
+    for ([_]bool{ false, true }) |abort_on_error| {
+        for (0..count) |at| _ = try FlushPublicationFixture.run(.manifest, at, true, abort_on_error);
+    }
 }
