@@ -1947,27 +1947,8 @@ fn computeAlgebraicTermsAggregation(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(TermsBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(TermsBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByCountThenKey(TermsBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-
-    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
-            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-            return lhs.count > rhs.count;
-        }
-    }.lessThan);
 
     const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < candidates.len) @intCast(request.size) else candidates.len;
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
@@ -2370,27 +2351,8 @@ fn computeAlgebraicPathFactTermsAggregation(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(TermsBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(TermsBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByCountThenKey(TermsBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-
-    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
-            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-            return lhs.count > rhs.count;
-        }
-    }.lessThan);
 
     const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < candidates.len) @intCast(request.size) else candidates.len;
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
@@ -2504,26 +2466,8 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
         bucket.count += 1;
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(TermsCardinalityBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(TermsCardinalityBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByCountThenKey(TermsCardinalityBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-    std.mem.sortUnstable(TermsCardinalityBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: TermsCardinalityBucketAccum, rhs: TermsCardinalityBucketAccum) bool {
-            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-            return lhs.count > rhs.count;
-        }
-    }.lessThan);
 
     const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < candidates.len) @intCast(request.size) else candidates.len;
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
@@ -2913,27 +2857,8 @@ fn computeDerivedJoinTermsAggregation(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(TermsBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(TermsBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByCountThenKey(TermsBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-
-    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
-            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-            return lhs.count > rhs.count;
-        }
-    }.lessThan);
 
     const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < candidates.len) @intCast(request.size) else candidates.len;
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
@@ -3031,27 +2956,8 @@ pub fn algebraicTermsAggregationFromDistributedPartialsAlloc(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(TermsBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(TermsBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByCountThenKey(TermsBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-
-    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
-            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-            return lhs.count > rhs.count;
-        }
-    }.lessThan);
 
     const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < candidates.len) @intCast(request.size) else candidates.len;
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
@@ -3114,26 +3020,8 @@ pub fn algebraicTermsCardinalityAggregationFromDistributedPartialsAlloc(
         bucket.count += count;
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(TermsCardinalityBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(TermsCardinalityBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByCountThenKey(TermsCardinalityBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-    std.mem.sortUnstable(TermsCardinalityBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: TermsCardinalityBucketAccum, rhs: TermsCardinalityBucketAccum) bool {
-            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-            return lhs.count > rhs.count;
-        }
-    }.lessThan);
 
     const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < candidates.len) @intCast(request.size) else candidates.len;
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
@@ -3241,26 +3129,8 @@ fn algebraicPathFactTermsCardinalityAggregationFromDistributedPartialsAlloc(
         bucket.count += count;
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(TermsCardinalityBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(TermsCardinalityBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByCountThenKey(TermsCardinalityBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-    std.mem.sortUnstable(TermsCardinalityBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: TermsCardinalityBucketAccum, rhs: TermsCardinalityBucketAccum) bool {
-            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-            return lhs.count > rhs.count;
-        }
-    }.lessThan);
 
     const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < candidates.len) @intCast(request.size) else candidates.len;
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
@@ -3350,27 +3220,8 @@ fn algebraicPathFactTermsAggregationFromDistributedPartialsAlloc(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(TermsBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(TermsBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByCountThenKey(TermsBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-
-    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
-            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-            return lhs.count > rhs.count;
-        }
-    }.lessThan);
 
     const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < candidates.len) @intCast(request.size) else candidates.len;
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
@@ -3756,26 +3607,8 @@ pub fn algebraicDateHistogramAggregationFromDistributedPartialsAlloc(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(DateBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(DateBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByStart(DateBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-
-    std.mem.sortUnstable(DateBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: DateBucketAccum, rhs: DateBucketAccum) bool {
-            return std.mem.order(u8, lhs.bucket_start, rhs.bucket_start) == .lt;
-        }
-    }.lessThan);
 
     const bucket_keys = if (request.min_doc_count == 0 and candidates.len > 0) blk: {
         const first_ns = (try parseRfc3339ToNs(candidates[0].bucket_start)) orelse return null;
@@ -4101,26 +3934,8 @@ pub fn algebraicHistogramAggregationFromDistributedPartialsAlloc(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(HistogramBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(HistogramBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByIndex(HistogramBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-
-    std.mem.sortUnstable(HistogramBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: HistogramBucketAccum, rhs: HistogramBucketAccum) bool {
-            return lhs.bucket_index < rhs.bucket_index;
-        }
-    }.lessThan);
 
     const keys = if (request.min_doc_count == 0 and candidates.len > 0)
         try fillHistogramBucketKeys(alloc, candidates[0].bucket_index, candidates[candidates.len - 1].bucket_index)
@@ -4203,26 +4018,8 @@ fn algebraicDocFactHistogramAggregationFromDistributedPartialsAlloc(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(HistogramBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(HistogramBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByIndex(HistogramBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-
-    std.mem.sortUnstable(HistogramBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: HistogramBucketAccum, rhs: HistogramBucketAccum) bool {
-            return lhs.bucket_index < rhs.bucket_index;
-        }
-    }.lessThan);
 
     const keys = if (request.min_doc_count == 0 and candidates.len > 0)
         try fillHistogramBucketKeys(alloc, candidates[0].bucket_index, candidates[candidates.len - 1].bucket_index)
@@ -4965,26 +4762,8 @@ fn computeAdaptiveTermsAggregation(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(TermsBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(TermsBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByCountThenKey(TermsBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
-            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-            return lhs.count > rhs.count;
-        }
-    }.lessThan);
 
     const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < candidates.len) @intCast(request.size) else candidates.len;
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
@@ -5293,6 +5072,53 @@ fn adaptiveChildReadPlan(
     return .indexed_scan;
 }
 
+
+/// Buckets that meet min_doc_count, bounded by the algebraic result limit and
+/// sorted by `lessThan`. The caller frees a non-empty result.
+fn keptBucketsAlloc(comptime T: type, alloc: Allocator, index: anytype, buckets: []const T, min_doc_count: anytype, comptime lessThan: fn (void, T, T) bool) ![]T {
+    var kept_count: usize = 0;
+    for (buckets) |bucket| {
+        if (min_doc_count > 0 and bucket.count < min_doc_count) continue;
+        kept_count += 1;
+    }
+    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
+    const kept = try alloc.alloc(T, kept_count);
+    var kept_idx: usize = 0;
+    for (buckets) |bucket| {
+        if (min_doc_count > 0 and bucket.count < min_doc_count) continue;
+        kept[kept_idx] = bucket;
+        kept_idx += 1;
+    }
+    std.mem.sortUnstable(T, kept, {}, lessThan);
+    return kept;
+}
+
+fn bucketsByCountThenKey(comptime T: type) fn (void, T, T) bool {
+    return struct {
+        fn lessThan(_: void, lhs: T, rhs: T) bool {
+            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+            return lhs.count > rhs.count;
+        }
+    }.lessThan;
+}
+
+fn bucketsByStart(comptime T: type) fn (void, T, T) bool {
+    return struct {
+        fn lessThan(_: void, lhs: T, rhs: T) bool {
+            return std.mem.order(u8, lhs.bucket_start, rhs.bucket_start) == .lt;
+        }
+    }.lessThan;
+}
+
+fn bucketsByIndex(comptime T: type) fn (void, T, T) bool {
+    return struct {
+        fn lessThan(_: void, lhs: T, rhs: T) bool {
+            return lhs.bucket_index < rhs.bucket_index;
+        }
+    }.lessThan;
+}
+
+
 test "adaptive child read planner avoids scans over budget" {
     try std.testing.expectEqual(AdaptiveChildReadPlan.point_lookup, adaptiveChildReadPlan(.{
         .parent_candidate_count = 10,
@@ -5569,26 +5395,8 @@ fn computeDerivedJoinHistogramAggregation(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(HistogramBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(HistogramBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByIndex(HistogramBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-
-    std.mem.sortUnstable(HistogramBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: HistogramBucketAccum, rhs: HistogramBucketAccum) bool {
-            return lhs.bucket_index < rhs.bucket_index;
-        }
-    }.lessThan);
 
     const keys = if (request.min_doc_count == 0 and candidates.len > 0)
         try fillHistogramBucketKeys(alloc, candidates[0].bucket_index, candidates[candidates.len - 1].bucket_index)
@@ -6255,26 +6063,8 @@ fn computeAlgebraicDateHistogramAggregation(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(DateBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(DateBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByStart(DateBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-
-    std.mem.sortUnstable(DateBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: DateBucketAccum, rhs: DateBucketAccum) bool {
-            return std.mem.order(u8, lhs.bucket_start, rhs.bucket_start) == .lt;
-        }
-    }.lessThan);
 
     const bucket_keys = if (request.min_doc_count == 0 and candidates.len > 0) blk: {
         const first_ns = (try parseRfc3339ToNs(candidates[0].bucket_start)) orelse return null;
@@ -6501,25 +6291,8 @@ fn computeDerivedJoinDateHistogramAggregation(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(DateBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(DateBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByStart(DateBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-    std.mem.sortUnstable(DateBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: DateBucketAccum, rhs: DateBucketAccum) bool {
-            return std.mem.order(u8, lhs.bucket_start, rhs.bucket_start) == .lt;
-        }
-    }.lessThan);
 
     const bucket_keys = if (request.min_doc_count == 0 and candidates.len > 0) blk: {
         const first_ns = (try parseRfc3339ToNs(candidates[0].bucket_start)) orelse return null;
@@ -6640,25 +6413,8 @@ fn computeAdaptiveDateHistogramAggregation(
         }
     }
 
-    var kept_count: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        kept_count += 1;
-    }
-    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
-    var candidates = try alloc.alloc(DateBucketAccum, kept_count);
+    const candidates = try keptBucketsAlloc(DateBucketAccum, alloc, index, buckets_accum.items, request.min_doc_count, bucketsByStart(DateBucketAccum));
     defer if (candidates.len > 0) alloc.free(candidates);
-    var kept_idx: usize = 0;
-    for (buckets_accum.items) |bucket| {
-        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
-        candidates[kept_idx] = bucket;
-        kept_idx += 1;
-    }
-    std.mem.sortUnstable(DateBucketAccum, candidates, {}, struct {
-        fn lessThan(_: void, lhs: DateBucketAccum, rhs: DateBucketAccum) bool {
-            return std.mem.order(u8, lhs.bucket_start, rhs.bucket_start) == .lt;
-        }
-    }.lessThan);
 
     const bucket_keys = if (request.min_doc_count == 0 and candidates.len > 0) blk: {
         const first_ns = (try parseRfc3339ToNs(candidates[0].bucket_start)) orelse return null;
