@@ -15,6 +15,7 @@
 
 const std = @import("std");
 pub const document_runs = @import("document_runs.zig");
+pub const document_failure = @import("document_failure.zig");
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference_api = @import("inference_api");

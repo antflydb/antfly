@@ -183,7 +183,7 @@ pub const Owner = struct {
         identity_hash.update(&request_hash);
         const call = try self.allocator.create(Call);
         errdefer self.allocator.destroy(call);
-        call.* = .{ .a = undefined, .backing = self.allocator, .memory = .{ .budget = .init(self.allocator, 256 * 1024 * 1024) }, .owner = self, .root_key = &.{}, .blob_scope = &.{}, .id = &.{} };
+        call.* = .{ .a = undefined, .backing = self.allocator, .memory = .init(self.allocator, 256 * 1024 * 1024), .owner = self, .root_key = &.{}, .blob_scope = &.{}, .id = &.{} };
         const retained = call.memory.allocator();
         call.a = retained;
         const run_id = try retained.dupe(u8, &std.fmt.bytesToHex(identity_hash.finalResult(), .lower));
@@ -216,10 +216,7 @@ pub const Owner = struct {
             next.revision += 1;
             next.lease_until_ms = 0;
             next.state = .queued;
-            for (current.pending) |pending| inline for (@typeInfo(runs.Charge).@"struct".field_names) |field| {
-                @field(next.uncertain, field) = std.math.add(u64, @field(next.uncertain, field), @field(pending.upper, field)) catch return error.DocumentBudgetExhausted;
-            };
-            next.pending = &.{};
+            try next.abandonPending();
             if (!try store.cas_fn(store.ptr, current.version(), next)) return error.DocumentRunLeaseLost;
             const lease = try store.claim(scratch, run_id, root_key, next.identity, now(), 1_800_000);
             if (next.inputs.len == 0) {
@@ -398,43 +395,9 @@ fn protocolError(err: anyerror) anyerror {
     };
 }
 
-// The retained RPC binding must never borrow a producer's stack-scoped budget
-// allocator. This bounded allocator lives with the last response and serializes
-// accounting while independent native/remote checkpoint calls are in flight.
-const RetainedMemory = struct {
-    budget: @import("antfly_inference_work").BoundedInvocationAllocator,
-    mutex: std.atomic.Mutex = .unlocked,
-    fn allocator(self: *@This()) A {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
-    }
-    fn lock(self: *@This()) void {
-        @import("antfly_platform").sync.lockYielding(&self.mutex);
-    }
-    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        self.lock();
-        defer self.mutex.unlock();
-        return self.budget.allocator().rawAlloc(len, alignment, address);
-    }
-    fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, address: usize) bool {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        self.lock();
-        defer self.mutex.unlock();
-        return self.budget.allocator().rawResize(bytes, alignment, len, address);
-    }
-    fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, address: usize) ?[*]u8 {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        self.lock();
-        defer self.mutex.unlock();
-        return self.budget.allocator().rawRemap(bytes, alignment, len, address);
-    }
-    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        self.lock();
-        defer self.mutex.unlock();
-        self.budget.allocator().rawFree(bytes, alignment, address);
-    }
-};
+// The retained binding owns the same synchronized budget used by transport
+// invocations, rather than borrowing a producer's stack-scoped allocator.
+const RetainedMemory = @import("antfly_inference_work").BoundedInvocationAllocator;
 
 test "index document checkpoint binding outlives the producer invocation allocator" {
     const a = std.testing.allocator;
@@ -499,4 +462,39 @@ test "index document checkpoint retirement rejects stale source and checkpoint o
     const fresh = (try backend.backend().get(&backend, scratch, key)).?;
     try std.testing.expectEqual(Collection.done, try collect(backend.backend(), scratch, key, fresh, prefix, 32));
     try std.testing.expectEqual(@as(usize, 0), backend.values.count());
+}
+
+test "index document checkpoint owner releases abandoned logical source capacity on rebind" {
+    const a = std.testing.allocator;
+    var backend = TestBackend.init(a);
+    defer backend.deinit();
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    var owner = Owner{ .allocator = a, .backend = backend.backend(), .binding = .{ .document = "doc", .producer = "reader", .source_key = "doc", .source_digest = @splat(1), .producer_digest = @splat(2) }, .io = io.io() };
+    defer owner.drain();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    {
+        const endpoint = try owner.factory().bind(a, "request", false);
+        defer endpoint.view().release();
+        var client = try rpc.Client.initBound(a, endpoint.view(), io.io());
+        defer client.deinit();
+        const store = client.store();
+        const record = try store.load(work, client.id, client.owner);
+        const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+        try std.testing.expect(try store.reserve(work, lease, @splat(5), .{ .source_bytes = record.limits.source_bytes - record.used.source_bytes }, now()));
+    }
+    const endpoint = try owner.factory().bind(a, "request", false);
+    defer endpoint.view().release();
+    var client = try rpc.Client.initBound(a, endpoint.view(), io.io());
+    defer client.deinit();
+    const store = client.store();
+    const record = try store.load(work, client.id, client.owner);
+    try std.testing.expectEqual(@as(u64, 7), record.used.source_bytes);
+    try std.testing.expectEqual(@as(u64, 0), record.uncertain.source_bytes);
+    const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+    try std.testing.expect(try store.reserve(work, lease, @splat(5), .{ .source_bytes = record.limits.source_bytes - record.used.source_bytes }, now()));
+    _ = try store.complete(work, lease, @splat(5), .{ .source_bytes = 3 }, "pdf", now());
+    try std.testing.expectEqual(@as(u64, 10), (try store.load(work, client.id, client.owner)).used.source_bytes);
 }

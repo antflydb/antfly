@@ -25,6 +25,8 @@ pub const Charge = struct {
     tokens: u64 = 0,
     pixels: u64 = 0,
     output_bytes: u64 = 0,
+    /// Logical bytes held by accepted input snapshots and active preparation.
+    /// Unpublished preparation releases this capacity when its attempt ends.
     source_bytes: u64 = 0,
     fn plus(left: Charge, right: Charge) !Charge {
         var result: Charge = .{};
@@ -77,6 +79,22 @@ pub const Record = struct {
     sequence: u64 = 0,
     result: ?Ref = null,
     pending: []const Reservation = &.{},
+    /// Retire an attempt without charging an unpublished source twice. Source
+    /// bytes are logical snapshot occupancy, unlike uncertain physical calls,
+    /// tokens, pixels and artifact output. Accepted checkpoints stay charged.
+    /// Older records may already carry source uncertainty; normalize it here.
+    pub fn abandonPending(self: *Record) !void {
+        var released = self.uncertain.source_bytes;
+        self.uncertain.source_bytes = 0;
+        for (self.pending) |pending| {
+            released = std.math.add(u64, released, pending.upper.source_bytes) catch return error.InvalidDocumentCheckpoint;
+            var physical = pending.upper;
+            physical.source_bytes = 0;
+            self.uncertain = try self.uncertain.plus(physical);
+        }
+        self.used.source_bytes = std.math.sub(u64, self.used.source_bytes, released) catch return error.InvalidDocumentCheckpoint;
+        self.pending = &.{};
+    }
     pub fn version(self: Record) Version {
         return .{ .revision = self.revision, .attempt = self.attempt, .nonce = self.nonce };
     }
@@ -174,11 +192,11 @@ pub const Store = struct {
             if (record.retention_until_ms != 0) record.lease_until_ms = @min(record.lease_until_ms, record.retention_until_ms);
             record.state = .running;
             record.not_before_ms = 0;
+            record.error_code = null;
             record.nonce = nonce;
             // Old in-flight steps may no longer be chosen by an adaptive
-            // policy. Retire their dispatch intents, retaining every charge.
-            for (record.pending) |pending| record.uncertain = try record.uncertain.plus(pending.upper);
-            record.pending = &.{};
+            // policy. Retire their dispatch intents, retaining physical charges.
+            try record.abandonPending();
             if (try self.cas_fn(self.ptr, expected, record)) return .{ .run_id = id, .owner = owner, .attempt = record.attempt, .nonce = nonce };
         }
         return error.DocumentRunBusy;
@@ -308,6 +326,7 @@ pub const Store = struct {
             if (record.state == .succeeded or record.state == .cancelled) return;
             const expected = record.version();
             const previous = record.revision;
+            try record.abandonPending();
             record.state = .cancelled;
             record.lease_until_ms = 0;
             record.revision = std.math.add(u64, previous, 1) catch return error.InvalidDocumentCheckpoint;
@@ -354,13 +373,17 @@ pub const Store = struct {
         return self.yieldLeaseUntil(a, lease, now_ms, now_ms);
     }
     pub fn yieldLeaseUntil(self: Store, a: A, lease: Lease, now_ms: u64, not_before_ms: u64) !void {
+        return self.yieldLeaseWithCode(a, lease, now_ms, not_before_ms, null);
+    }
+    pub fn yieldLeaseWithCode(self: Store, a: A, lease: Lease, now_ms: u64, not_before_ms: u64, code: ?[]const u8) !void {
+        if (code) |text| if (text.len > 128) return error.InvalidDocumentCheckpoint;
         for (0..16) |_| {
             var record = try self.current(a, lease, now_ms);
             const expected = record.version();
-            for (record.pending) |pending| record.uncertain = try record.uncertain.plus(pending.upper);
-            record.pending = &.{};
+            try record.abandonPending();
             record.state = .queued;
             record.not_before_ms = @max(now_ms, not_before_ms);
+            record.error_code = code;
             record.lease_until_ms = 0;
             record.revision = std.math.add(u64, record.revision, 1) catch return error.InvalidDocumentCheckpoint;
             if (try self.cas_fn(self.ptr, expected, record)) return;
@@ -375,6 +398,7 @@ pub const Store = struct {
         for (0..16) |_| {
             var record = try self.current(a, lease, now_ms);
             const expected = record.version();
+            try record.abandonPending();
             record.state = .failed;
             record.error_code = code;
             record.lease_until_ms = 0;
@@ -398,8 +422,7 @@ pub const Store = struct {
             record.retired = true;
             record.state = .cancelled;
             record.lease_until_ms = 0;
-            for (record.pending) |pending| record.uncertain = try record.uncertain.plus(pending.upper);
-            record.pending = &.{};
+            try record.abandonPending();
             record.inputs = &.{};
             record.head = null;
             record.sequence = 0;
@@ -1332,4 +1355,87 @@ test "document durable retry deadline survives handoff without releasing uncerta
     try std.testing.expectEqual(@as(u64, 9), record.used.tokens);
     try std.testing.expectEqual(@as(u64, 9), record.uncertain.tokens);
     try std.testing.expectEqual(@as(u64, 0), record.not_before_ms);
+}
+
+test "document durable source capacity survives yield crash and legacy uncertainty without refunding model work" {
+    const a = std.testing.allocator;
+    for ([_]enum { yielding, crash, legacy }{ .yielding, .crash, .legacy }) |mode| {
+        var memory = TestStore{ .a = a };
+        defer memory.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const Clock = struct {
+            var value: u64 = 1;
+            fn now(_: ?*anyopaque) u64 {
+                return value;
+            }
+        };
+        Clock.value = 1;
+        var request_hash: Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash("request", &request_hash, .{});
+        const identity: Identity = .{ .request = request_hash, .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
+        const store = memory.interface();
+        try store.create(.{ .run_id = "sources", .owner = "alice", .prepared = false, .identity = identity, .inputs = &.{}, .limits = .{ .calls = 4, .tokens = 100, .pixels = 100, .source_bytes = 71, .output_bytes = 1024 } });
+        const first = try store.claim(work, "sources", "alice", identity, 1, 10);
+        try std.testing.expect(try store.reserve(work, first, @splat(1), .{ .source_bytes = 7 }, 1));
+        const request = try store.complete(work, first, @splat(1), .{ .source_bytes = 7 }, "request", 1);
+        try store.attachRequest(work, first, request, 1);
+        const Download = struct {
+            calls: *usize,
+            fail: bool,
+            fn invoke(self: @This(), _: A) !Session.Output {
+                self.calls.* += 1;
+                if (self.fail) return error.Timeout;
+                return .{ .bytes = "pdf", .actual = .{ .source_bytes = 3 } };
+            }
+        };
+        var calls: usize = 0;
+        {
+            var session = try Session.init(a, store, first, identity, .{ .now_fn = Clock.now }, 512, 32768);
+            defer session.deinit();
+            try std.testing.expectError(error.Timeout, session.execute(work, @splat(2), .{ .source_bytes = 64 }, 64, Download{ .calls = &calls, .fail = true }, Download.invoke));
+        }
+        switch (mode) {
+            .yielding => try store.yieldLease(work, first, 2),
+            .crash => {}, // Leave the reservation in the expired attempt.
+            .legacy => {
+                var old = try store.load(work, "sources", "alice");
+                const version = old.version();
+                for (old.pending) |pending| old.uncertain = try old.uncertain.plus(pending.upper);
+                old.pending = &.{};
+                old.state = .queued;
+                old.lease_until_ms = 0;
+                old.revision += 1;
+                try std.testing.expect(try store.cas_fn(store.ptr, version, old));
+            },
+        }
+        Clock.value = 12;
+        const second = try store.claim(work, "sources", "alice", identity, 12, 100);
+        var session = try Session.init(a, store, second, identity, .{ .now_fn = Clock.now }, 512, 32768);
+        defer session.deinit();
+        const recovered = try store.load(work, "sources", "alice");
+        try std.testing.expectEqual(@as(u64, 7), recovered.used.source_bytes);
+        try std.testing.expectEqual(@as(u64, 0), recovered.uncertain.source_bytes);
+        const source = try session.execute(work, @splat(2), .{ .source_bytes = 64 }, 64, Download{ .calls = &calls, .fail = false }, Download.invoke);
+        try std.testing.expectEqualStrings("pdf", source.bytes);
+        try std.testing.expectEqual(@as(usize, 2), calls);
+        const source_ref = try session.reference(work, @splat(2));
+        const prepared = try store.load(work, "sources", "alice");
+        try store.prepare(work, second, identity, prepared.limits, &.{ request, source_ref }, 12);
+        try std.testing.expect(try store.reserve(work, second, @splat(3), .{ .calls = 1, .tokens = 11, .pixels = 5, .output_bytes = 10 }, 12));
+        try store.yieldLease(work, second, 13);
+        Clock.value = 14;
+        const third = try store.claim(work, "sources", "alice", identity, 14, 100);
+        var replay = try Session.init(a, store, third, identity, .{ .now_fn = Clock.now }, 512, 32768);
+        defer replay.deinit();
+        try std.testing.expect((try replay.replay(work, @splat(2), 64)).?.replayed);
+        const final = try store.load(work, "sources", "alice");
+        try std.testing.expectEqual(@as(u64, 10), final.used.source_bytes);
+        try std.testing.expectEqual(@as(u64, 1), final.uncertain.calls);
+        try std.testing.expectEqual(@as(u64, 11), final.uncertain.tokens);
+        try std.testing.expectEqual(@as(u64, 5), final.uncertain.pixels);
+        try std.testing.expectEqual(@as(u64, 10), final.uncertain.output_bytes);
+        try std.testing.expectError(error.DocumentBudgetExhausted, store.reserve(work, third, @splat(4), .{ .tokens = 90 }, 14));
+    }
 }

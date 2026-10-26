@@ -8424,11 +8424,7 @@ test "index document checkpoint producer replays accepted work and completed out
 }
 
 fn documentRemoteError(a: Allocator, status: i32, body: []const u8) anyerror {
-    if (body.len <= 4096) {
-        var parsed = std.json.parseFromSlice(struct { @"error": []const u8 = "" }, a, body, .{ .ignore_unknown_fields = true }) catch return documentRemoteStatus(status);
-        defer parsed.deinit();
-        inline for (.{ error.DocumentModelRevisionMismatch, error.DocumentBudgetExhausted, error.DocumentRunLeaseLost, error.DocumentRunStoreNeedsRecovery, error.DocumentOutputTooLarge, error.DocumentUnresolved, error.InvalidDocumentCheckpoint, error.InvalidDocumentSource, error.UnsupportedDocumentFormat }) |err| if (std.mem.eql(u8, parsed.value.@"error", @errorName(err))) return err;
-    }
+    if (readers.document_failure.recognized(a, body)) |failure| return failure.cause.?;
     return documentRemoteStatus(status);
 }
 fn documentRemoteStatus(status: i32) anyerror {
@@ -8638,5 +8634,56 @@ test "index document checkpoint producer preserves source part prompt and locato
             try std.testing.expectEqualStrings("https://example.test/receipt.png", parsed.value.object.get("images").?.array.items[0].object.get("url").?.string);
             try std.testing.expect(parsed.value.object.get("documents") == null);
         }
+    }
+}
+
+test "index document checkpoint producer allocator atomically admits duplex work within its ceiling" {
+    const a = std.testing.allocator;
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    const SlowBacking = struct {
+        io: std.Io,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.io.sleep(.fromMilliseconds(5), .awake) catch return null;
+            return std.testing.allocator.rawAlloc(len, alignment, address);
+        }
+        fn resize(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, address: usize) bool {
+            return std.testing.allocator.rawResize(bytes, alignment, len, address);
+        }
+        fn remap(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, address: usize) ?[*]u8 {
+            return std.testing.allocator.rawRemap(bytes, alignment, len, address);
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, address);
+        }
+    };
+    var backing = SlowBacking{ .io = io.io() };
+    for (0..16) |_| {
+        var budget = inference_work.BoundedInvocationAllocator.init(backing.allocator(), 8);
+        const Task = struct {
+            allocator: Allocator,
+            ready: *std.atomic.Value(u32),
+            bytes: ?[]u8 = null,
+            fn run(self: *@This()) void {
+                _ = self.ready.fetchAdd(1, .acq_rel);
+                while (self.ready.load(.acquire) < 2) std.atomic.spinLoopHint();
+                self.bytes = self.allocator.alloc(u8, 8) catch null;
+            }
+        };
+        var ready: std.atomic.Value(u32) = .init(0);
+        var tasks = [_]Task{ .{ .allocator = budget.allocator(), .ready = &ready }, .{ .allocator = budget.allocator(), .ready = &ready } };
+        var group: std.Io.Group = .init;
+        defer group.cancel(io.io());
+        for (&tasks) |*task| try group.concurrent(io.io(), Task.run, .{task});
+        try group.await(io.io());
+        try std.testing.expect((tasks[0].bytes == null) != (tasks[1].bytes == null));
+        try std.testing.expectEqual(@as(usize, 8), budget.live_bytes);
+        try std.testing.expectEqual(@as(usize, 8), budget.peak_live_bytes);
+        for (tasks) |task| if (task.bytes) |bytes| budget.allocator().free(bytes);
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
     }
 }

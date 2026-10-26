@@ -19,6 +19,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const readers = @import("antfly_readers");
 const runs = readers.document_runs;
+const failures = readers.document_failure;
 const storage = @import("document_run_storage.zig");
 const jobs = @import("research_jobs.zig");
 const gateway = @import("inference_gateway.zig");
@@ -385,16 +386,19 @@ pub fn Work(comptime Server: type) type {
             defer client.deinit();
             var response = connections.invokeInferenceConnectionWithRequest(a, &client, self.server.cfg.node_config, self.server.cfg.local_inference_connection_target, self.server.cfg.secret_store, record.connection, @tagName(record.operation), request, httpx.CancellationToken.fromCallback(self, cancelledFn), @import("antfly_platform").time.monotonicNs() + 1_800_000 * std.time.ns_per_ms, .{}, .post, .{ .document_store = binding.view(), .document_allocator = transport_budget.allocator() }) catch |err| {
                 if (cancelledFn(self)) return;
-                switch (err) {
-                    error.DocumentStorageNotConfigured, error.DocumentModelRevisionMismatch, error.DocumentBudgetExhausted, error.UnsupportedMediaTokenBudget, error.InvalidDocumentCheckpoint => try store.failWithCode(a, lease, now(), @errorName(err)),
-                    else => try store.yieldLeaseUntil(a, lease, now(), now() +| @import("job_retry.zig").retryDelayMs(std.hash.Wyhash.hash(0, self.id), lease.attempt)),
-                }
+                try self.settleFailure(a, store, lease, failures.fromError(err));
                 return;
             };
             defer response.deinit(a);
             const after = try store.loadAt(a, self.id, self.owner, now());
-            if (after.state == .succeeded or after.state == .cancelled) return;
-            if (response.status >= 400 and response.status < 500) try store.failWithCode(a, lease, now(), "DocumentRequestRejected") else try store.yieldLeaseUntil(a, lease, now(), now() +| @import("job_retry.zig").retryDelayMs(std.hash.Wyhash.hash(0, self.id), lease.attempt));
+            if (after.state == .succeeded or after.state == .cancelled or after.state == .failed) return;
+            try self.settleFailure(a, store, lease, failures.fromResponse(a, response.status, response.body));
+        }
+        fn settleFailure(self: *Self, a: A, store: runs.Store, lease: runs.Lease, failure: failures.Failure) !void {
+            if (failure.retryable) {
+                const retry_at = now() +| @import("job_retry.zig").retryDelayMs(std.hash.Wyhash.hash(0, self.id), lease.attempt);
+                try store.yieldLeaseWithCode(a, lease, now(), retry_at, failure.code);
+            } else try store.failWithCode(a, lease, now(), failure.code);
         }
         pub fn deinit(raw: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(raw));
@@ -493,6 +497,10 @@ test "httpx inference gateway document worker renews throughout slow request hyd
     };
     const Target = struct {
         calls: usize = 0,
+        response_status: u16 = 200,
+        response_body: []const u8 = "",
+        native_error: ?anyerror = null,
+        require_renewal: bool = false,
         fn invoke(call: *const abi.InvokeContext) callconv(.c) abi.Status {
             complete(call) catch |err| return abi.statusFromError(err);
             return .ok;
@@ -507,16 +515,25 @@ test "httpx inference gateway document worker renews throughout slow request hyd
             defer client.deinit();
             const store = client.store();
             const record = try store.loadAt(work, client.id, client.owner, now());
-            try std.testing.expect(record.revision > 10); // Renewals preceded inference.
+            if (self.require_renewal) try std.testing.expect(record.revision > 10);
             const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
-            try store.prepare(work, lease, record.identity, record.limits, record.inputs, now());
+            if (!record.prepared) try store.prepare(work, lease, record.identity, record.limits, record.inputs, now());
+            self.calls += 1;
+            // Reserve before dispatch. Even a transient response must retain
+            // conservative charges across the owner's next attempt.
+            if (self.native_error != null or self.response_status != 200) {
+                try std.testing.expect(try store.reserve(work, lease, @splat(17), .{ .calls = 1, .tokens = 10, .output_bytes = 1024 }, now()));
+                if (self.native_error) |err| return err;
+                const bytes = try a.dupe(u8, self.response_body);
+                call.out_response.* = .{ .status = self.response_status, .body = .{ .ptr = bytes.ptr, .len = bytes.len } };
+                return;
+            }
             const reply = "{\"object\":\"list\",\"data\":[]}";
             try std.testing.expect(try store.reserve(work, lease, @splat(17), .{ .calls = 1, .output_bytes = 1024 }, now()));
             const result = try store.complete(work, lease, @splat(17), .{ .calls = 1, .output_bytes = reply.len }, reply, now());
             try store.finish(work, lease, result, now());
             const bytes = try a.dupe(u8, reply);
             call.out_response.* = .{ .status = 200, .body = .{ .ptr = bytes.ptr, .len = bytes.len } };
-            self.calls += 1;
         }
     };
     const Server = struct {
@@ -537,44 +554,84 @@ test "httpx inference gateway document worker renews throughout slow request hyd
             return true;
         }
     };
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/slow-document-jobs", .{tmp.sub_path});
-    defer a.free(path);
-    const artifacts_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/slow-document-artifacts", .{tmp.sub_path});
-    defer a.free(artifacts_path);
-    var files = try FsStore.init(a, artifacts_path);
-    defer files.deinit();
-    var artifact_store = files.artifactStore();
-    var table = artifact_store.vtable.*;
-    table.get_bounded_alloc_with_cancellation = Slow.read;
-    artifact_store.vtable = &table;
-    var target = Target{};
-    var server = Server{ .alloc = a, .document_job_store = jobs.Store.init(a, .{ .namespace = .documents }), .cfg = .{ .document_artifact_store = artifact_store, .local_inference_connection_target = .{ .capabilities = abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } } };
-    defer server.document_job_store.deinit();
-    const opened = try a.create(jobs.OpenedStore);
-    opened.* = try jobs.OpenedStore.open(a, path);
-    try server.document_job_store.attachOpenedStore(opened);
-    var persistence = try context(&server);
-    const store = try persistence.interface();
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const work = arena.allocator();
-    const request = "{\"model\":\"native-reader\",\"documents\":[]}";
-    const identity: runs.Identity = .{ .request = digest(request), .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
-    try store.create(.{ .run_id = "slow-hydration", .owner = "alice", .connection = sources.common_config.local_inference_connection_id, .prepared = false, .identity = identity, .inputs = &.{}, .limits = .{ .calls = 1, .source_bytes = 4096, .output_bytes = 4096 } });
-    const submission = try store.claim(work, "slow-hydration", "alice", identity, now(), lease_ms);
-    try std.testing.expect(try store.reserve(work, submission, @splat(1), .{ .source_bytes = request.len }, now()));
-    const ref = try store.complete(work, submission, @splat(1), .{ .source_bytes = request.len }, request, now());
-    try store.attachRequest(work, submission, ref, now());
-    try store.yieldLease(work, submission, now());
-    Slow.delay_next.store(true, .release);
-    var job = Work(Server){ .server = &server, .id = "slow-hydration", .owner = "alice", .term = 7, .lease_policy = .{ .duration_ms = 2000, .renew_interval_ms = 50 } };
-    try Work(Server).run(&job);
-    try std.testing.expectEqual(@as(usize, 1), target.calls);
-    try std.testing.expectEqual(.succeeded, (try store.loadAt(work, "slow-hydration", "alice", now())).state);
-    try std.testing.expect(!job.cancelled.load(.acquire));
-    var finished = LeaseRenewal{ .persistence = &persistence, .lease = job.lease.?, .policy = job.lease_policy };
-    try std.testing.expect(!try finished.renew());
+    const Scenario = struct {
+        slow: bool = false,
+        status: u16 = 200,
+        body: []const u8 = "",
+        native_error: ?anyerror = null,
+        expected: @FieldType(runs.Record, "state"),
+        code: ?[]const u8 = null,
+    };
+    for ([_]Scenario{
+        .{ .slow = true, .expected = .succeeded },
+        .{ .status = 429, .body = "{\"error\":\"CloudflareRateLimited\"}", .expected = .queued, .code = "CloudflareRateLimited" },
+        .{ .native_error = error.CloudflareRateLimited, .expected = .queued, .code = "CloudflareRateLimited" },
+        .{ .status = 503, .body = "temporary upstream failure", .expected = .queued, .code = "InferenceTransportUnavailable" },
+        .{ .status = 504, .body = "{\"error\":\"DocumentBudgetExhausted\"}", .expected = .failed, .code = "DocumentBudgetExhausted" },
+        .{ .status = 400, .body = "{\"error\":\"InvalidDocumentSource\"}", .expected = .failed, .code = "InvalidDocumentSource" },
+    }) |scenario| {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/slow-document-jobs", .{tmp.sub_path});
+        defer a.free(path);
+        const artifacts_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/slow-document-artifacts", .{tmp.sub_path});
+        defer a.free(artifacts_path);
+        var files = try FsStore.init(a, artifacts_path);
+        defer files.deinit();
+        var artifact_store = files.artifactStore();
+        var table = artifact_store.vtable.*;
+        table.get_bounded_alloc_with_cancellation = Slow.read;
+        artifact_store.vtable = &table;
+        var target = Target{ .response_status = scenario.status, .response_body = scenario.body, .native_error = scenario.native_error, .require_renewal = scenario.slow };
+        var server = Server{ .alloc = a, .document_job_store = jobs.Store.init(a, .{ .namespace = .documents }), .cfg = .{ .document_artifact_store = artifact_store, .local_inference_connection_target = .{ .capabilities = abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } } };
+        defer server.document_job_store.deinit();
+        const opened = try a.create(jobs.OpenedStore);
+        opened.* = try jobs.OpenedStore.open(a, path);
+        try server.document_job_store.attachOpenedStore(opened);
+        var persistence = try context(&server);
+        const store = try persistence.interface();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const request = "{\"model\":\"native-reader\",\"documents\":[]}";
+        const identity: runs.Identity = .{ .request = digest(request), .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
+        try store.create(.{ .run_id = "slow-hydration", .owner = "alice", .connection = sources.common_config.local_inference_connection_id, .prepared = false, .identity = identity, .inputs = &.{}, .limits = .{ .calls = 4, .tokens = 100, .source_bytes = 4096, .output_bytes = 4096 } });
+        const submission = try store.claim(work, "slow-hydration", "alice", identity, now(), lease_ms);
+        try std.testing.expect(try store.reserve(work, submission, @splat(1), .{ .source_bytes = request.len }, now()));
+        const ref = try store.complete(work, submission, @splat(1), .{ .source_bytes = request.len }, request, now());
+        try store.attachRequest(work, submission, ref, now());
+        try store.yieldLease(work, submission, now());
+        Slow.delay_next.store(scenario.slow, .release);
+        var job = Work(Server){ .server = &server, .id = "slow-hydration", .owner = "alice", .term = 7, .lease_policy = .{ .duration_ms = 2000, .renew_interval_ms = 50 } };
+        const started = now();
+        try Work(Server).run(&job);
+        try std.testing.expectEqual(@as(usize, 1), target.calls);
+        const after = try store.loadAt(work, "slow-hydration", "alice", now());
+        try std.testing.expectEqual(scenario.expected, after.state);
+        if (scenario.code) |code| try std.testing.expectEqualStrings(code, after.error_code.?);
+        if (after.state == .succeeded) {
+            try std.testing.expect(!job.cancelled.load(.acquire));
+            var finished = LeaseRenewal{ .persistence = &persistence, .lease = job.lease.?, .policy = job.lease_policy };
+            try std.testing.expect(!try finished.renew());
+        } else {
+            try std.testing.expectEqual(@as(u64, 1), after.uncertain.calls);
+            try std.testing.expectEqual(@as(u64, 10), after.uncertain.tokens);
+            if (after.state == .queued) {
+                try std.testing.expect(after.not_before_ms > started);
+                const delay = after.not_before_ms -| now();
+                if (delay != 0) try std.testing.io.sleep(.fromMilliseconds(@intCast(delay)), .awake);
+                target.response_status = 200;
+                target.native_error = null;
+                var retry = Work(Server){ .server = &server, .id = "slow-hydration", .owner = "alice", .term = 7 };
+                try Work(Server).run(&retry);
+                const completed = try store.loadAt(work, "slow-hydration", "alice", now());
+                try std.testing.expectEqual(.succeeded, completed.state);
+                try std.testing.expectEqual(@as(usize, 2), target.calls);
+                try std.testing.expectEqual(@as(u64, 2), completed.used.calls);
+                try std.testing.expectEqual(@as(u64, 10), completed.uncertain.tokens);
+                try std.testing.expect(completed.error_code == null);
+            }
+        }
+    }
 }

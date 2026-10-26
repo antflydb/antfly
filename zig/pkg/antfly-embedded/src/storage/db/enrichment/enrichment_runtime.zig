@@ -2206,6 +2206,7 @@ const EnrichmentErrorDisposition = enum {
 };
 
 fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
+    if (!@import("antfly_readers").document_failure.fromError(err).retryable) return .terminal_request;
     if (document_extraction_mod.remoteContentErrorIsPermanent(err)) return .terminal_request;
     // These stages describe deterministic failures of the fetched PDF bytes.
     // Retrying the same immutable input cannot repair its structure or streams.
@@ -41114,4 +41115,12 @@ test "index document checkpoint native storage rejects changed sources and super
         try std.testing.expect(try replacement.ensureLease(runtime.clock.nowRealtimeMs() + runtime.config.lease_ttl_ms + 1));
         try std.testing.expectError(error.DocumentRunLeaseLost, store.put_fn(store.ptr, scratch, upload, "superseded page"));
     }
+}
+
+test "enrichment maintenance document failures share durable retry policy" {
+    for ([_]anyerror{ error.DocumentSourceLimitExceeded, error.DocumentPixelLimitExceeded, error.CloudflareAuthenticationFailed, error.DocumentUnresolved }) |err| {
+        try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
+    }
+    try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.CloudflareRateLimited));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
 }

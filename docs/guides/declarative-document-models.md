@@ -684,8 +684,13 @@ quotas. Recovery visits at most 32 records per pass and admits four distinct
 jobs concurrently. Lease renewal covers initial request persistence, request
 hydration, inference, and draining retained callbacks. It moves the recovery
 ticket to the new expiry.
-Transient failures persist a retry deadline using the same exponential backoff
-and deterministic jitter as index repair (250 ms base, 30 second cap).
+Transient failures persist a retry deadline and bounded error code using the same
+exponential backoff and deterministic jitter as index repair (250 ms base,
+30 second cap). Native runtime errors and recognized remote error envelopes use
+the same classification: rate limits and temporary capacity/transport failures
+retry; invalid sources, incompatible models and exhausted budgets terminate.
+Unknown HTTP 408, 425 and 429 responses also retry. Claiming the next attempt
+clears the previous transient error code without resetting usage.
 Collectors retain tombstones and revisit completed namespaces after a minute
 to catch uploads that finish after ownership loss. Completed history is not
 loaded into memory or scanned for ordinary job dispatch.
@@ -750,7 +755,18 @@ validated rows and final responses use immutable checkpoints. The executor pins
 request, source, definition, model, renderer and runtime identities; changed pins
 reject resume. Reservations persist before model dispatch and CPU pixel work.
 Replay uses committed stages without invoking the provider again; interrupted
-work keeps conservative charges. Opaque remote model bindings used inside a
+work keeps conservative charges for model calls, tokens, pixels and output bytes.
+`source_bytes` measures accepted input snapshots and active source preparation.
+Abandoning a download releases its unpublished source reservation, allowing
+retry even when preparation reserved all remaining source capacity. Committed
+snapshots remain charged and replay without another download. Recovery also
+normalizes source uncertainty written by older attempts.
+
+Duplex upload and response processing share a synchronized invocation allocator.
+Memory admission, backing allocation/free and usage accounting are atomic with
+respect to one another, including for indexed document producers; concurrent
+transport cannot exceed the invocation ceiling by racing two admissions.
+Opaque remote model bindings used inside a
 durable composite must declare `max_total_tokens`, a deployment-enforced hard
 ceiling for one call. An unknown ceiling fails preflight before source downloads.
 
