@@ -8140,12 +8140,12 @@ const SortedSegmentDocMembership = struct {
             self.slots[i].clear();
             return true;
         }
-        fn contains(self: *@This(), ordinal: usize, base: u32, doc: u32) !?bool {
+        fn slotFor(self: *@This(), ordinal: usize, base: u32) !?usize {
             self.clock +|= 1;
             for (&self.slots, 0..) |*slot, i| if (slot.ordinal == ordinal) {
                 self.probe_hits += 1;
                 slot.used = self.clock;
-                return self.probeAt(i, doc);
+                return i;
             };
             const i = for (self.slots, 0..) |slot, index| {
                 if (slot.ordinal == null) break index;
@@ -8166,7 +8166,7 @@ const SortedSegmentDocMembership = struct {
                 };
                 self.probe_opens += 1;
                 self.slots[i] = .{ .ordinal = ordinal, .compound = probe, .used = self.clock };
-                return self.probeAt(i, doc);
+                return i;
             }
             const probe = acquire: while (true) {
                 break :acquire query_mod.ExactTermProbe.init(self.probe_budget.allocator(), self.filter, self.snapshot, ordinal) catch |err| {
@@ -8181,7 +8181,28 @@ const SortedSegmentDocMembership = struct {
             };
             self.probe_opens += 1;
             self.slots[i] = .{ .ordinal = ordinal, .probe = probe, .used = self.clock };
+            return i;
+        }
+        fn contains(self: *@This(), ordinal: usize, base: u32, doc: u32) !?bool {
+            const i = (try self.slotFor(ordinal, base)) orelse return null;
             return self.probeAt(i, doc);
+        }
+        fn containsMany(self: *@This(), ordinal: usize, base: u32, docs: []const u32, allowed: []bool) !bool {
+            if (docs.len == 0) return true;
+            const i = (try self.slotFor(ordinal, base)) orelse return false;
+            const slot = &self.slots[i];
+            if (slot.compound) |probe| {
+                probe.containsMany(docs, allowed) catch |err| {
+                    if (err == error.OutOfMemory and self.probe_budget.isLocallyExhausted()) {
+                        slot.clear();
+                        return false;
+                    }
+                    return err;
+                };
+                return true;
+            }
+            for (docs, allowed) |doc, *keep| keep.* = (try self.probeAt(i, doc)) orelse return false;
+            return true;
         }
         fn probeAt(self: *@This(), i: usize, doc: u32) !?bool {
             const result = if (self.slots[i].compound) |probe| probe.contains(doc) else if (self.slots[i].probe) |*probe| probe.contains(doc) else return null;
@@ -8232,6 +8253,28 @@ const SortedSegmentDocMembership = struct {
             if (try @constCast(self.lazy.?).contains(self.segment_index, self.base, doc)) |matched| return matched;
             try self.ensure();
             return self.matches.?.bitmap().contains(doc);
+        }
+        fn containsMany(self: *@This(), docs: []const u32, allowed: []bool) !void {
+            if (self.matches != null or self.exact_count == 0 or self.header_count == self.count) {
+                for (docs, allowed) |doc, *keep| keep.* = try self.contains(doc);
+                return;
+            }
+            var selected: [64]u32 = undefined;
+            var positions: [64]usize = undefined;
+            var output: [64]bool = undefined;
+            var count: usize = 0;
+            @memset(allowed, false);
+            for (docs, 0..) |doc, i| {
+                if (doc >= self.count or (if (self.deleted) |*mask| mask.contains(doc) else false)) continue;
+                selected[count] = doc;
+                positions[count] = i;
+                count += 1;
+            }
+            if (!try @constCast(self.lazy.?).containsMany(self.segment_index, self.base, selected[0..count], output[0..count])) {
+                try self.ensure();
+                for (selected[0..count], output[0..count]) |doc, *keep| keep.* = self.matches.?.bitmap().contains(doc);
+            }
+            for (positions[0..count], output[0..count]) |i, keep| allowed[i] = keep;
         }
         const LocalIterator = union(enum) {
             bitmap: roaring.RoaringBitmap.LiveIterator,
@@ -8288,6 +8331,35 @@ const SortedSegmentDocMembership = struct {
         if (lo == 0) return false;
         const segment = &self.segments[lo - 1];
         return segment.contains(doc - segment.base);
+    }
+    fn containsMany(self: *const @This(), docs: []const u32, allowed: []bool) !void {
+        if (docs.len != allowed.len or docs.len > 64) return error.InvalidQueryRequest;
+        var begin: usize = 0;
+        while (begin < docs.len) {
+            try self.control.check();
+            var lo: usize = 0;
+            var hi = self.segments.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.segments[mid].base <= docs[begin]) lo = mid + 1 else hi = mid;
+            }
+            if (lo == 0) {
+                allowed[begin] = false;
+                begin += 1;
+                continue;
+            }
+            const segment = &self.segments[lo - 1];
+            var locals: [64]u32 = undefined;
+            var end = begin;
+            while (end < docs.len and docs[end] >= segment.base and @as(u64, docs[end]) < @as(u64, segment.base) + segment.count) : (end += 1) locals[end - begin] = docs[end] - segment.base;
+            if (end == begin) {
+                allowed[begin] = false;
+                begin += 1;
+                continue;
+            }
+            try segment.containsMany(locals[0 .. end - begin], allowed[begin..end]);
+            begin = end;
+        }
     }
     fn cardinality(self: *const @This()) usize {
         return self.candidate_count;
@@ -12358,6 +12430,13 @@ fn sortAndPageTextDocValueCandidatesAlloc(
     defer ordered_seen.deinit();
     const ordered_scan_budget: usize = if (bitmap != null and !bitmap.?.cardinality_exact) @min(@max(1024, window_capacity *| 64), 65536) else @max(1024, candidate_count);
     var ordered_probes: usize = 0;
+    const ordered_tile_capacity: usize = if (bitmap) |membership| if (membership.lazy) |lazy| if (lazy.compound_plan) |program| if (program.has_batch_producer) 16 else 1 else 1 else 1 else 1;
+    var ordered_tile: [16]u32 = undefined;
+    var ordered_allowed: [16]bool = undefined;
+    var ordered_complete: [16]bool = undefined;
+    var ordered_tile_len: usize = 0;
+    var ordered_tile_at: usize = 0;
+    var ordered_exhausted = false;
     var visible_candidate_count: usize = 0;
     var iterator = if (bitmap) |set| set.iterator() else null;
     var position: usize = 0;
@@ -12366,25 +12445,49 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         // not walk the archive: discard the partial window and resume the
         // untouched compressed membership iterator once the bounded walk loses.
         const i = position;
-        const doc_num = if (ordered) |stream|
-            (stream.next(stream.ptr, ordered_scan_budget -| ordered_probes) catch |err| switch (err) {
-                error.OrderedCandidateBudgetExceeded => {
-                    if (collect_sort_profile) {
-                        if (stream.scanned_count) |count| profile.ordered_scanned_count = count(stream.ptr);
-                        profile.candidate_source = if (std.mem.eql(u8, stream.source, "sorted_segment_membership")) "sorted_segment_then_text_postings" else "ordered_lake_index_then_text_postings";
-                    }
-                    stream.close(stream.ptr);
-                    ordered = null;
-                    continue;
-                },
-                else => return err,
-            }) orelse break
-        else if (iterator) |*it| try it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
-        if (ordered) |stream| ordered_probes = if (stream.scanned_count) |count| @intCast(count(stream.ptr)) else ordered_probes + 1;
+        const doc_num = if (ordered) |stream| tile: {
+            if (ordered_tile_at == ordered_tile_len) {
+                if (ordered_exhausted) break;
+                ordered_tile_len = 0;
+                ordered_tile_at = 0;
+                // A small fixed tile amortizes producer work without expanding
+                // memory or changing the public candidate/decorating budget.
+                while (ordered_tile_len < ordered_tile_capacity) {
+                    const next = stream.next(stream.ptr, ordered_scan_budget -| ordered_probes) catch |err| switch (err) {
+                        error.OrderedCandidateBudgetExceeded => {
+                            if (collect_sort_profile) {
+                                if (stream.scanned_count) |count| profile.ordered_scanned_count = count(stream.ptr);
+                                profile.candidate_source = if (std.mem.eql(u8, stream.source, "sorted_segment_membership")) "sorted_segment_then_text_postings" else "ordered_lake_index_then_text_postings";
+                            }
+                            stream.close(stream.ptr);
+                            ordered = null;
+                            break;
+                        },
+                        else => return err,
+                    };
+                    ordered_probes = if (stream.scanned_count) |count| @intCast(count(stream.ptr)) else ordered_probes + @as(usize, @intFromBool(next != null));
+                    const doc = next orelse {
+                        ordered_exhausted = true;
+                        break;
+                    };
+                    ordered_complete[ordered_tile_len] = if (stream.complete_order_at) |proof| proof(stream.ptr) else stream.complete_order;
+                    ordered_tile[ordered_tile_len] = doc;
+                    ordered_tile_len += 1;
+                }
+                if (ordered == null) continue;
+                if (ordered_tile_len == 0) break;
+                if (ordered_tile_capacity == 1) {
+                    ordered_allowed[0] = try bitmap.?.contains(ordered_tile[0]);
+                } else try bitmap.?.containsMany(ordered_tile[0..ordered_tile_len], ordered_allowed[0..ordered_tile_len]);
+            }
+            const doc = ordered_tile[ordered_tile_at];
+            ordered_tile_at += 1;
+            break :tile doc;
+        } else if (iterator) |*it| try it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
         if (ordered) |stream| if (collect_sort_profile) {
             profile.ordered_scanned_count = if (stream.scanned_count) |count| count(stream.ptr) else profile.ordered_scanned_count + 1;
         };
-        if (ordered != null and !(try bitmap.?.contains(doc_num))) {
+        if (ordered != null and !ordered_allowed[ordered_tile_at - 1]) {
             if (position % 1024 == 0) try checkSearchRequestDeadline(effective_req);
             position += 1;
             continue;
@@ -12428,7 +12531,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
 
         if (ordered != null and window_len == window_capacity) {
             var primary_order = effective_req;
-            const complete = if (ordered.?.complete_order_at) |proof| proof(ordered.?.ptr) else ordered.?.complete_order;
+            const complete = ordered_complete[ordered_tile_at - 1];
             if (!complete) primary_order.order_by = effective_req.order_by[0 .. effective_req.order_by.len - 1];
             if (compareDecoratedSortHits(primary_order, decorated, window[0]) == (if (keep_previous_page) std.math.Order.lt else .gt)) {
                 decorated.deinit(alloc);

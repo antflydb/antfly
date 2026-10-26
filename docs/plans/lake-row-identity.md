@@ -1665,3 +1665,29 @@ exact sorting keeps the public `422 unsupported_exact_sort` contract across the
 compiled runtime boundary. Shared-scan capture adds narrow temporary key writes
 under the existing quota in exchange for eliminating repeated wide payload
 reads; local qualification measures those operations separately from latency.
+
+### Batch-bound ordering and candidate membership
+
+Ordering extraction binds each emitted field to its actual source column once
+per typed batch. Exact column names take precedence over dotted JSON traversal;
+virtual mappings retain their declared source association. Numeric, Boolean and
+keyword columns use typed kernels, including dictionaries and validity masks.
+Datetime, encoded and nested values keep the canonical mapped conversion. Tuples
+own their byte keys and never retain source-batch storage beyond its lifetime.
+Verification capture, payload fallback and selective physical gathers share this
+binding, without changing ordering-input commitments or durable tuple formats.
+
+Native ordered collection uses tiles of at most 16 rows only when its compiled
+predicate includes a metadata batch producer. Boolean masks eliminate candidates
+before each expensive child; minimum-should-match and exclusions preserve the
+scalar evaluation semantics. Per-row public tie proofs travel with the tile.
+Ordinary term plans retain single-row admission. Metadata probes translate a
+bounded tile under the existing scratch, work and lineage budgets; any incomplete
+probe is discarded before complete compressed membership fallback. This internal
+callback addition advances the compiled runtime ABI, not the reader protocol.
+
+Sorted typed compaction emits contiguous provenance ranges from the existing
+statistics/source-span preparation walk. It avoids a second ordered-plan read
+and per-row lineage callbacks. Source-only merges retain their allocation-free
+fallback traversal. Observer failures abort the private publication attempt;
+provenance cannot authorize publication before the merged output is complete.

@@ -522,6 +522,7 @@ fn orderFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: 
             return left.offset < right.offset;
         }
     }.less);
+    var ordering_batch: ?OrderingBatch = null;
     for (missing.items) |item| {
         try Build.check(self);
         if (offset == null or offset.? != item.offset) {
@@ -532,9 +533,10 @@ fn orderFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: 
             page = reader.readPayload(item.offset) catch |err| return phase.failed(err);
             try phase.finish();
             offset = item.offset;
+            ordering_batch = (try OrderingBatch.bind(a, page.?.columns, schema, fields)) orelse return null;
         }
         if (item.index >= page.?.len) return error.InvalidLogicalRowIdentity;
-        docs[item.row] = (try orderingDocument(a, page.?.columns, item.index, &states[item.row], schema, fields)) orelse return null;
+        docs[item.row] = (try ordering_batch.?.document(a, item.index, &states[item.row])) orelse return null;
         self.ordering_rows_fetched += 1;
         try retained.remember(a, states[item.row].id, item.version, docs[item.row]);
     }
@@ -558,28 +560,93 @@ fn orderingDocFromTuple(a: A, id: [32]u8, fields: []const local.segment.SegmentI
     return .{ .id = try a.dupe(u8, &id), .stored_data = "", .text_fields = &.{}, .index_sort_values = values.items };
 }
 
-pub fn orderingDocument(a: A, columns: []const rows.ColumnVector, row: usize, state: *const identity.logical.State, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?local.introducer.TextDocument {
-    var values: std.ArrayList(local.introducer.NamedSortValue) = .empty;
-    for (fields) |field| {
-        if (std.mem.eql(u8, field.field, "_id")) continue;
-        const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse return null;
-        const source = for (schema.exact_fields) |mapped| {
-            if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
-        } else field.field;
-        const raw = try orderingValue(a, columns, row, source);
-        const value: local.segment.SegmentIndexSortBoundValue = if (raw == .null) .null_value else native: {
-            const typed = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, resolved.mapping, raw)) orelse return null;
-            break :native switch (typed) {
-                .numeric_val => |n| switch (n) {
-                    inline else => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
-                },
-                inline .datetime_ns, .u64_val, .i64_val, .f64_val, .bytes_val, .bool_val => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
-                else => return null,
+/// A batch borrows schema and column storage only while that batch is live.
+/// Resolve virtual fields, literal dotted names and nested paths once; flat
+/// scalar kernels avoid the JSON adapter and mapped-value allocation per row.
+pub const OrderingBatch = struct {
+    const Entry = struct {
+        field: []const u8,
+        mapping: local.storage_schema.FieldMapping,
+        column: ?usize,
+        tail: []const u8 = "",
+    };
+    entries: []const Entry,
+    columns: []const rows.ColumnVector,
+    pub fn bind(a: A, columns: []const rows.ColumnVector, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?OrderingBatch {
+        var entries: std.ArrayList(Entry) = .empty;
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.field, "_id")) continue;
+            const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse return null;
+            const source = for (schema.exact_fields) |mapped| {
+                if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+            } else field.field;
+            var entry: Entry = .{ .field = field.field, .mapping = resolved.mapping, .column = null };
+            for (columns, 0..) |column, index| if (std.mem.eql(u8, column.name, source)) {
+                entry.column = index;
+                break;
             };
-        };
-        try values.append(a, .{ .field_name = field.field, .value = value });
+            if (entry.column == null) if (std.mem.indexOfScalar(u8, source, '.')) |dot| {
+                for (columns, 0..) |column, index| if (std.mem.eql(u8, column.name, source[0..dot])) {
+                    entry.column = index;
+                    entry.tail = source[dot + 1 ..];
+                    break;
+                };
+            };
+            try entries.append(a, entry);
+        }
+        return .{ .entries = try entries.toOwnedSlice(a), .columns = columns };
     }
-    return .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .index_sort_values = values.items };
+    fn value(self: OrderingBatch, a: A, entry: Entry, row: usize) !?local.segment.SegmentIndexSortBoundValue {
+        const index = entry.column orelse return .null_value;
+        const column = self.columns[index];
+        if (column.nulls.isNull(row)) return .null_value;
+        if (entry.tail.len == 0) switch (entry.mapping.field_type) {
+            .numeric => switch (column.values) {
+                .i64 => |values| return .{ .i64_val = values[row] },
+                .dictionary_i64 => |values| return .{ .i64_val = values.at(row) },
+                .f64 => |values| return if (std.math.isFinite(values[row])) .{ .f64_val = values[row] } else null,
+                .dictionary_f64 => |values| return if (std.math.isFinite(values.at(row))) .{ .f64_val = values.at(row) } else null,
+                else => {},
+            },
+            .boolean => switch (column.values) {
+                .bool => |values| return .{ .bool_val = values[row] },
+                else => {},
+            },
+            .keyword, .link => switch (column.values) {
+                .bytes => |values| return .{ .bytes_val = try a.dupe(u8, values[row]) },
+                .dictionary_bytes => |values| return .{ .bytes_val = try a.dupe(u8, values.at(row)) },
+                else => {},
+            },
+            else => {},
+        };
+        var raw = try column.values.jsonAt(a, row);
+        if (entry.tail.len != 0) {
+            var parts = std.mem.splitScalar(u8, entry.tail, '.');
+            while (parts.next()) |part| {
+                if (raw != .object) return .null_value;
+                raw = raw.object.get(part) orelse return .null_value;
+            }
+        }
+        if (raw == .null) return .null_value;
+        const typed = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, entry.mapping, raw)) orelse return null;
+        return switch (typed) {
+            .numeric_val => |number| switch (number) {
+                inline else => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+            },
+            inline .datetime_ns, .u64_val, .i64_val, .f64_val, .bytes_val, .bool_val => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+            else => null,
+        };
+    }
+    pub fn document(self: OrderingBatch, a: A, row: usize, state: *const identity.logical.State) !?local.introducer.TextDocument {
+        const values = try a.alloc(local.introducer.NamedSortValue, self.entries.len);
+        for (self.entries, values) |entry, *target| target.* = .{ .field_name = entry.field, .value = (try self.value(a, entry, row)) orelse return null };
+        return .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .index_sort_values = values };
+    }
+};
+
+pub fn orderingDocument(a: A, columns: []const rows.ColumnVector, row: usize, state: *const identity.logical.State, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?local.introducer.TextDocument {
+    const batch = (try OrderingBatch.bind(a, columns, schema, fields)) orelse return null;
+    return batch.document(a, row, state);
 }
 
 /// Incremental verification may retain no complete payload capture. Gather only
@@ -660,6 +727,7 @@ fn orderProjectedFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment,
             for (projected) |*column| for (self.table.columns) |definition| {
                 if (std.mem.eql(u8, column.name, definition.name)) column.name = definition.path;
             };
+            const ordering_batch = (try OrderingBatch.bind(a, projected, schema, fields)) orelse return null;
             for (page.selection) |selected| {
                 var ref = page.batch.rowRef(selected);
                 ref.external.identity_version = self.physical.inventory.row_identity_version;
@@ -667,7 +735,7 @@ fn orderProjectedFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment,
                 const position = positions.get(key) orelse return error.InvalidLogicalRowIdentity;
                 if (seen[position]) return error.InvalidLogicalRowIdentity;
                 seen[position] = true;
-                docs[position] = (try orderingDocument(a, projected, selected, &states[position], schema, fields)) orelse return null;
+                docs[position] = (try ordering_batch.document(a, selected, &states[position])) orelse return null;
                 self.ordering_rows_fetched += 1;
                 try retained.remember(a, states[position].id, versions[position], docs[position]);
                 found += 1;
@@ -2570,4 +2638,117 @@ test "external lake logical fragments bind cached field positions while reusing 
 
 test "external lake logical fragments group captured ordering misses across random identities" {
     try broadSpoolScenario(true, false, true, true);
+}
+
+test "external lake logical fragments bound ordering kernels preserve typed and nested mapping semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema: local.storage_schema.TableSchema = .{ .version = 1, .exact_fields = &.{
+        .{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "title.keyword", .source_field = "title", .mapping = .{ .field_type = .keyword, .doc_values = true } },
+        .{ .field = "enabled", .source_field = "enabled", .mapping = .{ .field_type = .boolean, .doc_values = true } },
+        .{ .field = "nested", .source_field = "payload.rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "literal", .source_field = "literal.rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "at", .source_field = "at", .mapping = .{ .field_type = .datetime, .doc_values = true } },
+    } };
+    const fields = [_]local.segment.SegmentIndexSortField{ .{ .field = "rank" }, .{ .field = "title.keyword" }, .{ .field = "enabled" }, .{ .field = "nested" }, .{ .field = "literal" }, .{ .field = "at" }, .{ .field = "_id" } };
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "title", .values = .{ .dictionary_bytes = .{ .values = &.{ "z", "a" }, .indices = &.{ 1, 0 } } } },
+        .{ .name = "rank", .values = .{ .dictionary_i64 = .{ .values = &.{ std.math.minInt(i64), std.math.maxInt(i64) }, .indices = &.{ 1, 0 } } }, .nulls = .{ .bytes = &.{ 0, 1 } } },
+        .{ .name = "enabled", .values = .{ .bool = &.{ true, false } } },
+        .{ .name = "payload", .values = .{ .json = &.{ "{\"rank\":9007199254740993}", "{}" } } },
+        .{ .name = "literal.rank", .values = .{ .i64 = &.{ 7, 8 } } },
+        .{ .name = "at", .values = .{ .bytes = &.{ "1969-12-31T23:59:59.999999999Z", "1970-01-01T00:00:00.000000001Z" } } },
+    };
+    const sorted = try a.dupe(local.storage_schema.ExactField, schema.exact_fields);
+    std.mem.sort(local.storage_schema.ExactField, sorted, {}, struct {
+        fn less(_: void, l: local.storage_schema.ExactField, r: local.storage_schema.ExactField) bool {
+            return std.mem.order(u8, l.field, r.field) == .lt;
+        }
+    }.less);
+    schema.exact_fields = sorted;
+    const batch = (try OrderingBatch.bind(a, &columns, schema, &fields)).?;
+    const state: identity.logical.State = .{ .id = @splat(3), .values = @splat(3) };
+    for (0..2) |row| {
+        const document = (try batch.document(a, row, &state)).?;
+        for (batch.entries, document.index_sort_values) |entry, actual| {
+            const source = for (schema.exact_fields) |field| {
+                if (std.mem.eql(u8, field.field, entry.field)) break field.source_field;
+            } else unreachable;
+            const raw = try orderingValue(a, &columns, row, source);
+            if (raw == .null) {
+                try std.testing.expect(actual.value == .null_value);
+                continue;
+            }
+            const expected = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, entry.mapping, raw)).?;
+            const bound: local.segment.SegmentIndexSortBoundValue = switch (expected) {
+                .numeric_val => |n| switch (n) {
+                    inline else => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+                },
+                inline .datetime_ns, .bytes_val, .bool_val => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+                else => unreachable,
+            };
+            try std.testing.expectEqualDeep(bound, actual.value);
+        }
+    }
+}
+
+test "external lake logical fragments bound ordering kernel comparison" {
+    const a = std.testing.allocator;
+    const count = 16384;
+    const keys = 8;
+    var schema: local.storage_schema.TableSchema = .{ .version = 1 };
+    var exact: [keys]local.storage_schema.ExactField = undefined;
+    var fields: [keys]local.segment.SegmentIndexSortField = undefined;
+    var names: [32][8]u8 = undefined;
+    var columns: [32]rows.ColumnVector = undefined;
+    const integers = try a.alloc(i64, count);
+    defer a.free(integers);
+    for (integers, 0..) |*integer, i| integer.* = @intCast(i);
+    for (&columns, &names, 0..) |*column, *name, i| {
+        const text = try std.fmt.bufPrint(name, "col{d}", .{i});
+        column.* = .{ .name = text, .values = .{ .i64 = integers } };
+        if (i >= columns.len - keys) {
+            const k = i - (columns.len - keys);
+            fields[k] = .{ .field = text };
+            exact[k] = .{ .field = text, .source_field = text, .mapping = .{ .field_type = .numeric, .doc_values = true } };
+        }
+    }
+    schema.exact_fields = &exact;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var checksums: [2]u64 = @splat(0);
+    var times: [2]u64 = undefined;
+    const state: identity.logical.State = .{ .id = @splat(3), .values = @splat(3) };
+    for (0..2) |mode| {
+        const started = @import("antfly_platform").time.monotonicNs();
+        if (mode == 0) {
+            for (0..count) |row| {
+                _ = region.reset(.retain_capacity);
+                for (fields) |field| {
+                    const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field).?;
+                    const source = for (schema.exact_fields) |mapped| {
+                        if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+                    } else field.field;
+                    const raw = try orderingValue(scratch, &columns, row, source);
+                    const value = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(scratch, resolved.mapping, raw)).?;
+                    checksums[mode] += @intCast(value.numeric_val.i64_val);
+                }
+            }
+        } else {
+            var bindings = std.heap.ArenaAllocator.init(a);
+            defer bindings.deinit();
+            const batch = (try OrderingBatch.bind(bindings.allocator(), &columns, schema, &fields)).?;
+            for (0..count) |row| {
+                _ = region.reset(.retain_capacity);
+                const document = (try batch.document(scratch, row, &state)).?;
+                for (document.index_sort_values) |value| checksums[mode] += @intCast(value.value.i64_val);
+            }
+        }
+        times[mode] = @import("antfly_platform").time.monotonicNs() - started;
+    }
+    try std.testing.expectEqual(checksums[0], checksums[1]);
+    std.debug.print("ORDERING_BIND rows={d} keys={d} columns=32 row_adapter_ns={d} bound_kernel_ns={d} checksum={d}\n", .{ count, keys, times[0], times[1], checksums[0] });
 }

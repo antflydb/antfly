@@ -1343,15 +1343,39 @@ fn PredicateResolver(comptime Set: type) type {
                 return if (self.materialized) |*bitmap| bitmap else null;
             }
             fn contains(raw: *anyopaque, a: A, ordinal: u32) anyerror!bool {
+                var allowed: [1]bool = undefined;
+                try containsMany(raw, a, &.{ordinal}, &allowed);
+                return allowed[0];
+            }
+            fn containsMany(raw: *anyopaque, a: A, ordinals: []const u32, allowed: []bool) anyerror!void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
+                if (ordinals.len != allowed.len or ordinals.len > 128) return error.InvalidQueryRequest;
                 try self.resolver.context.ensureActive();
-                if (self.materialized) |*bitmap| return bitmap.contains(ordinal);
-                var selected = Bitmap.init(a);
-                defer selected.deinit();
-                try selected.add(0);
-                var matched = try produce(raw, a, ordinal, 1, &selected);
-                defer matched.deinit();
-                return matched.contains(0);
+                if (ordinals.len == 0) return;
+                if (self.materialized == null) {
+                    const work = self.predicate.membershipWork(ordinals.len);
+                    if (self.predicate.canProbeMembership() and work <= self.work_budget -| self.spent_work) {
+                        self.spent_work +|= work;
+                        var tile_budget: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 4 * 1024 * 1024 };
+                        var scratch = std.heap.ArenaAllocator.init(tile_budget.allocator());
+                        defer scratch.deinit();
+                        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.resolver.server.lake_read_cache, .scope = self.resolver.store_identity, .context = self.resolver.read_context };
+                        const admitted = tile: {
+                            const refs = self.resolver.identities.physicalRows(scratch.allocator(), &self.cache, self.resolver.store, cached, ordinals, self.resolver.source.inventory.source_id, self.resolver.source.inventory.snapshot_id) catch |err| {
+                                if (err == error.OutOfMemory and tile_budget.isExhausted()) break :tile false;
+                                return err;
+                            };
+                            self.predicate.containsMany(refs, allowed) catch |err| {
+                                if (err == error.ArtifactReadBudgetExceeded or err == error.QueryCandidateBudgetExceeded or (err == error.OutOfMemory and tile_budget.isExhausted())) break :tile false;
+                                return err;
+                            };
+                            break :tile true;
+                        };
+                        if (admitted) return;
+                    }
+                    try self.materialize();
+                }
+                for (ordinals, allowed) |ordinal, *keep| keep.* = self.materialized.?.contains(ordinal);
             }
             fn produce(raw: *anyopaque, a: A, offset: u32, count: u32, candidates: ?*const Bitmap) anyerror!Bitmap {
                 const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1448,7 +1472,7 @@ fn PredicateResolver(comptime Set: type) type {
             const work_budget = @min(predicate.work, rows.predicateScanWork(self.source, copied) orelse std.math.maxInt(u64));
             const owner = try a.create(ProducerOwner);
             owner.* = .{ .a = a, .resolver = self, .predicate = predicate, .arena = owned, .conditions = copied, .work_budget = work_budget, .cache = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a) } };
-            return .{ .bitmap = Bitmap.init(a), .producer = .{ .ptr = owner, .produce = ProducerOwner.produce, .contains = ProducerOwner.contains, .materialized = ProducerOwner.completeMembership }, .owner = owner, .close = ProducerOwner.close };
+            return .{ .bitmap = Bitmap.init(a), .producer = .{ .ptr = owner, .produce = ProducerOwner.produce, .contains = ProducerOwner.contains, .contains_many = ProducerOwner.containsMany, .materialized = ProducerOwner.completeMembership }, .owner = owner, .close = ProducerOwner.close };
         }
         fn value(self: Self, a: A, pa: A, input: Compiled, depth: usize, allow_scan: bool) anyerror!?PredicateResult {
             if (depth > 64) return null;

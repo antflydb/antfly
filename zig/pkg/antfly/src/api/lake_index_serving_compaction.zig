@@ -390,7 +390,7 @@ const StreamingLineage = struct {
     fn emit(raw: *anyopaque, input: usize, source: u32, count: u32, output: u32) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (input >= self.inputs.len or count == 0 or output != self.rows) return error.InvalidNativeLakeTextCorpus;
-        if (self.rows % 1024 == 0) try self.owner.check();
+        try self.owner.check();
         var current = source;
         var left = count;
         const lineage = self.inputs[input];

@@ -332,13 +332,14 @@ pub const Capture = struct {
         defer phase.abort();
         self.cluster.?.add(ca, bound_vectors, keys, selected, sizing) catch |err| return phase.failed(err);
         try phase.finish();
-        if (self.ordering_schema) |schema| for (ids, 0..) |id, row| {
+        const ordering_batch = if (self.ordering_schema) |schema| try @import("lake_row_fragments.zig").OrderingBatch.bind(ca, batch.columns, schema, self.ordering_fields) else null;
+        if (ordering_batch) |bound| for (ids, 0..) |id, row| {
             try check(self);
             var keys_region = std.heap.ArenaAllocator.init(a);
             defer keys_region.deinit();
             const ka = keys_region.allocator();
             const state: local.storage_rowsource_logical.State = .{ .id = id, .values = id };
-            const document = (try @import("lake_row_fragments.zig").orderingDocument(ka, batch.columns, row, &state, schema, self.ordering_fields)) orelse continue;
+            const document = (try bound.document(ka, row, &state)) orelse continue;
             var values: std.ArrayList(local.segment.SegmentIndexSortBoundValue) = .empty;
             for (document.index_sort_values) |value| try values.append(ka, value.value);
             const encoded = (try @import("lake_ordering_keys.zig").encode(ka, @splat(0), values.items)) orelse continue;

@@ -3143,6 +3143,9 @@ const SortedPreparation = struct {
     statistics: []SortedInputStatistics,
     spans: SortedSourceSpans,
     fn init(alloc: Allocator, records: SortedRecords, inputs: []const MergeInput) !@This() {
+        return initWithProvenance(alloc, records, inputs, null);
+    }
+    fn initWithProvenance(alloc: Allocator, records: SortedRecords, inputs: []const MergeInput, observer: ?MergeProvenance) !@This() {
         const stats = try alloc.alloc(SortedInputStatistics, inputs.len);
         errdefer alloc.free(stats);
         @memset(stats, .{});
@@ -3168,11 +3171,15 @@ const SortedPreparation = struct {
                     span.count += 1;
                     continue;
                 }
+                if (observer) |provenance| try provenance.emit(provenance.ptr, span.input, span.first, span.count, @intCast(span.output_start));
                 try spans.append(span.*);
             }
             pending = .{ .output_start = output_start, .input = std.math.cast(u32, ref.input_idx) orelse return error.InvalidSegment, .first = ref.doc_id, .count = 1 };
         }
-        if (pending) |span| try spans.append(span);
+        if (pending) |span| {
+            if (observer) |provenance| try provenance.emit(provenance.ptr, span.input, span.first, span.count, @intCast(span.output_start));
+            try spans.append(span);
+        }
         if (spans.run) |run| try run.seal(0);
         return .{ .statistics = stats, .spans = spans };
     }
@@ -3466,19 +3473,21 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
             try buildSortedMergePlanWithScratch(alloc, inputs, options.index_sort, options.scratch);
         defer plan.deinit(alloc);
         if (hasLiveTypedField(inputs, null)) {
-            const prepared = try SortedPreparation.init(alloc, plan.ordered(), inputs);
+            const prepared = try SortedPreparation.initWithProvenance(alloc, plan.ordered(), inputs, options.provenance);
             plan.statistics = prepared.statistics;
             plan.spans = prepared.spans;
         }
         try writeSortedMergedSegmentToSink(alloc, sink, inputs, options.index_sort, &plan);
-        if (options.provenance) |observer| {
+        // Typed merges already emitted coalesced provenance during preparation.
+        // Source-only merges retain their allocation-free traversal.
+        if (plan.statistics == null) if (options.provenance) |observer| {
             var iterator = plan.ordered().iterator();
             var output_doc: u32 = 0;
             while (try iterator.next()) |record| {
                 try observer.emit(observer.ptr, record.ref.input_idx, record.ref.doc_id, 1, output_doc);
                 output_doc += 1;
             }
-        }
+        };
         if (options.source_map) |map| {
             if (plan.file) |file| {
                 try map.adoptFile(file);
@@ -12619,4 +12628,39 @@ test "public ordering seeks complete ties nullable sorted merge preserves sparse
         try std.testing.expect(bounds.first[0] == .null_value);
         try std.testing.expectEqual(@as(f64, 95), bounds.last[0].f64_val);
     }
+}
+
+test "merge provenance fuses typed preparation and coalesces contiguous source runs" {
+    const a = std.testing.allocator;
+    const Observe = struct {
+        calls: usize = 0,
+        rows: u32 = 0,
+        fail: bool = false,
+        fn emit(raw: *anyopaque, input: usize, source: u32, count: u32, output: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail and self.calls == 1) return error.Canceled;
+            try std.testing.expectEqual(self.rows, output);
+            try std.testing.expectEqual(@as(u32, 256), count);
+            try std.testing.expectEqual(self.calls % 2, input);
+            try std.testing.expectEqual(@as(u32, @intCast(self.calls / 2 * 256)), source);
+            self.calls += 1;
+            self.rows += count;
+        }
+    };
+    // Preparation reads only the already-authenticated input document counts.
+    var readers: [2]SegmentReader = undefined;
+    for (&readers) |*reader| reader.doc_count = 4096;
+    const inputs = [_]MergeInput{ .{ .reader = &readers[0] }, .{ .reader = &readers[1] } };
+    const records = try a.alloc(SortedMergeDoc, 8192);
+    defer a.free(records);
+    for (records, 0..) |*record, i| record.* = .{ .ref = .{ .input_idx = i / 256 % 2, .doc_id = @intCast(i / 512 * 256 + i % 256) } };
+    var observed: Observe = .{};
+    var prepared = try SortedPreparation.initWithProvenance(a, asSortedRecords(records), &inputs, .{ .ptr = &observed, .emit = Observe.emit });
+    defer prepared.deinit(a);
+    try std.testing.expectEqual(@as(usize, 32), observed.calls);
+    try std.testing.expectEqual(@as(u32, 8192), observed.rows);
+    try std.testing.expectEqual(@as(usize, 32), prepared.spans.count);
+    std.debug.print("MERGE_PROVENANCE rows=8192 prior_point_callbacks=8192 fused_range_callbacks={d} extra_plan_passes=0\n", .{observed.calls});
+    var failed: Observe = .{ .fail = true };
+    try std.testing.expectError(error.Canceled, SortedPreparation.initWithProvenance(a, asSortedRecords(records), &inputs, .{ .ptr = &failed, .emit = Observe.emit }));
 }
