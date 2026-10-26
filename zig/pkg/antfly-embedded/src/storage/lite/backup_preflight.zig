@@ -443,6 +443,16 @@ pub const Inspector = struct {
         defer parsed.deinit();
         switch (parsed.value) {
             .object => |object| {
+                // Catalog incarnations fence runtime ownership; they do not
+                // change the executable model contract. Remove only these
+                // top-level index fields from our private parse, preserving
+                // nested producer settings and every source file byte.
+                var definitions = object.iterator();
+                while (definitions.next()) |entry| {
+                    if (entry.value_ptr.* != .object) continue;
+                    _ = entry.value_ptr.object.orderedRemove("_index_incarnation");
+                    _ = entry.value_ptr.object.orderedRemove("_coverage_incarnation");
+                }
                 var sources = object.iterator();
                 while (sources.next()) |entry| try self.collectSources(entry.value_ptr.*, 0);
                 var it = object.iterator();
@@ -1499,6 +1509,43 @@ test "backup preflight prior context selects runtime artifact items and rejects 
     try std.testing.expect(!report.analysis_complete);
     try std.testing.expectEqual(@as(u64, 1), count(report, .dynamic_loader));
     try std.testing.expectError(error.PreflightLimitExceeded, inspector.metadataJson(public));
+}
+
+test "backup preflight index incarnation does not change model compatibility" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"exact-model"},"_index_incarnation":17}}
+    );
+    const first = report.requirements.items[0].sha256;
+    const requirements = report.requirements.items.len;
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"exact-model"},"_index_incarnation":29,"_coverage_incarnation":11}}
+    );
+    try std.testing.expectEqual(requirements, report.requirements.items.len);
+    try std.testing.expectEqualStrings(&first, &report.requirements.items[0].sha256);
+    // Executable configuration must remain bound even when lifecycle identity
+    // is ignored. A different field or model still requires separate evidence.
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"title","dimension":3,"embedder":{"provider":"antfly","model":"exact-model"},"_index_incarnation":17}}
+    );
+    try std.testing.expectEqual(requirements + 1, report.requirements.items.len);
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"different-model"},"_index_incarnation":17}}
+    );
+    try std.testing.expectEqual(requirements + 3, report.requirements.items.len);
+    // A similarly named nested producer setting is still executable input.
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"exact-model","_index_incarnation":17}}}
+    );
+    try std.testing.expectEqual(requirements + 5, report.requirements.items.len);
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"exact-model","_index_incarnation":29}}}
+    );
+    try std.testing.expectEqual(requirements + 7, report.requirements.items.len);
 }
 
 test "backup preflight context property names remain valid index catalog names" {
