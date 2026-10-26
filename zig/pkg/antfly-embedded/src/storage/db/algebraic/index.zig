@@ -26516,12 +26516,6 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
             for ([_]doc_set.DocOrdinal{ 1, 2, 3 }) |ordinal|
                 try std.testing.expect(exclusion_only_resolved.include.containsOrdinal(ordinal));
         },
-        .ordinal_bitmap => |*bitmap| {
-            try std.testing.expectEqual(@as(usize, 3), bitmap.cardinality());
-            try std.testing.expect(bitmap.contains(1));
-            try std.testing.expect(bitmap.contains(2));
-            try std.testing.expect(bitmap.contains(3));
-        },
         .all => {},
         else => return error.ExpectedOrdinalDocSet,
     }

@@ -5914,7 +5914,7 @@ test "db ordered artifact inventory reader epoch upgrade refreshes digest and im
     const after = try inventory.local(&read);
     try std.testing.expectEqual(before.epoch + 1, after.epoch);
     const catalogs = try inventory.catalogs(&read);
-    try std.testing.expectEqualStrings("{\"version\":4,\"resolvers\":[],\"projections\":{}}", catalogs.resolvers);
+    try std.testing.expectEqualStrings("{\"version\":4,\"resolvers\":[]}", catalogs.resolvers);
     try std.testing.expect(try db.core.index_manager.matchesArtifactInventory(catalogs));
     var current = try db.core.index_manager.acquireWritePlanSnapshot();
     defer current.release();

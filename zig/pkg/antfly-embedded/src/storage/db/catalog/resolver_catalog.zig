@@ -102,17 +102,14 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
     };
 }
 
-/// Keeps the envelope byte-identical to serializeCatalogWithMinimumVersion,
-/// which always writes a projections dictionary for versioned catalogs.
 pub fn versionedCatalog(a: Allocator, data: []const u8, version: u32) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
     defer parsed.deinit();
     if (parsed.value == .array) {
-        return try std.fmt.allocPrint(a, "{{\"version\":{d},\"resolvers\":{s},\"projections\":{{}}}}", .{ version, data });
+        return try std.fmt.allocPrint(a, "{{\"version\":{d},\"resolvers\":{s}}}", .{ version, data });
     }
     if (parsed.value != .object) return error.InvalidResolverConfig;
     try parsed.value.object.put(parsed.arena.allocator(), "version", .{ .integer = version });
-    if (parsed.value.object.get("projections") == null) try parsed.value.object.put(parsed.arena.allocator(), "projections", .{ .object = .empty });
     return try std.json.Stringify.valueAlloc(a, parsed.value, .{});
 }
 
