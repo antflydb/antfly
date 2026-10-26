@@ -1078,7 +1078,7 @@ class TestAntflyClient:
         expected_content = json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
         mock_httpx = MagicMock()
-        configure_response(mock_httpx, 201, {"inserted": 1})
+        configure_response(mock_httpx, 201, {"status": "committed", "inserted": 1})
         mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
 
         client = AntflyClient(base_url="http://localhost:8080", max_write_request_bytes=len(expected_content))

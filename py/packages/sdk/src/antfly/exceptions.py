@@ -96,3 +96,16 @@ class AntflyHTTPError(AntflyException):
 
 class AntflyNotFoundError(AntflyHTTPError):
     """A requested table, index or record does not exist (HTTP 404)."""
+
+
+class AntflyResponseError(AntflyException):
+    """A successful HTTP response could not establish its declared result.
+
+    For mutations, the server may already have committed. Do not infer failure
+    or replay the request from this exception.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        self.status_code = status_code
+        self.detail = message
+        super().__init__(message)

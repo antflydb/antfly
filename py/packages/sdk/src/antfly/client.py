@@ -75,6 +75,7 @@ from .exceptions import (
     AntflyException,
     AntflyHTTPError,
     AntflyNotFoundError,
+    AntflyResponseError,
     IndexMutationTemporarilyUnavailableError,
     InferenceAPIError,
     InferenceCapacityError,
@@ -955,11 +956,11 @@ class AntflyClient:
             )
             body, truncated = _read_limited_response(response, response_limit)
             if truncated:
-                raise AntflyException(f"response exceeded {response_limit} bytes")
+                raise AntflyResponseError(f"response exceeded {response_limit} bytes", response.status_code)
             try:
                 return json.loads(body)
             except (TypeError, ValueError) as exc:
-                raise AntflyException("response returned invalid JSON") from exc
+                raise AntflyResponseError("response returned invalid JSON", response.status_code) from exc
 
     def _encode_write_request(self, operation: str, body: dict[str, Any]) -> bytes:
         encoded = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -1861,7 +1862,12 @@ class AntflyClient:
             headers={"Content-Type": "application/json"},
         )
 
-        return BatchResponse.from_dict(result)
+        try:
+            if not isinstance(result, dict) or not isinstance(result.get("status"), str):
+                raise ValueError("batch response requires a durable status")
+            return BatchResponse.from_dict(result)
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise AntflyResponseError("batch returned an unusable mutation outcome") from exc
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
         """Call an Antfly API using authenticated, bounded JSON transport.

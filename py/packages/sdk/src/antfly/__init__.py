@@ -324,6 +324,6 @@ from .provenance import resource_reference, trace_event
 
 __all__ += ["resource_reference", "trace_event"]
 
-from .exceptions import AntflyHTTPError, AntflyNotFoundError
+from .exceptions import AntflyHTTPError, AntflyNotFoundError, AntflyResponseError
 
-__all__ += ["AntflyHTTPError", "AntflyNotFoundError"]
+__all__ += ["AntflyHTTPError", "AntflyNotFoundError", "AntflyResponseError"]
