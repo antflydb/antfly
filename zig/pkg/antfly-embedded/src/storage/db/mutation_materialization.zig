@@ -970,6 +970,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             batch: derived_types.DerivedBatch,
             writes: []const mapper.DenseEmbeddingWrite,
         ) !void {
+            var pinned = try ctx.index_manager.acquireWritePlanSnapshot();
+            defer pinned.release();
+            return accountDenseCoverageWithPlan(ctx, index_name, batch, writes, pinned.plan());
+        }
+
+        fn accountDenseCoverageWithPlan(
+            ctx: *const AsyncContext,
+            index_name: []const u8,
+            batch: derived_types.DerivedBatch,
+            writes: []const mapper.DenseEmbeddingWrite,
+            plan: *const index_manager_mod.IndexManager.WritePlanSnapshot,
+        ) !void {
             const external = ctx.index_manager.denseIndexUsesExternalCoverage(index_name);
             const direct = ctx.index_manager.denseIndexUsesManagedDirectField(index_name);
             var deleted_artifacts = std.StringHashMapUnmanaged(void).empty;
@@ -999,7 +1011,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .outcome = if (was_produced) .produced else .skipped,
                     });
                 }
-                try appendDirectVectorArtifactOutcomes(ctx, index_name, writes, &deleted_artifacts, &produced, &outcomes);
+                try appendDirectVectorArtifactOutcomes(ctx, index_name, writes, &deleted_artifacts, &produced, &outcomes, plan);
             } else {
                 // Generated indexes have a distinct producer lifecycle. A replay
                 // window can contain source documents before, or independently from,
@@ -1022,6 +1034,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             index_name: []const u8,
             batch: derived_types.DerivedBatch,
             writes: []const mapper.SparseEmbeddingWrite,
+        ) !void {
+            var pinned = try ctx.index_manager.acquireWritePlanSnapshot();
+            defer pinned.release();
+            return accountSparseCoverageWithPlan(ctx, index_name, batch, writes, pinned.plan());
+        }
+
+        fn accountSparseCoverageWithPlan(
+            ctx: *const AsyncContext,
+            index_name: []const u8,
+            batch: derived_types.DerivedBatch,
+            writes: []const mapper.SparseEmbeddingWrite,
+            plan: *const index_manager_mod.IndexManager.WritePlanSnapshot,
         ) !void {
             const external = ctx.index_manager.sparseIndexUsesExternalCoverage(index_name);
             const direct = ctx.index_manager.sparseIndexUsesManagedDirectField(index_name);
@@ -1047,7 +1071,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .outcome = if (was_produced) .produced else .skipped,
                     });
                 }
-                try appendDirectVectorArtifactOutcomes(ctx, index_name, writes, &deleted_artifacts, &produced, &outcomes);
+                try appendDirectVectorArtifactOutcomes(ctx, index_name, writes, &deleted_artifacts, &produced, &outcomes, plan);
             } else {
                 var iter = produced.keyIterator();
                 while (iter.next()) |doc_key| {
@@ -1500,13 +1524,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try store_writes.append(alloc, .{ .key = due_key, .value = due_value });
         }
 
-        pub fn appendDirectVectorArtifactOutcomes(ctx: *const AsyncContext, index_name: []const u8, writes: anytype, deleted: *const std.StringHashMapUnmanaged(void), produced: *const std.StringHashMapUnmanaged(void), outcomes: *std.ArrayListUnmanaged(DerivedCoverageDocOutcome)) !void {
+        pub fn appendDirectVectorArtifactOutcomes(ctx: *const AsyncContext, index_name: []const u8, writes: anytype, deleted: *const std.StringHashMapUnmanaged(void), produced: *const std.StringHashMapUnmanaged(void), outcomes: *std.ArrayListUnmanaged(DerivedCoverageDocOutcome), plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !void {
             for (writes) |write| {
                 const artifact_key = write.artifact_key orelse continue;
                 const owner = if (@hasField(@TypeOf(write), "parent_doc_key")) write.parent_doc_key orelse write.doc_key else write.doc_key;
                 if (internal_keys.isInternalUserKey(owner) or !ctx.index_manager.byte_range.contains(owner)) continue;
                 if (!try replaySourceDocumentExists(ctx, owner)) {
-                    try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_name, &.{owner});
+                    try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_name, &.{owner}, plan);
                     continue;
                 }
                 if (produced.contains(owner)) {
@@ -3617,7 +3641,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 null;
             defer if (graph_publication) |*lease| lease.release();
             if (index_ref.kind == .graph and ctx.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
-            var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+            var index_apply_guard = try ctx.index_manager.lockManagedIndexApplyWithPlan(index_ref);
+            const coverage_plan = index_apply_guard.snapshot.plan();
             defer index_apply_guard.unlock();
             if (index_ref.kind == .graph) {
                 // Acquire the catalog/apply guard before checking publication. A
@@ -3724,9 +3749,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (!ctx.projection_only) {
                         // Translate external artifact deletions to their parent
                         // identities so explicit null also retires coverage.
-                        try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, if (external) replay_delete_keys else batch.deleted_keys);
+                        try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, if (external) replay_delete_keys else batch.deleted_keys, coverage_plan);
                         if (ctx.index_manager.denseIndexUsesManagedDirectField(index_ref.name)) {
-                            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+                            try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys, coverage_plan);
                         } else if (!external) {
                             // Producer-owned exact outcomes are committed atomically with
                             // the source update. Only a request retained for asynchronous
@@ -3739,7 +3764,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 batch.generated_enrichment_refs,
                             );
                             defer ctx.alloc.free(pending_doc_keys);
-                            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending_doc_keys);
+                            try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending_doc_keys, coverage_plan);
                         }
                     }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
@@ -3776,7 +3801,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const dense_embedding_start_ns = monotonicTimeNs();
                     try ctx.index_manager.applyDenseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, dense_embeddings.writes, batch_options);
                     if (!ctx.projection_only)
-                        try accountDenseCoverage(ctx, index_ref.name, batch, dense_embeddings.writes);
+                        try accountDenseCoverageWithPlan(ctx, index_ref.name, batch, dense_embeddings.writes, coverage_plan);
                     if (profile) |active_profile| {
                         recordProfileNs(profile, &active_profile.dense_embedding_apply_ns, dense_embedding_start_ns);
                         if (before_hbc_profile) |before| {
@@ -3849,9 +3874,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const external = ctx.index_manager.sparseIndexUsesExternalCoverage(index_ref.name);
                     if (!external) try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
                     if (!ctx.projection_only) {
-                        try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, if (external) replay_delete_keys else batch.deleted_keys);
+                        try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, if (external) replay_delete_keys else batch.deleted_keys, coverage_plan);
                         if (ctx.index_manager.sparseIndexUsesManagedDirectField(index_ref.name)) {
-                            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+                            try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys, coverage_plan);
                         } else if (!external) {
                             const pending_doc_keys = try pendingGeneratedCoverageDocKeysForIndexAlloc(
                                 ctx.alloc,
@@ -3861,7 +3886,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 batch.generated_enrichment_refs,
                             );
                             defer ctx.alloc.free(pending_doc_keys);
-                            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending_doc_keys);
+                            try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending_doc_keys, coverage_plan);
                         }
                     }
                     if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
@@ -3903,7 +3928,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const sparse_embedding_apply_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
                     try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, sparse_embeddings.writes, batch_options);
                     if (!ctx.projection_only) {
-                        try accountSparseCoverage(ctx, index_ref.name, batch, sparse_embeddings.writes);
+                        try accountSparseCoverageWithPlan(ctx, index_ref.name, batch, sparse_embeddings.writes, coverage_plan);
                         try clearPublishedEmbeddingArtifactRepairIssuesContext(ctx, index_ref.name, sparse_embeddings.writes, batch.sequence);
                     }
                     if (emit_sparse_write_profile) sparse_embedding_apply_ns = monotonicTimeNs() - sparse_embedding_apply_start_ns;
@@ -3943,7 +3968,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 },
                 .graph => {
                     const apply_start_ns = monotonicTimeNs();
-                    if (!ctx.projection_only) try invalidateLocalArtifactProducerCoverage(ctx, batch, index_ref);
+                    if (!ctx.projection_only) try invalidateLocalArtifactProducerCoverageWithPlan(ctx, batch, index_ref, coverage_plan);
                     try ctx.index_manager.deleteGraphDocsByName(index_ref.name, batch.deleted_keys);
                     try applyGraphDocClearsForIndex(ctx, batch.graph_doc_clears, index_ref.name);
 
@@ -7235,11 +7260,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         fn invalidateLocalArtifactProducerCoverage(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
-            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
-            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+            var pinned = try ctx.index_manager.acquireWritePlanSnapshot();
+            defer pinned.release();
+            return invalidateLocalArtifactProducerCoverageWithPlan(ctx, batch, index_ref, pinned.plan());
+        }
+
+        fn invalidateLocalArtifactProducerCoverageWithPlan(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !void {
+            try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys, plan);
+            try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys, plan);
             const pending = try pendingGeneratedCoverageDocKeysForIndexAlloc(ctx.alloc, ctx.index_manager, index_ref.name, index_ref.kind, batch.generated_enrichment_refs);
             defer ctx.alloc.free(pending);
-            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending);
+            try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending, plan);
         }
 
         pub fn deleteDerivedCoverageForDocKeys(
@@ -7249,21 +7280,33 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             index_name: []const u8,
             doc_keys: []const []const u8,
         ) !void {
+            if (doc_keys.len == 0 or try orderedCoverageActive(store)) return;
+            var pinned = try index_manager.acquireWritePlanSnapshot();
+            defer pinned.release();
+            return deleteDerivedCoverageForDocKeysWithPlan(alloc, store, index_manager, index_name, doc_keys, pinned.plan());
+        }
+
+        pub fn deleteDerivedCoverageForDocKeysWithPlan(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            index_name: []const u8,
+            doc_keys: []const []const u8,
+            plan: *const index_manager_mod.IndexManager.WritePlanSnapshot,
+        ) !void {
             if (doc_keys.len == 0) return;
             if (try orderedCoverageActive(store)) return;
             var local_coverage_guard = index_manager.lockLocalCoverage();
             defer local_coverage_guard.release();
             const generation = index_manager.coverageGenerationForIndex(index_name) orelse return;
             try deleteDerivedCoverageScopeForDocKeys(alloc, store, index_name, generation, doc_keys);
-            var pinned = try index_manager.acquireWritePlanSnapshot();
-            defer pinned.release();
             const sources = try index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
             defer {
                 for (sources) |source| alloc.free(source);
                 alloc.free(sources);
             }
             for (sources) |source| {
-                const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_name, source, pinned.plan());
+                const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_name, source, plan);
                 defer alloc.free(scope);
                 try deleteDerivedCoverageScopeForDocKeys(alloc, store, scope, generation, doc_keys);
             }
