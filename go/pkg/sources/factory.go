@@ -29,14 +29,15 @@ import (
 // Connection contains secret references, never secret values. Applications can
 // provide a different Factory backed by their own credential/identity service.
 type Connection struct {
-	Provider        string `json:"provider"`
-	TokenEnv        string `json:"token_env,omitempty"`
-	CredentialsEnv  string `json:"credentials_env,omitempty"`
-	AccessKeyEnv    string `json:"access_key_env,omitempty"`
-	SecretKeyEnv    string `json:"secret_key_env,omitempty"`
-	SessionTokenEnv string `json:"session_token_env,omitempty"`
-	S3Endpoint      string `json:"s3_endpoint,omitempty"`
-	S3Insecure      bool   `json:"s3_insecure,omitempty"`
+	Services        []string `json:"services,omitempty"`
+	Provider        string   `json:"provider"`
+	TokenEnv        string   `json:"token_env,omitempty"`
+	CredentialsEnv  string   `json:"credentials_env,omitempty"`
+	AccessKeyEnv    string   `json:"access_key_env,omitempty"`
+	SecretKeyEnv    string   `json:"secret_key_env,omitempty"`
+	SessionTokenEnv string   `json:"session_token_env,omitempty"`
+	S3Endpoint      string   `json:"s3_endpoint,omitempty"`
+	S3Insecure      bool     `json:"s3_insecure,omitempty"`
 }
 type Factory func(context.Context, Connection) (Connector, error)
 
@@ -52,19 +53,28 @@ func EnvironmentFactory(ctx context.Context, connection Connection) (Connector, 
 		return value, nil
 	}
 	switch connection.Provider {
-	case ProviderGoogleDrive, ProviderGCS:
+	case ProviderGoogleWorkspace, ProviderGCS:
 		raw, err := secret(connection.CredentialsEnv)
 		if err != nil {
 			return nil, err
 		}
-		auth, err := GoogleCredentials(ctx, connection.Provider, raw)
+		auth, err := GoogleCredentialsForServices(ctx, connection.Provider, raw, connection.Services)
 		if err != nil {
 			return nil, err
 		}
 		client := oauth2.NewClient(ctx, auth.TokenSource)
 		client.Timeout = 60 * time.Second
 		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		if connection.Provider == ProviderGoogleWorkspace {
+			return &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, HTTPClient: client, Services: connection.Services}, nil
+		}
 		return &GoogleConnector{ProviderName: connection.Provider, HTTPClient: client}, nil
+	case ProviderSlack, ProviderDiscord:
+		token, err := secret(connection.TokenEnv)
+		if err != nil {
+			return nil, err
+		}
+		return &CollaborationConnector{ProviderName: connection.Provider, HTTPClient: &http.Client{Timeout: 60 * time.Second}, AccessToken: func(context.Context) (string, error) { return token, nil }}, nil
 	case ProviderGitHub:
 		token, err := secret(connection.TokenEnv)
 		if err != nil {

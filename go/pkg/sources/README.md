@@ -1,7 +1,7 @@
 # Portable source ingestion
 
 This module acquires canonical text from GitHub repositories and collaboration
-resources, Google Drive (including Docs and Slides text exports), GCS, and S3.
+resources, Google Workspace (Drive, Gmail and Calendar), Slack, Discord, GCS, and S3.
 It has no Colony, Cloud account, PostgreSQL, or Antfly CLI dependency.
 
 `Connector` receives credentials through an injected client/access resolver.
@@ -50,8 +50,19 @@ reuse a connection. Other connection forms:
   scoped to the selected repositories/resources. Config accepts `repositories`
   with per-repository `repository`, `ref`, `prefix` and `include` selections.
   Supported includes: code, issues, prs, comments, reviews and discussions.
-- Drive: `provider: "google_drive"`, `credentials_env: "SOURCE_GOOGLE_JSON"`;
-  config has `folder_id` and optional `shared_drive_id`.
+- Google Workspace: `provider: "google_workspace"`,
+  `credentials_env: "SOURCE_GOOGLE_JSON"`, and explicit `services` containing
+  `drive`, `gmail`, and/or `calendar` (default: Drive only). Source configs select
+  `resource: "drive"` with `folder_id` and optional `shared_drive_id`,
+  `resource: "gmail"` with optional `label_ids`, or `resource: "calendar"` with
+  `calendar_ids`. One connection can supply separately shared sources for each.
+- Slack: `provider: "slack"`, `token_env: "SOURCE_SLACK_TOKEN"`; source config
+  has `team_id` and `channel_ids`. The token must read the selected channels and
+  their replies. Membership and workspace identity are checked explicitly.
+- Discord: `provider: "discord"`, `token_env: "SOURCE_DISCORD_TOKEN"`; source
+  config has `guild_id` and `channel_ids`. The bot needs message-content access,
+  channel visibility and history permissions. Threads are included by default;
+  `include_threads: false` limits selection to explicitly named channels.
 - GCS: `provider: "gcs"`, the same explicit Google JSON reference;
   config has `bucket` and optional `prefix` or `key`.
 - S3-compatible storage: optional `s3_endpoint`, `s3_insecure`, and
@@ -60,6 +71,16 @@ reuse a connection. Other connection forms:
 Google credentials are service-account or authorized-user JSON. There is no
 ambient ADC fallback or browser enrollment. The caller owns secret storage;
 Google token renewal is handled by the injected OAuth client.
+
+Set `attachments: true` on a Slack, Discord, Gmail, Calendar, or Drive source to
+extract attached/binary content. Text, HTML, DOCX and PPTX work directly; PDFs
+require `pdftotext`, and images require `tesseract`, or an injected extractor.
+Unsupported formats and failed extraction stop publication explicitly. Calendar
+Drive attachments also require the connection's `drive` service. Drive links,
+mail thread headers, calendar invitation UIDs, and attachment parent identities
+are retained as relationships; linked content remains independently authorized.
+See [collaboration source design](../../../docs/design/collaboration-sources.md)
+for the hosted onboarding flow, scale limits, and qualification requirements.
 
 ```sh
 antfly-source sync --config sources.json \
@@ -98,24 +119,34 @@ incomplete inventories leave the catalog stale. GitHub omitted identities are
 checked independently before deletion. Legacy provider-key rows are retired only when present in the ownership journal.
 
 The catalog is marked syncing before writes and published atomically after
-readiness and reconciliation. Its permission lease starts at enumeration, not
-retry completion (default 900 seconds, configurable 60..86400). Grep rejects
+readiness and reconciliation. For collaboration providers, a fresh container-access check before publication starts
+the permission lease. Other providers retain the enumeration-time lease
+(default 900 seconds, configurable 60..86400). Grep rejects
 pending, syncing, stale or expired bindings. Existing Antfly server authorization
 remains responsible for current access during retained query snapshots.
 
-Each item is at most 32 MiB of complete UTF-8 text; each inventory has at most
-10,000 items, and a sync reads at most 10 GiB. Metadata/state/catalog sizes are
+Each item is at most 32 MiB of complete UTF-8 text; collaboration inventories admit up to 100,000 items (other providers retain their
+10,000-item limit), and a sync reads at most 10 GiB. Metadata/state/catalog sizes are
 bounded separately. A bounded `max_objects` listing is not deletion authority and
-cannot establish a complete searchable publication. Binary extraction, Sheets
+cannot establish a complete searchable publication. Sheets
 whole-workbook extraction, visual rendering, provider-native ACL mirroring,
 webhooks, distributed scheduling and live-provider qualification are outside this
 runner's current text-ingestion scope. Removing a source from configuration hides
 it from the emitted catalog and retains its indexed records/state; it is not a
 purge request.
 
-Ownership of up to 100,000 potentially written rows is retained across interrupted
-inventories; active inventories remain limited to 10,000 items. Reconciliation
+Ownership of up to 1,000,000 potentially written rows is retained across interrupted
+inventories; active inventory limits still apply. Reconciliation
 checks deletion visibility before publishing a searchable catalog.
+
+Gmail persists history IDs and Calendar persists per-calendar sync tokens after a
+successful publication. Expired cursors trigger a complete rebuild. Successful
+inventory pages are checkpointed privately so rate-limited backfills can resume;
+checkpoints do not replace current access checks. Slack and Discord use complete
+polling inventories; event-driven ingestion and Drive changes cursors remain future
+work. Provider reads still verify pinned content on each publication. Calendar sync also
+refreshes previously imported Drive attachments, whose files can change without a
+Calendar event update.
 
 ## Durable Antfly catalog
 

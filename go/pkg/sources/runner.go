@@ -34,7 +34,7 @@ import (
 
 // Ownership includes previously attempted writes across interrupted inventories.
 // It is bounded separately from the 10,000-item active inventory.
-const maxOwnedSourceObjects = 100000
+const maxOwnedSourceObjects = 1000000
 
 type Profile struct {
 	CatalogTable      string                `json:"catalog_table,omitempty"`
@@ -67,6 +67,8 @@ type runState struct {
 	Endpoint, Table, SourceID, ConfigHash string
 	Owned                                 map[string]string
 	Pending                               *Inventory
+	Published                             *Inventory
+	AcquisitionID                         string
 	StartedAt                             int64
 }
 
@@ -264,7 +266,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	hash := hex.EncodeToString(digest[:])
 	state := runState{Version: 1, Endpoint: r.Profile.Endpoint, Table: s.Table, SourceID: s.ID, ConfigHash: hash, Owned: map[string]string{}}
 	var persisted runState
-	if err := loadJSON(statePath, &persisted, 64<<20); err == nil {
+	if err := loadJSON(statePath, &persisted, 256<<20); err == nil {
 		if persisted.Version != 1 || persisted.Endpoint != state.Endpoint || persisted.Table != s.Table || persisted.SourceID != s.ID {
 			return 0, "", fmt.Errorf("source state belongs to another destination")
 		}
@@ -278,6 +280,8 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			}
 			state.Pending = nil
 			state.ConfigHash = hash
+			state.Published = nil
+			state.AcquisitionID = ""
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return 0, "", err
@@ -302,6 +306,19 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err != nil {
 		return 0, "", err
 	}
+	if c, ok := connector.(*CollaborationConnector); ok {
+		c.Baseline = state.Published
+		if r.Restart {
+			c.Baseline = nil
+		}
+		if state.AcquisitionID == "" || r.Restart {
+			state.AcquisitionID = rand.Text()
+			if err := writeJSON(statePath, state, 256<<20); err != nil {
+				return 0, "", err
+			}
+		}
+		c.Cache = &FileAcquisitionCache{Directory: filepath.Join(r.StateDir, "acquisition", s.ID, acquisitionKey(state.AcquisitionID))}
+	}
 	if r.Restart {
 		state.Pending = nil
 	}
@@ -311,7 +328,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		if err != nil {
 			return 0, "", err
 		}
-		if !inventory.Authoritative || len(inventory.Objects) > maxImportSourceObjects {
+		if !inventory.Authoritative || len(inventory.Objects) > sourceInventoryLimit(connection.Provider) {
 			return 0, "", fmt.Errorf("complete authoritative inventory required")
 		}
 		seen := map[string]bool{}
@@ -328,11 +345,11 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 		state.Pending = &inventory
 		state.StartedAt = enumerationStarted
-		if err := writeJSON(statePath, state, 64<<20); err != nil {
+		if err := writeJSON(statePath, state, 256<<20); err != nil {
 			return 0, "", err
 		}
 	}
-	if !state.Pending.Authoritative || len(state.Pending.Objects) > maxImportSourceObjects {
+	if !state.Pending.Authoritative || len(state.Pending.Objects) > sourceInventoryLimit(connection.Provider) {
 		return 0, "", fmt.Errorf("invalid persisted inventory authority")
 	}
 	seenPending := map[string]bool{}
@@ -345,7 +362,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err := connector.ValidateInventory(ctx, request, *state.Pending); err != nil {
 		return 0, "", err
 	}
-	if err := writeJSON(statePath, state, 64<<20); err != nil {
+	if err := writeJSON(statePath, state, 256<<20); err != nil {
 		return 0, "", err
 	}
 	if err := resetOwnershipJournal(journalPath); err != nil {
@@ -441,13 +458,28 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		digest := sha256.Sum256(raw)
 		revision = hex.EncodeToString(digest[:])
 	}
+	state.Published = state.Pending
+	if c, ok := connector.(*CollaborationConnector); ok {
+		if err := c.ValidateInventory(ctx, request, *state.Pending); err != nil {
+			return 0, "", err
+		}
+		state.StartedAt = time.Now().Unix()
+	}
 	state.Pending = nil
+	state.AcquisitionID = ""
 	state.RecordFormat = 2
-	if err := writeJSON(statePath, state, 64<<20); err != nil {
+	if err := writeJSON(statePath, state, 256<<20); err != nil {
 		return 0, "", err
 	}
 	if err := resetOwnershipJournal(journalPath); err != nil {
 		return 0, "", err
+	}
+	if c, ok := connector.(*CollaborationConnector); ok {
+		if cache, ok := c.Cache.(*FileAcquisitionCache); ok {
+			if err := os.RemoveAll(cache.Directory); err != nil {
+				return 0, "", err
+			}
+		}
 	}
 	return state.StartedAt, revision, nil
 }
