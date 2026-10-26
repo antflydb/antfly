@@ -171,8 +171,10 @@ unchanged. No device performance evidence will be attributed to this builder.
 The task-owned VM was removed after compilation and static review; the original
 VM and default connection were preserved.
 The CUDA-wide test scope compiles without running device tests. Its dual-backend
-macOS build peaked at 15,131,361,280 bytes, narrowly exceeding the declared
-14 GiB reservation. Raising that scheduler reservation to 16 GiB fixes the
-build; single-backend reservations and runtime/performance gates are unchanged.
+macOS build initially peaked at 15,131,361,280 bytes, exceeding the original
+14 GiB reservation. The final regenerated-image build peaked at 20,664,074,240
+bytes and exceeded the intermediate 16 GiB reservation. Both failures are
+retained; the final scheduler reservation is 24 GiB. Single-backend reservations
+and runtime/performance gates are unchanged.
 Receipts, failed attempts, tool identities and complete inputs live separately
 under `.benchmark-assets/1166/w-campaign/merge-main-20261026/`.

@@ -40,13 +40,13 @@ pub fn create(ctx: Context) Suite {
     const native_cpu_debug = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
         ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
-    // The macOS dual-backend ReleaseFast CUDA scope peaked at
-    // 15,131,361,280 bytes; 16 GiB provides headroom above its 14 GiB estimate.
+    // The macOS dual-backend ReleaseFast CUDA scope with regenerated images
+    // peaked at 20,664,074,240 bytes; reserve 24 GiB for compiler headroom.
     // Keep the existing single-backend and CPU Debug reservations.
     const dual_accelerator_macos = ctx.target.result.os.tag == .macos and
         ctx.backend.enable_metal and ctx.backend.enable_cuda;
     const tests = b.addTest(.{
-        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (dual_accelerator_macos) 16 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (dual_accelerator_macos) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
