@@ -57,6 +57,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
             "src/backends/metal_runtime.zig",
             "src/graph/quant_kernel_metal_renderer.zig",
             "src/graph/quant_kernel_metal_attention_phases.zig",
+            "src/graph/quant_kernel_metal_param_abi.zig",
             "src/graph/templates/metal_paged_prefill_compat.metal",
             "src/graph/kernel_jit.zig",
             "src/graph/quant_kernel_compiler.zig",
@@ -84,6 +85,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     // the translation-unit text is unchanged. Declare the complete local
     // include closure so Zig's watch/cache graph sees those edits as well.
     const metal_dependencies = [_][]const u8{
+        "src/backends/metal_param_abi.h",
         "src/backends/metal_buffer_observation.h",
         "src/backends/metal_mtp_head.h",
         "src/backends/metal_mtp_head_impl.h",

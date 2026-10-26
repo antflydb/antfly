@@ -23,6 +23,7 @@ const source_regions = @import("graph/quant_kernel_source_regions.zig");
 const gpu_training_renderer = @import("graph/quant_kernel_gpu_training_attention_renderer.zig");
 const gpu_operator_renderer = @import("graph/quant_kernel_gpu_operator_renderer.zig");
 const metal_attention_phases = @import("graph/quant_kernel_metal_attention_phases.zig");
+const metal_param_abi = @import("graph/quant_kernel_metal_param_abi.zig");
 const cpu_activation_renderer = @import("graph/quant_kernel_cpu_activation_pipeline_renderer.zig");
 const cpu_q8_dot_renderer = @import("graph/quant_kernel_cpu_q8_dot_renderer.zig");
 const cpu_panel_dot_renderer = @import("graph/quant_kernel_cpu_panel_dot_renderer.zig");
@@ -132,6 +133,14 @@ fn checkMetalRuntimeExternalHelpers(allocator: std.mem.Allocator, split: MetalRu
         if (std.mem.indexOf(u8, split.prefix, fragment) == null and
             std.mem.indexOf(u8, split.suffix, fragment) == null)
         {
+            // A schema reference is valid only outside the generated region,
+            // with its native owner included. Standalone fields come from that
+            // same checked schema, preserving the reinterpret-cast ABI guard.
+            const include = "#include \"metal_param_abi.h\"";
+            const binding = "           TERMITE_METAL_ABI_MSL(paged_attention)\n";
+            if (std.mem.eql(u8, helper, metal_param_abi.declaration("paged_attention")) and
+                (std.mem.indexOf(u8, split.prefix, include) != null or std.mem.indexOf(u8, split.suffix, include) != null) and
+                (std.mem.indexOf(u8, split.prefix, binding) != null or std.mem.indexOf(u8, split.suffix, binding) != null)) continue;
             print(
                 "quant kernel Metal external helper drifted from compiler copy in {s}: {s}\n",
                 .{ metal_runtime_source_path, helper },
@@ -353,7 +362,7 @@ fn printUsage() void {
 fn generatedFiles(allocator: std.mem.Allocator) ![]GeneratedFile {
     try quant_kernel_compiler.validateGeneratedArtifactRegistry();
     const source_count = generatedSourceFileCount();
-    const files = try allocator.alloc(GeneratedFile, source_count + 4);
+    const files = try allocator.alloc(GeneratedFile, source_count + 5);
     @memset(files, .{ .path = "", .data = "" });
     errdefer freeGeneratedFiles(allocator, files);
     var index: usize = 0;
@@ -367,7 +376,8 @@ fn generatedFiles(allocator: std.mem.Allocator) ![]GeneratedFile {
         index += 1;
     }
     if (index != source_count) return error.GeneratedQuantKernelSourceCountMismatch;
-    var manifest_index = index;
+    files[index] = .{ .path = metal_param_abi.header_path, .data = try metal_param_abi.renderHeader(allocator), .owned = true };
+    var manifest_index = index + 1;
     files[manifest_index] = .{
         .path = quant_kernel_compiler.first_spec_manifest_path,
         .data = try quant_kernel_compiler.specManifestJson(allocator),
@@ -775,7 +785,7 @@ test "quant kernel codegen sources map to compiler artifacts" {
     const sources = try generatedFiles(std.testing.allocator);
     defer freeGeneratedFiles(std.testing.allocator, sources);
 
-    try std.testing.expectEqual(generatedSourceFileCount() + 4, sources.len);
+    try std.testing.expectEqual(generatedSourceFileCount() + 5, sources.len);
     for (quant_kernel_compiler.first_generated_artifacts, sources[0..quant_kernel_compiler.first_generated_artifacts.len]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);
@@ -889,7 +899,7 @@ test "quant kernel codegen emits a self-contained microkernel source per microke
     const attn_count = quant_kernel_compiler.first_generated_attention_artifacts.len;
     try std.testing.expect(micro_count > 0);
     try std.testing.expect(attn_count > 0);
-    // Source layout: [matmul..][microkernel..][attention..][4 manifests].
+    // Source layout: [matmul..][microkernel..][attention..][scalar ABI][4 manifests].
     for (quant_kernel_compiler.first_generated_microkernel_artifacts, sources[matmul_count .. matmul_count + micro_count]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);

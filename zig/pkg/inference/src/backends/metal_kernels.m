@@ -25,6 +25,7 @@
 #include <mach/mach.h>
 #include <mach/vm_statistics.h>
 #include <stdint.h>
+#include "metal_param_abi.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3135,20 +3136,7 @@ static int termite_metal_decode_runtime_encode_attention_span_slot(
     id<MTLBuffer> output_buffer,
     size_t output_offset
 );
-typedef struct termite_metal_sample_logits_params {
-    uint32_t out_dim;
-    float temperature;
-    uint32_t top_k;
-    float top_p;
-    float min_p;
-    float repetition_penalty;
-    float frequency_penalty;
-    float presence_penalty;
-    uint32_t penalty_count;
-    uint32_t seed;
-    float final_logit_softcap;
-    uint32_t defer_monotonic_max;
-} termite_metal_sample_logits_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(sample_logits)
 
 static bool termite_metal_decode_runtime_nucleus_pipelines_ready(
     termite_metal_decode_runtime *runtime
@@ -5175,16 +5163,7 @@ typedef struct termite_metal_linear_params {
 _Static_assert(sizeof(termite_metal_linear_params) == 24, "Metal parameter size drift");
 TERMITE_METAL_LINEAR_FIELDS(TERMITE_METAL_PARAM_ASSERT, termite_metal_linear_params)
 
-typedef struct termite_metal_linear_id_params {
-    uint32_t rows;
-    uint32_t in_dim;
-    uint32_t out_dim;
-    uint32_t row_blocks;
-    uint32_t source_out_dim;
-    uint32_t row_offset;
-    uint32_t expert_count;
-    uint32_t reserved;
-} termite_metal_linear_id_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(linear_id)
 
 typedef struct termite_metal_mapped_moe_projection_source {
     const uint8_t *mapped_base;
@@ -5290,19 +5269,9 @@ typedef struct termite_metal_pair_activation_id_params {
     uint32_t reserved1;
 } termite_metal_pair_activation_id_params;
 
-typedef struct termite_metal_a4b_down_reduce_params {
-    uint32_t has_expert_scale;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_a4b_down_reduce_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(a4b_down_reduce)
 
-typedef struct termite_metal_moe_scatter_params {
-    uint32_t base_rows;
-    uint32_t route_rows;
-    uint32_t dim;
-    uint32_t reserved;
-} termite_metal_moe_scatter_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(moe_scatter)
 
 typedef enum termite_metal_jit_qualification_implementation {
     TERMITE_METAL_JIT_QUALIFICATION_BASELINE = 0,
@@ -5737,79 +5706,21 @@ TERMITE_METAL_QKV_LINEAR_FIELDS(TERMITE_METAL_PARAM_ASSERT, termite_metal_qkv_li
 
 static const size_t TERMITE_METAL_Q8_0_PAIR_ACTIVATION_SPLIT_MM_SG_MIN_ROWS = 129u;
 
-typedef struct termite_metal_key_scores_params {
-    uint32_t q_len;
-    uint32_t block_tokens;
-    uint32_t num_heads;
-    uint32_t num_kv_heads;
-    uint32_t head_dim;
-    uint32_t key_row_bytes;
-} termite_metal_key_scores_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(key_scores)
 
-typedef struct termite_metal_tl1_params {
-    uint32_t rows;
-    uint32_t in_dim;
-    uint32_t out_dim;
-    uint32_t packed_len;
-    uint32_t bm;
-    uint32_t cfg_by;
-    uint32_t bmm;
-} termite_metal_tl1_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(tl1)
 
-typedef struct termite_metal_tl2_params {
-    uint32_t rows;
-    uint32_t in_dim;
-    uint32_t out_dim;
-    uint32_t scale_off;
-    uint32_t three_value_len;
-    uint32_t three_sign_len;
-    uint32_t bm;
-    uint32_t cfg_by;
-    uint32_t bmm;
-    uint32_t three_cols;
-    uint32_t two_cols;
-} termite_metal_tl2_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(tl2)
 
-typedef struct termite_metal_embed_absolute_position_params {
-    uint32_t token_id;
-    uint32_t position_id;
-    uint32_t hidden_size;
-} termite_metal_embed_absolute_position_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(embed_absolute_position)
 
-typedef struct termite_metal_embedding_lookup_params {
-    uint32_t total;
-    uint32_t dim;
-} termite_metal_embedding_lookup_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(embedding_lookup)
 
-typedef struct termite_metal_quant_rows_params {
-    uint32_t total;
-    uint32_t dim;
-    uint32_t source_rows;
-    uint32_t row_offset;
-    float scale;
-} termite_metal_quant_rows_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(quant_rows)
 
-typedef struct termite_metal_rope_params {
-    uint32_t total_chunks;
-    uint32_t head_dim;
-    uint32_t rope_dim;
-    float theta;
-    float freq_scale;
-    uint32_t consecutive_pairs;
-} termite_metal_rope_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(rope)
 
-typedef struct termite_metal_mrope_params {
-    uint32_t total_chunks;
-    uint32_t token_count;
-    uint32_t head_dim;
-    uint32_t heads_per_token;
-    uint32_t section_t;
-    uint32_t section_h;
-    uint32_t section_w;
-    uint32_t mode;
-    float theta;
-    float freq_scale;
-} termite_metal_mrope_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(mrope)
 
 #define TERMITE_METAL_HEAD_RMS_ROPE_FIELDS(F, Record) \
     F(Record, uint32_t, uint, total_heads, 0) \
@@ -5829,92 +5740,17 @@ typedef struct termite_metal_head_rms_rope_params {
 _Static_assert(sizeof(termite_metal_head_rms_rope_params) == 44, "Metal parameter size drift");
 TERMITE_METAL_HEAD_RMS_ROPE_FIELDS(TERMITE_METAL_PARAM_ASSERT, termite_metal_head_rms_rope_params)
 
-typedef struct termite_metal_attention_f32_params {
-    uint32_t q_len;
-    uint32_t kv_len;
-    uint32_t num_heads;
-    uint32_t num_kv_heads;
-    uint32_t head_dim;
-    uint32_t query_position_offset;
-    uint32_t kv_position_offset;
-    uint32_t sliding_window;
-    uint32_t total_sequence_len;
-    uint32_t has_bias;
-    uint32_t has_mask;
-    uint32_t batch;
-    uint32_t reserved0;
-} termite_metal_attention_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(attention_f32)
 
-typedef struct termite_metal_florence_window_params {
-    uint32_t batch;
-    uint32_t height;
-    uint32_t width;
-    uint32_t dim;
-    uint32_t window_size;
-    uint32_t padded_h;
-    uint32_t padded_w;
-    uint32_t window_area;
-    uint32_t window_count;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_florence_window_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(florence_window)
 
-typedef struct termite_metal_florence_channel_params {
-    uint32_t batch;
-    uint32_t seq_len;
-    uint32_t dim;
-    uint32_t groups;
-    uint32_t channels_per_group;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_florence_channel_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(florence_channel)
 
-typedef struct termite_metal_compressed_attention_store_local_params {
-    uint32_t query_rows;
-    uint32_t query_abs_start;
-    uint32_t head_dim;
-    uint32_t reserved;
-} termite_metal_compressed_attention_store_local_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(compressed_attention_store_local)
 
-typedef struct termite_metal_compressed_attention_component_params {
-    uint32_t query_rows;
-    uint32_t query_abs_start;
-    uint32_t total_tokens;
-    uint32_t compress_rate;
-    uint32_t row_dim;
-    uint32_t gate_width;
-    uint32_t row_count;
-    uint32_t rope_dim;
-    float theta;
-    float freq_scale;
-    float eps;
-    uint32_t consecutive_pairs;
-    uint32_t bias_rows;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_compressed_attention_component_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(compressed_attention_component)
 
-typedef struct termite_metal_compressed_attention_params {
-    uint32_t query_abs_start;
-    uint32_t query_rows;
-    uint32_t token_count;
-    uint32_t compressed_rows;
-    uint32_t num_heads;
-    uint32_t head_dim;
-    uint32_t sliding_window;
-    uint32_t top_k;
-    uint32_t has_indexer;
-    uint32_t index_rows;
-    uint32_t index_heads;
-    uint32_t index_head_dim;
-    uint32_t has_sinks;
-    uint32_t reserved0;
-    float scale;
-    float reserved1;
-} termite_metal_compressed_attention_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(compressed_attention)
 
 typedef struct termite_metal_apply_layer_norm_params {
     TERMITE_METAL_LAYER_NORM_FIELDS(TERMITE_METAL_PARAM_C, termite_metal_apply_layer_norm_params)
@@ -5922,91 +5758,31 @@ typedef struct termite_metal_apply_layer_norm_params {
 _Static_assert(sizeof(termite_metal_apply_layer_norm_params) == 8, "Metal parameter size drift");
 TERMITE_METAL_LAYER_NORM_FIELDS(TERMITE_METAL_PARAM_ASSERT, termite_metal_apply_layer_norm_params)
 
-typedef struct termite_metal_layer_norm_bwd_params {
-    uint32_t hidden_size;
-    uint32_t rows;
-    float eps;
-    uint32_t reserved0;
-} termite_metal_layer_norm_bwd_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(layer_norm_bwd)
 
-typedef struct termite_metal_apply_layer_norm_scale_params {
-    uint32_t hidden_size;
-    float eps;
-    float scale;
-    uint32_t reserved;
-} termite_metal_apply_layer_norm_scale_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(apply_layer_norm_scale)
 
-typedef struct termite_metal_apply_row_norm_params {
-    uint32_t rows;
-    uint32_t hidden_size;
-    float eps;
-} termite_metal_apply_row_norm_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(apply_row_norm)
 
-typedef struct termite_metal_apply_row_norm_scale_params {
-    uint32_t rows;
-    uint32_t hidden_size;
-    float eps;
-    float scale;
-} termite_metal_apply_row_norm_scale_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(apply_row_norm_scale)
 
-typedef struct termite_metal_apply_linear_params {
-    uint32_t in_dim;
-    uint32_t out_dim;
-} termite_metal_apply_linear_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(apply_linear)
 
-typedef struct termite_metal_quantize_rows_params {
-    uint32_t rows;
-    uint32_t dim;
-} termite_metal_quantize_rows_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(quantize_rows)
 
-typedef struct termite_metal_topk_reduce_params {
-    uint32_t candidate_count;
-    uint32_t top_k;
-    float top_p;
-    float min_p;
-    uint32_t seed;
-} termite_metal_topk_reduce_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(topk_reduce)
 
-typedef struct termite_metal_apply_activation_params {
-    uint32_t activation_kind;
-    uint32_t rows;
-    uint32_t dim;
-} termite_metal_apply_activation_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(apply_activation)
 
-typedef struct termite_metal_apply_add_params {
-    uint32_t rows;
-    uint32_t dim;
-    uint32_t flags;
-    uint32_t reserved;
-} termite_metal_apply_add_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(apply_add)
 
-typedef struct termite_metal_norm_residual_params {
-    uint32_t dim;
-    float eps;
-    float norm_scale;
-    float output_scale;
-} termite_metal_norm_residual_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(norm_residual)
 
-typedef struct termite_metal_gemma4_audio_clamp_params {
-    uint32_t total;
-    uint32_t flags;
-    float min_value;
-    float max_value;
-} termite_metal_gemma4_audio_clamp_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(gemma4_audio_clamp)
 
-typedef struct termite_metal_gemma4_audio_rows_params {
-    uint32_t rows;
-    uint32_t dim;
-    uint32_t extra;
-    uint32_t reserved;
-} termite_metal_gemma4_audio_rows_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(gemma4_audio_rows)
 
-typedef struct termite_metal_gemma4_audio_channel_norm_params {
-    uint32_t channels;
-    uint32_t positions;
-    float eps;
-    uint32_t reserved;
-} termite_metal_gemma4_audio_channel_norm_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(gemma4_audio_channel_norm)
 
 typedef struct termite_metal_gemma4_audio_attention_params {
     uint32_t rows;
@@ -6028,140 +5804,40 @@ typedef struct termite_metal_gemma4_audio_attention_params {
 
 #define TERMITE_GEMMA4_AUDIO_MAX_CONTEXT 64u
 
-typedef struct termite_metal_training_accumulate_params {
-    uint32_t elem_count;
-    float scale;
-    uint32_t first;
-    uint32_t reserved;
-} termite_metal_training_accumulate_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(training_accumulate)
 
-typedef struct termite_metal_training_accumulate_into_params {
-    uint32_t elem_count;
-    float divisor;
-    float renormalize;
-    uint32_t flags;
-} termite_metal_training_accumulate_into_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(training_accumulate_into)
 
 typedef struct termite_metal_training_ref {
     const void *handle;
     size_t offset;
 } termite_metal_training_ref;
 
-typedef struct termite_metal_training_adamw_params {
-    uint32_t elem_count;
-    float lr;
-    float beta1;
-    float beta2;
-    float eps;
-    float weight_decay;
-    float bias_correction1;
-    float bias_correction2;
-    float grad_scale;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_training_adamw_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(training_adamw)
 
-typedef struct termite_metal_training_sumsq_params {
-    uint32_t elem_count;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_training_sumsq_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(training_sumsq)
 
-typedef struct termite_metal_apply_softmax_params {
-    uint32_t rows;
-    uint32_t dim;
-    uint32_t log_softmax;
-    uint32_t reserved;
-} termite_metal_apply_softmax_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(apply_softmax)
 
-typedef struct termite_metal_moe_route_select_params {
-    uint32_t rows;
-    uint32_t num_experts;
-    uint32_t top_k;
-    float logit_scale;
-} termite_metal_moe_route_select_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(moe_route_select)
 
-typedef struct termite_metal_moe_route_map_slots_params {
-    uint32_t rows;
-    uint32_t num_experts;
-    uint32_t top_k;
-    uint32_t reserved;
-} termite_metal_moe_route_map_slots_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(moe_route_map_slots)
 
-typedef struct termite_metal_moe_slot_q4_0_gate_up_params {
-    uint32_t route_rows;
-    uint32_t total_rows;
-    uint32_t in_dim;
-    uint32_t out_dim;
-    uint32_t row_blocks;
-    uint32_t gate_offset;
-    uint32_t up_offset;
-    uint32_t expert_stride;
-    uint32_t slot_count;
-    uint32_t top_k;
-} termite_metal_moe_slot_q4_0_gate_up_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(moe_slot_q4_0_gate_up)
 
-typedef struct termite_metal_moe_slot_q4_0_down_params {
-    uint32_t route_rows;
-    uint32_t in_dim;
-    uint32_t out_dim;
-    uint32_t row_blocks;
-    uint32_t down_offset;
-    uint32_t expert_stride;
-    uint32_t slot_count;
-    uint32_t reserved;
-} termite_metal_moe_slot_q4_0_down_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(moe_slot_q4_0_down)
 
-typedef struct termite_metal_moe_slot_reduce_params {
-    uint32_t rows;
-    uint32_t top_k;
-    uint32_t dim;
-    uint32_t has_expert_scale;
-} termite_metal_moe_slot_reduce_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(moe_slot_reduce)
 
-typedef struct termite_metal_mapped_page_touch_params {
-    uint32_t page_size;
-    uint32_t page_count;
-} termite_metal_mapped_page_touch_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(mapped_page_touch)
 
-typedef struct termite_metal_mapped_selected_expert_page_touch_params {
-    uint32_t route_count;
-    uint32_t expert_count;
-    uint32_t source_out_dim;
-    uint32_t row_offset;
-    uint32_t logical_out_dim;
-    uint32_t row_stride;
-    uint32_t page_size;
-    uint32_t max_pages_per_route;
-    uint32_t weight_view_offset;
-} termite_metal_mapped_selected_expert_page_touch_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(mapped_selected_expert_page_touch)
 
-typedef struct termite_metal_reduce_last_dim_params {
-    uint32_t rows;
-    uint32_t dim;
-    uint32_t kind;
-    uint32_t reserved;
-} termite_metal_reduce_last_dim_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(reduce_last_dim)
 
-typedef struct termite_metal_nomic_pool_params {
-    uint32_t batch;
-    uint32_t seq_len;
-    uint32_t hidden_size;
-    uint32_t normalize;
-} termite_metal_nomic_pool_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(nomic_pool)
 
-typedef struct termite_metal_masked_bce_params {
-    uint32_t elem_count;
-    uint32_t mean_reduction;
-    float positive_weight;
-    float negative_weight;
-    float eps;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_masked_bce_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(masked_bce)
 
 typedef struct termite_metal_broadcast_f32_params {
     uint32_t rank;
@@ -6185,12 +5861,7 @@ typedef struct termite_metal_reduce_axis_f32_params {
     uint32_t input_strides_for_out[8];
 } termite_metal_reduce_axis_f32_params;
 
-typedef struct termite_metal_broadcast_last_dim_params {
-    uint32_t rows;
-    uint32_t in_dim;
-    uint32_t out_dim;
-    uint32_t reserved;
-} termite_metal_broadcast_last_dim_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(broadcast_last_dim)
 
 #define TERMITE_METAL_ATTENTION_SPAN_FIELDS(F, Record) \
     F(Record, uint32_t, uint, kv_tokens, 0) \
@@ -6209,39 +5880,12 @@ typedef struct termite_metal_attention_span_params {
 _Static_assert(sizeof(termite_metal_attention_span_params) == 40, "Metal parameter size drift");
 TERMITE_METAL_ATTENTION_SPAN_FIELDS(TERMITE_METAL_PARAM_ASSERT, termite_metal_attention_span_params)
 
-typedef struct termite_metal_paged_attention_params {
-    uint32_t q_len;
-    uint32_t kv_tokens;
-    uint32_t num_heads;
-    uint32_t num_kv_heads;
-    uint32_t head_dim;
-    uint32_t key_row_bytes;
-    uint32_t base_key_row_bytes;
-    uint32_t query_position_offset;
-    uint32_t kv_position_offset;
-    uint32_t sliding_window;
-    uint32_t v_row_stride;
-    uint32_t page_size;
-    uint32_t block_count;
-    uint32_t contiguous_base_token;
-    uint32_t contiguous_blocks;
-    uint32_t format;
-    uint32_t v_element_bytes;
-    uint32_t has_sinks;
-    float softcap;
-    uint32_t swa_scan_clamp;
-    uint32_t has_explicit_positions;
-} termite_metal_paged_attention_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(paged_attention)
 
 // Per-dispatch schedule data is deliberately separate from the stable paged
 // attention ABI. This keeps the portfolio bounded and lets stage/reduce share
 // one compact-stride contract without growing the common parameter block.
-typedef struct termite_metal_decode_gqa_split_params {
-    uint32_t split_count;
-    uint32_t max_splits;
-    uint32_t key_chunk;
-    uint32_t reduce_simdgroups;
-} termite_metal_decode_gqa_split_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(decode_gqa_split)
 
 _Static_assert(sizeof(termite_metal_paged_attention_params) == 84, "paged attention params ABI size drift");
 _Static_assert(offsetof(termite_metal_paged_attention_params, q_len) == 0, "paged attention q_len ABI drift");
@@ -6574,78 +6218,25 @@ int termite_metal_run_generated_flash_prefill_check(
     }
 }
 
-typedef struct termite_metal_encode_key_params {
-    uint32_t rows;
-    uint32_t num_kv_heads;
-    uint32_t head_dim;
-    uint32_t key_row_bytes;
-    uint32_t base_key_row_bytes;
-} termite_metal_encode_key_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(encode_key)
 
-typedef struct termite_metal_paged_f32_kv_seed_params {
-    uint32_t total_tokens;
-    uint32_t suffix_tokens;
-    uint32_t values_per_row;
-    uint32_t page_size;
-    uint32_t key_row_floats;
-    uint32_t v_row_stride;
-} termite_metal_paged_f32_kv_seed_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(paged_f32_kv_seed)
 
-typedef struct termite_metal_slice_last_dim_f32_2d_params {
-    uint32_t rows;
-    uint32_t cols;
-    uint32_t start;
-    uint32_t out_cols;
-} termite_metal_slice_last_dim_f32_2d_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(slice_last_dim_f32_2d)
 
-typedef struct termite_metal_gather_axis0_f32_2d_params {
-    uint32_t rows;
-    uint32_t cols;
-    uint32_t index_count;
-    uint32_t reserved;
-} termite_metal_gather_axis0_f32_2d_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(gather_axis0_f32_2d)
 
-typedef struct termite_metal_concat_lastdim_f32_2d_params {
-    uint32_t rows;
-    uint32_t dim_a;
-    uint32_t dim_b;
-    uint32_t reserved;
-} termite_metal_concat_lastdim_f32_2d_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(concat_lastdim_f32_2d)
 
-typedef struct termite_metal_dense_qkv_split_bias_params {
-    uint32_t rows;
-    uint32_t q_out_dim;
-    uint32_t kv_out_dim;
-    uint32_t total_out_dim;
-} termite_metal_dense_qkv_split_bias_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(dense_qkv_split_bias)
 
-typedef struct termite_metal_dense_pair_split_bias_params {
-    uint32_t rows;
-    uint32_t out_dim;
-    uint32_t total_out_dim;
-    uint32_t reserved;
-} termite_metal_dense_pair_split_bias_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(dense_pair_split_bias)
 
-typedef struct termite_metal_dense_qkv_direct_params {
-    uint32_t rows;
-    uint32_t in_dim;
-    uint32_t q_out_dim;
-    uint32_t kv_out_dim;
-} termite_metal_dense_qkv_direct_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(dense_qkv_direct)
 
-typedef struct termite_metal_dense_pair_direct_params {
-    uint32_t rows;
-    uint32_t in_dim;
-    uint32_t out_dim;
-    uint32_t reserved;
-} termite_metal_dense_pair_direct_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(dense_pair_direct)
 
-typedef struct termite_metal_deberta_embeddings_f32_params {
-    uint32_t total;
-    uint32_t rows;
-    uint32_t dim;
-    float eps;
-} termite_metal_deberta_embeddings_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(deberta_embeddings_f32)
 
 typedef struct termite_metal_gliner_boundary_params {
     uint32_t kind;
@@ -6653,33 +6244,13 @@ typedef struct termite_metal_gliner_boundary_params {
     float scalars[4];
 } termite_metal_gliner_boundary_params;
 
-typedef struct termite_metal_gliner_word_embeddings_f32_params {
-    uint32_t batch;
-    uint32_t seq_len;
-    uint32_t hidden_size;
-    uint32_t num_words;
-} termite_metal_gliner_word_embeddings_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(gliner_word_embeddings_f32)
 
-typedef struct termite_metal_gliner_gru_combine_f32_params {
-    uint32_t rows;
-    uint32_t dim;
-    uint32_t reserved0;
-    uint32_t reserved1;
-} termite_metal_gliner_gru_combine_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(gliner_gru_combine_f32)
 
-typedef struct termite_metal_argmax_axis_f32_params {
-    uint32_t outer;
-    uint32_t axis_dim;
-    uint32_t inner;
-    uint32_t reserved;
-} termite_metal_argmax_axis_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(argmax_axis_f32)
 
-typedef struct termite_metal_convert_dtype_f32_params {
-    uint32_t elem_count;
-    uint32_t kind;
-    uint32_t reserved0;
-    uint32_t reserved1;
-} termite_metal_convert_dtype_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(convert_dtype_f32)
 
 #define TERMITE_METAL_SDPA_SEGMENTS_F32_FIELDS(F, Record) \
     F(Record, uint32_t, uint, queries, 0) \
@@ -6713,38 +6284,11 @@ typedef struct termite_metal_modernbert_training_attention_params {
     uint64_t dropout_seed;
 } termite_metal_modernbert_training_attention_params;
 
-typedef struct termite_metal_sdpa_f32_params {
-    uint32_t batch;
-    uint32_t seq_len;
-    uint32_t num_heads;
-    uint32_t head_dim;
-    uint32_t bias_mode;
-    uint32_t has_mask;
-    uint32_t layout;
-    uint32_t reserved1;
-} termite_metal_sdpa_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(sdpa_f32)
 
-typedef struct termite_metal_disentangled_relative_attention_f32_params {
-    uint32_t batch;
-    uint32_t seq_len;
-    uint32_t num_heads;
-    uint32_t head_dim;
-    uint32_t has_mask;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_disentangled_relative_attention_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(disentangled_relative_attention_f32)
 
-typedef struct termite_metal_deberta_relative_score_gemm_f32_params {
-    uint32_t batch;
-    uint32_t seq_len;
-    uint32_t rel_len;
-    uint32_t num_heads;
-    uint32_t head_dim;
-    uint32_t mode;
-    uint32_t reserved0;
-    uint32_t reserved1;
-} termite_metal_deberta_relative_score_gemm_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(deberta_relative_score_gemm_f32)
 
 typedef struct termite_metal_transpose_f32_params {
     uint32_t rank;
@@ -6757,93 +6301,21 @@ typedef struct termite_metal_transpose_f32_params {
     uint32_t perm[8];
 } termite_metal_transpose_f32_params;
 
-typedef struct termite_metal_transpose_last2_params {
-    uint32_t batch;
-    uint32_t rows;
-    uint32_t cols;
-    uint32_t reserved0;
-} termite_metal_transpose_last2_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(transpose_last2)
 
-typedef struct termite_metal_dot_general_2d_f32_params {
-    uint32_t m;
-    uint32_t n;
-    uint32_t k;
-    uint32_t rhs_contract_axis;
-} termite_metal_dot_general_2d_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(dot_general_2d_f32)
 
-typedef struct termite_metal_dot_general_batched_f32_params {
-    uint32_t batch_count;
-    uint32_t m;
-    uint32_t n;
-    uint32_t k;
-    uint32_t rhs_contract_axis;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_dot_general_batched_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(dot_general_batched_f32)
 
-typedef struct termite_metal_lora_linear_f32_params {
-    uint32_t rows;
-    uint32_t in_dim;
-    uint32_t rank;
-    uint32_t out_dim;
-    float scale;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_lora_linear_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(lora_linear_f32)
 
-typedef struct termite_metal_scatter_add_axis0_f32_params {
-    uint32_t out_rows;
-    uint32_t value_rows;
-    uint32_t dim;
-    uint32_t reserved0;
-} termite_metal_scatter_add_axis0_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(scatter_add_axis0_f32)
 
-typedef struct termite_metal_conv1d_f32_params {
-    uint32_t batch;
-    uint32_t in_channels;
-    uint32_t out_channels;
-    uint32_t time_steps;
-    uint32_t kernel_size;
-    uint32_t stride;
-    uint32_t padding;
-    uint32_t out_time;
-    uint32_t has_bias;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} termite_metal_conv1d_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(conv1d_f32)
 
-typedef struct termite_metal_conv1d_im2col_params {
-    uint32_t batch;
-    uint32_t in_channels;
-    uint32_t time_steps;
-    uint32_t kernel_size;
-    uint32_t stride;
-    uint32_t padding;
-    uint32_t out_time;
-    uint32_t time_major;
-} termite_metal_conv1d_im2col_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(conv1d_im2col)
 
-typedef struct termite_metal_conv2d_f32_params {
-    uint32_t batch;
-    uint32_t in_channels;
-    uint32_t out_channels;
-    uint32_t height;
-    uint32_t width;
-    uint32_t kernel_h;
-    uint32_t kernel_w;
-    uint32_t stride_h;
-    uint32_t stride_w;
-    uint32_t padding_h;
-    uint32_t padding_w;
-    uint32_t groups;
-    uint32_t out_h;
-    uint32_t out_w;
-    uint32_t has_bias;
-    uint32_t reserved0;
-} termite_metal_conv2d_f32_params;
+TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
 
 // Stage K/V and form the 32-query, 16-key score tile. Both callers keep
 // their own range types, Q initialization, masking and online statistics.
@@ -7196,99 +6668,99 @@ static NSString *termite_metal_shader_source(void) {
            "using namespace metal;\n"
            "#define TERMITE_FOR_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)\n"
            "struct termite_metal_linear_params { " TERMITE_METAL_LINEAR_FIELDS(TERMITE_METAL_PARAM_MSL, termite_metal_linear_params) "};\n"
-           "struct termite_metal_linear_id_params { uint rows; uint in_dim; uint out_dim; uint row_blocks; uint source_out_dim; uint row_offset; uint expert_count; uint reserved; };\n"
+           TERMITE_METAL_ABI_MSL(linear_id)
            "struct termite_metal_linear_pair_id_params { termite_metal_linear_id_params first; termite_metal_linear_id_params second; };\n"
            "struct termite_metal_pair_activation_id_params { termite_metal_linear_pair_id_params pair; uint activation_kind; uint top_k; uint reserved0; uint reserved1; };\n"
-           "struct termite_metal_a4b_down_reduce_params { uint has_expert_scale; uint reserved0; uint reserved1; uint reserved2; };\n"
-           "struct termite_metal_moe_scatter_params { uint base_rows; uint route_rows; uint dim; uint reserved; };\n"
+           TERMITE_METAL_ABI_MSL(a4b_down_reduce)
+           TERMITE_METAL_ABI_MSL(moe_scatter)
            "struct termite_metal_qkv_linear_params { " TERMITE_METAL_QKV_LINEAR_FIELDS(TERMITE_METAL_PARAM_MSL, termite_metal_qkv_linear_params) "};\n"
            "static_assert(sizeof(termite_metal_qkv_linear_params) == 32, \"Metal parameter size drift\");\n"
            TERMITE_METAL_QKV_LINEAR_FIELDS(TERMITE_METAL_PARAM_MSL_ASSERT, termite_metal_qkv_linear_params)
-           "struct termite_metal_lora_linear_f32_params { uint rows; uint in_dim; uint rank; uint out_dim; float scale; uint reserved0; uint reserved1; uint reserved2; };\n"
-           "struct termite_metal_key_scores_params { uint q_len; uint block_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; };\n"
+           TERMITE_METAL_ABI_MSL(lora_linear_f32)
+           TERMITE_METAL_ABI_MSL(key_scores)
            "struct termite_metal_head_rms_rope_params { " TERMITE_METAL_HEAD_RMS_ROPE_FIELDS(TERMITE_METAL_PARAM_MSL, termite_metal_head_rms_rope_params) "};\n"
            "static_assert(sizeof(termite_metal_head_rms_rope_params) == 44, \"Metal parameter size drift\");\n"
            TERMITE_METAL_HEAD_RMS_ROPE_FIELDS(TERMITE_METAL_PARAM_MSL_ASSERT, termite_metal_head_rms_rope_params)
-           "struct termite_metal_tl1_params { uint rows; uint in_dim; uint out_dim; uint packed_len; uint bm; uint cfg_by; uint bmm; };\n"
-           "struct termite_metal_tl2_params { uint rows; uint in_dim; uint out_dim; uint scale_off; uint three_value_len; uint three_sign_len; uint bm; uint cfg_by; uint bmm; uint three_cols; uint two_cols; };\n"
-           "struct termite_metal_embed_absolute_position_params { uint token_id; uint position_id; uint hidden_size; };\n"
-           "struct termite_metal_embedding_lookup_params { uint total; uint dim; };\n"
-           "struct termite_metal_deberta_embeddings_f32_params { uint total; uint rows; uint dim; float eps; };\n"
-           "struct termite_metal_quant_rows_params { uint total; uint dim; uint source_rows; uint row_offset; float scale; };\n"
-           "struct termite_metal_rope_params { uint total_chunks; uint head_dim; uint rope_dim; float theta; float freq_scale; uint consecutive_pairs; };\n"
-           "struct termite_metal_mrope_params { uint total_chunks; uint token_count; uint head_dim; uint heads_per_token; uint section_t; uint section_h; uint section_w; uint mode; float theta; float freq_scale; };\n"
+           TERMITE_METAL_ABI_MSL(tl1)
+           TERMITE_METAL_ABI_MSL(tl2)
+           TERMITE_METAL_ABI_MSL(embed_absolute_position)
+           TERMITE_METAL_ABI_MSL(embedding_lookup)
+           TERMITE_METAL_ABI_MSL(deberta_embeddings_f32)
+           TERMITE_METAL_ABI_MSL(quant_rows)
+           TERMITE_METAL_ABI_MSL(rope)
+           TERMITE_METAL_ABI_MSL(mrope)
            "struct termite_metal_apply_layer_norm_params { " TERMITE_METAL_LAYER_NORM_FIELDS(TERMITE_METAL_PARAM_MSL, termite_metal_apply_layer_norm_params) "};\n"
-           "struct termite_metal_layer_norm_bwd_params { uint hidden_size; uint rows; float eps; uint reserved0; };\n"
-           "struct termite_metal_apply_layer_norm_scale_params { uint hidden_size; float eps; float scale; uint reserved; };\n"
-           "struct termite_metal_apply_row_norm_params { uint rows; uint hidden_size; float eps; };\n"
-           "struct termite_metal_apply_row_norm_scale_params { uint rows; uint hidden_size; float eps; float scale; };\n"
-           "struct termite_metal_apply_linear_params { uint in_dim; uint out_dim; };\n"
-           "struct termite_metal_sample_logits_params { uint out_dim; float temperature; uint top_k; float top_p; float min_p; float repetition_penalty; float frequency_penalty; float presence_penalty; uint penalty_count; uint seed; float final_logit_softcap; uint defer_monotonic_max; };\n"
+           TERMITE_METAL_ABI_MSL(layer_norm_bwd)
+           TERMITE_METAL_ABI_MSL(apply_layer_norm_scale)
+           TERMITE_METAL_ABI_MSL(apply_row_norm)
+           TERMITE_METAL_ABI_MSL(apply_row_norm_scale)
+           TERMITE_METAL_ABI_MSL(apply_linear)
+           TERMITE_METAL_ABI_MSL(sample_logits)
            "struct termite_metal_penalty_entry { uint token_id; uint count; };\n"
-           "struct termite_metal_topk_reduce_params { uint candidate_count; uint top_k; float top_p; float min_p; uint seed; };\n"
-           "struct termite_metal_apply_activation_params { uint activation_kind; uint rows; uint dim; };\n"
-           "struct termite_metal_apply_add_params { uint rows; uint dim; uint flags; uint reserved; };\n"
-           "struct termite_metal_norm_residual_params { uint dim; float eps; float norm_scale; float output_scale; };\n"
-           "struct termite_metal_gemma4_audio_clamp_params { uint total; uint flags; float min_value; float max_value; };\n"
-           "struct termite_metal_gemma4_audio_rows_params { uint rows; uint dim; uint extra; uint reserved; };\n"
-           "struct termite_metal_gemma4_audio_channel_norm_params { uint channels; uint positions; float eps; uint reserved; };\n"
+           TERMITE_METAL_ABI_MSL(topk_reduce)
+           TERMITE_METAL_ABI_MSL(apply_activation)
+           TERMITE_METAL_ABI_MSL(apply_add)
+           TERMITE_METAL_ABI_MSL(norm_residual)
+           TERMITE_METAL_ABI_MSL(gemma4_audio_clamp)
+           TERMITE_METAL_ABI_MSL(gemma4_audio_rows)
+           TERMITE_METAL_ABI_MSL(gemma4_audio_channel_norm)
            "struct termite_metal_gemma4_audio_attention_params { uint rows; uint hidden; uint heads; uint head_dim; uint chunk; uint context_left; uint context; uint reserved; float k_scale; float logit_cap; float invalid_value; float reserved_f; uint qkv_stride; uint qkv_flags; float qkv_bounds[6]; };\n"
-           "struct termite_metal_training_accumulate_params { uint elem_count; float scale; uint first; uint reserved; };\n"
-           "struct termite_metal_training_accumulate_into_params { uint elem_count; float divisor; float renormalize; uint flags; };\n"
-           "struct termite_metal_training_adamw_params { uint elem_count; float lr; float beta1; float beta2; float eps; float weight_decay; float bias_correction1; float bias_correction2; float grad_scale; uint reserved0; uint reserved1; uint reserved2; };\n"
-           "struct termite_metal_training_sumsq_params { uint elem_count; uint reserved0; uint reserved1; uint reserved2; };\n"
-           "struct termite_metal_apply_softmax_params { uint rows; uint dim; uint log_softmax; uint reserved; };\n"
-           "struct termite_metal_moe_route_select_params { uint rows; uint num_experts; uint top_k; float logit_scale; };\n"
-           "struct termite_metal_moe_route_map_slots_params { uint rows; uint num_experts; uint top_k; uint reserved; };\n"
-           "struct termite_metal_reduce_last_dim_params { uint rows; uint dim; uint kind; uint reserved; };\n"
-           "struct termite_metal_nomic_pool_params { uint batch; uint seq_len; uint hidden_size; uint normalize; };\n"
-           "struct termite_metal_masked_bce_params { uint elem_count; uint mean_reduction; float positive_weight; float negative_weight; float eps; uint reserved0; uint reserved1; uint reserved2; };\n"
+           TERMITE_METAL_ABI_MSL(training_accumulate)
+           TERMITE_METAL_ABI_MSL(training_accumulate_into)
+           TERMITE_METAL_ABI_MSL(training_adamw)
+           TERMITE_METAL_ABI_MSL(training_sumsq)
+           TERMITE_METAL_ABI_MSL(apply_softmax)
+           TERMITE_METAL_ABI_MSL(moe_route_select)
+           TERMITE_METAL_ABI_MSL(moe_route_map_slots)
+           TERMITE_METAL_ABI_MSL(reduce_last_dim)
+           TERMITE_METAL_ABI_MSL(nomic_pool)
+           TERMITE_METAL_ABI_MSL(masked_bce)
            "struct termite_metal_broadcast_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint out_strides[8]; uint input_strides_for_out[8]; };\n"
            "struct termite_metal_reduce_axis_f32_params { uint rank; uint out_total; uint reduce_dim; uint reduce_stride; uint kind; uint reserved0; uint reserved1; uint reserved2; uint out_strides[8]; uint input_strides_for_out[8]; };\n"
-           "struct termite_metal_broadcast_last_dim_params { uint rows; uint in_dim; uint out_dim; uint reserved; };\n"
-           "struct termite_metal_quantize_rows_params { uint rows; uint dim; };\n"
-           "struct termite_metal_attention_f32_params { uint q_len; uint kv_len; uint num_heads; uint num_kv_heads; uint head_dim; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint total_sequence_len; uint has_bias; uint has_mask; uint batch; uint reserved0; };\n"
-           "struct termite_metal_florence_window_params { uint batch; uint height; uint width; uint dim; uint window_size; uint padded_h; uint padded_w; uint window_area; uint window_count; uint reserved0; uint reserved1; uint reserved2; };\n"
-           "struct termite_metal_florence_channel_params { uint batch; uint seq_len; uint dim; uint groups; uint channels_per_group; uint reserved0; uint reserved1; uint reserved2; };\n"
+           TERMITE_METAL_ABI_MSL(broadcast_last_dim)
+           TERMITE_METAL_ABI_MSL(quantize_rows)
+           TERMITE_METAL_ABI_MSL(attention_f32)
+           TERMITE_METAL_ABI_MSL(florence_window)
+           TERMITE_METAL_ABI_MSL(florence_channel)
            "struct termite_metal_argmax_suppress_params { uint out_dim; uint suppress_count; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_whisper_logits_params { uint out_dim; uint suppress_count; uint ts_begin; uint text_allowed; uint ts_min; uint ts_max; uint eot; uint probe_id; uint mode; uint token_slot; uint stats_slot; uint reserved; };\n"
-           "struct termite_metal_compressed_attention_store_local_params { uint query_rows; uint query_abs_start; uint head_dim; uint reserved; };\n"
-           "struct termite_metal_compressed_attention_component_params { uint query_rows; uint query_abs_start; uint total_tokens; uint compress_rate; uint row_dim; uint gate_width; uint row_count; uint rope_dim; float theta; float freq_scale; float eps; uint consecutive_pairs; uint bias_rows; uint reserved0; uint reserved1; uint reserved2; };\n"
-           "struct termite_metal_compressed_attention_params { uint query_abs_start; uint query_rows; uint token_count; uint compressed_rows; uint num_heads; uint head_dim; uint sliding_window; uint top_k; uint has_indexer; uint index_rows; uint index_heads; uint index_head_dim; uint has_sinks; uint reserved0; float scale; float reserved1; };\n"
+           TERMITE_METAL_ABI_MSL(compressed_attention_store_local)
+           TERMITE_METAL_ABI_MSL(compressed_attention_component)
+           TERMITE_METAL_ABI_MSL(compressed_attention)
            "struct termite_metal_attention_span_params { " TERMITE_METAL_ATTENTION_SPAN_FIELDS(TERMITE_METAL_PARAM_MSL, termite_metal_attention_span_params) "};\n"
            "static_assert(sizeof(termite_metal_attention_span_params) == 40, \"Metal parameter size drift\");\n"
            TERMITE_METAL_ATTENTION_SPAN_FIELDS(TERMITE_METAL_PARAM_MSL_ASSERT, termite_metal_attention_span_params)
-           "struct termite_metal_paged_attention_params { uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; uint swa_scan_clamp; uint has_explicit_positions; };\n"
-           "struct termite_metal_decode_gqa_split_params { uint split_count; uint max_splits; uint key_chunk; uint reduce_simdgroups; };\n"
-           "struct termite_metal_encode_key_params { uint rows; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; };\n"
-           "struct termite_metal_paged_f32_kv_seed_params { uint total_tokens; uint suffix_tokens; uint values_per_row; uint page_size; uint key_row_floats; uint v_row_stride; };\n"
-           "struct termite_metal_slice_last_dim_f32_2d_params { uint rows; uint cols; uint start; uint out_cols; };\n"
-           "struct termite_metal_gather_axis0_f32_2d_params { uint rows; uint cols; uint index_count; uint reserved; };\n"
-           "struct termite_metal_concat_lastdim_f32_2d_params { uint rows; uint dim_a; uint dim_b; uint reserved; };\n"
-           "struct termite_metal_dense_qkv_split_bias_params { uint rows; uint q_out_dim; uint kv_out_dim; uint total_out_dim; };\n"
-           "struct termite_metal_dense_pair_split_bias_params { uint rows; uint out_dim; uint total_out_dim; uint reserved; };\n"
-           "struct termite_metal_dense_qkv_direct_params { uint rows; uint in_dim; uint q_out_dim; uint kv_out_dim; };\n"
-           "struct termite_metal_dense_pair_direct_params { uint rows; uint in_dim; uint out_dim; uint reserved; };\n"
+           TERMITE_METAL_ABI_MSL(paged_attention)
+           TERMITE_METAL_ABI_MSL(decode_gqa_split)
+           TERMITE_METAL_ABI_MSL(encode_key)
+           TERMITE_METAL_ABI_MSL(paged_f32_kv_seed)
+           TERMITE_METAL_ABI_MSL(slice_last_dim_f32_2d)
+           TERMITE_METAL_ABI_MSL(gather_axis0_f32_2d)
+           TERMITE_METAL_ABI_MSL(concat_lastdim_f32_2d)
+           TERMITE_METAL_ABI_MSL(dense_qkv_split_bias)
+           TERMITE_METAL_ABI_MSL(dense_pair_split_bias)
+           TERMITE_METAL_ABI_MSL(dense_qkv_direct)
+           TERMITE_METAL_ABI_MSL(dense_pair_direct)
            "struct termite_metal_gliner_boundary_params { uint kind; uint dims[8]; float scalars[4]; };\n"
-           "struct termite_metal_gliner_word_embeddings_f32_params { uint batch; uint seq_len; uint hidden_size; uint num_words; };\n"
-           "struct termite_metal_gliner_gru_combine_f32_params { uint rows; uint dim; uint reserved0; uint reserved1; };\n"
-           "struct termite_metal_argmax_axis_f32_params { uint outer; uint axis_dim; uint inner; uint reserved; };\n"
-           "struct termite_metal_convert_dtype_f32_params { uint elem_count; uint kind; uint reserved0; uint reserved1; };\n"
-           "struct termite_metal_sdpa_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint bias_mode; uint has_mask; uint layout; uint reserved1; };\n"
+           TERMITE_METAL_ABI_MSL(gliner_word_embeddings_f32)
+           TERMITE_METAL_ABI_MSL(gliner_gru_combine_f32)
+           TERMITE_METAL_ABI_MSL(argmax_axis_f32)
+           TERMITE_METAL_ABI_MSL(convert_dtype_f32)
+           TERMITE_METAL_ABI_MSL(sdpa_f32)
            "struct termite_metal_sdpa_segments_f32_params { " TERMITE_METAL_SDPA_SEGMENTS_F32_FIELDS(TERMITE_METAL_PARAM_MSL, termite_metal_sdpa_segments_f32_params) "};\n"
            "static_assert(sizeof(termite_metal_sdpa_segments_f32_params) == 32, \"Metal parameter size drift\");\n"
            TERMITE_METAL_SDPA_SEGMENTS_F32_FIELDS(TERMITE_METAL_PARAM_MSL_ASSERT, termite_metal_sdpa_segments_f32_params)
            "struct termite_metal_modernbert_training_attention_params { uint tokens; uint seq_len; uint num_heads; uint head_dim; uint window; uint backward; float scale; float dropout_probability; ulong dropout_seed; };\n"
-           "struct termite_metal_disentangled_relative_attention_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint has_mask; uint reserved0; uint reserved1; uint reserved2; };\n"
-           "struct termite_metal_deberta_relative_score_gemm_f32_params { uint batch; uint seq_len; uint rel_len; uint num_heads; uint head_dim; uint mode; uint reserved0; uint reserved1; };\n"
+           TERMITE_METAL_ABI_MSL(disentangled_relative_attention_f32)
+           TERMITE_METAL_ABI_MSL(deberta_relative_score_gemm_f32)
            "struct termite_metal_transpose_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint dims[8]; uint in_strides[8]; uint out_strides[8]; uint perm[8]; };\n"
-           "struct termite_metal_transpose_last2_params { uint batch; uint rows; uint cols; uint reserved0; };\n"
-           "struct termite_metal_dot_general_2d_f32_params { uint m; uint n; uint k; uint rhs_contract_axis; };\n"
-           "struct termite_metal_dot_general_batched_f32_params { uint batch_count; uint m; uint n; uint k; uint rhs_contract_axis; uint reserved0; uint reserved1; uint reserved2; };\n"
-           "struct termite_metal_scatter_add_axis0_f32_params { uint out_rows; uint value_rows; uint dim; uint reserved0; };\n"
-           "struct termite_metal_conv1d_f32_params { uint batch; uint in_channels; uint out_channels; uint time_steps; uint kernel_size; uint stride; uint padding; uint out_time; uint has_bias; uint reserved0; uint reserved1; uint reserved2; };\n"
-           "struct termite_metal_conv1d_im2col_params { uint batch; uint in_channels; uint time_steps; uint kernel_size; uint stride; uint padding; uint out_time; uint time_major; };\n"
-           "struct termite_metal_conv2d_f32_params { uint batch; uint in_channels; uint out_channels; uint height; uint width; uint kernel_h; uint kernel_w; uint stride_h; uint stride_w; uint padding_h; uint padding_w; uint groups; uint out_h; uint out_w; uint has_bias; uint reserved0; };\n"
+           TERMITE_METAL_ABI_MSL(transpose_last2)
+           TERMITE_METAL_ABI_MSL(dot_general_2d_f32)
+           TERMITE_METAL_ABI_MSL(dot_general_batched_f32)
+           TERMITE_METAL_ABI_MSL(scatter_add_axis0_f32)
+           TERMITE_METAL_ABI_MSL(conv1d_f32)
+           TERMITE_METAL_ABI_MSL(conv1d_im2col)
+           TERMITE_METAL_ABI_MSL(conv2d_f32)
            "inline float termite_erf_approx(float x) {\n"
            "    float sign = x < 0.0f ? -1.0f : 1.0f;\n"
            "    float ax = fabs(x);\n"
@@ -10763,11 +10235,11 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    miss_rows[row] = misses;\n"
            "}\n"
-           "struct termite_metal_moe_slot_q4_0_gate_up_params { uint route_rows; uint total_rows; uint in_dim; uint out_dim; uint row_blocks; uint gate_offset; uint up_offset; uint expert_stride; uint slot_count; uint top_k; };\n"
-           "struct termite_metal_moe_slot_q4_0_down_params { uint route_rows; uint in_dim; uint out_dim; uint row_blocks; uint down_offset; uint expert_stride; uint slot_count; uint reserved; };\n"
-           "struct termite_metal_moe_slot_reduce_params { uint rows; uint top_k; uint dim; uint has_expert_scale; };\n"
-           "struct termite_metal_mapped_page_touch_params { uint page_size; uint page_count; };\n"
-           "struct termite_metal_mapped_selected_expert_page_touch_params { uint route_count; uint expert_count; uint source_out_dim; uint row_offset; uint logical_out_dim; uint row_stride; uint page_size; uint max_pages_per_route; uint weight_view_offset; };\n"
+           TERMITE_METAL_ABI_MSL(moe_slot_q4_0_gate_up)
+           TERMITE_METAL_ABI_MSL(moe_slot_q4_0_down)
+           TERMITE_METAL_ABI_MSL(moe_slot_reduce)
+           TERMITE_METAL_ABI_MSL(mapped_page_touch)
+           TERMITE_METAL_ABI_MSL(mapped_selected_expert_page_touch)
            // Bit-exact Q4_0 arithmetic from the qualified compact-A4B route,
            // with one material change: route_slots directly addresses a fixed
            // private arena. UINT32_MAX and out-of-range slots fail closed to

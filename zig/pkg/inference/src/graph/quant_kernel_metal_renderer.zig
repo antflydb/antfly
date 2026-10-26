@@ -32,6 +32,7 @@ const compiler = @import("quant_kernel_compiler.zig");
 const quant_kernel_op = @import("quant_kernel_op.zig");
 const quant_matmul = @import("quant_matmul.zig");
 const attention_phases = @import("quant_kernel_metal_attention_phases.zig");
+const param_abi = @import("quant_kernel_metal_param_abi.zig");
 
 const Epilogue = compiler.Epilogue;
 const KernelSchedule = compiler.KernelSchedule;
@@ -95,13 +96,9 @@ pub const helper_qk_gelu = HelperFragment{
 // the generated kernel stays byte-identical across the two, exactly like the
 // RMSNorm microkernel.
 //
-// `paged_attention_params_field_body` is the single source of truth for the
-// struct layout. The compiler pins the hand-written MSL copy in metal_kernels.m
-// to this same body via a `metal_runtime_external_helpers` drift guard, so the
-// generated struct (which the dispatch's `termite_metal_paged_attention_params`
-// bytes are reinterpret-cast into at buffer(6)) can never silently diverge in
-// layout from what the runtime binds.
-pub const paged_attention_params_field_body = "uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; uint swa_scan_clamp; uint has_explicit_positions;";
+// The typed parameter schema supplies C, runtime MSL and this standalone
+// view. The external-helper guard also checks native declaration placement.
+pub const paged_attention_params_field_body = param_abi.fields("paged_attention");
 
 pub const helper_paged_attention_1x_params = HelperFragment{
     .name = "antfly_paged_attention_1x_params",
