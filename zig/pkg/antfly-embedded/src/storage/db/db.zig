@@ -81162,6 +81162,10 @@ test "db enrichments precomputes generated enrichments into the committed batch"
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
+        // Inspect the foreground transaction and its exact first watermark.
+        // Independent replay may legitimately publish another observation.
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),
@@ -118398,6 +118402,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     // boundary and producer assistance are deterministic.
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
+        .start_optional_runtime_workers = false,
     });
     defer db.close();
 
@@ -118424,6 +118429,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         _ = try db.indexTextKernelDocuments("ft_v1", &docs);
     }
 
+    // Disabling derived workers alone does not stop optional merge workers.
+    // This fixture owns the scheduler directly until its explicit runtimes start.
+    if (db.text_merge_runtime) |automatic| try std.testing.expect(!automatic.isStarted());
     const before = db.core.index_manager.textMergeStatsSnapshot();
     try std.testing.expect(before.pending_segments > 8);
 
@@ -118431,7 +118439,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var held_task = (try resources.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
     var held_task_active = true;
     defer if (held_task_active) {
+        resources.apply_mutex.lockExclusive();
         resources.index_manager.cancelTextMergeTask(&held_task);
+        resources.apply_mutex.unlockExclusive();
         held_task.deinit(resources.index_manager.alloc);
     };
 
@@ -118478,7 +118488,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     byte_permit.release();
     byte_only_runtime.deinit();
 
+    resources.apply_mutex.lockExclusive();
     resources.index_manager.cancelTextMergeTask(&held_task);
+    resources.apply_mutex.unlockExclusive();
     held_task.deinit(resources.index_manager.alloc);
     held_task_active = false;
 
@@ -118499,6 +118511,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
 
     const outcome = runtime.applyBackpressure();
     try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.drained, outcome);
+    // Retire the worker before comparing two separately acquired snapshots;
+    // crossing the low watermark does not promise the scheduler stays idle.
+    _ = runtime.stop();
 
     const after = runtime.stats();
     try std.testing.expect(after.pending_segments <= 4);
@@ -118645,7 +118660,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     // process-wide byte dimension. A younger request for another index must
     // not consume the remaining bytes merely because the older waiter is also
     // blocked on its index-local segment ceiling.
-    const mixed_byte_limit = resources.index_manager.textMergeStatsSnapshot().pending_bytes +| 100;
+    const mixed_byte_limit = runtime.stats().pending_bytes +| 100;
     var mixed_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
         alloc,
         resources.index_manager,
