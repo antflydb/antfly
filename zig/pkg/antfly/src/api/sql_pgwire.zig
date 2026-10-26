@@ -462,6 +462,7 @@ const OwnedRead = struct {
     identity: ?http.AuthenticatedIdentity,
     authority: Authority,
     native_adapter: execution.Adapter,
+    native_cut: ?*@import("sql_retained_snapshot.zig").Shared = null,
     decision_runtime: ?@import("antfly_local_sources").functions_runtime.Runtime = null,
     session_id: ?[]u8 = null,
     staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
@@ -495,6 +496,8 @@ const OwnedRead = struct {
         errdefer alloc.destroy(self);
         self.alloc = alloc;
         self.session_id = null;
+        self.native_cut = null;
+        errdefer if (self.native_cut) |cut| cut.release();
         self.staged = .{};
         self.range_guards = .{};
         self.detached = false;
@@ -547,7 +550,12 @@ const OwnedRead = struct {
             self.native_adapter.accepted_lake_repeatable = self.native_adapter.lake_visibility == .accepted and (state.metadata.isolation != .serializable or state.metadata.mode == .read_only);
             self.native_adapter.active_transaction = id;
             self.native_adapter.staged = &self.staged;
-            if (state.metadata.isolation != .read_committed) self.native_adapter.range_reads = &self.range_guards;
+            if (state.metadata.isolation != .read_committed) {
+                self.native_cut = try self.native_adapter.pinTransactionSnapshot(id);
+                self.native_adapter.dynamic_snapshot = &self.native_cut.?.snapshot;
+                self.native_adapter.range_reads = &self.range_guards;
+            }
+            try server.txn_sessions.lockSqlCharacteristics(server.alloc, id);
         }
         self.decision_runtime = try self.native_adapter.decisionRuntime();
         errdefer if (self.decision_runtime) |*active| active.deinit();
@@ -563,6 +571,7 @@ const OwnedRead = struct {
         // prepared epoch on that same snapshot before binding or reading rows.
         const opened = try Pull.Stream.openOwned(try @import("sql_memory_owner.zig").create(adapter.server.alloc, alloc, adapter.server.shared_resource_manager orelse &adapter.server.local_resource_manager), stream_backend, plan.compiled(), parameters, .{ .result_rows = if (plan.compiled().statement == .copy_to) std.math.maxInt(usize) else request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
+            if (self.native_cut) |cut| cut.release();
             if (self.decision_runtime) |*active| active.deinit();
             self.identity.?.deinit(server.alloc);
             self.arena.deinit();
@@ -822,6 +831,9 @@ const OwnedRead = struct {
         if (self.detached) return;
         self.detached = true;
         self.stream.close();
+        if (self.native_cut) |cut| cut.release();
+        self.native_cut = null;
+        self.adapter.server.txn_sessions.snapshot_retirement.drain();
         if (self.decision_runtime) |*active| active.deinit();
         self.plan.release(self.adapter.server.sqlPlanCacheIo());
         self.admission.release();

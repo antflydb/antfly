@@ -501,7 +501,7 @@ pub const CopyOptions = struct {
 };
 
 pub const Begin = struct {
-    isolation: @import("session.zig").Isolation = .serializable,
+    isolation: @import("session.zig").Isolation = .read_committed,
     mode: @import("session.zig").ReadMode = .read_write,
     isolation_specified: bool = false,
     mode_specified: bool = false,

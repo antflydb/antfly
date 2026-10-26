@@ -61,6 +61,7 @@ pub const Snapshot = struct {
     boundary_dispatch: SnapshotAbi.Dispatch = SnapshotAbi.local_dispatch,
 
     pub const VTable = struct {
+        renew: ?*const fn (*anyopaque, ?u64) anyerror!void = null,
         open: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, types.ScanOptions) anyerror!View,
         release: *const fn (*anyopaque) void,
     };
@@ -68,6 +69,11 @@ pub const Snapshot = struct {
 
     pub fn open(self: Snapshot, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !View {
         return SnapshotAbi.call("open", self.boundary_dispatch, self.vtable.open, .{ self.ptr, alloc, from, to, opts });
+    }
+
+    pub fn renew(self: Snapshot, deadline_ns: ?u64) !void {
+        const callback = self.vtable.renew orelse return;
+        return SnapshotAbi.call("renew", self.boundary_dispatch, callback, .{ self.ptr, deadline_ns });
     }
 
     pub fn deinit(self: Snapshot) void {

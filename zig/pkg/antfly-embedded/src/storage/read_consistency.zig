@@ -82,6 +82,16 @@ pub const ReadSafetyBarrier = struct {
         term: u64,
         applied_index: u64,
 
+        /// A retained immutable root was certified while capture was frozen.
+        /// Later opens require a newly quorum-completed prefix on the same
+        /// owner/term, which may include subsequent writes. Never use this to
+        /// validate a live capture fence or fabricate completion from Raft tips.
+        pub fn validateRetained(self: @This(), completed: FrozenProof) !void {
+            if (self.incarnation == 0 or self.term == 0 or self.applied_index == 0) return error.InvalidControlReceiptPosition;
+            if (completed.incarnation != self.incarnation or completed.term != self.term) return error.NotLeader;
+            if (completed.applied_index < self.applied_index) return error.ReadUnavailable;
+        }
+
         pub fn validate(self: @This(), incarnation: u128, term: u64, is_leader: bool, quorum_index: u64) !void {
             if (!is_leader or incarnation != self.incarnation or term != self.term) return error.NotLeader;
             if (quorum_index > self.applied_index) return error.ReadUnavailable;

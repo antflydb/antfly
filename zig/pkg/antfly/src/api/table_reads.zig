@@ -2627,18 +2627,11 @@ pub const BoundTableReadSource = struct {
     /// certifies one untorn distributed visibility cut.
     const CoordinatedStatementSnapshot = struct {
         alloc: std.mem.Allocator,
+        source: *ProvisionedTableReadSource,
         prepared: ProvisionedTableReadSource.PreparedSpanRead,
         snapshots: []@import("antfly_local_sources").storage_statement_read_fence.Snapshot,
         table: []u8,
         schema_version: u32,
-        cancellation: ?@import("antfly_cancellation").CancellationToken,
-        deadline_ns: ?u64,
-        opened: usize = 0,
-
-        fn check(self: *@This()) !void {
-            if (self.cancellation) |token| try token.check();
-            if (self.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
-        }
 
         fn open(_: *anyopaque, _: std.mem.Allocator, _: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
             return error.SqlRangeTrackingRequired;
@@ -2646,26 +2639,40 @@ pub const BoundTableReadSource = struct {
 
         fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot.GuardedRead {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.check();
-            if (!std.mem.eql(u8, input.table, self.table) or self.opened >= 64 or !input.opts.include_range_proofs) return error.SqlStatementSnapshotRequired;
+            if (!std.mem.eql(u8, input.table, self.table) or !input.opts.include_range_proofs) return error.SqlStatementSnapshotRequired;
             const row_query = input.opts.relational_query orelse return error.SqlStatementSnapshotRequired;
             if (row_query.schema_version != self.schema_version or row_query.index != null or row_query.auto_index) return error.SqlStatementSnapshotRequired;
             const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
             const OwnerProof = @import("antfly_local_sources").api_range_read_guards.OwnerRangeProof;
-            const views = try alloc.alloc(View, self.snapshots.len);
+            var selection: [256]usize = undefined;
+            var selected_count = self.snapshots.len;
+            if (input.from.len != 0 or input.to.len != 0) {
+                var selected = try self.source.prepareRoutedSpanRead(alloc, input.table, input.from, input.to, .{ .scan = .{ .from_key = input.from, .to_key = input.to, .opts = input.opts } }, .stale, .general);
+                defer selected.deinit();
+                selected.releaseActivity();
+                if (selected.table_id != self.prepared.table_id or selected.topology_epoch != self.prepared.topology_epoch or selected.metadata_group_id != self.prepared.metadata_group_id or !std.meta.eql(selected.metadata_incarnation, self.prepared.metadata_incarnation) or selected.group_ids.len == 0 or selected.group_ids.len > selection.len) return error.CatalogGenerationChanged;
+                selected_count = selected.group_ids.len;
+                for (selected.group_ids, 0..) |group, slot| {
+                    const index = std.mem.indexOfScalar(u64, self.prepared.group_ids, group) orelse return error.CatalogGenerationChanged;
+                    if (!std.meta.eql(selected.routes[slot], self.prepared.routes[index])) return error.CatalogGenerationChanged;
+                    selection[slot] = index;
+                }
+            } else {
+                for (0..selected_count) |index| selection[index] = index;
+            }
+            const views = try alloc.alloc(View, selected_count);
             defer alloc.free(views);
             var opened: usize = 0;
             errdefer for (views[0..opened]) |view| view.deinit();
-            const proofs = try alloc.alloc(OwnerProof, self.snapshots.len);
+            const proofs = try alloc.alloc(OwnerProof, selected_count);
             errdefer alloc.free(proofs);
             var proven: usize = 0;
             errdefer for (proofs[0..proven]) |owner| alloc.free(owner.proofs);
-            var opts = input.opts;
-            if (self.cancellation) |token| opts.cancellation = token;
-            if (self.deadline_ns) |deadline| opts.execution_deadline_ns = if (opts.execution_deadline_ns) |prior| @min(prior, deadline) else deadline;
-            for (self.snapshots, views, proofs, 0..) |snapshot, *view, *owner, index| {
-                try self.check();
-                view.* = try snapshot.open(alloc, input.from, input.to, opts);
+            for (selection[0..selected_count], views, proofs) |index, *view, *owner| {
+                const snapshot = self.snapshots[index];
+                if (input.opts.cancellation) |token| try token.check();
+                if (input.opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+                view.* = try snapshot.open(alloc, input.from, input.to, input.opts);
                 opened += 1;
                 const native_proofs = try view.rangeProofs(alloc);
                 if (native_proofs.len == 0) {
@@ -2677,7 +2684,6 @@ pub const BoundTableReadSource = struct {
             }
             const combined = try @import("../storage/relational_read_set.zig").Set.create(alloc, views, true);
             opened = 0;
-            self.opened += 1;
             return .{ .view = combined, .owner_proofs = proofs };
         }
 
@@ -3900,78 +3906,201 @@ pub const ProvisionedTableReadSource = struct {
     }
 
     fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot {
+        return openRelationalSnapshotCohort(ptr, alloc, &.{.{ .table = table, .schema_version = schema_version }}, consistency, cancellation, deadline_ns);
+    }
+
+    const SnapshotCohort = struct {
+        alloc: std.mem.Allocator,
+        cuts: []BoundTableReadSource.CoordinatedStatementSnapshot,
+        io: ?std.Io,
+
+        fn renew(ptr: *anyopaque, requested_deadline_ns: ?u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const deadline = requested_deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+            const Snapshot = @import("antfly_local_sources").storage_statement_read_fence.Snapshot;
+            const Job = struct {
+                snapshot: Snapshot,
+                failure: ?anyerror = null,
+                fn run(job: *@This(), budget: u64) void {
+                    job.snapshot.renew(budget) catch |err| {
+                        job.failure = err;
+                    };
+                }
+            };
+            // Bounded fan-out; local snapshots perform no I/O. The same total
+            // deadline applies even to a 256-owner transaction.
+            var jobs: [8]Job = undefined;
+            var table: usize = 0;
+            var owner: usize = 0;
+            while (table < self.cuts.len) {
+                var count: usize = 0;
+                while (count < jobs.len and table < self.cuts.len) {
+                    const cut = self.cuts[table];
+                    if (owner == cut.snapshots.len) {
+                        table += 1;
+                        owner = 0;
+                        continue;
+                    }
+                    jobs[count] = .{ .snapshot = cut.snapshots[owner] };
+                    owner += 1;
+                    count += 1;
+                }
+                if (self.io) |io| {
+                    var group: std.Io.Group = .init;
+                    for (jobs[0..count]) |*job| group.async(io, Job.run, .{ job, deadline });
+                    try group.await(io);
+                } else for (jobs[0..count]) |*job| Job.run(job, deadline);
+                for (jobs[0..count]) |job| if (job.failure) |err| return err;
+            }
+        }
+        fn open(_: *anyopaque, _: std.mem.Allocator, _: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
+            return error.SqlRangeTrackingRequired;
+        }
+        fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot.GuardedRead {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (self.cuts) |*cut| if (std.mem.eql(u8, cut.table, input.table)) return BoundTableReadSource.CoordinatedStatementSnapshot.openGuarded(cut, alloc, input);
+            // An unseen relation is never recaptured into an existing cut.
+            return error.SqlStatementSnapshotRequired;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (self.cuts) |*cut| {
+                for (cut.snapshots) |snapshot| snapshot.deinit();
+                self.alloc.free(cut.snapshots);
+                cut.prepared.deinit();
+                self.alloc.free(cut.table);
+            }
+            self.alloc.free(self.cuts);
+            self.alloc.destroy(self);
+        }
+    };
+
+    const SnapshotParticipant = struct { cut: usize, group: usize, route: table_router.GroupRoute };
+
+    fn tryCaptureSnapshotCohort(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, temporary: std.mem.Allocator, cuts: []BoundTableReadSource.CoordinatedStatementSnapshot, participants: []const SnapshotParticipant, opts: db_mod.types.ScanOptions) !bool {
+        const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
+        const fences = try temporary.alloc(Fence, participants.len);
+        defer temporary.free(fences);
+        var held: usize = 0;
+        defer for (fences[0..held]) |fence| fence.deinit();
+        var published = false;
+        defer if (!published) for (cuts) |*cut| {
+            for (cut.snapshots) |snapshot| snapshot.deinit();
+            alloc.free(cut.snapshots);
+            cut.snapshots = &.{};
+        };
+        for (participants) |participant| {
+            const cut = &cuts[participant.cut];
+            const group = cut.prepared.group_ids[participant.group];
+            const route_fence = cut.prepared.fenceAt(participant.group, opts.execution_deadline_ns, opts.cancellation);
+            const fence = (switch (participant.route) {
+                .local => self.groupLocalSourceWithFence(route_fence).tryStatementReadFenceGroupLocal(alloc, group, cut.table, opts, .stale),
+                .remote => |remote| @import("retained_read_client.zig").Client.capture(alloc, self.distributedInternalExecutor(), remote.base_uri, cut.table, route_fence, cut.schema_version, opts.execution_deadline_ns),
+            } catch |err| {
+                if (err == error.ReadUnavailable) return false;
+                return err;
+            }) orelse return false;
+            fences[held] = fence;
+            held += 1;
+        }
+        var fence_index: usize = 0;
+        for (cuts) |*cut| {
+            const snapshots = try alloc.alloc(@import("antfly_local_sources").storage_statement_read_fence.Snapshot, cut.prepared.group_ids.len);
+            var captured: usize = 0;
+            errdefer {
+                for (snapshots[0..captured]) |snapshot| snapshot.deinit();
+                alloc.free(snapshots);
+            }
+            for (snapshots) |*snapshot| {
+                snapshot.* = fences[fence_index].captureSnapshot(alloc) catch |err| {
+                    // Returning false is success in Zig error-unwinding terms.
+                    // Release the partially forked vector explicitly first.
+                    if (err == error.ReadUnavailable) {
+                        for (snapshots[0..captured]) |prior| prior.deinit();
+                        alloc.free(snapshots);
+                        return false;
+                    }
+                    return err;
+                };
+                captured += 1;
+                fence_index += 1;
+            }
+            cut.snapshots = snapshots;
+        }
+        for (fences) |fence| fence.validate() catch |err| {
+            if (err == error.ReadUnavailable) return false;
+            return err;
+        };
+        published = true;
+        return true;
+    }
+
+    fn openRelationalSnapshotCohort(ptr: *anyopaque, alloc: std.mem.Allocator, targets: []const @import("antfly_local_sources").api_table_read_source.RelationalSnapshotTarget, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHotStandbyReadAllowed(consistency);
-        if (self.local_read_source == null) return error.SqlStatementSnapshotRequired;
+        if (targets.len > 256) return error.SqlProgramLimitExceeded;
+        if (self.local_read_source == null and self.distributed_router == null) return error.SqlStatementSnapshotRequired;
         const opts: db_mod.types.ScanOptions = .{ .cancellation = cancellation, .execution_deadline_ns = deadline_ns };
-        var prepared = try self.prepareRoutedSpanRead(alloc, table, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, consistency, .general);
-        errdefer prepared.deinit();
-        if (prepared.group_ids.len == 0) return error.TableNotFound;
-        if (prepared.group_ids.len > 256) return error.SqlProgramLimitExceeded;
-        try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table, prepared.group_ids.len);
-        // A partially resolved 2PC decision leaves an intent on another
-        // participant. Its owner fence returns busy and the entire cohort
-        // releases/retries before any delayed cursor can be published.
-        try certifyDelayedOwnerCut(prepared.group_ids.len);
-        // Admission may wait for Raft apply; it must not retain the catalog
-        // preparation activity while doing so. The exact route is rechecked
-        // under each owner fence before any snapshot is published.
-        if (self.distributed_router != null) prepared.releaseActivity();
+        const owned = try alloc.create(SnapshotCohort);
+        errdefer alloc.destroy(owned);
+        const cuts = try alloc.alloc(BoundTableReadSource.CoordinatedStatementSnapshot, targets.len);
+        errdefer alloc.free(cuts);
+        var initialized: usize = 0;
+        errdefer for (cuts[0..initialized]) |*cut| {
+            cut.prepared.deinit();
+            alloc.free(cut.table);
+            for (cut.snapshots) |snapshot| snapshot.deinit();
+            alloc.free(cut.snapshots);
+        };
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const temp = scratch.allocator();
-        const routes = try temp.alloc(table_router.GroupRoute, prepared.group_ids.len);
-        var resolved: usize = 0;
-        defer for (routes[0..resolved]) |*route| route.deinit(temp);
-        for (prepared.group_ids, routes, 0..) |group, *route, index| {
-            route.* = if (self.distributed_router) |router|
-                (try table_router.resolveGroupRoute(temp, self.catalog, router.withBudget(.fromRequest(opts)), group, .prefer_leader)) orelse return error.GroupLeaderUnavailable
-            else
-                .local;
-            resolved += 1;
-            if (self.distributed_router != null and consistency != .stale) switch (route.*) {
-                .local => try prepareProvisionedGroupConsistency(self.read_safety_barrier, group, .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, consistency, false),
-                .remote => |remote| try @import("retained_read_client.zig").Client.admit(alloc, self.distributedInternalExecutor(), remote.base_uri, table, prepared.fenceAt(index, deadline_ns, cancellation), schema_version, deadline_ns),
-            };
+        var participants: std.ArrayList(SnapshotParticipant) = .empty;
+        defer for (participants.items) |*participant| participant.route.deinit(temp);
+        for (targets, cuts, 0..) |target, *cut, cut_index| {
+            if (cancellation) |token| try token.check();
+            for (targets[0..cut_index]) |prior| if (std.mem.eql(u8, prior.table, target.table)) return error.SqlStatementSnapshotRequired;
+            var prepared = try self.prepareRoutedSpanRead(alloc, target.table, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, if (self.distributed_router != null) .stale else consistency, .general);
+            errdefer prepared.deinit();
+            if (prepared.group_ids.len == 0) return error.TableNotFound;
+            if (target.table_id) |expected| if (expected != prepared.table_id) return error.CatalogGenerationChanged;
+            if (prepared.group_ids.len > 256 - participants.items.len) return error.SqlProgramLimitExceeded;
+            if (cut_index != 0 and (prepared.catalog_revision != cuts[0].prepared.catalog_revision or prepared.metadata_group_id != cuts[0].prepared.metadata_group_id or !std.meta.eql(prepared.metadata_incarnation, cuts[0].prepared.metadata_incarnation))) return error.CatalogGenerationChanged;
+            try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, target.table, prepared.group_ids.len);
+            try certifyDelayedOwnerCut(prepared.group_ids.len);
+            // Do not retain preparation activity while awaiting Raft apply.
+            if (self.distributed_router != null) prepared.releaseActivity();
+            const name = try alloc.dupe(u8, target.table);
+            cut.* = .{ .alloc = alloc, .source = self, .prepared = prepared, .table = name, .schema_version = target.schema_version, .snapshots = &.{} };
+            initialized += 1;
+            // Ownership passed to cuts; following errors unwind it there.
+            prepared = .{ .alloc = alloc, .routes = &.{}, .group_ids = &.{}, .metadata_group_id = 0, .metadata_incarnation = null, .table_id = 0, .catalog_revision = 0, .topology_epoch = 0, .activity = null };
+            for (cut.prepared.group_ids, 0..) |group, group_index| {
+                var route: table_router.GroupRoute = if (self.distributed_router) |router|
+                    (try table_router.resolveGroupRoute(temp, self.catalog, router.withBudget(.fromRequest(opts)), group, .prefer_leader)) orelse return error.GroupLeaderUnavailable
+                else
+                    .local;
+                errdefer route.deinit(temp);
+                if (self.distributed_router != null and consistency != .stale) switch (route) {
+                    .local => try prepareProvisionedGroupConsistency(self.read_safety_barrier, group, .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, consistency, false),
+                    .remote => |remote| try @import("retained_read_client.zig").Client.admit(alloc, self.distributedInternalExecutor(), remote.base_uri, target.table, cut.prepared.fenceAt(group_index, deadline_ns, cancellation), target.schema_version, deadline_ns),
+                };
+                try participants.append(temp, .{ .cut = cut_index, .group = group_index, .route = route });
+            }
         }
-        const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
-        const fences = try temp.alloc(Fence, routes.len);
-        var held: usize = 0;
-        defer for (fences[0..held]) |fence| fence.deinit();
         var wait_budget = self.catalog.budget(null);
         wait_budget.deadline_ns = if (deadline_ns) |deadline| @min(deadline, wait_budget.nowNs() +| 5 * std.time.ns_per_s) else wait_budget.nowNs() +| 5 * std.time.ns_per_s;
         while (true) {
             try wait_budget.checkpoint();
             if (cancellation) |token| try token.check();
-            for (prepared.group_ids, routes, 0..) |group, route, index| {
-                const fence = (try switch (route) {
-                    .local => self.groupLocalSourceWithFence(prepared.fenceAt(index, deadline_ns, cancellation)).tryStatementReadFenceGroupLocal(alloc, group, table, opts, .stale),
-                    .remote => |remote| @import("retained_read_client.zig").Client.capture(alloc, self.distributedInternalExecutor(), remote.base_uri, table, prepared.fenceAt(index, deadline_ns, cancellation), schema_version, deadline_ns),
-                }) orelse break;
-                fences[held] = fence;
-                held += 1;
-            }
-            if (held == fences.len) break;
-            for (fences[0..held]) |fence| fence.deinit();
-            held = 0;
+            // Only certified unpublished ReadUnavailable/busy results retry.
+            // Every attempt closes all partial roots and releases all fences
+            // before waiting; ambiguous transport failures never replay.
+            if (try self.tryCaptureSnapshotCohort(alloc, temp, cuts, participants.items, opts)) break;
             try wait_budget.sleepNs(std.time.ns_per_ms);
         }
-        const snapshots = try alloc.alloc(@import("antfly_local_sources").storage_statement_read_fence.Snapshot, fences.len);
-        var captured: usize = 0;
-        errdefer {
-            for (snapshots[0..captured]) |snapshot| snapshot.deinit();
-            alloc.free(snapshots);
-        }
-        for (fences, snapshots) |fence, *snapshot| {
-            snapshot.* = try fence.captureSnapshot(alloc);
-            captured += 1;
-        }
-        for (fences) |fence| try fence.validate();
-        const owned = try alloc.create(BoundTableReadSource.CoordinatedStatementSnapshot);
-        errdefer alloc.destroy(owned);
-        const table_copy = try alloc.dupe(u8, table);
-        owned.* = .{ .alloc = alloc, .prepared = prepared, .snapshots = snapshots, .table = table_copy, .schema_version = schema_version, .cancellation = cancellation, .deadline_ns = deadline_ns };
-        return .{ .ptr = owned, .vtable = &.{ .open = BoundTableReadSource.CoordinatedStatementSnapshot.open, .open_guarded = BoundTableReadSource.CoordinatedStatementSnapshot.openGuarded, .close = BoundTableReadSource.CoordinatedStatementSnapshot.close } };
+        owned.* = .{ .alloc = alloc, .cuts = cuts, .io = if (self.io_impl) |io| io.io() else null };
+        return .{ .ptr = owned, .vtable = &.{ .renew = SnapshotCohort.renew, .open = SnapshotCohort.open, .open_guarded = SnapshotCohort.openGuarded, .close = SnapshotCohort.close } };
     }
 
     fn finishRelationalStatement(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency, retained: *RetainedStatementRead) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
@@ -4153,6 +4282,7 @@ pub const ProvisionedTableReadSource = struct {
                 .acquire_join_view = JoinReadBinding(ProvisionedTableReadSource).acquire,
                 .open_relational_read = openRelationalRead,
                 .open_relational_statement = openRelationalStatement,
+                .open_relational_snapshot_cohort = openRelationalSnapshotCohort,
                 .open_relational_statement_snapshot = openRelationalStatementSnapshot,
                 .open_relational_read_group_local_routed = openRelationalReadGroupRouted,
                 .try_statement_read_fence_group_local_routed = tryStatementReadFenceGroupRouted,
@@ -6933,6 +7063,8 @@ pub const HostedProvisionedTableReadSource = struct {
                 .acquire_join_view = JoinReadBinding(HostedProvisionedTableReadSource).acquire,
                 .open_relational_read = openRelationalRead,
                 .open_relational_statement = openRelationalStatement,
+                .open_relational_snapshot_cohort = openRelationalSnapshotCohort,
+                .open_relational_statement_snapshot = openRelationalStatementSnapshot,
                 .lookup = lookup,
                 .scan = scan,
                 .scan_stream = scanStream,
@@ -7239,6 +7371,47 @@ pub const HostedProvisionedTableReadSource = struct {
         _ = owner.coordinator.withDistributedRouting(self.router, self.executor, self.internal_service_secret, self.internal_service_issuer);
         owner.statement = try ProvisionedTableReadSource.openRelationalStatement(&owner.coordinator, alloc, scans, consistency);
         return .{ .ptr = owner, .views = owner.statement.views, .vtable = &.{ .close = Owner.close, .range_proofs = Owner.rangeProofs } };
+    }
+
+    /// Retain the coordinator as well as the owner-cut vector. Prepared span
+    /// leases and remote snapshot callbacks may borrow its address after this
+    /// request returns; a stack adapter would leave those borrows dangling.
+    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !table_read_source.RelationalStatementSnapshot {
+        return openRelationalSnapshotCohort(ptr, alloc, &.{.{ .table = table, .schema_version = schema_version }}, consistency, cancellation, deadline_ns);
+    }
+
+    fn openRelationalSnapshotCohort(ptr: *anyopaque, alloc: std.mem.Allocator, targets: []const table_read_source.RelationalSnapshotTarget, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !table_read_source.RelationalStatementSnapshot {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const Owner = struct {
+            alloc: std.mem.Allocator,
+            coordinator: ProvisionedTableReadSource,
+            snapshot: table_read_source.RelationalStatementSnapshot,
+            fn renew(raw: *anyopaque, renewal_deadline_ns: ?u64) !void {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                try owner.snapshot.renew(renewal_deadline_ns);
+            }
+            fn open(raw: *anyopaque, owner_alloc: std.mem.Allocator, request: table_read_source.RelationalStatementScan) !table_read_source.RelationalReadView {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                return owner.snapshot.open(owner_alloc, request);
+            }
+            fn openGuarded(raw: *anyopaque, owner_alloc: std.mem.Allocator, request: table_read_source.RelationalStatementScan) !table_read_source.RelationalStatementSnapshot.GuardedRead {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                return owner.snapshot.openGuarded(owner_alloc, request);
+            }
+            fn close(raw: *anyopaque) void {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                owner.snapshot.deinit();
+                owner.alloc.destroy(owner);
+            }
+        };
+        const owner = try alloc.create(Owner);
+        errdefer alloc.destroy(owner);
+        owner.* = .{ .alloc = alloc, .coordinator = ProvisionedTableReadSource.init(self.replica_root_dir, self.catalog, self.read_safety_barrier), .snapshot = undefined };
+        owner.coordinator.local_read_source = self.local_read_source;
+        owner.coordinator.io_impl = self.io_impl;
+        _ = owner.coordinator.withDistributedRouting(self.router, self.executor, self.internal_service_secret, self.internal_service_issuer);
+        owner.snapshot = try ProvisionedTableReadSource.openRelationalSnapshotCohort(&owner.coordinator, alloc, targets, consistency, cancellation, deadline_ns);
+        return .{ .ptr = owner, .vtable = &.{ .renew = Owner.renew, .open = Owner.open, .open_guarded = Owner.openGuarded, .close = Owner.close } };
     }
 
     fn openRemoteRelationalRead(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !table_read_source.RelationalReadView {
@@ -17131,6 +17304,8 @@ fn consumerTests() type {
                 busy_once: bool = false,
                 snapshots: usize = 0,
                 snapshot_closes: usize = 0,
+                snapshot_opens: usize = 0,
+                fail_snapshot_validation_once: bool = false,
                 const Owner = struct {
                     fixture: *Self,
                     group: u64,
@@ -17138,6 +17313,10 @@ fn consumerTests() type {
                     pub fn validate(ptr: *anyopaque) !void {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
                         try std.testing.expect(self.held);
+                        if (self.fixture.fail_snapshot_validation_once and self.fixture.snapshots == 2) {
+                            self.fixture.fail_snapshot_validation_once = false;
+                            return error.ReadUnavailable;
+                        }
                     }
                     fn open(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions) !View {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -17155,6 +17334,7 @@ fn consumerTests() type {
                     fn snapshotOpen(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions) !View {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
                         try std.testing.expect(!self.held);
+                        self.fixture.snapshot_opens += 1;
                         return .{ .ptr = self, .vtable = &.{ .next = next, .close = close, .range_proofs = primaryProofs } };
                     }
                     fn primaryProofs(_: *anyopaque, alloc: std.mem.Allocator) ![]tracking.Proof {
@@ -17263,6 +17443,25 @@ fn consumerTests() type {
                 try std.testing.expectError(error.SqlStatementSnapshotRequired, dynamic.openGuarded(std.testing.allocator, .{ .table = "docs", .opts = .{ .include_range_proofs = true, .relational_query = .{ .fields = &.{}, .schema_version = 2 } } }));
             }
             try std.testing.expectEqual(@as(usize, 2), fixture.snapshot_closes);
+            fixture.snapshots = 0;
+            fixture.fail_snapshot_validation_once = true;
+            {
+                const cut = try routed.source().openRelationalSnapshotCohort(std.testing.allocator, &.{.{ .table = "docs", .schema_version = 1 }}, .read_index, null, null);
+                defer cut.deinit();
+                try std.testing.expectEqual(@as(usize, 4), fixture.snapshots);
+                try std.testing.expectEqual(@as(usize, 4), fixture.snapshot_closes);
+                const opened_before = fixture.snapshot_opens;
+                const point = try cut.openGuarded(std.testing.allocator, .{ .table = "docs", .from = "x", .to = "y", .opts = .{ .include_range_proofs = true, .relational_query = .{ .fields = &.{}, .schema_version = 1 } } });
+                defer point.view.deinit();
+                defer {
+                    for (point.owner_proofs) |owner| std.testing.allocator.free(owner.proofs);
+                    std.testing.allocator.free(point.owner_proofs);
+                }
+                try std.testing.expectEqual(opened_before + 1, fixture.snapshot_opens);
+                try std.testing.expectEqual(@as(usize, 1), point.owner_proofs.len);
+                try std.testing.expectEqual(@as(u64, 7002), point.owner_proofs[0].fence.route.group_id);
+            }
+            try std.testing.expectEqual(@as(usize, 6), fixture.snapshot_closes);
         }
 
         test "relational row query coordinator never weakens failed read index to stale" {

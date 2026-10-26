@@ -259,6 +259,7 @@ test "api module compiles" {
     _ = @import("sql_policy_ddl.zig");
     _ = sql_execution;
     _ = @import("sql_schema_cache.zig");
+    _ = @import("sql_retained_snapshot.zig");
     _ = sql_pgwire;
     _ = sql_session;
     _ = @import("sql_prepared.zig");

@@ -241,6 +241,75 @@ test "mounted SQL original transaction characteristics retain snapshots and save
     }
 }
 
+test "mounted SQL transaction cohort pins unseen tables document roots savepoints and rejects cold recapture" {
+    const SnapshotCampaign = struct {
+        pub const native_sessions = true;
+        pub const cold_catalog = true;
+        connection: [32]u8 = undefined,
+
+        fn sql(ctx: *fixture.Context, id: []const u8, statement: []const u8) !void {
+            var response = try connected(ctx, id, statement);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 200) std.debug.print("snapshot command={s} status={d} body={s}\n", .{ statement, response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            for ([_][]const u8{ "cut_left", "cut_right" }) |name| {
+                const ddl = try std.fmt.allocPrint(ctx.alloc, "CREATE TABLE {s}(id UUID PRIMARY KEY,status TEXT)", .{name});
+                defer ctx.alloc.free(ddl);
+                try command(ctx, ddl, null);
+                _ = try readyTable(ctx, name, 0);
+            }
+            try command(ctx, "CREATE TABLE cut_docs () WITH (antfly.storage_mode='document')", null);
+            _ = try readyTable(ctx, "cut_docs", 0);
+            try command(ctx, "INSERT INTO cut_docs(_id,_doc) VALUES('doc:before','{\"status\":\"before\"}')", null);
+            try command(ctx, "INSERT INTO cut_left(id,status) VALUES('00000000-0000-0000-0000-000000000001','before')", null);
+            var opened = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql/connections", .POST, "{}", 15_000);
+            defer opened.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), opened.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLConnectionResponse, ctx.alloc, opened.body, .{});
+            defer parsed.deinit();
+            const id = parsed.value.connection_id;
+            try std.testing.expectEqual(self.connection.len, id.len);
+            @memcpy(&self.connection, id);
+            try sql(ctx, id, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+            // Scalar-only first query fixes even the still-unseen relations.
+            try sql(ctx, id, "SELECT 1");
+            try command(ctx, "INSERT INTO cut_right(id,status) VALUES('00000000-0000-0000-0000-000000000001','outside')", null);
+            try command(ctx, "INSERT INTO cut_docs(_id,_doc) VALUES('doc:one','{\"status\":\"outside\"}')", null);
+            try expectSessionRows(ctx, id, "SELECT id::text AS id,status FROM cut_right ORDER BY id", &.{});
+            try expectSessionRows(ctx, id, "SELECT _id AS id,_doc->>'status' AS status FROM cut_docs ORDER BY _id", &.{&.{ "doc:before", "before" }});
+            try expectSessionRows(ctx, id, "SELECT l.id::text AS id,r.status AS status FROM cut_left l JOIN cut_right r ON l.id=r.id", &.{});
+            try sql(ctx, id, "SAVEPOINT same_cut");
+            try sql(ctx, id, "UPDATE cut_left SET status='own' WHERE id='00000000-0000-0000-0000-000000000001'");
+            try expectSessionRows(ctx, id, "SELECT id::text AS id,status FROM cut_left", &.{&.{ "00000000-0000-0000-0000-000000000001", "own" }});
+            try expectSessionRows(ctx, null, "SELECT id::text AS id,status FROM cut_left", &.{&.{ "00000000-0000-0000-0000-000000000001", "before" }});
+            try sql(ctx, id, "ROLLBACK TO same_cut");
+            try expectSessionRows(ctx, id, "SELECT id::text AS id,status FROM cut_left", &.{&.{ "00000000-0000-0000-0000-000000000001", "before" }});
+            try expectSessionRows(ctx, id, "SELECT id::text AS id,status FROM cut_right", &.{});
+            try sql(ctx, id, "ROLLBACK");
+            // A new transaction sees the outside commit and retains that cut.
+            try sql(ctx, id, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+            try expectSessionRows(ctx, id, "SELECT id::text AS id,status FROM cut_right", &.{&.{ "00000000-0000-0000-0000-000000000001", "outside" }});
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            _ = try readyTable(ctx, "cut_right", 0);
+            var response = try connected(ctx, &self.connection, "SELECT id::text AS id,status FROM cut_right");
+            defer response.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 409), response.status);
+            var diagnostic = try std.json.parseFromSlice(struct { code: []const u8, transaction_status: []const u8, retryable: bool }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+            defer diagnostic.deinit();
+            try std.testing.expectEqualStrings("40001", diagnostic.value.code);
+            try std.testing.expectEqualStrings("failed", diagnostic.value.transaction_status);
+            try std.testing.expect(diagnostic.value.retryable);
+            try sql(ctx, &self.connection, "ROLLBACK");
+            try expectSessionRows(ctx, null, "SELECT id::text AS id,status FROM cut_right", &.{&.{ "00000000-0000-0000-0000-000000000001", "outside" }});
+            try expectSessionRows(ctx, null, "SELECT _id AS id,_doc->>'status' AS status FROM cut_docs ORDER BY _id", &.{ &.{ "doc:before", "before" }, &.{ "doc:one", "outside" } });
+        }
+    };
+    try fixture.runWithState(SnapshotCampaign, .{});
+}
+
 fn constraintTimingCampaign(only: ?[]const u8, expected_ids: []const []const u8) !void {
     const Golden = struct { format: u8, campaigns: []const SessionGolden };
     const bytes = local.sql_parity_fixtures.constraint_timing_reference;

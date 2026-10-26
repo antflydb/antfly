@@ -991,6 +991,9 @@ pub const Session = struct {
     terminal_abort_reason: ?CommitConflictReason = null,
     /// Private immutable accepted-lake cuts. Savepoint rollback deliberately
     /// leaves these transaction read cuts intact.
+    // Live capability is intentionally absent from durable session encoding.
+    // A locked session recovered without it fails rather than recapturing.
+    native_sql_cut: ?*@import("sql_retained_snapshot.zig").Shared = null,
     lake_cuts: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
     setting_active: SettingEntries = .empty,
@@ -1007,6 +1010,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session, alloc: std.mem.Allocator) void {
+        if (self.native_sql_cut) |cut| cut.release();
         self.sequence_state.deinit(alloc);
         if (self.sql) |*metadata| metadata.deinit(alloc);
         if (self.principal) |principal| alloc.free(principal);
@@ -1039,6 +1043,7 @@ pub const Session = struct {
             .terminal_abort_reason = self.terminal_abort_reason,
         };
         errdefer out.deinit(alloc);
+        out.native_sql_cut = if (self.native_sql_cut) |cut| cut.retain() else null;
         out.sequence_epoch = self.sequence_epoch;
         out.sequence_state = try self.sequence_state.clone(alloc);
         if (self.sql) |metadata| out.sql = try metadata.clone(alloc);
@@ -1733,6 +1738,9 @@ pub const SessionLeaseStore = struct {
 pub const SessionRegistry = struct {
     const session_lock_count = 64;
 
+    snapshot_retirement: @import("sql_retained_snapshot.zig").Retirement = .{},
+    snapshot_renew_offset: std.atomic.Value(usize) = .init(0),
+
     mutex: AtomicMutex = .{},
     session_locks: [session_lock_count]AtomicMutex = @as([session_lock_count]AtomicMutex, @splat(.{})),
     // Record locks protect individual durable mutations. Execution ownership
@@ -1754,9 +1762,11 @@ pub const SessionRegistry = struct {
 
     pub const CommitExecution = struct {
         lock: *AtomicMutex,
+        retirement: *@import("sql_retained_snapshot.zig").Retirement,
 
         pub fn release(self: CommitExecution) void {
             self.lock.unlock();
+            self.retirement.drain();
         }
     };
 
@@ -1766,7 +1776,7 @@ pub const SessionRegistry = struct {
         // retry must yield through its caller's Io as well, including under
         // cooperative execution, and must remain cancellable.
         while (!lock.inner.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
-        return .{ .lock = lock };
+        return .{ .lock = lock, .retirement = &self.snapshot_retirement };
     }
 
     /// Maintenance skips live requests instead of waiting on their execution.
@@ -1774,7 +1784,7 @@ pub const SessionRegistry = struct {
     pub fn tryAcquireCommitExecution(self: *SessionRegistry, txn_id: db_mod.types.TxnId) ?CommitExecution {
         const lock = self.commitLock(txn_id);
         if (!lock.inner.tryLock()) return null;
-        return .{ .lock = lock };
+        return .{ .lock = lock, .retirement = &self.snapshot_retirement };
     }
 
     fn commitLock(self: *SessionRegistry, txn_id: db_mod.types.TxnId) *AtomicMutex {
@@ -1811,6 +1821,7 @@ pub const SessionRegistry = struct {
         var it = self.sessions.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.sessions.deinit(alloc);
+        self.snapshot_retirement.drain();
         self.* = .{};
     }
 
@@ -2085,6 +2096,54 @@ pub const SessionRegistry = struct {
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
         errdefer candidate.deinit(alloc);
         if (candidate.sql) |*metadata| metadata.characteristics_locked = true else return error.SqlTransactionNotActive;
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, target, &candidate);
+    }
+
+    pub const NativeSqlCut = struct {
+        locked: bool,
+        cut: ?*@import("sql_retained_snapshot.zig").Shared,
+    };
+
+    /// Caller holds execution ownership, but no registry lock while using it.
+    pub fn nativeSqlCut(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !NativeSqlCut {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.sessions.getPtr(txn_id)) |session| {
+                const metadata = session.sql orelse return error.SqlTransactionNotActive;
+                if (metadata.failed) return error.SqlTransactionAborted;
+                if (session.native_sql_cut) |cut| if (cut.lost.load(.acquire)) return error.RetainedReadRestartRequired;
+                return .{ .locked = metadata.characteristics_locked, .cut = if (session.native_sql_cut) |cut| cut.retain() else null };
+            }
+        }
+        // Ordinary metadata reads intentionally do not populate this cache.
+        // A recovered first-query marker is evidence of a LOST cut, never an
+        // absent transaction or permission to capture a replacement snapshot.
+        var recovered = (try self.getSqlState(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        defer recovered.deinit(alloc);
+        if (recovered.metadata.failed) return error.SqlTransactionAborted;
+        return .{ .locked = recovered.metadata.characteristics_locked, .cut = null };
+    }
+
+    /// Publish the live capability before acknowledging the durable first-query
+    /// marker. A crash may lose the capability, never authorize a newer cut.
+    /// The caller retains ownership of its reference on all paths.
+    pub fn installNativeSqlCut(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, cut: *@import("sql_retained_snapshot.zig").Shared) !void {
+        const stripe = self.sessionLock(txn_id);
+        stripe.lock();
+        defer stripe.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        const metadata = if (candidate.sql) |*value| value else return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.SqlTransactionAborted;
+        if (metadata.characteristics_locked or candidate.native_sql_cut != null) return error.RetainedReadRestartRequired;
+        candidate.native_sql_cut = cut.retain();
+        metadata.characteristics_locked = true;
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
         try self.persistLocked(candidate);
         self.mutex.lock();
@@ -3254,6 +3313,7 @@ pub const SessionRegistry = struct {
     }
 
     pub fn cleanupExpired(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {
+        defer self.snapshot_retirement.drain();
         var expired_ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         defer expired_ids.deinit(alloc);
         if (self.durable) |durable| {
@@ -3328,12 +3388,14 @@ pub const SessionRegistry = struct {
     }
 
     pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
+        defer self.snapshot_retirement.drain();
         return self.removeMode(alloc, txn_id, false, false);
     }
 
     /// Preflight failure may race another commit retry. Never delete its
     /// durable decision/recovery handoff based on an earlier missing-plan read.
     pub fn removeBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
+        defer self.snapshot_retirement.drain();
         return self.removeMode(alloc, txn_id, true, false);
     }
 
@@ -3342,10 +3404,12 @@ pub const SessionRegistry = struct {
     /// share one durable transaction; failed preflight/rollback use the abort
     /// variant above and leave the idle overlay unchanged.
     pub fn commitBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
+        defer self.snapshot_retirement.drain();
         return self.removeMode(alloc, txn_id, true, true);
     }
 
     pub fn rollbackConnectionBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, connection_id: [32]u8) !void {
+        defer self.snapshot_retirement.drain();
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
@@ -3507,18 +3571,14 @@ pub const SessionRegistry = struct {
         try self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns);
     }
 
-    pub fn renewOwnedLeases(self: *SessionRegistry, owner_node_id: u64, now_ns: u64) !usize {
+    pub fn renewOwnedLeases(self: *SessionRegistry, alloc: std.mem.Allocator, owner_node_id: u64, now_ns: u64) !usize {
         var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
-        defer ids.deinit(self.durable.?.alloc);
+        defer ids.deinit(alloc);
         self.mutex.lock();
-        if (self.lease_store == null or self.owner_lease_ttl_ns == null or self.durable == null) {
-            self.mutex.unlock();
-            return 0;
-        }
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.owner_node_id != owner_node_id) continue;
-            ids.append(self.durable.?.alloc, entry.key_ptr.*) catch |err| {
+            ids.append(alloc, entry.key_ptr.*) catch |err| {
                 self.mutex.unlock();
                 return err;
             };
@@ -3529,13 +3589,37 @@ pub const SessionRegistry = struct {
         for (ids.items) |txn_id| {
             const session_lock = self.sessionLock(txn_id);
             session_lock.lock();
-            defer session_lock.unlock();
             self.mutex.lock();
             const still_owned = if (self.sessions.getPtr(txn_id)) |session| session.owner_node_id == owner_node_id else false;
             self.mutex.unlock();
-            if (!still_owned) continue;
-            try self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns);
+            if (!still_owned) {
+                session_lock.unlock();
+                continue;
+            }
+            self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns) catch |err| {
+                session_lock.unlock();
+                return err;
+            };
+            session_lock.unlock();
             renewed += 1;
+        }
+        // Renew durable coordinator leases first. Retained token maintenance
+        // gets a separate bounded pass, with rotation for fairness under load.
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
+        const first_index = if (ids.items.len == 0) 0 else self.snapshot_renew_offset.load(.monotonic) % ids.items.len;
+        for (0..ids.items.len) |offset| {
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) break;
+            const index = (first_index + offset) % ids.items.len;
+            self.snapshot_renew_offset.store(index + 1, .monotonic);
+            const txn_id = ids.items[index];
+            const execution = self.tryAcquireCommitExecution(txn_id) orelse continue;
+            defer execution.release();
+            const state = self.nativeSqlCut(alloc, txn_id) catch continue;
+            if (state.cut) |cut| {
+                defer cut.release();
+                // Loss is local to this cut and never recaptures newer data.
+                cut.renew(deadline) catch {};
+            }
         }
         return renewed;
     }
@@ -5388,6 +5472,58 @@ fn decodeAbortReason(value: ?std.json.Value, aborted: bool) !?CommitConflictReas
     if (item == .null) return null;
     if (!aborted or item != .string) return error.InvalidTransactionSessionRecord;
     return std.meta.stringToEnum(CommitConflictReason, item.string) orelse error.InvalidTransactionSessionRecord;
+}
+
+test "distributed txn SQL retained cut survives candidates and savepoints but never durable recovery" {
+    _ = @import("sql_retained_snapshot.zig");
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        closed: usize = 0,
+        fn open(_: *anyopaque, _: std.mem.Allocator, _: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
+            return error.TestUnexpectedResult;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closed += 1;
+        }
+    };
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "system/sql-native-cut" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(a, &store);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(a);
+    var fixture: Fixture = .{};
+    const info = try registry.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .repeatable_read, .mode = .read_only } }, 7, "alice");
+    const point = (try registry.createSavepoint(a, info.txn_id)).?;
+    const cut = try @import("sql_retained_snapshot.zig").Shared.create(a, .{ .ptr = &fixture, .vtable = &.{ .open = Fixture.open, .close = Fixture.close } }, &registry.snapshot_retirement);
+    defer cut.release();
+    defer registry.snapshot_retirement.drain();
+    durable.fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, registry.installNativeSqlCut(a, info.txn_id, cut));
+    durable.fail_writes_for_test = false;
+    const before = try registry.nativeSqlCut(a, info.txn_id);
+    try std.testing.expect(!before.locked and before.cut == null);
+    try registry.installNativeSqlCut(a, info.txn_id, cut);
+    _ = try registry.rollbackToSavepoint(a, info.txn_id, point.savepoint_id);
+    const pinned = try registry.nativeSqlCut(a, info.txn_id);
+    try std.testing.expect(pinned.locked and pinned.cut.? == cut);
+    pinned.cut.?.release();
+    var recovered = (try durable.load(info.txn_id)).?;
+    defer recovered.deinit(a);
+    try std.testing.expect(recovered.sql.?.characteristics_locked);
+    try std.testing.expect(recovered.native_sql_cut == null);
+    var reopened = SessionRegistry.init(&durable);
+    defer reopened.deinit(a);
+    const cold = try reopened.nativeSqlCut(a, info.txn_id);
+    try std.testing.expect(cold.locked and cold.cut == null);
+    try std.testing.expectEqual(@as(usize, 0), reopened.sessions.count());
+    try std.testing.expectError(error.RetainedReadRestartRequired, reopened.installNativeSqlCut(a, info.txn_id, cut));
+    try std.testing.expectError(error.RetainedReadRestartRequired, registry.installNativeSqlCut(a, info.txn_id, cut));
+    try std.testing.expectEqual(0, fixture.closed);
+    try std.testing.expect(registry.remove(a, info.txn_id));
+    try std.testing.expectEqual(0, fixture.closed);
 }
 
 test "distributed txn SQL characteristics survive faults reopen and savepoint rollback" {
@@ -7588,7 +7724,7 @@ test "transaction session registry can renew owned leases opportunistically" {
 
     const initial = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
     const renewed_now = initial.lease_expires_at + 2 * std.time.ns_per_ms;
-    try std.testing.expectEqual(@as(usize, 1), try registry.renewOwnedLeases(21, renewed_now));
+    try std.testing.expectEqual(@as(usize, 1), try registry.renewOwnedLeases(std.testing.allocator, 21, renewed_now));
     const renewed = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expect(renewed.lease_expires_at > initial.lease_expires_at);
 }

@@ -183,7 +183,7 @@ pub const Client = struct {
         const route = try alloc.dupe(u8, self.route);
         errdefer alloc.free(route);
         snapshot.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = token, .connection = self.connection };
-        return .{ .ptr = snapshot, .vtable = &.{ .open = openSnapshot, .release = close } };
+        return .{ .ptr = snapshot, .vtable = &.{ .renew = renewRetainedSnapshot, .open = openSnapshot, .release = close } };
     }
 
     fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
@@ -191,8 +191,17 @@ pub const Client = struct {
         return self.openKind(alloc, from, to, opts, false);
     }
 
+    fn renewRetainedSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !void {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        self.deadline_ns = deadline_ns orelse self.executor.monotonicNs() +| 5 * std.time.ns_per_s;
+        try self.renewSnapshot(rpc.max_lease_ms);
+    }
+
     fn openSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
         const self: *Client = @ptrCast(@alignCast(ptr));
+        if (opts.cancellation) |token| try token.check();
+        // Forks use the current statement budget, never a stale capture budget.
+        self.deadline_ns = opts.execution_deadline_ns orelse self.executor.monotonicNs() +| 30 * std.time.ns_per_s;
         return self.openKind(alloc, from, to, opts, true);
     }
 

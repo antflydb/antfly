@@ -20000,6 +20000,61 @@ pub const RaftApplyStore = struct {
         }, .{});
     }
 
+    /// One catalog transaction across every namespace, including legacy
+    /// default-public bindings. The limit is checked before reading schemas.
+    pub fn sqlSnapshotCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, database: []const u8) ![]u8 {
+        try system_catalog.validateName(database);
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = try system_catalog_storage.readMeta(a, &txn, group_id) };
+        const db = (try view.lookup(.database, 0, database)) orelse return error.DatabaseNotFound;
+        const namespaces = try view.children(.namespace, db.id, 257);
+        if (namespaces.len > 256) return error.SqlProgramLimitExceeded;
+        var ids: std.ArrayList(u64) = .empty;
+        for (namespaces) |namespace| {
+            for (try view.children(.table, namespace.id, 257 - ids.items.len)) |binding| {
+                try ids.append(a, binding.id);
+                if (ids.items.len > 256) return error.SqlProgramLimitExceeded;
+            }
+        }
+        if (db.id == system_catalog.default_database_id) {
+            const prefix = try legacyListingPrefix(a, group_id);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(prefix);
+            while (row) |kv| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+                if (kv.value.len != 8) return error.InvalidDerivedCatalogIndex;
+                const id = std.mem.readInt(u64, kv.value[0..8], .little);
+                if (std.mem.indexOfScalar(u64, ids.items, id) != null) return error.InvalidDerivedCatalogIndex;
+                try ids.append(a, id);
+                if (ids.items.len > 256) return error.SqlProgramLimitExceeded;
+            }
+        }
+        const Result = @import("../../system_catalog/server_call.zig").SqlSnapshotCohort;
+        const tables = try a.alloc(@typeInfo(@FieldType(Result, "tables")).pointer.child, ids.items.len);
+        var header_arena = std.heap.ArenaAllocator.init(alloc);
+        defer header_arena.deinit();
+        for (ids.items, tables) |id, *table| {
+            _ = header_arena.reset(.retain_capacity);
+            const temporary = header_arena.allocator();
+            var buf: [160]u8 = undefined;
+            const bytes = try txn.get(try tableKeyForGroup(&buf, group_id, id));
+            const header = try borrowTableProjection(bytes, .schema);
+            const schema_json = header.query_definition.?.schema_json;
+            if (header.table_id != id) return error.InvalidCatalogRecord;
+            // A restore has not published a readable cut yet.
+            if (header.restore_pending) return error.ReadUnavailable;
+            const SchemaHeader = struct { version: u32 = 0, base_source: ?struct { kind: []const u8 } = null };
+            const schema_header = if (schema_json.len == 0) SchemaHeader{} else try std.json.parseFromSliceLeaky(SchemaHeader, temporary, schema_json, .{ .ignore_unknown_fields = true });
+            table.* = .{ .id = id, .table = try a.dupe(u8, header.name), .schema_version = schema_header.version, .external = if (schema_header.base_source) |source| std.mem.eql(u8, source.kind, "external") else false };
+        }
+        return std.json.Stringify.valueAlloc(alloc, Result{ .revision = view.meta.revision, .tables = tables }, .{});
+    }
+
     pub fn listSystemCatalogTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, input: system_catalog.TableList) ![]u8 {
         var request = input;
         const projection = @import("../../system_catalog/projection.zig");
@@ -39772,6 +39827,7 @@ fn decodeTableQueryProjection(alloc: std.mem.Allocator, encoded: []const u8, inc
 
 const TableProjectionMode = enum { identity, schema, query };
 const BorrowedTableProjection = struct {
+    restore_pending: bool = false,
     table_id: u64,
     name: []const u8,
     query_definition: ?system_catalog.QueryDefinition,
@@ -39824,7 +39880,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
     if (count != 5 and count != 6 and count != 8) return error.InvalidMetadataTransitionEncoding;
-    return .{ .table_id = table_id, .name = name, .schema_reader_requirements = reader_requirements, .full_text_read_index = full_text_read_index, .query_definition = if (mode != .identity) system_catalog.QueryDefinition{
+    return .{ .restore_pending = count == 8 and fields[6].len != 0, .table_id = table_id, .name = name, .schema_reader_requirements = reader_requirements, .full_text_read_index = full_text_read_index, .query_definition = if (mode != .identity) system_catalog.QueryDefinition{
         .full_text_read_index = if (mode == .query) full_text_read_index else null,
         .table_id = table_id,
         .storage_engine = storage.engine,

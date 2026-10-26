@@ -1930,6 +1930,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.exportStandalonePortableCatalog(a) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .sql_snapshot_cohort => |database| {
+                    const value = handle.store.sqlSnapshotCohort(a, group_id, database) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .catalog_list_tables => |input| {
                     const value = handle.store.listSystemCatalogTables(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -6703,6 +6707,10 @@ pub const StorageRelationalRead = struct {
             if (!opts.include_range_proofs) return error.SqlRangeTrackingRequired;
             const query = opts.relational_query orelse return error.SqlStatementSnapshotRequired;
             if (query.index != null or query.auto_index) return error.SqlStatementSnapshotRequired;
+            if (self.read.document) {
+                const session = try self.db.openDocumentReadSessionAtSnapshot(alloc, from, to, opts, &self.read);
+                return .{ .ptr = session, .vtable = &.{ .next = StorageRelationalRead.nextDocument, .close = StorageRelationalRead.closeDocument, .normalize = StorageRelationalRead.normalizeDocument, .range_proofs = StorageRelationalRead.documentRangeProofs } };
+            }
             const session = try self.db.openRelationalReadSessionAtSnapshot(alloc, from, to, opts, &self.read);
             return .{ .ptr = session, .vtable = &.{ .next = StorageRelationalRead.next, .close = StorageRelationalRead.close, .normalize = StorageRelationalRead.normalize, .range_proofs = StorageRelationalRead.rangeProofs } };
         }

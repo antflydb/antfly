@@ -3677,6 +3677,7 @@ pub const DB = struct {
         row_policy_catalog_epoch: u64 = 0,
         read: docstore_mod.DocStore.Txn,
         schema_version: u32,
+        document: bool = false,
 
         pub fn deinit(self: *@This()) void {
             if (comptime storage_engine.enabled) return storage_engine.call("relationalSnapshotDeinit", .{self}) catch @panic("incompatible storage owner");
@@ -3706,9 +3707,8 @@ pub const DB = struct {
         const policy_epoch = self.local_execution.row_policy_gate.catalog_epoch.load(.acquire);
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
-        defer view.release();
-        if (view.storageMode() != .relational) return error.RelationalTableRequired;
+        var view = self.core.acquireSchemaView();
+        defer if (view) |*schema| schema.release();
         var read = try self.core.store.beginReadTxn();
         errdefer read.abort();
         if (self.local_execution.row_policy_gate.currentPhase() != initial_phase or
@@ -3721,7 +3721,8 @@ pub const DB = struct {
             .row_policy_generation = policy_generation,
             .row_policy_catalog_epoch = policy_epoch,
             .read = read,
-            .schema_version = view.version(),
+            .schema_version = if (view) |schema| schema.version() else 0,
+            .document = view == null or view.?.storageMode() == .document,
         };
     }
 
@@ -42638,28 +42639,46 @@ pub const DB = struct {
 
     pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
         if (comptime storage_engine.enabled) return storage_engine.call("openDocumentReadSession", .{ self, alloc, from_key, to_key, opts });
+        return self.openDocumentReadSessionAtSnapshot(alloc, from_key, to_key, opts, null);
+    }
+
+    pub fn openDocumentReadSessionAtSnapshot(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*RelationalStatementSnapshot) !*DocumentReadSession {
+        if (comptime storage_engine.enabled) return storage_engine.call("openDocumentReadSessionAtSnapshot", .{ self, alloc, from_key, to_key, opts, statement });
+        if (statement) |cut| if (!cut.document) return error.PreparedGenerationChanged;
         if (opts.relational_query_json.len > 1024 * 1024) return error.InvalidRelationalRowsRequest;
         if (opts.relational_query) |input| {
-            if (input.text_filter) |text| return self.openDocumentTextReadSession(alloc, from_key, to_key, opts, text);
+            if (input.text_filter) |text| {
+                if (statement != null) return error.SqlStatementSnapshotRequired;
+                return self.openDocumentTextReadSession(alloc, from_key, to_key, opts, text);
+            }
         } else if (opts.relational_query_json.len != 0) {
             var parsed = try std.json.parseFromSlice(types.RelationalRowQuery, alloc, opts.relational_query_json, .{});
             defer parsed.deinit();
-            if (parsed.value.text_filter) |text| return self.openDocumentTextReadSession(alloc, from_key, to_key, opts, text);
+            if (parsed.value.text_filter) |text| {
+                if (statement != null) return error.SqlStatementSnapshotRequired;
+                return self.openDocumentTextReadSession(alloc, from_key, to_key, opts, text);
+            }
         }
         try self.maybeFinalizePendingRowPolicyPublication();
-        var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
+        var row_policy_lease = if (statement) |cut| blk: {
+            if (cut.row_policy_phase != .disabled) return error.RowPolicyAuthenticationRequired;
+            const lease = if (cut.row_policy_lease) |*active| active else return error.RowPolicyAuthenticationRequired;
+            break :blk lease.clone();
+        } else try self.local_execution.row_policy_gate.enterRawRead();
         errdefer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         var locked = true;
         defer if (locked) self.core.unlockApplyShared();
         var schema = self.core.acquireSchemaView();
         defer if (schema) |*view| view.release();
+        if (schema) |view| if (view.storageMode() != .document) return error.PreparedGenerationChanged;
+        if (statement) |cut| if (cut.schema_version != (if (schema) |view| view.version() else @as(u32, 0))) return error.PreparedGenerationChanged;
         const borrowed = self.core.byteRange();
         const start = try alloc.dupe(u8, borrowed.start);
         defer alloc.free(start);
         const end = try alloc.dupe(u8, borrowed.end);
         defer alloc.free(end);
-        const txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        const txn = if (statement) |cut| try cut.read.forkRead() else try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
         const now = currentTimeNs();
         self.core.unlockApplyShared();
         locked = false;

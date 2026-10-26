@@ -25557,7 +25557,11 @@ pub const HostedProvisionedTableWriteSource = struct {
             // Preserve the local owner's declared preparation capability.
             // Remote hosted commits use native owner preparation.
             .prepares_rows_atomically = if (self.groupLocalWriteSource()) |local| local.prepares_rows_atomically else true,
+            // Coordinator capability is independent of an optional local leaf.
+            // Each selected owner must still acknowledge routed activation.
+            .supports_sql_range_guards = true,
             .vtable = &.{
+                .activate_range_tracking = activateRangeTracking,
                 .drop_table = dropTable,
                 .create_index = createIndex,
                 .put_artifact_enrichment = putArtifactEnrichment,
@@ -25609,6 +25613,56 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
+    }
+
+    /// The marker is an owner-routed Raft command, not an empty grouped
+    /// mutation. Every selected range must acknowledge its exact catalog fence
+    /// before a coordinator can publish retained reads under range protection.
+    fn activateRangeTracking(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const normalized = try context.platformDeadline();
+        try normalized.ensureActive();
+        const route_options: db_mod.types.ScanOptions = .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation };
+        const router = self.router.withBudget(.fromRequest(route_options));
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(alloc, self.catalog, table, self.catalog.deadlineFrom(.{ .deadline_ns = normalized.deadline_ns }))) orelse return error.TableNotFound;
+        defer routing.deinit(alloc);
+        if (!routing.coversKeyspace() or routing.ranges.len > 256) return error.CatalogGenerationChanged;
+        // A local native owner already has the Raft routing coordinator. Let
+        // it cover the complete cohort once, rather than recursively activate
+        // every table range for each local participant or bypass its admission.
+        for (routing.ranges) |range| {
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, range.group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+            defer route.deinit(alloc);
+            if (route == .local) {
+                const local = self.groupLocalWriteSource() orelse return error.SqlRangeTrackingRequired;
+                if (!local.supports_sql_range_guards) return error.SqlRangeTrackingRequired;
+                return local.activateRangeTracking(alloc, table, normalized);
+            }
+        }
+        var client = self.httpClient(alloc);
+        const body = try encodeRemoteBatchRequest(alloc, .{ .activate_range_tracking = true });
+        defer alloc.free(body);
+        var cancellation = http_common.RequestCancellation.fromToken(normalized.cancellation);
+        for (routing.ranges) |range| {
+            try normalized.ensureActive();
+            const selected = routing.resolveRouteForKey(range.start_key) orelse return error.CatalogGenerationChanged;
+            const fence = routing.fenceForRoute(selected);
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, range.group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+            defer route.deinit(alloc);
+            const remote = switch (route) {
+                .remote => |remote| remote,
+                .local => return error.TopologyChanged,
+            };
+            const encoded = try std.json.Stringify.valueAlloc(alloc, fence, .{});
+            defer alloc.free(encoded);
+            const timeout = @min(try normalized.remainingTimeoutMs() orelse internal_batch_forwarding.max_remaining_ms, internal_batch_forwarding.max_remaining_ms);
+            var response = try client.fetchGroupBatchWithForwarding(remote.base_uri, range.group_id, table, body, timeout, .{
+                .remaining_ms = timeout,
+                .forwards_remaining = internal_batch_forwarding.max_forwards,
+                .campaign_allowed = true,
+            }, if (normalized.cancellation.ptr != null) &cancellation else null, encoded);
+            response.deinit(alloc);
+        }
     }
 
     fn graphMetricMaintenanceGroupLocal(

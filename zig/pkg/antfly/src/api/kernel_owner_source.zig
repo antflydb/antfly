@@ -6257,16 +6257,44 @@ pub const ProvisionedKernelOwnerSource = struct {
         deadline_ns: ?u64,
         frozen_proof: read_gate.ReadSafetyBarrier.FrozenProof,
 
-        fn check(self: *@This()) !void {
+        fn check(self: *@This(), request: db_types.ScanOptions) !void {
             if (self.cancellation) |token| try token.check();
-            if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
-            try self.source.validateRoutedRead(self.alloc, self.route, self.group, self.table);
-            const validate = self.source.read_safety_barrier.vtable.validate_frozen orelse return error.SqlStatementSnapshotRequired;
-            try validate(self.source.read_safety_barrier.ptr, self.group, self.frozen_proof, self.deadline_ns, self.cancellation orelse .none);
+            const now = platform_time.monotonicNs();
+            if (self.deadline_ns) |deadline| if (now >= deadline) return error.DeadlineExceeded;
+            if (request.cancellation) |token| try token.check();
+            const deadline = @min(request.execution_deadline_ns orelse std.math.maxInt(u64), now +| 5 * std.time.ns_per_s);
+            var route = self.route;
+            route.admission_deadline_ns = deadline;
+            route.admission_cancellation = request.cancellation orelse .none;
+            const certify = self.source.read_safety_barrier.vtable.certify_completed_prefix orelse return error.SqlStatementSnapshotRequired;
+            var budget = self.source.catalog.budget(self.source.catalog.deadlineFrom(.{ .deadline_ns = deadline }));
+            while (true) {
+                if (request.cancellation) |token| try token.check();
+                budget.checkpoint() catch {
+                    if (request.execution_deadline_ns) |requested| if (platform_time.monotonicNs() >= requested) return error.DeadlineExceeded;
+                    return error.ReadUnavailable;
+                };
+                // A historical root holds no mutation fence. Retry only pure
+                // authority checks which could not obtain the Raft mutex or
+                // a completed quorum prefix. Never replace the retained root,
+                // replay a page, or retry a changed term/incarnation/topology.
+                self.source.validateRoutedRead(self.alloc, route, self.group, self.table) catch |err| {
+                    if (err != error.ReadUnavailable) return err;
+                    budget.sleepNs(std.time.ns_per_ms) catch return error.ReadUnavailable;
+                    continue;
+                };
+                const completed = certify(self.source.read_safety_barrier.ptr, self.group, self.frozen_proof.term, self.frozen_proof.applied_index, deadline, request.cancellation orelse .none) catch |err| {
+                    if (err != error.ReadUnavailable) return err;
+                    budget.sleepNs(std.time.ns_per_ms) catch return error.ReadUnavailable;
+                    continue;
+                };
+                try self.frozen_proof.validateRetained(completed);
+                return;
+            }
         }
         fn open(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan) !table_read_source.RelationalReadView {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.check();
+            try self.check(input.opts);
             if (!std.mem.eql(u8, input.table, self.table)) return error.SqlStatementSnapshotRequired;
             if (!input.opts.include_range_proofs) return error.SqlRangeTrackingRequired;
             var opts = input.opts;
@@ -6276,7 +6304,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             errdefer lease.deinit();
             const view = try self.native.open(alloc, input.from, input.to, opts);
             errdefer view.deinit();
-            try self.check();
+            try self.check(input.opts);
             const retained = try alloc.create(RetainedRelationalRead);
             retained.* = .{ .alloc = alloc, .lease = lease, .view = view };
             return .{ .text_filter_digest = view.text_filter_digest, .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };

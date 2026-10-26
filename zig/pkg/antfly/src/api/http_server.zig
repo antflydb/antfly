@@ -13474,11 +13474,10 @@ pub const ApiHttpServer = struct {
     }
 
     fn maybeRenewOwnedSessionLeases(self: *ApiHttpServer) !void {
-        const ttl_ns = self.cfg.session_owner_lease_ttl_ns orelse return;
-        _ = ttl_ns;
-        const interval_ns = self.cfg.session_owner_lease_renew_interval_ns orelse return;
+        // Native snapshot tokens need renewal even without transferable
+        // session-owner leases (including the standalone coordinator).
+        const interval_ns = @min(self.cfg.session_owner_lease_renew_interval_ns orelse 5 * std.time.ns_per_s, 5 * std.time.ns_per_s);
         const owner_node_id = self.localSessionNodeId();
-        if (owner_node_id == 0) return;
         const schedule_now_ns = platform_time.monotonicNs();
         const previous_ns = self.last_session_lease_renew_ns.load(.acquire);
         if (previous_ns != 0 and schedule_now_ns -| previous_ns < interval_ns) return;
@@ -13486,7 +13485,7 @@ pub const ApiHttpServer = struct {
         // Lease expirations are durable and compared across processes, so they
         // must use the Unix realtime epoch. Monotonic time is only valid for
         // deciding when this process should run another renewal pass.
-        _ = self.txn_sessions.renewOwnedLeases(owner_node_id, platform_time.realtimeNs()) catch |err| switch (err) {
+        _ = self.txn_sessions.renewOwnedLeases(self.alloc, owner_node_id, platform_time.realtimeNs()) catch |err| switch (err) {
             error.SessionLeaseLost => return,
             else => return err,
         };

@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [21]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [22]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -274,6 +274,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api.sql_catalog",
         "api.sql_truncate",
         "api.sql_schema_cache",
+        "api.sql_retained_snapshot",
         "SQL typed mutation boundary",
         "SQL JSON null metadata",
         "SQL session metadata",
@@ -1692,6 +1693,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     retained_snapshot_run.addArg("--require-no-skips");
     b.step("antfly-api-retained-snapshot-test", "Verify retained snapshot lifetimes, authenticated renewal and ambiguous transport cleanup")
         .dependOn(&retained_snapshot_run.step);
+    const snapshot_cohort_run = addFilteredTestRunArtifactWithRuntimeFilters(b, api_table_reads_linked_tests.executable, &.{"relational row query full-key index proof requires every routed owner"});
+    snapshot_cohort_run.addArg("--require-no-skips");
+    b.step("antfly-api-snapshot-cohort-test", "Verify snapshot capture retry, proof cleanup and point-owner pruning").dependOn(&snapshot_cohort_run.step);
     const statement_capture_retry_run = b.addRunArtifact(api_table_reads_linked_tests.executable);
     @import("../../../build_support/antfly/test_support.zig").configureTestRun(statement_capture_retry_run);
     statement_capture_retry_run.addArgs(&.{ "--test-filter", "relational statement retries unavailable capture and releases fences before pages or deadline" });
@@ -2235,10 +2239,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original covering constraints publish atomic native payloads and cold enforcement",
             "mounted SQL named FK and CHECK timing preserves schema epochs",
             "mounted SQL original transaction characteristics retain snapshots and savepoint modes",
+            "mounted SQL transaction cohort pins unseen tables document roots savepoints and rejects cold recapture",
             "mounted SQL original document CREATE shares native schemas writes and cold recovery",
             "mounted SQL original tablespace names preserve bound owners deletion guards and restart",
             "distributed txn SQL characteristics survive faults reopen and savepoint rollback",
             "distributed txn SQL recovery decodes into the registry allocator without adopting store memory",
+            "distributed txn SQL retained cut survives candidates and savepoints but never durable recovery",
+            "SQL retained snapshots retire outside registry locks and close exactly once",
+            "SQL retained snapshot certification preserves capture fences and accepts completed history",
             "distributed txn terminal constraint abort survives durable reopen and failed persistence",
             "distributed txn session timing observations preserve borrowed staged row ownership",
             "SQL session observations retry only pure active reads without mutation outcomes",
@@ -2354,12 +2362,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-sql-tablespace-lifecycle-test", "Run original tablespace names through bound native owners and cold recovery").dependOn(&tablespace_run.step);
     const characteristics_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{
         "mounted SQL original transaction characteristics retain snapshots and savepoint modes",
+        "mounted SQL transaction cohort pins unseen tables document roots savepoints and rejects cold recapture",
         "distributed txn SQL characteristics survive faults reopen and savepoint rollback",
         "distributed txn SQL recovery decodes into the registry allocator without adopting store memory",
+        "distributed txn SQL retained cut survives candidates and savepoints but never durable recovery",
+        "SQL retained snapshots retire outside registry locks and close exactly once",
+        "SQL retained snapshot certification preserves capture fences and accepts completed history",
     });
     const characteristics_unit_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{
         "distributed txn SQL characteristics survive faults reopen and savepoint rollback",
         "distributed txn SQL recovery decodes into the registry allocator without adopting store memory",
+        "distributed txn SQL retained cut survives candidates and savepoints but never durable recovery",
+        "SQL retained snapshots retire outside registry locks and close exactly once",
+        "SQL retained snapshot certification preserves capture fences and accepts completed history",
     });
     characteristics_unit_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-transaction-characteristics-unit-test", "Verify durable characteristic fences, recovery allocators and safe-snapshot nonadmission").dependOn(&characteristics_unit_run.step);
@@ -2926,7 +2941,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run },
+        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, characteristics_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

@@ -633,6 +633,10 @@ fn openDocumentReadSession(self: *DB, alloc: std.mem.Allocator, from_key: []cons
     return .{ .value = self.openDocumentReadSession(alloc, from_key, to_key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn openDocumentReadSessionAtSnapshot(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot) engine.Outcome(*DB.DocumentReadSession) {
+    return .{ .value = self.openDocumentReadSessionAtSnapshot(alloc, from_key, to_key, opts, statement) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot) engine.Outcome(*DB.RelationalReadSession) {
     return .{ .value = self.openRelationalReadSessionAtSnapshot(alloc, from_key, to_key, opts, statement) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

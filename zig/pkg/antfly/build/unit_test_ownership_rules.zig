@@ -166,6 +166,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "api.sql_execution.test.",
             "api.sql_pgwire.test.",
             "api.sql_schema_cache.test.",
+            "api.sql_retained_snapshot.test.",
             "api.sql_session.test.",
             "api.transactions.test.SQL",
             "metadata.http_server.test.",

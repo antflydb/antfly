@@ -398,6 +398,9 @@ pub const RaftApplyStore = struct {
     pub fn projectHotStandbyCheckpointCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, checkpoint: @import("hot_standby/metadata_effects.zig").CheckpointArtifact) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_checkpoint_projection = checkpoint });
     }
+    pub fn sqlSnapshotCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, database: []const u8) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_snapshot_cohort = database });
+    }
     pub fn listSystemCatalogTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.TableList) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_list_tables = request });
     }

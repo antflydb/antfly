@@ -69,7 +69,15 @@ pub const RelationDescriptionMutation = struct {
     }
 };
 
+/// Private bounded discovery for a native transaction visibility cut. Rows,
+/// index payloads and policy definitions never cross this metadata boundary.
+pub const SqlSnapshotCohort = struct {
+    revision: u64,
+    tables: []const struct { id: u64, table: []const u8, schema_version: u32, external: bool },
+};
+
 pub const Call = union(enum) {
+    sql_snapshot_cohort: struct { database: []const u8 },
     resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
     lake_index_lifecycle_read: u64,
     lake_index_lifecycle_work: ?u64,

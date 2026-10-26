@@ -533,7 +533,8 @@ pub const Adapter = struct {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
-            if ((compiled.statement == .merge or captured_conflict or deferred_conflict) and transaction.isolation == .read_committed) return zig017_failure: {
+            const statement_guards = compiled.statement == .merge or captured_conflict or deferred_conflict;
+            if (statement_guards and !supportsRangeGuards(self.server)) return zig017_failure: {
                 zig017_return_error = error.SqlRangeTrackingRequired;
                 break :zig017_failure error.SqlRangeTrackingRequired;
             };
@@ -549,6 +550,14 @@ pub const Adapter = struct {
                     break :zig017_failure error.SqlWriteCapacityUnavailable;
                 };
                 defer execution_lease.release();
+                const transaction_cut = if (transaction.isolation != .read_committed)
+                    self.pinTransactionSnapshot(id) catch |err| {
+                        zig017_return_error = err;
+                        return err;
+                    }
+                else
+                    null;
+                defer if (transaction_cut) |cut| cut.release();
                 self.server.txn_sessions.lockSqlCharacteristics(self.server.alloc, id) catch |err| {
                     zig017_return_error = err;
                     return err;
@@ -579,7 +588,7 @@ pub const Adapter = struct {
                 defer staged.deinit(alloc);
                 var read_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
                 defer read_guards.deinit(self.server.alloc);
-                self.range_reads = if (transaction.isolation != .read_committed) &read_guards else null;
+                self.range_reads = if (transaction.isolation != .read_committed or statement_guards) &read_guards else null;
                 self.ranges_staged = false;
                 self.active_transaction = id;
                 self.active_write_version = transaction.write_version;
@@ -607,7 +616,11 @@ pub const Adapter = struct {
                 defer if (dynamic) |snapshot| snapshot.deinit();
                 var dynamic_scratch = std.heap.ArenaAllocator.init(alloc);
                 defer dynamic_scratch.deinit();
-                if (deferred_conflict) {
+                if (transaction_cut) |cut| {
+                    self.dynamic_snapshot = &cut.snapshot;
+                    self.dynamic_table = null;
+                }
+                if (deferred_conflict and transaction_cut == null) {
                     const table = (resolve(self, dynamic_scratch.allocator(), compiled.statement.insert.table, .read_write) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
@@ -654,7 +667,7 @@ pub const Adapter = struct {
                 if (guarded_backend != null) {
                     active_backend.atomic_statement_read_set = self.range_reads != null;
                     active_backend.coordinated_point_reads = self.range_reads != null;
-                    active_backend.coordinated_index_reads = self.range_reads != null and staged.tables.len == 0;
+                    active_backend.coordinated_index_reads = self.dynamic_snapshot == null and self.range_reads != null and staged.tables.len == 0;
                     active_backend.dynamic_statement_read_set = self.dynamic_snapshot != null;
                 }
                 var output = (@import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), active_backend, compiled, parameters, limits) catch |zig017_err| {
@@ -736,7 +749,7 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
+        return .{ .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -1891,9 +1904,44 @@ pub const Adapter = struct {
         }
     };
 
+    /// Called under the session execution lease before its first query is
+    /// acknowledged. Even a scalar query fixes the cut for later table reads.
+    pub fn pinTransactionSnapshot(self: *Adapter, id: db_types.TxnId) !*@import("sql_retained_snapshot.zig").Shared {
+        const registry = &self.server.txn_sessions;
+        const state = try registry.nativeSqlCut(self.server.alloc, id);
+        if (state.cut) |cut| return cut;
+        if (state.locked) return error.RetainedReadRestartRequired;
+        var scratch = std.heap.ArenaAllocator.init(self.server.alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const bytes = try self.server.source.systemCatalog(a, self.context, .{ .sql_snapshot_cohort = .{ .database = self.database } });
+        const cohort = try std.json.parseFromSliceLeaky(@import("../system_catalog/server_call.zig").SqlSnapshotCohort, a, bytes, .{ .allocate = .alloc_always });
+        if (cohort.tables.len > 256) return error.SqlProgramLimitExceeded;
+        if (self.revision) |revision| if (revision != cohort.revision) return error.CatalogGenerationChanged;
+        self.revision = cohort.revision;
+        const reads = self.server.table_reads orelse return error.SqlStatementSnapshotRequired;
+        const writes = self.server.table_writes orelse return error.SqlRangeTrackingRequired;
+        var targets: std.ArrayList(@import("antfly_local_sources").api_table_read_source.RelationalSnapshotTarget) = .empty;
+        for (cohort.tables) |table| {
+            try self.context.ensureActive();
+            // External reads retain their existing committed/accepted token
+            // admission. They are never opened from this native root vector.
+            if (table.external) continue;
+            try targets.append(a, .{ .table = table.table, .schema_version = table.schema_version, .table_id = table.id });
+            try writes.activateRangeTracking(a, table.table, self.context);
+        }
+        const snapshot = reads.openRelationalSnapshotCohort(self.server.alloc, targets.items, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns) catch |err| return physicalReadAdmissionError(err);
+        const shared = @import("sql_retained_snapshot.zig").Shared.create(self.server.alloc, snapshot, &registry.snapshot_retirement) catch |err| {
+            snapshot.deinit();
+            return err;
+        };
+        errdefer shared.release();
+        try registry.installNativeSqlCut(self.server.alloc, id, shared);
+        return shared;
+    }
+
     fn openDynamicStatement(self: *Adapter, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
         const snapshot = self.dynamic_snapshot orelse return error.SqlStatementSnapshotRequired;
-        const bound_table = self.dynamic_table orelse return error.SqlStatementSnapshotRequired;
         const observed = self.range_reads orelse return error.SqlRangeTrackingRequired;
         if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;
         const retained = try alloc.create(DynamicStatementRead);
@@ -1921,7 +1969,8 @@ pub const Adapter = struct {
         const temporary = scratch.allocator();
         for (requests, views, wrappers, cursors) |request, *view, *wrapper, *cursor| {
             try self.context.ensureActive();
-            if (!std.mem.eql(u8, request.table.physical_name, bound_table)) return error.SqlStatementSnapshotRequired;
+            const bound_table = request.table.physical_name;
+            if (self.dynamic_table) |single| if (!std.mem.eql(u8, bound_table, single)) return error.SqlStatementSnapshotRequired;
             try self.verify(temporary, request.table);
             var query = request.request;
             // Dynamic retained cuts currently prove primary-key intervals.
@@ -1931,7 +1980,7 @@ pub const Adapter = struct {
             query.primary_order = true;
             const scan_request = try self.prepareScan(temporary, request.table, query);
             const guarded = snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }) catch |err| blk: {
-                if (err != error.SqlRangeTrackingRequired or retained.view_count != 0 or observed.tables.len != 0) return physicalReadAdmissionError(err);
+                if (self.dynamic_table == null or err != error.SqlRangeTrackingRequired or retained.view_count != 0 or observed.tables.len != 0) return physicalReadAdmissionError(err);
                 // Activate the capability before any row or absence has been
                 // observed, then replace the stale cut. Once a view exists we
                 // must never silently mix two cuts within one SQL statement.

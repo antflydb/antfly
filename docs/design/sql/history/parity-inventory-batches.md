@@ -1832,3 +1832,52 @@ allocating copies and verify final budget reclamation. Only the original cursor
 case receives disposition credit; supplemental protocol/domain probes add none.
 The qualified native Debug, protocol Debug and PostgreSQL gates are recorded in
 the inventory ledger. The remaining inventory report stays authoritative.
+
+
+## Native transaction cuts and isolation (2026-10-26)
+
+Originals `sql-0084` and `sql-0087` now pass their unchanged PostgreSQL
+transaction-characteristic campaigns through native durable sessions. This
+closes two source cases; supplemental scenarios receive no disposition credit.
+The inventory checker remains authoritative for the remaining cases.
+
+The first query, including a scalar-only query, captures one bounded native
+cohort across the selected database's namespaces. Metadata discovery returns
+physical table/version identities from one catalog transaction, borrowing the
+binary record projection and parsing only schema headers. It neither transfers
+full definitions nor binds untouched SQL schemas. Admission allows at most 256
+tables and 256 aggregate owner roots. Every owner completes routed read-index
+admission before nonblocking capture fences pin immutable storage roots. Busy
+or explicitly unpublished failed attempts release all partial roots and fences
+before bounded retry; ambiguous RPC delivery never authorizes page replay.
+
+Sessions share those roots by reference across candidate publication and
+savepoints. Returned scans still apply current authorization, mandatory filters,
+row-policy proofs, schema checks and routed identity validation. Retained opens
+use the existing quorum-completed-prefix contract on the captured owner/term;
+the stricter moving-tip rule remains unchanged for live capture fences. Point
+reads select only owners intersecting the requested interval and require their
+identity/topology to match the captured cohort. The routing regression verifies
+one physical open for a point in a two-owner table, including cleanup after a
+failed capture. This is fan-out evidence, not a latency benchmark.
+
+The first-query marker and range observations are durable. Native snapshot
+handles are deliberately live capabilities: a recovered marker without its
+handle returns HTTP 409 / SQLSTATE `40001`, marks the transaction failed, and
+requires rollback/restart. No later read silently captures a new cut. Lease
+maintenance renews exact remote tokens with bounded `std.Io` fan-out and a shared
+deadline; failed renewal poisons that cut. Final releases enqueue teardown so
+remote cleanup does not run under registry mutexes or record stripes.
+
+Public SQL `BEGIN` defaults to PostgreSQL READ COMMITTED. Internal guarded
+transactions retain their existing stronger mode; explicit READ COMMITTED
+MERGE/conflict mutations retain statement guards. The mounted regression checks
+unseen relations, existing document rows and later absences, joins, staged write
+visibility, savepoints, and fully reopened catalog/session/data owners. Original
+session controls, document MERGE and cursor campaigns remain green in Debug.
+
+Retained native cuts currently use primary access paths. This cohort does not
+claim DEFERRABLE safe-snapshot admission, cross-provider native/lake snapshots,
+or live snapshot failover. The qualified campaign is part of the ordinary CI
+integration aggregate. Native isolation, transport/capture fault and independent
+PostgreSQL gates are recorded in the inventory ledger.

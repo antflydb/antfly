@@ -3414,6 +3414,28 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-native-retained-snapshot-transport-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-retained-snapshot-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-native-snapshot-cohort-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-snapshot-cohort-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
@@ -4638,8 +4660,30 @@
     },
     {
       "id": "sql-0084",
-      "status": "unresolved",
-      "reason": "The PostgreSQL original transaction-characteristics oracle passes, but the real-owner native campaign aborts its retained read with 40001 after an outside insert. SQL openStatement captures fresh physical cuts for later statements and compares their range generations with earlier observations instead of reopening transaction-owned snapshots. Completion requires stable physical snapshot leases and coherent participant cuts across statements, scope-safe renewal/recovery and savepoints; relaxing proof validation or caching query rows is not a substitute."
+      "status": "implemented",
+      "reason": "The unchanged original transaction characteristics match isolated PostgreSQL sessions and execute through native durable sessions. Transaction-owned immutable cuts retain historical rows and absences across statements, unseen native tables, document tables, joins and savepoint rollback. All owner roots are captured together after routed read-index admission; later opens certify completed history without weakening capture fences. First-query characteristics and read guards are durable, while lost live cuts return HTTP 409 / SQLSTATE 40001 after cold catalog/session/data recovery instead of recapturing newer rows. READ COMMITTED remains the SQL default. Admission is bounded; this does not qualify serializable read-only DEFERRABLE safe snapshots, secondary-index retained scans, or a unified native/lake visibility cut.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction characteristics retain snapshots and savepoint modes",
+          "gate": "sql-qualified-transaction-characteristics-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction characteristics retain snapshots and savepoint modes",
+          "gate": "sql-qualified-transaction-characteristics-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client renews the exact snapshot and fails closed on lost acknowledgement",
+          "gate": "sql-native-retained-snapshot-transport-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/table_reads.zig",
+          "test": "relational row query full-key index proof requires every routed owner",
+          "gate": "sql-native-snapshot-cohort-debug"
+        }
+      ]
     },
     {
       "id": "sql-0085",
@@ -4677,8 +4721,30 @@
     },
     {
       "id": "sql-0087",
-      "status": "unresolved",
-      "reason": "PostgreSQL verifies this REPEATABLE READ/read-only characteristic campaign, but native SQL retains read observations rather than reusable transaction-scoped physical cuts. The shared native campaign fails first on sql-0084 after a concurrent outside insert. This case remains open until transaction-owned snapshot leases preserve historical rows and absences across later statements, with durable characteristic/savepoint state and fail-closed ownership/expiry recovery."
+      "status": "implemented",
+      "reason": "The unchanged original transaction characteristics match isolated PostgreSQL sessions and execute through native durable sessions. Transaction-owned immutable cuts retain historical rows and absences across statements, unseen native tables, document tables, joins and savepoint rollback. All owner roots are captured together after routed read-index admission; later opens certify completed history without weakening capture fences. First-query characteristics and read guards are durable, while lost live cuts return HTTP 409 / SQLSTATE 40001 after cold catalog/session/data recovery instead of recapturing newer rows. READ COMMITTED remains the SQL default. Admission is bounded; this does not qualify serializable read-only DEFERRABLE safe snapshots, secondary-index retained scans, or a unified native/lake visibility cut.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction characteristics retain snapshots and savepoint modes",
+          "gate": "sql-qualified-transaction-characteristics-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original transaction characteristics retain snapshots and savepoint modes",
+          "gate": "sql-qualified-transaction-characteristics-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client renews the exact snapshot and fails closed on lost acknowledgement",
+          "gate": "sql-native-retained-snapshot-transport-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/table_reads.zig",
+          "test": "relational row query full-key index proof requires every routed owner",
+          "gate": "sql-native-snapshot-cohort-debug"
+        }
+      ]
     },
     {
       "id": "sql-0088",
