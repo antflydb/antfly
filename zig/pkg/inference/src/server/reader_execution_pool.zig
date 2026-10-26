@@ -20,7 +20,7 @@ const platform = @import("antfly_platform");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const Pool = struct {
-    pub const max_capacity: usize = 64;
+    pub const max_capacity: usize = 128;
     mutex: std.atomic.Mutex = .unlocked,
     context: ?*anyopaque = null,
     users: usize = 0,
@@ -242,7 +242,7 @@ test "LightOnOCR3 logical window keeps sixty-four independent leases bounded" {
     };
     var fake = Fake{};
     var pool = Pool{};
-    try std.testing.expectError(error.InvalidReaderCapacity, pool.joinBounded(.{}, 65, 256, &fake, Fake.create, Fake.destroy));
+    try std.testing.expectError(error.InvalidReaderCapacity, pool.joinBounded(.{}, 129, 256, &fake, Fake.create, Fake.destroy));
     var leases: [64]Pool.Lease = undefined;
     for (&leases) |*lease| lease.* = try pool.joinBounded(.{}, 64, 256, &fake, Fake.create, Fake.destroy);
     try std.testing.expectEqual(@as(usize, 64), pool.users);
@@ -349,4 +349,32 @@ test "LightOnOCR3 shared host and device vision peaks preserve the combined scra
     try std.testing.expectEqual(@as(usize, 0), controller.admitted.backend_scratch_bytes);
     host.deinit();
     try std.testing.expectEqual(@as(usize, 0), controller.admitted.hostTotalBytes() + controller.admitted.backendTotalBytes());
+}
+
+test "LightOnOCR3 128 page reader pool refills within the existing 256 join epoch" {
+    const Fake = struct {
+        created: usize = 0,
+        destroyed: usize = 0,
+        fn create(raw: *anyopaque) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.created += 1;
+            return raw;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.destroyed += 1;
+        }
+    };
+    var fake = Fake{};
+    var pool = Pool{};
+    var leases: [128]Pool.Lease = undefined;
+    for (&leases) |*lease| lease.* = try pool.joinBounded(.{}, 128, 256, &fake, Fake.create, Fake.destroy);
+    try std.testing.expectEqual(@as(usize, 128), pool.users);
+    leases[64].release();
+    leases[64] = try pool.joinBounded(.{}, 128, 256, &fake, Fake.create, Fake.destroy);
+    try std.testing.expectEqual(@as(usize, 129), pool.joins);
+    for (&leases) |*lease| lease.release();
+    try std.testing.expectEqual(@as(usize, 0), pool.users);
+    try std.testing.expectEqual(@as(usize, 1), fake.created);
+    try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
 }

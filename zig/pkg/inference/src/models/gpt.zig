@@ -205,6 +205,7 @@ pub const Config = struct {
     vision_spatial_merge_size: u32 = 1,
     vision_temporal_patch_size: u32 = 1,
     vision_use_quick_gelu: bool = false,
+    vision_use_gelu_tanh: bool = false,
     vision_deepstack_visual_indexes_len: u8 = 0,
     vision_deepstack_visual_indexes: [max_vision_deepstack_layers]u32 = @as([max_vision_deepstack_layers]u32, @splat(0)),
     vision_deepstack_visual_indexes_truncated: bool = false,
@@ -1251,6 +1252,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
             };
             if (vision_obj.get("hidden_act")) |vv| if (vv == .string) {
                 config.vision_use_quick_gelu = std.mem.eql(u8, vv.string, "quick_gelu");
+                config.vision_use_gelu_tanh = std.mem.eql(u8, vv.string, "gelu_pytorch_tanh") or std.mem.eql(u8, vv.string, "gelu_new");
             };
             if (vision_obj.get("deepstack_visual_indexes")) |vv| {
                 parseVisionDeepstackVisualIndexes(&config, vv);
@@ -3691,6 +3693,7 @@ test "LightOnOCR3 official 0.8B config has partial M-RoPE and no DeepStack" {
     const config = try parseConfig(std.testing.allocator, @embedFile("testdata/lightonocr3/config.json"));
     try std.testing.expectEqual(ModelFamily.qwen3_5, config.family);
     try std.testing.expect(config.hasQwen35VisionArchitectureContract());
+    try std.testing.expect(config.vision_use_gelu_tanh);
     try std.testing.expectEqual(@as(u32, 1024), config.hidden_size);
     try std.testing.expectEqual(@as(u32, 24), config.num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 256), config.headDim());

@@ -1,0 +1,2 @@
+1/239 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA BF16 prefill FFN preserves decode policy rounded reference and readonly sources...OK
+1 selected; 1 passed; 0 skipped.

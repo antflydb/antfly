@@ -1,0 +1,79 @@
+1/241 server.server.test.LightOnOCR3 CUDA Florence collection honors explicit waits with bounded latency and backend isolation...OK
+2/241 server.server.test.LightOnOCR3 CUDA bounded vision charges full shared peaks without widening byte limits...OK
+3/241 server.server.test.LightOnOCR3 CUDA sixteen prefix admission keeps all per page state and reserves both working sets...OK
+4/241 architectures.qwen3vl_projector.test.LightOnOCR3 CUDA resident vision batch width preserves other backend ceilings...OK
+5/241 architectures.qwen3vl_projector.test.LightOnOCR3 CUDA vision block activation follows checkpoint tanh GELU independently of exact merger GELU...OK
+6/241 architectures.gpt.test.LightOnOCR3 CUDA recurrent core preserves continuation reset and device residency...OK
+7/241 architectures.gpt.test.LightOnOCR3 CUDA sampler downloads IDs and preserves suppression and lowest-index ties...OK
+8/241 architectures.gpt.test.LightOnOCR3 CUDA packed recurrent groups preserve ragged continuations and permuted page ownership...OK
+9/241 architectures.gpt.test.LightOnOCR3 CUDA compact recurrent batch preserves fresh resets and ragged independent page ownership...OK
+10/241 architectures.gpt.test.LightOnOCR3 CUDA fully fused mixed GDN decode preserves fresh resets and permuted page ownership...OK
+11/241 architectures.florence.test.LightOnOCR3 CUDA Florence encoder microbatch keeps backend and cohort limits isolated...OK
+12/241 architectures.florence.test.LightOnOCR3 CUDA Florence packed self KV preserves page prefixes and returned ownership...OK
+13/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA profile rejects devices without BF16 tensor cores...OK
+14/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA split attention plans logical context and preserves graph capacity...OK
+15/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA paged F16 prefill matches dense attention at actual head geometry...OK
+16/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA query gate and row views retain released backing tensors...OK
+17/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA batched attention preserves page bindings and validates before KV mutation...OK
+18/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA recurrent batch matches independent pages and fails before state mutation...OK
+19/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fully fused GDN decode preserves independent states and F32 outputs bitwise...OK
+20/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA GB10 GEMM tuning includes singleton decode and stays opt in...OK
+21/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA bounded GEMM plan cache retains cuBLAS when tuning saturates...OK
+22/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence F16 policy is restricted to supported matrix consumers...OK
+23/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence F16 upload keeps supported weights compact and biases F32...OK
+24/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA F32 projection row chunks cover large vision batches and guard tails...OK
+25/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence F16 LM head declines quantized fusion and preserves dense argmax...OK
+26/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA cuDNN vision matches CPU attention at actual page and head geometry...OK
+27/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence cuDNN F16 windows and encoder match independent F32 attention...OK
+28/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence cuDNN convolutions match CPU borders channels and batch lanes...OK
+29/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA bucketed GEMM preserves logical rows and reuses bounded plans...OK
+30/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence channel tensor cores match independent attention at all DaViT stages...OK
+31/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA BF16 decode outputs match exact CPU rounding and retain workspace admission...OK
+32/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA BF16 prefix projection policy rounds exactly and preserves inputs and admission...OK
+33/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence batched vision tail preserves independent page positions and pooling...OK
+34/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits paired weights by both sources...OK
+35/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence image prompt concat preserves distinct page boundaries and returned lifetime...OK
+36/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence FP16 bias epilogue preserves bias and model isolation...OK
+37/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence token depthwise residual matches independent border and page oracle...OK
+38/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence fused half norm and exact GELU match existing arithmetic bitwise...OK
+39/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence fused DaViT MLP preserves exact GELU and residual at all stages...OK
+40/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA stateless FFN graphs preserve results ownership buckets and retained admission...OK
+41/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA pinned OCR metadata owns queued host bytes across arena and ring wraps...[default] (warn): cuda_graph_capture_probe: unsafe_h2d_copy bytes=4 disabled=1
+OK
+42/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA cached MROPE positions preserve content changes scratch isolation and admission...OK
+43/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA coalesced Florence cross attention matches independent F64 page and mask oracle...OK
+44/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA pinned OCR image inputs retain host admission and queued tensor contents...OK
+45/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence window norm pack and QKV split preserve existing half bits and page order...OK
+46/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence fused attention QKV matches both original layouts and rejects padding and other profiles...OK
+47/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused recurrent input projections preserve four BF16 GEMMs and immutable source identity...OK
+48/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA prefills independent recurrent pages together without mixing state or widening limits...OK
+49/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence fused KV append preserves exact bits active prefixes and unused pages...OK
+50/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA temporary LRU retains recently used buffers with bounded physical storage and stable-mode isolation...OK
+51/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA norm weight cache preserves bits readonly sources detached borrowers and admission fallback...OK
+52/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA admission bounds cached and direct physical allocations without widening an existing ceiling...OK
+53/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused vision MLP preserves the original BF16 boundaries and F32 residual math...OK
+54/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence BART FFN fusion preserves exact GELU residual and post norm...OK
+55/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA recurrent state recycling keeps independent cache admission and immutable resident weights...OK
+56/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused vision QKV preserves cuDNN inputs output and readonly packed storage...OK
+57/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused FFN activation input preserves F32 outputs for independent and paired checkpoint projections...OK
+58/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA full FFN block preserves F32 normalization residual outputs and readonly sources...OK
+59/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA compact BF16 FFN block preserves projection rounding residual outputs and readonly sources...OK
+60/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA BF16 prefill FFN preserves decode policy rounded reference and readonly sources...OK
+61/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves suppressed ties embeddings and ownership...OK
+62/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused dense head preserves F32 greedy IDs ties inputs and model guards...OK
+63/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence canonical decode GEMM preserves row independence and output bounds...OK
+64/241 ops.cuda.kernels.test.LightOnOCR3 CUDA F32 row tiles respect grid and device indexing limits...OK
+65/241 ops.cuda.temp_buffer_index.test.LightOnOCR3 CUDA temp index matches independent best fit through churn and rebuilds...OK
+66/241 ops.cuda.temp_buffer_index.test.LightOnOCR3 CUDA temp index metadata failure leaves canonical ownership intact...OK
+67/241 ops.cuda.temp_buffer_index.test.LightOnOCR3 CUDA temp index bounds historical size metadata and fails closed at limits...OK
+68/241 ops.cuda.cudnn_sdpa.test.LightOnOCR3 CUDA cuDNN OCR vision geometry remains separate from embedding defaults...OK
+69/241 ops.cuda.cudnn_sdpa.test.LightOnOCR3 CUDA Florence F16 plans isolate dtype windows and encoder masks...OK
+70/241 ops.cuda.cudnn_conv.test.LightOnOCR3 CUDA Florence convolution eligibility excludes unrelated and oversized geometry...OK
+71/241 ops.cuda.cublaslt.test.LightOnOCR3 CUDA channel GEMM alignment accounts for every strided group...OK
+72/241 pipelines.generation.test.LightOnOCR3 CUDA wide prefill preserves legacy bounds and caps complete groups at 8192 rows...OK
+73/241 pipelines.generation.test.LightOnOCR3 CUDA packed prefix capacity preserves legacy limits and total row budget...OK
+74/241 runtime.scheduler.native_generate.test.LightOnOCR3 CUDA native generate coordinator turn coalescing reunites work aged behind a GPU turn...OK
+75/241 pipelines.reading.test.LightOnOCR3 CUDA Florence checked argmax preserves no-repeat policy without logits download...OK
+76/241 pipelines.reading.test.LightOnOCR3 CUDA Florence incremental admission preserves complete KV capacity and cannot fund prefix fallback...OK
+77/241 architectures.session_factory.test.LightOnOCR3 CUDA loader profile requires the reader role and supported recurrent geometry...OK
+77 selected; 77 passed; 0 skipped.

@@ -1,0 +1,242 @@
+1/241 inference.test_0...OK
+2/241 server.server.test_0...OK
+3/241 server.server.test.LightOnOCR3 wide admission waits for progressing cohorts and bounds stalled capacity...OK
+4/241 server.server.test.LightOnOCR3 internal 128 row cohorts preserve public request and explicit model limits...OK
+5/241 server.server.test.LightOnOCR3 CUDA Florence collection honors explicit waits with bounded latency and backend isolation...OK
+6/241 server.server.test.LightOnOCR3 active windows preserve the physical reader contract...OK
+7/241 server.server.test.LightOnOCR3 continuous controls isolate canceled and expired pages...OK
+8/241 server.server.test.LightOnOCR3 logical64 isolates physical rows and bounds multi-image workers...OK
+9/241 server.server.test.LightOnOCR3 read routing preserves image-only and grounding prompts...OK
+10/241 server.server.test.LightOnOCR3 HTTP read rejects untrained prompts before loading weights...OK
+11/241 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...SKIP
+12/241 server.server.test.LightOnOCR3 page template preserves exact image-only and grounding framing...OK
+13/241 server.server.test.LightOnOCR3 execution counters distinguish fused pages and singleton tails...OK
+14/241 server.server.test.LightOnOCR3 cohorts reserve one serialized vision peak and every retained page state...OK
+15/241 server.server.test.LightOnOCR3 shared decoder envelope retains independent page state and outputs...OK
+16/241 server.server.test.LightOnOCR3 batched prefill reserves its complete shared peak and independent page state...OK
+17/241 server.server.test.LightOnOCR3 decoder peak ownership preserves caps across failed growth and page retirement...OK
+18/241 server.server.test.LightOnOCR3 shared decoder scratch admits bounded prefill and requires GPU-only state...OK
+19/241 server.server.test.LightOnOCR3 device recurrent admission preserves GPU state KV and per-page outputs...OK
+20/241 server.server.test.LightOnOCR3 retained prefill pool charges its full bounded epoch cache...OK
+21/241 server.server.test.LightOnOCR3 thirty-two-row workspace acquires its larger admitted envelope...OK
+22/241 server.server.test.LightOnOCR3 sixty-four-row workspace acquires its larger admitted envelope...OK
+23/241 server.server.test.LightOnOCR3 epoch admission owns shared scratch across page retirement and failed retries...OK
+24/241 server.server.test.LightOnOCR3 shared side-weight storage requires an epoch resource owner...OK
+25/241 server.server.test.LightOnOCR3 forward prefix streaming reserves its shared overlap envelope...OK
+26/241 server.server.test.LightOnOCR3 physical32 streaming admits prepared and overlap envelopes together...OK
+27/241 server.server.test.LightOnOCR3 batched attention reserves two disjoint frame scratch banks...OK
+28/241 server.server.test.LightOnOCR3 throughput preset preserves explicit overrides and resource ownership...OK
+29/241 server.server.test.LightOnOCR3 microbatch GPU gate parks and preserves group cancellation...OK
+30/241 server.server.test.LightOnOCR3 GPU greedy streaming reserves both physical64 frame envelopes...OK
+31/241 server.server.test.LightOnOCR3 queued phase priority drains counts and preserves decode-dependent prefill...OK
+32/241 server.server.test.LightOnOCR3 mixed decoder envelope admits the prefill and physical decode rows together...OK
+33/241 server.server.test.LightOnOCR3 chunk groups retain complete pages and admit both bounded working sets...OK
+34/241 server.server.test.LightOnOCR3 packed shared frame excludes split and retained-prefill lifetimes...OK
+35/241 server.server.test.LightOnOCR3 packed output admission retains complete projected inputs and page state...OK
+36/241 server.server.test.LightOnOCR3 pooled reader rejects invalid cohorts before touching payloads...OK
+37/241 server.server.test.LightOnOCR3 CUDA bounded vision charges full shared peaks without widening byte limits...OK
+38/241 server.server.test.LightOnOCR3 CUDA sixteen prefix admission keeps all per page state and reserves both working sets...OK
+39/241 backends.backends.test_0...OK
+40/241 execution_control.test.LightOnOCR3 parked execution gate preserves cancellation and lock ownership...OK
+41/241 execution_control.test.LightOnOCR3 execution lane cleanup survives cancellation of its owning Io task...OK
+42/241 pipelines.pipelines.test_0...OK
+43/241 pipelines.pipelines.test_1...OK
+44/241 extractors.mod.test_0...OK
+45/241 server.executor_microbatch.test.LightOnOCR3 microbatch keeps queued work mergeable until its execution lane is ready...OK
+46/241 registry.registry.test_0...OK
+47/241 registry.registry.test.LightOnOCR3 pulled manifest preserves OCR identity when tasks are overridden...OK
+48/241 tabular.root.test_0...OK
+49/241 models.models.test_0...OK
+50/241 gguf.root.test_0...OK
+51/241 runtime.root.test_0...OK
+52/241 util.util.test_0...OK
+53/241 ops.ops.test_0...OK
+54/241 graph.root.test_0...OK
+55/241 ops.wasm_compute.test_0...OK
+56/241 architectures.qwen3vl_projector.test.LightOnOCR3 admission charges packed vision storage beyond FFN and score peaks...OK
+57/241 architectures.qwen3vl_projector.test.LightOnOCR3 resident vision uses learned positions without DeepStack...OK
+58/241 architectures.qwen3vl_projector.test.LightOnOCR3 CPU image preparation owns patches and binds model geometry...OK
+59/241 architectures.qwen3vl_projector.test.LightOnOCR3 CPU image preparation cancels in kernels and restores its caller scope...OK
+60/241 architectures.qwen3vl_projector.test.LightOnOCR3 resident vision budget preserves host banks and complete grouped working bounds...OK
+61/241 architectures.qwen3vl_projector.test.LightOnOCR3 CUDA resident vision batch width preserves other backend ceilings...OK
+62/241 architectures.qwen3vl_projector.test.LightOnOCR3 CUDA vision block activation follows checkpoint tanh GELU independently of exact merger GELU...OK
+63/241 architectures.gpt.test.LightOnOCR3 prefill streaming preserves prompt and frame eligibility...OK
+64/241 architectures.gpt.test.LightOnOCR3 rolling chunks omit empty final frames and preserve prefix mode...OK
+65/241 architectures.gpt.test.LightOnOCR3 Metal recurrent core matches CPU prefill continuation and reset without readbacks...SKIP
+66/241 architectures.gpt.test.LightOnOCR3 SIMD recurrent update matches scalar reference with tails and cached state...OK
+67/241 architectures.gpt.test.LightOnOCR3 DeltaNet gated norm uses its scale directly without a plus-one shift...OK
+68/241 architectures.gpt.test.LightOnOCR3 batched DeltaNet projections match independent histories across decode and retirement...OK
+69/241 architectures.gpt.test.LightOnOCR3 device recurrent cache omits CPU matrices and refuses host fallback...OK
+70/241 architectures.gpt.test.LightOnOCR3 device recurrent cache unwinds descriptor allocation failure...OK
+71/241 architectures.gpt.test.LightOnOCR3 page cache initialization releases every earlier layer on allocation failure...OK
+72/241 architectures.gpt.test.LightOnOCR3 forward prefix streaming only splits owned batched decode frames...OK
+73/241 architectures.gpt.test.LightOnOCR3 packed query bounds reject empty zero overflowing and oversized groups...OK
+74/241 architectures.gpt.test.LightOnOCR3 packed full attention preserves causal page boundaries...OK
+75/241 architectures.gpt.test.LightOnOCR3 packed metadata rejects aliases and malformed later pages before execution...OK
+76/241 architectures.gpt.test.LightOnOCR3 packed decode attention grouping preserves independent KV writes...OK
+77/241 architectures.gpt.test.LightOnOCR3 CUDA recurrent core preserves continuation reset and device residency...OK
+78/241 architectures.gpt.test.LightOnOCR3 CUDA sampler downloads IDs and preserves suppression and lowest-index ties...OK
+79/241 architectures.gpt.test.LightOnOCR3 CUDA packed recurrent groups preserve ragged continuations and permuted page ownership...OK
+80/241 architectures.gpt.test.LightOnOCR3 CUDA compact recurrent batch preserves fresh resets and ragged independent page ownership...OK
+81/241 architectures.gpt.test.LightOnOCR3 CUDA fully fused mixed GDN decode preserves fresh resets and permuted page ownership...OK
+82/241 architectures.florence.test.LightOnOCR3 CUDA Florence encoder microbatch keeps backend and cohort limits isolated...OK
+83/241 architectures.florence.test.LightOnOCR3 CUDA Florence packed self KV preserves page prefixes and returned ownership...OK
+84/241 ops.cuda.video.test_0...OK
+85/241 pipelines.embedding_gemma2.test_0...OK
+86/241 pipelines.embedding_gemma2.test_1...OK
+87/241 server.model_manager.test.LightOnOCR3 integrated vision scratch is admitted without charging resident weights again...OK
+88/241 finetune.root.test_0...OK
+89/241 finetune.cli.root.test_0...OK
+90/241 quantize.root.test_0...OK
+91/241 native_export.test_0...OK
+92/241 native_quantize.test_0...OK
+93/241 readers.lightonocr3.test.LightOnOCR3 uses image-only transcription and the trained grounding prompt...OK
+94/241 readers.lightonocr3.test.LightOnOCR3 installs its reader profile only for the canonical integrated checkpoint...OK
+95/241 ops.native_compute.test.LightOnOCR3 partial M-RoPE rotates each head prefix and preserves its tail...OK
+96/241 ops.native_compute.test.LightOnOCR3 query gate projection splits within each attention head...OK
+97/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA profile rejects devices without BF16 tensor cores...OK
+98/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA split attention plans logical context and preserves graph capacity...OK
+99/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA paged F16 prefill matches dense attention at actual head geometry...OK
+100/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA query gate and row views retain released backing tensors...OK
+101/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA batched attention preserves page bindings and validates before KV mutation...OK
+102/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA recurrent batch matches independent pages and fails before state mutation...OK
+103/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fully fused GDN decode preserves independent states and F32 outputs bitwise...OK
+104/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA GB10 GEMM tuning includes singleton decode and stays opt in...OK
+105/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA bounded GEMM plan cache retains cuBLAS when tuning saturates...OK
+106/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence F16 policy is restricted to supported matrix consumers...OK
+107/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence F16 upload keeps supported weights compact and biases F32...OK
+108/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA F32 projection row chunks cover large vision batches and guard tails...OK
+109/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence F16 LM head declines quantized fusion and preserves dense argmax...OK
+110/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA cuDNN vision matches CPU attention at actual page and head geometry...OK
+111/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence cuDNN F16 windows and encoder match independent F32 attention...OK
+112/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence cuDNN convolutions match CPU borders channels and batch lanes...OK
+113/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA bucketed GEMM preserves logical rows and reuses bounded plans...OK
+114/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence channel tensor cores match independent attention at all DaViT stages...OK
+115/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA BF16 decode outputs match exact CPU rounding and retain workspace admission...OK
+116/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA BF16 prefix projection policy rounds exactly and preserves inputs and admission...OK
+117/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence batched vision tail preserves independent page positions and pooling...OK
+118/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits paired weights by both sources...OK
+119/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence image prompt concat preserves distinct page boundaries and returned lifetime...OK
+120/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence FP16 bias epilogue preserves bias and model isolation...OK
+121/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence token depthwise residual matches independent border and page oracle...OK
+122/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence fused half norm and exact GELU match existing arithmetic bitwise...OK
+123/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence fused DaViT MLP preserves exact GELU and residual at all stages...OK
+124/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA stateless FFN graphs preserve results ownership buckets and retained admission...OK
+125/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA pinned OCR metadata owns queued host bytes across arena and ring wraps...[default] (warn): cuda_graph_capture_probe: unsafe_h2d_copy bytes=4 disabled=1
+OK
+126/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA cached MROPE positions preserve content changes scratch isolation and admission...OK
+127/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA coalesced Florence cross attention matches independent F64 page and mask oracle...OK
+128/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA pinned OCR image inputs retain host admission and queued tensor contents...OK
+129/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence window norm pack and QKV split preserve existing half bits and page order...OK
+130/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence fused attention QKV matches both original layouts and rejects padding and other profiles...OK
+131/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused recurrent input projections preserve four BF16 GEMMs and immutable source identity...OK
+132/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA prefills independent recurrent pages together without mixing state or widening limits...OK
+133/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence fused KV append preserves exact bits active prefixes and unused pages...OK
+134/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA temporary LRU retains recently used buffers with bounded physical storage and stable-mode isolation...OK
+135/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA norm weight cache preserves bits readonly sources detached borrowers and admission fallback...OK
+136/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA admission bounds cached and direct physical allocations without widening an existing ceiling...OK
+137/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused vision MLP preserves the original BF16 boundaries and F32 residual math...OK
+138/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence BART FFN fusion preserves exact GELU residual and post norm...OK
+139/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA recurrent state recycling keeps independent cache admission and immutable resident weights...OK
+140/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused vision QKV preserves cuDNN inputs output and readonly packed storage...OK
+141/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused FFN activation input preserves F32 outputs for independent and paired checkpoint projections...OK
+142/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA full FFN block preserves F32 normalization residual outputs and readonly sources...OK
+143/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA compact BF16 FFN block preserves projection rounding residual outputs and readonly sources...OK
+144/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA BF16 prefill FFN preserves decode policy rounded reference and readonly sources...OK
+145/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves suppressed ties embeddings and ownership...OK
+146/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA fused dense head preserves F32 greedy IDs ties inputs and model guards...OK
+147/241 ops.cuda.cuda_compute.test.LightOnOCR3 CUDA Florence canonical decode GEMM preserves row independence and output bounds...OK
+148/241 ops.cuda.kernels.test.LightOnOCR3 CUDA F32 row tiles respect grid and device indexing limits...OK
+149/241 ops.cuda.temp_buffer_index.test.LightOnOCR3 CUDA temp index matches independent best fit through churn and rebuilds...OK
+150/241 ops.cuda.temp_buffer_index.test.LightOnOCR3 CUDA temp index metadata failure leaves canonical ownership intact...OK
+151/241 ops.cuda.temp_buffer_index.test.LightOnOCR3 CUDA temp index bounds historical size metadata and fails closed at limits...OK
+152/241 ops.cuda.cudnn_sdpa.test.LightOnOCR3 CUDA cuDNN OCR vision geometry remains separate from embedding defaults...OK
+153/241 ops.cuda.cudnn_sdpa.test.LightOnOCR3 CUDA Florence F16 plans isolate dtype windows and encoder masks...OK
+154/241 ops.cuda.cudnn_conv.test.LightOnOCR3 CUDA Florence convolution eligibility excludes unrelated and oversized geometry...OK
+155/241 ops.cuda.cublaslt.test.LightOnOCR3 CUDA channel GEMM alignment accounts for every strided group...OK
+156/241 runtime.tier.root.test_0...OK
+157/241 runtime.moe.root.test_0...OK
+158/241 runtime.kv.root.test_0...OK
+159/241 models.gpt.test.LightOnOCR3 official 0.8B config has partial M-RoPE and no DeepStack...OK
+160/241 models.gpt.test.LightOnOCR3 official 4B config uses grouped recurrent heads and larger vision tower...OK
+161/241 finetune.gliner.boundary_train_step.test_0...OK
+162/241 finetune.gliner.boundary_training_source.test_0...OK
+163/241 models.manifest.test.LightOnOCR3 reader identity requires explicit metadata and the Qwen3.5 architecture...OK
+164/241 pipelines.generation.test.LightOnOCR3 decoder cohorts preserve page caches and heterogeneous image positions...OK
+165/241 pipelines.generation.test.LightOnOCR3 dedicated executor publishes without request-side execution...OK
+166/241 pipelines.generation.test.LightOnOCR3 dedicated executor cancels idle stack work without executing it...OK
+167/241 pipelines.generation.test.LightOnOCR3 dedicated cancellation drains an unrelated claimed turn...OK
+168/241 pipelines.generation.test.LightOnOCR3 executor tail preserves per-page tokens EOS length and KV geometry...OK
+169/241 pipelines.generation.test.LightOnOCR3 executor tail cancellation drains a claimed token or removes its idle continuation...OK
+170/241 pipelines.generation.test.LightOnOCR3 compact KV storage and admission retain every attention layer and recurrent history...OK
+171/241 pipelines.generation.test.LightOnOCR3 phase priority releases its waiter on cancellation and permits cleanup...OK
+172/241 pipelines.generation.test.LightOnOCR3 event execution gate removes cancelled waiters and drains cleanup...OK
+173/241 pipelines.generation.test.LightOnOCR3 batched prefill CPU scratch is admitted before allocations and released on failure...OK
+174/241 pipelines.generation.test.LightOnOCR3 prefill group size respects the complete packed input row budget...OK
+175/241 pipelines.generation.test.LightOnOCR3 GPU token burst publishes widths two through eight with EOS length cancellation and KV accounting...OK
+176/241 pipelines.generation.test.LightOnOCR3 packed last logits publish independent rows for unequal query lengths...OK
+177/241 pipelines.generation.test.LightOnOCR3 packed greedy publication keeps only independent prefix logits in either order...OK
+178/241 pipelines.generation.test.LightOnOCR3 prepared chunks preserve visual axes independent KV histories and reject replay...OK
+179/241 pipelines.generation.test.LightOnOCR3 prepared chunk cancellation stops before another prefix reservation...OK
+180/241 pipelines.generation.test.LightOnOCR3 bounded chunk workspace rejects direct fallback before cache mutation...OK
+181/241 pipelines.generation.test.LightOnOCR3 CUDA wide prefill preserves legacy bounds and caps complete groups at 8192 rows...OK
+182/241 pipelines.generation.test.LightOnOCR3 packed 128 page decode publication accepts empty prefix logits and preserves independent IDs...OK
+183/241 pipelines.generation.test.LightOnOCR3 CUDA packed prefix capacity preserves legacy limits and total row budget...OK
+184/241 runtime.scheduler.root.test_0...OK
+185/241 runtime.scheduler.native_generate.test.LightOnOCR3 cohort coalescing blocks followers until the full decoder step is ready...OK
+186/241 runtime.scheduler.native_generate.test.LightOnOCR3 cohort coalescing bounds sparse waits and shrinks after page retirement...OK
+187/241 runtime.scheduler.native_generate.test.LightOnOCR3 scheduler contention wait parks outside the lock and propagates cancellation...OK
+188/241 runtime.scheduler.native_generate.test.LightOnOCR3 ready cohorts exclude prefill and unknown next work...OK
+189/241 runtime.scheduler.native_generate.test.LightOnOCR3 step events preserve publication and detached waiter ownership...OK
+190/241 runtime.scheduler.native_generate.test.LightOnOCR3 executor claims a bounded cohort without allocating...OK
+191/241 runtime.scheduler.native_generate.test.LightOnOCR3 executor claims thirty-two rows without allocation and preserves overflow...OK
+192/241 runtime.scheduler.native_generate.test.LightOnOCR3 logical64 executor drains two physical32 steps without allocating...OK
+193/241 runtime.scheduler.native_generate.test.LightOnOCR3 physical64 executor drains one complete step without allocating...OK
+194/241 runtime.scheduler.native_generate.test.LightOnOCR3 executor queue wakes preserve selective publication and cancellation...OK
+195/241 runtime.scheduler.native_generate.test.LightOnOCR3 executor yields to manual prefill and preserves turn ownership...OK
+196/241 runtime.scheduler.native_generate.test.LightOnOCR3 manual prefill turn events wake only the next owner...OK
+197/241 runtime.scheduler.native_generate.test.LightOnOCR3 canceled manual prefill wait detaches before releasing its lease...OK
+198/241 runtime.scheduler.native_generate.test.LightOnOCR3 cancellation while parked leaves the current prefill owner intact...OK
+199/241 runtime.scheduler.native_generate.test.LightOnOCR3 collecting prefill groups leave ready decode runnable until sealing...OK
+200/241 runtime.scheduler.native_generate.test.LightOnOCR3 packed step admits one prefill and decode peers within its working set...OK
+201/241 runtime.scheduler.native_generate.test.LightOnOCR3 packed step caps multiple unequal prefills while retaining decode peers...OK
+202/241 runtime.scheduler.native_generate.test.LightOnOCR3 CUDA native generate coordinator turn coalescing reunites work aged behind a GPU turn...OK
+203/241 ops.metal_compute.test.LightOnOCR3 Metal partial M-RoPE preserves unrotated head channels...SKIP
+204/241 ops.metal_compute.test.LightOnOCR3 vision slots retain cache owners across page handles and retire transient weights...SKIP
+205/241 ops.metal_compute.test.LightOnOCR3 runtime policy snapshots isolate successive provider epochs...SKIP
+206/241 ops.metal_compute.test.LightOnOCR3 decoder weight descriptors retain only cached backing and release idle host mirrors...SKIP
+207/241 ops.metal_compute.test.LightOnOCR3 decoder weight descriptor allocation failures unwind owners and aliases...SKIP
+208/241 ops.metal_compute.test.LightOnOCR3 prepared blocks decline incompatible activation and normalization...OK
+209/241 ops.metal_compute.test.LightOnOCR3 runtime-owned hidden storage never enters activation reuse...SKIP
+210/241 ops.metal_compute.test.LightOnOCR3 shared side weights retain immutable identities and bounded device ownership...SKIP
+211/241 ops.metal_compute.test.LightOnOCR3 encoder scope counters reject borrowed backend wrappers...SKIP
+212/241 ops.metal_compute.test.LightOnOCR3 streaming topology validates configured frame count and one argmax...OK
+213/241 ops.metal_compute.test.LightOnOCR3 strict resident vision rejects fallbacks and restores ordinary execution...SKIP
+214/241 ops.metal_compute.test.LightOnOCR3 row reporting covers sixty-four cohorts without shift overflow...OK
+215/241 models.compatibility.test.LightOnOCR3 compatibility enables only the explicit safetensors reader profile...OK
+216/241 pipelines.reading.test.LightOnOCR3 CUDA Florence checked argmax preserves no-repeat policy without logits download...OK
+217/241 pipelines.reading.test.LightOnOCR3 CUDA Florence incremental admission preserves complete KV capacity and cannot fund prefix fallback...OK
+218/241 pipelines.tasks.test_0...OK
+219/241 pipelines.documents.test_0...OK
+220/241 pipelines.multimodal_reranker.test_0...OK
+221/241 pipelines.document_preprocessing.test_0...OK
+222/241 pipelines.document_classification.test_0...OK
+223/241 pipelines.document_token_classification.test_0...OK
+224/241 pipelines.adapters.test_0...OK
+225/241 pipelines.multimodal_qwen_adapter.test_0...OK
+226/241 pipelines.document_preprocessing_runtime.test_0...OK
+227/241 architectures.session_factory.test.LightOnOCR3 4B budget covers both weight domains and preserves explicit limits...OK
+228/241 architectures.session_factory.test.LightOnOCR3 CUDA loader profile requires the reader role and supported recurrent geometry...OK
+229/241 server.metrics.test_0...OK
+230/241 server.reader_execution_pool.test.LightOnOCR3 shared reader pool refills before the longest page retires...OK
+231/241 server.reader_execution_pool.test.LightOnOCR3 shared reader pool rejects canceled joins and unwinds failed creation...OK
+232/241 server.reader_execution_pool.test.LightOnOCR3 shared vision peak preserves caps and reservations across page retirement...OK
+233/241 server.reader_execution_pool.test.LightOnOCR3 logical window keeps thirty-two independent leases bounded...OK
+234/241 server.reader_execution_pool.test.LightOnOCR3 logical window keeps sixty-four independent leases bounded...OK
+235/241 server.reader_execution_pool.test.LightOnOCR3 extended epoch refills beyond sixty-four pages without changing its bound...OK
+236/241 server.reader_execution_pool.test.LightOnOCR3 extended epoch retains every vision increment until teardown...OK
+237/241 server.reader_execution_pool.test.LightOnOCR3 shared host and device vision peaks preserve the combined scratch cap...OK
+238/241 server.reader_execution_pool.test.LightOnOCR3 128 page reader pool refills within the existing 256 join epoch...OK
+239/241 backends.metal_runtime.test.LightOnOCR3 prefill fused FFN wrapper retains private scratch through submit and cancellation...SKIP
+240/241 backends.metal_runtime.test.LightOnOCR3 batched gate up wrapper reaches qualified device kernel...SKIP
+240 selected; 227 passed; 13 skipped.

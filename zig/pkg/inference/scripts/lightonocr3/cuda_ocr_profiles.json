@@ -1,0 +1,234 @@
+{
+  "schema_version": 1,
+  "qualification": "Experimental throughput profiles measured on DGX Spark GB10 SM12.1. Original checkpoint weights and numerical tolerances. Accuracy coverage is limited to three synthetic pages; no vLLM performance parity claim. Operator environment overrides profile defaults. Memory and request-admission limits are not changed. cuDNN must be available on the dynamic library search path.",
+  "profiles": {
+    "lighton08": {
+      "environment": {
+        "ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_ATTENTION": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_KV_WRITE": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_PREFIX": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_RECURRENT": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_DECODE_OUTPUTS": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_CACHED_MROPE_POSITIONS": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_CACHED_RECURRENT_GATES": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BF16_INPUTS": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_GRAPHS": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_BATCH_RECURRENT": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_FFN": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_GDN_DECODE": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_GEMM_BUCKET_ROWS": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_PACKED_MIXED": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_PARALLEL_PREFIX": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_PREFIX_SHARED_QK": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_RAGGED_RECURRENT": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_SHARED_RECURRENT_WEIGHTS": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_STATE_POOL": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_TEMP_LRU": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN": "1",
+        "ANTFLY_CUDA_ENABLE_OCR_PINNED_METADATA": "1",
+        "ANTFLY_CUDA_ENABLE_OCR_TEMP_INDEX": "0",
+        "ANTFLY_INFERENCE_CUDA_CUBLASLT_BF16_TUNING_PROFILE": "off",
+        "ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES": "1024",
+        "ANTFLY_INFERENCE_CUDA_CUBLASLT_WORKSPACE_MB": "0",
+        "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "mma",
+        "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "0",
+        "ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MAX_BUFFERS": "4096",
+        "ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB": "16384",
+        "ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE": "0",
+        "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+        "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "32",
+        "ANTFLY_INFERENCE_PREFERRED_BACKEND": "cuda",
+        "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
+        "ANTFLY_LIGHTONOCR3_BATCH": "1",
+        "ANTFLY_LIGHTONOCR3_BATCH_ROWS": "64",
+        "ANTFLY_LIGHTONOCR3_BATCH_WAIT_US": "5000",
+        "ANTFLY_LIGHTONOCR3_BATCH_WINDOW": "64",
+        "ANTFLY_LIGHTONOCR3_CONTINUOUS": "1",
+        "ANTFLY_LIGHTONOCR3_CUDA_BATCH": "1",
+        "ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES": "1",
+        "ANTFLY_LIGHTONOCR3_DECODE_WAIT_US": "1000",
+        "ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE": "1",
+        "ANTFLY_LIGHTONOCR3_EXECUTOR_TAIL": "1",
+        "ANTFLY_LIGHTONOCR3_EXTENDED_EPOCH": "1",
+        "ANTFLY_LIGHTONOCR3_GPU_GREEDY_STREAM": "0",
+        "ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST": "0",
+        "ANTFLY_LIGHTONOCR3_KEEP_VISION_WORKSPACE": "0",
+        "ANTFLY_LIGHTONOCR3_LOGICAL64": "0",
+        "ANTFLY_LIGHTONOCR3_PACKED_MIXED": "1",
+        "ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS": "8",
+        "ANTFLY_LIGHTONOCR3_PACKED_SHARED_FRAME": "0",
+        "ANTFLY_LIGHTONOCR3_PHASE_FAIR": "1",
+        "ANTFLY_LIGHTONOCR3_PHASE_PARK": "1",
+        "ANTFLY_LIGHTONOCR3_PHYSICAL32": "0",
+        "ANTFLY_LIGHTONOCR3_PHYSICAL64": "1",
+        "ANTFLY_LIGHTONOCR3_PIPELINE_VISION": "0",
+        "ANTFLY_LIGHTONOCR3_PREFILL_ACTIVATION_POOL": "0",
+        "ANTFLY_LIGHTONOCR3_PREFILL_BATCH_ITEMS": "1",
+        "ANTFLY_LIGHTONOCR3_PREFILL_DECODE_STREAK": "0",
+        "ANTFLY_LIGHTONOCR3_PREFILL_LATE_SEAL": "1",
+        "ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS": "0",
+        "ANTFLY_LIGHTONOCR3_PREFILL_STREAM_LAYERS": "0",
+        "ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US": "1000",
+        "ANTFLY_LIGHTONOCR3_QUEUED_PHASE_PRIORITY": "1",
+        "ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET": "0",
+        "ANTFLY_LIGHTONOCR3_SHARED_DECODER_SCRATCH": "1",
+        "ANTFLY_LIGHTONOCR3_SINGLE_FRAME": "0",
+        "ANTFLY_LIGHTONOCR3_STREAM_CHUNKS": "0",
+        "ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS": "0",
+        "ANTFLY_LIGHTONOCR3_TOKEN_ENCODER": "1",
+        "ANTFLY_LIGHTONOCR3_TURN_COALESCING": "1",
+        "ANTFLY_LIGHTONOCR3_VISION_BATCH": "1",
+        "ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS": "8",
+        "ANTFLY_LIGHTONOCR3_VISION_LATE_SEAL": "1",
+        "ANTFLY_LIGHTONOCR3_VISION_WAIT_US": "1000",
+        "ANTFLY_LIGHTONOCR3_WAIT_FOR_PREFILL_PEERS": "0",
+        "TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_HEAD": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS": "0",
+        "ANTFLY_LIGHTONOCR3_PHYSICAL128": "0"
+      }
+    },
+    "lighton4b": {
+      "extends": "lighton08",
+      "environment": {
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS": "1",
+        "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128": "1",
+        "ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS": "1",
+        "ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US": "0",
+        "ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS": "4",
+        "ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS": "256"
+      }
+    },
+    "florence": {
+      "environment": {
+        "ANTFLY_CUDA_ENABLE_FLORENCE_BART_FFN": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_BATCH_VISION_TAIL": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_CHANNEL_PLAN_CACHE": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_CHANNEL_TC": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_CUDNN": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_CUDNN_CONV": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_F16_WEIGHTS": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_ATTENTION_INPUTS": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_BIAS": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_CROSS_ATTENTION": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_DEPTHWISE": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_KV_APPEND": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_MLP": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_GROUPED_CHANNEL_TC": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_INCREMENTAL_ADMISSION": "1",
+        "ANTFLY_CUDA_ENABLE_FLORENCE_PACKED_SELF_KV": "0",
+        "ANTFLY_CUDA_ENABLE_OCR_PINNED_INPUTS": "0",
+        "ANTFLY_CUDA_ENABLE_OCR_PINNED_METADATA": "1",
+        "ANTFLY_FLORENCE2_BATCH_WAIT_US": "100000",
+        "ANTFLY_FLORENCE2_CUDA_ENCODER_MICROBATCH": "4",
+        "ANTFLY_FLORENCE2_CUDA_VISION_MICROBATCH": "1",
+        "ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB": "1024",
+        "ANTFLY_INFERENCE_PREFERRED_BACKEND": "cuda",
+        "ANTFLY_INFERENCE_READ_BATCH_SIZE": "32",
+        "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda"
+      }
+    },
+    "lighton08-bf16-projections": {
+      "extends": "lighton08",
+      "qualification": "Unqualified experimental BF16 projection outputs for prefix and decode; F32 tensor storage and recurrent state. This is not a complete vLLM BF16 activation match.",
+      "environment": {
+        "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_HEAD": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK": "0"
+      }
+    },
+    "lighton4b-bf16-projections": {
+      "extends": "lighton4b",
+      "qualification": "Unqualified experimental BF16 projection outputs for prefix and decode; F32 tensor storage and recurrent state. This is not a complete vLLM BF16 activation match.",
+      "environment": {
+        "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS": "1",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_HEAD": "0",
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK": "0"
+      }
+    },
+    "lighton08-bf16-projections-compact-ffn": {
+      "extends": "lighton08-bf16-projections",
+      "qualification": "Unqualified compact BF16 FFN intermediates; same BF16 projection policy, F32 residual and recurrent state. Not a full vLLM precision match.",
+      "environment": {
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK": "1"
+      }
+    },
+    "lighton4b-bf16-projections-compact-ffn": {
+      "extends": "lighton4b-bf16-projections",
+      "qualification": "Unqualified compact BF16 FFN intermediates; same BF16 projection policy, F32 residual and recurrent state. Not a full vLLM precision match.",
+      "environment": {
+        "ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK": "1"
+      }
+    },
+    "lighton08-physical128": {
+      "extends": "lighton08",
+      "qualification": "Unqualified experimental 128-page CUDA cohort; dense projections span the cohort, recurrent and attention packets remain at most 64 pages. Original F32 policy and byte limits.",
+      "environment": {
+        "ANTFLY_LIGHTONOCR3_PHYSICAL128": "1",
+        "ANTFLY_LIGHTONOCR3_PHYSICAL64": "0",
+        "ANTFLY_LIGHTONOCR3_BATCH_ROWS": "128",
+        "ANTFLY_LIGHTONOCR3_BATCH_WINDOW": "128"
+      }
+    },
+    "lighton4b-physical128": {
+      "extends": "lighton4b",
+      "qualification": "Unqualified experimental 128-page CUDA cohort; dense projections span the cohort, recurrent and attention packets remain at most 64 pages. Original F32 policy and byte limits.",
+      "environment": {
+        "ANTFLY_LIGHTONOCR3_PHYSICAL128": "1",
+        "ANTFLY_LIGHTONOCR3_PHYSICAL64": "0",
+        "ANTFLY_LIGHTONOCR3_BATCH_ROWS": "128",
+        "ANTFLY_LIGHTONOCR3_BATCH_WINDOW": "128"
+      }
+    },
+    "lighton08-physical128-compact-kv": {
+      "extends": "lighton08-physical128",
+      "qualification": "Experimental CUDA compact attention KV mapping. F32 policy, original byte caps; full fixture output checks passed for 128 and 256 requests. See paired evidence before performance claims.",
+      "environment": {
+        "ANTFLY_LIGHTONOCR3_COMPACT_KV": "1"
+      }
+    },
+    "lighton4b-physical128-compact-kv": {
+      "extends": "lighton4b-physical128",
+      "qualification": "Experimental CUDA compact attention KV mapping. F32 policy, original byte caps; full fixture output checks passed for 128 and 256 requests. See paired evidence before performance claims.",
+      "environment": {
+        "ANTFLY_LIGHTONOCR3_COMPACT_KV": "1"
+      }
+    },
+    "florence-canonical": {
+      "extends": "florence",
+      "qualification": "Unqualified experimental canonical 32-row GEMM selection for Florence decode. Original FP16 operands and F32 outputs; actual row layouts are independently checked.",
+      "environment": {
+        "ANTFLY_CUDA_ENABLE_FLORENCE_CANONICAL_DECODE_GEMM": "1"
+      }
+    },
+    "lighton08-physical128-compact-kv-bf16-prefill-ffn": {
+      "extends": "lighton08-physical128-compact-kv",
+      "qualification": "Unqualified experimental BF16 FFN intermediates only for 256 or more query rows. F32 residual, decode path and recurrent state; not a complete vLLM precision match.",
+      "environment": {
+        "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN": "1"
+      }
+    },
+    "lighton4b-physical128-compact-kv-bf16-prefill-ffn": {
+      "extends": "lighton4b-physical128-compact-kv",
+      "qualification": "Unqualified experimental BF16 FFN intermediates only for 256 or more query rows. F32 residual, decode path and recurrent state; not a complete vLLM precision match.",
+      "environment": {
+        "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN": "1"
+      }
+    },
+    "lighton4b-physical128-compact-kv-prefill16": {
+      "extends": "lighton4b-physical128-compact-kv",
+      "qualification": "Unqualified experimental CUDA sixteen-prefix admission. Original F32 policy, byte caps and total 4096-query-row ceiling.",
+      "environment": {
+        "ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS": "16",
+        "ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS": "256"
+      }
+    }
+  }
+}

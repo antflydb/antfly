@@ -107,6 +107,10 @@ pub const ReadBatchResult = struct {
 /// Only the loaded native Metal reader can transfer GPU-lane ownership into
 /// the pipeline. Standalone readers retain the existing serialized contract.
 pub fn nativeFlorencePreprocessOverlapEnabled(session: backends.Session) bool {
+    // CUDA's provider owns mutable activation scratch and temporary pools too.
+    // Preprocessing can overlap, but the pinned reader's lane must cover the
+    // complete encoder/decoder and scoped provider cleanup.
+    if (session.backend() == .cuda) return session_factory.getFlorenceConfig(session) != null;
     if (comptime !build_options.enable_metal) return false;
     return session.backend() == .metal and
         session_factory.getFlorenceConfig(session) != null and
@@ -639,13 +643,17 @@ pub const ReadingPipeline = struct {
 
         // Direct compute bypasses Session.run, so retain its admission permit
         // through both encoder/decoder execution and backend cleanup.
-        run_permit = try self.vision_encoder.admit(try nativeFlorenceRunRequest(
+        const incremental_admission = cudaFlorenceIncrementalAdmissionEligible(self.vision_encoder.backend(), florenceKvCacheDisabled());
+        run_permit = try self.vision_encoder.admit(try nativeFlorenceRunRequestWithLogitMode(
             florence_cfg,
             batch,
             pixel_values.len,
             prompt_i32.len,
             self.config.max_length,
+            incremental_admission,
         ));
+        if (incremental_admission and platform.env.getenvBool("ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX"))
+            std.debug.print("FLORENCE2 cuda_incremental_admission_items={d}\n", .{batch});
 
         var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
         defer managed.deinit();
@@ -673,7 +681,11 @@ pub const ReadingPipeline = struct {
             last_read_telemetry.cuda_graph_replay = false;
             last_read_telemetry.cuda_graph_fallback_reason = "batched_florence_kv_decode";
             const kv_result = self.decodeNativeFlorenceBatchIncrementalFromEncoder(cb, florence_cfg, encoder.hidden, batch, encoder.seq_len) catch |err| fallback: {
-                if (!shouldFallbackFlorenceIncremental(backend, err)) return err;
+                // The bounded reservation funds only incremental logits. An
+                // unsupported batch must unwind its encoder/cache and permit
+                // before the outer reader may try separately admitted serial
+                // requests. Never enter full-prefix decode on this lease.
+                if (!florenceIncrementalFallbackAdmitted(backend, incremental_admission, err)) return err;
                 markFlorenceIncrementalFallback();
                 break :fallback null;
             };
@@ -682,6 +694,9 @@ pub const ReadingPipeline = struct {
                 return result;
             }
         }
+        // This includes a cache-policy change between admission and execution:
+        // only the full reservation can fund the full-prefix implementation.
+        if (incremental_admission) return error.UnsupportedOperation;
         const result = try self.decodeNativeFlorenceBatchFromEncoder(cb, florence_cfg, encoder.hidden, batch, encoder.seq_len);
         logReadProfile("batch_decode_from_encoder", decode_start);
         return result;
@@ -760,7 +775,7 @@ pub const ReadingPipeline = struct {
         // An unmasked device winner is also the masked winner when the
         // page's no-repeat policy allows that token. Only rejected winners
         // need the existing full-logits host selection path.
-        const checked_no_repeat_argmax = cb.kind() == .metal and
+        const checked_no_repeat_argmax = (cb.kind() == .metal or cb.kind() == .cuda) and
             !platform.env.getenvBool("ANTFLY_FLORENCE2_DISABLE_NO_REPEAT_ARGMAX");
         // This invocation already admits full-prefix logits and decoder/KV
         // storage. Keep each incremental decoder, head and reduction in one
@@ -1939,6 +1954,29 @@ fn nativeFlorenceRunRequest(
     prompt_length: usize,
     max_length: usize,
 ) !session_mod.RunRequest {
+    return nativeFlorenceRunRequestWithLogitMode(cfg, batch, pixel_count, prompt_length, max_length, false);
+}
+
+fn cudaFlorenceIncrementalAdmissionEligible(backend: backends.BackendType, cache_disabled: bool) bool {
+    return backend == .cuda and !cache_disabled and
+        platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_INCREMENTAL_ADMISSION");
+}
+
+fn florenceIncrementalFallbackAdmitted(backend: backends.BackendType, incremental_admission: bool, err: anyerror) bool {
+    return !incremental_admission and shouldFallbackFlorenceIncremental(backend, err);
+}
+
+/// Cached batched decoding materializes [active_rows, vocab] logits for one
+/// step. KV capacity and encoder geometry still cover the complete invocation.
+/// Callers selecting this envelope must unwind before full-prefix fallback.
+fn nativeFlorenceRunRequestWithLogitMode(
+    cfg: florence_arch.Config,
+    batch: usize,
+    pixel_count: usize,
+    prompt_length: usize,
+    max_length: usize,
+    incremental: bool,
+) !session_mod.RunRequest {
     const Checked = struct {
         fn add(a: usize, b: usize) !usize {
             return std.math.add(usize, a, b) catch error.ResourceLimitExceeded;
@@ -1967,7 +2005,7 @@ fn nativeFlorenceRunRequest(
     const encoder_length = try Checked.add(image_tokens, prompt_length);
     const decoder_length = @max(max_length, 1);
     const encoder_bytes = try Checked.mul(try Checked.mul(batch, encoder_length), try Checked.mul(cfg.d_model, @sizeOf(f32)));
-    const logits_bytes = try Checked.mul(try Checked.mul(batch, decoder_length), try Checked.mul(cfg.vocab_size, @sizeOf(f32)));
+    const logits_bytes = try Checked.mul(try Checked.mul(batch, if (incremental) @as(usize, 1) else decoder_length), try Checked.mul(cfg.vocab_size, @sizeOf(f32)));
     const cache_length = try Checked.add(encoder_length, decoder_length);
     const kv_bytes = try Checked.mul(try Checked.mul(batch, cache_length), try Checked.mul(cfg.decoder_layers, try Checked.mul(cfg.d_model, 2 * @sizeOf(f32))));
     const prompt_bytes = try Checked.mul(prompt_length, try Checked.add(try Checked.mul(batch, @sizeOf(i64)), @sizeOf(i32)));
@@ -3278,4 +3316,87 @@ test "Florence telemetry belongs to the calling thread during concurrent preproc
     second.join();
     second_joined = true;
     try std.testing.expectEqual(@as(usize, 2), passed.load(.acquire));
+}
+
+test "LightOnOCR3 CUDA Florence checked argmax preserves no-repeat policy without logits download" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const ids = [_]i64{ 1, 2, 3, 1, 2, 0, 7, 8, 9, 7, 8, 0, 4, 5, 6, 4, 5, 0 };
+    const active = [_]usize{ 2, 0 };
+    const vocab: usize = 2051;
+    var logits: [vocab * 2]f32 = @splat(-2);
+    for ([_]bool{ false, true }) |blocked| {
+        @memset(&logits, -2);
+        logits[if (blocked) 6 else 7] = 4;
+        logits[vocab + 4] = 4;
+        const tensor = try cb.fromFloat32Shape(&logits, &.{ 2, vocab });
+        defer cb.free(tensor);
+        const before = compute.snapshotStats();
+        const tokens = (try cb.argmaxRows(tensor, 0, 2, vocab, a)).?;
+        defer a.free(tokens);
+        const after = compute.snapshotStats();
+        try std.testing.expectEqual(@as(usize, 2 * @sizeOf(u32)), after.d2h_bytes - before.d2h_bytes);
+        const allowed = florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 5, &active, tokens, 3);
+        try std.testing.expectEqual(!blocked, allowed);
+        if (allowed) {
+            for (tokens, active, 0..) |token, original, row| try std.testing.expectEqual(@as(u32, @intCast(selectGreedyToken(logits[row * vocab ..][0..vocab], ids[original * 6 ..][0..5], 3))), token);
+        } else {
+            const downloaded = try cb.toFloat32(tensor, a);
+            defer a.free(downloaded);
+            try std.testing.expectEqualSlices(f32, &logits, downloaded);
+            try std.testing.expectEqual(@as(usize, 0), selectGreedyToken(downloaded[0..vocab], ids[12..17], 3));
+        }
+    }
+}
+
+test "LightOnOCR3 CUDA Florence incremental admission preserves complete KV capacity and cannot fund prefix fallback" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const cfg = florence_arch.Config{
+        .image_size = 8,
+        .patch_size = .{ 1, 1, 1, 1 },
+        .patch_stride = .{ 2, 2, 1, 1 },
+        .patch_padding = .{ 0, 0, 0, 0 },
+        .d_model = 4,
+        .vocab_size = 8,
+        .decoder_layers = 2,
+    };
+    const full = try nativeFlorenceRunRequest(cfg, 2, 384, 3, 6);
+    const incremental = try nativeFlorenceRunRequestWithLogitMode(cfg, 2, 384, 3, 6, true);
+    try std.testing.expectEqual(@as(usize, 2112), incremental.output_bytes.?);
+    try std.testing.expectEqual(full.input_bytes, incremental.input_bytes);
+    try std.testing.expectEqual(full.output_kv_bytes, incremental.output_kv_bytes);
+    try std.testing.expectEqual(full.sequence, incremental.sequence);
+    try std.testing.expect(!cudaFlorenceIncrementalAdmissionEligible(.metal, false));
+    try std.testing.expect(!cudaFlorenceIncrementalAdmissionEligible(.native, false));
+    try std.testing.expect(!cudaFlorenceIncrementalAdmissionEligible(.cuda, true));
+    try std.testing.expect(!florenceIncrementalFallbackAdmitted(.cuda, true, error.UnsupportedOperation));
+    try std.testing.expect(!florenceIncrementalFallbackAdmitted(.cuda, true, error.UnsupportedShape));
+    try std.testing.expect(florenceIncrementalFallbackAdmitted(.cuda, false, error.UnsupportedOperation));
+    try std.testing.expect(!florenceIncrementalFallbackAdmitted(.native, false, error.UnsupportedOperation));
+
+    // This budget can fund complete cached decoding but cannot fund the larger
+    // prefix logits. A supplemental denial must leave the original owner live.
+    var controller = memory.AdmissionController{};
+    var probe = AdmissionDenyingFlorenceSession{};
+    var session = probe.session();
+    session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .scratch_limit_bytes = 25000, .kv_limit_bytes = 4000 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admit(full));
+    var permit = try session.admit(incremental);
+    var live = true;
+    defer if (live) permit.deinit();
+    const before = controller.snapshot();
+    try std.testing.expectEqual(@as(usize, 22248), before.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 2236), before.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 3584), before.host_kv_bytes);
+    const full_amounts = try session.run_admission.?.estimateRequest(full, session.outputInfo());
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitSupplement(&permit, full_amounts));
+    try std.testing.expectEqualDeep(before, controller.snapshot());
+    permit.deinit();
+    live = false;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+    try std.testing.expect(!probe.run_called);
 }

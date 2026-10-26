@@ -55,6 +55,7 @@ def checkpoint(path):
                 "config.json",
                 "preprocessor_config.json",
                 "model_manifest.json",
+                "source_revision.json",
             )
             if (path / name).is_file()
         },
@@ -62,7 +63,11 @@ def checkpoint(path):
 
 
 def hardware():
-    result = {"processor": platform.processor()}
+    result = {
+        "processor": platform.processor(),
+        "system": platform.system(),
+        "machine": platform.machine(),
+    }
     if platform.system() == "Darwin":
         result.update(
             processor=subprocess.check_output(
@@ -74,6 +79,56 @@ def hardware():
                 )
             ),
         )
+    elif platform.system() == "Linux":
+        if hasattr(os, "sched_getaffinity"):
+            result["cpu_affinity"] = sorted(os.sched_getaffinity(0))
+        capacities = {}
+        for cpu in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpu_capacity"):
+            try:
+                capacities[cpu.parent.name] = int(cpu.read_text())
+            except (OSError, ValueError):
+                pass
+        if capacities:
+            result["cpu_capacities"] = capacities
+        memory = Path("/proc/meminfo")
+        if memory.is_file():
+            for line in memory.read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    result["physical_memory_bytes"] = int(line.split()[1]) * 1024
+        try:
+            result["nvidia_smi"] = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=name,driver_version,compute_cap",
+                    "--format=csv,noheader",
+                ],
+                text=True,
+                timeout=15,
+            ).strip()
+        except (OSError, subprocess.SubprocessError) as error:
+            result["nvidia_smi_error"] = str(error)
+        for name, query in (
+            (
+                "gpu_telemetry",
+                "--query-gpu=temperature.gpu,power.draw,clocks.sm,utilization.gpu",
+            ),
+            (
+                "gpu_compute_processes",
+                "--query-compute-apps=pid,process_name,used_gpu_memory",
+            ),
+        ):
+            try:
+                result[name] = (
+                    subprocess.check_output(
+                        ["nvidia-smi", query, "--format=csv,noheader"],
+                        text=True,
+                        timeout=15,
+                    )
+                    .strip()
+                    .splitlines()
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                result[name + "_error"] = str(error)
     return result
 
 

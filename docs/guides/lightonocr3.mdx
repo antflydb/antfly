@@ -80,12 +80,12 @@ model's native labeled bounding-box markers, descriptions, and chart tables in
 the result's `text`. These markers use coordinates normalized to 0–1000; they
 are not converted into pixel-coordinate `regions`.
 
-On Metal, `/read` coalesces compatible pages from the same request and from
-concurrent requests into bounded cohorts. Decoder projections share GPU work;
+On Metal, and on CUDA with the opt-in LightOn batch profile, `/read` coalesces
+compatible pages from the same request and from concurrent requests into bounded
+cohorts. Decoder projections share GPU work;
 each page keeps independent KV, DeltaNet history, and image positions. Pages
 retire independently inside the cohort. Vision projection and prefill retain
-the shared runtime's execution lock. CPU and CUDA readers retain serial page
-execution. Response execution counters report pages that actually participated
+the shared runtime's execution lock. CPU readers retain serial page execution. Response execution counters report pages that actually participated
 in a multi-page decode step.
 
 `/read` currently accepts at most 1024 output tokens
@@ -150,6 +150,79 @@ The invoice fixture is copied from Antfly's existing native
 Apple OCR tests. Published quality and speed numbers are documented in
 [LightOn's evaluation](https://huggingface.co/blog/lightonai/lightonocr-3);
 they are not Antfly runtime measurements.
+
+## CUDA execution and validation
+
+The CUDA implementation supports both original BF16 safetensors checkpoints.
+Its qualified kernels cover the models' grouped recurrent heads, short and
+chunked prefixes, continued decoding, independent page resets, and paged
+attention. Activations, recurrent matrices, and projection outputs remain F32;
+eligible tensor-core projections use BF16 operands. Vision attention uses cuDNN
+at its existing BF16 boundary.
+
+CUDA batching requires a CUDA build, `TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE=1`,
+and `ANTFLY_LIGHTONOCR3_CUDA_BATCH=1`. The default physical decode ceiling for
+this opt-in profile is 16 pages. `ANTFLY_LIGHTONOCR3_PHYSICAL64=1` raises that
+ceiling to 64; every page still acquires its own memory and scheduling leases.
+Pending client requests, admitted live pages, and physical GPU rows are separate
+limits. Increasing the request backlog does not increase the physical row
+ceiling or override byte limits.
+
+The experimental `lighton08-physical128-compact-kv` and
+`lighton4b-physical128-compact-kv` presets allow 128 physical CUDA rows while
+keeping recurrent and attention packets at most 64 rows. Compact KV allocates
+attention storage only for full-attention layers; every recurrent layer keeps
+its independent state. The original memory limits still apply. These profiles
+have passed the bundled full-output checks; LightOn CUDA throughput remains
+below the installed vLLM reference.
+
+The corresponding `-bf16-prefill-ffn` presets additionally use BF16 FFN
+intermediates for at least 256 query rows, retaining F32 residuals, decode and
+recurrent state. This is a partial precision experiment, not a complete match
+to vLLM's BF16 activation profile. The `florence-canonical` preset selects decode
+GEMM algorithms using a canonical 32-row descriptor and checks the actual row
+layout before execution. All of these options remain experimental.
+
+The [DGX Spark checkpoint evidence](https://github.com/antflydb/antfly/tree/feat/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/cuda_spark_checkpoint)
+records settings, build identities, validation and separate throughput screens.
+
+The experimental DGX Spark presets collect the measured settings in one place.
+Choose `lighton08` or `lighton4b` for the corresponding original checkpoint:
+
+```bash
+python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton08 --print-env
+python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton08 -- ./antfly standalone
+```
+
+The `florence` preset targets the original Florence-2-base FP16 checkpoint.
+These presets require a CUDA build and cuDNN on the dynamic library search path.
+They preserve existing operator environment values and do not change memory
+or request-admission limits. The LightOn presets allow a 16 GiB temporary cache
+within the runtime's memory policy; deployments must budget working memory
+separately from weights. They leave GPU token bursts and GEMM autotuning disabled.
+
+The CUDA optimizations remain opt-in while throughput qualification is in
+progress. Benchmark the deployment's page sizes and output lengths before
+selecting a profile. The bundled synthetic pages check runtime agreement;
+they do not establish accuracy on a document dataset or a general throughput
+advantage over vLLM.
+
+From the repository root, reproduce the standalone CUDA checks on an NVIDIA
+machine with the CUDA toolkit and the reference Python dependencies installed:
+
+```bash
+bash zig/pkg/inference/scripts/lightonocr3/verify_cuda_recurrent.sh
+bash zig/pkg/inference/scripts/lightonocr3/verify_cuda_attention.sh
+bash zig/pkg/inference/scripts/lightonocr3/verify_cuda_activations.sh
+bash zig/pkg/inference/scripts/lightonocr3/verify_cuda_vision.sh
+```
+
+The recurrent checks compare against CPU references and preserve the original
+numerical tolerances, read-only inputs, history state, and allocation canaries.
+The fused decode and compact mixed-prefix paths receive additional checks.
+Full-model benchmarking with `benchmark_concurrency.py` also compares every
+page against ordinary native serial decoding and the supplied reference report.
+CUDA token bursts use ordinary serial references with bursts disabled.
 
 ## Rough local comparison with PyTorch
 

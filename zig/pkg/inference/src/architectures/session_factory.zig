@@ -100,6 +100,7 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     qwen3_embedding,
     embedding_gemma2,
     qwen3_vl_generation,
+    lightonocr3,
 };
 const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
 const GpuHostedCompute = void;
@@ -2227,6 +2228,13 @@ fn cudaProfileForArch(
                 model_manifest.model_type == .generator and
                 model_manifest.isQwen3VlGenerationSafetensorsBundle())
                 .qwen3_vl_generation
+            else
+                null,
+            .qwen3_5 => if (task == .generic and model_manifest.isLightOnOcr3() and
+                cfg.hasQwen35VisionArchitectureContract() and
+                cfg.qwen35_linear_key_head_dim == 128 and cfg.qwen35_linear_value_head_dim == 128 and
+                cfg.qwen35_linear_conv_kernel_dim == 4)
+                .lightonocr3
             else
                 null,
             else => null,
@@ -12533,4 +12541,27 @@ test "embeddinggemma2 coefficient cache relinquishes device credit before recove
     try std.testing.expectEqual(@as(usize, Cache.device_budget), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, Cache.device_budget), try reclaimVideoPreparationCoefficients(session, .{}));
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+}
+
+test "LightOnOCR3 CUDA loader profile requires the reader role and supported recurrent geometry" {
+    const a = std.testing.allocator;
+    const cfg = try gpt_mod.parseConfig(a, @embedFile("../models/testdata/lightonocr3/config.json"));
+    var capabilities = [_][]const u8{"lightonocr3"};
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = a,
+        .model_type = .generator,
+        .config_model_arch = "qwen3_5",
+        .capabilities = &capabilities,
+    };
+    try std.testing.expectEqual(CudaCapabilityProfile.lightonocr3, cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest).?);
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .classifier, &manifest) == null);
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .extractor, &manifest) == null);
+    var unsupported = cfg;
+    unsupported.qwen35_linear_key_head_dim = 64;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
+    unsupported = cfg;
+    unsupported.vision_temporal_patch_size = 1;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = unsupported }, .generic, &manifest) == null);
+    manifest.capabilities = &.{};
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest) == null);
 }

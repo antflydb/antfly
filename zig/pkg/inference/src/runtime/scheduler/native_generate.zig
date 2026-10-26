@@ -230,6 +230,10 @@ pub const Policy = struct {
     decode_coalesce_rows: usize = 1,
     /// Count only pages with known next decode work when forming a cohort.
     decode_coalesce_ready_only: bool = false,
+    /// A GPU turn can outlast the coalescing window. Give pending work a fresh
+    /// bounded window when that turn completes so its published peers can
+    /// rejoin, rather than permanently splitting into alternating tiny batches.
+    decode_coalesce_after_turn: bool = false,
     /// Model-scoped wait between unsuccessful turn/step claims. A positive
     /// duration parks waiting OS threads while their peer owns a GPU forward.
     /// Zero preserves the cooperative polling policy for other backends.
@@ -285,6 +289,8 @@ pub const Stats = struct {
     step_kv_block_skips_total: u64 = 0,
     decode_coalesce_waits_total: u64 = 0,
     decode_coalesce_wait_us_total: u64 = 0,
+    decode_coalesce_turn_boundaries_total: u64 = 0,
+    decode_coalesce_rebased_items_total: u64 = 0,
     step_batch_size_2_total: u64 = 0,
     step_batch_size_3_4_total: u64 = 0,
     step_batch_size_5_8_total: u64 = 0,
@@ -1316,6 +1322,14 @@ pub const NativeGenerateCoordinator = struct {
     fn finishTurnUnlocked(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) void {
         defer self.notifyWaitersUnlocked();
         if (self.in_turn != lease.request_id) return;
+        if (self.policy.decode_coalesce_after_turn and self.policy.decode_coalesce_rows > 1 and
+            self.policy.max_decode_wait_us > 0)
+        {
+            const now = platform.time.monotonicNs();
+            for (self.pending_decode.items) |*pending| pending.enqueued_ns = now;
+            self.stats.decode_coalesce_turn_boundaries_total += 1;
+            self.stats.decode_coalesce_rebased_items_total += self.pending_decode.items.len;
+        }
         self.in_turn = null;
         self.in_turn_phase = null;
         switch (phase) {
@@ -1614,6 +1628,8 @@ pub fn aggregateStats(models: anytype) struct { snapshot: Snapshot, stats: Stats
         stats.step_kv_block_skips_total += st.step_kv_block_skips_total;
         stats.decode_coalesce_waits_total += st.decode_coalesce_waits_total;
         stats.decode_coalesce_wait_us_total += st.decode_coalesce_wait_us_total;
+        stats.decode_coalesce_turn_boundaries_total += st.decode_coalesce_turn_boundaries_total;
+        stats.decode_coalesce_rebased_items_total += st.decode_coalesce_rebased_items_total;
         stats.step_batch_size_2_total += st.step_batch_size_2_total;
         stats.step_batch_size_3_4_total += st.step_batch_size_3_4_total;
         stats.step_batch_size_5_8_total += st.step_batch_size_5_8_total;
@@ -3785,4 +3801,59 @@ test "LightOnOCR3 packed step caps multiple unequal prefills while retaining dec
     coordinator.completeStep(&leases[0], step.items);
     try std.testing.expect(coordinator.findPendingPrefill(&works[2]) != null);
     coordinator.cancelPrefillWork(&works[2]);
+}
+
+test "LightOnOCR3 CUDA native generate coordinator turn coalescing reunites work aged behind a GPU turn" {
+    for ([_]bool{ false, true }) |enabled| {
+        var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+        defer coordinator.deinit();
+        coordinator.setPolicy(.{
+            .max_step_items = 4,
+            .max_step_query_tokens = 4,
+            .decode_coalesce_rows = 4,
+            .decode_coalesce_ready_only = true,
+            .decode_coalesce_after_turn = enabled,
+            .allow_mixed_sequence_lengths = true,
+            .max_decode_wait_us = 1000,
+        });
+        var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+        defer coordinator.release(first);
+        const second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+        defer coordinator.release(second);
+        coordinator.beginDecode(&first, 4);
+        var second_lease = second;
+        coordinator.beginDecode(&second_lease, 4);
+        try coordinator.enqueueDecodeWork(first, @ptrFromInt(1), 5, 4, 0, .{ .exclusive_step = true });
+        try coordinator.enqueueDecodeWork(second, @ptrFromInt(2), 5, 4, 0, .{});
+        // The waiting peer is already older than the 1ms window when the GPU
+        // finishes. Its enqueue age must not force a permanent separate batch.
+        coordinator.pending_decode.items[1].enqueued_ns = 1;
+        var step = std.ArrayListUnmanaged(StepItem).empty;
+        defer step.deinit(std.testing.allocator);
+        const budget = coordinator.defaultStepBudget();
+        try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &first, @ptrFromInt(1), .decode, budget, &step));
+        try std.testing.expectEqual(@as(usize, 1), step.items.len);
+        coordinator.completeStep(&first, step.items);
+        const pending = coordinator.pending_decode.items[0];
+        const now = platform.time.monotonicNs();
+        if (enabled) {
+            try std.testing.expect(pending.enqueued_ns > 1 and pending.enqueued_ns <= now);
+            try std.testing.expect(coordinator.deferReadyDecodeCohort(budget, pending.enqueued_ns, pending));
+            try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, pending.enqueued_ns + std.time.ns_per_ms, pending));
+            try std.testing.expectEqual(@as(u64, 1), coordinator.stats.decode_coalesce_rebased_items_total);
+        } else {
+            try std.testing.expectEqual(@as(u64, 1), pending.enqueued_ns);
+            try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, now, pending));
+            try std.testing.expectEqual(@as(u64, 0), coordinator.stats.decode_coalesce_turn_boundaries_total);
+        }
+        // A published result re-enqueues quickly. Once all known peers are
+        // ready, batching proceeds immediately rather than sleeping to deadline.
+        try coordinator.enqueueDecodeWork(first, @ptrFromInt(3), 6, 5, 0, .{});
+        try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, platform.time.monotonicNs(), coordinator.pending_decode.items[0]));
+        var turn = second;
+        try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &turn, @ptrFromInt(2), .decode, budget, &step));
+        try std.testing.expectEqual(@as(usize, 2), step.items.len);
+        coordinator.completeStep(&turn, step.items);
+        try std.testing.expectEqual(@as(u64, 3), coordinator.stats.step_decode_items_total);
+    }
 }

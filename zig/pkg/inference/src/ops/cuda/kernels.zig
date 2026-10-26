@@ -7015,7 +7015,8 @@ pub const KernelModule = struct {
             @ptrCast(&in_dim_u32),
             @ptrCast(&out_dim_u32),
         };
-        try launch2d(self.linear_bias_add_f32_tile4_r2, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (rows + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, &params);
+        const bindings = [_]F32RowBinding{ .{ .pointer = &dst_ptr, .base = dst_ptr, .row_bytes = out_dim * @sizeOf(f32) }, .{ .pointer = &input_ptr, .base = input_ptr, .row_bytes = in_dim * @sizeOf(f32) }, .{ .pointer = &residual_ptr, .base = residual_ptr, .row_bytes = out_dim * @sizeOf(f32) } };
+        try launchF32RowTiles(self.linear_bias_add_f32_tile4_r2, ctx, rows, in_dim, out_dim, &rows_u32, &bindings, &params);
     }
 
     pub fn launchLinearPairBiasTile4Rows2F32(
@@ -7064,7 +7065,8 @@ pub const KernelModule = struct {
             @ptrCast(&in_dim_u32),
             @ptrCast(&out_dim_u32),
         };
-        try launch2d(self.linear_pair_bias_f32_tile4_r2, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (rows + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, &params);
+        const bindings = [_]F32RowBinding{ .{ .pointer = &dst_a_ptr, .base = dst_a_ptr, .row_bytes = out_dim * @sizeOf(f32) }, .{ .pointer = &dst_b_ptr, .base = dst_b_ptr, .row_bytes = out_dim * @sizeOf(f32) }, .{ .pointer = &input_ptr, .base = input_ptr, .row_bytes = in_dim * @sizeOf(f32) } };
+        try launchF32RowTiles(self.linear_pair_bias_f32_tile4_r2, ctx, rows, in_dim, out_dim, &rows_u32, &bindings, &params);
     }
 
     pub fn launchLinearTripleBiasTile4Rows2F32(
@@ -7125,7 +7127,8 @@ pub const KernelModule = struct {
             @ptrCast(&in_dim_u32),
             @ptrCast(&out_dim_u32),
         };
-        try launch2d(self.linear_triple_bias_f32_tile4_r2, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (rows + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, &params);
+        const bindings = [_]F32RowBinding{ .{ .pointer = &dst_a_ptr, .base = dst_a_ptr, .row_bytes = out_dim * @sizeOf(f32) }, .{ .pointer = &dst_b_ptr, .base = dst_b_ptr, .row_bytes = out_dim * @sizeOf(f32) }, .{ .pointer = &dst_c_ptr, .base = dst_c_ptr, .row_bytes = out_dim * @sizeOf(f32) }, .{ .pointer = &input_ptr, .base = input_ptr, .row_bytes = in_dim * @sizeOf(f32) } };
+        try launchF32RowTiles(self.linear_triple_bias_f32_tile4_r2, ctx, rows, in_dim, out_dim, &rows_u32, &bindings, &params);
     }
 
     fn launchLinearBiasF32Tile4Rows2Common(
@@ -7164,7 +7167,8 @@ pub const KernelModule = struct {
             @ptrCast(&in_dim_u32),
             @ptrCast(&out_dim_u32),
         };
-        try launch2d(function, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (rows + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, &params);
+        const bindings = [_]F32RowBinding{ .{ .pointer = &dst_ptr, .base = dst_ptr, .row_bytes = out_dim * @sizeOf(f32) }, .{ .pointer = &input_ptr, .base = input_ptr, .row_bytes = in_dim * @sizeOf(f32) } };
+        try launchF32RowTiles(function, ctx, rows, in_dim, out_dim, &rows_u32, &bindings, &params);
     }
 
     pub fn launchRmsNormF32(
@@ -18509,6 +18513,48 @@ fn checkTypedTailWeightBytes(buffer: buffer_mod.DeviceBuffer, elem_count: usize,
 
 fn checkRawBytes(buffer: buffer_mod.DeviceBuffer, bytes: usize) driver_mod.Error!void {
     if (bytes > buffer.len) return error.InvalidCudaState;
+}
+
+// CUDA grid.y is limited to 65535. Large Florence vision batches exceed
+// that limit even though all buffers fit their admitted byte envelopes.
+// Rebase row-major pointers for bounded launches; each row keeps identical
+// arithmetic and kernels need no new launch ABI or artifact regeneration.
+const F32RowBinding = struct {
+    pointer: *driver_mod.CUdeviceptr,
+    base: driver_mod.CUdeviceptr,
+    row_bytes: usize,
+};
+
+fn f32RowTileChunkLimit(in_dim: usize, out_dim: usize) driver_mod.Error!usize {
+    if (in_dim == 0 or out_dim == 0) return error.InvalidCudaState;
+    const index_rows = std.math.maxInt(u32) / @max(in_dim, out_dim);
+    const limit = @min(@as(usize, 65535) * f32_row_tile, index_rows);
+    if (limit == 0) return error.InvalidCudaState;
+    return limit;
+}
+
+fn launchF32RowTiles(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, rows: usize, in_dim: usize, out_dim: usize, row_argument: *u32, bindings: []const F32RowBinding, params: [*]?*anyopaque) driver_mod.Error!void {
+    const limit = try f32RowTileChunkLimit(in_dim, out_dim);
+    const full_rows = row_argument.*;
+    defer {
+        row_argument.* = full_rows;
+        for (bindings) |binding| binding.pointer.* = binding.base;
+    }
+    var start: usize = 0;
+    while (start < rows) {
+        const count = @min(rows - start, limit);
+        row_argument.* = try toU32(count);
+        for (bindings) |binding| binding.pointer.* = binding.base + start * binding.row_bytes;
+        try launch2d(function, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (count + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, params);
+        start += count;
+    }
+}
+
+test "LightOnOCR3 CUDA F32 row tiles respect grid and device indexing limits" {
+    try std.testing.expectEqual(@as(usize, 131070), try f32RowTileChunkLimit(128, 512));
+    const large = try f32RowTileChunkLimit(65536, 65536);
+    try std.testing.expect(large * 65536 <= std.math.maxInt(u32));
+    try std.testing.expectError(error.InvalidCudaState, f32RowTileChunkLimit(0, 512));
 }
 
 fn launch1d(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, count: usize, params: [*]?*anyopaque) driver_mod.Error!void {

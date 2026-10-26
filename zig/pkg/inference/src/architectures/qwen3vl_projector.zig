@@ -411,6 +411,7 @@ pub const PreparedPrompt = struct {
 
 const Config = struct {
     is_qwen35: bool = false,
+    block_gelu_tanh: bool = false,
     require_metal_resident_vision: bool = false,
     text_hidden: usize,
     vision_hidden: usize,
@@ -808,6 +809,39 @@ fn encodeProjectedImagesFromStoreQualified(
 /// reside on the model compute backend. This is the BF16 counterpart of the
 /// split GGUF projector path and deliberately shares the exact preprocessing,
 /// M-RoPE, DeepStack, and decoder-injection graph.
+fn embedSpatialPatchRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, weights: *WeightCache, cfg: Config, patches: []const f32, geometry: Geometry) !CT {
+    const bias = try weights.weight("v.patch_embd.bias");
+    const patch_dim = cfg.patch_size * cfg.patch_size * 3;
+    const full = if (comptime build_options.enable_cuda)
+        if (cb.kind() == .cuda) try weights.fullResidentPatch() else null
+    else
+        null;
+    if (full) |weight| {
+        const temporal = try duplicateStillImageTemporalPatches(allocator, patches, geometry.patchCount(), cfg.patch_size);
+        defer allocator.free(temporal);
+        const input = try cb.fromFloat32Shape(temporal, &.{ @intCast(geometry.patchCount()), @intCast(patch_dim * 2) });
+        defer cb.free(input);
+        return cb.linear(input, weight, bias, geometry.patchCount(), patch_dim * 2, cfg.vision_hidden);
+    }
+    const input = try cb.fromFloat32Shape(patches, &.{ @intCast(geometry.patchCount()), @intCast(patch_dim) });
+    defer cb.free(input);
+    const w0 = try weights.patch("v.patch_embd.weight", cfg);
+    const w1 = try weights.patch("v.patch_embd.weight.1", cfg);
+    const first = try cb.linear(input, w0, bias, geometry.patchCount(), patch_dim, cfg.vision_hidden);
+    defer cb.free(first);
+    const second = try cb.linearNoBias(input, w1, geometry.patchCount(), patch_dim, cfg.vision_hidden);
+    defer cb.free(second);
+    return cb.add(first, second);
+}
+
+/// CUDA groups independently admitted pages under the same byte limits. Metal
+/// retains its existing qualified four-page submission envelope.
+pub const resident_vision_batch_capacity: usize = 16;
+pub fn maxResidentVisionBatchItems(backend: ops.BackendKind) usize {
+    if (backend != .cuda) return 4;
+    return if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES")) resident_vision_batch_capacity else 8;
+}
+
 /// Exact resized geometry for a bounded, independent-image vision batch.
 pub fn residentBatchGeometryKey(config: gpt_config.Config, bytes: []const u8, limits: Limits) !u64 {
     try limits.validate();
@@ -833,9 +867,9 @@ pub fn encodeProjectedImagesResidentBatched(
     limits: Limits,
 ) ![]ProjectedImages {
     try limits.validate();
-    if (images.len == 0 or images.len > 4 or images.len > limits.max_images) return error.ImageLimitExceeded;
+    if (images.len == 0 or images.len > maxResidentVisionBatchItems(cb.kind()) or images.len > limits.max_images) return error.ImageLimitExceeded;
     const cfg = try configFromResidentModel(config);
-    if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or cb.kind() != .metal) return error.UnsupportedBatchedVision;
+    if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedBatchedVision;
     const key = try residentBatchGeometryKey(config, images[0], limits);
     for (images[1..]) |bytes| if (try residentBatchGeometryKey(config, bytes, limits) != key) return error.VisionBatchGeometryMismatch;
     const Check = struct {
@@ -844,10 +878,10 @@ pub fn encodeProjectedImagesResidentBatched(
             try backend.checkExecutionControl();
         }
     };
-    var prepared: [4]PreparedImage = undefined;
+    var prepared: [resident_vision_batch_capacity]PreparedImage = undefined;
     var initialized: usize = 0;
     defer for (prepared[0..initialized]) |*value| value.deinit();
-    var views: [4]*const PreparedImage = undefined;
+    var views: [resident_vision_batch_capacity]*const PreparedImage = undefined;
     for (images, 0..) |bytes, index| {
         prepared[index] = try prepareImageCpu(allocator, cfg, bytes, limits, .{ .context = cb, .check_fn = Check.check }, false);
         initialized += 1;
@@ -865,9 +899,9 @@ pub fn encodePreparedProjectedImagesResidentBatched(
     limits: Limits,
 ) ![]ProjectedImages {
     try limits.validate();
-    if (prepared_images.len == 0 or prepared_images.len > 4 or prepared_images.len > limits.max_images) return error.ImageLimitExceeded;
+    if (prepared_images.len == 0 or prepared_images.len > maxResidentVisionBatchItems(cb.kind()) or prepared_images.len > limits.max_images) return error.ImageLimitExceeded;
     const cfg = try configFromResidentModel(config);
-    if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or cb.kind() != .metal) return error.UnsupportedBatchedVision;
+    if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedBatchedVision;
     for (prepared_images) |prepared| {
         try prepared.validateFor(cfg, limits);
         if (!std.meta.eql(prepared.geometry, prepared_images[0].geometry)) return error.VisionBatchGeometryMismatch;
@@ -892,18 +926,7 @@ pub fn encodePreparedProjectedImagesResidentBatched(
         const current = prepared.geometry;
         if (index != 0 and (current.width != geometry.width or current.height != geometry.height)) return error.VisionBatchGeometryMismatch;
         if (index == 0) geometry = current;
-        const patches = prepared.patch_rows;
-        const patch_dim = cfg.patch_size * cfg.patch_size * 3;
-        const input = try cb.fromFloat32Shape(patches, &.{ @intCast(current.patchCount()), @intCast(patch_dim) });
-        defer cb.free(input);
-        const w0 = try weights.patch("v.patch_embd.weight", cfg);
-        const w1 = try weights.patch("v.patch_embd.weight.1", cfg);
-        const bias = try weights.weight("v.patch_embd.bias");
-        const temporal0 = try cb.linear(input, w0, bias, current.patchCount(), patch_dim, cfg.vision_hidden);
-        defer cb.free(temporal0);
-        const temporal1 = try cb.linearNoBias(input, w1, current.patchCount(), patch_dim, cfg.vision_hidden);
-        defer cb.free(temporal1);
-        const embedded = try cb.add(temporal0, temporal1);
+        const embedded = try embedSpatialPatchRows(cb, allocator, &weights, cfg, prepared.patch_rows, current);
         defer cb.free(embedded);
         const positioned = try addInterpolatedPositionsTensor(cb, allocator, &weights, embedded, cfg, current);
         defer cb.free(positioned);
@@ -1423,82 +1446,10 @@ fn encodePreparedSingleImage(
     else
         null;
     errdefer if (preprocess_spatial_patches) |patches| allocator.free(patches);
-    failed_stage = "patch_weights";
-    const patch_bias = (weights.weight("v.patch_embd.bias") catch |zig017_err| {
-        zig017_return_error = zig017_err;
-        return zig017_err;
-    });
-    const patch_dim = cfg.patch_size * cfg.patch_size * 3;
-    const full_resident_patch = if (comptime build_options.enable_cuda)
-        if (cb.kind() == .cuda) (weights.fullResidentPatch() catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        }) else null
-    else
-        null;
-    const embedded = if (full_resident_patch) |full_patch| blk: {
-        failed_stage = "patch_temporal_expand";
-        const temporal_rows = (duplicateStillImageTemporalPatches(
-            allocator,
-            patch_rows,
-            geometry.patchCount(),
-            cfg.patch_size,
-        ) catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        });
-        defer allocator.free(temporal_rows);
-        const temporal_shape = [_]i32{ @intCast(geometry.patchCount()), @intCast(patch_dim * 2) };
-        const temporal_input = (cb.fromFloat32Shape(temporal_rows, &temporal_shape) catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        });
-        defer cb.free(temporal_input);
-        failed_stage = "patch_linear_bf16";
-        break :blk (cb.linear(
-            temporal_input,
-            full_patch,
-            patch_bias,
-            geometry.patchCount(),
-            patch_dim * 2,
-            cfg.vision_hidden,
-        ) catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        });
-    } else blk: {
-        const patch_shape = [_]i32{ @intCast(geometry.patchCount()), @intCast(patch_dim) };
-        failed_stage = "patch_upload";
-        const patch_input = (cb.fromFloat32Shape(patch_rows, &patch_shape) catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        });
-        defer cb.free(patch_input);
-        const patch0 = (weights.patch("v.patch_embd.weight", cfg) catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        });
-        const patch1 = (weights.patch("v.patch_embd.weight.1", cfg) catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        });
-        failed_stage = "patch_linear_first";
-        const first_temporal = (cb.linear(patch_input, patch0, patch_bias, geometry.patchCount(), patch_dim, cfg.vision_hidden) catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        });
-        defer cb.free(first_temporal);
-        failed_stage = "patch_linear_second";
-        const second_temporal = (cb.linearNoBias(patch_input, patch1, geometry.patchCount(), patch_dim, cfg.vision_hidden) catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        });
-        defer cb.free(second_temporal);
-        failed_stage = "patch_add";
-        break :blk (cb.add(first_temporal, second_temporal) catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        });
+    failed_stage = "patch_embedding";
+    const embedded = embedSpatialPatchRows(cb, allocator, weights, cfg, patch_rows, geometry) catch |err| {
+        zig017_return_error = err;
+        return err;
     };
     defer cb.free(embedded);
     failed_stage = "position_embedding";
@@ -1721,6 +1672,34 @@ const ResidentVisionScope = struct {
     }
 };
 
+// Hugging Face uses config.hidden_act in vision blocks. Patch mergers
+// deliberately retain their separate nn.GELU() (exact-erf) operation.
+fn tryLightOnVisionMlp(
+    cb: *const ComputeBackend,
+    weights: *WeightCache,
+    cfg: Config,
+    input: CT,
+    rows: usize,
+    layer: usize,
+) !?CT {
+    if (comptime !@import("build_options").enable_cuda) return null;
+    if (cb.kind() != .cuda or !cfg.is_qwen35 or !cfg.block_gelu_tanh or
+        !platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP")) return null;
+    var name: [128]u8 = undefined;
+    const norm_w = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln2.weight", .{layer}));
+    const norm_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln2.bias", .{layer}));
+    const up_w = try weights.linear(try std.fmt.bufPrint(&name, "v.blk.{d}.ffn_up.weight", .{layer}), cfg.vision_hidden, cfg.intermediate);
+    const up_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ffn_up.bias", .{layer}));
+    const down_w = try weights.linear(try std.fmt.bufPrint(&name, "v.blk.{d}.ffn_down.weight", .{layer}), cfg.intermediate, cfg.vision_hidden);
+    const down_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ffn_down.bias", .{layer}));
+    return @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionMlp(cb, input, .{ norm_w, norm_b, up_w, up_b, down_w, down_b }, rows, cfg.vision_hidden, cfg.intermediate, cfg.layer_norm_eps);
+}
+
+fn visionBlockActivation(cb: *const ComputeBackend, cfg: Config, input: CT) !CT {
+    if (cfg.block_gelu_tanh) return cb.gelu(input);
+    return (try cb.geluExact(input)) orelse try cb.gelu(input);
+}
+
 fn encoderBlock(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1778,6 +1757,10 @@ fn encoderBlock(
         zig017_return_error = zig017_err;
         return zig017_err;
     });
+    if (try tryLightOnVisionMlp(cb, weights, cfg, residual1, token_count, layer)) |fused| {
+        cb.free(residual1);
+        return fused;
+    }
     failed_stage = "ln2";
     const normed2 = (layerNormNamed(cb, allocator, weights, residual1, ln2_prefix, cfg.vision_hidden, cfg.layer_norm_eps) catch |zig017_err| {
         zig017_return_error = zig017_err;
@@ -1797,10 +1780,7 @@ fn encoderBlock(
     defer cb.free(fc1);
     const fc1_ns = profileLap(profile, &stage_started_at);
     failed_stage = "gelu";
-    const activated = (cb.geluExact(fc1) catch |zig017_err| {
-        zig017_return_error = zig017_err;
-        return zig017_err;
-    }) orelse (cb.gelu(fc1) catch |zig017_err| {
+    const activated = (visionBlockActivation(cb, cfg, fc1) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
@@ -1873,6 +1853,17 @@ fn visionAttention(
     });
     defer cb.free(qkv);
     const qkv_ns = profileLap(profile, &stage_started_at);
+    if (comptime build_options.enable_cuda) {
+        if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionAttention(cb, qkv, positions, image_batch, token_count, cfg.head_count, cfg.headDim(), cfg.rope_theta)) |attended| {
+            defer cb.free(attended);
+            const attention_ns = profileLap(profile, &stage_started_at);
+            const out_prefix = try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_out", .{layer});
+            const output = try linearNamed(cb, allocator, weights, attended, out_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden);
+            if (profile) std.debug.print("qwen3vl-vision-fused-attention-profile: layer={d} qkv_ms={d:.3} attention_ms={d:.3} out_ms={d:.3}\n", .{ layer, @as(f64, @floatFromInt(qkv_ns)) / std.time.ns_per_ms, @as(f64, @floatFromInt(attention_ns)) / std.time.ns_per_ms, @as(f64, @floatFromInt(profileLap(profile, &stage_started_at))) / std.time.ns_per_ms });
+            return output;
+        }
+    }
+
     failed_stage = "split_q";
     const q_unrotated = (cb.sliceLastDim(qkv, 0, cfg.vision_hidden) catch |zig017_err| {
         zig017_return_error = zig017_err;
@@ -2374,6 +2365,7 @@ fn configFromResidentModel(config: gpt_config.Config) !Config {
     const patch_size: usize = @intCast(config.vision_patch_size);
     var cfg = Config{
         .is_qwen35 = config.family == .qwen3_5,
+        .block_gelu_tanh = config.vision_use_gelu_tanh,
         .require_metal_resident_vision = config.qwen35_metal_resident_vision,
         .text_hidden = @intCast(config.hidden_size),
         .vision_hidden = @intCast(config.vision_hidden_size),
@@ -3014,4 +3006,68 @@ test "Qwen3-VL vision pipeline drains both tensor banks on completion cancellati
             else => unreachable,
         }
     }
+}
+
+test "LightOnOCR3 CUDA resident vision batch width preserves other backend ceilings" {
+    try std.testing.expectEqual(@as(usize, if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES")) 16 else 8), maxResidentVisionBatchItems(.cuda));
+    try std.testing.expectEqual(@as(usize, 4), maxResidentVisionBatchItems(.metal));
+    try std.testing.expectEqual(@as(usize, 4), maxResidentVisionBatchItems(.native));
+}
+
+test "LightOnOCR3 CUDA vision block activation follows checkpoint tanh GELU independently of exact merger GELU" {
+    const a = std.testing.allocator;
+    const model_config = try gpt_config.parseConfig(a, @embedFile("../models/testdata/lightonocr3/config.json"));
+    var cfg = try configFromResidentModel(model_config);
+    try std.testing.expect(cfg.block_gelu_tanh);
+    const Oracle = struct {
+        fn check(cb: *const ComputeBackend, config: Config) !void {
+            const values = [_]f32{ -4, -2.5, -1, -0.001, 0, 0.001, 1, 2.5, 4 };
+            const input = try cb.fromFloat32(&values);
+            defer cb.free(input);
+            const output = try visionBlockActivation(cb, config, input);
+            defer cb.free(output);
+            const result = try cb.toFloat32(output, std.testing.allocator);
+            defer std.testing.allocator.free(result);
+            for (values, result) |value, actual| {
+                const x: f64 = value;
+                const reference: f32 = @floatCast(0.5 * x * (1 + std.math.tanh(@sqrt(@as(f64, 2.0 / std.math.pi)) * (x + 0.044715 * x * x * x))));
+                try std.testing.expectApproxEqAbs(reference, actual, 2e-5);
+            }
+            // The exact merger operation remains available, and differs at
+            // x=2.5 enough to detect accidentally routing both through it.
+            const merger = (try cb.geluExact(input)).?;
+            defer cb.free(merger);
+            const exact = try cb.toFloat32(merger, std.testing.allocator);
+            defer std.testing.allocator.free(exact);
+            try std.testing.expect(@abs(result[7] - exact[7]) > 1e-4);
+            const unchanged = try cb.toFloat32(input, std.testing.allocator);
+            defer std.testing.allocator.free(unchanged);
+            try std.testing.expectEqualSlices(f32, &values, unchanged);
+        }
+    };
+    const native_compute = @import("../ops/native_compute.zig");
+    var store = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = native_compute.NativeCompute.init(a, &store, null);
+    defer native.deinit();
+    const cb = ComputeBackend{ .ptr = &native, .vtable = &native_compute.vtable_impl };
+    try Oracle.check(&cb, cfg);
+    if (comptime build_options.enable_cuda) {
+        const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+        var cuda = try CudaCompute.init(a);
+        defer cuda.deinit();
+        const cuda_cb = cuda.computeBackend();
+        try Oracle.check(&cuda_cb, cfg);
+    }
+    cfg.block_gelu_tanh = false;
+    const input = try cb.fromFloat32(&.{2.5});
+    defer cb.free(input);
+    const fallback = try visionBlockActivation(&cb, cfg, input);
+    defer cb.free(fallback);
+    const exact = (try cb.geluExact(input)).?;
+    defer cb.free(exact);
+    const result = try cb.toFloat32(fallback, a);
+    defer a.free(result);
+    const expected = try cb.toFloat32(exact, a);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(f32, expected, result);
 }

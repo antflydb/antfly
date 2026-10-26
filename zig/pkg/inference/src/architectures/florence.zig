@@ -664,7 +664,114 @@ pub fn encoderForward(
     return .{ .hidden = result, .seq_len = tensor.seq_len };
 }
 
+fn cudaEncoderMicrobatchSize(kind: ops.BackendKind, batch: usize, configured: ?usize) usize {
+    if (kind != .cuda or batch <= 1 or batch > 64) return batch;
+    const limit = configured orelse return batch;
+    return if (limit >= 1 and limit <= 64) @min(batch, limit) else batch;
+}
+
+/// Keep the decoder cohort large while bounding the much larger vision and
+/// encoder activations. Finished encoder rows stay on device in page order.
+/// The caller's original full-cohort admission permit remains authoritative.
 pub fn encoderForwardTensor(
+    control_cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    pixel_values: []const f32,
+    batch: usize,
+    prompt_input_ids: []const i64,
+    prompt_seq_len: usize,
+) !EncoderForwardTensorResult {
+    const result = try encoderForwardTensorMicrobatched(control_cb, allocator, config, pixel_values, batch, prompt_input_ids, prompt_seq_len);
+    errdefer control_cb.free(result.hidden);
+    // Diagnostic only: compare actual image/weight encodings with independently
+    // executed single-page encoders. Keep outputs and all OCR oracles intact.
+    if (control_cb.kind() == .cuda and batch > 1 and batch <= 64 and
+        platform.env.getenvBool("ANTFLY_FLORENCE2_CUDA_CHECK_ENCODER_BATCH"))
+    {
+        if (pixel_values.len % batch != 0 or prompt_input_ids.len != (std.math.mul(usize, batch, prompt_seq_len) catch return error.InvalidInputShape)) return error.InvalidInputShape;
+        const host = try control_cb.toFloat32(result.hidden, allocator);
+        defer allocator.free(host);
+        const page_values = std.math.mul(usize, result.seq_len, config.d_model) catch return error.InvalidInputShape;
+        if (host.len != (std.math.mul(usize, batch, page_values) catch return error.InvalidInputShape)) return error.InvalidInputShape;
+        const pixels_per_page = pixel_values.len / batch;
+        for (0..batch) |page| {
+            try control_cb.checkExecutionControl();
+            const serial = try encoderForwardTensorWhole(control_cb, allocator, config, pixel_values[page * pixels_per_page ..][0..pixels_per_page], 1, prompt_input_ids[page * prompt_seq_len ..][0..prompt_seq_len], prompt_seq_len);
+            defer control_cb.free(serial.hidden);
+            if (serial.seq_len != result.seq_len) return error.InvalidInputShape;
+            const reference = try control_cb.toFloat32(serial.hidden, allocator);
+            defer allocator.free(reference);
+            if (reference.len != page_values) return error.InvalidInputShape;
+            var different_bits: usize = 0;
+            var nonfinite: usize = 0;
+            var max_abs: f32 = 0;
+            var squared_error: f64 = 0;
+            for (reference, host[page * page_values ..][0..page_values]) |expected, actual| {
+                if (@as(u32, @bitCast(expected)) != @as(u32, @bitCast(actual))) different_bits += 1;
+                if (!std.math.isFinite(expected) or !std.math.isFinite(actual)) {
+                    nonfinite += 1;
+                    continue;
+                }
+                const difference = @abs(expected - actual);
+                max_abs = @max(max_abs, difference);
+                squared_error += @as(f64, difference) * difference;
+            }
+            std.debug.print("FLORENCE2 encoder_batch_check items={d} page={d} values={d} different_bits={d} nonfinite={d} max_abs={d} rms_error={d}\n", .{ batch, page, page_values, different_bits, nonfinite, max_abs, @sqrt(squared_error / @as(f64, @floatFromInt(page_values))) });
+        }
+    }
+    return result;
+}
+
+fn encoderForwardTensorMicrobatched(
+    control_cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    pixel_values: []const f32,
+    batch: usize,
+    prompt_input_ids: []const i64,
+    prompt_seq_len: usize,
+) !EncoderForwardTensorResult {
+    try control_cb.checkExecutionControl();
+    const limit = cudaEncoderMicrobatchSize(control_cb.kind(), batch, platform.env.getenvUsize("ANTFLY_FLORENCE2_CUDA_ENCODER_MICROBATCH"));
+    if (limit == batch) return encoderForwardTensorWhole(control_cb, allocator, config, pixel_values, batch, prompt_input_ids, prompt_seq_len);
+    if (pixel_values.len % batch != 0 or prompt_input_ids.len != (std.math.mul(usize, batch, prompt_seq_len) catch return error.InvalidInputShape)) return error.InvalidInputShape;
+    const pixels_per_page = pixel_values.len / batch;
+    var output: ?CT = null;
+    errdefer if (output) |value| control_cb.free(value);
+    var sequence: usize = 0;
+    var offset: usize = 0;
+    var chunks: usize = 0;
+    while (offset < batch) {
+        const count = @min(limit, batch - offset);
+        const encoded = try encoderForwardTensorWhole(control_cb, allocator, config, pixel_values[offset * pixels_per_page ..][0 .. count * pixels_per_page], count, prompt_input_ids[offset * prompt_seq_len ..][0 .. count * prompt_seq_len], prompt_seq_len);
+        defer control_cb.free(encoded.hidden);
+        if (output == null) {
+            sequence = encoded.seq_len;
+            const rows = std.math.mul(usize, batch, sequence) catch return error.InvalidInputShape;
+            output = (try control_cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(config.d_model) })) orelse return error.UnsupportedTensorType;
+        } else if (sequence != encoded.seq_len) return error.InvalidInputShape;
+        if (!try control_cb.copyRows2D(allocator, output.?, offset * sequence, encoded.hidden, 0, count * sequence, config.d_model)) return error.UnsupportedTensorType;
+        offset += count;
+        chunks += 1;
+    }
+    if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+        std.debug.print("FLORENCE2 cuda_encoder_microbatch_chunks={d} items={d} limit={d}\n", .{ chunks, batch, limit });
+    return .{ .hidden = output.?, .seq_len = sequence };
+}
+
+test "LightOnOCR3 CUDA Florence encoder microbatch keeps backend and cohort limits isolated" {
+    try std.testing.expectEqual(@as(usize, 64), cudaEncoderMicrobatchSize(.metal, 64, 4));
+    try std.testing.expectEqual(@as(usize, 64), cudaEncoderMicrobatchSize(.native, 64, 4));
+    try std.testing.expectEqual(@as(usize, 64), cudaEncoderMicrobatchSize(.cuda, 64, null));
+    try std.testing.expectEqual(@as(usize, 64), cudaEncoderMicrobatchSize(.cuda, 64, 0));
+    try std.testing.expectEqual(@as(usize, 64), cudaEncoderMicrobatchSize(.cuda, 64, 65));
+    try std.testing.expectEqual(@as(usize, 1), cudaEncoderMicrobatchSize(.cuda, 1, 4));
+    try std.testing.expectEqual(@as(usize, 4), cudaEncoderMicrobatchSize(.cuda, 64, 4));
+    try std.testing.expectEqual(@as(usize, 17), cudaEncoderMicrobatchSize(.cuda, 17, 32));
+}
+
+fn encoderForwardTensorWhole(
     control_cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
@@ -693,7 +800,7 @@ pub fn encoderForwardTensor(
     const profile = readProfileEnabled();
     if (debug_cuda_session) std.log.info("florence: encoder forward start batch={d} prompt_seq={d}", .{ batch, prompt_seq_len });
     const vision_start = nowNs();
-    if (try visionEncoderForwardTensorTail(control_cb, allocator, config, pixel_values, batch)) |image_tensor| {
+    if (try visionEncoderForwardTensorTailMicrobatched(control_cb, allocator, config, pixel_values, batch)) |image_tensor| {
         if (profile) logFlorenceProfile("vision_total", vision_start);
         if (debug_cuda_session) std.log.info("florence: device vision encoder done seq={d}", .{image_tensor.seq_len});
         defer cb.free(image_tensor.features);
@@ -1647,6 +1754,49 @@ fn visionEncoderForward(
     return .{ .features = normed, .seq_len = sourced.seq_len };
 }
 
+/// Bound DaViT activations independently of the text encoder batch. A large
+/// decoder cohort can retain tensor-core batching in BART without materializing
+/// every page's much larger early-stage vision tensors at the same time.
+/// The caller still holds the original complete-cohort admission permit.
+fn visionEncoderForwardTensorTailMicrobatched(
+    control_cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    pixel_values: []const f32,
+    batch: usize,
+) !?VisionForwardTensorResult {
+    const limit = cudaEncoderMicrobatchSize(control_cb.kind(), batch, platform.env.getenvUsize("ANTFLY_FLORENCE2_CUDA_VISION_MICROBATCH"));
+    const layer_cb = layerComputeBackend(control_cb);
+    if (limit == batch or !useDeviceVisionTail(&layer_cb, config, limit))
+        return visionEncoderForwardTensorTail(control_cb, allocator, config, pixel_values, batch);
+    if (pixel_values.len % batch != 0) return error.InvalidInputShape;
+    const pixels_per_page = pixel_values.len / batch;
+    var output: ?CT = null;
+    errdefer if (output) |value| control_cb.free(value);
+    var sequence: usize = 0;
+    var offset: usize = 0;
+    var chunks: usize = 0;
+    while (offset < batch) {
+        try control_cb.checkExecutionControl();
+        const count = @min(limit, batch - offset);
+        // The supported source configuration was qualified before executing
+        // any chunk; declining after a partial execution is an error.
+        const encoded = (try visionEncoderForwardTensorTail(control_cb, allocator, config, pixel_values[offset * pixels_per_page ..][0 .. count * pixels_per_page], count)) orelse return error.UnsupportedTensorType;
+        defer control_cb.free(encoded.features);
+        if (output == null) {
+            sequence = encoded.seq_len;
+            const rows = std.math.mul(usize, batch, sequence) catch return error.InvalidInputShape;
+            output = (try control_cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(config.d_model) })) orelse return error.UnsupportedTensorType;
+        } else if (sequence != encoded.seq_len) return error.InvalidInputShape;
+        if (!try control_cb.copyRows2D(allocator, output.?, offset * sequence, encoded.features, 0, count * sequence, config.d_model)) return error.UnsupportedTensorType;
+        offset += count;
+        chunks += 1;
+    }
+    if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+        std.debug.print("FLORENCE2 cuda_vision_microbatch_chunks={d} items={d} limit={d}\n", .{ chunks, batch, limit });
+    return .{ .features = output.?, .seq_len = sequence };
+}
+
 fn visionEncoderForwardTensorTail(
     control_cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1741,7 +1891,7 @@ fn visionEncoderForwardTensorTail(
 
 fn useDeviceVisionTail(cb: *const ComputeBackend, config: Config, batch: usize) bool {
     return cb.kind() == .cuda and
-        batch == 1 and
+        (batch == 1 or (batch > 1 and batch <= 64 and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_BATCH_VISION_TAIL"))) and
         !florenceDeviceVisionTailDisabled() and
         config.image_feature_source_count == 2 and
         config.image_feature_sources[0] == .spatial_avg_pool and
@@ -2491,6 +2641,9 @@ fn residualDepthwiseConv(
     const bias_name = try fmtAlloc(allocator, "vision_tower.blocks.{d}.{d}.{s}.fn.dw.bias", .{ stage, layer, block_prefix });
     defer allocator.free(bias_name);
 
+    if (cb.kind() == .cuda) {
+        if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceDepthwiseResidual(cb, input, try cb.getWeight(weight_name), try cb.getWeight(bias_name), batch, height, width, channels)) |result| return result;
+    }
     const updates_ct = try cb.tokenGridConv2d(
         input,
         try cb.getWeight(weight_name),
@@ -2622,6 +2775,14 @@ fn residualMlp(
     defer allocator.free(fc2_w_name);
     const fc2_b_name = try fmtAlloc(allocator, "vision_tower.blocks.{d}.{d}.{s}.fn.net.fc2.bias", .{ stage, layer, block_prefix });
     defer allocator.free(fc2_b_name);
+
+    if (cb.kind() == .cuda) {
+        if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceMlp(cb, input, .{
+            try cb.getWeight(norm_w_name), try cb.getWeight(norm_b_name),
+            try cb.getWeight(fc1_w_name),  try cb.getWeight(fc1_b_name),
+            try cb.getWeight(fc2_w_name),  try cb.getWeight(fc2_b_name),
+        }, batch * seq_len, dim, hidden_dim)) |result| return result;
+    }
 
     const rows = batch * seq_len;
     const normed_ct = try cb.layerNorm(input, try cb.getWeight(norm_w_name), try cb.getWeight(norm_b_name), dim, 1e-5);
@@ -2876,15 +3037,17 @@ fn applyEncoderImagePromptEmbeddingsTensor(
     prompt_input_ids: []const i64,
     prompt_seq_len: usize,
 ) !CT {
-    if (batch != 1) return error.UnsupportedShape;
+    if (batch == 0 or batch > 64) return error.InvalidInputShape;
+    if (batch != 1 and cb.kind() != .cuda) return error.UnsupportedShape;
     const d_model: usize = config.d_model;
     const total_seq = image.seq_len + prompt_seq_len;
 
     const merged = if (prompt_seq_len > 0) blk: {
         const prompt_embeddings = try cb.embeddingLookup(try promptEmbedWeight(cb), prompt_input_ids, batch * prompt_seq_len, d_model);
         defer cb.free(prompt_embeddings);
+        if (batch > 1) break :blk try @import("../ops/cuda/cuda_compute.zig").CudaCompute.concatFlorenceImagePrompt(cb, image.features, prompt_embeddings, batch, image.seq_len, prompt_seq_len, d_model);
         break :blk try cb.concatRows2D(allocator, image.features, prompt_embeddings, image.seq_len, prompt_seq_len, d_model);
-    } else try cb.sliceRows2D(allocator, image.features, 0, image.seq_len, d_model);
+    } else try cb.sliceRows2D(allocator, image.features, 0, batch * image.seq_len, d_model);
 
     return applyEncoderEmbeddingsTensor(cb, allocator, merged, config, batch, total_seq);
 }
@@ -3016,6 +3179,20 @@ fn encoderBlock(
 
     const fc1_start = nowNs();
     const fc1_weights = try encoderLinearWeights(cb, layer, "fc1", buf);
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_BART_FFN")) {
+            errdefer cb.free(attn_normed);
+            const second = try encoderLinearWeights(cb, layer, "fc2", buf);
+            const nw = try encoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
+            const nb = try encoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceBartFfn(cb, attn_normed, .{ fc1_weights.weight, fc1_weights.bias, second.weight, second.bias, nw, nb }, total, d_model, ffn_dim)) |fused| {
+                errdefer cb.free(fused);
+                if (profile) logFlorenceProfileStep("enc_fused_ffn", layer, fc1_start);
+                cb.free(attn_normed);
+                return fused;
+            }
+        }
+    }
     const fc1 = try cb.linear(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim);
     defer cb.free(fc1);
     const activated = try florenceExactGelu(cb, fc1);
@@ -3075,6 +3252,19 @@ fn decoderBlockSelfOnly(
     cb.free(attn_res);
 
     const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_BART_FFN")) {
+            errdefer cb.free(attn_normed);
+            const second = try decoderLinearWeights(cb, layer, "fc2", buf);
+            const nw = try decoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
+            const nb = try decoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceBartFfn(cb, attn_normed, .{ fc1_weights.weight, fc1_weights.bias, second.weight, second.bias, nw, nb }, total, d_model, ffn_dim)) |fused| {
+                errdefer cb.free(fused);
+                cb.free(attn_normed);
+                return fused;
+            }
+        }
+    }
     const fc1 = try cb.linear(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim);
     defer cb.free(fc1);
     const activated = try florenceExactGelu(cb, fc1);
@@ -3195,6 +3385,19 @@ fn decoderBlockWithOptionalCrossCache(
     cb.free(cross_res);
 
     const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_BART_FFN")) {
+            errdefer cb.free(cross_normed);
+            const second = try decoderLinearWeights(cb, layer, "fc2", buf);
+            const nw = try decoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
+            const nb = try decoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceBartFfn(cb, cross_normed, .{ fc1_weights.weight, fc1_weights.bias, second.weight, second.bias, nw, nb }, dec_total, d_model, ffn_dim)) |fused| {
+                errdefer cb.free(fused);
+                cb.free(cross_normed);
+                return fused;
+            }
+        }
+    }
     const fc1 = try cb.linear(cross_normed, fc1_weights.weight, fc1_weights.bias, dec_total, d_model, ffn_dim);
     defer cb.free(fc1);
     const activated = try florenceExactGelu(cb, fc1);
@@ -3244,9 +3447,10 @@ fn decoderBlockIncrementalCached(
     const qkv_self = try cb.linearTriple(hidden, q_self_weights.weight, q_self_weights.bias, k_self_weights.weight, k_self_weights.bias, v_self_weights.weight, v_self_weights.bias, batch, d_model, d_model);
     defer cb.free(qkv_self.first);
 
-    const cached_k_ref = try appendSelfCacheTensor(cb, allocator, &cache.self, &cache.self.keys[layer], qkv_self.second, batch, old_len, new_len, d_model);
+    const cached_pair = try appendSelfCachePair(cb, allocator, &cache.self, &cache.self.keys[layer], &cache.self.values[layer], qkv_self.second, qkv_self.third, batch, old_len, new_len, d_model);
+    const cached_k_ref = cached_pair[0];
     defer cached_k_ref.deinit(cb);
-    const cached_v_ref = try appendSelfCacheTensor(cb, allocator, &cache.self, &cache.self.values[layer], qkv_self.third, batch, old_len, new_len, d_model);
+    const cached_v_ref = cached_pair[1];
     defer cached_v_ref.deinit(cb);
 
     const self_attn = try cb.crossAttention(qkv_self.first, cached_k_ref.tensor, cached_v_ref.tensor, self_mask, batch, 1, new_len, num_heads, head_dim);
@@ -3278,6 +3482,20 @@ fn decoderBlockIncrementalCached(
     profile_stage_start = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_cross", layer, profile_stage_start);
 
     const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_BART_FFN")) {
+            errdefer cb.free(cross_normed);
+            const second = try decoderLinearWeights(cb, layer, "fc2", buf);
+            const nw = try decoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
+            const nb = try decoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceBartFfn(cb, cross_normed, .{ fc1_weights.weight, fc1_weights.bias, second.weight, second.bias, nw, nb }, batch, d_model, ffn_dim)) |fused| {
+                errdefer cb.free(fused);
+                _ = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_ffn", layer, profile_stage_start);
+                cb.free(cross_normed);
+                return fused;
+            }
+        }
+    }
     const fc1 = try cb.linear(cross_normed, fc1_weights.weight, fc1_weights.bias, batch, d_model, ffn_dim);
     defer cb.free(fc1);
     const activated = try florenceExactGelu(cb, fc1);
@@ -3309,6 +3527,38 @@ const CachedSelfTensor = struct {
         if (self.owned_view) cb.free(self.tensor);
     }
 };
+
+// Own both projected rows on every route, including a failed first append.
+fn appendSelfCachePair(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    self_cache: *DecoderSelfCache,
+    key_slot: *?CT,
+    value_slot: *?CT,
+    next_key: CT,
+    next_value: CT,
+    batch: usize,
+    old_len: usize,
+    new_len: usize,
+    d_model: usize,
+) ![2]CachedSelfTensor {
+    var own_key = true;
+    defer if (own_key) cb.free(next_key);
+    var own_value = true;
+    defer if (own_value) cb.free(next_value);
+    if (comptime build_options.enable_cuda) {
+        if (self_cache.preallocated and old_len < self_cache.capacity and new_len == old_len + 1 and key_slot.* != null and value_slot.* != null) {
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceAppendSelfCachePair(cb, .{ key_slot.*.?, value_slot.*.? }, .{ next_key, next_value }, batch, self_cache.capacity, old_len, d_model)) |pair|
+                return .{ .{ .tensor = pair[0], .owned_view = true }, .{ .tensor = pair[1], .owned_view = true } };
+        }
+    }
+    own_key = false;
+    const key = try appendSelfCacheTensor(cb, allocator, self_cache, key_slot, next_key, batch, old_len, new_len, d_model);
+    errdefer key.deinit(cb);
+    own_value = false;
+    const value = try appendSelfCacheTensor(cb, allocator, self_cache, value_slot, next_value, batch, old_len, new_len, d_model);
+    return .{ key, value };
+}
 
 fn appendSelfCacheTensor(
     cb: *const ComputeBackend,
@@ -3425,6 +3675,8 @@ fn compactSelfCacheRows(
     d_model: usize,
 ) !CT {
     if (batch == 1) return cb.sliceRows2D(allocator, slab, 0, active_len, d_model);
+    if (cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_PACKED_SELF_KV"))
+        return compactSelfCacheRowsDevice(cb, slab, batch, capacity, active_len, d_model);
 
     var acc: ?CT = null;
     var acc_rows: usize = 0;
@@ -3451,6 +3703,45 @@ fn compactSelfCacheRows(
     const result = acc orelse return error.InvalidInputShape;
     acc = null;
     return result;
+}
+
+// Slice all active page prefixes in one device operation. Repeated pairwise
+// concatenation otherwise copies the growing prefix once for every page.
+fn compactSelfCacheRowsDevice(cb: *const ComputeBackend, slab: CT, batch: usize, capacity: usize, active_len: usize, d_model: usize) !CT {
+    if (batch == 0 or batch > 64 or capacity == 0 or active_len == 0 or active_len > capacity or d_model == 0)
+        return error.InvalidInputShape;
+    return @import("../ops/cuda/cuda_compute.zig").CudaCompute.compactFlorenceSelfCache(cb, slab, batch, capacity, active_len, d_model);
+}
+
+test "LightOnOCR3 CUDA Florence packed self KV preserves page prefixes and returned ownership" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+    const allocator = std.testing.allocator;
+    var compute = try CudaCompute.init(allocator);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const batch = 3;
+    const allocated_pages = 5;
+    const capacity = 7;
+    const width = 4;
+    // Finished pages leave spare physical slots after in-place compaction.
+    var data: [allocated_pages * capacity * width]f32 = undefined;
+    for (&data, 0..) |*x, i| x.* = @floatFromInt(i);
+    const slab = try cb.fromFloat32Shape(&data, &.{ allocated_pages * capacity, width });
+    defer cb.free(slab);
+    for ([_]usize{ 1, 5, capacity }) |active| {
+        const compacted = try compactSelfCacheRowsDevice(&cb, slab, batch, capacity, active, width);
+        defer cb.free(compacted);
+        // Both intermediate descriptors have been released before downloading.
+        const actual = try cb.toFloat32(compacted, allocator);
+        defer allocator.free(actual);
+        for (0..batch) |b|
+            try std.testing.expectEqualSlices(f32, data[b * capacity * width ..][0 .. active * width], actual[b * active * width ..][0 .. active * width]);
+    }
+    const after = try cb.toFloat32(slab, allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(f32, &data, after);
+    try std.testing.expectError(error.InvalidInputShape, compactSelfCacheRowsDevice(&cb, slab, batch, capacity, capacity + 1, width));
 }
 
 fn tokenEmbeddingsData(
