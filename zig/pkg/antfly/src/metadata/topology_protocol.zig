@@ -87,11 +87,11 @@ const std = @import("std");
 /// Version 53 maintains ordinary destination query proofs through v10 backfill.
 /// Version 54 accepts immutable query-profile references on policy pages.
 /// Version 55 returns complete bounded configured/native query paths.
-/// Version 56 admits compact execution rows with qualified profile identities.
-pub const current_version: u16 = 56;
-pub const resolver_records_version: u16 = 56;
+/// Version 57 projects configured negatives with qualified profile identities.
+pub const current_version: u16 = 57;
+pub const resolver_records_version: u16 = 57;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 56;
+pub const resolver_namespaces_version: u16 = 57;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

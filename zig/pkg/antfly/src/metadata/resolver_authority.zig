@@ -36,6 +36,7 @@ pub const Read = struct {
     query_profile: ?QueryProfileReference = null,
     distinct: bool = false,
     complete_aliases: bool = false,
+    project_suppression: bool = false,
     expected_head: ?records.Stamp = null,
     key: []const u8 = "",
     into: ?[]const u8 = null,
@@ -54,7 +55,7 @@ pub const Read = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "complete_aliases")) self.complete_aliases else if (comptime std.mem.eql(u8, field, "static_profiles")) self.static_profiles else if (comptime std.mem.eql(u8, field, "heads_only")) self.heads_only else if (comptime std.mem.eql(u8, field, "query_profile")) self.query_profile != null else if (comptime std.mem.eql(u8, field, "aliases")) self.query_profile == null else true;
+            const include = if (comptime std.mem.eql(u8, field, "project_suppression")) self.project_suppression else if (comptime std.mem.eql(u8, field, "complete_aliases")) self.complete_aliases else if (comptime std.mem.eql(u8, field, "static_profiles")) self.static_profiles else if (comptime std.mem.eql(u8, field, "heads_only")) self.heads_only else if (comptime std.mem.eql(u8, field, "query_profile")) self.query_profile != null else if (comptime std.mem.eql(u8, field, "aliases")) self.query_profile == null else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));

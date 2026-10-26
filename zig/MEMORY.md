@@ -2614,3 +2614,11 @@ restart their cursors before v11 readiness can be published. Lite also reuses a
 single physical-owner schema digest across requests, qualified by instance,
 namespace, core, catalog and schema epochs. These optimizations do not cache
 authorization or weaken native-head and binding revalidation.
+
+Resolver query policy uses indexed configured negatives alongside bounded
+forward alias paths (see `RESOLUTION.md`). Profile-scoped key and normalized
+text lookups replace whole suppression lists in warm HTTP/Lite execution.
+Derived readiness is fenced before compact admission; inline declarations
+remain the fallback during upgrade. Publication of detached Lite work compares
+pinned native metadata-record identities, with exact content checks only for
+rewritten records, rather than rebuilding catalog hashes under writer locks.

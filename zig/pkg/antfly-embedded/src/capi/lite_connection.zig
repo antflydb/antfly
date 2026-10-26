@@ -43,32 +43,62 @@ const NativeStore = std.meta.Child(std.meta.Child(@FieldType(std.meta.Child(@Fie
 const WriterAdmission = std.meta.Child(@FieldType(NativeStore, "writer_admission"));
 const PublicationScope = @typeInfo(std.meta.Child(@FieldType(WriterAdmission, "enter"))).@"fn".param_types[1].?;
 
-fn catalogStamp(database: *h.db_mod.DB) ![32]u8 {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var hash = std.crypto.hash.Blake3.init(.{});
-    if (try database.getSchemaJson(a)) |schema| hash.update(schema);
-    const indexes = try database.core.listIndexes(a);
-    std.mem.sort(@TypeOf(indexes[0]), indexes, {}, struct {
-        fn less(_: void, lhs: @TypeOf(indexes[0]), rhs: @TypeOf(indexes[0])) bool {
-            return std.mem.lessThan(u8, lhs.name, rhs.name);
+/// A small proof over the existing immutable native metadata records. The
+/// captured read pin prevents page reuse until the detached turn ends. Stable
+/// record references therefore prove identical content without reading a large
+/// catalog, even as unrelated document commits replace B-tree index leaves.
+/// Rewritten records use exact content comparison as a conservative slow path.
+const PublicationCatalog = struct {
+    const Txn = @import("../storage/lite/docstore.zig").Txn;
+    const metadata_keys = [_][]const u8{
+        keys.public_schema_json_key,
+        "\x00\x00__metadata__:schema",
+        "\x00\x00__metadata__:indexes",
+        "\x00\x00__metadata__:enrichments",
+        "\x00\x00__metadata__:resolvers",
+        @import("../storage/db/catalog/resolver_catalog.zig").merge_catalog_key,
+        @import("../storage/db/resolver_projection.zig").epoch_key,
+    };
+    pin: Txn,
+    inode: u64,
+    paths: [metadata_keys.len][]const u8,
+    references: [metadata_keys.len]?u64,
+
+    fn capture(a: std.mem.Allocator, root: *h.Handle, database: *h.db_mod.DB) !PublicationCatalog {
+        const backend = &root.owned_lite_backend.?;
+        const store = backend.native_docstore.?;
+        var pin = try store.beginRead();
+        errdefer pin.abort();
+        const prefix = if (database == &root.db) "" else prefix: {
+            const namespace = try @import("../storage/lite/embedded_catalog.zig").namespaceAlloc(a, database.core.identity_namespace.table_id);
+            break :prefix try backend.documentPrefixAlloc(a, namespace);
+        };
+        var result: PublicationCatalog = .{ .pin = pin, .inode = (try (try pin.readFile()).file.stat((try pin.readFile()).runtime())).inode, .paths = undefined, .references = undefined };
+        for (metadata_keys, 0..) |key, i| {
+            result.paths[i] = try std.mem.concat(a, u8, &.{ prefix, key });
+            result.references[i] = try result.pin.valueIdentity(result.paths[i]);
         }
-    }.less);
-    hash.update(try std.json.Stringify.valueAlloc(a, indexes, .{}));
-    var txn = try database.core.store.beginReadTxn();
-    defer txn.abort();
-    inline for (.{ "\x00\x00__metadata__:resolvers", @import("../storage/db/catalog/resolver_catalog.zig").merge_catalog_key }) |key| {
-        hash.update(key);
-        if (txn.get(key)) |raw| hash.update(raw) else |err| if (err != error.NotFound) return err;
+        return result;
     }
-    // Hash native immutable snapshot identities through lightweight descriptors;
-    // policy bytes remain in the storage owner.
-    if (txn.get(@import("../storage/db/resolver_projection.zig").epoch_key)) |raw| hash.update(raw) else |err| if (err != error.NotFound) return err;
-    var digest: [32]u8 = undefined;
-    hash.final(&digest);
-    return digest;
-}
+    fn verify(self: *PublicationCatalog, root: *h.Handle) !void {
+        var live = try root.owned_lite_backend.?.native_docstore.?.beginRead();
+        defer live.abort();
+        const file = try live.readFile();
+        if ((try file.file.stat(file.runtime())).inode != self.inode) return error.EnrichmentSourceChanged;
+        for (self.paths, self.references) |path, captured| {
+            if (try live.valueIdentity(path) == captured) continue;
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const before = self.pin.getOwned(scratch.allocator(), path) catch |err| if (err == error.NotFound) null else return err;
+            const after = live.getOwned(scratch.allocator(), path) catch |err| if (err == error.NotFound) null else return err;
+            if ((before == null) != (after == null)) return error.EnrichmentSourceChanged;
+            if (before) |value| if (!std.mem.eql(u8, value, after.?)) return error.EnrichmentSourceChanged;
+        }
+    }
+    fn deinit(self: *PublicationCatalog) void {
+        self.pin.abort();
+    }
+};
 
 // Completed producer bytes are delivered to the current runtime, rather than
 // replaying inference whenever an unrelated primary commit moves the file tip.
@@ -79,7 +109,7 @@ pub const PreparedPublication = struct {
     name: []const u8,
     identity: std.meta.Child(@FieldType(h.db_mod.OpenOptions, "identity_namespace")),
     incarnation: @FieldType(h.db_mod.DB, "root_incarnation"),
-    catalog: [32]u8,
+    catalog: ?*PublicationCatalog,
     index_prefix: []const u8,
     shadow_scopes: []const ShadowScope = &.{},
     snapshot_root: *h.Handle,
@@ -95,8 +125,8 @@ pub const PreparedPublication = struct {
         try @import("sql_commit.zig").recover(root);
         try @import("sql_ddl.zig").recover(root);
         const database = try @import("tables.zig").get(root, self.name);
-        if (database.root_incarnation != self.incarnation or !std.meta.eql(database.core.identity_namespace, self.identity) or
-            !std.mem.eql(u8, &(try catalogStamp(database)), &self.catalog)) return error.EnrichmentSourceChanged;
+        if (database.root_incarnation != self.incarnation or !std.meta.eql(database.core.identity_namespace, self.identity)) return error.EnrichmentSourceChanged;
+        try (self.catalog orelse return error.EnrichmentSourceChanged).verify(root);
         if (self.resolver_dependency) |dependency| {
             const destination = @import("tables.zig").get(root, dependency.table) catch |err| switch (err) {
                 error.UndefinedTable => null,
@@ -1220,7 +1250,9 @@ pub const Owner = struct {
         defer alloc.free(index_prefix);
         var source_read = if (run_database) try database.core.store.runtime_store.beginRead() else null;
         defer if (source_read) |*read| read.abort();
-        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (run_database) try catalogStamp(database) else @splat(0), .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
+        var catalog = if (run_database) try PublicationCatalog.capture(turn_alloc, root, database) else null;
+        defer if (catalog) |*proof| proof.deinit();
+        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
@@ -1290,6 +1322,10 @@ pub const Owner = struct {
         }
         store.writer_admission = null;
         root.maintenance_owner = null;
+        // The raw native pin borrows this snapshot's store. Release it before
+        // collectRetired can destroy a superseded hosted/serving root.
+        if (catalog) |*proof| proof.deinit();
+        catalog = null;
         root.maintenance_references -= 1;
         if (independent) inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
         if (!independent and self.current != root) {
@@ -1695,4 +1731,75 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         models_dir = null;
     }
     return wrapper;
+}
+
+test "capi resolver curation publication proofs skip large catalogs and fence changed records" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("publication-catalog-proof");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    const root = try api.openLiteHandleAllocWithRuntime(alloc, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    defer h.closeHandle(root);
+    const store = root.owned_lite_backend.?.native_docstore.?;
+    const large = try a.alloc(u8, 4 * 1024 * 1024);
+    @memset(large, 'x');
+    try @import("tables.zig").create(root, "named", "{}", false);
+    const named = try @import("tables.zig").get(root, "named");
+    var named_proof = try PublicationCatalog.capture(a, root, named);
+    defer named_proof.deinit();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(keys.public_schema_json_key, large);
+        try txn.commit();
+    }
+    var proof = try PublicationCatalog.capture(a, root, &root.db);
+    defer proof.deinit();
+    for (0..20) |i| {
+        {
+            var txn = try store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(try std.fmt.allocPrint(a, "unrelated/{d}", .{i}), "primary");
+            try txn.commit();
+        }
+        try proof.verify(root);
+    }
+    // Neither capture nor twenty verifications hydrated a catalog value.
+    try std.testing.expectEqual(@as(u32, 0), proof.pin.snapshot_reads.count());
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(keys.public_schema_json_key, large);
+        try txn.commit();
+    }
+    try proof.verify(root); // same bytes, new immutable record remains valid.
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(keys.public_schema_json_key, "changed");
+        try txn.commit();
+    }
+    try std.testing.expectError(error.EnrichmentSourceChanged, proof.verify(root));
+    // Root changes must not invalidate an unrelated named namespace.
+    try named_proof.verify(root);
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(named_proof.paths[0], "{\"named\":true}");
+        try txn.commit();
+    }
+    try std.testing.expectError(error.EnrichmentSourceChanged, named_proof.verify(root));
+    // Metadata absent at capture must not be admitted if later introduced.
+    var absent = try PublicationCatalog.capture(a, root, &root.db);
+    defer absent.deinit();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(@import("../storage/db/resolver_projection.zig").epoch_key, "1");
+        try txn.commit();
+    }
+    try std.testing.expectError(error.EnrichmentSourceChanged, absent.verify(root));
+    std.debug.print("PUBLICATION PROOF catalog_bytes=4194304 primary_commits=20 hydrated_catalogs=0 same_content=accepted changed_content=fenced\n", .{});
 }

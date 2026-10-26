@@ -23159,13 +23159,22 @@ pub const RaftApplyStore = struct {
                     if (actual.revision != expected.revision or !std.mem.eql(u8, &actual.fingerprint, &expected.fingerprint)) return error.CatalogGenerationChanged;
                 }
                 if (read.seeds.len > 16384 or read.texts.len > 4096 or read.key_template.len > 16384) return error.InvalidResolverCurationRequest;
-                if (read.seeds.len != 0) if (read.query_profile) |reference| {
+                if (read.query_profile) |reference| {
                     if (read.aliases.len != 0) return error.InvalidResolverCurationRequest;
                     const binding = (try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, a, txn, group, try system_catalog.Target.parse(reference.target))) orelse return error.CatalogGenerationChanged;
                     if (binding.table_id != table.table_id) return error.CatalogGenerationChanged;
                     const target = try resolverTargetPrefix(a, group, try system_catalog.Target.parse(reference.target));
                     const profile_root = try staticProfileRoot(a, target, read.key_template);
                     if (!try StaticProfiles.queryReferenceActive(a, txn, profile_root, reference.id, read.key_template)) return error.CatalogGenerationChanged;
+                    if (read.seeds.len == 0) {
+                        var snapshot = (if (read.complete_aliases) try store.queryExecutionPolicy(read.key_template, &.{}, read.texts, &.{}, false) else try store.textPolicy(read.key_template, read.texts)) orelse return error.CatalogGenerationChanged;
+                        if (read.project_suppression) {
+                            var reader: StaticProfiles.QueryReader = .{ .backend = store.backend, .root = profile_root, .profile = reference.id };
+                            try reader.projectSuppression(a, &snapshot, &.{}, read.texts);
+                        }
+                        result.namespaces = try a.dupe(native.Snapshot, &.{snapshot});
+                        break :policy_read;
+                    }
                     const Loader = struct {
                         txn: *docstore.DocStore.Txn,
                         root: []const u8,
@@ -23181,10 +23190,11 @@ pub const RaftApplyStore = struct {
                     var indexed_profile: StaticProfiles.QueryReader = .{ .backend = store.backend, .root = profile_root, .profile = reference.id, .indexed = try StaticProfiles.queryNodesReady(a, txn, profile_root, reference.id) };
                     const prepared = (try store.prepareQuery(read.key_template, .{ .id = reference.id, .ptr = &loader, .load = Loader.load, .estimated_bytes = try StaticProfiles.queryEstimatedBytes(a, txn, profile_root, reference.id), .lookup = indexed_profile.lookup() }, read.distinct)) orelse return error.CatalogGenerationChanged;
                     defer prepared.release();
-                    const snapshot = if (read.complete_aliases) try store.queryExecutionPrepared(prepared, read.seeds, read.texts, read.distinct) else try store.queryPrepared(prepared, read.seeds, read.texts, read.distinct);
+                    var snapshot = if (read.complete_aliases) try store.queryExecutionPrepared(prepared, read.seeds, read.texts, read.distinct) else try store.queryPrepared(prepared, read.seeds, read.texts, read.distinct);
+                    if (read.project_suppression) try indexed_profile.projectSuppression(a, &snapshot, read.seeds, read.texts);
                     result.namespaces = try a.dupe(native.Snapshot, &.{snapshot});
                     break :policy_read;
-                };
+                }
                 if (if (read.complete_aliases) try store.queryExecutionPolicy(read.key_template, read.seeds, read.texts, read.aliases, read.distinct) else try store.queryPolicy(read.key_template, read.seeds, read.texts, read.aliases, read.distinct)) |snapshot|
                     result.namespaces = try a.dupe(native.Snapshot, &.{snapshot});
             },
@@ -23495,7 +23505,7 @@ pub const RaftApplyStore = struct {
             const definition = try @import("antfly_resolver").fingerprint(a, table.indexes_json);
             if (try stagingGet(txn, head_path)) |raw| {
                 const old = try std.json.parseFromSliceLeaky(ResolverQuerySource, a, raw, .{});
-                if (old.version == 2 and std.mem.eql(u8, &definition, &old.definition)) {
+                if (old.version == 3 and std.mem.eql(u8, &definition, &old.definition)) {
                     var schema = table;
                     schema.indexes_json = "{}";
                     var updated = old;
@@ -23511,7 +23521,7 @@ pub const RaftApplyStore = struct {
             if (configs.len > 0) {
                 var schema = table;
                 schema.indexes_json = "{}";
-                const head: ResolverQuerySource = .{ .version = 2, .table_id = id, .name = table.name, .definition = definition, .schema = try @import("../resolver_authority.zig").schemaFingerprint(a, schema), .stamp = try @import("../resolver_authority.zig").sourceDefinitionFingerprint(a, table.indexes_json) };
+                const head: ResolverQuerySource = .{ .version = 3, .table_id = id, .name = table.name, .definition = definition, .schema = try @import("../resolver_authority.zig").schemaFingerprint(a, schema), .stamp = try @import("../resolver_authority.zig").sourceDefinitionFingerprint(a, table.indexes_json) };
                 try rows.put(a, head_path, try std.json.Stringify.valueAlloc(a, head, .{}));
                 var producers: std.StringHashMapUnmanaged(std.ArrayList(std.json.Value)) = .empty;
                 try collectResolverQueryProducers(a, value, &producers);
@@ -23526,13 +23536,14 @@ pub const RaftApplyStore = struct {
                     execution.aliases = &.{};
                     execution.merges = &.{};
                     execution.curation_json = "";
+                    execution.suppress_json = "";
                     execution.shared_projection = null;
                     execution.validation_proof = null;
                     const profile_id = if (cfg.aliases.len != 0 or cfg.suppress_json.len != 0)
                         try (StaticProfiles.Definition{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json }).identity(a)
                     else
                         null;
-                    try rows.put(a, try resolverQueryKey(a, group, id, try std.fmt.allocPrint(a, "execution/{s}", .{name})), try std.json.Stringify.valueAlloc(a, QueryExecution{ .config = execution, .profile_id = profile_id }, .{}));
+                    try rows.put(a, try resolverQueryKey(a, group, id, try std.fmt.allocPrint(a, "execution/{s}", .{name})), try std.json.Stringify.valueAlloc(a, QueryExecution{ .version = 2, .config = execution, .profile_id = profile_id }, .{}));
                     if (!cfg.retired) try rows.put(a, try resolverQueryKey(a, group, id, try std.fmt.allocPrint(a, "group/{s}/{s}", .{ try resolverQueryGroup(a, cfg), name })), encoded);
                     if (!(try published_producers.getOrPut(a, cfg.source_artifact)).found_existing) if (producers.get(cfg.source_artifact)) |items| {
                         if (builtin.is_test) _ = test_query_producers.fetchAdd(1, .monotonic);
@@ -23603,7 +23614,7 @@ pub const RaftApplyStore = struct {
                 if (compact) {
                     const raw = (try stagingGet(txn, try resolverQueryKey(a, group, source, try std.fmt.allocPrint(a, "execution/{s}", .{try NamespaceRoutes.digest(a, name)})))) orelse return error.InvalidCatalogRecord;
                     const execution = try std.json.parseFromSliceLeaky(QueryExecution, a, raw, .{});
-                    if (execution.version != 1) return error.InvalidCatalogRecord;
+                    if (execution.version != 2) return error.InvalidCatalogRecord;
                     cfg.* = execution.config;
                     try compacted.put(a, cfg.name, execution.profile_id);
                 } else {
@@ -23709,7 +23720,7 @@ pub const RaftApplyStore = struct {
             };
             const raw = (try stagingGet(&txn, try resolverQueryKey(a, group_id, id, "head"))) orelse break :blk null;
             const value = try std.json.parseFromSliceLeaky(ResolverQuerySource, a, raw, .{});
-            if ((value.version != 1 and value.version != 2) or value.table_id != id) return error.InvalidCatalogRecord;
+            if ((value.version != 1 and value.version != 2 and value.version != 3) or value.table_id != id) return error.InvalidCatalogRecord;
             const stamp = (try stagingGet(&txn, try resolverSourceStampKey(a, group_id, id))) orelse break :blk null;
             if (!std.mem.eql(u8, stamp, &value.stamp)) break :blk null;
             break :blk value;
@@ -23736,7 +23747,7 @@ pub const RaftApplyStore = struct {
                 // alias arrays on subsequent query-policy pages.
                 result.indexed = try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group_id)) != null;
                 const Descriptor = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
-                const compact_query = input.compact_query and result.indexed and if (query_source) |source| source.version == 2 else false;
+                const compact_query = input.compact_query and result.indexed and if (query_source) |source| source.version == 3 else false;
                 const selected = if (query_source != null)
                     try resolverQueryDescriptorsTxn(a, &txn, group_id, table.table_id, input, compact_query)
                 else legacy: {
@@ -23807,7 +23818,7 @@ pub const RaftApplyStore = struct {
                         if (qualified) if (projection.value_ptr.*) |profile_id| {
                             const target = try resolverTargetPrefix(a, group_id, try system_catalog.Target.parse(cfg.table));
                             const profile_root = try staticProfileRoot(a, target, cfg.key_template);
-                            qualified = try StaticProfiles.queryReferenceActive(a, &txn, profile_root, profile_id, cfg.key_template) and try StaticProfiles.queryNodesReady(a, &txn, profile_root, profile_id);
+                            qualified = try StaticProfiles.queryReferenceActive(a, &txn, profile_root, profile_id, cfg.key_template) and try StaticProfiles.queryNodesReady(a, &txn, profile_root, profile_id) and try StaticProfiles.querySuppressionReady(a, &txn, profile_root, profile_id);
                             if (qualified) try profiles.append(a, .{ .name = cfg.name, .target = cfg.table, .id = profile_id });
                         };
                         if (!qualified) {
@@ -24147,7 +24158,11 @@ pub const RaftApplyStore = struct {
         while (added.next()) |entry| {
             const raw = try std.json.Stringify.valueAlloc(a, @import("../resolver_catalog_read.zig").ConsumerReference{ .source_id = next.?.table_id, .source_name = next.?.name, .configs = entry.value_ptr.configs.items }, .{});
             const stored = try stagingGet(txn, entry.key_ptr.*);
-            if (stored) |value| if (std.mem.eql(u8, value, raw)) continue;
+            if (stored) |value| if (std.mem.eql(u8, value, raw)) {
+                const root = try staticProfileRoot(a, entry.value_ptr.root, entry.value_ptr.template);
+                for (entry.value_ptr.profiles.items, entry.value_ptr.configs.items) |definition, cfg| try StaticProfiles.ensureQueryPolicy(a, txn, root, cfg.admission_profile, definition);
+                continue;
+            };
             const prior = old.get(entry.key_ptr.*);
             // An upgrade can revisit an already enrolled row without a previous
             // table descriptor. Reconcile against its durable profile identities
@@ -24315,7 +24330,7 @@ pub const RaftApplyStore = struct {
         return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:job:", .{group_id});
     }
     fn resolverNamespaceBootstrapKey(a: std.mem.Allocator, group_id: u64) ![]const u8 {
-        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v11", .{group_id});
+        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v12", .{group_id});
     }
     fn resolverConfigs(a: std.mem.Allocator, root: std.json.Value) ![]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig {
         const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
@@ -24770,9 +24785,9 @@ pub const RaftApplyStore = struct {
         const first = (try nextResolverNamespaceJobTxn(a, &txn, group)) orelse return null;
         var job = try std.json.parseFromSliceLeaky(ResolverNamespaceJob, a, first.value, .{});
         if (job.retire) return null;
-        if ((!job.bootstrap or job.bootstrap_generation != 11) and try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group)) == null) {
+        if ((!job.bootstrap or job.bootstrap_generation != 12) and try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group)) == null) {
             job.bootstrap = true;
-            job.bootstrap_generation = 11;
+            job.bootstrap_generation = 12;
             job.after = null;
             job.ownership_turn = 0;
         }
@@ -24864,9 +24879,9 @@ pub const RaftApplyStore = struct {
         defer cursor.close();
         const first = (try nextResolverNamespaceJobTxn(a, &txn, group_id)) orelse return alloc.alloc(metadata.TableRecord, 0);
         var job = try std.json.parseFromSliceLeaky(ResolverNamespaceJob, a, first.value, .{});
-        if ((!job.bootstrap or job.bootstrap_generation != 11) and try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group_id)) == null) {
+        if ((!job.bootstrap or job.bootstrap_generation != 12) and try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group_id)) == null) {
             job.bootstrap = true;
-            job.bootstrap_generation = 11;
+            job.bootstrap_generation = 12;
             job.after = null;
             job.ownership_turn = 0;
         }
@@ -24917,9 +24932,9 @@ pub const RaftApplyStore = struct {
         };
         var job = try std.json.parseFromSliceLeaky(ResolverNamespaceJob, a, raw, .{});
         try txn.put(try resolverScheduleKey(a, group_id), job_key);
-        if ((!job.bootstrap or job.bootstrap_generation != 11) and try stagingGet(txn, try resolverNamespaceBootstrapKey(a, group_id)) == null) {
+        if ((!job.bootstrap or job.bootstrap_generation != 12) and try stagingGet(txn, try resolverNamespaceBootstrapKey(a, group_id)) == null) {
             job.bootstrap = true;
-            job.bootstrap_generation = 11;
+            job.bootstrap_generation = 12;
             job.after = null;
             job.ownership_turn = 0;
         }
@@ -42509,7 +42524,7 @@ test "resolver curation namespace propagation shared query producers serialize o
     try std.testing.expectError(error.NotFound, txn.get(producer_key));
 }
 
-test "resolver curation namespace propagation v11 readiness waits for bounded ownership backfill" {
+test "resolver curation namespace propagation v12 readiness waits for bounded ownership backfill" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -42589,7 +42604,10 @@ test "resolver curation namespace propagation compact execution admits bounded p
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/compact-query", .{tmp.sub_path});
-    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = path });
+    // Hundreds of thousands of derived metadata rows are deliberately built
+    // and retired. Batch their test allocations: the debug allocator's stack
+    // capture on every individual free otherwise dominates fixture teardown.
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
     defer store.deinit();
     const group: u64 = 41;
     const domain = @import("../resolver_authority.zig");
@@ -42603,7 +42621,11 @@ test "resolver curation namespace propagation compact execution admits bounded p
     const destination = (try store.getTable(a, group, 1)).?;
     const bootstrap: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, destination), .bootstrap = .{ .expected_indexes = try pure.fingerprint(a, destination.indexes_json) }, .patches = &.{try domain.records.difference(a, .{ .key_template = template }, .{ .key_template = template, .revision = 1 })} };
     try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, bootstrap, .{}) });
-    var cfg: Config = .{ .name = "r", .table = "entities", .key_template = template, .source_artifact = "kg", .resolution_artifact = "resolved", .aliases = aliases, .min_confidence = 0.6, .promote = false, .type_must_match = true };
+    const blocked = try a.alloc([]const u8, 99999);
+    for (blocked, 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "entity/blocked-{d}", .{i});
+    blocked[0] = "entity/alias-0";
+    const suppress = try std.json.Stringify.valueAlloc(a, .{ .keys = blocked, .texts = &.{" MiXeD noise "}, .min_text_chars = @as(u32, 3) }, .{});
+    var cfg: Config = .{ .name = "r", .table = "entities", .key_template = template, .source_artifact = "kg", .resolution_artifact = "resolved", .aliases = aliases, .suppress_json = suppress, .min_confidence = 0.6, .promote = false, .type_must_match = true };
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = &.{cfg} }, .{}) } });
     while (try store.pendingResolverNamespaceWork(a, group, true)) |work| try store.applyStandaloneCommand(group, .{ .advance_resolver_namespace = work.advance });
     const request: wire.Request = .{ .table_name = "source", .policy_descriptors = true, .projection_names = &.{"r"}, .routing_siblings = true, .standalone = true, .compact_query = true };
@@ -42617,16 +42639,26 @@ test "resolver curation namespace propagation compact execution admits bounded p
     try std.testing.expect(bytes.len < 16384);
     try std.testing.expect(bounded.queryCapacity() < 128 * 1024);
     try std.testing.expectEqual(@as(usize, 0), compact.configs.?[0].aliases.len);
+    try std.testing.expectEqualStrings("", compact.configs.?[0].suppress_json);
     try std.testing.expectEqual(@as(?f64, 0.6), compact.configs.?[0].min_confidence);
     try std.testing.expect(compact.configs.?[0].type_must_match and !compact.configs.?[0].promote);
     try std.testing.expectEqual(@as(usize, 10000), full.configs.?[0].aliases.len);
     try std.testing.expectEqualSlices(u8, &full.query_fingerprint.?, &compact.query_fingerprint.?);
     const reference = compact.query_profiles.?[0];
-    const id = try (RaftApplyStore.StaticProfiles.Definition{ .key_template = template, .aliases = aliases }).identity(a);
+    const id = try (RaftApplyStore.StaticProfiles.Definition{ .key_template = template, .aliases = aliases, .suppress_json = suppress }).identity(a);
     try std.testing.expectEqualStrings(id, reference.id);
     const target = try RaftApplyStore.resolverTargetPrefix(a, group, try system_catalog.Target.parse("entities"));
     const root = try RaftApplyStore.staticProfileRoot(a, target, template);
-    const ready_key = try std.fmt.allocPrint(a, "{s}query-nodes-ready/{s}", .{ root, id });
+    const query: domain.Read = .{ .mode = .policy, .key_template = template, .seeds = &.{"entity/alias-0"}, .texts = &.{" MIXED NOISE "}, .query_profile = .{ .target = "entities", .id = id }, .complete_aliases = true, .project_suppression = true };
+    const projection_bytes = try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .authority, .authority = query });
+    const projected = try std.json.parseFromSliceLeaky(domain.View, a, projection_bytes, .{});
+    const negatives = projected.namespaces[0].configured_suppression.?;
+    try std.testing.expectEqual(@as(usize, 1), negatives.keys.len);
+    try std.testing.expectEqualStrings("entity/alias-0", negatives.keys[0]);
+    try std.testing.expectEqualStrings("mixed_noise", negatives.texts[0]);
+    try std.testing.expectEqual(@as(u32, 3), negatives.min_text_chars);
+    try std.testing.expect(projection_bytes.len < 4096);
+    const ready_key = try std.fmt.allocPrint(a, "{s}query-negatives-ready-v1/{s}", .{ root, id });
     {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
@@ -42636,11 +42668,12 @@ test "resolver curation namespace propagation compact execution admits bounded p
     const fallback = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, request), .{});
     try std.testing.expectEqual(@as(usize, 0), fallback.query_profiles.?.len);
     try std.testing.expectEqual(@as(usize, 10000), fallback.configs.?[0].aliases.len);
+    try std.testing.expectEqualStrings(suppress, fallback.configs.?[0].suppress_json);
     try std.testing.expectEqualSlices(u8, &full.query_fingerprint.?, &fallback.query_fingerprint.?);
     {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
-        try txn.put(ready_key, "1");
+
         const head_key = try RaftApplyStore.resolverQueryKey(a, group, 2, "head");
         var old = try std.json.parseFromSliceLeaky(RaftApplyStore.ResolverQuerySource, a, try txn.get(head_key), .{});
         old.version = 1;
@@ -42668,5 +42701,5 @@ test "resolver curation namespace propagation compact execution admits bounded p
     var verify = request;
     verify.expected_query_fingerprint = compact.query_fingerprint;
     try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, verify));
-    std.debug.print("COMPACT QUERY aliases=10000 response_bytes={d} arena_bytes={d} hydrated_aliases=0 readiness=fenced backfill=v11\n", .{ bytes.len, bounded.queryCapacity() });
+    std.debug.print("COMPACT QUERY aliases=10000 suppression_entries=100000 response_bytes={d} arena_bytes={d} hydrated_aliases=0 readiness=fenced backfill=v12\n", .{ bytes.len, bounded.queryCapacity() });
 }

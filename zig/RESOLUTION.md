@@ -2034,21 +2034,23 @@ A one-resolver warm admission uses 2,296 bytes of request arena capacity at
 1,000, 10,000 and 100,000 selected aliases, rather than copying up to 12 MB of
 selected aliases and recomputing their identities on every request.
 
-HTTP query admission uses topology protocol 56's opt-in compact execution rows.
+HTTP query admission uses topology protocol 57's opt-in compact execution rows.
 The owner writes each stripped execution descriptor and static profile identity
 atomically with its source declaration. Initial reads return those rows only
-after v11 bootstrap readiness and same-cut native-head, profile-enrollment and
-persistent-node checks. Alias bodies and source-projected curation stay out of
+after v12 bootstrap readiness and same-cut native-head, profile-enrollment,
+persistent-node and configured-negative checks. Alias bodies, configured
+suppression lists and source-projected curation stay out of
 the warm response; scorer, embedding, routing and other execution options remain.
 The API consumes the supplied identities without rehashing the source aliases.
 A null profile list denotes a legacy response; an empty qualified list explicitly
 selects inline fallback and must not synthesize a potentially inactive reference.
 Missing heads or node readiness hydrate only the selected legacy descriptor.
-Version-one source rows remain readable until the leader's bounded walk publishes
-version-two execution rows. Old in-flight bootstrap cursors rewind for the new
-generation in both work previews and committed advancement. The 10,000-alias
-regression returns a 1,906-byte response with 19,078 bytes of request arena
-capacity and zero hydrated aliases; compact and full reads have identical query
+Older source rows remain readable until the leader's bounded walk publishes
+version-three sources and version-two execution rows. Old in-flight bootstrap cursors rewind for the new
+generation in both work previews and committed advancement. The regression with
+10,000 aliases and 100,000 suppression rules returns a 1,902-byte response with
+53,072 bytes of request arena capacity and zero hydrated aliases or suppression
+lists; compact and full reads have identical query
 fingerprints, and policy replacement invalidates the captured proof.
 
 Lite schema capture retains one content digest on its physical DB owner, keyed
@@ -2623,3 +2625,34 @@ consumer status after the writer transaction closes. Each source is sampled once
 for all consumers, including mixed promotion requirements. Wait polling uses the
 same selective observation and reuses it for replay floors and response progress.
 An unavailable observation reports pending without invalidating a committed edit.
+
+Configured suppression is an immutable indexed part of each static profile.
+Enrollment/backfill validates it with the execution parser, stores exact keys,
+normalized text and the scalar minimum text length, and publishes readiness in
+the same transaction. Query pages point-read only their seed/forward-path and
+incident-pin endpoints and requested mention texts. The same helper serves
+HTTP and Lite; it never scans the negative directory. A separate optional
+`configured_suppression` projection is query-only, keeps native corrections
+separate, and is unioned across bounded pages. Mixed projected/legacy pages
+are rejected. Attachment caches bounded negatives by their own content, never
+by the full profile ID (which would conflate different query frontiers).
+Text-only pages retain the profile reference and avoid alias-context builds.
+An isolated 100,000-rule projection with two keys and two mention texts issues
+five point reads, zero scans and uses 7,086 bytes of arena capacity.
+Until readiness, admission hydrates the inline descriptor. V12 metadata and
+V8 Lite bootstrap repair existing enrolled profiles without changing refcounts.
+
+Lite detached publication captures a small proof over persisted schema, index,
+enrichment, resolver, merge and projection-epoch records. The proof retains a
+native read transaction for the detached turn and compares immutable document
+record references at final admission, under the existing writer fences. This
+uses existing transactional native identities rather than adding a second
+catalog digest format. The pinned checkpoint prevents record-page reuse/ABA;
+file inode and the existing namespace/root-incarnation checks fence replacement.
+Unrelated primary commits may replace B-tree leaves but do not change these
+record references. No full catalog is copied, serialized or hashed on that path.
+A rewritten record receives an exact byte comparison; identical bytes remain
+valid, changed or newly present/missing records refuse publication. The pin
+ends with the detached turn, retaining no permanent reclamation frontier.
+Live execution grants, source guards, leases and namespace heads still undergo
+their own publication checks. No authorization or decision is cached.

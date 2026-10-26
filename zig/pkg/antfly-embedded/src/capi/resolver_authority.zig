@@ -1020,6 +1020,7 @@ pub const QuerySession = struct {
         };
         var current = cfg.*;
         var complete_aliases = false;
+        var complete_suppression = false;
         if (captured.stamp) |expected| {
             const LiteTxn = @import("../storage/lite/docstore.zig").Txn;
             var profile_txn: ?LiteTxn = null;
@@ -1027,14 +1028,14 @@ pub const QuerySession = struct {
             var directory: native.static_profiles.ReadTransaction(LiteTxn) = undefined;
             var indexed_profile: native.static_profiles.QueryReader = undefined;
             var profile_lookup: ?native.AliasLookup = null;
-            if (cfg.aliases.len != 0 and seeds.count() != 0) {
+            if ((cfg.aliases.len != 0 or cfg.suppress_json.len != 0) and (seeds.count() != 0 or texts.count() != 0)) {
                 const physical = if (self.root.owned_lite_backend) |*backend| backend.native_docstore else null;
                 if (physical) |file| {
                     profile_txn = try file.beginRead();
                     directory = .{ .txn = &profile_txn.? };
                     const profile_id = self.profiles.get(cfg.name) orelse return error.Busy;
                     const profile_root = try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, cfg.table, cfg.key_template);
-                    if (try native.static_profiles.queryReferenceActive(a, &profile_txn.?, profile_root, profile_id, cfg.key_template) and try native.static_profiles.queryNodesReady(a, &profile_txn.?, profile_root, profile_id)) {
+                    if (try native.static_profiles.queryReferenceActive(a, &profile_txn.?, profile_root, profile_id, cfg.key_template) and try native.static_profiles.queryNodesReady(a, &profile_txn.?, profile_root, profile_id) and try native.static_profiles.querySuppressionReady(a, &profile_txn.?, profile_root, profile_id)) {
                         indexed_profile = .{ .backend = directory.backend(), .root = profile_root, .profile = profile_id, .indexed = true };
                         profile_lookup = indexed_profile.lookup();
                     }
@@ -1067,7 +1068,8 @@ pub const QuerySession = struct {
                 if (head.revision != expected.revision or !std.mem.eql(u8, &head.fingerprint, &expected.fingerprint)) return error.Busy;
                 const seed_end = @min(seeds.count(), seed_offset + 1024);
                 const text_end = @min(texts.count(), text_offset + 128);
-                const part = if (prepared) |query| try store.queryExecutionPrepared(query, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], candidates != null) else (try store.queryExecutionPolicy(cfg.key_template, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], &.{}, candidates != null)) orelse return error.Busy;
+                var part = if (prepared) |query| try store.queryExecutionPrepared(query, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], candidates != null) else (try store.queryExecutionPolicy(cfg.key_template, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], &.{}, candidates != null)) orelse return error.Busy;
+                if (profile_lookup != null) try indexed_profile.projectSuppression(page, &part, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end]);
                 try joined.add(a, page, part);
                 seed_offset = seed_end;
                 text_offset = text_end;
@@ -1075,6 +1077,10 @@ pub const QuerySession = struct {
             }
             const snapshot = try joined.finish();
             complete_aliases = snapshot.complete_aliases;
+            if (snapshot.configured_suppression) |suppression| {
+                current.suppress_json = try json(a, suppression);
+                complete_suppression = true;
+            }
             current.merges = snapshot.namespace.merges;
             current.curation_json = try json(a, snapshot.namespace.state);
             current.shared_projection = null;
@@ -1084,7 +1090,7 @@ pub const QuerySession = struct {
             current = try currentConfig(self.root, self.database, a, cfg.*, null);
         }
         if (captured.stamp != null and complete_aliases) {
-            try target.installQueryProjection(a, self.profiles.get(cfg.name), cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
+            try target.installQueryProjection(a, if (complete_suppression) null else self.profiles.get(cfg.name), current.suppress_json, current.merges, current.curation_json, seeds.keys());
         } else if (captured.stamp != null) {
             try target.installQueryPolicy(a, self.profiles.get(cfg.name), cfg.aliases, cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
         } else try target.installCachedPolicy(current.aliases, current.merges, current.suppress_json, current.curation_json);
@@ -1539,7 +1545,11 @@ test "capi resolver curation query uses persisted profile nodes under leased cac
     try tables.create(root, "entities", "{}", false);
     const profile_aliases = try a.alloc(resolver.KeyAlias, 5000);
     for (profile_aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "concept/query-admission-{d}", .{i}), .target = "concept/query-root" };
-    const cfg: h.db_mod.ResolverConfig = .{ .name = "query-admission", .table = "entities", .source_artifact = "kg", .resolution_artifact = "out", .key_template = "concept/{{_entity.text}}", .aliases = profile_aliases, .promote = false };
+    const negatives = try a.alloc([]const u8, 10000);
+    for (negatives, 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "concept/blocked-{d}", .{i});
+    negatives[0] = "concept/query-admission-0";
+    const suppress = try json(a, .{ .keys = negatives, .texts = &.{" BLOCKED TEXT "}, .min_text_chars = @as(u32, 3) });
+    const cfg: h.db_mod.ResolverConfig = .{ .name = "query-admission", .table = "entities", .source_artifact = "kg", .resolution_artifact = "out", .key_template = "concept/{{_entity.text}}", .aliases = profile_aliases, .suppress_json = suppress, .promote = false };
     _ = try root.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
     var out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out);
@@ -1567,6 +1577,12 @@ test "capi resolver curation query uses persisted profile nodes under leased cac
     try std.testing.expectEqual(builds, native.test_query_base_loads.load(.monotonic));
     try std.testing.expectEqualStrings("concept/query-root", target.alias_index.?.canonical(profile_aliases[0].key));
     try std.testing.expectEqual(@as(usize, 0), target.query_policy_lease.?.aliases().len);
+    try std.testing.expect(target.curation_index.keySuppressed("concept/query-admission-0"));
+    try std.testing.expect(target.query_policy_lease.?.policy.bytes < 16384);
+    try QuerySession.prepare(&session, &query_cfg, a, &target, &.{.{ .local_id = "allowed", .label = "concept", .text = "allowed" }}, null);
+    try std.testing.expect(!target.curation_index.keySuppressed("concept/allowed"));
+    try QuerySession.prepare(&session, &query_cfg, a, &target, &.{.{ .local_id = "blocked", .label = "concept", .text = "blocked text" }}, null);
+    try std.testing.expect((try target.curation_index.textReason(a, " Blocked Text ")) != null);
     try session.verify(root);
 }
 

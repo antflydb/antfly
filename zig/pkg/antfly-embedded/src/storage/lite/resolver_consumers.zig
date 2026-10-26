@@ -19,7 +19,7 @@ const std = @import("std");
 const directory = @import("embedded_catalog.zig");
 const A = std.mem.Allocator;
 pub const catalog_key = "\x00\x00__metadata__:resolvers";
-pub const marker = "\x00antfly/embedded/resolver-consumers/v7/ready";
+pub const marker = "\x00antfly/embedded/resolver-consumers/v8/ready";
 pub const epoch_key = "\x00antfly/embedded/resolver-consumers/v7/epoch";
 pub fn epoch(txn: anytype) !u64 {
     const raw = txn.get(epoch_key) catch |err| return if (err == error.NotFound) 0 else err;
@@ -184,6 +184,7 @@ fn writeBinding(a: A, txn: anytype, source_prefix: []const u8, cfg: Definition, 
     if (old) |raw| {
         const previous = try std.json.parseFromSliceLeaky(Binding, a, raw, .{});
         if (!std.mem.eql(u8, previous.profile_id, id_profile)) return error.ResolverCurationConflict;
+        try static_profiles.ensureQueryPolicy(a, txn, try profileRoot(a, cfg.table, cfg.key_template), id_profile, definition);
         if (std.mem.eql(u8, raw, encoded)) return;
     } else try static_profiles.synchronize(a, txn, try profileRoot(a, cfg.table, cfg.key_template), &.{}, &.{definition});
     try txn.put(try bindingKey(a, source_prefix, cfg), encoded);

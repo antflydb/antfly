@@ -58,7 +58,10 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
     var it = counts.iterator();
     while (it.next()) |entry| {
         const delta = entry.value_ptr.delta;
-        if (delta == 0) continue;
+        if (delta == 0) {
+            try ensureQueryPolicy(a, txn, root, entry.key_ptr.*, entry.value_ptr.definition);
+            continue;
+        }
         const definition = entry.value_ptr.definition;
         const id = entry.key_ptr.*;
         const key = try headKey(a, root, id);
@@ -73,6 +76,7 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
             try txn.put(size_key, try std.json.Stringify.valueAlloc(a, estimate, .{}));
         }
         try synchronizeQueryNodes(a, txn, root, id, definition, head.refs != 0);
+        try synchronizeQuerySuppression(a, txn, root, id, definition, head.refs != 0);
         if ((prior == 0) == (head.refs == 0)) continue;
         const summary_key = try std.mem.concat(a, u8, &.{ root, "summary" });
         const summary_raw = txn.get(summary_key) catch |err| if (err == error.NotFound) null else return err;
@@ -118,6 +122,35 @@ fn synchronizeQueryNodes(a: A, txn: anytype, root: []const u8, id: []const u8, d
         }
     }
     if (active) try txn.put(marker, "1") else try txn.delete(marker);
+}
+/// Optional derived projections are rebuilt before compact admission is enabled.
+/// Refcounts and immutable identity remain independent of projection versions.
+pub fn ensureQueryPolicy(a: A, txn: anytype, root: []const u8, id: []const u8, definition: Definition) !void {
+    try synchronizeQueryNodes(a, txn, root, id, definition, true);
+    try synchronizeQuerySuppression(a, txn, root, id, definition, true);
+}
+fn suppressionKey(a: A, root: []const u8, id: []const u8, kind: []const u8, value: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{s}query-negative-v1/{s}/{s}/{s}", .{ root, id, kind, try routes.digest(a, value) });
+}
+fn synchronizeQuerySuppression(a: A, txn: anytype, root: []const u8, id: []const u8, definition: Definition, active: bool) !void {
+    const marker = try std.fmt.allocPrint(a, "{s}query-negatives-ready-v1/{s}", .{ root, id });
+    const ready = (txn.get(marker) catch |err| if (err == error.NotFound) null else return err) != null;
+    if (ready == active) return;
+    // Use the execution parser so validation and Unicode normalization are
+    // identical to the inline path. Build once at enrollment/backfill.
+    const policy = try resolver.curation.Index.init(a, definition.suppress_json, "");
+    inline for (.{ "key", "text" }, .{ policy.keys, policy.texts }) |kind, values| {
+        var it = values.keyIterator();
+        while (it.next()) |value| {
+            const path = try suppressionKey(a, root, id, kind, value.*);
+            if (active) try txn.put(path, try std.json.Stringify.valueAlloc(a, value.*, .{})) else try txn.delete(path);
+        }
+    }
+    if (active) try txn.put(marker, try std.json.Stringify.valueAlloc(a, policy.min_text_chars, .{})) else try txn.delete(marker);
+}
+pub fn querySuppressionReady(a: A, txn: anytype, root: []const u8, id: []const u8) !bool {
+    _ = txn.get(try std.fmt.allocPrint(a, "{s}query-negatives-ready-v1/{s}", .{ root, id })) catch |err| return if (err == error.NotFound) false else err;
+    return true;
 }
 pub fn queryNodesReady(a: A, txn: anytype, root: []const u8, id: []const u8) !bool {
     const raw = txn.get(try std.fmt.allocPrint(a, "{s}query-nodes-ready/{s}", .{ root, id })) catch |err| return if (err == error.NotFound) false else err;
@@ -169,6 +202,37 @@ pub const QueryReader = struct {
     indexed: bool = false,
     pub fn lookup(self: *QueryReader) records.AliasLookup {
         return .{ .ptr = self, .expand = expand, .node = if (self.indexed) node else null, .seek_node = if (self.indexed) seekNode else null };
+    }
+    /// Only the admitted profile's exact negatives for the returned forward
+    /// frontier and mention texts. No directory scans or full-policy cache.
+    pub fn projectSuppression(self: *QueryReader, a: A, snapshot: *records.Snapshot, seeds: []const []const u8, texts: []const []const u8) !void {
+        const marker = (try self.backend.get(self.backend.ptr, a, try std.fmt.allocPrint(a, "{s}query-negatives-ready-v1/{s}", .{ self.root, self.profile }))) orelse return error.CatalogGenerationChanged;
+        var keys: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for (seeds) |key| try keys.put(a, key, {});
+        for (snapshot.namespace.merges) |edge| {
+            try keys.put(a, edge.key, {});
+            try keys.put(a, edge.target, {});
+        }
+        for (snapshot.namespace.state.distinct) |pair| {
+            try keys.put(a, pair.from, {});
+            try keys.put(a, pair.to, {});
+        }
+        var matched_keys: std.ArrayList([]const u8) = .empty;
+        var matched_texts: std.ArrayList([]const u8) = .empty;
+        for (keys.keys()) |key| if (try self.negative(a, "key", key)) |value| try matched_keys.append(a, value);
+        var normalized: std.StringHashMapUnmanaged(void) = .empty;
+        for (texts) |text| {
+            const key = try resolver.curation.normalize(a, text);
+            if ((try normalized.getOrPut(a, key)).found_existing) continue;
+            if (try self.negative(a, "text", key)) |value| try matched_texts.append(a, value);
+        }
+        snapshot.configured_suppression = .{ .keys = matched_keys.items, .texts = matched_texts.items, .min_text_chars = try std.json.parseFromSliceLeaky(u32, a, marker, .{}) };
+    }
+    fn negative(self: *QueryReader, a: A, kind: []const u8, key: []const u8) !?[]const u8 {
+        const raw = (try self.backend.get(self.backend.ptr, a, try suppressionKey(a, self.root, self.profile, kind, key))) orelse return null;
+        const value = try std.json.parseFromSliceLeaky([]const u8, a, raw, .{ .allocate = .alloc_always });
+        if (!std.mem.eql(u8, key, value)) return error.InvalidCatalogRecord;
+        return value;
     }
     fn node(ptr: *anyopaque, a: A, id: []const u8) !?records.query_context.QueryNode {
         const self: *@This() = @ptrCast(@alignCast(ptr));

@@ -248,6 +248,8 @@ pub const Snapshot = struct {
     /// Query-only projection: merges include the effective configured paths.
     /// Never persisted as namespace corrections or sent to older readers.
     complete_aliases: bool = false,
+    /// Query-only configured negatives, qualified by the enrolled profile.
+    configured_suppression: ?c.Suppression = null,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         try writer.objectField("head");
@@ -257,6 +259,10 @@ pub const Snapshot = struct {
         if (self.complete_aliases) {
             try writer.objectField("complete_aliases");
             try writer.write(true);
+        }
+        if (self.configured_suppression) |suppression| {
+            try writer.objectField("configured_suppression");
+            try writer.write(suppression);
         }
         try writer.endObject();
     }
@@ -1775,11 +1781,24 @@ pub fn unionNamespaces(a: A, left: policy.Namespace, right: policy.Namespace) !p
 /// Streaming union of bounded query pages. Only unique facts survive a page;
 /// transport bytes and duplicate paths can be released before the next read.
 pub const QueryPolicyUnion = struct {
+    suppression_projected: ?bool = null,
+    configured_keys: std.StringArrayHashMapUnmanaged(void) = .empty,
+    configured_texts: std.StringArrayHashMapUnmanaged(void) = .empty,
+    configured_min_text_chars: u32 = 0,
     complete_aliases: ?bool = null,
     head: ?Head = null,
     seen: std.StringHashMapUnmanaged([]const u8) = .empty,
     values: Store.Values = .{},
     pub fn add(self: *QueryPolicyUnion, a: A, scratch: A, part: Snapshot) !void {
+        const projected = part.configured_suppression != null;
+        if (self.suppression_projected) |prior| {
+            if (prior != projected) return error.ResolverCurationConflict;
+        } else self.suppression_projected = projected;
+        if (part.configured_suppression) |suppression| {
+            self.configured_min_text_chars = @max(self.configured_min_text_chars, suppression.min_text_chars);
+            for (suppression.keys) |key| if (!self.configured_keys.contains(key)) try self.configured_keys.put(a, try a.dupe(u8, key), {});
+            for (suppression.texts) |text| if (!self.configured_texts.contains(text)) try self.configured_texts.put(a, try a.dupe(u8, text), {});
+        }
         if (self.complete_aliases) |complete| {
             if (complete != part.complete_aliases) return error.ResolverCurationConflict;
         } else self.complete_aliases = part.complete_aliases;
@@ -1802,6 +1821,7 @@ pub const QueryPolicyUnion = struct {
     pub fn finish(self: QueryPolicyUnion) !Snapshot {
         var result = self.values.snapshot(self.head orelse return error.InvalidResolverCurationRequest);
         result.complete_aliases = self.complete_aliases orelse false;
+        if (self.suppression_projected orelse false) result.configured_suppression = .{ .keys = self.configured_keys.keys(), .texts = self.configured_texts.keys(), .min_text_chars = self.configured_min_text_chars };
         return result;
     }
 };
@@ -2761,11 +2781,17 @@ test "resolver curation query policy unions bounded batches with a head lineage 
     defer arena.deinit();
     const a = arena.allocator();
     const h: Head = .{ .key_template = "entity/{{_key}}", .revision = 7, .min_text_chars = 2, .fingerprint = @splat(1) };
-    const part: Snapshot = .{ .head = h, .namespace = .{ .key_template = h.key_template, .revision = 7, .merges = &.{.{ .key = "entity/a", .target = "entity/b" }}, .state = .{ .suppress = .{ .texts = &.{"noise"} } } } };
+    const part: Snapshot = .{ .configured_suppression = .{ .keys = &.{"entity/configured"}, .texts = &.{"configured noise"}, .min_text_chars = 4 }, .head = h, .namespace = .{ .key_template = h.key_template, .revision = 7, .merges = &.{.{ .key = "entity/a", .target = "entity/b" }}, .state = .{ .suppress = .{ .texts = &.{"noise"} } } } };
     const joined = try unionQueryPolicies(a, &.{ part, part });
     try std.testing.expectEqual(@as(usize, 1), joined.namespace.merges.len);
     try std.testing.expectEqual(@as(usize, 1), joined.namespace.state.suppress.texts.len);
     try std.testing.expectEqual(@as(u32, 2), joined.namespace.state.suppress.min_text_chars);
+    try std.testing.expectEqual(@as(usize, 1), joined.configured_suppression.?.keys.len);
+    try std.testing.expectEqualStrings("configured noise", joined.configured_suppression.?.texts[0]);
+    try std.testing.expectEqual(@as(u32, 4), joined.configured_suppression.?.min_text_chars);
+    var legacy = part;
+    legacy.configured_suppression = null;
+    try std.testing.expectError(error.ResolverCurationConflict, unionQueryPolicies(a, &.{ part, legacy }));
     var divergent = part;
     divergent.head.fingerprint = @splat(2);
     try std.testing.expectError(error.ResolverCurationConflict, unionQueryPolicies(a, &.{ part, divergent }));

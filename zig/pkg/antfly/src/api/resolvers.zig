@@ -522,7 +522,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
             const current = projected.config;
             const identity = if (query_fence) |fence| if (fence.profiles.get(cfg.name)) |profile| profile.id else null else null;
             if (server.source.vtable.supports_resolver_authority and cfg.namespace_curation_table_id != 0) {
-                if (projected.complete_aliases) try parsed.installQueryProjection(a, identity, cfg.suppress_json, current.merges, current.curation_json, &.{minted}) else try parsed.installQueryPolicy(a, identity, cfg.aliases, cfg.suppress_json, current.merges, current.curation_json, &.{minted});
+                if (projected.complete_aliases) try parsed.installQueryProjection(a, if (projected.complete_suppression) null else identity, current.suppress_json, current.merges, current.curation_json, &.{minted}) else try parsed.installQueryPolicy(a, identity, cfg.aliases, cfg.suppress_json, current.merges, current.curation_json, &.{minted});
             } else try parsed.installCachedPolicy(current.aliases, current.merges, current.suppress_json, current.curation_json);
             const index = parsed.alias_index.?;
             const policy = parsed.curation_index;
@@ -1546,7 +1546,7 @@ const QueryFence = struct {
 
 /// The caller pins the catalog cut before any model work and revalidates it
 /// before returning. Legacy source-owned configs already carry their policy.
-const QueryConfig = struct { config: Config, complete_aliases: bool = false };
+const QueryConfig = struct { config: Config, complete_aliases: bool = false, complete_suppression: bool = false };
 fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, cfg: Config, seeds: []const []const u8, texts: []const []const u8, distinct: bool, request: operation.RequestContext, fence: ?*const QueryFence) !QueryConfig {
     if (!server.source.vtable.supports_resolver_authority or cfg.namespace_curation_table_id == 0) return .{ .config = cfg };
     var joined: native_authority.records.QueryPolicyUnion = .{};
@@ -1559,9 +1559,10 @@ fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, 
         const page_allocator = page_arena.allocator();
         const seed_end = @min(seeds.len, seed_offset + 1024);
         const text_end = @min(texts.len, text_offset + 128);
-        const bytes = try server.source.systemCatalog(page_allocator, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .authority = .{ .mode = .policy, .expected_head = if (fence) |pinned| try pinned.expected(a, cfg) else null, .key_template = cfg.key_template, .seeds = seeds[seed_offset..seed_end], .texts = texts[text_offset..text_end], .aliases = if (profile != null or seed_offset == seed_end) &.{} else cfg.aliases, .query_profile = if (seed_offset != seed_end) profile else null, .distinct = distinct, .complete_aliases = true } } });
+        const bytes = try server.source.systemCatalog(page_allocator, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .authority = .{ .mode = .policy, .expected_head = if (fence) |pinned| try pinned.expected(a, cfg) else null, .key_template = cfg.key_template, .seeds = seeds[seed_offset..seed_end], .texts = texts[text_offset..text_end], .aliases = if (profile != null or seed_offset == seed_end) &.{} else cfg.aliases, .query_profile = profile, .project_suppression = profile != null, .distinct = distinct, .complete_aliases = true } } });
         const view = try std.json.parseFromSliceLeaky(native_authority.View, page_allocator, bytes, .{});
         if (!view.native or view.table_id != cfg.namespace_curation_table_id or view.namespaces.len != 1) return error.CatalogGenerationChanged;
+        if (profile != null and view.namespaces[0].configured_suppression == null) return error.InvalidCatalogRecord;
         try joined.add(a, page_allocator, view.namespaces[0]);
         seed_offset = seed_end;
         text_offset = text_end;
@@ -1575,7 +1576,8 @@ fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, 
     current.merges = snapshot.namespace.merges;
     current.curation_json = try std.json.Stringify.valueAlloc(a, snapshot.namespace.state, .{});
     current.namespace_curation_generation = snapshot.head.revision;
-    return .{ .config = current, .complete_aliases = snapshot.complete_aliases };
+    if (snapshot.configured_suppression) |suppression| current.suppress_json = try std.json.Stringify.valueAlloc(a, suppression, .{});
+    return .{ .config = current, .complete_aliases = snapshot.complete_aliases, .complete_suppression = snapshot.configured_suppression != null };
 }
 
 fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, table: anytype, all: []const Config, cfg: Config, body: []const u8, request: operation.RequestContext, fence: ?*const QueryFence) !@import("public_table_http.zig").OwnedResponse {
@@ -1615,7 +1617,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
             const current = projected.config;
             const identity = if (self.fence) |captured| if (captured.profiles.get(policy_cfg.name)) |profile| profile.id else null else null;
             if (self.server.source.vtable.supports_resolver_authority and policy_cfg.namespace_curation_table_id != 0) {
-                if (projected.complete_aliases) try target.installQueryProjection(allocator, identity, policy_cfg.suppress_json, current.merges, current.curation_json, seeds.keys()) else try target.installQueryPolicy(allocator, identity, policy_cfg.aliases, policy_cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
+                if (projected.complete_aliases) try target.installQueryProjection(allocator, if (projected.complete_suppression) null else identity, current.suppress_json, current.merges, current.curation_json, seeds.keys()) else try target.installQueryPolicy(allocator, identity, policy_cfg.aliases, policy_cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
             } else try target.installCachedPolicy(current.aliases, current.merges, current.suppress_json, current.curation_json);
         }
         fn filter(ptr: *anyopaque, _: std.mem.Allocator, physical: []const u8) ![]const u8 {
@@ -1780,10 +1782,10 @@ test "resolver curation HTTP policy pages share immutable profile references and
             }
             if (read.seeds.len == 0) {
                 self.text_pages += 1;
-                try std.testing.expect(read.query_profile == null and read.aliases.len == 0);
+                try std.testing.expect(read.aliases.len == 0);
             }
             const head: native_authority.records.Head = .{ .key_template = "entity/{{_key}}", .revision = 3, .fingerprint = @splat(7) };
-            return std.json.Stringify.valueAlloc(allocator, native_authority.View{ .native = true, .table_id = 1, .namespaces = &.{.{ .head = head, .namespace = .{ .key_template = head.key_template, .revision = head.revision } }} }, .{});
+            return std.json.Stringify.valueAlloc(allocator, native_authority.View{ .native = true, .table_id = 1, .namespaces = &.{.{ .head = head, .namespace = .{ .key_template = head.key_template, .revision = head.revision }, .configured_suppression = if (read.project_suppression) .{} else null }} }, .{});
         }
     };
     var server: struct { source: Source = .{} } = .{};
@@ -1793,7 +1795,7 @@ test "resolver curation HTTP policy pages share immutable profile references and
     const fence = try QueryFence.init(a, page, cfg.name, true);
     _ = try queryConfig(&server, std.testing.allocator, a, cfg, &.{"entity/seed"}, texts, true, .{}, &fence);
     try std.testing.expectEqual(@as(usize, 8), server.source.pages);
-    try std.testing.expectEqual(@as(usize, 1), server.source.references);
+    try std.testing.expectEqual(@as(usize, 8), server.source.references);
     try std.testing.expectEqual(@as(usize, 7), server.source.text_pages);
     try std.testing.expectEqual(@as(usize, 0), server.source.aliases);
     try std.testing.expect(server.source.bytes < 64 * 1024);

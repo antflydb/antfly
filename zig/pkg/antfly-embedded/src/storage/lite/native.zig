@@ -6805,6 +6805,14 @@ pub const NativeFile = struct {
         return if (entry.external_value_root_page != 0) try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint) else try allocator.dupe(u8, entry.value);
     }
 
+    /// Immutable record identity, meaningful only while the caller retains the
+    /// checkpoint's reader pin and the same file incarnation. It names the
+    /// document record, not an index leaf that unrelated writes can replace.
+    /// External value bytes need not be read to qualify unchanged metadata.
+    pub fn documentReferenceAtCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8) !?u64 {
+        return self.lookupDocumentIndexPage(checkpoint, key);
+    }
+
     /// Resolve the pinned document once; nearby requested fields share one
     /// extent read and independent spans reuse the same page reader.
     pub fn readDocumentRangesAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
