@@ -1691,3 +1691,20 @@ statistics/source-span preparation walk. It avoids a second ordered-plan read
 and per-row lineage callbacks. Source-only merges retain their allocation-free
 fallback traversal. Observer failures abort the private publication attempt;
 provenance cannot authorize publication before the merged output is complete.
+
+Metadata candidate probes reuse original index coordinates when the existing
+coordinate-space admission rule proves both readers share the authenticated
+file dictionary and row map. Incoming source/snapshot labels must still match
+the originating index cut before rebinding them to the metadata reader's cut.
+Matching filenames, row counts or logical-ID recipes do not establish this
+equivalence. Different or absent relocation witnesses keep the ordinary
+text-index-to-source-to-metadata translation and complete membership fallback.
+
+Ordered predicate read-ahead follows remaining page demand and observed tile
+selectivity, bounded by the existing 16-row maximum. Dense small pages avoid
+reading a full tile merely to establish their boundary; sparse predicates and
+unresolved public tie groups retain larger batches. Capture binds its ordering
+columns once, fills a fixed typed tuple, and immediately encodes it using one
+reusable scratch arena. Flat byte keys may borrow the live source batch only
+until encoding copies them. Durable tuple bytes, quota ownership, nullable
+coverage and ordering-input commitments remain unchanged.

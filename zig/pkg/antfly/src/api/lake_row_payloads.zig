@@ -333,18 +333,20 @@ pub const Capture = struct {
         self.cluster.?.add(ca, bound_vectors, keys, selected, sizing) catch |err| return phase.failed(err);
         try phase.finish();
         const ordering_batch = if (self.ordering_schema) |schema| try @import("lake_row_fragments.zig").OrderingBatch.bind(ca, batch.columns, schema, self.ordering_fields) else null;
-        if (ordering_batch) |bound| for (ids, 0..) |id, row| {
-            try check(self);
+        if (ordering_batch) |bound| if (bound.entries.len <= 32) {
             var keys_region = std.heap.ArenaAllocator.init(a);
             defer keys_region.deinit();
             const ka = keys_region.allocator();
-            const state: local.storage_rowsource_logical.State = .{ .id = id, .values = id };
-            const document = (try bound.document(ka, row, &state)) orelse continue;
-            var values: std.ArrayList(local.segment.SegmentIndexSortBoundValue) = .empty;
-            for (document.index_sort_values) |value| try values.append(ka, value.value);
-            const encoded = (try @import("lake_ordering_keys.zig").encode(ka, @splat(0), values.items)) orelse continue;
-            try self.ordering_edits.?.addRecord(&id, encoded);
-            self.ordering_rows += 1;
+            var values: [32]local.segment.SegmentIndexSortBoundValue = undefined;
+            const tuple = values[0..bound.entries.len];
+            for (ids, 0..) |id, row| {
+                try check(self);
+                _ = keys_region.reset(.retain_capacity);
+                if (!try bound.tupleInto(ka, row, tuple)) continue;
+                const encoded = (try @import("lake_ordering_keys.zig").encode(ka, @splat(0), tuple)) orelse continue;
+                try self.ordering_edits.?.addRecord(&id, encoded);
+                self.ordering_rows += 1;
+            }
         };
         self.rows += ids.len;
     }

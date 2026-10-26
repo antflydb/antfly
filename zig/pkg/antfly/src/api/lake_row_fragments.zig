@@ -596,7 +596,7 @@ pub const OrderingBatch = struct {
         }
         return .{ .entries = try entries.toOwnedSlice(a), .columns = columns };
     }
-    fn value(self: OrderingBatch, a: A, entry: Entry, row: usize) !?local.segment.SegmentIndexSortBoundValue {
+    fn value(self: OrderingBatch, a: A, entry: Entry, row: usize, own_bytes: bool) !?local.segment.SegmentIndexSortBoundValue {
         const index = entry.column orelse return .null_value;
         const column = self.columns[index];
         if (column.nulls.isNull(row)) return .null_value;
@@ -613,8 +613,8 @@ pub const OrderingBatch = struct {
                 else => {},
             },
             .keyword, .link => switch (column.values) {
-                .bytes => |values| return .{ .bytes_val = try a.dupe(u8, values[row]) },
-                .dictionary_bytes => |values| return .{ .bytes_val = try a.dupe(u8, values.at(row)) },
+                .bytes => |values| return .{ .bytes_val = if (own_bytes) try a.dupe(u8, values[row]) else values[row] },
+                .dictionary_bytes => |values| return .{ .bytes_val = if (own_bytes) try a.dupe(u8, values.at(row)) else values.at(row) },
                 else => {},
             },
             else => {},
@@ -637,9 +637,16 @@ pub const OrderingBatch = struct {
             else => null,
         };
     }
+    /// Capture consumes this tuple before releasing the source batch. Flat
+    /// byte keys may borrow columns until the encoder copies their bytes.
+    pub fn tupleInto(self: OrderingBatch, a: A, row: usize, output: []local.segment.SegmentIndexSortBoundValue) !bool {
+        if (output.len != self.entries.len) return error.InvalidLogicalRowIdentity;
+        for (self.entries, output) |entry, *value_| value_.* = (try self.value(a, entry, row, false)) orelse return false;
+        return true;
+    }
     pub fn document(self: OrderingBatch, a: A, row: usize, state: *const identity.logical.State) !?local.introducer.TextDocument {
         const values = try a.alloc(local.introducer.NamedSortValue, self.entries.len);
-        for (self.entries, values) |entry, *target| target.* = .{ .field_name = entry.field, .value = (try self.value(a, entry, row)) orelse return null };
+        for (self.entries, values) |entry, *target| target.* = .{ .field_name = entry.field, .value = (try self.value(a, entry, row, true)) orelse return null };
         return .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .index_sort_values = values };
     }
 };
@@ -2751,4 +2758,71 @@ test "external lake logical fragments bound ordering kernel comparison" {
     }
     try std.testing.expectEqual(checksums[0], checksums[1]);
     std.debug.print("ORDERING_BIND rows={d} keys={d} columns=32 row_adapter_ns={d} bound_kernel_ns={d} checksum={d}\n", .{ count, keys, times[0], times[1], checksums[0] });
+}
+
+test "external lake logical fragments capture tuples borrow only until encoding" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var title = "owned".*;
+    const columns = [_]rows.ColumnVector{.{ .name = "title", .values = .{ .bytes = &.{&title} } }};
+    const schema: local.storage_schema.TableSchema = .{ .version = 1, .exact_fields = &.{.{ .field = "title", .source_field = "title", .mapping = .{ .field_type = .keyword, .doc_values = true } }} };
+    const batch = (try OrderingBatch.bind(arena.allocator(), &columns, schema, &.{.{ .field = "title" }})).?;
+    var tuple: [1]local.segment.SegmentIndexSortBoundValue = undefined;
+    try std.testing.expect(try batch.tupleInto(arena.allocator(), 0, &tuple));
+    try std.testing.expectEqual(@intFromPtr(&title), @intFromPtr(tuple[0].bytes_val.ptr));
+    const encoded = (try @import("lake_ordering_keys.zig").encode(arena.allocator(), @splat(0), &tuple)).?;
+    @memset(&title, 'x');
+    const decoded = try @import("lake_ordering_keys.zig").decodeIntoArena(arena.allocator(), encoded);
+    try std.testing.expectEqualStrings("owned", decoded.keys[0].bytes_val);
+    try std.testing.expectError(error.InvalidLogicalRowIdentity, batch.tupleInto(arena.allocator(), 0, &.{}));
+}
+
+test "external lake logical fragments capture reuses scratch and encodes identical tuples" {
+    const a = std.testing.allocator;
+    const count = 4096;
+    var bindings = std.heap.ArenaAllocator.init(a);
+    defer bindings.deinit();
+    const integers = try a.alloc(i64, count);
+    defer a.free(integers);
+    for (integers, 0..) |*value_, i| value_.* = @intCast(i);
+    const text = try a.alloc([]const u8, count);
+    defer a.free(text);
+    @memset(text, "capture-key-with-a-long-enough-string-to-observe-copy-cost");
+    const columns = [_]rows.ColumnVector{ .{ .name = "rank", .values = .{ .i64 = integers } }, .{ .name = "title", .values = .{ .bytes = text } } };
+    const schema: local.storage_schema.TableSchema = .{ .version = 1, .exact_fields = &.{
+        .{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true } },
+        .{ .field = "title", .source_field = "title", .mapping = .{ .field_type = .keyword, .doc_values = true } },
+    } };
+    const batch = (try OrderingBatch.bind(bindings.allocator(), &columns, schema, &.{ .{ .field = "rank" }, .{ .field = "title" } })).?;
+    var hashes = [_]std.hash.Wyhash{ .init(0), .init(0) };
+    var capacity: [2]usize = @splat(0);
+    var times: [2]u64 = undefined;
+    const state: identity.logical.State = .{ .id = @splat(3), .values = @splat(3) };
+    for (0..2) |mode| {
+        const started = @import("antfly_platform").time.monotonicNs();
+        var reused = std.heap.ArenaAllocator.init(a);
+        defer reused.deinit();
+        for (0..count) |row| {
+            var per_row = std.heap.ArenaAllocator.init(a);
+            defer per_row.deinit();
+            _ = reused.reset(.retain_capacity);
+            const scratch = if (mode == 0) per_row.allocator() else reused.allocator();
+            var tuple: [2]local.segment.SegmentIndexSortBoundValue = undefined;
+            if (mode == 0) {
+                const doc = (try batch.document(scratch, row, &state)).?;
+                var values: std.ArrayList(local.segment.SegmentIndexSortBoundValue) = .empty;
+                for (doc.index_sort_values) |value_| try values.append(scratch, value_.value);
+                @memcpy(&tuple, values.items);
+            } else try std.testing.expect(try batch.tupleInto(scratch, row, &tuple));
+            const bytes = (try @import("lake_ordering_keys.zig").encode(scratch, @splat(0), &tuple)).?;
+            hashes[mode].update(bytes);
+            if (mode == 0) capacity[mode] += per_row.queryCapacity();
+        }
+        if (mode == 1) capacity[mode] = reused.queryCapacity();
+        times[mode] = @import("antfly_platform").time.monotonicNs() - started;
+    }
+    try std.testing.expectEqual(hashes[0].final(), hashes[1].final());
+    try std.testing.expect(capacity[1] * 100 < capacity[0]);
+    std.debug.print("CAPTURE_TUPLES rows={d} prior_arena_bytes={d} reusable_arena_bytes={d} prior_ns={d} direct_ns={d} checksum={d}\n", .{ count, capacity[0], capacity[1], times[0], times[1], hashes[0].final() });
 }

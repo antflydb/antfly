@@ -1342,6 +1342,16 @@ fn PredicateResolver(comptime Set: type) type {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 return if (self.materialized) |*bitmap| bitmap else null;
             }
+            fn probe(self: *@This(), a: A, ordinals: []const u32, allowed: []bool, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !void {
+                var identities = self.resolver.identities;
+                const binding = identities.row_resolver;
+                const direct = self.predicate.sharesCoordinates(binding);
+                if (direct) identities.row_resolver = null;
+                const refs = try identities.physicalRows(a, &self.cache, self.resolver.store, cached, ordinals, if (binding) |bound| bound.source else self.resolver.source.inventory.source_id, if (binding) |bound| bound.snapshot else self.resolver.source.inventory.snapshot_id);
+                if (direct) {
+                    if (!try self.predicate.containsInSpaceMany(binding, refs, allowed)) return error.InvalidNativeLakeRowIndex;
+                } else try self.predicate.containsMany(refs, allowed);
+            }
             fn contains(raw: *anyopaque, a: A, ordinal: u32) anyerror!bool {
                 var allowed: [1]bool = undefined;
                 try containsMany(raw, a, &.{ordinal}, &allowed);
@@ -1361,11 +1371,7 @@ fn PredicateResolver(comptime Set: type) type {
                         defer scratch.deinit();
                         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.resolver.server.lake_read_cache, .scope = self.resolver.store_identity, .context = self.resolver.read_context };
                         const admitted = tile: {
-                            const refs = self.resolver.identities.physicalRows(scratch.allocator(), &self.cache, self.resolver.store, cached, ordinals, self.resolver.source.inventory.source_id, self.resolver.source.inventory.snapshot_id) catch |err| {
-                                if (err == error.OutOfMemory and tile_budget.isExhausted()) break :tile false;
-                                return err;
-                            };
-                            self.predicate.containsMany(refs, allowed) catch |err| {
+                            self.probe(scratch.allocator(), ordinals, allowed, cached) catch |err| {
                                 if (err == error.ArtifactReadBudgetExceeded or err == error.QueryCandidateBudgetExceeded or (err == error.OutOfMemory and tile_budget.isExhausted())) break :tile false;
                                 return err;
                             };
@@ -1407,12 +1413,8 @@ fn PredicateResolver(comptime Set: type) type {
                             const admitted = tile: {
                                 if (!self.predicate.canProbeMembership()) break :tile false;
                                 _ = scratch.reset(.free_all);
-                                const refs = self.resolver.identities.physicalRows(scratch.allocator(), &self.cache, self.resolver.store, cached, ordinals[0..size], self.resolver.source.inventory.source_id, self.resolver.source.inventory.snapshot_id) catch |err| {
-                                    if (err == error.OutOfMemory and tile_budget.isExhausted()) break :tile false;
-                                    return err;
-                                };
                                 var allowed: [128]bool = undefined;
-                                self.predicate.containsMany(refs, allowed[0..size]) catch |err| {
+                                self.probe(scratch.allocator(), ordinals[0..size], allowed[0..size], cached) catch |err| {
                                     if (err == error.ArtifactReadBudgetExceeded or err == error.QueryCandidateBudgetExceeded or (err == error.OutOfMemory and tile_budget.isExhausted())) break :tile false;
                                     return err;
                                 };

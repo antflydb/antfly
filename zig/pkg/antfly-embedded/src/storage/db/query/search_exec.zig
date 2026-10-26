@@ -12318,6 +12318,26 @@ test "external lake ordered producer cost preserves selective native sorting" {
     try std.testing.expect(preferOrderedCandidates(50_000_000, 50_000_000, 10));
 }
 
+/// Bounded read-ahead follows remaining winner demand and the last tile's
+/// selectivity. Sparse or unresolved boundary groups retain vector-sized work.
+const OrderedCandidateDemand = struct {
+    examined: usize = 0,
+    matched: usize = 0,
+    boundary_group: bool = false,
+    fn width(self: @This(), maximum: usize, remaining: usize) usize {
+        if (maximum <= 1) return 1;
+        if (self.boundary_group or (self.examined != 0 and self.matched == 0)) return maximum;
+        const wanted = @max(1, remaining);
+        const estimated = if (self.examined == 0) wanted else std.math.divCeil(usize, wanted *| self.examined, self.matched) catch maximum;
+        return @min(maximum, @max(1, estimated));
+    }
+    fn observe(self: *@This(), allowed: []const bool) void {
+        self.examined = allowed.len;
+        self.matched = 0;
+        for (allowed) |keep| self.matched += @intFromBool(keep);
+    }
+};
+
 fn sortAndPageTextDocValueCandidatesAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -12431,6 +12451,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
     const ordered_scan_budget: usize = if (bitmap != null and !bitmap.?.cardinality_exact) @min(@max(1024, window_capacity *| 64), 65536) else @max(1024, candidate_count);
     var ordered_probes: usize = 0;
     const ordered_tile_capacity: usize = if (bitmap) |membership| if (membership.lazy) |lazy| if (lazy.compound_plan) |program| if (program.has_batch_producer) 16 else 1 else 1 else 1 else 1;
+    var ordered_demand: OrderedCandidateDemand = .{};
     var ordered_tile: [16]u32 = undefined;
     var ordered_allowed: [16]bool = undefined;
     var ordered_complete: [16]bool = undefined;
@@ -12452,7 +12473,8 @@ fn sortAndPageTextDocValueCandidatesAlloc(
                 ordered_tile_at = 0;
                 // A small fixed tile amortizes producer work without expanding
                 // memory or changing the public candidate/decorating budget.
-                while (ordered_tile_len < ordered_tile_capacity) {
+                const tile_width = ordered_demand.width(ordered_tile_capacity, (window_capacity -| window_len) +| 1);
+                while (ordered_tile_len < tile_width) {
                     const next = stream.next(stream.ptr, ordered_scan_budget -| ordered_probes) catch |err| switch (err) {
                         error.OrderedCandidateBudgetExceeded => {
                             if (collect_sort_profile) {
@@ -12479,6 +12501,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
                 if (ordered_tile_capacity == 1) {
                     ordered_allowed[0] = try bitmap.?.contains(ordered_tile[0]);
                 } else try bitmap.?.containsMany(ordered_tile[0..ordered_tile_len], ordered_allowed[0..ordered_tile_len]);
+                ordered_demand.observe(ordered_allowed[0..ordered_tile_len]);
             }
             const doc = ordered_tile[ordered_tile_at];
             ordered_tile_at += 1;
@@ -12533,7 +12556,9 @@ fn sortAndPageTextDocValueCandidatesAlloc(
             var primary_order = effective_req;
             const complete = ordered_complete[ordered_tile_at - 1];
             if (!complete) primary_order.order_by = effective_req.order_by[0 .. effective_req.order_by.len - 1];
-            if (compareDecoratedSortHits(primary_order, decorated, window[0]) == (if (keep_previous_page) std.math.Order.lt else .gt)) {
+            const comparison = compareDecoratedSortHits(primary_order, decorated, window[0]);
+            ordered_demand.boundary_group = !complete and comparison == .eq;
+            if (comparison == (if (keep_previous_page) std.math.Order.lt else .gt)) {
                 decorated.deinit(alloc);
                 decorated_owned = false;
                 break;
@@ -37131,4 +37156,21 @@ test "logical value borrowed compound probes and nullable native ordering preser
         std.debug.print("COMPOUND_NULL_ORDER descending={any} before={any} candidates={d} total_lower_bound={d}\n", .{ descending, before, actual.sort_profile.?.candidate_count, actual.total_hits });
     };
     try std.testing.expectError(error.UnsupportedExactSort, planTextNativeSortFields(.{ .order_by = &.{.{ .field = "price" }} }, writer.snapshot(), testSortedPriceSchema()));
+}
+
+test "producer top k demand sizing caps dense pages and batches sparse boundary groups" {
+    var demand: OrderedCandidateDemand = .{};
+    try std.testing.expectEqual(@as(usize, 2), demand.width(16, 2));
+    demand.observe(&@as([16]bool, @splat(true)));
+    try std.testing.expectEqual(@as(usize, 5), demand.width(16, 5));
+    try std.testing.expectEqual(@as(usize, 1), demand.width(16, 1));
+    demand.observe(&.{ true, false, false, false });
+    try std.testing.expectEqual(@as(usize, 8), demand.width(16, 2));
+    demand.observe(&.{ false, false });
+    try std.testing.expectEqual(@as(usize, 16), demand.width(16, 1));
+    demand.observe(&.{true});
+    demand.boundary_group = true;
+    try std.testing.expectEqual(@as(usize, 16), demand.width(16, 1));
+    try std.testing.expectEqual(@as(usize, 1), demand.width(1, 20));
+    std.debug.print("DEMAND_PREFETCH limit=1 initial_tile=2 dense_remaining=5 sparse_tile=16\n", .{});
 }

@@ -587,6 +587,54 @@ pub const Predicate = struct {
             return err;
         };
     }
+    /// Both readers must carry the exact authenticated coordinate dictionary
+    /// and row map. Cut labels alone, or an absent witness, grant no shortcut.
+    pub fn sharesCoordinates(self: Predicate, target: ?local.serverless_query_lake_serving.ServingSource.RowResolver) bool {
+        if (self.scan) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        const left = owner.row_resolver orelse return target == null;
+        const right = target orelse return !left.relocated;
+        if (left.coordinate_space) |space| if (right.coordinate_space) |other| return std.mem.eql(u8, &space, &other);
+        return false;
+    }
+    fn rebaseSharedCoordinates(self: Predicate, a: A, source: ?local.serverless_query_lake_serving.ServingSource.RowResolver, refs: []const local.storage_rowsource_types.RowRef) !?[]const local.storage_rowsource_types.RowRef {
+        if (!self.sharesCoordinates(source)) return null;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        const source_id = if (source) |binding| binding.source else owner.reader.root.source;
+        const snapshot_id = if (source) |binding| binding.snapshot else owner.reader.root.snapshot;
+        // Rebinding labels is permitted only after the map/dictionary proof.
+        // Validate the incoming index cut before using the target reader's cut.
+        for (refs) |ref| {
+            if (ref != .external) return error.InvalidNativeLakeRowIndex;
+            if (!std.mem.eql(u8, ref.external.source_id, source_id) or !std.mem.eql(u8, ref.external.snapshot_id, snapshot_id)) return error.ExternalLakeSnapshotMismatch;
+        }
+        const result = try a.dupe(local.storage_rowsource_types.RowRef, refs);
+        for (result) |*ref| {
+            ref.external.source_id = owner.reader.root.source;
+            ref.external.snapshot_id = owner.reader.root.snapshot;
+        }
+        return result;
+    }
+    /// Probe original index coordinates directly when their exact proof agrees.
+    /// A decline leaves output untouched and retains ordinary source translation.
+    pub fn containsInSpaceMany(self: *Predicate, source: ?local.serverless_query_lake_serving.ServingSource.RowResolver, refs: []const local.storage_rowsource_types.RowRef, output: []bool) !bool {
+        if (refs.len != output.len or refs.len > 128) return error.InvalidNativeLakeRowIndex;
+        if (!self.sharesCoordinates(source)) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        var workspace: local.sql_memory_budget = .{ .backing = owner.a, .limit = 4 * 1024 * 1024 };
+        var scratch = std.heap.ArenaAllocator.init(workspace.allocator());
+        defer scratch.deinit();
+        const rebased = (self.rebaseSharedCoordinates(scratch.allocator(), source, refs) catch |err| {
+            if (err == error.OutOfMemory and workspace.isExhausted()) return error.QueryCandidateBudgetExceeded;
+            return err;
+        }).?;
+        owner.reader.containsPhysicalMany(scratch.allocator(), rebased, owner.predicate_lower, owner.predicate_upper, output) catch |err| {
+            if (err == error.OutOfMemory and workspace.isExhausted()) return error.QueryCandidateBudgetExceeded;
+            return err;
+        };
+        return true;
+    }
     pub fn intersectsPhysical(self: *Predicate, first: local.storage_rowsource_types.RowRef, last: local.storage_rowsource_types.RowRef) !?bool {
         if (self.scan) return null;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -604,11 +652,7 @@ pub const Predicate = struct {
     pub fn blocksMatch(self: Predicate, target: ?local.serverless_query_lake_serving.ServingSource.RowResolver) bool {
         if (self.scan) return false;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
-        if (owner.reader.root.predicates == null) return false;
-        const left = owner.row_resolver orelse return target == null;
-        const right = target orelse return !left.relocated;
-        if (left.coordinate_space) |space| if (right.coordinate_space) |other| return std.mem.eql(u8, &space, &other);
-        return false;
+        return owner.reader.root.predicates != null and self.sharesCoordinates(target);
     }
     pub fn nextBlocks(self: *Predicate, a: A) ![]const ordered.predicate_blocks.Block {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -2412,4 +2456,50 @@ test "external lake covering waves overlap cold blocks retain admission and join
         wave.deinit();
         try std.testing.expectEqual(before, scheduler.pull_bytes);
     }
+}
+
+test "external lake direct metadata probes require exact maps and validate source cuts" {
+    const a = std.testing.allocator;
+    const Resolver = local.serverless_query_lake_serving.ServingSource.RowResolver;
+    const RowRef = local.storage_rowsource_types.RowRef;
+    var owner: Owner = undefined;
+    owner.reader.root.source = "metadata-native";
+    owner.reader.root.snapshot = "metadata-cut";
+    var target: Resolver = undefined;
+    target.relocated = true;
+    target.coordinate_space = @splat(7);
+    target.source = "metadata-native";
+    target.snapshot = "metadata-cut";
+    owner.row_resolver = target;
+    var source = target;
+    source.source = "text-native";
+    source.snapshot = "text-cut";
+    var predicate: Predicate = .{ .cursor = .{ .ptr = &owner, .next = undefined, .close = undefined } };
+    const refs = [_]RowRef{.{ .external = .{ .source_id = source.source, .snapshot_id = source.snapshot, .file_id = "fragment", .row_group_ordinal = 9, .row_ordinal = (1 << 40) + 7 } }};
+    const rebased = (try predicate.rebaseSharedCoordinates(a, source, &refs)).?;
+    defer a.free(rebased);
+    try std.testing.expectEqualStrings("metadata-native", rebased[0].external.source_id);
+    try std.testing.expectEqualStrings("metadata-cut", rebased[0].external.snapshot_id);
+    try std.testing.expectEqualStrings(refs[0].external.file_id, rebased[0].external.file_id);
+    try std.testing.expectEqual(refs[0].external.row_ordinal, rebased[0].external.row_ordinal);
+    try std.testing.expectEqual(refs[0].external.row_group_ordinal, rebased[0].external.row_group_ordinal);
+    var wrong_cut = refs;
+    wrong_cut[0].external.snapshot_id = "unrelated-cut";
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, predicate.rebaseSharedCoordinates(a, source, &wrong_cut));
+    var other = source;
+    other.coordinate_space = @splat(8);
+    try std.testing.expect((try predicate.rebaseSharedCoordinates(a, other, &refs)) == null);
+    var allowed = [_]bool{true};
+    try std.testing.expect(!try predicate.containsInSpaceMany(other, &refs, &allowed));
+    try std.testing.expect(allowed[0]);
+    other.coordinate_space = null;
+    try std.testing.expect(!predicate.sharesCoordinates(other));
+    const Fault = struct {
+        fn run(out: A, value: Predicate, binding: Resolver, input: []const RowRef) !void {
+            const result = (try value.rebaseSharedCoordinates(out, binding, input)).?;
+            defer out.free(result);
+            try std.testing.expectEqual(input.len, result.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fault.run, .{ predicate, source, &refs });
 }
