@@ -423,3 +423,30 @@ protocol 88 / text metadata v16 fence the new writers. The field-level
 `nulls_ordered` option preserves the `missing_rejected` default. The candidate
 includes the main merge; concurrent local Debug timings do not isolate latency
 attribution or qualify cloud transport, empty-cache searches, or archive throughput.
+
+
+The [interval/probe/capture observation](native-interval-probes-capture-v3-observation.json)
+records protocol 89 / text metadata v17 qualification and the final clean-source
+executable. Forty layouts publish with a 52-byte aggregate under the 256-byte
+limit. Deep cursor checks exclude 255–256 obsolete ranges, including three whole
+subtrees, while retaining an overlapping interval and public-ID ties. Candidate
+metadata membership uses seven exact point checks across two segment bases
+without materializing a segment bitmap.
+
+The documented 8,193-row, 129-block, 16-fragment ordering scenario now performs
+zero payload decodes, versus the previous documented 144. Compact keys are
+captured during verification under the existing private memory/spill quotas;
+extra narrow key writes replace repeated wide payload reads. The same four
+real-Parquet controls preserve all 48 normalized baseline/candidate answers and
+21 decorations per query. The record retains publication intervals and timings
+without attributing a latency gain under concurrent Debug validation. Real cloud
+transport and full-archive execution remain separate qualifications.
+
+
+All 37 E2Es pass on the final executable frozen from clean source `80fe9777a5`
+in 849.51 seconds, including real Parquet/Iceberg lifecycles and ordered logical
+identity reuse through rewrites, updates, deletes and restart. Forty-eight new
+integer/timestamp feature samples retain 21–22 ordered candidates out of 4,096
+rows. Eighteen archive tooling tests, stable control/error catalog checks, format
+checks and embedded/Apache boundary audits (1,014 / 2,486 sources) pass. Main
+`9d152a4c78` is merged; repeated final fetch/merge checks report up to date.

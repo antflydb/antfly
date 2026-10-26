@@ -3912,3 +3912,10 @@ candidates and shares the producer's existing adaptive work budget. Once probing
 loses, the producer materializes complete compressed membership; exact counts,
 unsupported leaves and unproved visibility retain the existing bitmap executor.
 Candidate-local answers never become complete coverage metadata.
+
+Deferred lineage is a compact representation, not an empty row set. When the
+adaptive planner selects complete compressed membership, block translation and
+residual physical selections resolve the admitted window's authenticated inverse
+map through the existing bounded cache. Point probes retain their paged path.
+Segment membership receives its already computed document base, avoiding a prefix
+walk for every newly opened probe in a fragmented snapshot.

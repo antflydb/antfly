@@ -6138,3 +6138,37 @@ conflicted keyword values must never become certified NULLs, metadata probes mus
 avoid segment materialization for small Top-K, and complete-capture ordering must
 perform zero payload decodes. Measure operation counts independently from wall
 clock timings; representative cloud and full-archive qualification remain separate.
+
+
+The [qualification record](bench/lake/native-interval-probes-capture-v3-observation.json)
+pins clean production source `80fe9777a5`, executable and input hashes. Forty
+layouts publish with 52-byte summaries. A 512-range cursor regression skips
+255–256 ranges and three complete child subtrees in each direction, preserves an
+overlapping [0,1000] interval at cursor 600, and retains primary-key ties. Five
+candidate probes plus two offset checks do not materialize segment membership.
+The existing 8,193-row scattered capture scenario drops ordering payload decodes
+from the documented 144 to zero, with 129 payload blocks and 16 fragments.
+
+The full integration contracts pass (516 server / 237 embedded). The later
+fallback regression passes with 90 server / 26 embedded frontier contracts.
+Final source passes 79 embedded Top-K contracts (one declared skip), 32 server
+Top-K contracts and 83 logical-query contracts (one declared skip). Reader/composed
+and shared query gates pass 67 and 171 contracts. Source-free selected-field
+projections withdraw nullable proofs; exact historical witnesses, including
+selected indexes, require the existing private rebuild. The upgrade fixture waits
+for indexing before directly mutating historical state, preventing a writer-lock
+race with its live producer.
+
+All 48 local before/after control samples retain identical complete answers and
+independently expected IDs. Timings and initial publication intervals remain
+observational; this includes the main merge and concurrent validation, and does
+not qualify cloud transport or full-archive throughput.
+
+
+All 37 E2Es pass on the final executable frozen from clean source `80fe9777a5`
+in 849.51 seconds, including real Parquet/Iceberg lifecycles and ordered logical
+identity reuse through rewrites, updates, deletes and restart. Forty-eight new
+integer/timestamp feature samples retain 21–22 ordered candidates out of 4,096
+rows. Eighteen archive tooling tests, stable control/error catalog checks, format
+checks and embedded/Apache boundary audits (1,014 / 2,486 sources) pass. Main
+`9d152a4c78` is merged; repeated final fetch/merge checks report up to date.

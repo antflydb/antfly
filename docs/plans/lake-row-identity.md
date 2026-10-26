@@ -1644,7 +1644,8 @@ scalar, a multivalued field, or a conflicted typed column. Virtual fields resolv
 their actual source path before producing a navigation tuple. Invalid tuples
 withdraw physical ordering and nullable completeness; ordinary text indexing
 continues, and an exact sort rejects missing coverage. Local projection provenance
-fences prior nullable sort witnesses and uses the existing leader-owned private
+fences prior nullable sort witnesses, including those from selected-field indexes
+that omit the table sort columns, and uses the existing leader-owned private
 replacement workflow. Remote text recipe v2 likewise rebuilds affected sorted
 payloads instead of adopting a possibly false completeness witness.
 
@@ -1656,3 +1657,11 @@ ordering reads these narrow keys by logical ID and persists them with the actual
 ordering-input version. It no longer decodes payload blocks independently for
 each hash fragment. Missing or oversized tuples conservatively retain ordinary
 ordering fallback. Incremental refresh continues to verify retained key versions.
+
+The emitted typed projection owns scalar values and conflicts, including literal
+dotted field names. Raw source inspection only certifies genuine missing/null
+values; it cannot override an ambiguous or unsupported projection. Unsupported
+exact sorting keeps the public `422 unsupported_exact_sort` contract across the
+compiled runtime boundary. Shared-scan capture adds narrow temporary key writes
+under the existing quota in exchange for eliminating repeated wide payload
+reads; local qualification measures those operations separately from latency.
