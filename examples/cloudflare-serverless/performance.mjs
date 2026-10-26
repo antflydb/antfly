@@ -38,3 +38,7 @@ export function countMetadataRpc(counters,request){
  const kind=/\/wal-v1\//.test(request?.key??"")?"WAL_HEAD":match?.[1].split("/")[0]??"OTHER";
  counters.metadata_by_op??={};const label=`${request?.op??"unknown"}:${kind}`;counters.metadata_by_op[label]=(counters.metadata_by_op[label]??0)+1;
 }
+
+// Lease expiry retires the failed lane; a new request can acquire fresh rights.
+// Return backpressure without replaying an operation or hiding resource errors.
+export function retryableRuntimeFailure(error){return /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited|CoordinatorRecovering|ImmutableLogFenced|CoordinatorMigrationRequired|CoordinatorMigrationFrozen|CoordinatorCommitBusy|CoordinatorIoBudgetExceeded|PublicationExecutionBudgetExceeded|ManifestReadLeaseExpired|DeadlineExceeded|Canceled|WalCommitContended|WorkLeaseLost|10058)\b/.test(String(error));}

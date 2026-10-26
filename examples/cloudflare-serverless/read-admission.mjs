@@ -25,7 +25,7 @@ export async function prepareReadAdmission(env,input,trace,readViews){
   let view;
   if(readViews&&env.READ_ONLY_SNAPSHOTS!=="false"){
    try{view=await trace.span("native:openReadView",()=>readViews.open(options));physical.native_metadata_views=1;}
-   catch(error){if(!/^(ReadSnapshotNeeds(?:Admission|Pin)|CoordinatorAuthorityMissing)$/.test(error?.message))throw error;}
+   catch(error){if(!/^(ReadSnapshotNeeds(?:Admission|Pin)|CoordinatorAuthorityMissing|CoordinatorRecovering)$/.test(error?.message))throw error;}
   }
   if(!view){physical.rpc_calls++;view=await trace.span("rpc:openReadView",()=>env.COMMITS.getByName(env.ANTFLY_INCARNATION).openReadView(options));}
   physical.read_admission_immutable_hints=view.immutable?.length??0;

@@ -19,7 +19,7 @@ import { ObjectStoreError } from "./r2.mjs";
 import { validatePutBatch, executePutBatch } from "./batch.mjs";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now } = {}) {
+export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now, refreshClock = () => new Promise(resolve => setTimeout(resolve, 0)) } = {}) {
   if (!(module instanceof WebAssembly.Module)) throw new TypeError("a precompiled WebAssembly.Module is required");
   if (!Number.isSafeInteger(stackBytes) || stackBytes < 4096 || stackBytes > 8 * 1024 * 1024) throw new TypeError("invalid suspension stack size");
   let wasm, pending, completed, activeTransport, activeOptions, operations, inferenceCalls, transferred, busy = false, poisoned = false;
@@ -115,10 +115,22 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
     activeTransport = requestTransport;
     activeOptions = { signal, deadlineMs, maxOperations, maxTransferBytes, inference };
     operations = 0; inferenceCalls = 0; transferred = 0;
-    let requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0;
+    let requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0, clockRefreshes = 0, clockRegressionMs = 0;
     const started = performance.now();
     const manifestCacheHitsBefore=Number(wasm.antfly_host_manifest_cache_hits?.()??0);
     try {
+      // Workers freeze timers in an I/O context. A pooled host may next run in
+      // an older context, even though no wall clock rolled back. Refresh that
+      // context with a timer event BEFORE entering native code or consulting
+      // cached leases. Never clamp time or reset the host's high-water mark:
+      // a regression still present after fresh I/O fails closed as before.
+      const admissionWall = clock();
+      if (admissionWall < lastWall) {
+        clockRegressionMs = lastWall - admissionWall;
+        clockRefreshes++;
+        try { await refreshClock(); } catch (error) { invalidClock = true; throw error; }
+        if (clock() < lastWall) invalidClock = true;
+      }
       requestPtr = allocate(input);
       while (true) {
         const result = wasm.antfly_host_request(requestPtr, input.byteLength);
@@ -169,7 +181,7 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
       activeTransport = null;
       activeOptions = null;
       busy = false;
-      const metrics = Object.freeze({outcome, failure_code: failureCode, clock_valid: !invalidClock, operations, inference_calls: inferenceCalls,
+      const metrics = Object.freeze({outcome, failure_code: failureCode, clock_valid: !invalidClock, clock_refreshes: clockRefreshes, clock_regression_ms: clockRegressionMs, operations, inference_calls: inferenceCalls,
         transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs,
         wasm_linear_bytes: wasm.memory.buffer.byteLength,
         decoded_manifest_cache_hits: Number(wasm.antfly_host_manifest_cache_hits?.() ?? 0)-manifestCacheHitsBefore,

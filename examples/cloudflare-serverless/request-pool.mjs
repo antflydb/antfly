@@ -27,14 +27,18 @@ export class RequestPool {
   if(typeof job.recycleBytes!=="number"||Number.isNaN(job.recycleBytes)||job.recycleBytes<0)return Promise.reject(Error("InvalidKernelRecycleBudget"));
   if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))return Promise.reject(new Error("DeadlineExceeded"));
   if(this.pending.length>=this.maxQueued)return Promise.reject(new Error("CoordinatorCommitBusy"));
-  return new Promise((resolve,reject)=>{
-   Object.assign(job,{resolve,reject,queuedAt:performance.now(),admittedAt:this.clock()});let timer;
+  const admitted=new Promise((resolve,reject)=>{
+   Object.assign(job,{admit:resolve,reject,queuedAt:performance.now(),admittedAt:this.clock()});let timer;
    const abort=()=>{const index=this.pending.indexOf(job);if(index<0)return;this.pending.splice(index,1);job.cleanup();reject(new Error("DeadlineExceeded"));this.drain();};
    job.cleanup=()=>{job.options.signal?.removeEventListener("abort",abort);clearTimeout(timer);};
    job.options.signal?.addEventListener("abort",abort,{once:true});
    if(Number.isFinite(job.options.deadlineMs))timer=setTimeout(abort,Math.max(1,job.options.deadlineMs-this.clock()));
    this.pending.push(job);this.drain();
   });
+  // Register the continuation in the submitting request's I/O context. The
+  // request releasing a slot only resolves admission; it must never execute
+  // another Durable Object's callback or create its timers/transport promises.
+  return admitted.then(slot=>this.execute(slot,job));
  }
  drain(){while(this.pending.length){
   const idle=this.slots.filter(slot=>!slot.busy);if(!idle.length)return;
@@ -57,15 +61,14 @@ export class RequestPool {
    if(retained-(slot.host?slot.hostReservationBytes??0:0)+job.reservationBytes<=this.maxReservedBytes)break;
    if(other!==slot&&!other.busy)other.host=null;
   }
-  this.reservedBytes+=job.reservationBytes;slot.activeReservationBytes=job.reservationBytes;slot.busy=true;this.execute(slot,job);
+  this.reservedBytes+=job.reservationBytes;slot.activeReservationBytes=job.reservationBytes;slot.busy=true;job.admit(slot);
  }}
 
  async execute(slot,job){
   job.cleanup();
   const stage=(name,start)=>{try{job.options.onStage?.({name,duration_ms:performance.now()-start});}catch{}};
   stage("kernel_queue",job.queuedAt);
-  try{await new Promise(resolve=>setTimeout(resolve,0));if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");if(!slot.host){const start=performance.now();slot.host=await this.create(job);slot.hostKey=job.hostKey;slot.hostReservationBytes=job.reservationBytes;stage("wasm_instantiate",start);}if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");job.resolve(await (job.run?job.run(slot.host):slot.host.request(job.input,job.options)));}
-  catch(error){job.reject(error);}
+  try{await new Promise(resolve=>setTimeout(resolve,0));if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");if(!slot.host){const start=performance.now();slot.host=await this.create(job);slot.hostKey=job.hostKey;slot.hostReservationBytes=job.reservationBytes;stage("wasm_instantiate",start);}if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");return await (job.run?job.run(slot.host):slot.host.request(job.input,job.options));}
   finally{if(slot.host&&(!slot.host.usable()||slot.host.memoryBytes()>=job.recycleBytes))slot.host=null;this.reservedBytes-=job.reservationBytes;slot.activeReservationBytes=0;slot.busy=false;this.drain();}
  }
  memoryBytes(){return this.slots.reduce((n,slot)=>n+(slot.host?.memoryBytes()??0),0);}

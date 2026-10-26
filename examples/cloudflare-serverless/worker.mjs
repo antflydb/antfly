@@ -21,7 +21,7 @@ import {tenantEnv,tenantEnvs} from "./tenants.mjs";
 import {managedMaintenance} from "./maintenance-tickets.mjs";
 import {createRuntime,Busy} from "./runtime.mjs";
 import {runtimeName,readerSlots,readerSlot} from "./runtime-routing.mjs";
-import {unsupportedRpc} from "./performance.mjs";
+import {unsupportedRpc,retryableRuntimeFailure} from "./performance.mjs";
 import {collect} from "./collect.mjs";
 import {pruneEmbeddingCheckpoints} from "./embedding-checkpoints.mjs";
 export {configureKernels} from "./kernels.mjs";
@@ -147,7 +147,7 @@ export default {
       return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
     } catch (error) {
       trace.error("http",error);
-      const retryable = error instanceof Busy || /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited|CoordinatorRecovering|ImmutableLogFenced|CoordinatorMigrationRequired|CoordinatorMigrationFrozen|CoordinatorCommitBusy|CoordinatorIoBudgetExceeded|PublicationExecutionBudgetExceeded|DeadlineExceeded|Canceled|WalCommitContended|WorkLeaseLost|10058)\b/.test(String(error));
+      const retryable = error instanceof Busy || retryableRuntimeFailure(error);
       return Response.json({ error: String(error.message ?? error) }, { status: retryable ? 503 : 409,
         headers: retryable ? { "Retry-After": "1" } : undefined });
     } finally {ingress.release();admitted--;trace.emit(env.LOG_METRICS==="true");}

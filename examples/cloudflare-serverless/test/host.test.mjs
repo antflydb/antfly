@@ -916,3 +916,17 @@ test("immutable write-through admits only successful conditional uploads and pre
  cache.clear();const mutable={...put,key:'scope/progress/HEAD'};await transport(mutable,Uint8Array.of(5));await transport({...get,key:mutable.key});await transport({...get,key:mutable.key});assert.equal(gets,4);
  cache.clear();await transport(put,new Uint8Array(8192));await transport(get);assert.equal(gets,5);assert.ok(cache.retainedBytes()<=4096);
 });
+
+
+test("pooled host refreshes an older I/O context before native entry without extending a rolled-back clock",async()=>{
+ let now=10000,refreshes=0;
+ const bucket=new Bucket(),host=(await setup(bucket,undefined,{clock:()=>now,refreshClock:async()=>{refreshes++;now=10001;}})).host;
+ const mutation=request("mutate",{operation_id:"stale-context",mutations:[{kind:"upsert",doc_id:"a",body:'{"text":"context refresh"}'}]});
+ const accepted=await host.request(mutation);await host.request(request("publish"));
+ now=9999;const samples=[];assert.equal((await host.request(request("count",{required_visibility:accepted.visibility}),{onMetrics:m=>samples.push(m)})).count,"1");
+ assert.equal(refreshes,1);assert.equal(samples[0].clock_refreshes,1);assert.equal(samples[0].clock_regression_ms,1);assert.equal(samples[0].clock_valid,true);assert.equal(host.usable(),true);
+ assert.equal((await host.request(mutation)).visibility,accepted.visibility);assert.equal(refreshes,1);
+ const failed=(await setup(bucket,undefined,{clock:()=>now,refreshClock:async()=>{throw Error("clock refresh failed");}})).host;
+ await failed.request(request("count"));now--;
+ await assert.rejects(failed.request(request("count")),/clock refresh failed/);assert.equal(failed.usable(),false);
+});

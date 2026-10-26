@@ -378,20 +378,20 @@ test("native reader views authenticate local metadata without writer ownership o
  const env={DATABASE:bucket,ANTFLY_INCARNATION:'direct-reader'},keys=await metadataKeys(env.ANTFLY_INCARNATION),writer=new R2CoordinatorStore(module,bucket,env.ANTFLY_INCARNATION);
  await openAuthority(env,'r2');await writer.transaction(tx=>{tx.put(keys.head,record('7'));tx.put(keys.progress+'READ_PINS/7',record(String(BigInt(Date.now()+600000)*1000000n)));});
  const pool=new RequestPool(job=>instantiateHost(job.hostKey==='observe'?observe:module,null),4,{maxReservedBytes:32*1024*1024,reservationBytes:16*1024*1024,recycleBytes:12*1024*1024}),views=new NativeReadViews(observe,env,{kernel:pool}),writes=bucket.writes;
- views.authority=Promise.resolve({descriptor:{mode:'sqlite'}});await assert.rejects(views.open(),/CoordinatorMigrationRequired/);assert.equal(views.authority,null);
+ views.authorityAdmission.value={descriptor:{mode:'sqlite'}};await assert.rejects(views.open(),/CoordinatorMigrationRequired/);assert.equal(views.authorityAdmission.value,null);
  const results=await Promise.all(Array.from({length:8},()=>views.open()));assert.ok(results.every(v=>v.version==='7'));assert.equal(bucket.writes,writes);assert.equal(views.store.acquired,false);assert.equal(views.store.state,null);assert.ok(pool.memoryBytes()<=32*1024*1024);
  const replacement=new R2CoordinatorStore(module,bucket,env.ANTFLY_INCARNATION);await replacement.transaction(tx=>{tx.put(keys.head,record('8'));tx.put(keys.progress+'READ_PINS/8',record(String(BigInt(Date.now()+600000)*1000000n)));});assert.equal((await views.open()).version,'8');await assert.rejects(writer.readOnly(tx=>tx.get(keys.head)),/ImmutableLogFenced/);
  await replacement.transaction(tx=>tx.put('__antfly_r2_import',{phase:'freeze'}));await assert.rejects(views.open(),/CoordinatorMigrationRequired/);await replacement.transaction(tx=>tx.put('__antfly_r2_import',{phase:'active'}));assert.equal((await views.open()).version,'8');
  views.store.observedState.root='forged';await assert.rejects(views.open(),/InvalidImmutableLog/);
 });
 
-test("local read admission falls back only for a required durable pin or missing authority",async()=>{
+test("local read admission falls back only for pin admission or unavailable authority",async()=>{
  const{prepareReadAdmission}=await import('../read-admission.mjs'),{CriticalPath}=await import('../trace.mjs');let rpc=0,local=0;const view={format:1,version:'7',entries:[]},env={COORDINATOR_BACKEND:'r2',ANTFLY_INCARNATION:'local',COMMITS:{getByName:()=>({openReadView:async()=>{rpc++;return view;}})}};
- for(const message of['ReadSnapshotNeedsPin','ReadSnapshotNeedsAdmission','CoordinatorAuthorityMissing']){
+ for(const message of['ReadSnapshotNeedsPin','ReadSnapshotNeedsAdmission','CoordinatorAuthorityMissing','CoordinatorRecovering']){
   const admitted=await prepareReadAdmission(env,{op:'lookup'},new CriticalPath(),{open:async()=>{local++;throw Error(message);}});assert.equal(admitted.view,view);assert.equal(admitted.physical.rpc_calls,1);
  }
- const admitted=await prepareReadAdmission(env,{op:'lookup'},new CriticalPath(),{open:async()=>{local++;return view;}});assert.equal(admitted.physical.rpc_calls,0);assert.equal(admitted.physical.native_metadata_views,1);assert.equal(rpc,3);
- for(const message of['InvalidImmutableLog','ImmutableLogFenced','CoordinatorMigrationRequired','ObjectStoreTransportFailed','OutOfMemory'])await assert.rejects(prepareReadAdmission(env,{op:'lookup'},new CriticalPath(),{open:async()=>{throw Error(message);}}),new RegExp(message));assert.equal(rpc,3);assert.equal(local,4);
+ const admitted=await prepareReadAdmission(env,{op:'lookup'},new CriticalPath(),{open:async()=>{local++;return view;}});assert.equal(admitted.physical.rpc_calls,0);assert.equal(admitted.physical.native_metadata_views,1);assert.equal(rpc,4);
+ for(const message of['InvalidImmutableLog','ImmutableLogFenced','CoordinatorMigrationRequired','ObjectStoreTransportFailed','OutOfMemory'])await assert.rejects(prepareReadAdmission(env,{op:'lookup'},new CriticalPath(),{open:async()=>{throw Error(message);}}),new RegExp(message));assert.equal(rpc,4);assert.equal(local,5);
 });
 
 test("read-only authority checks never initialize a missing database",async()=>{
@@ -489,4 +489,32 @@ test("runtime placement separates compute generations from R2 identities and com
  for(const bad of [{RUNTIME_GENERATION:undefined},{R2_LOCATION_HINT:"unknown"},{RUNTIME_GENERATION:""},{COORDINATOR_BACKEND:"sqlite"}])assert.throws(()=>placementEnv({...root,...bad}),/InvalidRuntimePlacement/);
  assert.throws(()=>placementEnv({...placed,RUNTIME_GENERATION:"two"}),/RuntimePlacementAlreadyConfigured/);
  const none={COMMITS:binding};assert.equal(placementEnv(none),none);
+});
+
+
+test("queued kernel work resumes in its submitting context rather than the releasing actor",async()=>{
+ const{AsyncLocalStorage}=await import('node:async_hooks'),{RequestPool}=await import('../request-pool.mjs'),context=new AsyncLocalStorage(),seen=[];let release,entered;
+ const started=new Promise(resolve=>entered=resolve),held=new Promise(resolve=>release=resolve),pool=new RequestPool(async()=>({usable:()=>true,memoryBytes:()=>0}),1);
+ const first=context.run('actor-a',()=>pool.withHost(async()=>{seen.push(context.getStore());entered();await held;seen.push(context.getStore());return'a';}));await started;
+ const second=context.run('actor-b',()=>pool.withHost(async()=>{seen.push(context.getStore());await new Promise(resolve=>setTimeout(resolve,0));seen.push(context.getStore());return'b';}));
+ const third=context.run('actor-c',()=>pool.withHost(async()=>{seen.push(context.getStore());throw Error('caller-c');}));
+ release();assert.deepEqual(await Promise.all([first,second]),['a','b']);await assert.rejects(third,/caller-c/);
+ assert.deepEqual(seen,['actor-a','actor-a','actor-b','actor-b','actor-c']);assert.equal(pool.reservedBytes,0);assert.equal(pool.slots[0].busy,false);
+});
+
+
+test("expired read leases return recoverable admission without reclassifying corruption or opaque platform failures",async()=>{
+ const{retryableRuntimeFailure}=await import('../performance.mjs');
+ for(const message of ['ManifestReadLeaseExpired','DeadlineExceeded','WorkLeaseLost','ImmutableLogFenced'])assert.equal(retryableRuntimeFailure(Error(message)),true);
+ for(const message of ['InvalidImmutableLog','ManifestVersionRetired','OutOfMemory','internal error; reference = opaque','InvalidDocumentFactsRoot'])assert.equal(retryableRuntimeFailure(Error(message)),false);
+});
+
+
+test("authority admission bounds pending callers and detaches timeouts while one slow load recovers",async()=>{
+ const{AuthorityAdmission}=await import('../authority-admission.mjs');let release,calls=0;const held=new Promise(resolve=>release=resolve),admission=new AuthorityAdmission(()=>{calls++;return held;},{timeoutMs:10,maxWaiters:2});
+ const first=admission.get(),second=admission.get();await assert.rejects(admission.get(),/CoordinatorCommitBusy/);
+ const expired=await Promise.allSettled([first,second]);assert.ok(expired.every(r=>r.status==='rejected'&&r.reason.message==='CoordinatorRecovering'));assert.equal(admission.waiters.size,0);assert.equal(calls,1);
+ for(let i=0;i<3;i++){await assert.rejects(admission.get(),/CoordinatorRecovering/);assert.equal(admission.waiters.size,0);assert.equal(calls,1);}
+ const pending=admission.get(),authority={descriptor:{mode:'r2'}};release(authority);assert.equal(await pending,authority);assert.equal(await admission.get(),authority);assert.equal(admission.waiters.size,0);assert.equal(calls,1);
+ let attempts=0;const retry=new AuthorityAdmission(async()=>{if(++attempts===1)throw Error('CoordinatorAuthorityInvalid');return authority;});await assert.rejects(retry.get(),/CoordinatorAuthorityInvalid/);assert.equal(await retry.get(),authority);assert.equal(attempts,2);
 });

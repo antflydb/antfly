@@ -35,6 +35,7 @@ import {withCommitCoordinator} from "../../zig/lib/objectstore/wasm/coordinated.
 import {openAuthority, activateR2} from "./coordinator-authority.mjs";
 import {DurableObject} from "cloudflare:workers";
 import module from "./dist/antfly-serverless.wasm";
+import {AuthorityAdmission} from "./authority-admission.mjs";
 import {placementEnv} from "./runtime-placement.mjs";
 import {R2CoordinatorStore} from "./r2-coordinator-store.mjs";
 import {migrateCoordinator, MIGRATION} from "./r2-coordinator-migration.mjs";
@@ -54,8 +55,9 @@ export class R2CommitCoordinator extends DurableObject {
     this.publication=new PublicationScheduler(this.maintenanceStore,env.ANTFLY_INCARNATION);
     this.maintenance=new MaintenanceTickets(this.maintenanceStore);
     this.journal = new R2CollectionJournal(this.maintenanceStore);
-    ctx.blockConcurrencyWhile(async () => {this.authority = await openAuthority(env, "r2");});
+    this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,"r2"));
   }
+  async ensureAuthority(){if(!this.authority){const authority=await this.authorityAdmission.get();this.authority??=authority;}return this.authority;}
   requestMaintenance(kind,jobId){return this.maintenance.request(kind,jobId);}
   validMaintenance(kind,ticket,jobId){return this.maintenance.valid(kind,ticket,jobId);}
   advanceMaintenance(kind,ticket,jobId){return this.maintenance.advance(kind,ticket,jobId);}
@@ -67,7 +69,8 @@ export class R2CommitCoordinator extends DurableObject {
   finishPublication(id,watermark){return this.publication.finish(id,watermark);}
   openReadView(options={}) {
     this.readAdmissions??=new FreshReadAdmissions({delayMs:Number(this.env.READ_VIEW_BATCH_MS??2)});
-    return this.readAdmissions.run(options.version??"latest",traceIds=>{
+    return this.readAdmissions.run(options.version??"latest",async traceIds=>{
+      await this.ensureAuthority();
       const capture=async tx=>{
         const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
         const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor]);
@@ -119,7 +122,8 @@ export class R2CommitCoordinator extends DurableObject {
     return result;
   }
   abortPublication(lease){return this.transaction(tx=>this.nativePublication(tx,"publication_release",lease),{priority:"maintenance"});}
-  transaction(run,options) {
+  async transaction(run,options) {
+    await this.ensureAuthority();
     return this.store.transaction(async tx => {
       const migration = await tx.get(MIGRATION);
       if ((migration && migration.phase !== "active") || (this.env.COORDINATOR_MIGRATION_REQUIRED === "true" && !migration) || this.authority.descriptor.mode !== "r2") throw new Error("CoordinatorMigrationRequired");
@@ -127,11 +131,13 @@ export class R2CommitCoordinator extends DurableObject {
     },options);
   }
   async migrationStatus() {
+    await this.ensureAuthority();
     const state = await this.store.transaction(async tx => await tx.get(MIGRATION) ?? {phase:"none"});
     if (state.phase === "none" && this.env.LEGACY_COMMITS && await this.env.LEGACY_COMMITS.getByName(this.env.ANTFLY_INCARNATION).frozenR2Status()) return {phase:"freeze"};
     return state.phase === "active" && this.authority.descriptor.mode !== "r2" ? {...state,phase:"cutover"} : state;
   }
   async migrateFromSqlite() {
+    await this.ensureAuthority();
     if (!this.env.LEGACY_COMMITS || this.env.COORDINATOR_MIGRATION_REQUIRED !== "true") throw new Error("CoordinatorMigrationNotConfigured");
     const result = await migrateCoordinator(this.store, this.env.LEGACY_COMMITS.getByName(this.env.ANTFLY_INCARNATION), this.env.ANTFLY_INCARNATION);
     if (result.done) {

@@ -798,3 +798,44 @@ exhaustion, and diagnostics do not change retries or accepted write outcomes.
 Cloudflare's [error handling guidance](https://developers.cloudflare.com/durable-objects/best-practices/error-handling/)
 requires distinguishing overload from retryable idempotent operations and
 recreating a broken stub; an opaque internal error is not blindly replayed.
+
+
+## Originating request contexts and authority admission
+
+A module-level pool may share a memory ledger across colocated Durable Objects,
+but its scheduler must not execute a queued callback in the context of the actor
+that released a slot. Admission now resolves a slot promise; a continuation
+registered by the submitting request performs the native call, creates its timers
+and starts transport I/O. The memory reservation remains held from admission
+until execution finishes. A regression reproduces the previous behavior with
+async-local contexts, and a persisted Worker check verifies context labels across
+queued calls and actual R2 I/O in three Durable Objects.
+
+The WASM host keeps its clock high-water mark across uses. If a new request
+observes an older timestamp, it performs one timer I/O refresh before entering
+native code. It never clamps time, resets the high-water mark or extends a
+lease. A regression remaining after fresh I/O still invalidates the host and
+fails closed. Telemetry records the refresh count and observed regression in
+milliseconds. See [Cloudflare timers](https://developers.cloudflare.com/workers/runtime-apis/performance/)
+for the platform's I/O-dependent clock behavior. Expired read leases return
+retryable admission failure, so callers can reacquire rights on fresh compute;
+this does not replay an operation, suppress resource errors or remove retry time
+from qualification latency. Corruption and opaque platform failures retain
+their existing failure behavior.
+
+R2 authority initialization no longer performs remote I/O inside
+`blockConcurrencyWhile` in the coordinator constructor. The first operation
+authenticates the same namespace/storage descriptor before native access.
+Authority admission permits one in-flight load and at most 64 waiters, each
+bounded to five seconds. Expired waiters are detached from a bounded set, rather
+than adding permanent reactions to a never-settling shared promise. Late validated
+success serves subsequent callers; failure permits a new load. No timeout starts
+another load while the original is pending. A suspended-authority Worker fixture
+proves control RPCs can still release initialization.
+
+Optional local read observers use the same bounded admission while preserving
+`allowCreate:false`. Missing or temporarily unavailable local authority may fall
+back to the separately authenticated writer; invalid authority, migration state,
+corruption and fencing still fail closed. A cached pre-cutover SQLite descriptor
+is discarded before another observation. The R2 storage identity, native owner
+fences, receipt semantics and all existing memory limits remain unchanged.

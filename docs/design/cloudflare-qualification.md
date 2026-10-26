@@ -1235,3 +1235,29 @@ Their results, complete-hour latency distributions, exact verification and
 conditional cold admission remain pending; initiation is not a gate pass.
 The content-addressed local evidence manifest has been refreshed with the
 179-test Node log, six-test persisted Worker log and final native log.
+
+
+The first three strict regional executions were stopped after disqualifying warm
+failures and preserved under their original execution IDs. Trial 1 recorded
+`ManifestReadLeaseExpired` with `clock_valid:false`, read timeouts and two writes
+failed by a 30-second `blockConcurrencyWhile` initialization reset. Trials 2 and
+3 recorded read timeouts. None completed an hour or consumed a physical cold
+epoch. They are failed evidence, not completed gate trials.
+
+Investigation reproduced the pool scheduler executing queued actor B work in
+actor A's async context. Originating-context admission, pre-entry clock refresh
+and bounded authority loading address these distinct failure paths. Their
+183 Node regressions pass, including the original fail-closed clock rollback
+check. New persisted checks cover queued R2 I/O contexts and control RPCs during
+a suspended real R2 coordinator authority load. Live qualification must rerun
+on the resulting sealed revision; those tests alone do not establish the cause
+of every timeout or a gate pass.
+
+
+The final context/authority revision passes all eight persisted Worker checks
+in 189.3 seconds and all 183 Node checks. The new runtime fixtures verify
+originating contexts across actual R2 I/O and release suspended authority
+initialization through a control RPC. A post-stop audit found zero DLQ messages
+on all three candidates. Failed trial reports, prior bundles and configurations
+are archived before the next compute-generation rollout. Native module hashes
+and frozen ANN/50k report bindings remain unchanged.
