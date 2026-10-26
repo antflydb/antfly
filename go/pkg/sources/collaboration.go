@@ -54,6 +54,13 @@ type CollaborationConfig struct {
 type CollaborationConnector struct {
 	Baseline                                    *Inventory
 	Cache                                       AcquisitionCache
+	ContentStore                                AcquisitionContentStore
+	retainedRef                                 string
+	retainedScope                               string
+	retainedBundle                              []Input
+	ExtractorVersion                            string
+	scopeChecks                                 map[string]time.Time
+	observedScopes                              map[string]collaborationRef
 	ProviderName                                string
 	HTTPClient                                  *http.Client
 	AccessToken                                 func(context.Context) (string, error)
@@ -73,6 +80,7 @@ type collaborationRef struct {
 type collaborationFile struct {
 	ID, Name, MIME, URL string
 	CanonicalURL        string
+	Revision            string
 	Data                []byte
 }
 type collaborationMaterial struct {
@@ -315,7 +323,13 @@ func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inve
 	incremental := false
 	switch c.ProviderName {
 	case ProviderSlack:
-		refs, err = c.slackRefs(ctx, config)
+		refs, err = c.slackRefs(ctx, config, func(ref collaborationRef, message *slackMessage) error {
+			if c.ContentStore == nil {
+				return nil
+			}
+			_, captureErr := c.hydrate(ctx, r, config, ref, message)
+			return captureErr
+		})
 	case ProviderDiscord:
 		refs, err = c.discordRefs(ctx, config)
 	case ProviderGoogleWorkspace:
@@ -347,20 +361,17 @@ func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inve
 		}
 	}
 	for _, ref := range refs {
-		material, err := c.load(ctx, config, ref)
+		items, err := c.hydrate(ctx, r, config, ref, nil)
 		if err != nil {
 			return Inventory{}, err
 		}
-		items, err := c.materialItems(ctx, r, config, ref, material)
-		if err != nil {
-			return Inventory{}, err
-		}
+
 		for _, input := range items {
 			if seen[input.ID] {
 				continue
 			}
 			seen[input.ID] = true
-			total += int64(len(input.Bytes))
+			total += input.Size
 			if total > 10<<30 || len(inv.Objects) >= maxCollaborationSourceObjects {
 				return Inventory{}, ErrInventoryIncomplete
 			}
@@ -368,8 +379,8 @@ func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inve
 		}
 	}
 	sort.Slice(inv.Objects, func(i, j int) bool { return inv.Objects[i].ID < inv.Objects[j].ID })
-	if r.Preview && len(inv.Objects) > 1 {
-		inv.Objects = inv.Objects[:1]
+	if r.Preview && len(inv.Objects) > PreviewItemLimit {
+		inv.Objects = inv.Objects[:PreviewItemLimit]
 	}
 	if len(r.RetrySourceKeys) > 0 {
 		keys := exactSourceKeySet(r.RetrySourceKeys)
@@ -391,6 +402,9 @@ func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inve
 	return inv, nil
 }
 func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, config CollaborationConfig, ref collaborationRef, m collaborationMaterial) ([]Input, error) {
+	if config.preview && len(m.Files) > PreviewItemLimit-1 {
+		m.Files = m.Files[:PreviewItemLimit-1]
+	}
 	if len(m.Text) > maxImportSourceObjectBytes || !utf8.Valid(m.Text) {
 		return nil, fmt.Errorf("resource text exceeds byte limit")
 	}
@@ -450,6 +464,9 @@ func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, c
 			meta := cloneSourceMetadata(metadata)
 			meta["parent_identity"] = parent.ID
 			meta["attachment_id"] = file.ID
+			if file.Revision != "" {
+				meta["drive_revision"] = file.Revision
+			}
 			meta["filename"] = file.Name
 			meta["mime_type"] = file.MIME
 			meta["links"] = SourceLinks(text)
@@ -486,6 +503,7 @@ func (c *CollaborationConnector) Read(ctx context.Context, r Request, item Item)
 		return nil, err
 	}
 	config, _ := decodeSourceConfig[CollaborationConfig](r.Config)
+	config.preview = r.Preview
 	if c.ProviderName == ProviderGoogleWorkspace && config.Resource == "drive" {
 		return c.readWorkspaceDrive(ctx, r, item, config.Attachments)
 	}
@@ -493,16 +511,31 @@ func (c *CollaborationConnector) Read(ctx context.Context, r Request, item Item)
 	if err := json.Unmarshal([]byte(configString(item.Metadata, "acquisition")), &ref); err != nil {
 		return nil, fmt.Errorf("invalid persisted acquisition")
 	}
-	if err := c.validateRef(ctx, config, ref); err != nil {
-		return nil, err
+	if item.ContentRef != "" && c.ContentStore != nil {
+		inputs, found, err := c.retainedInputs(ctx, r, item.ContentRef)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			if err := c.authorizeRetained(ctx, config, ref, item); err != nil {
+				return nil, err
+			}
+			for _, input := range inputs {
+				if input.ID == item.ID && input.Revision == item.Revision {
+					return input.Bytes, nil
+				}
+			}
+			return nil, fmt.Errorf("retained acquisition does not match pinned item")
+		}
 	}
-	m, err := c.load(ctx, config, ref)
-	if err != nil {
+	if err := c.validateRef(ctx, config, ref); err != nil {
 		return nil, err
 	}
 	attachment := ref.Attachment
 	ref.Attachment = ""
-	items, err := c.materialItems(ctx, r, config, ref, m)
+	fresh := *c
+	fresh.Cache = nil
+	items, err := fresh.hydrate(ctx, r, config, ref, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -517,16 +550,41 @@ func (c *CollaborationConnector) Read(ctx context.Context, r Request, item Item)
 	return nil, fmt.Errorf("resource or attachment no longer accessible")
 }
 func (c *CollaborationConnector) CheckAccess(ctx context.Context, r Request, item Item) error {
+	if c.ContentStore != nil && item.ContentRef != "" {
+		if err := c.Validate(ctx, r); err != nil {
+			return err
+		}
+		config, _ := decodeSourceConfig[CollaborationConfig](r.Config)
+		var ref collaborationRef
+		if json.Unmarshal([]byte(configString(item.Metadata, "acquisition")), &ref) != nil {
+			return ErrInvalidInput
+		}
+		return c.authorizeRetained(ctx, config, ref, item)
+	}
 	_, err := c.Read(ctx, r, item)
 	return err
 }
 func (c *CollaborationConnector) ValidateInventory(ctx context.Context, r Request, inventory Inventory) error {
+	c.scopeChecks = nil
 	if err := c.Validate(ctx, r); err != nil {
 		return err
 	}
 	config, _ := decodeSourceConfig[CollaborationConfig](r.Config)
+	config.preview = r.Preview
 	if c.ProviderName == ProviderGoogleWorkspace && config.Resource == "drive" {
 		return c.drive().ValidateInventory(ctx, r, inventory)
+	}
+	for _, item := range inventory.Objects {
+		if item.ContentRef == "" {
+			continue
+		}
+		var ref collaborationRef
+		if json.Unmarshal([]byte(configString(item.Metadata, "acquisition")), &ref) != nil {
+			return ErrInvalidInput
+		}
+		if err := c.authorizeRetained(ctx, config, ref, item); err != nil {
+			return err
+		}
 	}
 	switch c.ProviderName {
 	case ProviderSlack:
@@ -536,6 +594,11 @@ func (c *CollaborationConnector) ValidateInventory(ctx context.Context, r Reques
 			}
 		}
 	case ProviderDiscord:
+		for _, ref := range c.observedScopes {
+			if err := c.discordScope(ctx, config, ref.Container); err != nil {
+				return err
+			}
+		}
 		for _, id := range config.ChannelIDs {
 			if err := c.discordScope(ctx, config, id); err != nil {
 				return err
@@ -590,16 +653,6 @@ func (c *CollaborationConnector) ValidateAbsentSources(ctx context.Context, r Re
 		}
 	}
 	return nil
-}
-func (c *CollaborationConnector) enumerateRefs(ctx context.Context, config CollaborationConfig) ([]collaborationRef, error) {
-	switch c.ProviderName {
-	case ProviderSlack:
-		return c.slackRefs(ctx, config)
-	case ProviderDiscord:
-		return c.discordRefs(ctx, config)
-	default:
-		return c.workspaceRefs(ctx, config)
-	}
 }
 func (c *CollaborationConnector) downloadAttachment(ctx context.Context, raw string) ([]byte, error) {
 	u, err := url.Parse(raw)

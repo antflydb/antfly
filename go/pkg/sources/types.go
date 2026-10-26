@@ -53,6 +53,8 @@ type Request struct {
 	RetrySourceKeys []string
 }
 type Item struct {
+	// ContentRef is a private acquisition checkpoint, never document metadata.
+	ContentRef                                              string `json:",omitempty"`
 	ID, Path, Filename, Revision, URL, SourceKind, ReadMode string
 	Size                                                    int64
 	Metadata                                                map[string]any

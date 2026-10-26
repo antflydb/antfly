@@ -47,7 +47,7 @@ before their fixes.
 ## Release prerequisites
 
 Publish/pin the portable sources module and Cloud CLI/SDK revision, then deploy the
-matching Colony API, worker and dashboard with migrations 124–126. Colony must pin this published module revision; final release checks must use
+matching Colony API, worker and dashboard with migrations 124–127. Colony must pin this published module revision; final release checks must use
 `GOWORK=off` with that dependency. Drain older workers for the unreleased provider migration.
 
 Register the exact backend callback for each enabled provider:
@@ -66,7 +66,7 @@ browser installation into the chosen test server. Slack live qualification is
 explicitly deferred. Operator deployment instructions are in Colony's
 `docs/dev/connected-source-search.md`; no provider secret belongs in a source.
 
-Slack/Discord remain bounded polling sources with resumable acquisition pages.
+Slack/Discord remain bounded polling sources with resumable acquisition pages and normalized-content checkpoints.
 Gmail history and Calendar sync-token enumeration are implemented; Drive changes,
 chat event ingestion, unlimited backfills and shared rate-limit coordination are
 not qualified by this release test record.

@@ -471,7 +471,7 @@ func (c *CollaborationConnector) workspaceDriveFile(ctx context.Context, id stri
 	if export != "" {
 		mime = export
 	}
-	return collaborationFile{ID: id, Name: file.Name, MIME: mime, Data: data, CanonicalURL: "https://drive.google.com/file/d/" + url.PathEscape(id) + "/view"}, nil
+	return collaborationFile{ID: id, Revision: file.Version, Name: file.Name, MIME: mime, Data: data, CanonicalURL: "https://drive.google.com/file/d/" + url.PathEscape(id) + "/view"}, nil
 }
 func (c *CollaborationConnector) readWorkspaceDrive(ctx context.Context, r Request, item Item, extractBinary bool) ([]byte, error) {
 	data, err := c.drive().Read(ctx, r, item)

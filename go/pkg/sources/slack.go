@@ -17,6 +17,7 @@ package sources
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -24,6 +25,7 @@ import (
 )
 
 type slackMessage struct {
+	hasBody    bool
 	TS         string `json:"ts"`
 	ThreadTS   string `json:"thread_ts"`
 	Text       string `json:"text"`
@@ -41,6 +43,21 @@ type slackMessage struct {
 		Private  string `json:"url_private"`
 		External bool   `json:"is_external"`
 	} `json:"files"`
+}
+
+func (m *slackMessage) UnmarshalJSON(data []byte) error {
+	type plain slackMessage
+	var value plain
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*m = slackMessage(value)
+	_, m.hasBody = fields["text"]
+	return nil
 }
 
 func validSlackTS(ts string) bool {
@@ -88,7 +105,7 @@ func (c *CollaborationConnector) slackScope(ctx context.Context, config Collabor
 	}
 	return nil
 }
-func (c *CollaborationConnector) slackPage(ctx context.Context, method string, q url.Values) ([]slackMessage, error) {
+func (c *CollaborationConnector) slackPage(ctx context.Context, method string, q url.Values, visitors ...func(slackMessage) error) ([]slackMessage, error) {
 	sample := q.Get("_sample") == "true"
 	q.Del("_sample")
 	messages := []slackMessage{}
@@ -112,7 +129,20 @@ func (c *CollaborationConnector) slackPage(ctx context.Context, method string, q
 		if result.Limited {
 			return nil, fmt.Errorf("%w: Slack history is retention limited", ErrInventoryIncomplete)
 		}
-		messages = append(messages, result.Messages...)
+		for _, message := range result.Messages {
+			for _, visit := range visitors {
+				if err := visit(message); err != nil {
+					return nil, err
+				}
+			}
+			if len(visitors) > 0 {
+				message.Text = ""
+				message.Files = nil
+				message.hasBody = false
+				message.Edited = nil
+			}
+			messages = append(messages, message)
+		}
 		if sample {
 			if len(messages) > 1 {
 				messages = messages[:1]
@@ -136,7 +166,7 @@ func (c *CollaborationConnector) slackPage(ctx context.Context, method string, q
 	}
 	return messages, nil
 }
-func (c *CollaborationConnector) slackRefs(ctx context.Context, config CollaborationConfig) ([]collaborationRef, error) {
+func (c *CollaborationConnector) slackRefs(ctx context.Context, config CollaborationConfig, visit func(collaborationRef, *slackMessage) error) ([]collaborationRef, error) {
 	refs := []collaborationRef{}
 	seen := map[string]bool{}
 	add := func(channel string, m slackMessage) error {
@@ -150,7 +180,13 @@ func (c *CollaborationConnector) slackRefs(ctx context.Context, config Collabora
 			if m.ThreadTS != "" && m.ThreadTS != m.TS {
 				thread = m.ThreadTS
 			}
-			refs = append(refs, collaborationRef{Resource: ProviderSlack, Container: channel, ID: m.TS, Thread: thread})
+			ref := collaborationRef{Resource: ProviderSlack, Container: channel, ID: m.TS, Thread: thread}
+			if visit != nil {
+				if err := visit(ref, &m); err != nil {
+					return err
+				}
+			}
+			refs = append(refs, ref)
 		}
 		if len(refs) > maxCollaborationSourceObjects {
 			return ErrInventoryIncomplete
@@ -165,7 +201,12 @@ func (c *CollaborationConnector) slackRefs(ctx context.Context, config Collabora
 		if config.preview {
 			q.Set("_sample", "true")
 		}
-		messages, err := c.slackPage(ctx, "conversations.history", q)
+		messages, err := c.slackPage(ctx, "conversations.history", q, func(m slackMessage) error {
+			if m.Subtype == "message_deleted" {
+				return nil
+			}
+			return add(channel, m)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -173,22 +214,15 @@ func (c *CollaborationConnector) slackRefs(ctx context.Context, config Collabora
 			if message.Subtype == "message_deleted" {
 				continue
 			}
-			if err := add(channel, message); err != nil {
-				return nil, err
-			}
 			if config.preview {
 				return refs, nil
 			}
 			if message.ReplyCount > 0 && (config.IncludeThreads == nil || *config.IncludeThreads) {
-				replies, err := c.slackPage(ctx, "conversations.replies", url.Values{"channel": {channel}, "ts": {message.TS}})
+				replies, err := c.slackPage(ctx, "conversations.replies", url.Values{"channel": {channel}, "ts": {message.TS}}, func(m slackMessage) error { return add(channel, m) })
 				if err != nil {
 					return nil, err
 				}
-				for _, reply := range replies {
-					if err := add(channel, reply); err != nil {
-						return nil, err
-					}
-				}
+				_ = replies
 			}
 		}
 	}
@@ -221,6 +255,9 @@ func (c *CollaborationConnector) slackLoad(ctx context.Context, config Collabora
 	if message == nil || message.Subtype == "message_deleted" {
 		return collaborationMaterial{}, ErrInventoryIncomplete
 	}
+	return c.slackMaterial(ctx, config, ref, *message)
+}
+func (c *CollaborationConnector) slackMaterial(ctx context.Context, config CollaborationConfig, ref collaborationRef, message slackMessage) (collaborationMaterial, error) {
 	files := []collaborationFile{}
 	for _, file := range message.Files {
 		if !config.Attachments {

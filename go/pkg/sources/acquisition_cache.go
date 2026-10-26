@@ -43,7 +43,10 @@ type AcquisitionCache interface {
 	Load(context.Context, string) ([]byte, bool, error)
 	Save(context.Context, string, []byte) error
 }
-type FileAcquisitionCache struct{ Directory string }
+type FileAcquisitionCache struct {
+	Directory string
+	maxBytes  int
+}
 
 func acquisitionKey(key string) string {
 	digest := sha256.Sum256([]byte(key))
@@ -62,7 +65,11 @@ func (c *FileAcquisitionCache) Load(_ context.Context, key string) ([]byte, bool
 	return b, err == nil, err
 }
 func (c *FileAcquisitionCache) Save(_ context.Context, key string, data []byte) error {
-	if len(data) > maxImportSourceObjectBytes || !json.Valid(data) {
+	limit := c.maxBytes
+	if limit == 0 {
+		limit = maxImportSourceObjectBytes
+	}
+	if len(data) > limit || !json.Valid(data) {
 		return fmt.Errorf("invalid acquisition page")
 	}
 	if err := os.MkdirAll(c.Directory, 0700); err != nil {

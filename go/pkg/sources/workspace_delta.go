@@ -34,10 +34,10 @@ func refKey(resource, container, id string) string {
 }
 
 func (c *CollaborationConnector) workspaceSelection(ctx context.Context, r Request, config CollaborationConfig) ([]collaborationRef, map[string]bool, map[string]string, bool, error) {
-	tokens := map[string]string{"config": workspaceSelectionKey(r)}
+	tokens := map[string]string{"config": workspaceSelectionKey(r), "hydration": c.hydrationSelection(r)}
 	config.tokens = tokens
 	baseline := c.Baseline
-	delta := baseline != nil && baseline.Authoritative && baseline.ProviderState["config"] == tokens["config"] && !r.Preview && len(r.RetrySourceKeys) == 0
+	delta := baseline != nil && baseline.Authoritative && baseline.ProviderState["config"] == tokens["config"] && (c.ContentStore == nil || baseline.ProviderState["hydration"] == tokens["hydration"]) && !r.Preview && len(r.RetrySourceKeys) == 0
 	removed := map[string]bool{}
 	if delta {
 		var refs []collaborationRef
@@ -78,7 +78,7 @@ func (c *CollaborationConnector) workspaceSelection(ctx context.Context, r Reque
 		}
 		// Expired change cursors require a new authoritative selection. The previous
 		// publication remains the ownership baseline until replacement is verified.
-		tokens = map[string]string{"config": workspaceSelectionKey(r)}
+		tokens = map[string]string{"config": workspaceSelectionKey(r), "hydration": c.hydrationSelection(r)}
 		config.tokens = tokens
 	}
 	if config.Resource == "gmail" {

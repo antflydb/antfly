@@ -226,7 +226,7 @@ sharing is explicit per source; split selections by trust boundary. Automatic Sl
 membership, Discord role, or Google ACL mirroring requires identity mapping,
 membership refresh, and revocation events before it can be offered as a policy mode.
 
-Collaboration inventories admit up to 100,000 items, with durable successful-page
+Collaboration inventories admit up to 100,000 items, with durable page and per-parent hydration
 checkpoints. Other provider limits still apply, including the internal Drive
 connector's 10,000-item inventory. Publication rechecks current container access;
 failed or incomplete acquisition cannot renew the lease. The manifest and staged
@@ -235,7 +235,9 @@ text remain bounded, rather than an unlimited history stream.
 Gmail history IDs and per-calendar sync tokens support incremental enumeration
 against the last published manifest. Expired cursors require a complete rebuild.
 Changed/deleted parent records also replace or retire their attachment records.
-Unchanged records still receive pinned provider reads before publication. Slack
+Unchanged records reuse immutable normalized bundles after current scope checks. Calendar
+event revisions and independently authorized Drive attachment revisions are checked
+before reuse. Slack
 and Discord use full polling with resumable pages; Slack Events, Discord Gateway,
 Drive changes cursors, and shared installation-wide rate-limit coordination remain
 additional scale work. Do not advertise event-driven or unlimited backfills.
@@ -266,3 +268,37 @@ does not establish hosted deployment readiness.
 See [release qualification](collaboration-source-qualification.md) for tested
 surfaces, live blockers and the exact CLI sequence. Local fixtures establish
 contracts; only an authorized live sync and search can qualify the hosted flow.
+
+## Durable normalized acquisition
+
+Each completed parent and its attachments is stored as one content-addressed,
+versioned bundle. Standalone runs use private state files. Hosted runs require the
+existing private import staging bucket; SQL stores only encrypted selection/item
+metadata and content references. The bundle binds the namespace, provider,
+selection, extractor version, revisions and bytes. Digests and tenant-scoped object
+paths are checked on read. Storage paths never enter searchable record metadata.
+One bundle is held in memory while siblings are read. Completed bundles are reused
+across worker attempts; expired blobs are rehydrated only if their pinned revisions
+still match. A changed extractor version invalidates incremental reuse.
+
+Slack history and reply pages hydrate their returned bodies directly. Resume pages
+retain only identities and cursors; successful hydration checkpoints prevent a
+later rate limit from repeating completed downloads and extraction. Current scope
+checks are memoized for at most 30 seconds within an attempt and refreshed before
+publication, including observed private thread scopes. Pinned message snapshots
+remain stable during an attempt; later provider edits are reconciled on the next
+sync. Independently authorized Calendar events and Drive attachments also retain
+revision checks. Custom extractors must supply a stable version before using a
+content store.
+
+Hosted lifetime attempt counts are monotonic. A separate durable progress counter
+allows continued 429 retries when new checkpoints were saved, while consecutive
+attempts without progress retain the existing three-attempt limit and Retry-After
+scheduling. Previews sample one parent and up to eight attachments; each returned
+text sample is capped separately by the API.
+
+Only organization source managers can select private collaboration connections,
+regardless of destination table grants. The CLI and dashboard share an Antfly-owned
+installation entry. It establishes a dashboard session before issuing provider
+consent, verifies the initiating user and tenant, and preserves PKCE and single-use
+callback state. The CLI validates the installation origin and path before opening it.

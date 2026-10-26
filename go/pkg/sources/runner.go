@@ -318,6 +318,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			}
 		}
 		c.Cache = &FileAcquisitionCache{Directory: filepath.Join(r.StateDir, "acquisition", s.ID, acquisitionKey(state.AcquisitionID))}
+		c.ContentStore = &FileAcquisitionContentStore{Directory: filepath.Join(r.StateDir, "content", s.ID)}
 	}
 	if r.Restart {
 		state.Pending = nil
@@ -477,6 +478,13 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if c, ok := connector.(*CollaborationConnector); ok {
 		if cache, ok := c.Cache.(*FileAcquisitionCache); ok {
 			if err := os.RemoveAll(cache.Directory); err != nil {
+				return 0, "", err
+			}
+		}
+	}
+	if c, ok := connector.(*CollaborationConnector); ok {
+		if content, ok := c.ContentStore.(*FileAcquisitionContentStore); ok {
+			if err := content.Prune(state.Published.Objects); err != nil {
 				return 0, "", err
 			}
 		}
