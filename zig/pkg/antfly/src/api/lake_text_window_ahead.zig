@@ -27,6 +27,7 @@ pub const Source = struct {
     ptr: *anyopaque,
     next: *const fn (*anyopaque, []Id, ?f32) anyerror!?Window,
     next_ranked: ?*const fn (*anyopaque, []Id, ?f32, ?Position) anyerror!?Window = null,
+    next_ordered: ?*const fn (*anyopaque, []Id, ?f32, ?Position, []const std.json.Value) anyerror!?Window = null,
     prepare: ?*const fn (*anyopaque, []const Id) anyerror!?Pin = null,
 };
 source: Source,
@@ -36,13 +37,15 @@ ids: [64]Id = undefined,
 limit: usize = 1,
 cutoff: ?f32 = null,
 position: ?Position = null,
+order_region: ?std.heap.ArenaAllocator = null,
+order_boundary: []const std.json.Value = &.{},
 task: ?scheduler.Task(anyerror!?Window) = null,
 prepared: ?Pin = null,
 pub fn init(source: Source, io: ?std.Io) Self {
     return .{ .source = source, .io = io, .scheduling = scheduler.global() };
 }
 fn run(self: *Self) anyerror!?Window {
-    const window = (if (self.source.next_ranked) |ranked| try ranked(self.source.ptr, self.ids[0..self.limit], self.cutoff, self.position) else try self.source.next(self.source.ptr, self.ids[0..self.limit], self.cutoff)) orelse return null;
+    const window = (if (self.source.next_ordered) |ordered| try ordered(self.source.ptr, self.ids[0..self.limit], self.cutoff, self.position, self.order_boundary) else if (self.source.next_ranked) |ranked| try ranked(self.source.ptr, self.ids[0..self.limit], self.cutoff, self.position) else try self.source.next(self.source.ptr, self.ids[0..self.limit], self.cutoff)) orelse return null;
     if (self.source.prepare) |prepare| {
         var pin = (prepare(self.source.ptr, window.identities) catch null) orelse return window;
         self.prepared = pin.share(std.heap.page_allocator) catch {
@@ -56,6 +59,9 @@ pub fn next(self: *Self, limit: usize, cutoff: ?f32) !?Window {
     return self.nextRanked(limit, cutoff, null);
 }
 pub fn nextRanked(self: *Self, limit: usize, cutoff: ?f32, position: ?Position) !?Window {
+    return self.nextOrdered(limit, cutoff, position, &.{});
+}
+pub fn nextOrdered(self: *Self, limit: usize, cutoff: ?f32, position: ?Position, boundary: []const std.json.Value) !?Window {
     if (self.task) |task| {
         var pending = task;
         self.task = null;
@@ -64,6 +70,7 @@ pub fn nextRanked(self: *Self, limit: usize, cutoff: ?f32, position: ?Position) 
     self.limit = @min(self.ids.len, @max(1, limit));
     self.cutoff = cutoff;
     self.position = position;
+    try self.copyBoundary(boundary);
     return self.run();
 }
 pub fn takePrepared(self: *Self) ?Pin {
@@ -75,11 +82,27 @@ pub fn prefetch(self: *Self, limit: usize, cutoff: ?f32) void {
     self.prefetchRanked(limit, cutoff, null);
 }
 pub fn prefetchRanked(self: *Self, limit: usize, cutoff: ?f32, position: ?Position) void {
+    self.prefetchOrdered(limit, cutoff, position, &.{});
+}
+pub fn prefetchOrdered(self: *Self, limit: usize, cutoff: ?f32, position: ?Position, boundary: []const std.json.Value) void {
     std.debug.assert(self.task == null and self.prepared == null);
     self.limit = @min(self.ids.len, @max(1, limit));
     self.cutoff = cutoff;
     self.position = position;
+    self.copyBoundary(boundary) catch {
+        self.order_boundary = &.{};
+        return;
+    };
     if (self.io) |io| self.task = self.scheduling.submitIoTransient(io, 16 * 1024 * 1024, run, .{self});
+}
+fn copyBoundary(self: *Self, boundary: []const std.json.Value) !void {
+    self.order_boundary = &.{};
+    if (self.order_region == null) self.order_region = .init(std.heap.page_allocator);
+    _ = self.order_region.?.reset(.retain_capacity);
+    if (boundary.len == 0) return;
+    const a = self.order_region.?.allocator();
+    const bytes = try std.json.Stringify.valueAlloc(a, boundary, .{});
+    self.order_boundary = try std.json.parseFromSliceLeaky([]const std.json.Value, a, bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
 }
 pub fn deinit(self: *Self) void {
     if (self.task) |task| {
@@ -89,6 +112,8 @@ pub fn deinit(self: *Self) void {
     }
     if (self.prepared) |*pin| pin.deinit();
     self.prepared = null;
+    if (self.order_region) |*region| region.deinit();
+    self.order_region = null;
 }
 
 test "external lake bounded window lookahead joins cancellation and yields under saturation" {
@@ -155,4 +180,30 @@ test "external lake bounded window lookahead joins cancellation and yields under
     try std.testing.expect(ahead.task == null);
     try std.testing.expectEqual(@as(usize, 64), ahead.limit);
     try std.testing.expect((try ahead.next(64, 2)) != null);
+}
+
+test "external lake bounded window lookahead owns a stable typed cutoff" {
+    const State = struct {
+        fn unused(_: *anyopaque, _: []Id, _: ?f32) !?Window {
+            return error.TestUnexpectedResult;
+        }
+        fn ordered(_: *anyopaque, ids: []Id, _: ?f32, _: ?Position, boundary: []const std.json.Value) !?Window {
+            try std.testing.expectEqualStrings("9007199254740993", boundary[0].number_string);
+            try std.testing.expectEqualStrings("before", boundary[1].string);
+            ids[0] = @splat(4);
+            return .{ .identities = ids[0..1], .doc_offset = 0 };
+        }
+    };
+    var marker: u8 = 0;
+    var scheduling: scheduler.Scheduler = .{};
+    var ahead = Self.init(.{ .ptr = &marker, .next = State.unused, .next_ordered = State.ordered }, std.testing.io);
+    ahead.scheduling = &scheduling;
+    defer ahead.deinit();
+    var id = "before".*;
+    const boundary = [_]std.json.Value{ .{ .number_string = "9007199254740993" }, .{ .string = &id } };
+    ahead.prefetchOrdered(1, null, null, &boundary);
+    @memset(&id, 'x');
+    try std.testing.expect(ahead.task != null);
+    try std.testing.expect((try ahead.nextOrdered(1, null, null, &.{})) != null);
+    try std.testing.expectEqual(@as(usize, 0), scheduling.io_workers);
 }

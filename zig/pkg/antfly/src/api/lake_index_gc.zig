@@ -394,6 +394,7 @@ pub const Collector = struct {
         } else try self.markPages(a, root.domain, root.directories.files, false);
         try self.markPages(a, root.domain, root.directories.segments, false);
         try self.markPages(a, root.domain, root.directories.routing, false);
+        try self.markPages(a, root.domain, root.directories.ordered, false);
         try self.markPages(a, root.domain, root.pack_ownership, false);
         try self.markPages(a, root.domain, root.source_routes, false);
         try self.markPages(a, root.domain, root.tie_bounds, false);

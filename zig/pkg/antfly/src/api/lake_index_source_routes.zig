@@ -34,7 +34,10 @@ pub const Route = struct {
 pub fn mutate(a: A, changes: *corpus.text_directory.Mutations, group: corpus.FileGroup, deleting: bool) !void {
     if (group.sources.len == 0 or group.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
     const segment = corpus.term_directory.identity(group.segments[0].artifact_id);
-    for (group.sources) |span| {
+    const compact = !deleting or group.coalesced_source_routes;
+    const spans = if (compact) try coalesce(a, group.sources) else group.sources;
+    defer if (compact) a.free(spans);
+    for (spans) |span| {
         var key: [36]u8 = undefined;
         key[0..32].* = corpus.term_directory.identity(span.file.id);
         std.mem.writeInt(u32, key[32..36], span.file_lower, .big);
@@ -42,6 +45,42 @@ pub fn mutate(a: A, changes: *corpus.text_directory.Mutations, group: corpus.Fil
         defer a.free(bytes);
         try changes.addPrefix(&key, if (deleting) null else bytes, bytes.len);
     }
+}
+/// Pack positions may interleave while source ranks remain contiguous in the
+/// same serving segment. Inverse routing needs only the latter cover.
+fn coalesce(a: A, spans: []const corpus.source_spans.Span) ![]const corpus.source_spans.Span {
+    const indices = try a.alloc(usize, spans.len);
+    defer a.free(indices);
+    for (indices, 0..) |*index, i| index.* = i;
+    std.mem.sort(usize, indices, spans, struct {
+        fn less(source: []const corpus.source_spans.Span, l: usize, r: usize) bool {
+            const file = std.mem.order(u8, source[l].file.id, source[r].file.id);
+            return if (file != .eq) file == .lt else source[l].file_lower < source[r].file_lower;
+        }
+    }.less);
+    var result: std.ArrayList(corpus.source_spans.Span) = .empty;
+    errdefer result.deinit(a);
+    for (indices) |index| {
+        const span = spans[index];
+        if (result.items.len != 0) {
+            const last = &result.items[result.items.len - 1];
+            if (std.mem.eql(u8, last.file.id, span.file.id)) {
+                const upper = try std.math.add(u32, last.file_lower, last.count);
+                if (span.file_lower < upper) return error.InvalidNativeLakeTextCorpus;
+                if (span.file_lower == upper and last.file_rows == span.file_rows and
+                    std.mem.eql(u8, &last.file.digest, &span.file.digest) and
+                    last.physical.byte_len == span.physical.byte_len and
+                    std.mem.eql(u8, last.physical.artifact_id, span.physical.artifact_id) and
+                    std.mem.eql(u8, last.physical.checksum, span.physical.checksum))
+                {
+                    last.count = try std.math.add(u32, last.count, span.count);
+                    continue;
+                }
+            }
+        }
+        try result.append(a, span);
+    }
+    return result.toOwnedSlice(a);
 }
 /// Publication maintenance follows the retained serving packs, never the
 /// superseded canonical payloads. Admit only a bounded complete file cover;
@@ -321,4 +360,27 @@ test "external lake bounded WAL compressed predicate spans route broad rows acro
         try std.testing.expectEqual(pack_count, sink.ids.count());
         for (refs[0..pack_count]) |ref| try std.testing.expect(sink.ids.contains(corpus.term_directory.identity(ref.artifact_id)));
     };
+}
+
+test "external lake global frontier inverse routing coalesces interleaved source ranks" {
+    const a = std.testing.allocator;
+    var spans: [1024]corpus.source_spans.Span = undefined;
+    for (&spans, 0..) |*span, i| span.* = .{
+        .file = .{ .id = if (i % 2 == 0) "first" else "second", .digest = @splat(7) },
+        .physical = .{ .artifact_id = "physical", .checksum = "checksum", .byte_len = 4096 },
+        .file_rows = 512,
+        .file_lower = @intCast(i / 2),
+        .pack_lower = @intCast(i),
+        .count = 1,
+    };
+    const merged = try coalesce(a, &spans);
+    defer a.free(merged);
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+    for (merged) |span| try std.testing.expectEqual(@as(u32, 512), span.count);
+    spans[500].physical.artifact_id = "other-physical-generation";
+    const split = try coalesce(a, &spans);
+    defer a.free(split);
+    try std.testing.expectEqual(@as(usize, 4), split.len);
+    spans[0].file_lower = 1;
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, coalesce(a, &spans));
 }

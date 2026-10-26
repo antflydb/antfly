@@ -802,7 +802,9 @@ test "external lake file-first publication shares one decode across five native 
             var backend = self.backend;
             backend.allocator = alloc;
             const metadata = try backend.putScoped(scope, data, token);
-            if (std.mem.startsWith(u8, data, "{\"file\":")) {
+            const group = if (data.len != 0 and data[0] == '{') try std.json.parseFromSlice(std.json.Value, alloc, data, .{}) else null;
+            defer if (group) |parsed| parsed.deinit();
+            if (group != null and group.?.value == .object and group.?.value.object.contains("file") and group.?.value.object.contains("segments")) {
                 @import("antfly_platform").sync.lockYielding(&self.mutex);
                 defer self.mutex.unlock();
                 std.debug.assert(self.count < self.ids.len);

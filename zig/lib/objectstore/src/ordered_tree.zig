@@ -2071,6 +2071,8 @@ pub const Cursor = struct {
     upper: ?[]const u8,
     lower: []const u8 = "",
     reverse: bool = false,
+    /// Optional operation-owned rejection from authenticated child aggregates.
+    pruning: ?struct { ptr: *anyopaque, keep: *const fn (*anyopaque, []const u8) anyerror!bool } = null,
     ahead: [max_read_batch]?Page = @splat(null),
 
     const Frame = struct { page: Page, next: usize, end: ?[]const u8 };
@@ -2137,6 +2139,7 @@ pub const Cursor = struct {
             frame.next -= 1;
             const entry = frame.page.entries[frame.next];
             if (entry.child) |child_ptr| {
+                if (self.pruning) |prune| if (!try prune.keep(prune.ptr, entry.aggregate)) continue;
                 const child = child_ptr.*;
                 const end = if (frame.next + 1 < frame.page.entries.len) frame.page.entries[frame.next + 1].key else frame.end;
                 try self.descendReverse(child, null, entry.key, end);
@@ -2205,7 +2208,9 @@ pub const Cursor = struct {
     /// with this cursor until consumed, invalidated by seek, or deinitialized.
     pub fn readAhead(self: *Cursor, records: u64, max_bytes: usize) !void {
         try self.store.check(self.store.ptr);
-        if (self.reverse or self.depth < 2 or max_bytes == 0 or self.store.read_many == null) return;
+        // An arbitrary pruning hook may have operation-owned side effects.
+        // Do not speculate past it or evaluate it twice for the same child.
+        if (self.pruning != null or self.reverse or self.depth < 2 or max_bytes == 0 or self.store.read_many == null) return;
         for (self.ahead) |slot| if (slot != null) return;
         const leaf = &self.frames[self.depth - 1];
         const parent = &self.frames[self.depth - 2];
@@ -2344,6 +2349,7 @@ pub const Cursor = struct {
             };
             frame.next += 1;
             if (entry.child) |child_ptr| {
+                if (self.pruning) |prune| if (!try prune.keep(prune.ptr, entry.aggregate)) continue;
                 const child = child_ptr.*;
                 const end = if (frame.next < frame.page.entries.len) frame.page.entries[frame.next].key else frame.end;
                 try self.descend(child, "", entry.key, end);
@@ -4398,6 +4404,55 @@ const AheadTest = struct {
         try std.testing.expectEqual(@as(u64, 50), std.mem.readInt(u64, (try cursor.next()).?.key[0..8], .big));
     }
 };
+test "serverless ordered cursor pruning skips authenticated children without speculative reads" {
+    const Reject = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        fn keep(ptr: *anyopaque, _: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.fail) return error.InjectedPruningFailure;
+            return false;
+        }
+    };
+    const a = std.testing.allocator;
+    var memory = TestStore{ .alloc = a };
+    defer memory.deinit();
+    var builder = SortedBuilder{ .alloc = a, .store = memory.store(), .target_bytes = 256 };
+    defer builder.deinit();
+    for (0..100) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        try builder.add(&key, &@as([64]u8, @splat(42)));
+    }
+    const root = (try builder.finish()).?;
+    for ([_]bool{ false, true }) |reverse| {
+        var probe = AheadTest{ .memory = &memory };
+        var cursor = if (reverse) try Cursor.initReverse(a, probe.store(), root, "", null) else try Cursor.init(a, probe.store(), root, "", null);
+        defer cursor.deinit();
+        var rejected: Reject = .{};
+        cursor.pruning = .{ .ptr = &rejected, .keep = Reject.keep };
+        const reads = memory.reads;
+        try cursor.readAhead(100, 8192);
+        var count: usize = 0;
+        while (try cursor.next()) |row| {
+            try std.testing.expectEqual(if (reverse) 99 - count else count, std.mem.readInt(u64, row.key[0..8], .big));
+            count += 1;
+        }
+        try std.testing.expect(count > 0 and count < 100);
+        try std.testing.expect(rejected.calls > 0);
+        try std.testing.expectEqual(reads, memory.reads);
+        try std.testing.expectEqual(@as(usize, 0), probe.batches);
+    }
+    var cursor = try Cursor.init(a, memory.store(), root, "", null);
+    defer cursor.deinit();
+    var failed: Reject = .{ .fail = true };
+    cursor.pruning = .{ .ptr = &failed, .keep = Reject.keep };
+    while (cursor.next()) |row| {
+        if (row == null) return error.MissingPruningFailure;
+    } else |err| try std.testing.expectEqual(error.InjectedPruningFailure, err);
+}
+
 test "serverless ordered cursor read ahead respects rank bounds seek cancellation and allocation failures" {
     const a = std.testing.allocator;
     var memory = TestStore{ .alloc = a };
