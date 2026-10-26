@@ -937,6 +937,38 @@ pub const UserManager = struct {
     /// this to intersect their admitted credential scope with live revocation:
     /// a later grant cannot broaden the request, while a later revoke takes
     /// effect before the next protected operation.
+    pub const PermissionCheck = struct { resource_type: ResourceType, resource: []const u8, permission_type: PermissionType };
+    /// One immutable live ACL snapshot for a complete graph operation. The
+    /// caller separately intersects every check with its admitted ACL snapshot.
+    pub fn permissionsCurrentlyAllowed(self: *UserManager, username: []const u8, credential: []const u8, checks: []const PermissionCheck) !bool {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.users.contains(username)) return false;
+        const permissions = if (std.mem.startsWith(u8, credential, "api-key:")) blk: {
+            const id = credential["api-key:".len..];
+            const record = self.api_keys.get(id) orelse return false;
+            if (!std.mem.eql(u8, record.key.username, username)) return false;
+            break :blk self.effectiveApiKeyPermissionsUnlocked(id) catch |err| switch (err) {
+                error.ApiKeyNotFound, error.ApiKeyExpired, error.UserNotFound => return false,
+                else => return err,
+            };
+        } else try self.getPermissionsForUser(username);
+        defer {
+            for (permissions) |*permission| permission.deinit(self.alloc);
+            self.alloc.free(permissions);
+        }
+        for (checks) |check| {
+            const allowed = for (permissions) |permission| {
+                const kind = permission.resource_type == .@"*" or permission.resource_type == check.resource_type;
+                const resource = if (check.resource_type == .table) catalog_names.tableResourceMatches(permission.resource, check.resource) else std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, check.resource);
+                if (kind and resource and permission.type.allows(check.permission_type)) break true;
+            } else false;
+            if (!allowed) return false;
+        }
+        return true;
+    }
     pub fn permissionCurrentlyAllowed(
         self: *UserManager,
         username: []const u8,
@@ -2024,7 +2056,11 @@ test "usermgr current permission check observes revocation" {
 
     try std.testing.expect(try manager.permissionCurrentlyAllowed("alice", .table, "tenant_docs", .read));
     try std.testing.expect(!try manager.permissionCurrentlyAllowed("alice", .table, "other_docs", .read));
+    const checks = [_]UserManager.PermissionCheck{.{ .resource_type = .table, .resource = "tenant_docs", .permission_type = .read }};
+    try std.testing.expect(try manager.permissionsCurrentlyAllowed("alice", "basic:alice", &checks));
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("alice", "basic:alice", &.{ checks[0], .{ .resource_type = .table, .resource = "other_docs", .permission_type = .read } }));
     try manager.removePermissionFromUser("alice", "tenant_docs", .table);
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("alice", "basic:alice", &checks));
     try std.testing.expect(!try manager.permissionCurrentlyAllowed("alice", .table, "tenant_docs", .read));
 }
 
@@ -2320,11 +2356,21 @@ test "usermgr api keys validate and persist creator-scoped permissions" {
 
     const credential = try std.fmt.allocPrint(alloc, "api-key:{s}", .{created.key.key_id});
     defer alloc.free(credential);
+    const batch = [_]UserManager.PermissionCheck{.{ .resource_type = .table, .resource = "docs", .permission_type = .read }};
+    try std.testing.expect(try manager.permissionsCurrentlyAllowed("alice", credential, &batch));
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("alice", credential, &.{.{ .resource_type = .table, .resource = "docs", .permission_type = .write }}));
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("bob", credential, &batch));
+    var expired = try manager.createApiKey("alice", "expired", &initial, &.{}, 1);
+    defer expired.deinit(alloc);
+    const expired_credential = try std.fmt.allocPrint(alloc, "api-key:{s}", .{expired.key.key_id});
+    defer alloc.free(expired_credential);
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("alice", expired_credential, &batch));
     const scope: @import("row_policy_authority.zig").Scope = .{ .table_id = 7, .table = "docs", .database = "main", .policy_generation = 2, .catalog_epoch = 9 };
     const proof = try manager.signRowPolicyRolesAuthorized(alloc, "alice", credential, "docs", .read, "1234567890abcdef1234567890abcdef", "cluster-a", scope, 100);
     defer alloc.free(proof);
 
     try manager.removePermissionFromUser("alice", "docs", .table);
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("alice", credential, &batch));
     try std.testing.expectError(error.Forbidden, manager.signRowPolicyRolesAuthorized(alloc, "alice", credential, "docs", .read, "1234567890abcdef1234567890abcdef", "cluster-a", scope, 101));
     var revoked = try manager.validateApiKey(created.key.key_id, created.key_secret);
     defer revoked.deinit(alloc);

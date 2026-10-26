@@ -525,6 +525,10 @@ pub const Cursor = struct {
     const GroupState = struct {
         source: *cypher.runtime.NodeCursor.ScalarGroups,
         orders: []const cypher.runtime.NodeCursor.GroupOrder,
+        fn skip(ptr: *anyopaque, maximum: usize) !usize {
+            const self: *GroupState = @ptrCast(@alignCast(ptr));
+            return self.source.skip(maximum);
+        }
         fn closeGroups(_: *anyopaque) void {} // Parent cursor retains the cut.
         fn nextGroups(ptr: *anyopaque, a: A, maximum: usize, _: bool) !?@import("operators.zig").GroupBatch {
             if (maximum == 0) return error.InvalidSqlBackendResponse;
@@ -581,9 +585,13 @@ pub const Cursor = struct {
             reducer.* = .{ .field = field, .kind = request.observer.?, .predicate = predicate };
         }
         const scalar_groups = (try stream.planScalarGroups(keys, orders, reducers, source)) orelse return false;
+        if (requests[0].observer_window) |window| if (try stream.preferScalarGroupScan(window.maximum, window.retained_bytes, keys.len, reducers.len, source)) {
+            scalar_groups.deinit();
+            return false;
+        };
         const state = try a.create(GroupState);
         state.* = .{ .source = scalar_groups, .orders = try a.dupe(cypher.runtime.NodeCursor.GroupOrder, orders) };
-        try grouped.adoptFinalized(.{ .ptr = state, .count = std.math.maxInt(usize), .exact_count = false, .ordered = true, .batch_rows = 1, .next = GroupState.nextGroups, .close = GroupState.closeGroups }, std.math.maxInt(usize));
+        try grouped.adoptFinalized(.{ .ptr = state, .count = std.math.maxInt(usize), .exact_count = false, .ordered = true, .batch_rows = 1, .skip = GroupState.skip, .next = GroupState.nextGroups, .close = GroupState.closeGroups }, std.math.maxInt(usize));
         self.groups = state;
         return true;
     }

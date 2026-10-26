@@ -601,6 +601,11 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.exportSystemCatalog(alloc, svc.metadata_group_id);
         },
+        .graph_authority => |request| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk std.json.Stringify.valueAlloc(alloc, try store.graphAuthority(alloc, svc.metadata_group_id, try svc.metadataIncarnation(), request), .{});
+        },
         .read => |request| blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;

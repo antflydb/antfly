@@ -29,6 +29,13 @@ const Guard = struct {
         try self.check.call(self.check.ptr, a);
         return result;
     }
+    fn skip(ptr: *anyopaque, maximum: usize) !usize {
+        const self: *Guard = @ptrCast(@alignCast(ptr));
+        try self.check.call(self.check.ptr, self.a);
+        const result = try self.source.skip.?(self.source.ptr, maximum);
+        try self.check.call(self.check.ptr, self.a);
+        return result;
+    }
     fn close(ptr: *anyopaque) void {
         const self: *Guard = @ptrCast(@alignCast(ptr));
         const a = self.a;
@@ -42,6 +49,7 @@ pub fn wrap(a: std.mem.Allocator, grouped: *operators.Grouped, check: Check) !vo
     guard.* = .{ .a = a, .source = source, .check = check };
     grouped.finalized.?.ptr = guard;
     grouped.finalized.?.next = Guard.next;
+    if (source.skip != null) grouped.finalized.?.skip = Guard.skip;
     grouped.finalized.?.close = Guard.close;
 }
 
@@ -61,6 +69,12 @@ test "sql.finalized group guard checks authority before and after every pull" {
             if (self.revoke_on_pull) self.allowed = false;
             return null;
         }
+        fn skip(ptr: *anyopaque, maximum: usize) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pulls += 1;
+            if (self.revoke_on_pull) self.allowed = false;
+            return maximum;
+        }
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.closes += 1;
@@ -69,7 +83,7 @@ test "sql.finalized group guard checks authority before and after every pull" {
     var source: Source = .{};
     const grouped = try operators.Grouped.create(std.testing.allocator, &.{.{ .kind = .count }}, .{});
     errdefer grouped.deinit();
-    try grouped.adoptFinalized(.{ .ptr = &source, .count = 1, .next = Source.next, .close = Source.close }, 1);
+    try grouped.adoptFinalized(.{ .ptr = &source, .count = 1, .skip = Source.skip, .next = Source.next, .close = Source.close }, 1);
     try wrap(std.testing.allocator, grouped, .{ .ptr = &source, .call = Source.check });
     const final = grouped.finalized.?;
     source.allowed = false;
@@ -82,6 +96,12 @@ test "sql.finalized group guard checks authority before and after every pull" {
     source.allowed = true;
     source.revoke_on_pull = false;
     try std.testing.expectEqual(@as(?operators.GroupBatch, null), try final.next(final.ptr, std.testing.allocator, 1, false));
+    source.revoke_on_pull = true;
+    try std.testing.expectError(error.TestUnexpectedResult, final.skip.?(final.ptr, 1));
+    source.allowed = false;
+    const pulls = source.pulls;
+    try std.testing.expectError(error.TestUnexpectedResult, final.skip.?(final.ptr, 1));
+    try std.testing.expectEqual(pulls, source.pulls);
     grouped.deinit();
     try std.testing.expectEqual(@as(usize, 1), source.closes);
 }

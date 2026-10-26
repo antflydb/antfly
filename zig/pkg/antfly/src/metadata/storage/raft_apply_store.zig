@@ -12213,6 +12213,17 @@ pub const RaftApplyStore = struct {
         return table;
     }
 
+    pub fn graphAuthority(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, incarnation: ?metadata.MetadataClusterIncarnation, request: @import("../../system_catalog/server_call.zig").GraphAuthority) !@import("../../system_catalog/server_call.zig").GraphAuthorityResult {
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
+        const head: @import("../api.zig").MetadataHead = .{ .metadata_group_id = group_id, .metadata_incarnation = incarnation, .metadata_epoch = meta.revision };
+        if (incarnation != null) if (request.known_head) |known| if (std.meta.eql(known, head)) return .{ .head = head, .state = .unchanged };
+        var record = (try system_catalog_storage.find(alloc, &txn, group_id, .graph, 0, request.name)) orelse return .{ .head = head, .state = .absent };
+        defer record.deinit();
+        return .{ .head = head, .state = if (record.value.id == request.graph_id) .present else .absent };
+    }
+
     pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
@@ -40457,4 +40468,43 @@ test "resolver curation namespace propagation persists compact bindings and mate
     try std.testing.expect(missing_configs[0].namespace_curation_missing);
     try std.testing.expectEqual(@as(usize, 0), missing_configs[0].merges.len);
     try std.testing.expectEqual(@as(usize, 1), store.resolver_projection_exports);
+}
+
+test "system catalog graph authority probes fence incarnation and avoid definition decoding" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-authority", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const large = try alloc.alloc(u8, 128 << 10);
+    defer alloc.free(large);
+    @memset(large, 'x');
+    const graph: system_catalog.Resource = .{ .kind = .graph, .id = 7, .name = "g", .source_json = large };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try system_catalog_storage.applyDelta(alloc, &txn, 21, .{ .next_id = 8, .upserts = @constCast(&.{graph}), .removes = &.{} }, .{}, @splat(0));
+        try txn.commit();
+    }
+    const incarnation: metadata.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    const first = try store.graphAuthority(alloc, 21, incarnation, .{ .name = "g", .graph_id = 7 });
+    try std.testing.expect(first.state == .present);
+    var buffer: [4096]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    const unchanged = try store.graphAuthority(bounded.allocator(), 21, incarnation, .{ .name = "g", .graph_id = 7, .known_head = first.head });
+    try std.testing.expect(unchanged.state == .unchanged);
+    const next_incarnation: metadata.MetadataClusterIncarnation = "1123456789abcdef0123456789abcdef".*;
+    const recaptured = try store.graphAuthority(alloc, 21, next_incarnation, .{ .name = "g", .graph_id = 7, .known_head = first.head });
+    try std.testing.expect(recaptured.state == .present);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try system_catalog_storage.applyDelta(alloc, &txn, 21, .{ .next_id = 8, .removes = @constCast(&.{graph}), .upserts = &.{} }, .{ .revision = 1, .next_id = 8 }, @splat(0));
+        try txn.commit();
+    }
+    bounded.reset();
+    const removed = try store.graphAuthority(bounded.allocator(), 21, incarnation, .{ .name = "g", .graph_id = 7, .known_head = first.head });
+    try std.testing.expect(removed.state == .absent);
 }

@@ -8561,6 +8561,11 @@ test "grouped reducer domains retain nonleading admission as a runtime residual"
 test "ordered scalar group cursor seeks NULL phases and complete reducer domains" {
     const F = struct {
         nodes: []const v.Node,
+        scalar_reads: usize = 0,
+        fn estimate(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const b.PropertyFilter, limit: usize) !?usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @min(self.nodes.len, limit);
+        }
         fn checkpoint(_: *anyopaque) !void {}
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
             return error.TestUnexpectedResult;
@@ -8578,7 +8583,10 @@ test "ordered scalar group cursor seeks NULL phases and complete reducer domains
         fn ordered(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, filters: []const b.PropertyFilter, fields: []const b.PropertyOrder, after: ?[]const u8, limit: usize, _: usize) !?b.Page(*const v.Node) {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = "", .exact_keys = true, .stable_ties = fields.len == 0 };
-            if (fields.len != 0) try std.testing.expectEqual(@as(usize, 1), fields.len);
+            if (fields.len != 0) {
+                try std.testing.expectEqual(@as(usize, 1), fields.len);
+                if (std.mem.eql(u8, fields[0].property, "rank")) self.scalar_reads += 1;
+            }
             const anchor = if (after) |id| for (self.nodes) |*node| {
                 if (std.mem.eql(u8, id, node.identity.key)) break node;
             } else null else null;
@@ -8632,7 +8640,7 @@ test "ordered scalar group cursor seeks NULL phases and complete reducer domains
     const nodes = try a.alloc(v.Node, ids.len);
     for (nodes, ids, ranks, 0..) |*node, id, rank, i| node.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "{d}", .{i}) }, .labels = &.{"Document"}, .properties = try a.dupe(v.Entry, &.{ .{ .name = "id", .value = if (id) |value| .{ .string = value } else .null }, .{ .name = "rank", .value = if (rank) |value| .{ .integer = value } else .null } }) };
     var fixture: F = .{ .nodes = nodes };
-    const backend: b.Backend = .{ .ptr = &fixture, .vtable = &.{ .bind = Fixture.bind, .checkpoint = F.checkpoint, .scan = F.scan, .scan_where = F.scanWhere, .get = Fixture.get, .expand = Fixture.expand, .scan_ordered = F.ordered } };
+    const backend: b.Backend = .{ .ptr = &fixture, .vtable = &.{ .bind = Fixture.bind, .checkpoint = F.checkpoint, .scan = F.scan, .scan_where = F.scanWhere, .get = Fixture.get, .expand = Fixture.expand, .scan_ordered = F.ordered, .estimate_where = F.estimate } };
     var diagnostic: c.Diagnostic = .{};
     var compiled = try c.compile(a, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
     defer compiled.deinit();
@@ -8653,6 +8661,23 @@ test "ordered scalar group cursor seeks NULL phases and complete reducer domains
             // same 3,000-entry invocation RHS or retain prior group key data.
             if (i != 0) try std.testing.expect(cursor.engine.stats.intermediate_states - before < 5000);
         }
+        try std.testing.expect((try groups.next(a)) == null);
+    }
+    {
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{})).?;
+        defer cursor.close();
+        const groups = (try cursor.planScalarGroups(&.{"id"}, &.{.{ .key = 0, .descending = false, .nulls_first = true }}, &.{.{ .field = "rank", .kind = .distinct }}, null)).?;
+        defer groups.deinit();
+        try std.testing.expect(try cursor.preferScalarGroupScan(100, 1 << 20, 1, 1, null));
+        try std.testing.expect(!try cursor.preferScalarGroupScan(1, 1 << 20, 1, 1, null));
+        try std.testing.expect(!try cursor.preferScalarGroupScan(100, 1, 1, 1, null));
+        const reads = fixture.scalar_reads;
+        try std.testing.expectEqual(@as(usize, 2), try groups.skip(2));
+        try std.testing.expectEqual(reads, fixture.scalar_reads);
+        const result = (try groups.next(a)).?;
+        try std.testing.expectEqualStrings("b", result.keys[0].string);
+        try std.testing.expectEqual(@as(i64, 0), result.values[0].integer);
+        try std.testing.expectEqual(@as(usize, 1), try groups.skip(100));
         try std.testing.expect((try groups.next(a)) == null);
     }
     for ([_]bool{ false, true }) |descending| {

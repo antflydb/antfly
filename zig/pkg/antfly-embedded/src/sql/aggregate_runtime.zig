@@ -697,6 +697,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             // Keep the original obligations for every fallback. The producer
             // must certify this restricted domain before any groups are skipped.
             const stream_requests = try context.arena.dupe(catalog.AggregateWeight, requests);
+            for (stream_requests) |*request| request.observer_window = .{ .descending = &.{}, .maximum = std.math.add(u64, offset, limit) catch return error.SqlProgramLimitExceeded, .retained_bytes = if (bound.having == null) context.limits.retained_bytes / 2 else 0 };
             if (try @import("group_output.zig").predicate(context.arena, bound, table, context.parameters, context.invocation_constants)) |filter| {
                 for (stream_requests) |*request| request.observer_filter = if (request.observer_filter) |prior|
                     .{ .all = try context.arena.dupe(catalog.Scan.GraphFilter, &.{ prior, filter }) }
@@ -815,7 +816,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         return projection.finish(context, &top.?, offset, limit, statement.limit == null);
     }
     const early_limit = direct_delivery;
-    var delivered: usize = 0;
+    var delivered: usize = if (direct_delivery and bound.having == null) try grouped.skipPrefix(offset) else 0;
     result_pages: while (true) {
         try context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(context.alloc);

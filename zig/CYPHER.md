@@ -3591,3 +3591,39 @@ reduction takes 88 ms versus about 127 ms before; key HAVING takes 5.5 ms versus
 whole-query measurements include owner/catalog startup and storage work; that
 startup still validates mapped owners even though repeated authority checkpoints
 now use a constant-time cohort check.
+
+SQL finalized scalar groups expose a certified key-only prefix operation. The
+SQL host uses it only for total output with no HAVING; HAVING still chooses the
+accepted groups before OFFSET. Skipped keys retain their continuation and count
+against the same logical row/page and Cypher work quotas, but allocate no output
+cells and evaluate no reducers. Embedded and hosted cursor wrappers validate
+authority before and after the prefix, and each key retains engine checkpoints.
+
+Ordered seek negotiation also considers the requested OFFSET + LIMIT, reducer
+count, bounded source cardinality, available retained bytes and work headroom.
+Small windows retain indexed seeks. A deep window may decline streaming for the
+ordinary full-pass aggregate when a conservative estimate fits its memory and
+work budget. Unknown or capped estimates retain bounded traversal. Costing is
+advisory and supplies no pruning certificate; fallible projections and HAVING
+continue through the existing proof and fallback boundaries.
+
+Embedded graph catalogs store a small versioned manifest and independently
+indexed graph records. Named queries read a format marker and one record, so
+unrelated graph definitions no longer inflate query startup. Listing still
+materializes the full catalog. Version 1 catalogs remain readable and migrate
+atomically on their next mutation. Manifest comparison under the write
+transaction rejects a stale predecessor; updates preserve incarnation, while
+drop/recreate allocates a fresh identity. Response encoding precedes commit.
+Old binaries reject the version 2 manifest, and future format markers reject
+reads and writes rather than downgrading the catalog.
+
+Hosted graph checkpoints batch graph/table ACL checks against one live
+permission snapshot, including API-key expiry and current owner/key permission
+intersection. The admitted request scope remains an additional intersection.
+The metadata authority endpoint performs a linearizable conditional probe of
+catalog group, cluster incarnation and catalog revision. An unchanged head
+avoids graph-definition and dependency-closure decoding; a changed head checks
+the indexed graph identity. A null incarnation cannot certify an unchanged
+head. Checks still bracket every data RPC: this reduces allocation and decoding
+work, and retains both control-plane round trips and immediate revocation
+behavior. Custom sources without the probe capability retain full catalog reads.

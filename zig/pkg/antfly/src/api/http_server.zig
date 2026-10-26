@@ -2012,6 +2012,7 @@ pub const StatusSource = struct {
 
     pub const VTable = struct {
         supports_query_definitions: bool = false,
+        supports_graph_authority_probe: bool = false,
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
         supports_resolver_catalog_read: bool = false,
@@ -2773,6 +2774,7 @@ pub const StatusSource = struct {
         return .{
             .system_catalog = Gen.systemCatalog,
             .supports_query_definitions = true,
+            .supports_graph_authority_probe = true,
             .supports_object_tables = true,
             .supports_resolver_catalog_read = true,
             .supports_resolver_authority = true,
@@ -28737,6 +28739,21 @@ pub fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?Authenticat
         if (!(try tablePermissionCurrentlyAllowed(identity, foreign_key.parent_table, .admin))) return false;
     };
     return true;
+}
+
+pub const GraphPermissionCheck = usermgr.UserManager.PermissionCheck;
+pub fn resourcePermissionsCurrentlyAllowed(alloc: std.mem.Allocator, authenticated_identity: ?AuthenticatedIdentity, checks: []const usermgr.UserManager.PermissionCheck) !bool {
+    const identity = authenticated_identity orelse return true;
+    for (checks) |check| if (!permissionsAllow(identity.permissions, check.resource_type, check.resource, check.permission_type)) return false;
+    const manager = identity.live_user_manager orelse return true;
+    const logical = try alloc.dupe(usermgr.UserManager.PermissionCheck, checks);
+    for (logical) |*check| if (check.resource_type == .table) {
+        for (identity.catalog_aliases) |alias| if (std.mem.eql(u8, alias.physical, check.resource)) {
+            check.resource = alias.logical;
+            break;
+        };
+    };
+    return manager.permissionsCurrentlyAllowed(identity.username, identity.credential_principal, logical);
 }
 
 pub fn tablePermissionCurrentlyAllowed(identity: ?AuthenticatedIdentity, table_name: []const u8, permission_type: usermgr.PermissionType) !bool {

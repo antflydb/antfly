@@ -6502,6 +6502,7 @@ test "SQL ordered scalar groups keep the cut alive and stop after accepted HAVIN
         expected_filter: enum { none, key, empty } = .none,
         position: usize = 0,
         pulls: usize = 0,
+        skipped: usize = 0,
         closed: usize = 0,
         fn cast(ptr: *anyopaque) *@This() {
             return @ptrCast(@alignCast(ptr));
@@ -6544,8 +6545,15 @@ test "SQL ordered scalar groups keep the cut alive and stop after accepted HAVIN
                     try std.testing.expect(filter == .any and filter.any.len == 0);
                 },
             }
-            try grouped.adoptFinalized(.{ .ptr = ptr, .count = 64, .exact_count = false, .ordered = true, .batch_rows = 1, .next = next, .close = closeGroups }, 100);
+            try grouped.adoptFinalized(.{ .ptr = ptr, .count = 64, .exact_count = false, .ordered = true, .batch_rows = 1, .skip = skip, .next = next, .close = closeGroups }, 100);
             return true;
+        }
+        fn skip(ptr: *anyopaque, maximum: usize) !usize {
+            const self = cast(ptr);
+            const count = @min(maximum, 64 - self.position);
+            self.position += count;
+            self.skipped += count;
+            return count;
         }
         fn next(ptr: *anyopaque, a: std.mem.Allocator, maximum: usize, _: bool) !?operators.GroupBatch {
             const self = cast(ptr);
@@ -6578,7 +6586,19 @@ test "SQL ordered scalar groups keep the cut alive and stop after accepted HAVIN
             try std.testing.expectEqualStrings("1", row[1].string);
         }
         try std.testing.expectEqual(@as(usize, 10), driver.pulls);
+        try std.testing.expectEqual(@as(usize, 0), driver.skipped);
         try std.testing.expectEqual(@as(usize, 1), driver.closed);
+    }
+    {
+        var compiled = try compiler.compile(a, "SELECT id,count(DISTINCT score) FROM docs GROUP BY id ORDER BY id NULLS FIRST OFFSET 40 LIMIT 3", .{});
+        defer compiled.deinit();
+        var driver: Driver = .{};
+        var result = try execute(a, driver.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 40), driver.skipped);
+        try std.testing.expectEqual(@as(usize, 3), driver.pulls);
+        try std.testing.expectEqualStrings("40", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("42", result.output.rows[2][0].string);
     }
     // Bind the parameter through SQL's typed invocation before licensing a cut.
     {

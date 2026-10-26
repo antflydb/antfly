@@ -133,6 +133,7 @@ pub const AuthorityChannel = struct {
     read: ?*port.GraphRead = null,
     read_owner: ?*?port.GraphRead = null,
     last_authority_check: ?u64 = null,
+    catalog_head: ?@import("../metadata/api.zig").MetadataHead = null,
     role_revision: ?u64 = null,
     fn releaseRead(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -156,15 +157,29 @@ pub const AuthorityChannel = struct {
             const manager = principal.live_user_manager orelse return error.Forbidden;
             if (manager.rowPolicyRoleRevision() != revision) return error.Forbidden;
         }
-        if (!try server_mod.resourcePermissionCurrentlyAllowed(self.identity.*, .graph, self.name, .read)) return error.Forbidden;
-        if (self.writes and !try server_mod.resourcePermissionCurrentlyAllowed(self.identity.*, .graph, self.name, .write)) return error.Forbidden;
-        for (self.tables) |table| {
-            if (!try server_mod.tablePermissionCurrentlyAllowed(self.identity.*, table.name, .read)) return error.Forbidden;
-            if (self.writes and !try server_mod.tablePermissionCurrentlyAllowed(self.identity.*, table.name, .write)) return error.Forbidden;
-        }
         var arena = std.heap.ArenaAllocator.init(self.server.alloc);
         defer arena.deinit();
         const a = arena.allocator();
+        var checks: std.ArrayList(server_mod.GraphPermissionCheck) = .empty;
+        try checks.append(a, .{ .resource_type = .graph, .resource = self.name, .permission_type = .read });
+        if (self.writes) try checks.append(a, .{ .resource_type = .graph, .resource = self.name, .permission_type = .write });
+        for (self.tables) |table| {
+            try checks.append(a, .{ .resource_type = .table, .resource = table.name, .permission_type = .read });
+            if (self.writes) try checks.append(a, .{ .resource_type = .table, .resource = table.name, .permission_type = .write });
+        }
+        if (!try server_mod.resourcePermissionsCurrentlyAllowed(a, self.identity.*, checks.items)) return error.Forbidden;
+        if (self.server.source.vtable.supports_graph_authority_probe) {
+            const bytes = try self.server.source.systemCatalog(a, self.context, .{ .graph_authority = .{ .name = self.name, .graph_id = self.record_id, .known_head = self.catalog_head } });
+            const reply = try std.json.parseFromSliceLeaky(@import("../system_catalog/server_call.zig").GraphAuthorityResult, a, bytes, .{});
+            switch (reply.state) {
+                .absent => return error.CatalogGenerationChanged,
+                .unchanged => if (self.catalog_head == null or !std.meta.eql(self.catalog_head.?, reply.head)) return error.CatalogGenerationChanged,
+                .present => {},
+            }
+            self.catalog_head = reply.head;
+            self.last_authority_check = now;
+            return;
+        }
         const bytes = try self.server.source.systemCatalog(a, self.context, .{ .read = .{ .kind = .graph, .name = self.name } });
         const state = try std.json.parseFromSliceLeaky(domain.State, a, bytes, .{});
         const record = state.find(.graph, 0, self.name) orelse return error.CatalogGenerationChanged;

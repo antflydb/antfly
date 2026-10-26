@@ -1802,6 +1802,7 @@ pub const Grouped = struct {
         exact_count: bool = true,
         ordered: bool = false,
         batch_rows: usize = 4096,
+        skip: ?*const fn (*anyopaque, usize) anyerror!usize = null,
         next: *const fn (*anyopaque, Allocator, usize, bool) anyerror!?GroupBatch,
         close: *const fn (*anyopaque) void,
     };
@@ -1843,6 +1844,18 @@ pub const Grouped = struct {
         self.finalized = source;
         self.finalized_quota = .{ .capacity = source.batch_rows, .row_limit = self.limits.groups, .page_limit = page_limit };
         self.finished = true;
+    }
+    /// Consume a certified prefix without allocating aggregate/output cells.
+    /// The producer owns key traversal; logical row/page quotas still apply.
+    pub fn skipPrefix(self: *Grouped, maximum: usize) !usize {
+        const source = self.finalized orelse return 0;
+        const skip = source.skip orelse return 0;
+        if (!source.ordered or maximum == 0) return 0;
+        const count = try skip(source.ptr, maximum);
+        if (count > maximum or count > source.count -| self.output_count) return error.InvalidSqlBackendResponse;
+        try self.finalized_quota.admit(count, count < maximum);
+        self.output_count += count;
+        return count;
     }
     fn nextFinalized(self: *Grouped, a: Allocator, maximum: usize, exact: bool) !?GroupBatch {
         const source = self.finalized.?;

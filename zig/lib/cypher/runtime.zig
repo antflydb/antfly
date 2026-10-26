@@ -520,9 +520,19 @@ pub const NodeCursor = struct {
             return false;
         }
         pub fn next(self: *ScalarGroups, a: A) !?Group {
-            return self.nextInner(a) catch |err| return if (self.cursor.budget.exhausted) error.CypherMemoryBudgetExceeded else err;
+            return self.nextInner(a, true) catch |err| return if (self.cursor.budget.exhausted) error.CypherMemoryBudgetExceeded else err;
         }
-        noinline fn nextInner(self: *ScalarGroups, a: A) !?Group {
+        /// The host licenses this only for total output without HAVING. Each
+        /// discarded key uses a reclaiming epoch and never evaluates reducers.
+        pub fn skip(self: *ScalarGroups, maximum: usize) !usize {
+            var count: usize = 0;
+            while (count < maximum) : (count += 1) {
+                const group = self.nextInner(self.cursor.budget.allocator(), false) catch |err| return if (self.cursor.budget.exhausted) error.CypherMemoryBudgetExceeded else err;
+                if (group == null) break;
+            }
+            return count;
+        }
+        noinline fn nextInner(self: *ScalarGroups, a: A, reduce: bool) !?Group {
             const parent = self.cursor.engine;
             const invocation = self.invocation;
             var arena = std.heap.ArenaAllocator.init(self.cursor.budget.allocator());
@@ -599,8 +609,9 @@ pub const NodeCursor = struct {
                 const row = (try self.successor(keys[0..index], null)) orelse return if (index == 0) null else error.CypherInvalidBackendPage;
                 keys[index] = row[0].value;
             }
-            const values = try a.alloc(v.Value, self.reducers.len);
-            for (self.reducers, values) |reducer, *value| {
+            const demanded = if (reduce) self.reducers else &.{};
+            const values = try a.alloc(v.Value, demanded.len);
+            for (demanded, values) |reducer, *value| {
                 if (self.empty(reducer.predicate, 0)) {
                     value.* = if (reducer.kind == .distinct) .{ .integer = 0 } else .null;
                     continue;
@@ -622,16 +633,35 @@ pub const NodeCursor = struct {
             }
             _ = self.retained.reset(.free_all);
             const saved = try self.retained.allocator().alloc(v.Value, keys.len);
-            const output = try a.alloc(v.Value, keys.len);
-            for (keys, saved, output) |key, *last, *out| {
-                last.* = try key.clone(self.retained.allocator());
+            const output = try a.alloc(v.Value, if (reduce) keys.len else 0);
+            for (keys, saved) |key, *last| last.* = try key.clone(self.retained.allocator());
+            if (reduce) for (keys, output) |key, *out| {
                 out.* = try key.clone(a);
-            }
+            };
             self.last = saved;
             self.ordinal += 1;
             return .{ .keys = output, .values = values };
         }
     };
+    /// Advisory costing only: never a pruning certificate. Decline a seek
+    /// plan only when a bounded full pass has ample physical-work and memory
+    /// headroom. Unknown or capped cardinalities retain the bounded cursor.
+    pub fn preferScalarGroupScan(self: *NodeCursor, maximum: u64, memory_bytes: usize, group_count: usize, reducer_count: usize, predicate: ?*const ast.Expr) !bool {
+        if (maximum <= 1 or memory_bytes == 0) return false;
+        const e = self.engine;
+        const estimate = e.backend.vtable.estimate_where orelse return false;
+        const node = self.original_match.paths[0].nodes[0];
+        if (node.labels.len != 1) return false;
+        const label = e.graph.label(node.labels[0]) orelse return false;
+        const per_row = std.math.mul(usize, 128, group_count + reducer_count) catch return false;
+        const cap = @min(memory_bytes / @max(1, per_row), e.limits.scanned_anchors, e.limits.intermediate_states / 64);
+        if (cap == 0) return false;
+        const filters = try e.nodeFilters(node, predicate, &.{});
+        const rows = (try estimate(e.backend.ptr, e.a, label.table, filters, cap)) orelse return false;
+        if (rows >= cap) return false;
+        const seeks = std.math.mul(u64, maximum, @as(u64, @intCast(reducer_count + group_count)) * 4) catch return true;
+        return seeks > rows;
+    }
     pub noinline fn planScalarGroups(self: *NodeCursor, groups: []const []const u8, orders: []const GroupOrder, reducers: []const GroupReducer, predicate: ?*const ast.Expr) !?*ScalarGroups {
         if (self.started or self.done or self.window_projection != null or self.original_match.paths.len != 1 or self.original_match.paths[0].edges.len != 0 or groups.len == 0 or orders.len != groups.len or reducers.len == 0) return null;
         const e = self.engine;

@@ -9089,3 +9089,56 @@ def test_duplicate_membership_inputs_preserve_indexed_domains(graph_db):
         "g", {"query": "RETURN size($values),0 IN $values", "parameters": {"values": [1, None, 2] * 400}}
     )
     assert [cell["value"] for cell in result["rows"][0]] == ["1200", None]
+
+
+@pytest.mark.parametrize("storage", [af.Storage.LITE, af.Storage.DIRECTORY])
+def test_indexed_graph_catalog_preserves_reopen_update_drop_and_other_records(require_native, tmp_path, storage):
+    path = tmp_path / ("indexed.aflite" if storage == af.Storage.LITE else "indexed")
+    options = af.OpenOptions(storage=storage)
+    opener = af.create_with_options if storage == af.Storage.LITE else af.open_with_options
+    definition = {"labels": [{"name": "D", "table": "docs"}], "relationships": []}
+    with closing(opener(path, options)) as db:
+        db.sql("CREATE TABLE docs(id TEXT)")
+        first = db.graph_catalog_json({"action": "put", "name": "g", "definition": definition})
+        aliases = {"labels": [{"name": f"L{i}", "table": "docs"} for i in range(64)], "relationships": []}
+        for i in range(64):
+            db.graph_catalog_json({"action": "put", "name": f"other_{i}", "definition": aliases})
+        assert db.graph_catalog_json({"action": "get", "name": "g"}) == first
+        assert db.cypher_json("g", {"query": "RETURN 1"})["rows"][0][0]["value"] == "1"
+    with closing(af.open_with_options(path, options)) as db:
+        assert len(db.graph_catalog_json({"action": "list"})) == 65
+        updated = db.graph_catalog_json(
+            {"action": "put", "name": "g", "expected_revision": "1", "definition": definition}
+        )
+        assert updated["revision"] == "2" and updated["incarnation"] == first["incarnation"]
+        with pytest.raises(af.GraphError):
+            db.graph_catalog_json({"action": "drop", "name": "g", "expected_revision": "1"})
+        db.graph_catalog_json({"action": "drop", "name": "g", "expected_revision": "2"})
+        with pytest.raises(af.GraphError):
+            db.graph_catalog_json({"action": "get", "name": "g"})
+        recreated = db.graph_catalog_json({"action": "put", "name": "g", "definition": definition})
+        assert recreated["incarnation"] != first["incarnation"]
+        assert db.graph_catalog_json({"action": "get", "name": "other_63"})["definition"] == aliases
+
+
+def test_sql_group_costing_and_prefix_skip_preserve_order_and_reducer_values(graph_db):
+    populate(graph_db, 4000)
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    graph_db.run_until_idle()
+    source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
+    # Small windows retain seeks; deep windows may choose a full source pass.
+    # Both must agree with an expression order that declines ordered streaming.
+    for reducers in ("count(DISTINCT score)", "count(DISTINCT score),min(score),max(score)"):
+        for offset in (0, 99, 2999, 4001):
+            for direction in ("ASC", "DESC"):
+                query = (
+                    f"SELECT id,{reducers} FROM {source} GROUP BY id ORDER BY id {direction} OFFSET {offset} LIMIT 1"
+                )
+                control = query.replace(f"ORDER BY id {direction}", f"ORDER BY id||'' {direction}")
+                assert graph_db.sql(query)["rows"] == graph_db.sql(control)["rows"], query
+    # HAVING changes the accepted group sequence and must precede OFFSET.
+    query = (
+        f"SELECT id,count(DISTINCT score) FROM {source} GROUP BY id "
+        "HAVING min(score)%2=0 ORDER BY id OFFSET 999 LIMIT 3"
+    )
+    assert graph_db.sql(query)["rows"] == graph_db.sql(query.replace("ORDER BY id", "ORDER BY id||''"))["rows"]

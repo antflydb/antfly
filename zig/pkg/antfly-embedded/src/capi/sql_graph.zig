@@ -84,6 +84,7 @@ const Cursor = struct {
             self.group_source = grouped.finalized orelse return error.InvalidSqlBackendResponse;
             grouped.finalized.?.ptr = self;
             grouped.finalized.?.next = nextGroups;
+            if (self.group_source.?.skip != null) grouped.finalized.?.skip = skipGroups;
             grouped.finalized.?.close = closeGroups;
         }
         try self.read.validate();
@@ -94,6 +95,14 @@ const Cursor = struct {
         try self.read.validate();
         const source = self.group_source.?;
         const result = try source.next(source.ptr, a, maximum, exact);
+        try self.read.validate();
+        return result;
+    }
+    fn skipGroups(ptr: *anyopaque, maximum: usize) !usize {
+        const self: *Cursor = @ptrCast(@alignCast(ptr));
+        try self.read.validate();
+        const source = self.group_source.?;
+        const result = try source.skip.?(source.ptr, maximum);
         try self.read.validate();
         return result;
     }

@@ -645,7 +645,7 @@ pub const SummaryCertificate = struct {
     linear: ?@import("cypher").linear_bounds.Check = null,
 };
 /// Exact finite prefix of group keys; negotiated only by total scalar reducers.
-pub const ObserverWindow = struct { descending: []const bool, maximum: u64 };
+pub const ObserverWindow = struct { descending: []const bool, maximum: u64, retained_bytes: usize = 0 };
 pub const AggregateWeight = struct { observer_window: ?ObserverWindow = null, observer_reducer_filter: ?Scan.GraphFilter = null, observer_field: ?[]const u8 = null, observer_keys: []const []const u8 = &.{}, observer_filter: ?Scan.GraphFilter = null, observer: ?@import("cypher").runtime.NodeCursor.ScalarObserver = null, fields: []const []const u8, multiplicity: Multiplicity, summary: ?[]const u8 = null, invariants: []const []const u8 = &.{}, summaries: []const SummaryCertificate = &.{} };
 /// Borrowed snapshot-local costing evidence. Providers never perform I/O for
 /// optimizer statistics; absent fields remain unknown. Frequencies and hashes
