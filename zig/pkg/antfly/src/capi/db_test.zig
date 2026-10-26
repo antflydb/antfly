@@ -6515,6 +6515,72 @@ test "capi native resolver maintenance retries transient inference and survives 
     try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
 }
 
+test "capi native foreground reuses free pages during a captured worker turn" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-captured-reuse");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+        const large: [32768]u8 = @splat('x');
+        for (0..16) |_| try file.putCatalogRecord("test/free-pool", &large);
+        try file.deleteCatalogRecord("test/free-pool");
+        _ = try file.reclaimPages(4096);
+        try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 16);
+        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"captured\"}" }}, .sync_level = .write });
+        owner.maintenance_pending = true;
+    }
+    const Fixture = struct {
+        handle: ?*anyopaque,
+        ran: bool = false,
+        failure: ?anyerror = null,
+        fn check(self: *@This()) !void {
+            const guard = public.enterHandle(self.handle, .exclusive).?;
+            defer guard.leave();
+            const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+            const before = (try file.allocatorStats()).?.reused_pages;
+            for (0..4) |i| try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = if (i % 2 == 0) "{\"body\":\"concurrent-a\"}" else "{\"body\":\"concurrent-b\"}" }}, .sync_level = .write });
+            try std.testing.expect((try file.allocatorStats()).?.reused_pages > before);
+        }
+        fn notify(raw: *anyopaque, snapshot: *shared.Handle) void {
+            if (!snapshot.db_live) return;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ran = true;
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var fixture = Fixture{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &fixture, .notify = Fixture.notify };
+    defer owner.test_after_capture = null;
+    _ = try owner.maintenanceTurnForTest();
+    if (fixture.failure) |err| return err;
+    try std.testing.expect(fixture.ran);
+}
+
 test "capi SQL native maintenance carries orphan sweep progress across replay snapshots" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;

@@ -245,7 +245,7 @@ pub const Registry = struct {
         // Writable roots are protected by the catalog reference. Read-only
         // sources use the established external-reader lock, since they cannot
         // publish a lease and external writers must not reuse their pages.
-        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .no_sync = true });
+        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .reader_coordinator = owner.file.reader_coordinator, .no_sync = true });
         errdefer reader.close();
         reader.page_cache_enabled.store(false, .monotonic);
         var capture = Capture{ .allocator = a, .key = key, .lease_key = lease_key };

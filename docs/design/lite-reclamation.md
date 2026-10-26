@@ -435,3 +435,34 @@ previously published partial roots remain durable and resumable. Cancellation
 is not injected into the final durability boundary, whose existing uncertainty
 fencing remains authoritative. Cooperative maintenance calls have independent
 cancellation from the owner's worker shutdown token.
+
+
+### Reuse during detached native turns
+
+A detached runtime used to hold shared locks on the entire inode through replay
+and provider work. Those locks correctly protected snapshots but also disabled
+reuse of pages already free before capture. Rapid native writes could append
+throughout the lifetime of a worker turn, including in short-lived processes.
+
+The connection now coordinates its data-reader fences. While holding the same
+cross-process path-writer lease used for publication, a verified writer accounts
+for their oldest checkpoint, suspends only its own shared inode locks, and tries
+the normal exclusive inode lock. Retirement retains the captured reader frontier
+for the entire allocation window. Remaining external readers still deny exclusive
+reuse. Shared locks are restored before releasing the path-writer lease. Reader
+registration and close remain serialized without retaining the registry mutex
+through allocator callbacks, so reclaiming an idle source can release its fence.
+
+An unrecognized checkpoint publication permanently disqualifies existing readers
+from coordinated suspension: an external writer may have promoted retirement
+without knowing their local frontier. Their ordinary shared locks remain until
+close. The next reader generation can coordinate again. Allocator verification
+and integrity readers retain their original whole-inode locks; the coordinated
+frontier applies to data readers, which do not inspect historical allocator pages.
+This changes no file format and requires no cooperation from older processes.
+
+Allocator ownership validation reads packed tree records through one bounded
+physical-page reader. It verifies each loaded bundle and each requested record
+without reconstructing a synthetic checksummed page per inline record. The
+reachable-root and ownership-count checks remain unchanged, including both
+recovery checkpoints and the cancellation fence.
