@@ -20740,13 +20740,13 @@ pub const RaftApplyStore = struct {
 
     fn setFkGenerationTableLocksTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: fk_generation_publication.Plan, acquire: bool) !void {
         const lifecycle = @import("../table_lifecycle_lock.zig");
-        const lock: lifecycle.Lock = .{ .kind = .generation, .id = plan.id };
         for (0..plan.parents.len + 1) |i| {
             const table_id = if (i == 0) plan.child_before.table_id else plan.parents[i - 1].table.table_id;
             // Dual-role self-FK owners share the child table lock. A second
             // acquisition would reject our own publication, while a second
             // release would fail after the first removal.
             if (i != 0 and table_id == plan.child_before.table_id) continue;
+            const lock: lifecycle.Lock = .{ .kind = if (i == 0 and plan.sql_drop != null) .sql_drop else .generation, .id = plan.id };
             var key_buf: [160]u8 = undefined;
             const key = try fk_generation_publication.tableLockKey(&key_buf, group_id, table_id);
             if (acquire) {
@@ -21795,10 +21795,14 @@ pub const RaftApplyStore = struct {
                 .acknowledge => @as(fk_generation_publication.Phase, if (publication.phase == .acknowledging_reference_coverage) .acknowledging_reference_coverage else .acknowledging_parents),
                 .cancel => .canceling,
             }) return error.GenerationPublicationChanged;
-        try self.validateFkGenerationCutTxn(&txn, group_id, publication.plan, publication.phase == .acknowledging_reference_coverage);
+        // DROP proves empty future reference coverage from the frozen source
+        // and retire-only parent generations before deleting the source owner.
+        // Ordinary ALTER still requires the installed successor child image.
+        try self.validateFkGenerationCutTxn(&txn, group_id, publication.plan, publication.phase == .acknowledging_reference_coverage and publication.plan.sql_drop == null);
         const parent = for (publication.plan.parents) |candidate| {
             if (candidate.table.table_id == request.parent_table_id) break candidate;
         } else return error.GenerationPublicationChanged;
+        if (publication.phase == .acknowledging_reference_coverage and !publication.plan.needsParentCoverage(parent)) return error.GenerationPublicationChanged;
         const index = for (parent.ranges, 0..) |range, i| {
             if (range.group_id == request.parent_group_id) break i;
         } else return error.GenerationPublicationChanged;
@@ -21806,6 +21810,7 @@ pub const RaftApplyStore = struct {
         const incarnation_bytes = txn.get(try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id)) catch return error.InvalidMetadataIncarnation;
         const incarnation = (try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation;
         const decision: fk_generation_publication.Decision = .{
+            .sql_drop_control = publication.plan.sql_drop != null,
             .historical_reference_coverage = publication.plan.historical_reference_coverage,
             .reference_coverage_ready = publication.phase == .acknowledging_reference_coverage,
             .phase = publication.phase,
@@ -21848,6 +21853,7 @@ pub const RaftApplyStore = struct {
         const incarnation_bytes = txn.get(try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id)) catch return error.InvalidMetadataIncarnation;
         const incarnation = (try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation;
         const decision: fk_generation_publication.SourceDecision = .{
+            .sql_drop_control = publication.plan.sql_drop != null,
             .historical_reference_coverage = publication.plan.historical_reference_coverage,
             .phase = publication.phase,
             .metadata_group_id = group_id,
@@ -21884,17 +21890,52 @@ pub const RaftApplyStore = struct {
 
     /// Every expected rejection in this helper is read-only. Lock acquisition
     /// begins only after all owners pass; errors after that point must abort.
+    fn validateSqlDropDependenciesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !void {
+        if (try sql_views.firstDependent(txn, group, .table, table.table_id, null) != null) return error.SqlDependentObjectsExist;
+        if (try self.extensionOwnsTableTxn(txn, group, table.name)) return error.ExtensionOwnedObject;
+        if (try backupCohortLocksTableTxn(txn, group, table.table_id) or try restoreStagingLocksTableTxn(txn, group, table.table_id)) return error.TableTransitionActive;
+        var prefix_buffer: [128]u8 = undefined;
+        const prefix = try tablePrefixForGroup(&prefix_buffer, group);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const candidate = try borrowTableProjection(entry.value, .schema);
+            if (candidate.table_id == table.table_id) continue;
+            const definition = candidate.query_definition orelse return error.InvalidCatalogRecord;
+            // Historical read layouts decode old rows; they do not resurrect
+            // a logically removed FK. In-flight generation publication holds
+            // the shared parent lifecycle lock until its native ACKs finish.
+            var declarations = try RelationalDeclarations.parse(self.alloc, definition.schema_json);
+            defer declarations.deinit();
+            if (declarations.value.references(table.name)) return error.ForeignKeyReferenced;
+        }
+    }
+
     fn validateFkGenerationBeginAdmissionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: fk_generation_publication.Plan) !void {
+        if (plan.sql_drop) |guard| {
+            _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_drop_generation_version);
+            try self.validateRelationMutationTxn(txn, group_id, guard, plan.child_before, plan.child_before);
+            try self.validateSqlDropDependenciesTxn(txn, group_id, plan.child_before);
+        }
         if (plan.readerPublicationRequired())
             _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.schema_reader_publication_version);
         if (plan.constraint_name_guard) |guard|
             try self.validateRelationMutationTxn(txn, group_id, guard, plan.child_before, plan.child_after);
         var policy = try system_catalog_storage.loadPolicyPublication(self.alloc, txn, group_id, plan.child_before.table_id);
         defer if (policy) |*record| record.deinit();
-        if (policy) |record| if (record.value.phase != .disabled or system_catalog_storage.policyPublicationNeedsWork(record.value)) return error.RowPolicyUnsupported;
+        if (policy) |record| if ((plan.sql_drop == null and record.value.phase != .disabled) or system_catalog_storage.policyPublicationNeedsWork(record.value)) return error.RowPolicyUnsupported;
         try self.validateFkGenerationCutTxn(txn, group_id, plan, false);
-        for (plan.parents) |parent| if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, parent.table.table_id))
-            return error.RowPolicyUnsupported;
+        for (plan.parents) |parent| {
+            if (plan.sql_drop == null) {
+                if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, parent.table.table_id)) return error.RowPolicyUnsupported;
+            } else {
+                var parent_policy = try system_catalog_storage.loadPolicyPublication(self.alloc, txn, group_id, parent.table.table_id);
+                defer if (parent_policy) |*record| record.deinit();
+                if (parent_policy) |record| if (system_catalog_storage.policyPublicationNeedsWork(record.value)) return error.RowPolicyUnsupported;
+            }
+        }
         for (0..plan.parents.len + 1) |i| {
             const table_id = if (i == 0) plan.child_before.table_id else plan.parents[i - 1].table.table_id;
             if (i != 0 and table_id == plan.child_before.table_id) continue;
@@ -23712,16 +23753,16 @@ pub const RaftApplyStore = struct {
             if (existing) |current_bytes| {
                 var prior_terminal = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, current_bytes, .{});
                 defer prior_terminal.deinit();
-                if (plan.constraint_name_guard != null) try prior_terminal.value.validate(alloc);
+                if (plan.constraint_name_guard != null or plan.sql_drop != null) try prior_terminal.value.validate(alloc);
                 if (prior_terminal.value.phase != .published and prior_terminal.value.phase != .canceled) {
-                    if (plan.constraint_name_guard != null) return;
+                    if (plan.constraint_name_guard != null or plan.sql_drop != null) return;
                     return error.GenerationPublicationChanged;
                 }
                 if (source_tracked) previous_source_digest = try relationFkSourceDigest(prior_terminal.value, table_id);
             }
             self.validateFkGenerationBeginAdmissionTxn(txn, group_id, plan) catch |err| {
-                if (plan.constraint_name_guard != null) switch (err) {
-                    error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired, error.ExtensionOwnedObject, error.GenerationPublicationChanged, error.RowPolicyUnsupported => return,
+                if (plan.constraint_name_guard != null or plan.sql_drop != null) switch (err) {
+                    error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired, error.ExtensionOwnedObject, error.GenerationPublicationChanged, error.RowPolicyUnsupported, error.SqlDependentObjectsExist, error.ForeignKeyReferenced, error.TableTransitionActive => return,
                     else => {},
                 };
                 return err;
@@ -23734,8 +23775,23 @@ pub const RaftApplyStore = struct {
             publication = try previous.?.value.apply(alloc, command);
             if (command.action == .publish_child) {
                 try self.validateFkGenerationCutTxn(txn, group_id, publication.plan, false);
-                var table_key_buf: [160]u8 = undefined;
-                try self.putTableRecordTxnMode(txn, group_id, try tableKeyForGroup(&table_key_buf, group_id, table_id), publication.plan.child_after, true);
+                if (publication.plan.sql_drop) |guard| {
+                    _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_drop_generation_version);
+                    try publication.validate(alloc);
+                    var owner = try self.guardedRelationOwnerTxn(txn, group_id, guard);
+                    defer owner.deinit();
+                    try self.validateSqlDropDependenciesTxn(txn, group_id, publication.plan.child_before);
+                    const lifecycle = @import("../table_lifecycle_lock.zig");
+                    const lock = (try lifecycle.read(txn, group_id, table_id)) orelse return error.GenerationPublicationChanged;
+                    if (lock.kind != .sql_drop or !std.mem.eql(u8, &lock.id, &publication.plan.id)) return error.GenerationPublicationChanged;
+                    const fence = try self.loadTableTransitionFenceTxn(txn, group_id, table_id);
+                    try self.applyTableTopologyMutationWithSqlDropTxn(txn, group_id, .{ .drop = .{ .table_id = table_id, .expected_name = publication.plan.child_before.name, .expected_transition_generation = fence.generation, .range_contract = .{ .membership = fence.membership(table_id) } } }, true);
+                    var table_key_buf: [160]u8 = undefined;
+                    if (try stagingGet(txn, try tableKeyForGroup(&table_key_buf, group_id, table_id)) != null) return error.GenerationPublicationChanged;
+                } else {
+                    var table_key_buf: [160]u8 = undefined;
+                    try self.putTableRecordTxnMode(txn, group_id, try tableKeyForGroup(&table_key_buf, group_id, table_id), publication.plan.child_after, true);
+                }
             }
         }
         if (publication.phase == .published or publication.phase == .canceled) try self.setFkGenerationTableLocksTxn(txn, group_id, publication.plan, false);
@@ -23820,7 +23876,17 @@ pub const RaftApplyStore = struct {
             var scope = try self.guardedRelationOwnerTxn(&txn, group_id, guard);
             defer scope.deinit();
         }
+        if (request.kind == .table and request.action == .drop) {
+            const table = (try self.resolveSystemCatalogResultTxn(metadata.TableRecord, alloc, &txn, group_id, .{ .database = request.database, .namespace = request.namespace, .table = request.name })) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(alloc, table);
+            try self.validateSqlDropDependenciesTxn(&txn, group_id, table);
+        }
         const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
+        // Reject live deletion intents before proposal. Apply repeats this
+        // check, but an apply-only no-op would make a definite naming conflict
+        // appear to callers as an ambiguous mutation outcome.
+        const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = alloc, .txn = &txn, .group_id = group_id, .meta = meta } };
+        try validateSqlDropNameMutation(reader, .{ .expected_revision = meta.revision, .mutation = request });
         var result: CatalogAdmission = .{ .meta = meta };
         if (request.kind == .table and (request.action == .create or request.action == .set_tablespace)) {
             const view: system_catalog_storage.View = .{ .alloc = alloc, .txn = &txn, .group_id = group_id, .meta = meta };
@@ -23999,6 +24065,51 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    fn validateSqlDropNameMutation(reader: CatalogReader, command: SystemCatalogCommand) !void {
+        const mutation = command.mutation;
+        if (mutation.kind == .table) {
+            if (mutation.action == .create) return;
+            const table = (try reader.store.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, reader.view.alloc, reader.view.txn, reader.view.group_id, .{ .database = mutation.database, .namespace = mutation.namespace, .table = mutation.name })) orelse return;
+            if (try reader.store.fkTableLockKindTxn(reader.view.txn, reader.view.group_id, table.table_id) == .sql_drop) return error.TableTransitionActive;
+            return;
+        }
+        if ((mutation.kind != .database and mutation.kind != .namespace) or
+            (mutation.action != .rename and mutation.action != .drop)) return;
+        // Ancestor renames would invalidate the admitted relation guard after
+        // irreversible parent activation. Inspect only live lifecycle locks and
+        // their compact namespace bindings, never complete publication plans.
+        const target = if (mutation.kind == .database)
+            (try reader.lookup(.database, 0, mutation.name)) orelse return
+        else block: {
+            const database = (try reader.lookup(.database, 0, mutation.database)) orelse return;
+            break :block (try reader.lookup(.namespace, database.id, mutation.name)) orelse return;
+        };
+        const lifecycle = @import("../table_lifecycle_lock.zig");
+        var prefix_buffer: [160]u8 = undefined;
+        const prefix = try lifecycle.prefix(&prefix_buffer, reader.view.group_id);
+        var cursor = try reader.view.txn.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if ((try lifecycle.Lock.decode(entry.value)).kind != .sql_drop) continue;
+            const table_id = (try lifecycle.tableFromKey(entry.key)) orelse return error.InvalidGenerationPublication;
+            var binding = try system_catalog_storage.getById(reader.store.alloc, reader.view.txn, reader.view.group_id, .table, table_id);
+            defer if (binding) |*value| value.deinit();
+            // Unbound legacy tables belong only to the protected default scope.
+            const namespace_id = if (binding) |value| value.value.parent_id else system_catalog.default_namespace_id;
+            if (namespace_id == 0) return error.InvalidCatalogRecord;
+            if (mutation.kind == .namespace) {
+                if (namespace_id == target.id) return error.TableTransitionActive;
+            } else {
+                var namespace = try system_catalog_storage.getById(reader.store.alloc, reader.view.txn, reader.view.group_id, .namespace, namespace_id);
+                defer if (namespace) |*value| value.deinit();
+                const database_id = if (namespace) |value| value.value.parent_id else if (namespace_id == system_catalog.default_namespace_id) system_catalog.default_database_id else return error.InvalidCatalogRecord;
+                if (database_id == target.id) return error.TableTransitionActive;
+            }
+        }
+    }
+
     /// Bind placement to the logical target and derive the ONLY permitted
     /// physical delta from this same catalog cut. A placement command cannot
     /// substitute another table, smuggle schema changes, or omit its writer.
@@ -24151,6 +24262,7 @@ pub const RaftApplyStore = struct {
         if (meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta } };
         try validateCatalogTopology(command);
+        try validateSqlDropNameMutation(reader, command);
         var delta = try system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, false);
         defer delta.deinit(a);
         const prepared = try self.prepareTableColumnSequencesTxn(a, &txn, group, command, meta, delta.next_id, true);
@@ -24699,7 +24811,7 @@ pub const RaftApplyStore = struct {
         }
         if (command.sql_view != null) {
             _ = self.applySqlViewLifecycleTxn(txn, group_id, command, true) catch |err| switch (err) {
-                error.CatalogGenerationChanged, error.CatalogAlreadyExists, error.CatalogNotFound, error.SqlDependentObjectsExist, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.SqlViewCycle, error.SqlProgramLimitExceeded => return,
+                error.CatalogGenerationChanged, error.CatalogAlreadyExists, error.CatalogNotFound, error.SqlDependentObjectsExist, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.SqlViewCycle, error.SqlProgramLimitExceeded, error.TableTransitionActive => return,
                 else => return err,
             };
             return;
@@ -24729,6 +24841,10 @@ pub const RaftApplyStore = struct {
         }
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = meta } };
         validateCatalogTopology(command) catch return;
+        validateSqlDropNameMutation(reader, command) catch |err| switch (err) {
+            error.TableTransitionActive => return,
+            else => return err,
+        };
         var delta = system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return, // A concurrent catalog/topology operation defeated admission.
@@ -26045,6 +26161,13 @@ pub const RaftApplyStore = struct {
             .extension_owned = extension_owned,
             .range_group_ids = indexed_range_group_ids,
         };
+    }
+
+    fn extensionOwnershipAdditionAllowedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, member: extension_domain.ExtensionMember) !bool {
+        const name = extensionMemberTableName(member) orelse return true;
+        const table = (try self.getTableByNameResultTxn(system_catalog.ResolvedTable, self.alloc, txn, group, name)) orelse return true;
+        defer table.deinit(self.alloc);
+        return try self.fkTableLockKindTxn(txn, group, table.table_id) != .sql_drop;
     }
 
     fn extensionMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
@@ -31662,6 +31785,7 @@ pub const RaftApplyStore = struct {
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             },
             .upsert_extension_member => |record| {
+                if (!try self.extensionOwnershipAdditionAllowedTxn(txn, group_id, record)) return;
                 var key_buf: [256]u8 = undefined;
                 const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
                 const encoded_existing = txn.get(key) catch |err| switch (err) {
@@ -32975,6 +33099,10 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         mutation: TableTopologyMutation,
     ) !void {
+        return self.applyTableTopologyMutationWithSqlDropTxn(txn, group_id, mutation, false);
+    }
+
+    fn applyTableTopologyMutationWithSqlDropTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, mutation: TableTopologyMutation, generation_drop: bool) !void {
         switch (mutation) {
             .create => |create| {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -33092,7 +33220,7 @@ pub const RaftApplyStore = struct {
                 }
             },
             .drop => |drop| {
-                if (try self.fkGenerationTableLockedTxn(txn, group_id, drop.table_id)) return;
+                if (!generation_drop and try self.fkGenerationTableLockedTxn(txn, group_id, drop.table_id)) return;
                 const fence = try self.loadTableTransitionFenceTxn(txn, group_id, drop.table_id);
                 if (fence.active() or fence.generation != drop.expected_transition_generation) return;
                 if (drop.range_contract == .membership and
@@ -33112,7 +33240,7 @@ pub const RaftApplyStore = struct {
                 if (try self.extensionOwnsTableTxn(txn, group_id, existing.name)) return;
                 // Recheck under the authoritative metadata transaction: an FK
                 // can have been published since the DROP admission snapshot.
-                if (try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
+                if (!generation_drop and try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
 
                 var owned_range_group_ids: ?[]u64 = null;
                 defer if (owned_range_group_ids) |ids| self.alloc.free(ids);
@@ -35559,6 +35687,7 @@ pub const RaftApplyStore = struct {
                 var table_buf: [160]u8 = undefined;
                 const raw_table = try txn.get(try tableKeyForGroup(&table_buf, group, source.table_id));
                 const table = try decodeTableRecord(a, raw_table);
+                if (try self.fkTableLockKindTxn(txn, group, table.table_id) == .sql_drop) return error.TableTransitionActive;
                 if (table.table_id != source.table_id or !std.mem.eql(u8, table.name, source.physical_name)) return error.CatalogGenerationChanged;
                 if (try restoreStagingLocksTableTxn(txn, group, table.table_id)) return error.CatalogGenerationChanged;
                 // Logical source scope is admitted in this same catalog cut.
@@ -36521,6 +36650,7 @@ pub const RaftApplyStore = struct {
     }
 
     fn applyExtensionLifecycleDeltaTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, delta: ExtensionLifecycleDelta) !void {
+        for (delta.upsert_extension_members) |member| if (!try self.extensionOwnershipAdditionAllowedTxn(txn, group_id, member)) return;
         if (delta.expected_tables.len != 0) {
             if (delta.expected_tables.len != delta.upsert_tables.len) return;
             for (delta.upsert_tables) |replacement| {

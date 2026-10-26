@@ -10637,6 +10637,11 @@ pub const DB = struct {
         // derived inline-edge/job maintenance. It cannot mutate user rows,
         // and must progress while a policy publication is preparing or active.
         const graph_cleanup_maintenance = req.graph_endpoint_cleanup;
+        const sql_drop_control = if (req.relational_topology) |command| command.sql_drop_control else false;
+        if (sql_drop_control) {
+            try @import("relational_integrity_topology_contract.zig").validateSqlDropBatch(req);
+            if (!trusted_replay and opts.native_fk_generation_entry == null) return error.InvalidControlReceiptPosition;
+        }
         if (!trusted_replay and !graph_cleanup_maintenance) try self.maybeFinalizePendingRowPolicyPublication();
         if (req.row_policy_principal_proof.len != 0) {
             if (req.row_policy_admitted_at_seconds <= 0 or req.row_policy_database.len == 0 or
@@ -10651,7 +10656,7 @@ pub const DB = struct {
                 try self.local_execution.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, now_seconds);
         } else if (req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) {
             return error.RowPolicyAuthenticationRequired;
-        } else if (!trusted_replay and !graph_cleanup_maintenance and req.relational_generation_gc == null and opts.transaction_resolution == null) {
+        } else if (!trusted_replay and !graph_cleanup_maintenance and !sql_drop_control and req.relational_generation_gc == null and opts.transaction_resolution == null) {
             row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         } else if (self.local_execution.row_policy_gate.currentPhase() != .disabled and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
@@ -10672,7 +10677,7 @@ pub const DB = struct {
         // which deliberately bypasses ordinary user-row admission.
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled and !graph_cleanup_maintenance and
             (req.online_source != null or req.restore_staging != null or
-                req.relational_topology != null or req.split_transition != null or
+                (req.relational_topology != null and !sql_drop_control) or req.split_transition != null or
                 req.split_checkpoint != null or req.split_replication != null or
                 req.merge_source_transition != null or req.merge_checkpoint != null or
                 req.merge_replication != null or req.merge_page != null or

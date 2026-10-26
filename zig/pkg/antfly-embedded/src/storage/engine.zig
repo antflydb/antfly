@@ -535,7 +535,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 36,
+    version: u32 = 37,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -607,7 +607,7 @@ pub const resource_manager_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
 };
-extern fn antfly_storage_engine_get_descriptor_v36() callconv(.c) *const Descriptor;
+extern fn antfly_storage_engine_get_descriptor_v37() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Wire = @typeInfo(Function).@"fn".return_type.?;
@@ -635,11 +635,11 @@ test "logical query engine allocator normalization preserves custom quotas" {
 }
 
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
-    const descriptor = antfly_storage_engine_get_descriptor_v36();
+    const descriptor = antfly_storage_engine_get_descriptor_v37();
     try validateDescriptor(descriptor);
     // Individual hidden accessors let final links discard unused operations.
     // A global table would retain every physical operation in every consumer.
-    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v36" });
+    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v37" });
     const method: @FieldType(VTable, name) = @ptrCast(@alignCast(getter()));
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Args = std.meta.ArgsTuple(Function);
@@ -674,10 +674,10 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
 }
 
 pub fn descriptorForValidation() *const Descriptor {
-    return antfly_storage_engine_get_descriptor_v36();
+    return antfly_storage_engine_get_descriptor_v37();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 36 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 37 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

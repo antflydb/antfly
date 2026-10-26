@@ -1698,6 +1698,13 @@ pub fn prepareForeignKeyPublicationRecord(alloc: std.mem.Allocator, table: *cons
     return applySchemaRecord(alloc, table, schema_json, false, true, null);
 }
 
+/// DROP needs a distinct private source-fence epoch even when no outgoing FK
+/// changes. This image is consumed only by the validated deletion protocol;
+/// ordinary idempotent ALTERs continue to retain their current epoch.
+pub fn prepareSqlDropPublicationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
+    return applySchemaRecordWithEpoch(alloc, table, schema_json, false, true, null, true);
+}
+
 /// Prepare, but never publish, the exact validation-only NOT NULL successor.
 /// Physical rows, index declarations/incarnations and read projections remain
 /// unchanged. The metadata owner must authenticate the complete owner cohort,
@@ -1796,10 +1803,14 @@ pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: [
 }
 
 fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64) !metadata_table_manager.TableRecord {
+    return applySchemaRecordWithEpoch(alloc, table, schema_json, rewrite, fk_publication, pinned_incarnation, false);
+}
+
+fn applySchemaRecordWithEpoch(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64, force_epoch: bool) !metadata_table_manager.TableRecord {
     try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
     const comparison = try compareSchemaDefinitions(alloc, table.schema_json, schema_json);
-    const schema_changed = !comparison.equal;
+    const schema_changed = force_epoch or !comparison.equal;
     if (schema_changed and !rewrite) {
         try @import("antfly_local_sources").schema_column_nullability.validateSchemaUpdate(alloc, table.schema_json, schema_json);
         try @import("antfly_local_sources").schema_relational_expression.validateSchemaUpdate(alloc, table.schema_json, schema_json);

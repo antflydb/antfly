@@ -244,8 +244,12 @@ pub const Context = struct {
 pub const ServingSchema = struct { table_id: u64, version: u32 };
 
 pub fn waitServingSchema(ctx: *Context, name: []const u8, minimum: u32) !ServingSchema {
+    return waitServingSchemaInScope(ctx, "default", "public", name, minimum);
+}
+
+pub fn waitServingSchemaInScope(ctx: *Context, database: []const u8, namespace: []const u8, name: []const u8, minimum: u32) !ServingSchema {
     const domain = @import("antfly_local_sources").system_catalog_domain;
-    const lookup: domain.ResolveMany = .{ .relations = &.{.{ .name = name }}, .include_query_definitions = true };
+    const lookup: domain.ResolveMany = .{ .relations = &.{.{ .database = database, .namespace = namespace, .name = name }}, .include_query_definitions = true };
     const metadata = http_server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
     const reader = ctx.data.http_server.?.table_reads orelse return error.MissingOwnerReadSource;
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;

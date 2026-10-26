@@ -12453,6 +12453,7 @@ pub const DataServer = struct {
         // set. Their phase enums differ; each read-index endpoint already
         // authenticates the requested action against its durable phase.
         const ParentDecision = struct {
+            sql_drop_control: bool = false,
             historical_reference_coverage: bool = false,
             reference_coverage_ready: bool = false,
             plan_digest: publication.Digest,
@@ -12531,7 +12532,7 @@ pub const DataServer = struct {
         if (request.action == .stage and !already_completed and (prior.fence == null or !prior.fence.?.eql(decision.fence))) {
             if (decision.fence.role == .child_generation_dual) return error.GenerationAdmissionPending;
             // Admission is durable before the staged accepted-generation CAS.
-            try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .begin, .fence = decision.fence } }, leader_term);
+            try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .begin, .fence = decision.fence, .sql_drop_control = decision.sql_drop_control } }, leader_term);
         }
         const action: @FieldType(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Command, "action") = switch (request.action) {
             .stage => .stage_child_generation,
@@ -12548,6 +12549,7 @@ pub const DataServer = struct {
             .child_generations = transitions,
             .child_generation_reference_coverage_required = request.action == .activate and decision.historical_reference_coverage,
             .child_reference_coverage_ready = decision.reference_coverage_ready,
+            .sql_drop_control = decision.sql_drop_control,
         } }, leader_term);
         var status_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"generation_publication\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
         defer status_response.deinit(scratch);
@@ -12600,6 +12602,7 @@ pub const DataServer = struct {
             .action = request.action,
         } });
         const decision = try std.json.parseFromSliceLeaky(publication.SourceDecision, scratch, decision_bytes, .{ .allocate = .alloc_always });
+        if (decision.sql_drop_control and request.action == .install) return error.InvalidGenerationPublication;
         if (decision.child_before.table_id != request.child_table_id or
             decision.child_after.table_id != request.child_table_id or
             !std.mem.eql(u8, decision.child_before.name, table_name) or
@@ -12670,7 +12673,7 @@ pub const DataServer = struct {
         if (!std.mem.eql(u8, observed_schema_json, if (request.action == .install and already_completed) decision.child_after.schema_json else decision.child_before.schema_json))
             return error.IntegrityCatalogChanged;
         if (request.action == .fence and !already_completed) {
-            try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .begin, .fence = decision.fence } }, leader_term);
+            try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .begin, .fence = decision.fence, .sql_drop_control = decision.sql_drop_control } }, leader_term);
         }
         if (request.action == .fence) {
             var drained_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"status\"}", .fk_generation_source_control = true }, .read_index)) orelse return error.GenerationAdmissionPending;
@@ -12691,7 +12694,7 @@ pub const DataServer = struct {
             if (decision.fence.role == .child_generation_dual and
                 (prior.cancel_receipt == null or prior.completed == null or !prior.completed.?.eql(decision.fence)))
                 return error.GenerationAdmissionPending;
-            try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .cancel_child_generation_source, .fence = decision.fence } }, leader_term);
+            try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .cancel_child_generation_source, .fence = decision.fence, .sql_drop_control = decision.sql_drop_control } }, leader_term);
         }
         var status_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"generation_publication\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
         defer status_response.deinit(scratch);
@@ -14432,6 +14435,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.relational_topology) |command| if (command.sql_drop_control) return @import("../common/data_raft_protocol.zig").batch_sql_drop_control_protocol_version;
         if (req.relational_index_owner_control != null) return data_raft_batch.index_owner_control_protocol_version;
         if (req.artifact_publication) |command| if (command.completion) |page| if (page.group_producers) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (req.artifact_catalog) |command| if (command.binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
@@ -59517,4 +59521,25 @@ test "grouped source protocol dominates coexisting graph envelope features" {
         .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = 16 },
     }, .graph_endpoint_cleanup = true };
     try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+}
+
+test "SQL drop retirement control retains ordered timestamps and requires every applying decoder" {
+    const protocol = @import("../common/data_raft_protocol.zig");
+    const contract = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const command: contract.Command = .{ .sql_drop_control = true, .action = .begin, .fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 301, .owner_group_id = 301, .role = .child_generation_source, .namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(1) } };
+    const request = DataServer.materializeRaftBatchTimestamp(.{ .relational_topology = command }, 123);
+    try std.testing.expectEqual(@as(u64, 123), request.timestamp_ns);
+    try contract.validateSqlDropBatch(request);
+    try std.testing.expectEqual(protocol.batch_sql_drop_control_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    var mixed = request;
+    mixed.writes = &.{.{ .key = "forged", .value = "{}" }};
+    try std.testing.expectEqual(protocol.batch_sql_drop_control_protocol_version, DataServer.requiredRaftBatchProtocolVersion(mixed));
+    try std.testing.expectError(error.InvalidBatchRequest, contract.validateSqlDropBatch(mixed));
+    const encoded = try data_raft_batch.encode(std.testing.allocator, "drop_source", request);
+    defer std.testing.allocator.free(encoded);
+    var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expect(decoded.batch.req.relational_topology.?.sql_drop_control);
+    try std.testing.expectEqual(@as(u64, 123), decoded.batch.req.timestamp_ns);
+    try contract.validateSqlDropBatch(decoded.batch.req);
 }

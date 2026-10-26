@@ -34,7 +34,7 @@ pub const CatalogCoverage = @import("antfly_local_sources").schema_relational_de
 fn writeCoverageFields(value: anytype, writer: anytype) !void {
     try writer.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
-        const include = if (comptime std.mem.eql(u8, field, "catalog_coverage")) value.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field, "historical_reference_coverage")) value.historical_reference_coverage else if (comptime std.mem.eql(u8, field, "reference_coverage_ready")) value.reference_coverage_ready else true;
+        const include = if (comptime std.mem.eql(u8, field, "sql_drop_control")) value.sql_drop_control else if (comptime std.mem.eql(u8, field, "catalog_coverage")) value.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field, "historical_reference_coverage")) value.historical_reference_coverage else if (comptime std.mem.eql(u8, field, "reference_coverage_ready")) value.reference_coverage_ready else true;
         if (include) {
             try writer.objectField(field);
             try writer.write(@field(value, field));
@@ -286,6 +286,10 @@ pub const Plan = struct {
     }
 
     historical_reference_coverage: bool = false,
+    /// A subtract-only whole-table retirement. Source fences and parent
+    /// generation tombstones authorize catalog deletion, never a weaker public
+    /// child schema or a row-by-row unique-claim drain.
+    sql_drop: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard = null,
     id: Id,
     child_before: records.TableRecord,
     child_after: records.TableRecord,
@@ -318,7 +322,7 @@ pub const Plan = struct {
     pub fn jsonStringify(self: Plan, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Plan).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "constraint_name_guard")) self.constraint_name_guard != null else if (comptime std.mem.eql(u8, field, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field, "historical_reference_coverage")) self.historical_reference_coverage else true;
+            const include = if (comptime std.mem.eql(u8, field, "sql_drop")) self.sql_drop != null else if (comptime std.mem.eql(u8, field, "constraint_name_guard")) self.constraint_name_guard != null else if (comptime std.mem.eql(u8, field, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field, "historical_reference_coverage")) self.historical_reference_coverage else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -333,7 +337,7 @@ pub const Plan = struct {
             self.child_before.table_id != self.child_after.table_id or
             !std.mem.eql(u8, self.child_before.name, self.child_after.name) or
             self.child_ranges.len == 0 or self.child_ranges.len > max_owners or
-            self.child_fences.len != self.child_ranges.len or self.parents.len == 0 or
+            self.child_fences.len != self.child_ranges.len or (self.parents.len == 0 and self.sql_drop == null) or
             self.parents.len > 128 or self.child_catalog_before_b64.len == 0 or
             self.child_catalog_before_b64.len > std.base64.standard.Encoder.calcSize(integrity_catalog.max_catalog_bytes)) return error.InvalidGenerationPublication;
         if (std.mem.eql(u8, self.child_before.schema_json, self.child_after.schema_json)) return error.InvalidGenerationPublication;
@@ -346,6 +350,19 @@ pub const Plan = struct {
         if (before.storage_mode != .relational or after.storage_mode != .relational or
             after.version != next_version)
             return error.InvalidGenerationPublication;
+        if (self.sql_drop) |guard| {
+            guard.validate() catch return error.InvalidGenerationPublication;
+            if (guard.owner.kind != .table or guard.constraint_name_admission != null or self.constraint_name_guard != null or
+                guard.owner.table_id != self.child_before.table_id or guard.owner.schema_version != before.version or
+                !std.mem.eql(u8, guard.target.name, guard.logical_table)) return error.InvalidGenerationPublication;
+            var source_digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(self.child_before.schema_json, &source_digest, .{});
+            if (!std.mem.eql(u8, &source_digest, &guard.owner.schema_digest)) return error.InvalidGenerationPublication;
+            const foreign = try after.relationalForeignKeyDefinitions(alloc);
+            defer if (foreign.len != 0) alloc.free(foreign);
+            if (foreign.len != 0 or !self.historical_reference_coverage or self.catalog_coverage != .checks_v1) return error.InvalidGenerationPublication;
+            for (self.parents) |parent| for (parent.transitions) |transition| if (transition.next_generation != null) return error.InvalidGenerationPublication;
+        }
         if (self.catalog_coverage == .checks_v1) {
             const shape = @import("schema_publication_shape.zig");
             try shape.requireTableImages(alloc, self.child_before, self.child_after);
@@ -490,6 +507,21 @@ pub const Plan = struct {
         after_schema_digest: Digest,
         after_catalog_digest: Digest,
     };
+
+    /// A dropped dual-role source remains frozen until physical retirement.
+    /// Its local reference barrier disappears with that namespace. Surviving
+    /// parents still require independent durable coverage-completion ACKs.
+    pub fn needsParentCoverage(self: Plan, parent: Parent) bool {
+        return self.sql_drop == null or parent.table.table_id != self.child_before.table_id;
+    }
+
+    pub fn parentCoverageOwnerCount(self: Plan) usize {
+        var count: usize = 0;
+        for (self.parents) |parent| if (self.needsParentCoverage(parent)) {
+            count += parent.ranges.len;
+        };
+        return count;
+    }
 
     pub fn childIdentity(self: Plan, alloc: std.mem.Allocator) !ChildIdentity {
         const catalog_len = std.base64.standard.Decoder.calcSizeForSlice(self.child_catalog_before_b64) catch return error.InvalidGenerationPublication;
@@ -1568,8 +1600,14 @@ pub const Publication = struct {
         try validateReceipts(parent_groups.items, self.parent_staged);
         try validateReceipts(parent_groups.items, self.parent_activated);
         try validateReceipts(parent_groups.items, self.parent_acknowledged);
-        try validateReceipts(parent_groups.items, self.parent_coverage_acknowledged);
-        if (self.parent_coverage_acknowledged.len != 0 and (!self.plan.historical_reference_coverage or (self.phase != .acknowledging_reference_coverage and self.phase != .published))) return error.InvalidGenerationPublication;
+        var coverage_groups: std.ArrayList(records.RangeRecord) = .empty;
+        defer coverage_groups.deinit(alloc);
+        for (parent_groups.items) |range| {
+            if (self.plan.sql_drop != null and range.table_id == self.plan.child_before.table_id) continue;
+            try coverage_groups.append(alloc, range);
+        }
+        try validateReceipts(coverage_groups.items, self.parent_coverage_acknowledged);
+        if (self.parent_coverage_acknowledged.len != 0 and (!self.plan.historical_reference_coverage or (self.phase != .acknowledging_reference_coverage and self.phase != .published and !(self.plan.sql_drop != null and self.phase == .publishing_child)))) return error.InvalidGenerationPublication;
         try validateReceipts(parent_groups.items, self.parent_canceled);
         if (self.phase != .canceling and self.phase != .canceled and (self.child_canceled.len != 0 or self.parent_canceled.len != 0)) return error.InvalidGenerationPublication;
         switch (self.phase) {
@@ -1578,8 +1616,10 @@ pub const Publication = struct {
             .activating_parents => if (self.child_fenced.len != self.plan.child_ranges.len or self.parent_staged.len != parent_groups.items.len or self.parent_acknowledged.len != 0 or self.child_installed.len != 0) return error.InvalidGenerationPublication,
             .acknowledging_parents => if (self.parent_activated.len != parent_groups.items.len or self.child_installed.len != 0) return error.InvalidGenerationPublication,
             .publishing_child, .installing_child => if (self.child_fenced.len != self.plan.child_ranges.len or self.parent_acknowledged.len != parent_groups.items.len) return error.InvalidGenerationPublication,
-            .acknowledging_reference_coverage => if (!self.plan.historical_reference_coverage or self.child_installed.len != self.plan.child_ranges.len or self.parent_acknowledged.len != parent_groups.items.len) return error.InvalidGenerationPublication,
-            .published => if (self.child_installed.len != self.plan.child_ranges.len or (self.plan.historical_reference_coverage and self.parent_coverage_acknowledged.len != parent_groups.items.len)) return error.InvalidGenerationPublication,
+            .acknowledging_reference_coverage => if (!self.plan.historical_reference_coverage or self.child_installed.len != (if (self.plan.sql_drop != null) @as(usize, 0) else self.plan.child_ranges.len) or self.child_fenced.len != self.plan.child_ranges.len or self.parent_acknowledged.len != parent_groups.items.len) return error.InvalidGenerationPublication,
+            .published => if (self.plan.sql_drop != null) {
+                if (self.child_fenced.len != self.plan.child_ranges.len or self.parent_acknowledged.len != parent_groups.items.len or self.parent_coverage_acknowledged.len != coverage_groups.items.len or self.child_installed.len != 0) return error.InvalidGenerationPublication;
+            } else if (self.child_installed.len != self.plan.child_ranges.len or (self.plan.historical_reference_coverage and self.parent_coverage_acknowledged.len != parent_groups.items.len)) return error.InvalidGenerationPublication,
             .canceling, .canceled => if (self.parent_activated.len != 0 or self.parent_acknowledged.len != 0 or self.child_installed.len != 0) return error.InvalidGenerationPublication,
         }
         if (self.phase == .canceled and (self.child_canceled.len != self.plan.child_ranges.len or self.parent_canceled.len != parent_groups.items.len)) return error.InvalidGenerationPublication;
@@ -1599,7 +1639,7 @@ pub const Publication = struct {
                 if (self.phase != .fencing_child or command.source_receipt.?.action != .fence) return error.GenerationPublicationChanged;
                 try self.plan.verifySourceReceipt(self.child_identity, self.plan_digest, command.source_receipt.?);
                 next.child_fenced = try appendReceipt(alloc, self.child_fenced, .{ .group_id = command.source_receipt.?.child_group_id, .digest = command.source_receipt.?.digest() });
-                if (next.child_fenced.len == self.plan.child_ranges.len) next.phase = .staging_parents;
+                if (next.child_fenced.len == self.plan.child_ranges.len) next.phase = if (self.plan.sql_drop != null and self.plan.parents.len == 0) .publishing_child else .staging_parents;
             },
             .parent_staged => {
                 if (self.phase != .staging_parents or command.parent_receipt.?.action != .stage) return error.GenerationPublicationChanged;
@@ -1626,15 +1666,16 @@ pub const Publication = struct {
                 for (self.plan.parents) |parent| count += parent.ranges.len;
                 if (covering) {
                     next.parent_coverage_acknowledged = try appendReceipt(alloc, self.parent_coverage_acknowledged, receipt);
-                    if (next.parent_coverage_acknowledged.len == count) next.phase = .published;
+                    if (next.parent_coverage_acknowledged.len == self.plan.parentCoverageOwnerCount()) next.phase = if (self.plan.sql_drop != null) .publishing_child else .published;
                 } else {
                     next.parent_acknowledged = try appendReceipt(alloc, self.parent_acknowledged, receipt);
-                    if (next.parent_acknowledged.len == count) next.phase = .publishing_child;
+                    if (next.parent_acknowledged.len == count) next.phase = if (self.plan.sql_drop != null and self.plan.parentCoverageOwnerCount() != 0) .acknowledging_reference_coverage else .publishing_child;
                 }
             },
             .publish_child => {
                 if (self.phase != .publishing_child) return error.GenerationPublicationChanged;
-                next.phase = .installing_child;
+                if (self.plan.sql_drop != null and self.parent_coverage_acknowledged.len != self.plan.parentCoverageOwnerCount()) return error.InvalidGenerationPublication;
+                next.phase = if (self.plan.sql_drop != null) .published else .installing_child;
             },
             .child_installed => {
                 if (self.phase != .installing_child or command.source_receipt.?.action != .install) return error.GenerationPublicationChanged;
@@ -1643,7 +1684,8 @@ pub const Publication = struct {
                 if (next.child_installed.len == self.plan.child_ranges.len) next.phase = if (self.plan.historical_reference_coverage) .acknowledging_reference_coverage else .published;
             },
             .cancel => {
-                if ((self.phase != .fencing_child and self.phase != .staging_parents and self.phase != .activating_parents) or
+                const zero_parent_drop = self.plan.sql_drop != null and self.plan.parents.len == 0 and self.phase == .publishing_child;
+                if ((!zero_parent_drop and self.phase != .fencing_child and self.phase != .staging_parents and self.phase != .activating_parents) or
                     self.parent_activated.len != 0) return error.GenerationPublicationChanged;
                 next.phase = .canceling;
             },
@@ -1719,6 +1761,7 @@ pub const SourceDecisionRequest = struct {
 };
 
 pub const Decision = struct {
+    sql_drop_control: bool = false,
     historical_reference_coverage: bool = false,
     reference_coverage_ready: bool = false,
     phase: Phase,
@@ -1736,6 +1779,7 @@ pub const Decision = struct {
 };
 
 pub const SourceDecision = struct {
+    sql_drop_control: bool = false,
     historical_reference_coverage: bool = false,
     phase: Phase,
     metadata_group_id: u64,
@@ -2370,6 +2414,14 @@ pub fn schemaHasUnvalidatedForeignKeys(alloc: std.mem.Allocator, bytes: []const 
 }
 
 test "FK historical reference coverage requires independent durable completion ACK after child install" {
+    try exerciseHistoricalReferenceCoverage(false);
+}
+
+test "SQL drop retirement requires durable parent coverage completion before catalog deletion" {
+    try exerciseHistoricalReferenceCoverage(true);
+}
+
+fn exerciseHistoricalReferenceCoverage(sql_drop: bool) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -2381,7 +2433,7 @@ test "FK historical reference coverage requires independent durable completion A
     ;
     var before = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, before_json);
     defer before.deinit(alloc);
-    var compiled = try compileCatalog(alloc, before, 101, null);
+    var compiled = try compileCatalogWithCoverage(alloc, before, 101, null, if (sql_drop) .checks_v1 else .legacy);
     defer compiled.deinit();
     const old_b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(compiled.value.len));
     _ = std.base64.standard.Encoder.encode(old_b64, compiled.value);
@@ -2398,11 +2450,15 @@ test "FK historical reference coverage requires independent durable completion A
     const parent_range: records.RangeRecord = .{ .table_id = 202, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" };
     const child_fence: topology.Fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 301, .owner_group_id = 301, .role = .child_generation_source, .namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(1) };
     const parent_fence: topology.Fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 401, .owner_group_id = 401, .role = .child_generation_parent, .namespace = .{ .table_id = 202, .shard_id = 401, .range_id = 401 }, .catalog_digest = @splat(2) };
+    var source_digest: Digest = undefined;
+    std.crypto.hash.Blake3.hash(before_json, &source_digest, .{});
     const plan: Plan = .{
         .historical_reference_coverage = true,
+        .catalog_coverage = if (sql_drop) .checks_v1 else .legacy,
+        .sql_drop = if (sql_drop) .{ .target = .{ .name = "child" }, .logical_table = "child", .owner = .{ .table_id = 101, .schema_version = 1, .schema_digest = source_digest, .kind = .table }, .incarnation = @splat(1) } else null,
         .id = id,
         .child_before = .{ .table_id = 101, .name = "child", .schema_json = before_json },
-        .child_after = .{ .table_id = 101, .name = "child", .schema_json = after_json },
+        .child_after = .{ .table_id = 101, .name = "child", .schema_json = after_json, .read_schema_json = if (sql_drop) before_json else "" },
         .child_catalog_before_b64 = old_b64,
         .child_ranges = &.{child_range},
         .child_fences = &.{child_fence},
@@ -2414,7 +2470,7 @@ test "FK historical reference coverage requires independent durable completion A
     try value.validate(alloc);
     const command = struct {
         fn make(state: Publication, action: @FieldType(Command, "action"), source: ?@import("../api/relational_fk_generation_publication.zig").SourceReceipt, parent: ?@import("../api/relational_fk_generation_publication.zig").Receipt) Command {
-            return .{ .plan_id = state.plan.id, .child_table_id = state.plan.child_before.table_id, .expected_revision = state.revision, .action = action, .source_receipt = source, .parent_receipt = parent };
+            return .{ .plan_id = state.plan.id, .child_table_id = state.plan.child_before.table_id, .expected_revision = state.revision, .action = action, .source_receipt = source, .parent_receipt = parent, .catalog_coverage = state.plan.catalog_coverage };
         }
     }.make;
     try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .publish_child, null, null)));
@@ -2475,14 +2531,25 @@ test "FK historical reference coverage requires independent durable completion A
     parent.action = .acknowledge;
     parent.applied_index = 4;
     value = try value.apply(alloc, command(value, .parent_acknowledged, null, parent));
-    try std.testing.expectEqual(Phase.publishing_child, value.phase);
-    value = try value.apply(alloc, command(value, .publish_child, null, null));
-    try std.testing.expectEqual(Phase.installing_child, value.phase);
-    source.action = .install;
-    source.applied_index = 5;
-    try std.testing.expectError(error.InvalidGenerationPublication, value.apply(alloc, command(value, .child_installed, source, null)));
-    source.reference_coverage_ready = true;
-    value = try value.apply(alloc, command(value, .child_installed, source, null));
+    if (sql_drop) {
+        try std.testing.expectEqual(Phase.acknowledging_reference_coverage, value.phase);
+        try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .publish_child, null, null)));
+        try std.testing.expectEqual(@as(usize, 0), value.child_installed.len);
+        // A forged publishing phase cannot substitute the early parent ACK
+        // for its independent durable coverage-completion receipt.
+        var forged = value;
+        forged.phase = .publishing_child;
+        try std.testing.expectError(error.InvalidGenerationPublication, forged.apply(alloc, command(forged, .publish_child, null, null)));
+    } else {
+        try std.testing.expectEqual(Phase.publishing_child, value.phase);
+        value = try value.apply(alloc, command(value, .publish_child, null, null));
+        try std.testing.expectEqual(Phase.installing_child, value.phase);
+        source.action = .install;
+        source.applied_index = 5;
+        try std.testing.expectError(error.InvalidGenerationPublication, value.apply(alloc, command(value, .child_installed, source, null)));
+        source.reference_coverage_ready = true;
+        value = try value.apply(alloc, command(value, .child_installed, source, null));
+    }
     try std.testing.expectEqual(Phase.acknowledging_reference_coverage, value.phase);
     try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .parent_acknowledged, null, parent)));
     const pending_bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
@@ -2493,7 +2560,107 @@ test "FK historical reference coverage requires independent durable completion A
     const covered = command(value, .parent_acknowledged, null, parent);
     value = try value.apply(alloc, covered);
     try value.validate(alloc);
-    try std.testing.expectEqual(Phase.published, value.phase);
+    try std.testing.expectEqual(if (sql_drop) Phase.publishing_child else Phase.published, value.phase);
     try std.testing.expectEqual(@as(usize, 1), value.parent_coverage_acknowledged.len);
     try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, covered));
+    if (sql_drop) {
+        const recovered = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        value = try std.json.parseFromSliceLeaky(Publication, alloc, recovered, .{});
+        value = try value.apply(alloc, command(value, .publish_child, null, null));
+        try std.testing.expectEqual(Phase.published, value.phase);
+        try std.testing.expectEqual(@as(usize, 0), value.child_installed.len);
+        try value.validate(alloc);
+    }
+}
+
+test "SQL drop retirement validates zero parent source barriers terminal recovery and cancellation" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema_api = @import("antfly_local_sources").schema_mod;
+    const before_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"unique_constraints\":[{\"name\":\"pk\",\"columns\":[\"id\"]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}}}}";
+    const after_json = try std.mem.replaceOwned(u8, a, before_json, "\"version\":1", "\"version\":2");
+    var before_schema = try schema_api.parseValidatedTableSchema(a, before_json);
+    defer before_schema.deinit(a);
+    var compiled = try compileCatalogWithCoverage(a, before_schema, 101, null, .checks_v1);
+    defer compiled.deinit();
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(compiled.value.len));
+    _ = std.base64.standard.Encoder.encode(encoded, compiled.value);
+    var source_digest: Digest = undefined;
+    std.crypto.hash.Blake3.hash(before_json, &source_digest, .{});
+    var catalog_digest: Digest = undefined;
+    std.crypto.hash.Blake3.hash(compiled.value, &catalog_digest, .{});
+    var id: Id = undefined;
+    std.mem.writeInt(u64, id[0..8], 7, .little);
+    std.mem.writeInt(u64, id[8..16], 1, .little);
+    const plan: Plan = .{
+        .id = id,
+        .historical_reference_coverage = true,
+        .catalog_coverage = .checks_v1,
+        .sql_drop = .{ .target = .{ .name = "invoices" }, .logical_table = "invoices", .owner = .{ .table_id = 101, .schema_version = 1, .schema_digest = source_digest, .kind = .table }, .incarnation = @splat(1) },
+        .child_before = .{ .table_id = 101, .name = "table:101", .schema_json = before_json },
+        .child_after = .{ .table_id = 101, .name = "table:101", .schema_json = after_json, .read_schema_json = before_json },
+        .child_catalog_before_b64 = encoded,
+        .child_ranges = &.{.{ .table_id = 101, .group_id = 301, .range_id = 301, .doc_identity_shard_id = 301, .doc_identity_range_id = 301, .start_key = "" }},
+        .child_fences = &.{.{ .transition_id = 7, .attempt = 1, .peer_group_id = 301, .owner_group_id = 301, .role = .child_generation_source, .namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 301 }, .catalog_digest = catalog_digest }},
+        .parents = &.{},
+    };
+    try plan.validate(a);
+    var state: Publication = .{ .plan = plan, .plan_digest = try plan.digest(a), .child_identity = try plan.childIdentity(a), .revision = 1, .phase = .fencing_child };
+    const request: Command = .{ .child_table_id = 101, .plan_id = id, .expected_revision = 1, .action = .publish_child, .catalog_coverage = .checks_v1 };
+    try std.testing.expectError(error.GenerationPublicationChanged, state.apply(a, request));
+    state.phase = .publishing_child;
+    try std.testing.expectError(error.InvalidGenerationPublication, state.apply(a, request));
+    state.child_fenced = &.{.{ .group_id = 301, .digest = @splat(8) }};
+    try state.validate(a);
+    const done = try state.apply(a, request);
+    try std.testing.expectEqual(Phase.published, done.phase);
+    try std.testing.expectEqual(@as(usize, 0), done.child_installed.len);
+    try done.validate(a);
+    const bytes = try std.json.Stringify.valueAlloc(a, done, .{});
+    var restored = try std.json.parseFromSlice(Publication, a, bytes, .{ .allocate = .alloc_always });
+    defer restored.deinit();
+    try restored.value.validate(a);
+    try std.testing.expectEqualStrings("invoices", restored.value.plan.sql_drop.?.target.name);
+    var cancel = request;
+    cancel.action = .cancel;
+    const canceled = try state.apply(a, cancel);
+    try std.testing.expectEqual(Phase.canceling, canceled.phase);
+    try canceled.validate(a);
+    var invalid = plan;
+    invalid.sql_drop = null;
+    try std.testing.expectError(error.InvalidGenerationPublication, invalid.validate(a));
+    invalid = plan;
+    invalid.sql_drop.?.owner.table_id += 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, invalid.validate(a));
+}
+
+test "SQL drop retirement policy controls reject grants installs transfers and mixed user batches" {
+    const local = @import("antfly_local_sources");
+    const contract = local.storage_db_relational_integrity_topology_contract;
+    const batch = local.storage_db_types;
+    var command: contract.Command = .{ .sql_drop_control = true, .action = .begin, .fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 301, .owner_group_id = 301, .role = .child_generation_source, .namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(1) } };
+    try contract.validateSqlDropBatch(batch.BatchRequest{ .relational_topology = command });
+    try std.testing.expectError(error.InvalidBatchRequest, contract.validateSqlDropBatch(batch.BatchRequest{ .relational_topology = command, .writes = &.{.{ .key = "forged", .value = "{}" }} }));
+    try std.testing.expectError(error.InvalidBatchRequest, contract.validateSqlDropBatch(batch.BatchRequest{ .relational_topology = command, .activate_range_tracking = true }));
+    try std.testing.expectError(error.InvalidBatchRequest, contract.validateSqlDropBatch(batch.BatchRequest{ .relational_topology = command, .restore_staging_scope = @splat(8) }));
+    command.action = .install_child_schema;
+    try std.testing.expect(!command.isSqlDropControl());
+    command.action = .transfer;
+    try std.testing.expect(!command.isSqlDropControl());
+    command.action = .begin;
+    command.fence.role = .rewrite_source;
+    try std.testing.expect(!command.isSqlDropControl());
+    command.fence.role = .child_generation_parent;
+    command.action = .stage_child_generation;
+    var transition: local.storage_db_relational_integrity_generation_admission.Transition = .{ .child_table_id = 101, .child_table_name = "child", .constraint_name = "fk", .expected_generation = @splat(1), .next_generation = null, .plan_id = @splat(2), .decision_digest = @splat(3) };
+    command.child_generations = &.{transition};
+    try std.testing.expect(command.isSqlDropControl());
+    transition.next_generation = @splat(4);
+    command.child_generations = &.{transition};
+    try std.testing.expect(!command.isSqlDropControl());
+    transition.next_generation = null;
+    transition.expected_generation = null;
+    command.child_generations = &.{transition};
+    try std.testing.expect(!command.isSqlDropControl());
 }

@@ -17824,10 +17824,12 @@ fn consumerTests() type {
             const Capture = struct {
                 mode: enum { good, missing, invalid } = .good,
                 expect_policy: bool = false,
+                observations: bool = false,
                 token: []const u8 = "not-a-proof",
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    try std.testing.expect(std.mem.indexOf(u8, req.uri, "_primary_digest=true") != null);
+                    try std.testing.expectEqual(!self.observations, std.mem.indexOf(u8, req.uri, "_primary_digest=true") != null);
+                    if (self.observations) try std.testing.expect(std.mem.indexOf(u8, req.uri, "_relational_integrity_jobs=") != null);
                     const authority = @import("../usermgr/mod.zig").row_policy_authority;
                     var has_principal = false;
                     var has_database = false;
@@ -17846,13 +17848,13 @@ fn consumerTests() type {
                     try std.testing.expect(std.mem.indexOf(u8, req.uri, self.token) == null);
                     try std.testing.expect(std.mem.indexOf(u8, req.uri, "tenant-db") == null);
                     const digest = std.fmt.bytesToHex(@as([32]u8, @splat(0xab)), .lower);
-                    const headers = try allocator.alloc(http_common.Header, if (self.mode == .missing) 1 else 2);
+                    const headers = try allocator.alloc(http_common.Header, if (self.observations or self.mode == .missing) 1 else 2);
                     headers[0] = .{ .name = try allocator.dupe(u8, "X-Antfly-Version"), .value = try allocator.dupe(u8, "77") };
                     if (headers.len == 2) headers[1] = .{
                         .name = try allocator.dupe(u8, "X-Antfly-Primary-Digest"),
                         .value = try allocator.dupe(u8, if (self.mode == .invalid) "invalid" else &digest),
                     };
-                    return .{ .status = 200, .headers = headers, .body = try allocator.dupe(u8, "{\"id\":1}") };
+                    return .{ .status = 200, .headers = headers, .body = try allocator.dupe(u8, if (self.observations) "{\"observations\":[{\"key\":\"row\",\"row\":null}],\"typed_nulls\":true}" else "{\"id\":1}") };
                 }
             };
             var capture: Capture = .{};
@@ -17869,6 +17871,14 @@ fn consumerTests() type {
             var authorized = (try lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true, .row_policy_principal_proof = signed, .row_policy_database = "tenant-db" }, .read_index)).?;
             defer authorized.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 77), authorized.version);
+            capture.observations = true;
+            const query = try std.json.Stringify.valueAlloc(alloc, .{ .kind = "observations", .typed_nulls = true, .keys = &[_][]const u8{"row"}, .schema_version = @as(u32, 1), .generation_set = @as([32]u8, @splat(0xab)) }, .{});
+            defer alloc.free(query);
+            var observations = (try lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .relational_integrity_jobs_json = query, .row_policy_principal_proof = signed, .row_policy_database = "tenant-db" }, .read_index)).?;
+            defer observations.deinit(alloc);
+            try std.testing.expect(observations.expected_content_digest == null);
+            try std.testing.expectEqualStrings("{\"observations\":[{\"key\":\"row\",\"row\":null}],\"typed_nulls\":true}", observations.json);
+            capture.observations = false;
             capture.expect_policy = false;
             capture.mode = .missing;
             try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index));

@@ -2904,7 +2904,7 @@ pub const AntflyApiHandler = struct {
             if (!service_identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
             const token = policy_token orelse return textResponse(ctx, 400, "missing policy principal");
             const database = policy_database orelse return textResponse(ctx, 400, "missing policy database");
-            if (token.len == 0 or token.len > policy_authority.maximum_token_bytes or database.len == 0 or database.len > 3 * policy_authority.maximum_name_bytes or !lookup_options.opts.include_primary_digest)
+            if (token.len == 0 or token.len > policy_authority.maximum_token_bytes or database.len == 0 or database.len > 3 * policy_authority.maximum_name_bytes or !db_mod.types.supportsIntegrityReadProof(lookup_options.opts.include_primary_digest, lookup_options.opts.relational_integrity_jobs_json))
                 return textResponse(ctx, 400, "invalid policy observation authority");
             decoded_policy_database = (try decodePathParamOrBadRequest(ctx, database)) orelse return textResponse(ctx, 400, "invalid policy database");
             if (decoded_policy_database.?.len == 0 or decoded_policy_database.?.len > policy_authority.maximum_name_bytes)
@@ -18599,22 +18599,27 @@ test "httpx SQL policy observation rejects public capabilities even in legacy in
     defer api_server.deinit();
     var handler: AntflyApiHandler = .{ .api_server = &api_server };
     const authority = @import("../usermgr/mod.zig").row_policy_authority;
-    for ([_]bool{ false, true }) |with_database| {
-        var request = try httpx.Request.init(a, .GET, "http://127.0.0.1/internal/v1/groups/7/tables/docs/documents/a?read_consistency=read_index&_primary_digest=true");
-        defer request.deinit();
-        try request.setHeader(authority.principal_header, "opaque.signed-capability");
-        if (with_database) try request.setHeader(authority.database_header, "default");
-        var ctx = httpx.Context.init(a, undefined, &request);
-        defer ctx.deinit();
-        const params = [_]httpx.RouteParam{
-            .{ .name = "group_id", .value = "7" },
-            .{ .name = "table_name", .value = "docs" },
-            .{ .name = "key", .value = "a" },
-        };
-        ctx.params = &params;
-        var response = try handler.internalGroupLookup(&ctx);
-        defer response.deinit();
-        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+    for ([_][]const u8{
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/documents/a?read_consistency=read_index&_primary_digest=true",
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/documents/a?read_consistency=read_index&_relational_integrity_jobs=%7B%22kind%22%3A%22observations%22%7D",
+    }) |uri| {
+        for ([_]bool{ false, true }) |with_database| {
+            var request = try httpx.Request.init(a, .GET, uri);
+            defer request.deinit();
+            try request.setHeader(authority.principal_header, "opaque.signed-capability");
+            if (with_database) try request.setHeader(authority.database_header, "default");
+            var ctx = httpx.Context.init(a, undefined, &request);
+            defer ctx.deinit();
+            const params = [_]httpx.RouteParam{
+                .{ .name = "group_id", .value = "7" },
+                .{ .name = "table_name", .value = "docs" },
+                .{ .name = "key", .value = "a" },
+            };
+            ctx.params = &params;
+            var response = try handler.internalGroupLookup(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
     }
 }
 

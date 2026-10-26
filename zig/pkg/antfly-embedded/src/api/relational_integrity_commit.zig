@@ -60,7 +60,10 @@ fn boundedControl(request: RequestContext) !RequestContext {
 
 fn authorizedLookupOptions(control: RequestContext, alloc: Allocator, table: []const u8, options: types.LookupOptions) !types.LookupOptions {
     var result = options;
-    if (options.include_primary_digest) if (control.row_policy_integrity_read) |authority| {
+    // Batched observations delegate to the same full-primary reader inside
+    // the owner. Carry its scoped integrity proof through that envelope too;
+    // metadata-only job selectors do not turn it into mutation authority.
+    if (types.supportsIntegrityReadProof(options.include_primary_digest, options.relational_integrity_jobs_json)) if (control.row_policy_integrity_read) |authority| {
         if (try authority.authorize(authority.ptr, alloc, table)) |proof| {
             result.row_policy_principal_proof = proof.token;
             result.row_policy_database = proof.database;
@@ -3619,4 +3622,32 @@ test "foreign key validation pages select pending constraints retain row guards 
     var empty = try prepareForeignKeyValidationPage(a, source, &tables, &.{}, "children", &.{}, &.{"keep"}, .{});
     defer empty.deinit();
     try std.testing.expectEqual(@as(usize, 1), empty.tables.len);
+}
+
+test "SQL drop retirement integrity observations retain scoped native read authority" {
+    const Authority = struct {
+        calls: usize = 0,
+        denied: bool = false,
+        fn authorize(ptr: *anyopaque, _: Allocator, table: []const u8) !?@import("operation.zig").RowPolicyIntegrityRead.Proof {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("parent", table);
+            if (self.denied) return error.Forbidden;
+            return .{ .token = "scoped-read-proof", .database = "tenant" };
+        }
+    };
+    var authority: Authority = .{};
+    const context: RequestContext = .{ .row_policy_integrity_read = .{ .ptr = &authority, .authorize = Authority.authorize } };
+    const original: types.LookupOptions = .{ .relational_integrity_jobs_json = "{\"kind\":\"observations\"}" };
+    const authorized = try authorizedLookupOptions(context, std.testing.allocator, "parent", original);
+    try std.testing.expectEqualStrings("scoped-read-proof", authorized.row_policy_principal_proof);
+    try std.testing.expectEqualStrings("tenant", authorized.row_policy_database);
+    try std.testing.expect(!authorized.include_primary_digest);
+    const catalog_options = try authorizedLookupOptions(context, std.testing.allocator, "parent", .{ .relational_integrity_catalog = true });
+    try std.testing.expectEqual(@as(usize, 0), catalog_options.row_policy_principal_proof.len);
+    try std.testing.expectEqual(@as(usize, 1), authority.calls);
+    const untrusted = try authorizedLookupOptions(.{}, std.testing.allocator, "parent", original);
+    try std.testing.expectEqual(@as(usize, 0), untrusted.row_policy_principal_proof.len);
+    authority.denied = true;
+    try std.testing.expectError(error.Forbidden, authorizedLookupOptions(context, std.testing.allocator, "parent", original));
 }

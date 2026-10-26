@@ -1416,15 +1416,17 @@ test "mounted SQL table placement and name evolution follows captured search pat
             try std.testing.expectEqualStrings(original.sql, self.golden.sql);
             try std.testing.expect(self.golden.bound);
             try self.implicit(ctx, false);
-            // Constrained table retirement is a definite non-admission, not
-            // an uncertain mutation. Its rows/schema must survive recovery.
+            // RESTRICT must reject dependencies before fencing the table.
+            // Its constrained rows/schema must remain writable after recovery.
+            try command(ctx, "CREATE VIEW implicit_dependency AS SELECT z,a FROM implicit_rows", null);
             {
                 var authenticated = ctx.*;
                 authenticated.headers = ctx.admin_headers;
                 var rejected = try client.executeConnected(&authenticated, null, null, "DROP TABLE implicit_rows", .write_admission);
                 defer rejected.deinit(ctx.alloc);
-                try expectDiagnostic(ctx, rejected, "0A000");
+                try expectDiagnostic(ctx, rejected, "2BP01");
             }
+            try command(ctx, "DROP VIEW implicit_dependency", null);
             try command(ctx, "CREATE SCHEMA empty_ns", null);
             try command(ctx, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace'", null);
             try command(ctx, self.golden.create, null);
@@ -1508,4 +1510,313 @@ test "mounted SQL table placement and name evolution follows captured search pat
     try std.testing.expectEqual(@as(u8, 1), parsed.value.format);
     try std.testing.expectEqualStrings("sql-1202", parsed.value.id);
     try fixture.runWithState(PlacementCampaign, .{ .golden = parsed.value });
+}
+
+test "mounted SQL constrained table drops drain outgoing and self references preserve RESTRICT and recover names" {
+    const DropCampaign = struct {
+        pub const cold_catalog = true;
+        pub const native_auth = true;
+        pub const native_sessions = true;
+        old_child: u64 = 0,
+        old_parent: u64 = 0,
+        pending_child: u64 = 0,
+        pending_plan: [16]u8 = @splat(0),
+        lost_final_reply: bool = false,
+        credentials: client.ApiKeyHeaders = .{},
+        pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+            const users = @import("../usermgr/mod.zig");
+            for ([_]users.ResourceType{ .database, .namespace }) |kind| {
+                var permission = try users.Permission.initOwned(manager.alloc, kind, "*", .admin);
+                defer permission.deinit(manager.alloc);
+                try manager.addPermissionToUser("pk-rewriter", permission);
+            }
+        }
+        fn scoped(ctx: *fixture.Context, statement: []const u8) !@import("../raft/transport/http_common.zig").HttpResponse {
+            const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .database = "retirement_db", .namespace = "retirement_ns" }, .{});
+            defer ctx.alloc.free(body);
+            return fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.metadata_uri, "/db/v1/sql", .POST, body, 15_000);
+        }
+        fn scopedReady(ctx: *fixture.Context, name: []const u8, version: u32) !fixture.ServingSchema {
+            const owner = try fixture.waitServingSchemaInScope(ctx, "retirement_db", "retirement_ns", name, version);
+            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, owner.table_id);
+            return owner;
+        }
+        fn scopedCommand(ctx: *fixture.Context, statement: []const u8, expected: ?[]const u8) !void {
+            var response = try scoped(ctx, statement);
+            defer response.deinit(ctx.alloc);
+            if (expected) |code| return expectDiagnostic(ctx, response, code);
+            errdefer std.debug.print("scoped DROP SQL={s} status={d} body={s}\n", .{ statement, response.status, response.body });
+            try std.testing.expect(response.status == 200 or response.status == 202);
+            var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer result.deinit();
+            if (result.value.ddl_receipt) |receipt| {
+                try std.testing.expect(receipt.state == .ready or receipt.state == .pending);
+                if (!std.mem.startsWith(u8, statement, "DROP TABLE")) {
+                    const version = std.math.cast(u32, receipt.schema_version) orelse return error.InvalidSchemaReceipt;
+                    const owner = try scopedReady(ctx, receipt.table, version);
+                    try std.testing.expectEqual(try std.fmt.parseInt(u64, receipt.table_id, 10), owner.table_id);
+                    if (receipt.state != .ready) try awaitConstraintReceipt(ctx, receipt, version);
+                }
+            }
+        }
+        fn scopedGone(ctx: *fixture.Context, name: []const u8) !void {
+            const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+            const deadline = platform.time.monotonicNs() +| 60 * std.time.ns_per_s;
+            while (platform.time.monotonicNs() < deadline) {
+                try ctx.checkDrivers();
+                const bytes = try source.systemCatalog(ctx.alloc, .{ .deadline_ns = deadline }, .{ .resolve = .{ .database = "retirement_db", .namespace = "retirement_ns", .table = name } });
+                defer ctx.alloc.free(bytes);
+                var resolved = try std.json.parseFromSlice(?local.system_catalog_domain.ResolvedTable, ctx.alloc, bytes, .{});
+                defer resolved.deinit();
+                if (resolved.value == null) return;
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+            return error.SqlDropRetirementTimeout;
+        }
+        fn reject(ctx: *fixture.Context, statement: []const u8) !void {
+            var response = try execute(ctx, statement, false);
+            defer response.deinit(ctx.alloc);
+            try expectDiagnostic(ctx, response, "2BP01");
+        }
+        fn drop(ctx: *fixture.Context, name: []const u8) !void {
+            const statement = try std.fmt.allocPrint(ctx.alloc, "DROP TABLE {s}", .{name});
+            defer ctx.alloc.free(statement);
+            var response = try execute(ctx, statement, false);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 200 and response.status != 202) std.debug.print("constrained DROP sql={s} status={d} body={s}\n", .{ statement, response.status, response.body });
+            try std.testing.expect(response.status == 200 or response.status == 202);
+            var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(if (response.status == 200) "DROP TABLE" else "DDL PENDING", parsed.value.command_tag);
+            if (parsed.value.ddl_receipt) |receipt| {
+                try std.testing.expect(receipt.state == .ready or receipt.state == .pending);
+                try std.testing.expectEqualStrings(name, receipt.table);
+            }
+            try awaitGone(ctx, name);
+        }
+        fn awaitGone(ctx: *fixture.Context, name: []const u8) !void {
+            const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+            const deadline = platform.time.monotonicNs() +| 60 * std.time.ns_per_s;
+            while (platform.time.monotonicNs() < deadline) {
+                try ctx.checkDrivers();
+                const bytes = try source.systemCatalog(ctx.alloc, .{ .deadline_ns = deadline }, .{ .resolve = .{ .table = name } });
+                defer ctx.alloc.free(bytes);
+                var resolved = try std.json.parseFromSlice(?local.system_catalog_domain.ResolvedTable, ctx.alloc, bytes, .{});
+                defer resolved.deinit();
+                if (resolved.value == null) return;
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+            return error.SqlDropRetirementTimeout;
+        }
+        fn count(ctx: *fixture.Context, table: []const u8, expected: []const u8) !void {
+            const statement = try std.fmt.allocPrint(ctx.alloc, "SELECT count(*)::text AS n FROM {s}", .{table});
+            defer ctx.alloc.free(statement);
+            var response = try execute(ctx, statement, true);
+            defer response.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.rows.len);
+            try std.testing.expectEqualStrings(expected, parsed.value.rows[0][0].string);
+        }
+        fn publication(ctx: *fixture.Context, id: u64) !std.json.Parsed(@import("../metadata/fk_generation_publication.zig").Publication) {
+            const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+            const bytes = try source.systemCatalog(ctx.alloc, .{ .deadline_ns = platform.time.monotonicNs() +| 15 * std.time.ns_per_s, .fk_generation_publication_authority = true }, .{ .fk_generation_publication_status = id });
+            defer ctx.alloc.free(bytes);
+            return std.json.parseFromSlice(@import("../metadata/fk_generation_publication.zig").Publication, ctx.alloc, bytes, .{ .allocate = .alloc_always });
+        }
+        fn enablePolicy(ctx: *fixture.Context, name: []const u8, table_id: u64, expression: []const u8) !void {
+            const create = try std.fmt.allocPrint(ctx.alloc, "CREATE POLICY retirement_policy ON {s} USING ({s})", .{ name, expression });
+            defer ctx.alloc.free(create);
+            const enable = try std.fmt.allocPrint(ctx.alloc, "ALTER TABLE {s} ENABLE ROW LEVEL SECURITY", .{name});
+            defer ctx.alloc.free(enable);
+            for ([_][]const u8{ create, enable }) |statement| {
+                var response = try execute(ctx, statement, false);
+                defer response.deinit(ctx.alloc);
+                try std.testing.expect(response.status == 200 or response.status == 202);
+            }
+            const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+            const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+            while (true) {
+                try ctx.checkDrivers();
+                const bytes = try source.systemCatalog(ctx.alloc, .{ .setting_admin = true, .row_policy_install_authority = true, .deadline_ns = deadline }, .{ .policy_publication_status = table_id });
+                defer ctx.alloc.free(bytes);
+                var state = try std.json.parseFromSlice(?local.system_catalog_policies.PublicationStamp, ctx.alloc, bytes, .{});
+                defer state.deinit();
+                if (state.value) |value| if (value.phase == .active) break;
+                if (platform.time.monotonicNs() >= deadline) return error.PolicyPublicationTimeout;
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+        }
+        fn policyTable(ctx: *fixture.Context) !void {
+            try command(ctx, "CREATE TABLE drop_policy(id BIGINT PRIMARY KEY)", null);
+            const table = try readyTable(ctx, "drop_policy", 0);
+            try command(ctx, "INSERT INTO drop_policy VALUES(1)", null);
+            try enablePolicy(ctx, "drop_policy", table.table_id, "false");
+            const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+            try drop(ctx, "drop_policy");
+            const bytes = try source.systemCatalog(ctx.alloc, .{ .setting_admin = true, .row_policy_install_authority = true }, .{ .policy_publication_status = table.table_id });
+            defer ctx.alloc.free(bytes);
+            var state = try std.json.parseFromSlice(?local.system_catalog_policies.PublicationStamp, ctx.alloc, bytes, .{});
+            defer state.deinit();
+            try std.testing.expect(state.value == null);
+        }
+        fn pauseAfterParentAck(self: *@This(), ctx: *fixture.Context) !void {
+            const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
+            const driver = @import("http_server.zig").ApiHttpServer.FkGenerationPublicationTestDriver;
+            try driver.pauseBackground(api, ctx.io);
+            errdefer driver.resumeBackground(api);
+            var response = try scoped(ctx, "DROP TABLE recovery_child");
+            defer response.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 202), response.status);
+            var reply = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer reply.deinit();
+            const token = reply.value.ddl_receipt.?.fk_generation_publication_id orelse return error.MissingSqlDropToken;
+            // An admitted deletion owns both the logical name and dependency
+            // admission. Neither rename nor a new view may strand its final CAS.
+            try scopedCommand(ctx, "ALTER TABLE recovery_child RENAME TO stolen_child", "55006");
+            try scopedCommand(ctx, "CREATE VIEW late_dependency AS SELECT id FROM recovery_child", "55006");
+            try scopedCommand(ctx, "ALTER SCHEMA retirement_ns RENAME TO stolen_namespace", "55006");
+            try command(ctx, "ALTER DATABASE retirement_db RENAME TO stolen_database", "55006");
+            const deadline = platform.time.monotonicNs() +| 45 * std.time.ns_per_s;
+            while (platform.time.monotonicNs() < deadline) {
+                try ctx.checkDrivers();
+                var state = try publication(ctx, self.pending_child);
+                defer state.deinit();
+                self.pending_plan = state.value.plan.id;
+                try std.testing.expectEqualStrings(token, &std.fmt.bytesToHex(self.pending_plan, .lower));
+                const interrupt_phase: @import("../metadata/fk_generation_publication.zig").Phase = if (self.lost_final_reply) .publishing_child else .acknowledging_parents;
+                if (state.value.phase == interrupt_phase) {
+                    driver.forgetVolatileCursor(api);
+                    try std.testing.expectError(error.InjectedPublicationReplyLoss, driver.step(api, .after_metadata_mutate));
+                    var lost = try publication(ctx, self.pending_child);
+                    defer lost.deinit();
+                    try std.testing.expectEqual(if (self.lost_final_reply) @import("../metadata/fk_generation_publication.zig").Phase.published else .acknowledging_reference_coverage, lost.value.phase);
+                    if (self.lost_final_reply) {
+                        try scopedGone(ctx, "recovery_child");
+                    } else {
+                        // The early parent ACK is durable. Cold recovery must
+                        // clear its coverage barrier before catalog deletion.
+                        try std.testing.expectEqual(self.pending_child, (try scopedReady(ctx, "recovery_child", 0)).table_id);
+                    }
+                    return;
+                }
+                driver.forgetVolatileCursor(api);
+                driver.step(api, .none) catch |err| switch (err) {
+                    error.GenerationAdmissionPending, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.StorageReadTemporarilyUnavailable => {},
+                    else => return err,
+                };
+                try ctx.io.sleep(.fromMilliseconds(10), .awake);
+            }
+            return error.SqlDropFaultBoundaryTimeout;
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.credentials.activateWithCatalog(ctx, true);
+            try command(ctx, "CREATE TABLE drop_parent(id BIGINT PRIMARY KEY)", null);
+            self.old_parent = (try readyTable(ctx, "drop_parent", 0)).table_id;
+            try command(ctx, "CREATE TABLE drop_child(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_parent(id),email TEXT UNIQUE)", null);
+            self.old_child = (try readyTable(ctx, "drop_child", 0)).table_id;
+            try command(ctx, "INSERT INTO drop_parent VALUES(1),(2)", null);
+            try command(ctx, "INSERT INTO drop_child VALUES(1,1,'a'),(2,2,'b')", null);
+            {
+                var reader = ctx.*;
+                reader.base = ctx.metadata_uri;
+                reader.headers = ctx.reader_headers;
+                var denied = try client.execute(&reader, "DROP TABLE drop_child", .write_admission);
+                defer denied.deinit(ctx.alloc);
+                try std.testing.expectEqual(@as(u16, 403), denied.status);
+                try std.testing.expectEqual(self.old_child, (try readyTable(ctx, "drop_child", 0)).table_id);
+            }
+            try reject(ctx, "DROP TABLE drop_parent");
+            try command(ctx, "CREATE VIEW drop_child_view AS SELECT id,email FROM drop_child", null);
+            try reject(ctx, "DROP TABLE drop_child");
+            // Both dependency rejections precede fencing: normal writes still work.
+            try command(ctx, "INSERT INTO drop_child VALUES(3,1,'c')", null);
+            try command(ctx, "DROP VIEW drop_child_view", null);
+            {
+                const users = @import("../usermgr/mod.zig");
+                const manager = ctx.metadata.server.owned_public_http_server.?.cfg.user_manager.?;
+                const scope = try (local.system_catalog_domain.Target{ .table = "drop_child" }).resourceNameAlloc(ctx.alloc);
+                defer ctx.alloc.free(scope);
+                var permission = try users.Permission.initOwned(ctx.alloc, .table, scope, .admin);
+                defer permission.deinit(ctx.alloc);
+                var key = try manager.createApiKey("pk-rewriter", "sql-drop-child-only", &.{permission}, &.{}, null);
+                defer key.deinit(manager.alloc);
+                const authorization = try std.fmt.allocPrint(ctx.alloc, "ApiKey {s}", .{key.encoded});
+                defer ctx.alloc.free(authorization);
+                const headers = [_]@import("../raft/transport/http_common.zig").RequestHeader{.{ .name = "authorization", .value = authorization }};
+                var child_owner = ctx.*;
+                child_owner.admin_headers = &headers;
+                var denied_parent = try execute(&child_owner, "DROP TABLE drop_parent", false);
+                defer denied_parent.deinit(ctx.alloc);
+                try std.testing.expectEqual(@as(u16, 403), denied_parent.status);
+                try drop(&child_owner, "drop_child");
+            }
+            try count(ctx, "drop_parent", "2");
+            // Deleting a child must drain its inverse parent witnesses, so the
+            // surviving parent is immediately usable and subsequently droppable.
+            try command(ctx, "DELETE FROM drop_parent WHERE id=1", null);
+            try drop(ctx, "drop_parent");
+            try command(ctx, "CREATE TABLE drop_self(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_self(id))", null);
+            _ = try readyTable(ctx, "drop_self", 0);
+            try command(ctx, "INSERT INTO drop_self VALUES(1,NULL),(2,1)", null);
+            try drop(ctx, "drop_self");
+            try command(ctx, "CREATE TABLE mixed_parent(id BIGINT PRIMARY KEY)", null);
+            const mixed_parent = try readyTable(ctx, "mixed_parent", 0);
+            try command(ctx, "CREATE TABLE drop_mixed(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_mixed(id),external_parent BIGINT REFERENCES mixed_parent(id))", null);
+            _ = try readyTable(ctx, "drop_mixed", 0);
+            try command(ctx, "INSERT INTO mixed_parent VALUES(1)", null);
+            try command(ctx, "INSERT INTO drop_mixed VALUES(1,NULL,1),(2,1,1)", null);
+            try enablePolicy(ctx, "mixed_parent", mixed_parent.table_id, "true");
+            try drop(ctx, "drop_mixed");
+            try command(ctx, "DELETE FROM mixed_parent WHERE id=1", null);
+            try drop(ctx, "mixed_parent");
+            try policyTable(ctx);
+            try command(ctx, "CREATE DATABASE retirement_db", null);
+            try scopedCommand(ctx, "CREATE SCHEMA retirement_ns", null);
+            try scopedCommand(ctx, "CREATE TABLE recovery_parent(id BIGINT PRIMARY KEY)", null);
+            _ = try scopedReady(ctx, "recovery_parent", 0);
+            try scopedCommand(ctx, "CREATE TABLE recovery_child(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES recovery_parent(id))", null);
+            self.pending_child = (try scopedReady(ctx, "recovery_child", 0)).table_id;
+            try scopedCommand(ctx, "INSERT INTO recovery_parent VALUES(1)", null);
+            var seed: std.Io.Writer.Allocating = .init(ctx.alloc);
+            defer seed.deinit();
+            try seed.writer.writeAll("INSERT INTO recovery_child VALUES");
+            for (0..@as(usize, if (self.lost_final_reply) 128 else 1)) |i|
+                try seed.writer.print("{s}({d},1)", .{ if (i == 0) "" else ",", i + 1 });
+            try scopedCommand(ctx, seed.written(), null);
+            try self.pauseAfterParentAck(ctx);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.credentials.activateWithCatalog(ctx, true);
+            try scopedGone(ctx, "recovery_child");
+            var recovered = try publication(ctx, self.pending_child);
+            defer recovered.deinit();
+            try std.testing.expectEqualSlices(u8, &self.pending_plan, &recovered.value.plan.id);
+            try std.testing.expectEqual(@import("../metadata/fk_generation_publication.zig").Phase.published, recovered.value.phase);
+            // One source fence, four parent receipts and the final publication:
+            // the same seven durable revisions for one or 128 real child rows.
+            try std.testing.expectEqual(@as(u64, 7), recovered.value.revision);
+            try scopedCommand(ctx, "DELETE FROM recovery_parent WHERE id=1", null);
+            try scopedCommand(ctx, "DROP TABLE recovery_parent", null);
+            try scopedGone(ctx, "recovery_parent");
+            // The same legitimate ancestor renames succeed once the exact
+            // deletion intent has completed and released its lifecycle locks.
+            try scopedCommand(ctx, "ALTER SCHEMA retirement_ns RENAME TO retired_namespace", null);
+            try command(ctx, "ALTER DATABASE retirement_db RENAME TO retired_database", null);
+            inline for (.{ "drop_child", "drop_parent", "drop_self" }) |name| try expectAbsent(ctx, name);
+            try command(ctx, "CREATE TABLE drop_parent(id BIGINT PRIMARY KEY)", null);
+            const parent = try readyTable(ctx, "drop_parent", 0);
+            try std.testing.expect(parent.table_id != self.old_parent);
+            try command(ctx, "CREATE TABLE drop_child(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES drop_parent(id),email TEXT UNIQUE)", null);
+            const child = try readyTable(ctx, "drop_child", 0);
+            try std.testing.expect(child.table_id != self.old_child);
+            // Old generation claims cannot collide with fresh logical name reuse.
+            try command(ctx, "INSERT INTO drop_parent VALUES(1)", null);
+            try command(ctx, "INSERT INTO drop_child VALUES(1,1,'a')", null);
+            try count(ctx, "drop_child", "1");
+        }
+    };
+    for ([_]bool{ false, true }) |lost_final_reply|
+        try fixture.runWithState(DropCampaign, .{ .lost_final_reply = lost_final_reply });
 }

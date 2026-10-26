@@ -753,7 +753,7 @@ pub const ApiHttpClient = struct {
         if ((options.row_policy_principal_proof.len == 0) != (options.row_policy_database.len == 0) or
             options.row_policy_principal_proof.len > authority.maximum_token_bytes or
             options.row_policy_database.len > authority.maximum_name_bytes or
-            (options.row_policy_principal_proof.len != 0 and !include_primary_digest)) return error.InvalidArgument;
+            (options.row_policy_principal_proof.len != 0 and !db_mod.types.supportsIntegrityReadProof(include_primary_digest, relational_integrity_jobs_json))) return error.InvalidArgument;
         for (options.row_policy_principal_proof) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != ':' and byte != '.' and byte != '-' and byte != '_') return error.InvalidArgument;
         const policy_database = if (options.row_policy_principal_proof.len != 0) try percentEncodePathComponent(self.alloc, options.row_policy_database) else null;
         defer if (policy_database) |value| self.alloc.free(value);

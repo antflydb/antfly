@@ -20,7 +20,7 @@
 //! before admission; supporting decoding does not enable a public operation.
 const std = @import("std");
 pub const Id = [16]u8;
-pub const Kind = enum(u8) { generation = 1, initial_support = 2, index_build = 3, schema_validation = 4 };
+pub const Kind = enum(u8) { generation = 1, initial_support = 2, index_build = 3, schema_validation = 4, sql_drop = 5 };
 pub const encoded_len = 17;
 const all_prefix = "\x00\x00__metadata__:fk_generation_table_lock:";
 pub fn allGroupsPrefix() []const u8 {
@@ -90,7 +90,7 @@ pub fn read(txn: anytype, group_id: u64, table_id: u64) !?Lock {
 /// revision, never by guessing that an equal lock means begin was completed.
 pub fn acquire(txn: anytype, group_id: u64, table_id: u64, lock: Lock) !void {
     const bytes = try lock.encode();
-    if (lock.kind == .generation) try @import("schema_validation_dependencies.zig").requireUnleased(txn, group_id, table_id);
+    if (lock.kind == .generation or lock.kind == .sql_drop) try @import("schema_validation_dependencies.zig").requireUnleased(txn, group_id, table_id);
     if (try read(txn, group_id, table_id) != null) return error.GenerationPublicationChanged;
     var buf: [160]u8 = undefined;
     try txn.put(try key(&buf, group_id, table_id), &bytes);

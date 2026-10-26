@@ -132,7 +132,9 @@ const std = @import("std");
 /// branch's earlier SQL work, so require this combined decoder explicitly.
 /// Version 70 binds owned sequence defaults and table creation in one catalog transaction.
 /// Version 71 preserves exact SQL view temporal domains and dependency identities.
-pub const current_version: u16 = 71;
+/// Version 72 retains SQL DROP intent through native source/parent generation barriers.
+pub const current_version: u16 = 72;
+pub const sql_drop_generation_version: u16 = 72;
 pub const sql_view_domains_version: u16 = 71;
 pub const sql_column_sequences_version: u16 = 70;
 pub const native_service_tables_version: u16 = 69;

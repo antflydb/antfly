@@ -47,14 +47,17 @@ fn childWithoutReceipt(value: publication.Publication, receipts: []const publica
 }
 
 fn parentWithoutReceipt(value: publication.Publication, receipts: []const publication.Receipt, action: owner.Action) ?Target {
-    for (value.plan.parents) |parent| for (parent.ranges) |range| {
-        if (!contains(receipts, range.group_id)) return .{ .parent = .{
-            .table_name = parent.table.name,
-            .table_id = parent.table.table_id,
-            .group_id = range.group_id,
-            .action = action,
-        } };
-    };
+    for (value.plan.parents) |parent| {
+        if (value.phase == .acknowledging_reference_coverage and !value.plan.needsParentCoverage(parent)) continue;
+        for (parent.ranges) |range| {
+            if (!contains(receipts, range.group_id)) return .{ .parent = .{
+                .table_name = parent.table.name,
+                .table_id = parent.table.table_id,
+                .group_id = range.group_id,
+                .action = action,
+            } };
+        }
+    }
     return null;
 }
 

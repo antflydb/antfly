@@ -5951,6 +5951,17 @@ pub const ApiHttpServer = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const plan = try @import("fk_generation_plan_builder.zig").buildWithConstraintNameGuard(self, a, context, identity, before, proposed_schema_json, guard);
+        return self.submitFkGenerationPlan(alloc, context, plan);
+    }
+
+    /// SQL preallocates its receipt before this durable admission. A native
+    /// generation plan owns cancellation, recovery and parent retirement.
+    pub fn submitFkGenerationPlan(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, plan: @import("../metadata/fk_generation_publication.zig").Plan) !FkGenerationBegin {
+        if (self.cfg.deployment_mode == .standalone and
+            (self.hotStandbyMutationPolicy().failover_safe_mutations_only or self.cfg.fk_generation_source == null or self.cfg.fk_generation_parent == null)) return error.UnsupportedOperation;
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
         const result: FkGenerationBegin = .{
             .plan_id = plan.id,
             .child_table_id = plan.child_before.table_id,
@@ -5969,7 +5980,7 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         const accepted = std.json.parseFromSliceLeaky(@import("../metadata/fk_generation_publication.zig").Publication, a, response, .{ .allocate = .alloc_always }) catch return error.MetadataMutationOutcomeUnknown;
-        if (!std.mem.eql(u8, &accepted.plan.id, &plan.id) or accepted.plan.child_before.table_id != before.table_id)
+        if (!std.mem.eql(u8, &accepted.plan.id, &plan.id) or accepted.plan.child_before.table_id != plan.child_before.table_id)
             return error.MetadataMutationOutcomeUnknown;
         return result;
     }

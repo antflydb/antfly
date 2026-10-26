@@ -1421,6 +1421,13 @@ pub const Query = union(enum) {
     graph: graph_query_mod.GraphQuery,
 };
 
+/// A scoped integrity proof may authorize full-primary observations directly
+/// or inside a bounded integrity-job batch. Transport still requires explicit
+/// service authentication; native row reads verify the signed owner/purpose.
+pub fn supportsIntegrityReadProof(include_primary_digest: bool, jobs_json: []const u8) bool {
+    return include_primary_digest or jobs_json.len != 0;
+}
+
 pub const LookupOptions = struct {
     /// Local output allocation policy; never parsed from public requests.
     /// Raw copies and flat native projections already allocate exact bodies.

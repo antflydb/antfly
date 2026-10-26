@@ -1754,7 +1754,7 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     if (command.plan) |plan| try plan.requireAdmissionCoverage();
     // The full generation lifecycle shares one decoder floor, including
     // recovery commands which do not repeat the immutable plan.
-    const required = protocol.fk_generation_column_addition_version;
+    const required = if (command.plan != null and command.plan.?.sql_drop != null) protocol.sql_drop_generation_version else protocol.fk_generation_column_addition_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
@@ -1762,7 +1762,7 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     defer if (gate_held) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    if (command.plan) |plan| if (plan.constraint_name_guard != null)
+    if (command.plan) |plan| if (plan.constraint_name_guard != null or plan.sql_drop != null)
         try store.preflightFkGenerationNameAdmission(svc.metadata_group_id, plan);
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
