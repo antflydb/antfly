@@ -1,0 +1,93 @@
+{
+  "completed": true,
+  "delta_from_v3": [
+    "source comment version only; scientific/control/test code is byte-identical after the first four comment lines",
+    "test command pins ReleaseSafe separately for root and attention_mass_lp modules",
+    "test cwd and both cache paths are explicit inside the worktree zig directory",
+    "README explicitly bounds worst-case warm-hint duplicate validation"
+  ],
+  "design": {
+    "path": "/private/tmp/attention-matching-native-mass-cg-control-readiness-v1.json",
+    "sha256": "84a48621fa26fdbc3255ab6dd5a2209b64e4c52197f93e9fe509343077647003"
+  },
+  "diagnostic_only": true,
+  "execution_authorized": false,
+  "immutable_v1_snapshot": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v1.zig",
+    "sha256": "646a7d21add4f1189ad467277ea267c5ce915082fa1abe31bfaf65278f414853"
+  },
+  "limitations": [
+    "solver callback remains injected; no optimizer linked",
+    "no numerical/native parity claim",
+    "support/value/tangent/transaction/serving integration remain out of scope"
+  ],
+  "named_test_module": {
+    "path": "/private/tmp/attention_mass_lp_v4.zig",
+    "sha256": "ff1d98cab21450271694ab524dd0733294ae0ff15793c57ed105f4d18d9354de"
+  },
+  "native_parity_claimed": false,
+  "native_solver_integrated": false,
+  "predecessor_handoff": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-cg-controller-handoff-v3.json",
+    "sha256": "f644c45fec762484bdea44549ca9513eebc9f7fb7ff9d65213dfa07af8454131"
+  },
+  "predecessor_source": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v3.zig",
+    "sha256": "4010875b9b2a09e8c0d75920ee88531777112badbe470ee4e65a6631ee54e8b2"
+  },
+  "publication_authority": false,
+  "readme": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-cg-controller-v4.md",
+    "sha256": "e656a8e7a1b7617137dd1cb22bc9c4246ffe9ba5dce195bb32d5d6c501b46db7"
+  },
+  "schema": "antfly.attention-matching.native-mass-cg-controller-draft-handoff.v4",
+  "scientific_control_delta_from_v3": false,
+  "serving_authority": false,
+  "source": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v4.zig",
+    "sha256": "8556b762b7e79236fb8207c893459425e59624642848cfb4b8e988cb1d76f1f0"
+  },
+  "static_review_notes": [
+    "single-owner cleanup inspected across accepted, terminal, retry, and manual deadline branches",
+    "two-round test exercises added omitted row and final alpha/beta zero-fill",
+    "no failing-allocator sweep; retry-failure and timed/cancelled tests use std.testing.allocator",
+    "timeout fixtures cover initial finite scan and post-solver result; gather/maxAbs/violation/materialization implementations are statically checked but do not each have a dedicated crossing fixture"
+  ],
+  "test_command": [
+    "/opt/homebrew/Cellar/zig/0.17.0/bin/zig",
+    "test",
+    "-OReleaseSafe",
+    "--dep",
+    "attention_mass_lp",
+    "-Mroot=../docs/design/inference/native-port/attention_mass_constraint_generation_v4.zig",
+    "-OReleaseSafe",
+    "-Mattention_mass_lp=/private/tmp/attention_mass_lp_v4.zig",
+    "--cache-dir",
+    "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig/.zig-cache",
+    "--global-cache-dir",
+    "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig/.zig-cache/global"
+  ],
+  "test_cwd": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig",
+  "unapplied": true,
+  "v2_compile_failure": {
+    "resource": {
+      "path": "/private/tmp/attention-matching-native-mass-cg-v2-compiled-tests-resource-v1.json",
+      "sha256": "7d47ca6db91167a100887819f9b588c556d3d56979aaff379244b268ed53ddef"
+    },
+    "stderr": {
+      "path": "/private/tmp/attention-matching-native-mass-cg-v2-compiled-tests-resource-v1.stderr",
+      "sha256": "c66fdd94897fa05b8879e8fdffccc4d16f0a5b592c9224d4ed4b61b99b884cb7"
+    }
+  },
+  "verification": {
+    "git_diff_check": "PASS",
+    "reason": "root coordinates guarded pinned-Zig testing after active native capture drains",
+    "zig_compile": "NOT RUN",
+    "zig_fmt": "PASS",
+    "zig_tests": "NOT RUN"
+  },
+  "zig_out": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig/zig-out",
+    "used_by_test": false
+  }
+}

@@ -938,6 +938,8 @@ pub const AttentionSinkMetadata = struct {
 };
 
 pub const AttentionContext = struct {
+    context_session: ?runtime.kv.context_session.Hook = null,
+    context_consumer_layer: ?u32 = null,
     mode: AttentionMode = .dense_causal,
     total_sequence_len: usize,
     query_sequence_len: usize,
@@ -1317,6 +1319,8 @@ pub const DecoderRuntimeDecodeRequest = struct {
     mode: DecoderRuntimeDecodeMode = .greedy_argmax,
     sampling: ?DecoderRuntimeSamplingRequest = null,
     phase: DecoderRuntimeDecodePhase = .full,
+    qualification_require_finite_logits: bool = false,
+    qualification_final_logit_softcap: f32 = 0,
     configured_layer_count: usize,
     layer_count: usize,
     hidden_size: usize,

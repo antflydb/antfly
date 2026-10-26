@@ -227,6 +227,7 @@ pub fn create(config: Config) Graph {
     const hash_mod = shared.hash orelse createSharedModule(config, "lib/hash/src/mod.zig");
     const image_mod = shared.image orelse createSharedModule(config, "lib/image/src/mod.zig");
     if (shared.image == null) image_mod.addImport("antfly_hash", hash_mod);
+    structured_mod.addImport("antfly_image", image_mod);
     const prometheus_mod = shared.prometheus;
     const structlog_mod = shared.structlog;
     const jinja_mod = shared.jinja orelse b.dependency("jinja", .{
@@ -310,8 +311,9 @@ pub fn create(config: Config) Graph {
     // Native server composition replaces these imports when it builds the bridge.
     const apple_native_options = b.addOptions();
     apple_native_options.addOption(bool, "enabled", false);
+    const apple_native_options_mod = apple_native_options.createModule();
     const apple_native_mod = createSharedModule(config, "lib/apple_native/src/mod.zig");
-    apple_native_mod.addImport("apple_native_options", apple_native_options.createModule());
+    apple_native_mod.addImport("apple_native_options", apple_native_options_mod);
     apple_native_mod.addImport("antfly_platform", platform_mod);
     apple_native_mod.addImport("httpx", httpx_mod);
     transcribing_mod.addImport("antfly_apple_native", apple_native_mod);
@@ -370,6 +372,28 @@ pub fn create(config: Config) Graph {
     inference_chunker_mod.addImport("antfly_image", image_mod);
     inference_chunker_mod.addImport("antfly_hash", hash_mod);
 
+    const inference_work_mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/host/work.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_work_mod.addImport("antfly_scraping", scraping_mod);
+    inference_work_mod.addImport("antfly_image", image_mod);
+    const readers_mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/readers/src/mod.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    readers_mod.addImport("httpx", httpx_mod);
+    readers_mod.addImport("inference_api", inference_api_mod);
+    readers_mod.addImport("antfly_google", google_mod);
+    readers_mod.addImport("antfly_reader_config", reader_config_mod);
+    readers_mod.addImport("antfly_scraping", scraping_mod);
+    readers_mod.addImport("antfly_image", image_mod);
+    readers_mod.addImport("apple_reader_options", apple_native_options_mod);
+    readers_mod.addImport("antfly_inference_work", inference_work_mod);
+    readers_mod.addImport("antfly_platform", platform_mod);
+
     const inference_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/inference.zig")),
         .target = target,
@@ -382,6 +406,7 @@ pub fn create(config: Config) Graph {
     });
     inference_mod.addImport("antfly_decisions", decisions_mod);
     inference_mod.addImport("antfly_structured", structured_mod);
+    inference_mod.addImport("antfly_readers", readers_mod);
     decisions_mod.addImport("antfly_structured", structured_mod);
     inference_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     addInferenceRootImports(inference_mod, .{
@@ -451,6 +476,7 @@ pub fn create(config: Config) Graph {
     });
     inference_internal_mod.addImport("antfly_decisions", decisions_mod);
     inference_internal_mod.addImport("antfly_structured", structured_mod);
+    inference_internal_mod.addImport("antfly_readers", readers_mod);
     inference_internal_mod.addImport("antfly_extracting", extracting_mod);
     inference_internal_mod.addImport("build_info", shared.build_info_mod);
     identities.addImports(inference_internal_mod);

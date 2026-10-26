@@ -25,6 +25,7 @@ from native_checkpoint_transport import (
     MAX_CHECKPOINT,
     envelope_prefix,
     receive_checkpoint,
+    send_resume,
 )
 
 
@@ -45,6 +46,49 @@ def fixture(version=2, encoding="f32"):
 
 
 class TransportTests(unittest.TestCase):
+    def test_resume_upload_completion_hook_precedes_response_wait(self):
+        _, checkpoint = fixture()
+
+        class Connection:
+            def __init__(self):
+                self.events = []
+
+            def putrequest(self, method, path):
+                self.events.append(("request", method, path))
+
+            def putheader(self, name, value):
+                self.events.append(("header", name, value))
+
+            def endheaders(self):
+                self.events.append(("headers_complete",))
+
+            def send(self, data):
+                self.events.append(("send", len(data)))
+
+            def getresponse(self):
+                self.events.append(("response",))
+                return "response"
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "checkpoint"
+            source.write_bytes(checkpoint)
+            connection = Connection()
+            observed = []
+            result = send_resume(
+                connection,
+                "/resume",
+                {"request": "metadata"},
+                source,
+                on_upload_complete=lambda: (
+                    connection.events.append(("upload_complete",)),
+                    observed.append(True),
+                ),
+            )
+        self.assertEqual(result, "response")
+        self.assertEqual(observed, [True])
+        kinds = [event[0] for event in connection.events]
+        self.assertLess(kinds.index("upload_complete"), kinds.index("response"))
+
     def test_valid_bounded_transfer_and_independent_digest(self):
         frame, checkpoint = fixture()
 

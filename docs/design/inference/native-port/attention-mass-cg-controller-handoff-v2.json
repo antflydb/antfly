@@ -1,0 +1,80 @@
+{
+  "changes": [
+    "control check precedes initial full finite scan",
+    "finite matrix, max-absolute, and restricted gather scans check cancellation and absolute deadline",
+    "geometry explicitly bounded at 4096 rows and 512 columns for remaining non-callback work",
+    "all internal timeout crossings return deadline_exhausted while cancellation remains distinct",
+    "two-round added-row test proves canonical selected-row ownership and omitted full-dual zero fill",
+    "retry failure, after-callback cancellation, and deadline paths use testing allocator leak checks"
+  ],
+  "completed": true,
+  "design": {
+    "path": "/private/tmp/attention-matching-native-mass-cg-control-readiness-v1.json",
+    "sha256": "84a48621fa26fdbc3255ab6dd5a2209b64e4c52197f93e9fe509343077647003"
+  },
+  "diagnostic_only": true,
+  "embedded_tests": [
+    "V1 seed/order, accepted ownership, exact retry, solver terminals, cancellation, deadline, warm rows, clock regression, violation selection",
+    "two rounds add one violated row and zero-fill an omitted original-coordinate dual row",
+    "second restricted-witness rejection frees both solver results",
+    "cancellation occurs before non-finite input scan",
+    "deadline during initial finite scan returns deadline_exhausted without invoking solver"
+  ],
+  "execution_authorized": false,
+  "immutable_v1_snapshot": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v1.zig",
+    "sha256": "646a7d21add4f1189ad467277ea267c5ce915082fa1abe31bfaf65278f414853"
+  },
+  "limitations": [
+    "solver callback remains injected; no optimizer linked",
+    "no numerical/native parity claim",
+    "remaining LP build, witness, and stable sort work is callback-free but explicitly bounded by accepted geometry",
+    "support/value/tangent/transaction/serving integration remain out of scope"
+  ],
+  "named_test_module": {
+    "path": "/private/tmp/attention_mass_lp_v4.zig",
+    "sha256": "ff1d98cab21450271694ab524dd0733294ae0ff15793c57ed105f4d18d9354de"
+  },
+  "native_parity_claimed": false,
+  "native_solver_integrated": false,
+  "predecessor_handoff": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-cg-controller-handoff-v1.json",
+    "sha256": "9320f16da25100b92465bb6fc7b3dd14aa631d7aaeaa603dad845550f5f4ceef"
+  },
+  "predecessor_source": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation.zig",
+    "sha256": "646a7d21add4f1189ad467277ea267c5ce915082fa1abe31bfaf65278f414853"
+  },
+  "publication_authority": false,
+  "readme": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-cg-controller-v2.md",
+    "sha256": "f7ecf5535e46552cbf4763add220b3d727c54da21cf58bfdb1b36815c2c43f00"
+  },
+  "schema": "antfly.attention-matching.native-mass-cg-controller-draft-handoff.v2",
+  "serving_authority": false,
+  "source": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v2.zig",
+    "sha256": "4cbae68d0b7a29a9a33d346a5571426d72b62384c62fb0297d9a2d69643662a5"
+  },
+  "test_command": [
+    "/opt/homebrew/Cellar/zig/0.17.0/bin/zig",
+    "test",
+    "-OReleaseSafe",
+    "--dep",
+    "attention_mass_lp",
+    "-Mroot=docs/design/inference/native-port/attention_mass_constraint_generation_v2.zig",
+    "-Mattention_mass_lp=/private/tmp/attention_mass_lp_v4.zig",
+    "--cache-dir",
+    ".zig-cache",
+    "--global-cache-dir",
+    ".zig-cache/global"
+  ],
+  "unapplied": true,
+  "verification": {
+    "git_diff_check": "PASS",
+    "reason": "root coordinates guarded pinned-Zig testing",
+    "zig_compile": "NOT RUN",
+    "zig_fmt": "NOT RUN",
+    "zig_tests": "NOT RUN"
+  }
+}

@@ -554,14 +554,45 @@ pub const MetalTensor = struct {
         byte_len: usize,
         dims: []const i32,
     ) MetalTensor {
-        std.debug.assert(dims.len <= max_dims);
+        return deviceBorrowedWithAllocator(
+            std.heap.c_allocator,
+            runtime,
+            handle,
+            byte_offset,
+            byte_len,
+            dims,
+        ) catch @panic("Metal buffer ref alloc failed");
+    }
+
+    /// Wrap runtime-owned storage with a caller-owned, fallible lifetime
+    /// record. The caller's allocator must outlive every retained view.
+    pub fn deviceBorrowedWithAllocator(
+        allocator: std.mem.Allocator,
+        runtime: *anyopaque,
+        handle: *anyopaque,
+        byte_offset: usize,
+        byte_len: usize,
+        dims: []const i32,
+    ) !MetalTensor {
+        if (dims.len > max_dims) return error.InvalidTensorShape;
+        const ref = try allocator.create(DeviceBufferRef);
+        errdefer allocator.destroy(ref);
+        ref.* = .{
+            .handle = handle,
+            .runtime = runtime,
+            .byte_len = byte_len,
+            .ref_count = 1,
+            .released = false,
+            .release_on_drop = false,
+            .allocator = allocator,
+        };
         var t = MetalTensor{
             .shape_len = @intCast(dims.len),
             .data = @ptrFromInt(@alignOf(f32)),
             .len = 0,
             .owned_by_c_allocator = false,
             .device = .{
-                .ref = createDeviceBufferRef(runtime, handle, false, byte_len),
+                .ref = ref,
                 .byte_offset = byte_offset,
                 .byte_len = byte_len,
             },

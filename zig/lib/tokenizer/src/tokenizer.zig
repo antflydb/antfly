@@ -31,7 +31,7 @@ pub const Token = struct {
 pub const EncodeResult = struct {
     ids: []i32,
     attention_mask: []i32,
-    /// Character offsets [start, end) for each token position.
+    /// UTF-8 byte offsets [start, end) for each token position.
     /// null when the tokenizer doesn't support offset tracking.
     offsets: ?[]const [2]u32 = null,
     allocator: std.mem.Allocator,
@@ -88,6 +88,9 @@ pub const Tokenizer = struct {
         encodeForModelUnpadded: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!EncodeResult = null,
         /// Encode text for causal generation, optionally with BOS-aware start-of-sequence semantics.
         encodeGeneration: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) anyerror!EncodeResult,
+        /// Exact original UTF-8 byte spans for provenance-aware generation.
+        /// Unsupported normalization must fail closed; zero spans are protected.
+        encodeGenerationWithOffsets: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) anyerror!EncodeResult = null,
         /// Decode token IDs back to text.
         decode: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, ids: []const i32) anyerror![]u8,
         /// Bytes contributed by one generated token. Continuations must retain
@@ -107,6 +110,11 @@ pub const Tokenizer = struct {
         /// Free resources.
         deinit: *const fn (ptr: *anyopaque) void,
     };
+
+    pub fn encodeGenerationWithOffsets(self: Tokenizer, allocator: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) !EncodeResult {
+        const encode_fn = self.vtable.encodeGenerationWithOffsets orelse return error.UnsupportedTokenizerOffsets;
+        return encode_fn(self.ptr, allocator, text, max_length, add_bos_token);
+    }
 
     pub fn encode(self: Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]i32 {
         return self.vtable.encode(self.ptr, allocator, text);

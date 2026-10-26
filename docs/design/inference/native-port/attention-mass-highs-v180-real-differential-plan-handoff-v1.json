@@ -1,0 +1,88 @@
+{
+  "completed": true,
+  "diagnostic_only": true,
+  "execution_authorized": false,
+  "experiment": [
+    "pinned static-library receipt",
+    "cold real-C-ABI 1e-9 reject then fresh-instance 1e-10 pass",
+    "full original-coordinate witness and lifecycle parity",
+    "later separate canonical-rebuild basis-seeding A/B only after cold parity"
+  ],
+  "explicit_exclusions": [
+    "no append-only persistent model substitution because CG canonical row order can change",
+    "no fewer-LP-call policy",
+    "no tolerance or witness changes",
+    "no model/fitting/held-data execution",
+    "no canonical runtime integration"
+  ],
+  "highs": {
+    "build_authorized": false,
+    "commit": "fcfb5341462f8a7db5ef5038613413f97d6cac3d",
+    "library_present": false,
+    "solver_executed": false,
+    "tag": "v1.8.0"
+  },
+  "publication_authority": false,
+  "schema": "antfly.design.attention-mass-highs-v180-real-differential-plan-handoff.v1",
+  "sources": {
+    "adapter": {
+      "bytes": 29057,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_highs_v180_adapter_v3.zig",
+      "sha256": "493637b21fec53d07813fddac5cc874d232ae6680befe504bf639e9e3e6c5525"
+    },
+    "adapter_review": {
+      "bytes": 1752,
+      "path": "/private/tmp/attention-matching-native-highs-v180-adapter-independent-review-v3.json",
+      "sha256": "f574f049a7a37819f2edebbd6aea23c0203a5f289903f8ca70f6b25b864119f7"
+    },
+    "adapter_test_receipt": {
+      "bytes": 3100,
+      "path": "/private/tmp/attention-matching-native-highs-adapter-v3-fixture-tests-terminal-receipt-v1.json",
+      "sha256": "8a5667f00dcbaa3d5b6d05f8cf3071cc5809b28bd834a23bdb3524f54bcd060e"
+    },
+    "controller": {
+      "bytes": 41830,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v5.zig",
+      "sha256": "abdcc63e7d914b174f3fb8db2302db16af126386b610fcf6e80bf1dbb2ec82fa"
+    },
+    "controller_audit": {
+      "bytes": 1901,
+      "path": "/private/tmp/attention-matching-native-mass-cg-v5-compiled-tests-terminal-audit-root-v1.json",
+      "sha256": "faddb16f6f90a0b5ca6ece1ace2e1bd71ca35efa2b7638586020f392d2daad8b"
+    },
+    "design": {
+      "bytes": 6853,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-highs-v180-real-differential-plan-v1.md",
+      "sha256": "412abe1825d43e5d3295e1cc564083708d9e451e1a81f579ec05124b68796c4a"
+    },
+    "exporter": {
+      "bytes": 14035,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/export_attention_mass_highs_restricted_fixture_v1.py",
+      "sha256": "1c277ae899839278ee60d001a56e78d751074755c4eaf7856ff6f6194baa916a"
+    },
+    "exporter_test": {
+      "bytes": 2130,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/test_export_attention_mass_highs_restricted_fixture_v1.py",
+      "sha256": "15185e275923fa7028a9e2e15cf4708e284200ce0ccb17c51f2002cb75d7fe74"
+    },
+    "lp": {
+      "bytes": 24314,
+      "path": "/private/tmp/attention_mass_lp_v4.zig",
+      "sha256": "ff1d98cab21450271694ab524dd0733294ae0ff15793c57ed105f4d18d9354de"
+    },
+    "readiness": {
+      "bytes": 12924,
+      "path": "/private/tmp/attention-matching-native-highs-v180-c-abi-integration-readiness-v2.json",
+      "sha256": "a4b23dbf7e04525dd7f4a3ea07ee06d92ed4fbddd162d7c8fb0aac2de0baef91"
+    },
+    "timing": {
+      "bytes": 7005,
+      "path": "/private/tmp/attention-matching-main3-timing-origins-v2-partial-mass-profile-v1.json",
+      "sha256": "3cbf837e03b0848ef40a3de2690bf1adbe7348a9b8e3ac188f0e40a1e252fbf8"
+    }
+  },
+  "validation": {
+    "download_build_link_run": false,
+    "static_document_only": true
+  }
+}

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const bounded_allocator = @import("bounded_allocator.zig");
+pub const context_policy = @import("context_policy.zig");
 pub const distributed = @import("distributed.zig");
 pub const kv = @import("kv/root.zig");
 pub const moe = @import("moe/root.zig");
@@ -21,6 +22,7 @@ pub const scheduler = @import("scheduler/root.zig");
 pub const tier = @import("tier/root.zig");
 
 test {
+    _ = context_policy;
     _ = distributed;
     _ = kv;
     _ = moe;

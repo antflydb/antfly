@@ -86,9 +86,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);
     tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("antfly_video", ctx.graph.inference_mod.import_table.get("antfly_video").?);
-    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);
-    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("jinja", ctx.graph.jinja_mod);
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
@@ -117,6 +115,59 @@ pub fn create(ctx: Context) Suite {
     runtime_build.configureMetal(b, tests.root_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
     runtime_build.configureCudaVideo(b, tests.root_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
     tests.root_module.link_libc = ctx.backend.link_libc;
+
+    const context_module = b.createModule(.{
+        .root_source_file = ctx.path("src/context_test_root.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .strip = ctx.strip,
+    });
+    var context_imports = tests.root_module.import_table.iterator();
+    while (context_imports.next()) |entry| context_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    context_module.addImport("inference_internal", context_module);
+    if (ctx.backend.enable_system_blas) runtime_build.configureSystemBlas(b, context_module, ctx.target, ctx.backend.blas_root);
+    runtime_build.configureMetal(b, context_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
+    runtime_build.configureCudaVideo(b, context_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
+    context_module.link_libc = ctx.backend.link_libc;
+    const context_tests = b.addTest(.{
+        .name = "context-tests",
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .root_module = context_module,
+        .filters = if (main_test_filters.len != 0) main_test_filters else &.{ "context ", "compaction", "attention_match", "sliding", "gemma4", "native generation prompt", "swa ring", "serving qualification", "server generate stream", "native checkpoint", "selected Metal" },
+        .test_runner = runtime_filter_test_runner,
+    });
+    const run_context_tests = ctx.addRunArtifact(context_tests);
+    for (selected_test_filters) |filter| {
+        run_context_tests.addArgs(&.{ "--test-filter", filter });
+    }
+    build_test_filters.addRuntimeControls(run_context_tests, ctx.args orelse &.{});
+    ctx.step("test-context", "Test context admission, Gemma layer layouts and bounded KV compaction").dependOn(&run_context_tests.step);
+
+    const native_context_module = b.createModule(.{
+        .root_source_file = ctx.path("src/context_native_test_root.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .strip = ctx.strip,
+    });
+    var native_context_imports = tests.root_module.import_table.iterator();
+    while (native_context_imports.next()) |entry| native_context_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    native_context_module.addImport("inference_internal", native_context_module);
+    if (ctx.backend.enable_system_blas) runtime_build.configureSystemBlas(b, native_context_module, ctx.target, ctx.backend.blas_root);
+    runtime_build.configureMetal(b, native_context_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
+    native_context_module.link_libc = ctx.backend.link_libc;
+    const native_context_tests = b.addTest(.{
+        .name = "context-native-tests",
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .root_module = native_context_module,
+        .filters = if (main_test_filters.len != 0) main_test_filters else &.{ "context native", "attention_match" },
+        .test_runner = runtime_filter_test_runner,
+    });
+    const run_native_context_tests = ctx.addRunArtifact(native_context_tests);
+    for (selected_test_filters) |filter| {
+        run_native_context_tests.addArgs(&.{ "--test-filter", filter });
+    }
+    build_test_filters.addRuntimeControls(run_native_context_tests, ctx.args orelse &.{});
+    ctx.step("test-context-native", "Test native FP64 attention matching and rounded Metal whole-head acceptance").dependOn(&run_native_context_tests.step);
 
     // Keep the standalone server's CLI and configuration parsing covered too.
     // `src/inference.zig` does not import `src/main.zig`, so tests declared by

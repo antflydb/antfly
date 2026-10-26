@@ -30,13 +30,18 @@ const F32xN = @Vector(VEC_LEN, f32);
 /// On return, the lower triangle of A contains L (L * L^T = A) and B contains X.
 pub fn choleskySolve(A: []f32, B: []f32, n: usize, nrhs: usize) !void {
     if (n == 0) return;
+    const matrix_size = std.math.mul(usize, n, n) catch return error.InvalidShape;
+    const rhs_size = std.math.mul(usize, n, nrhs) catch return error.InvalidShape;
+    if (A.len != matrix_size or B.len != rhs_size) return error.InvalidShape;
+    for (A) |v| if (!std.math.isFinite(v)) return error.NonFiniteInput;
+    for (B) |v| if (!std.math.isFinite(v)) return error.NonFiniteInput;
 
     // Cholesky factorization: A = L * L^T (in-place, lower triangle).
     for (0..n) |j| {
         // Diagonal element: L[j,j] = sqrt(A[j,j] - sum_k L[j,k]^2)
         var diag = A[j * n + j];
         diag -= dotSelf(A[j * n ..].ptr, j);
-        if (diag <= 0) return error.NotPositiveDefinite;
+        if (!std.math.isFinite(diag) or diag <= 0) return error.NotPositiveDefinite;
         const l_jj = @sqrt(diag);
         A[j * n + j] = l_jj;
         const inv_jj = 1.0 / l_jj;
@@ -111,6 +116,7 @@ pub fn choleskySolve(A: []f32, B: []f32, n: usize, nrhs: usize) !void {
             b_row[r] *= 1.0 / A[i * n + i];
         }
     }
+    for (B) |v| if (!std.math.isFinite(v)) return error.NonFiniteResult;
 }
 
 /// Compute A^T * A -> out [n x n], where A is [m x n] row-major.

@@ -1,0 +1,447 @@
+--- a/zig/pkg/inference/src/backends/packed_context_session.zig
++++ b/zig/pkg/inference/src/backends/packed_context_session.zig
+@@ -41,7 +41,10 @@
+ };
+ pub const CommittedContextStorageDiagnostic = struct {
+     diagnostic_only: bool = true,
++    /// Compatibility alias for total_owner_count.
+     owner_count: u32,
++    global_owner_count: u32,
++    total_owner_count: u32,
+     physical_bytes: u64,
+     replay_control_bytes: u64,
+     tracker_snapshot: owner_alloc.Snapshot,
+@@ -730,6 +733,8 @@
+         }
+         return .{
+             .owner_count = @intCast(self.globals.len + self.sliding.len),
++            .global_owner_count = @intCast(self.globals.len),
++            .total_owner_count = @intCast(self.globals.len + self.sliding.len),
+             .physical_bytes = snapshot.tracked_combined_live_bytes - self.allocation_start.tracked_combined_live_bytes,
+             .replay_control_bytes = controls,
+             .tracker_snapshot = snapshot,
+--- a/zig/pkg/inference/src/backends/compaction_coordinator.zig
++++ b/zig/pkg/inference/src/backends/compaction_coordinator.zig
+@@ -750,7 +750,9 @@
+     materialization_host_bytes: usize,
+     artifact_count: u32,
+     expected_baseline_context_bytes: u64,
++    /// Global/profile owners; never total packed-session owners.
+     expected_owner_count: u32,
++    expected_total_owner_count: u32 = 0,
+ };
+ 
+ pub const StoredDiagnosticCoordinate = struct {
+@@ -810,7 +812,11 @@
+     baseline_request_context_physical_bytes: u64 = 0,
+     stored_request_context_physical_bytes: u64 = 0,
+     baseline_owner_count: u32 = 0,
++    baseline_global_owner_count: u32 = 0,
++    baseline_total_owner_count: u32 = 0,
+     stored_owner_count: u32 = 0,
++    stored_global_owner_count: u32 = 0,
++    stored_total_owner_count: u32 = 0,
+     tracker_live_bytes_before: u64 = 0,
+     tracker_live_bytes_after: u64 = 0,
+     tracker_peak_bytes_before: u64 = 0,
+@@ -1758,14 +1764,17 @@
+         .artifact_manifest_sha256 = reservation.artifact_manifest_sha256,
+         .profile_sha256 = reservation.profile_sha256,
+         .baseline_request_context_physical_bytes = baseline_storage.physical_bytes,
+-        .baseline_owner_count = baseline_storage.owner_count,
++        .baseline_owner_count = baseline_storage.total_owner_count,
++        .baseline_global_owner_count = baseline_storage.global_owner_count,
++        .baseline_total_owner_count = baseline_storage.total_owner_count,
+         .tracker_live_bytes_before = baseline_storage.tracker_snapshot.tracked_combined_live_bytes,
+         .tracker_peak_bytes_before = baseline_storage.tracker_snapshot.tracked_combined_peak_bytes,
+         .replay_control_bytes_before = baseline_storage.replay_control_bytes,
+     };
+     if (reservation.reservation_identity == 0 or reservation.artifact_count != 36 or
+         reservation.expected_baseline_context_bytes != baseline_storage.physical_bytes or
+-        reservation.expected_owner_count != baseline_storage.owner_count or baseline_storage.replay_control_bytes != 0)
++        reservation.expected_owner_count != baseline_storage.global_owner_count or
++        reservation.expected_total_owner_count != baseline_storage.total_owner_count or baseline_storage.replay_control_bytes != 0)
+     {
+         closeFailedStoredReservation(provider, reservation, terminal) catch return error.StoredDiagnosticLedgerFailure;
+         return error.InvalidPayloadProvenance;
+@@ -1813,11 +1822,14 @@
+         return err;
+     };
+     terminal.stored_request_context_physical_bytes = stored_storage.physical_bytes;
+-    terminal.stored_owner_count = stored_storage.owner_count;
++    terminal.stored_owner_count = stored_storage.total_owner_count;
++    terminal.stored_global_owner_count = stored_storage.global_owner_count;
++    terminal.stored_total_owner_count = stored_storage.total_owner_count;
+     terminal.tracker_live_bytes_after = stored_storage.tracker_snapshot.tracked_combined_live_bytes;
+     terminal.tracker_peak_bytes_after = stored_storage.tracker_snapshot.tracked_combined_peak_bytes;
+     terminal.replay_control_bytes_after = stored_storage.replay_control_bytes;
+-    if (stored_storage.owner_count != baseline_storage.owner_count or stored_storage.replay_control_bytes != 0 or
++    if (stored_storage.global_owner_count != baseline_storage.global_owner_count or
++        stored_storage.total_owner_count != baseline_storage.total_owner_count or stored_storage.replay_control_bytes != 0 or
+         stored_storage.tracker_snapshot.tracked_combined_peak_bytes > @as(u64, @intCast(native_peak_budget)))
+     {
+         terminal.state = .committed_but_receipt_failed;
+--- a/zig/pkg/inference/src/backends/context_stored_installed_invocation.zig
++++ b/zig/pkg/inference/src/backends/context_stored_installed_invocation.zig
+@@ -27,8 +27,44 @@
+     profile_sha256: [32]u8,
+     source_descriptor_sha256: [32]u8,
+     source_payload_sha256: [32]u8,
++    expected_baseline_context_bytes: u64 = 0,
++    expected_global_owner_count: u32 = 0,
++    expected_total_owner_count: u32 = 0,
+ };
+ 
++pub const BaselinePreflightReceipt = struct {
++    schema_name: []const u8 = "antfly.context.stored-installed-baseline-preflight.v1",
++    completed: bool = true,
++    diagnostic_only: bool = true,
++    serving_authority: bool = false,
++    release_authority: bool = false,
++    load_generation: u64,
++    model_identity: profiles.Identity,
++    build_sha256: [32]u8,
++    prompt_tokens: u32,
++    prompt_tokens_sha256: [32]u8,
++    session_identity: u64,
++    source_descriptor_sha256: [32]u8,
++    source_payload_sha256: [32]u8,
++    native_peak_budget: usize,
++    tracker_owner_identity: u64,
++    tracker_live_bytes: u64,
++    tracker_peak_bytes: u64,
++    baseline_context_physical_bytes: u64,
++    replay_control_bytes: u64,
++    global_owner_count: u32,
++    total_owner_count: u32,
++};
++
++fn validateExpectedBaseline(frozen: FrozenIdentity, measured: packed_mod.CommittedContextStorageDiagnostic) !void {
++    if (frozen.expected_baseline_context_bytes == 0 or frozen.expected_global_owner_count == 0 or
++        frozen.expected_total_owner_count < frozen.expected_global_owner_count or
++        frozen.expected_baseline_context_bytes != measured.physical_bytes or
++        frozen.expected_global_owner_count != measured.global_owner_count or
++        frozen.expected_total_owner_count != measured.total_owner_count or measured.replay_control_bytes != 0)
++        return error.InvalidPayloadProvenance;
++}
++
+ pub const Receipt = struct {
+     schema_name: []const u8 = schema,
+     diagnostic_only: bool = true,
+@@ -157,6 +193,10 @@
+             !std.meta.eql(before.payload_sha256, self.frozen.source_payload_sha256) or
+             before.diagnostic_kv_readback_bytes == 0)
+             return error.InvalidPayloadProvenance;
++        const measured_baseline = try live.committedContextStorageDiagnostic();
++        // This validation is deliberately before ProviderBinding and therefore
++        // before the external provider can create a tuple claim or ledger.
++        try validateExpectedBaseline(self.frozen, measured_baseline);
+         self.receipt = .{
+             .load_generation = installed_load_generation,
+             .model_identity = self.actual,
+@@ -212,6 +252,38 @@
+         self.receipt.publication_epoch_after = after.publication_epoch;
+         self.receipt.diagnostic_kv_readback_bytes_after = after.diagnostic_kv_readback_bytes;
+         self.receipt.completed = true;
++    }
++
++    pub fn measureBaseline(self: *Request, live: *packed_mod.Session, prompt: []const i64, installed_load_generation: u64) !BaselinePreflightReceipt {
++        if (!builtin.is_test or self.consumed or installed_load_generation == 0 or
++            installed_load_generation != self.frozen.load_generation or prompt.len == 0 or
++            prompt.len != @as(usize, live.logical_tokens)) return error.InvalidContextTransaction;
++        const prompt_digest = try teacher_forced.promptTokenDigest(prompt);
++        if (!std.meta.eql(prompt_digest, self.prompt_tokens_sha256) or
++            !std.meta.eql(self.actual, self.frozen.model_identity)) return error.InvalidPayloadProvenance;
++        const fingerprint = try live.qualificationFingerprint();
++        if (!std.meta.eql(fingerprint.descriptor_sha256, self.frozen.source_descriptor_sha256) or
++            !std.meta.eql(fingerprint.payload_sha256, self.frozen.source_payload_sha256) or
++            fingerprint.diagnostic_kv_readback_bytes == 0) return error.InvalidPayloadProvenance;
++        const measured = try live.committedContextStorageDiagnostic();
++        return .{
++            .load_generation = installed_load_generation,
++            .model_identity = self.actual,
++            .build_sha256 = self.frozen.build_sha256,
++            .prompt_tokens = @intCast(prompt.len),
++            .prompt_tokens_sha256 = prompt_digest,
++            .session_identity = fingerprint.context_instance_id,
++            .source_descriptor_sha256 = fingerprint.descriptor_sha256,
++            .source_payload_sha256 = fingerprint.payload_sha256,
++            .native_peak_budget = self.native_peak_budget,
++            .tracker_owner_identity = measured.tracker_snapshot.owner_identity,
++            .tracker_live_bytes = measured.tracker_snapshot.tracked_combined_live_bytes,
++            .tracker_peak_bytes = measured.tracker_snapshot.tracked_combined_peak_bytes,
++            .baseline_context_physical_bytes = measured.physical_bytes,
++            .replay_control_bytes = measured.replay_control_bytes,
++            .global_owner_count = measured.global_owner_count,
++            .total_owner_count = measured.total_owner_count,
++        };
+     }
+ };
+ 
+@@ -251,6 +323,7 @@
+         .artifact_count = 36,
+         .expected_baseline_context_bytes = 1,
+         .expected_owner_count = 3,
++        .expected_total_owner_count = 36,
+     };
+     try validateFrozenReservation(frozen, reservation);
+     reservation.artifact_manifest_sha256[0] ^= 1;
+@@ -285,6 +358,7 @@
+                 .artifact_count = 36,
+                 .expected_baseline_context_bytes = 1,
+                 .expected_owner_count = 3,
++                .expected_total_owner_count = 36,
+             };
+         }
+         fn materialize(raw: *anyopaque, _: packed_mod.StoredCampaignIdentity, _: *owner_alloc.HostAllocationTracker) !coordinator.StoredDiagnosticMaterialization {
+@@ -332,3 +406,21 @@
+     try std.testing.expect(request.receipt.terminal.failure != null);
+     try std.testing.expect(request.receipt.terminal.failure.?.nonreuse_committed);
+ }
++
++test "installed expected baseline distinguishes global and total owners" {
++    const frozen = FrozenIdentity{ .load_generation = 1, .model_identity = undefined, .algorithm_sha256 = @splat(1), .build_sha256 = @splat(2), .artifact_manifest_sha256 = @splat(3), .profile_sha256 = @splat(4), .source_descriptor_sha256 = @splat(5), .source_payload_sha256 = @splat(6), .expected_baseline_context_bytes = 100, .expected_global_owner_count = 3, .expected_total_owner_count = 36 };
++    const good = packed_mod.CommittedContextStorageDiagnostic{ .owner_count = 36, .global_owner_count = 3, .total_owner_count = 36, .physical_bytes = 100, .replay_control_bytes = 0, .tracker_snapshot = .{} };
++    try validateExpectedBaseline(frozen, good);
++    var bad = good;
++    bad.global_owner_count = 36;
++    try std.testing.expectError(error.InvalidPayloadProvenance, validateExpectedBaseline(frozen, bad));
++    bad = good;
++    bad.total_owner_count = 3;
++    try std.testing.expectError(error.InvalidPayloadProvenance, validateExpectedBaseline(frozen, bad));
++    bad = good;
++    bad.physical_bytes = 99;
++    try std.testing.expectError(error.InvalidPayloadProvenance, validateExpectedBaseline(frozen, bad));
++    bad = good;
++    bad.replay_control_bytes = 1;
++    try std.testing.expectError(error.InvalidPayloadProvenance, validateExpectedBaseline(frozen, bad));
++}
+--- a/zig/pkg/inference/src/context_stored_installed_caller.zig
++++ b/zig/pkg/inference/src/context_stored_installed_caller.zig
+@@ -12,7 +12,7 @@
+ const replay = @import("runtime/kv/reference_replay.zig");
+ const profiles = @import("runtime/kv/compaction_profile.zig");
+ 
+-pub const schema = "antfly.context.stored-installed-external-manifest.v1";
++pub const schema = "antfly.context.stored-installed-external-manifest.v2";
+ const max_manifest_bytes = 8 * 1024 * 1024;
+ 
+ pub const Manifest = struct {
+@@ -87,6 +87,9 @@
+                 .profile_sha256 = m.profile_sha256,
+                 .source_descriptor_sha256 = m.source_descriptor_sha256,
+                 .source_payload_sha256 = m.source_payload_sha256,
++                .expected_baseline_context_bytes = m.reservation.expected_baseline_context_bytes,
++                .expected_global_owner_count = m.reservation.expected_owner_count,
++                .expected_total_owner_count = m.reservation.expected_total_owner_count,
+             },
+             .prompt_tokens_sha256 = m.prompt_tokens_sha256,
+             .sources = sources,
+@@ -110,7 +113,9 @@
+         m.artifact_dir.len == 0 or m.evidence_dir.len == 0 or m.ledger_dir.len == 0 or
+         m.reservation_name.len == 0 or m.native_peak_budget == 0 or m.retained_limit == 0 or
+         m.artifacts.len != 36 or m.reservation.coordinates.len != 36 or m.reservation.artifact_count != 36 or
+-        m.reservation.expected_owner_count != 3 or m.reservation.reservation_identity == 0 or
++        m.reservation.expected_owner_count == 0 or
++        m.reservation.expected_total_owner_count < m.reservation.expected_owner_count or
++        m.reservation.reservation_identity == 0 or
+         m.evidence.len == 0 or m.eligible_labels.len == 0 or m.eligible_ranges.len == 0 or
+         m.eligible_blocks.len != 12 or m.parts.len != 3 or
+         !nonzero(m.algorithm_sha256) or !nonzero(m.build_sha256) or !nonzero(m.artifact_manifest_sha256) or
+@@ -218,7 +223,66 @@
+     source_build_sha256: [32]u8,
+     installed: installed.Receipt,
+ };
++
++pub const BaselineEnvelope = struct {
++    schema_name: []const u8 = "antfly.context.stored-installed-baseline-envelope.v1",
++    completed: bool = true,
++    diagnostic_only: bool = true,
++    serving_authority: bool = false,
++    release_authority: bool = false,
++    external_manifest_sha256: [32]u8,
++    capture_input_manifest_sha256: [32]u8,
++    source_build_sha256: [32]u8,
++    baseline: installed.BaselinePreflightReceipt,
++};
++
++pub const InvocationFailureReceipt = struct {
++    schema_name: []const u8 = "antfly.context.stored-installed-external-failure.v1",
++    completed: bool = false,
++    diagnostic_only: bool = true,
++    serving_authority: bool = false,
++    release_authority: bool = false,
++    error_name: []const u8,
++    external_manifest_sha256: [32]u8,
++    capture_input_manifest_sha256: [32]u8,
++    source_build_sha256: [32]u8,
++    installed: installed.Receipt,
++};
++
++fn writeExclusiveJsonDir(io: std.Io, dir: std.Io.Dir, path: []const u8, value: anytype) !void {
++    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, value, .{ .whitespace = .indent_2 });
++    defer std.testing.allocator.free(bytes);
++    const file = try dir.createFile(io, path, .{ .exclusive = true });
++    defer file.close(io);
++    try file.writeStreamingAll(io, bytes);
++    try file.writeStreamingAll(io, "\n");
++    try file.sync(io);
++}
++
++fn writeExclusiveJson(io: std.Io, path: []const u8, value: anytype) !void {
++    try writeExclusiveJsonDir(io, std.Io.Dir.cwd(), path, value);
++}
++
++pub fn writeBaselineReceipt(io: std.Io, path: []const u8, external: [32]u8, capture: [32]u8, build: [32]u8, baseline: installed.BaselinePreflightReceipt) !void {
++    if (!baseline.completed or !baseline.diagnostic_only or baseline.serving_authority or baseline.release_authority or
++        baseline.baseline_context_physical_bytes == 0 or baseline.global_owner_count == 0 or
++        baseline.total_owner_count < baseline.global_owner_count or baseline.replay_control_bytes != 0 or
++        !std.meta.eql(build, baseline.build_sha256) or !nonzero(external) or !nonzero(capture) or !nonzero(build))
++        return error.InvalidContextTransaction;
++    try writeExclusiveJson(io, path, BaselineEnvelope{ .external_manifest_sha256 = external, .capture_input_manifest_sha256 = capture, .source_build_sha256 = build, .baseline = baseline });
++}
++
++pub fn writeFailureReceipt(io: std.Io, path: []const u8, external: [32]u8, capture: [32]u8, build: [32]u8, error_name: []const u8, receipt: installed.Receipt) !void {
++    if (error_name.len == 0 or receipt.completed or !receipt.diagnostic_only or receipt.serving_authority or receipt.release_authority or
++        !nonzero(external) or !nonzero(capture) or !nonzero(build)) return error.InvalidContextTransaction;
++    try writeExclusiveJson(io, path, InvocationFailureReceipt{ .error_name = error_name, .external_manifest_sha256 = external, .capture_input_manifest_sha256 = capture, .source_build_sha256 = build, .installed = receipt });
++}
+ 
++pub fn persistFailureOrReturnOriginal(io: std.Io, path: []const u8, external: [32]u8, capture: [32]u8, build: [32]u8, original: anyerror, receipt: installed.Receipt) anyerror!void {
++    writeFailureReceipt(io, path, external, capture, build, @errorName(original), receipt) catch return original;
++    return original;
++}
++
+ pub fn writeReceipt(
+     io: std.Io,
+     path: []const u8,
+@@ -237,13 +301,7 @@
+         .source_build_sha256 = source_build_sha256,
+         .installed = receipt,
+     };
+-    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, envelope, .{ .whitespace = .indent_2 });
+-    defer std.testing.allocator.free(bytes);
+-    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
+-    defer file.close(io);
+-    try file.writeStreamingAll(io, bytes);
+-    try file.writeStreamingAll(io, "\n");
+-    try file.sync(io);
++    try writeExclusiveJson(io, path, envelope);
+ }
+ 
+ test "installed external manifest rejects authority and incomplete all36 profile before file opens" {
+@@ -289,6 +347,7 @@
+                 .artifact_count = 0,
+                 .expected_baseline_context_bytes = 1,
+                 .expected_owner_count = 3,
++                .expected_total_owner_count = 36,
+             },
+             .generator_sha256 = @splat(7),
+             .corpus_sha256 = @splat(8),
+@@ -334,6 +393,7 @@
+             .artifact_count = 36,
+             .expected_baseline_context_bytes = 1,
+             .expected_owner_count = 3,
++            .expected_total_owner_count = 36,
+         },
+         .generator_sha256 = @splat(7),
+         .corpus_sha256 = @splat(8),
+@@ -353,3 +413,45 @@
+     try std.testing.expectError(error.InvalidPayloadProvenance, eligibleThenDriverFailureForTest(false));
+     try std.testing.expectError(error.ExpectedDriverOpenFailure, eligibleThenDriverFailureForTest(true));
+ }
++
++test "baseline and incomplete failure envelopes are persisted exclusively" {
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const identity: profiles.Identity = .{ .artifact = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4), .runtime = @splat(5) };
++    const baseline = installed.BaselinePreflightReceipt{ .load_generation = 1, .model_identity = identity, .build_sha256 = @splat(6), .prompt_tokens = 8160, .prompt_tokens_sha256 = @splat(7), .session_identity = 9, .source_descriptor_sha256 = @splat(8), .source_payload_sha256 = @splat(9), .native_peak_budget = 1024, .tracker_owner_identity = 10, .tracker_live_bytes = 200, .tracker_peak_bytes = 300, .baseline_context_physical_bytes = 100, .replay_control_bytes = 0, .global_owner_count = 3, .total_owner_count = 36 };
++    const baseline_envelope = BaselineEnvelope{ .external_manifest_sha256 = @splat(10), .capture_input_manifest_sha256 = @splat(11), .source_build_sha256 = @splat(6), .baseline = baseline };
++    try writeExclusiveJsonDir(io, tmp.dir, "baseline.json", baseline_envelope);
++    const baseline_bytes = try tmp.dir.readFileAlloc(io, "baseline.json", std.testing.allocator, .limited(64 * 1024));
++    defer std.testing.allocator.free(baseline_bytes);
++    var parsed_baseline = try std.json.parseFromSlice(BaselineEnvelope, std.testing.allocator, baseline_bytes, .{});
++    defer parsed_baseline.deinit();
++    try std.testing.expectEqual(@as(u32, 3), parsed_baseline.value.baseline.global_owner_count);
++    try std.testing.expectEqual(@as(u32, 36), parsed_baseline.value.baseline.total_owner_count);
++
++    const failed = InvocationFailureReceipt{ .error_name = "InvalidPayloadProvenance", .external_manifest_sha256 = @splat(10), .capture_input_manifest_sha256 = @splat(11), .source_build_sha256 = @splat(6), .installed = .{ .terminal = .{ .state = .failed_before_commit } } };
++    try writeExclusiveJsonDir(io, tmp.dir, "failure.json", failed);
++    const failure_bytes = try tmp.dir.readFileAlloc(io, "failure.json", std.testing.allocator, .limited(64 * 1024));
++    defer std.testing.allocator.free(failure_bytes);
++    var parsed_failure = try std.json.parseFromSlice(InvocationFailureReceipt, std.testing.allocator, failure_bytes, .{});
++    defer parsed_failure.deinit();
++    try std.testing.expect(!parsed_failure.value.completed);
++    try std.testing.expectEqual(.failed_before_commit, parsed_failure.value.installed.terminal.state);
++}
++
++test "failure receipt writer failure preserves original diagnostic error" {
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const existing = try tmp.dir.createFile(io, "failure.json", .{ .exclusive = true });
++    existing.close(io);
++    const original = error.InvalidPayloadProvenance;
++    // Exercise the same exclusive-write failure used by the public helper, but
++    // return the original native error rather than the writer error.
++    const envelope = InvocationFailureReceipt{ .error_name = @errorName(original), .external_manifest_sha256 = @splat(1), .capture_input_manifest_sha256 = @splat(2), .source_build_sha256 = @splat(3), .installed = .{} };
++    writeExclusiveJsonDir(io, tmp.dir, "failure.json", envelope) catch {
++        try std.testing.expectEqual(error.InvalidPayloadProvenance, original);
++        return;
++    };
++    return error.TestExpectedError;
++}
+--- a/zig/pkg/inference/src/context_model_test.zig
++++ b/zig/pkg/inference/src/context_model_test.zig
+@@ -1943,8 +1943,15 @@
+         .identity = actual.identity,
+         .protocols = authorities.values,
+     } });
+-    try pipeline.runStoredInstalledDiagnostic(&live, inputs.prompt, &request);
+-    try stored_installed_caller.writeReceipt(std.testing.io, std.mem.span(stored_receipt_path), stored_manifest_sha, manifest_sha, inputs.source_build_sha256, request.receipt);
++    if (std.c.getenv("ANTFLY_CONTEXT_STORED_INSTALLED_BASELINE_PREFLIGHT")) |baseline_path| {
++        const baseline = try request.measureBaseline(&live, inputs.prompt, actual.load_generation);
++        try stored_installed_caller.writeBaselineReceipt(std.testing.io, std.mem.span(baseline_path), stored_manifest_sha, manifest_sha, inputs.source_build_sha256, baseline);
++    } else {
++        pipeline.runStoredInstalledDiagnostic(&live, inputs.prompt, &request) catch |err| {
++            return stored_installed_caller.persistFailureOrReturnOriginal(std.testing.io, std.mem.span(stored_receipt_path), stored_manifest_sha, manifest_sha, inputs.source_build_sha256, err, request.receipt);
++        };
++        try stored_installed_caller.writeReceipt(std.testing.io, std.mem.span(stored_receipt_path), stored_manifest_sha, manifest_sha, inputs.source_build_sha256, request.receipt);
++    }
+ 
+     decode_state.context_session = null;
+     live.deinit();
+--- a/zig/pkg/inference/src/backends/context_stored_all36_coordinator_fixture.zig
++++ b/zig/pkg/inference/src/backends/context_stored_all36_coordinator_fixture.zig
+@@ -180,7 +180,9 @@
+         try runner_state.step(live.hook(), live.logical_tokens, rows);
+     }
+     const baseline = try live.committedContextStorageDiagnostic();
+-    try std.testing.expectEqual(@as(u32, 3), baseline.owner_count);
++    try std.testing.expectEqual(@as(u32, 3), baseline.global_owner_count);
++    try std.testing.expectEqual(baseline.owner_count, baseline.total_owner_count);
++    try std.testing.expect(baseline.total_owner_count >= baseline.global_owner_count);
+     try std.testing.expectEqual(@as(u64, 0), baseline.replay_control_bytes);
+ 
+     var prompt: [prompt_tokens]i64 = @splat(1);
+@@ -310,7 +312,8 @@
+             .materialization_host_bytes = 0,
+             .artifact_count = artifact_count,
+             .expected_baseline_context_bytes = baseline.physical_bytes,
+-            .expected_owner_count = baseline.owner_count,
++            .expected_owner_count = baseline.global_owner_count,
++            .expected_total_owner_count = baseline.total_owner_count,
+         },
+         .generator_sha256 = @splat(8),
+         .corpus_sha256 = @splat(9),
+--- a/zig/pkg/inference/src/backends/context_stored_all36_driver.zig
++++ b/zig/pkg/inference/src/backends/context_stored_all36_driver.zig
+@@ -516,6 +516,7 @@
+             .artifact_count = max_artifacts,
+             .expected_baseline_context_bytes = 1,
+             .expected_owner_count = 3,
++            .expected_total_owner_count = 36,
+         },
+         .generator_sha256 = @splat(6),
+         .corpus_sha256 = @splat(7),

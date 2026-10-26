@@ -47,6 +47,94 @@ const selection = @import("../runtime/kv/selection.zig");
 const pool_mod = @import("../runtime/kv/pool.zig");
 const turboquant = @import("../runtime/kv/turboquant.zig");
 const metal_runtime = @import("metal_runtime.zig");
+const owner_alloc = @import("../runtime/kv/host_allocation_tracker.zig");
+const context_teacher_forced = @import("context_teacher_forced.zig");
+const attention_match_storage = @import("../ops/metal_attention_match_storage.zig");
+const AttentionMatchControl = @import("../runtime/kv/attention_match.zig").Control;
+
+fn fingerprintU32(hash: *std.crypto.hash.sha2.Sha256, value: usize) !void {
+    const narrowed = std.math.cast(u32, value) orelse return error.QualificationFingerprintOverflow;
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, narrowed, .little);
+    hash.update(&bytes);
+}
+
+fn fingerprintQualificationCoverage(
+    hash: *std.crypto.hash.sha2.Sha256,
+    logical_start: usize,
+    logical_end: usize,
+    page_size: usize,
+) !void {
+    if (page_size == 0 or logical_start >= logical_end) return error.InvalidQualificationFingerprint;
+    const first_page = logical_start / page_size;
+    const last_page = (logical_end - 1) / page_size;
+    try fingerprintU32(hash, last_page - first_page + 1);
+    var logical_page = first_page;
+    while (logical_page <= last_page) : (logical_page += 1) {
+        const page_first = @max(logical_start, logical_page * page_size);
+        const page_end = @min(logical_end, (logical_page + 1) * page_size);
+        try fingerprintU32(hash, logical_page);
+        try fingerprintU32(hash, page_first);
+        try fingerprintU32(hash, page_end - page_first);
+    }
+}
+
+const QualificationVisibleRange = struct { start: usize, count: usize };
+
+fn validateQualificationOwnerLayers(owner_layers: []const u32, expected_count: usize) !void {
+    if (owner_layers.len == 0 or owner_layers.len != expected_count)
+        return error.InvalidQualificationFingerprint;
+    var previous: ?u32 = null;
+    for (owner_layers) |layer| {
+        if (previous) |value| if (layer <= value)
+            return error.InvalidQualificationFingerprint;
+        previous = layer;
+    }
+}
+
+fn qualificationVisibleRange(binding: SlotBinding, logical_tokens: usize, page_size: usize) !QualificationVisibleRange {
+    if (logical_tokens == 0 or page_size == 0) return error.InvalidQualificationFingerprint;
+    const count = if (binding.ring_page_count > 0) blk: {
+        if (!binding.sequence_owned or binding.sliding_window_tokens == 0) return error.InvalidQualificationFingerprint;
+        const ring_capacity = std.math.mul(usize, binding.ring_page_count, page_size) catch
+            return error.QualificationFingerprintOverflow;
+        if (binding.sliding_window_tokens > ring_capacity) return error.InvalidQualificationFingerprint;
+        break :blk @min(logical_tokens, binding.sliding_window_tokens);
+    } else blk: {
+        if (binding.sliding_window_tokens != 0) return error.InvalidQualificationFingerprint;
+        break :blk logical_tokens;
+    };
+    return .{ .start = logical_tokens - count, .count = count };
+}
+
+fn fingerprintQualificationLayer(
+    hash: *std.crypto.hash.sha2.Sha256,
+    layer: usize,
+    binding: SlotBinding,
+    logical_start: usize,
+    visible_tokens: usize,
+    logical_tokens: usize,
+    page_size: usize,
+    key_row_bytes: usize,
+    value_row_stride: usize,
+    value_element_bytes: usize,
+) !void {
+    // Deliberately omit slot id, physical pages, buffer capacities, and pool
+    // capacity. Independent sibling contexts may choose different allocation
+    // geometry while implementing identical logical context semantics.
+    try fingerprintU32(hash, layer);
+    try fingerprintU32(hash, if (binding.sequence_owned) 1 else 0);
+    try fingerprintU32(hash, binding.ring_page_count);
+    try fingerprintU32(hash, binding.sliding_window_tokens);
+    try fingerprintU32(hash, binding.written_tokens);
+    try fingerprintU32(hash, binding.position_offset);
+    try fingerprintU32(hash, logical_start);
+    try fingerprintU32(hash, visible_tokens);
+    try fingerprintU32(hash, key_row_bytes);
+    try fingerprintU32(hash, value_row_stride);
+    try fingerprintU32(hash, value_element_bytes);
+    try fingerprintQualificationCoverage(hash, logical_start, logical_tokens, page_size);
+}
 
 /// Matches the `format` values accepted by
 /// `termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot`.
@@ -98,6 +186,9 @@ const SlotKey = struct {
 const SlotBinding = struct {
     slot: usize,
     ring_page_count: usize = 0,
+    /// Exact logical attention window. Ring capacity is page rounded and also
+    /// includes admitted in-flight rows, so it is not a visibility bound.
+    sliding_window_tokens: usize = 0,
     sequence_owned: bool = false,
     compactable_global: bool = false,
     logical_contiguous: bool = false,
@@ -131,6 +222,31 @@ const SlotBinding = struct {
     }
 };
 
+pub const AttentionMatchBinding = struct {
+    diagnostic_only: bool = false,
+    sequence: storage_runtime.SequenceId,
+    device: attention_match_storage.DeviceState,
+    control: AttentionMatchControl,
+    invalid: bool = false,
+    attention_calls: usize = 0,
+    donor_appends: usize = 0,
+    rollback_tokens: usize = 0,
+
+    pub fn deinit(self: *AttentionMatchBinding) void {
+        std.log.info("{s} source_tokens={d} logical_tokens={d} attention_calls={d} donor_appends={d} allocated_device_bytes={d} invalid={d} rollback_tokens={d}", .{
+            if (self.diagnostic_only) @as([]const u8, "attention_match_shadow_serving") else "attention_match_serving",
+            self.device.initial_logical_length,
+            self.device.logical_length,
+            self.attention_calls,
+            self.donor_appends,
+            self.device.allocated_bytes,
+            @intFromBool(self.invalid),
+            self.rollback_tokens,
+        });
+        self.device.deinit();
+    }
+};
+
 pub const MetalKvStorage = struct {
     allocator: std.mem.Allocator,
     runtime: *metal_runtime.RawMetalDecodeRuntime,
@@ -152,7 +268,15 @@ pub const MetalKvStorage = struct {
     slot_ring_page_count: [metal_runtime.attention_span_slot_capacity]usize = @as([metal_runtime.attention_span_slot_capacity]usize, @splat(0)),
     slot_ring_policy_initialized: [metal_runtime.attention_span_slot_capacity]bool = @as([metal_runtime.attention_span_slot_capacity]bool, @splat(false)),
     slot_buffer_capacity_tokens: [metal_runtime.attention_span_slot_capacity]usize = @as([metal_runtime.attention_span_slot_capacity]usize, @splat(0)),
+    allocation_peak_bytes: u64 = 0,
+    /// Non-null only for a request-exclusive hook. Shared prompt-cache hooks
+    /// leave this null and disclose their retained residency separately.
+    owner_allocation_tracker: ?*owner_alloc.HostAllocationTracker = null,
+    slot_accounted_live_bytes: [metal_runtime.attention_span_slot_capacity]usize = @splat(0),
     cyclic_page_table_cache: storage_runtime.CyclicPageTableCache = .{},
+    attention_match_runner: ?attention_match_storage.Runner = null,
+    attention_match_binding: ?*AttentionMatchBinding = null,
+    attention_match_revision: u64 = 0,
 
     /// Allocate a MetalKvStorage keyed to `runtime`. The storage does not own
     /// the runtime — callers are responsible for its lifetime. `dtype` must
@@ -166,6 +290,18 @@ pub const MetalKvStorage = struct {
         head_dim: u32,
         page_size_tokens: u16,
     ) !*MetalKvStorage {
+        return createTracked(allocator, runtime, dtype, num_kv_heads, head_dim, page_size_tokens, null);
+    }
+
+    pub fn createTracked(
+        allocator: std.mem.Allocator,
+        runtime: *metal_runtime.RawMetalDecodeRuntime,
+        dtype: pool_mod.KvDType,
+        num_kv_heads: u32,
+        head_dim: u32,
+        page_size_tokens: u16,
+        owner_allocation_tracker: ?*owner_alloc.HostAllocationTracker,
+    ) !*MetalKvStorage {
         const format = KeyFormat.fromKvDType(dtype) orelse return error.DeviceWriteFormatUnsupported;
         const self = try allocator.create(MetalKvStorage);
         self.* = .{
@@ -175,6 +311,7 @@ pub const MetalKvStorage = struct {
             .num_kv_heads = num_kv_heads,
             .head_dim = head_dim,
             .page_size_tokens = page_size_tokens,
+            .owner_allocation_tracker = owner_allocation_tracker,
         };
         return self;
     }
@@ -188,15 +325,23 @@ pub const MetalKvStorage = struct {
             return error.DeviceWriteFallback;
         }
         self.leased_slots[slot] = true;
+        errdefer self.reclaimSlot(slot);
         self.slot_ring_page_count[slot] = 0;
         self.slot_ring_policy_initialized[slot] = false;
         self.slot_buffer_capacity_tokens[slot] = 0;
+        // A released raw-runtime slot may retain model-owned cached buffers.
+        // Once leased, their actual allocatedSize is request-exclusive for
+        // this hook's lifetime and belongs in the request ledger.
+        try self.reconcileSlotAccounting(slot, 0);
         return slot;
     }
 
     fn reclaimSlot(self: *MetalKvStorage, slot: usize) void {
         if (slot >= self.leased_slots.len or !self.leased_slots[slot]) return;
-        _ = metal_runtime.termite_metal_decode_runtime_release_paged_kv_slot(self.runtime, slot);
+        if (metal_runtime.termite_metal_decode_runtime_release_paged_kv_slot(self.runtime, slot) != 0)
+            @panic("request-exclusive Metal KV slot released before backend drain");
+        self.reconcileSlotAccounting(slot, 0) catch
+            @panic("request-exclusive Metal KV release accounting failed");
         self.leased_slots[slot] = false;
         self.slot_ring_page_count[slot] = 0;
         self.slot_ring_policy_initialized[slot] = false;
@@ -209,25 +354,60 @@ pub const MetalKvStorage = struct {
             self.reclaimSlot(slot);
             return;
         }
+        self.reconcileSlotAccounting(slot, 0) catch
+            @panic("request-exclusive Metal KV discard accounting failed");
         self.leased_slots[slot] = false;
         self.slot_ring_page_count[slot] = 0;
         self.slot_ring_policy_initialized[slot] = false;
         self.slot_buffer_capacity_tokens[slot] = 0;
     }
 
+    fn slotAllocationInfo(self: *MetalKvStorage, slot: usize) !metal_runtime.PagedKvSlotAllocationInfo {
+        var info: metal_runtime.PagedKvSlotAllocationInfo = undefined;
+        if (metal_runtime.termite_metal_decode_runtime_attention_span_slot_allocation_info(self.runtime, slot, &info) != 0)
+            return error.DeviceAllocationSnapshotUnavailable;
+        return info;
+    }
+
+    fn slotLiveBytes(info: metal_runtime.PagedKvSlotAllocationInfo) !usize {
+        const installed: usize = @intCast(info.installed_live_bytes);
+        const active: usize = @intCast(info.active_frame_retained_bytes);
+        const submitted: usize = @intCast(info.submitted_frame_retained_bytes);
+        return try std.math.add(usize, try std.math.add(usize, installed, active), submitted);
+    }
+
+    fn slotTransitionInfo(self: *MetalKvStorage, slot: usize) !metal_runtime.PagedKvSlotTransitionInfo {
+        var info: metal_runtime.PagedKvSlotTransitionInfo = undefined;
+        if (metal_runtime.termite_metal_decode_runtime_attention_span_slot_transition_info(self.runtime, slot, &info) != 0)
+            return error.DeviceAllocationSnapshotUnavailable;
+        return info;
+    }
+
+    fn reconcileSlotAccounting(self: *MetalKvStorage, slot: usize, newly_allocated_bytes: usize) !void {
+        const tracker = self.owner_allocation_tracker orelse return;
+        const prior = self.slot_accounted_live_bytes[slot];
+        const info = try self.slotAllocationInfo(slot);
+        const final = if (info.leased == 0) 0 else try slotLiveBytes(info);
+        try tracker.recordDeviceTransition(.private_device, prior, newly_allocated_bytes, final);
+        self.slot_accounted_live_bytes[slot] = final;
+    }
+
     /// Bind a sequence/layer to either the layer-global full-history page pool
-    /// or a dedicated cyclic SWA ring. `paged` must be true before global
-    /// sharing is allowed; legacy contiguous writes remain sequence-owned.
+    /// or a dedicated cyclic SWA ring. `share_global` must be true before
+    /// global sharing is allowed; legacy contiguous writes remain
+    /// sequence-owned.
     fn acquireBinding(
         self: *MetalKvStorage,
         key: SlotKey,
         ring_page_count: usize,
+        sliding_window_tokens: usize,
         share_global: bool,
         compactable_global: bool,
     ) !*SlotBinding {
         if (self.slot_map.getPtr(key)) |binding| {
             if (binding.ring_page_count != ring_page_count) return error.DeviceWriteFallback;
             if (compactable_global and !binding.compactable_global) return error.DeviceWriteFallback;
+            if (binding.sliding_window_tokens != sliding_window_tokens) return error.DeviceWriteFallback;
             return binding;
         }
 
@@ -258,6 +438,7 @@ pub const MetalKvStorage = struct {
         try self.slot_map.put(self.allocator, key, .{
             .slot = slot,
             .ring_page_count = ring_page_count,
+            .sliding_window_tokens = sliding_window_tokens,
             .sequence_owned = owns_slot,
             .compactable_global = compactable_global,
         });
@@ -363,6 +544,10 @@ pub const MetalKvStorage = struct {
             required_tokens
         else
             try storage_runtime.geometricKvTokenCapacity(current, required_tokens, page_size_tokens);
+        // Reconcile generations retired since the previous frame before
+        // recording this transition. This has no allocation overlap.
+        try self.reconcileSlotAccounting(slot, 0);
+        const transition_before = try self.slotTransitionInfo(slot);
         const rc = metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
             self.runtime,
             slot,
@@ -371,8 +556,42 @@ pub const MetalKvStorage = struct {
             key_row_bytes,
             v_row_stride,
         );
+        const transition_after = try self.slotTransitionInfo(slot);
+        if (transition_after.operation_nonce != transition_before.operation_nonce +% 1)
+            return error.DeviceAllocationSnapshotUnavailable;
+        const newly_allocated = std.math.cast(usize, transition_after.newly_allocated_bytes) orelse
+            return error.DeviceAllocationReceiptOverflow;
+        // The C receipt survives every failure return, including a new
+        // allocation that is released before this after-call snapshot.
+        try self.reconcileSlotAccounting(slot, newly_allocated);
+        if (transition_after.overflow != 0)
+            return error.DeviceAllocationReceiptOverflow;
         if (rc != 0) return error.DeviceWriteFallback;
         self.slot_buffer_capacity_tokens[slot] = target;
+        _ = self.allocationSnapshot();
+    }
+
+    fn allocationSnapshotOp(ctx: *anyopaque) storage_runtime.DeviceAllocationSnapshot {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        return self.allocationSnapshot();
+    }
+
+    fn allocationSnapshot(self: *MetalKvStorage) storage_runtime.DeviceAllocationSnapshot {
+        var snapshot = storage_runtime.DeviceAllocationSnapshot{ .available = true };
+        for (self.leased_slots, 0..) |leased, slot| {
+            if (!leased) continue;
+            var info: metal_runtime.PagedKvSlotAllocationInfo = undefined;
+            if (metal_runtime.termite_metal_decode_runtime_attention_span_slot_allocation_info(self.runtime, slot, &info) != 0 or info.leased == 0)
+                return .{};
+            snapshot.kv_bytes +|= info.installed_live_bytes;
+            snapshot.live_bytes +|= info.installed_live_bytes;
+            snapshot.live_bytes +|= info.active_frame_retained_bytes;
+            snapshot.live_bytes +|= info.submitted_frame_retained_bytes;
+            snapshot.readback_bytes +|= info.lease_readback_bytes;
+        }
+        self.allocation_peak_bytes = @max(self.allocation_peak_bytes, snapshot.live_bytes);
+        snapshot.peak_bytes = self.allocation_peak_bytes;
+        return snapshot;
     }
 
     fn requiredTokenCapacity(block_offsets: []const u32, page_size_tokens: usize) !usize {
@@ -450,6 +669,227 @@ pub const MetalKvStorage = struct {
         return .{
             .ctx = @ptrCast(self),
             .vtable = &hook_vtable,
+            .owner_accounting = if (self.owner_allocation_tracker != null)
+                .exact_private_device
+            else
+                .unavailable,
+        };
+    }
+
+    pub fn fromDeviceWriteHook(hook: storage_runtime.DeviceWriteHook) !*MetalKvStorage {
+        if (hook.vtable != &hook_vtable) return error.UnsupportedAttentionMatchRoute;
+        return @ptrCast(@alignCast(hook.ctx));
+    }
+
+    pub fn attentionMatchBackend(
+        self: *MetalKvStorage,
+        allocator: std.mem.Allocator,
+        limits: @import("../runtime/kv/attention_match_checkpoint.zig").Limits,
+        max_device_bytes: usize,
+    ) !attention_match_storage.Backend {
+        if (self.format != .f16) return error.UnsupportedMetalKvCheckpointEncoding;
+        const tracker = self.owner_allocation_tracker orelse return error.ContextPhysicalAccountingUnavailable;
+        if (self.attention_match_runner == null) {
+            self.attention_match_runner = try attention_match_storage.Runner.init(
+                max_device_bytes,
+                tracker,
+            );
+        } else self.attention_match_runner.?.raiseMaxDeviceBytes(max_device_bytes);
+        return self.attention_match_runner.?.backend(allocator, limits);
+    }
+
+    pub fn attentionMatchRunner(self: *MetalKvStorage) ?*attention_match_storage.Runner {
+        if (self.attention_match_runner) |*runner| return runner;
+        return null;
+    }
+
+    pub fn retireExactKvForAttentionMatch(self: *MetalKvStorage) void {
+        var binding_it = self.slot_map.valueIterator();
+        while (binding_it.next()) |binding| {
+            if (binding.selected_positions) |positions| self.allocator.free(positions);
+        }
+        self.slot_map.clearRetainingCapacity();
+        self.global_layer_slots.clearRetainingCapacity();
+        for (&self.leased_slots, 0..) |*leased, slot| {
+            if (!leased.*) continue;
+            self.reclaimSlot(slot);
+        }
+    }
+
+    pub fn validateExactAttentionMatchSource(
+        self: *MetalKvStorage,
+        sequence: storage_runtime.SequenceId,
+        expected_length: usize,
+        candidate: *attention_match_storage.DeviceState,
+    ) !void {
+        if (self.format != .f16 or self.attention_match_binding != null or candidate.heads.len == 0)
+            return error.UnsupportedAttentionMatchRoute;
+        var donors: usize = 0;
+        for (candidate.heads) |head| {
+            if (head.logical_length != @as(u64, @intCast(expected_length))) return error.InvalidKvCheckpoint;
+            if (head.head != 0) continue;
+            donors += 1;
+            const heads = try candidate.layer(head.layer);
+            const binding = self.slot_map.get(.{ .sequence_id = sequence, .layer_index = head.layer }) orelse
+                return error.StaleKvCompaction;
+            if (binding.selected_positions != null or binding.ring_page_count != 0 or
+                !binding.logical_contiguous or binding.position_offset != 0 or
+                binding.written_tokens != expected_length or heads.len != @as(usize, self.num_kv_heads))
+                return error.StaleKvCompaction;
+            for (heads) |stored| if (stored.dim != self.head_dim) return error.InvalidKvCheckpoint;
+        }
+        if (donors != self.slot_map.count()) return error.UnsupportedAttentionMatchRoute;
+    }
+
+    fn cloneAllocationBytes(request: storage_runtime.device_clone.Request) !usize {
+        const common = try request.allocationBytes(@sizeOf(f16));
+        var metal_bytes: usize = 0;
+        for (request.donors) |donor| {
+            const width = try std.math.mul(usize, donor.heads, donor.dim);
+            const row_bytes = try std.math.mul(usize, width, @sizeOf(f16));
+            const buffer_bytes = try std.math.mul(usize, request.capacity, row_bytes);
+            // Metal private buffers may round their backing allocation to a
+            // 16 KiB VM page. Bound K and V independently before allocating.
+            const rounded = try std.math.add(usize, buffer_bytes, 16 * 1024 - 1);
+            const per_buffer = rounded & ~@as(usize, 16 * 1024 - 1);
+            metal_bytes = try std.math.add(usize, metal_bytes, try std.math.mul(usize, per_buffer, 2));
+        }
+        const allocation_bound = @max(common, metal_bytes);
+        if (allocation_bound > request.max_bytes) return error.DeviceKvCloneBudgetExceeded;
+        return allocation_bound;
+    }
+
+    fn cloneExactPrefix(
+        ctx: *anyopaque,
+        source_hook: storage_runtime.DeviceWriteHook,
+        request: storage_runtime.device_clone.Request,
+    ) anyerror!storage_runtime.device_clone.Result {
+        const destination: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (source_hook.vtable != &hook_vtable or source_hook.ctx == ctx)
+            return error.InvalidDeviceKvClone;
+        const source: *MetalKvStorage = @ptrCast(@alignCast(source_hook.ctx));
+        if (source.runtime != destination.runtime or source.format != .f16 or destination.format != .f16 or
+            source.attention_match_binding != null or destination.attention_match_binding != null or
+            source.page_size_tokens != request.page_size or destination.page_size_tokens != request.page_size or
+            source.slot_map.count() != request.donors.len or destination.slot_map.count() != 0 or
+            destination.global_layer_slots.count() != 0 or metal_runtime.hasActiveFrame(destination.runtime) or
+            metal_runtime.hasSubmittedFrame(destination.runtime))
+            return error.DeviceKvCloneUnsupported;
+
+        const allocation_bound = try cloneAllocationBytes(request);
+        try request.check();
+
+        const Staged = struct {
+            key: SlotKey,
+            slot: usize,
+            layout: @TypeOf(destination.rowLayout(1, 1)),
+        };
+        var staged: [256]Staged = undefined;
+
+        // Validate the complete immutable source before reserving destination
+        // map storage or leasing a single Metal slot.
+        for (request.donors, 0..) |donor, index| {
+            const key = SlotKey{ .sequence_id = request.source_sequence, .layer_index = donor.layer };
+            const binding = source.slot_map.get(key) orelse return error.InvalidDeviceKvClone;
+            const layout = source.rowLayout(donor.heads, donor.dim);
+            if (binding.selected_positions != null or binding.ring_page_count != 0 or
+                !binding.logical_contiguous or binding.physical_base_tokens != 0 or
+                binding.written_tokens != request.tokens or binding.position_offset != 0)
+                return error.UnsupportedDeviceKvCloneLayout;
+            const info = try source.slotInfo(binding.slot);
+            const key_bytes = try std.math.mul(usize, request.tokens, layout.key_row_bytes);
+            const value_bytes = try std.math.mul(
+                usize,
+                try std.math.mul(usize, request.tokens, layout.v_row_stride),
+                @sizeOf(f16),
+            );
+            if (info.tokens != request.tokens or info.position_offset != 0 or
+                info.key_row_bytes != layout.key_row_bytes or info.v_row_stride != layout.v_row_stride or
+                info.encoded_key_handle == null or info.v_handle == null or
+                info.encoded_key_capacity < key_bytes or info.v_capacity < value_bytes)
+                return error.UnsupportedDeviceKvCloneLayout;
+            staged[index] = .{
+                .key = .{ .sequence_id = request.destination_sequence, .layer_index = donor.layer },
+                .slot = binding.slot,
+                .layout = layout,
+            };
+        }
+        try destination.slot_map.ensureUnusedCapacity(destination.allocator, @intCast(request.donors.len));
+
+        var staged_count: usize = 0;
+        errdefer for (staged[0..staged_count]) |entry| destination.discardPrivateSlot(entry.slot);
+        var copied_bytes: usize = 0;
+        for (staged[0..request.donors.len]) |*entry| {
+            try request.check();
+            const source_slot = entry.slot;
+            var destination_slot = try destination.allocateSlot();
+            errdefer destination.discardPrivateSlot(destination_slot);
+
+            const requested_buffer_bytes = try std.math.mul(usize, request.capacity, entry.layout.key_row_bytes);
+            const rounded = try std.math.add(usize, requested_buffer_bytes, 16 * 1024 - 1);
+            const per_donor_bound = try std.math.mul(usize, rounded & ~@as(usize, 16 * 1024 - 1), 2);
+            var allocation = try destination.slotAllocationInfo(destination_slot);
+            if (try slotLiveBytes(allocation) > per_donor_bound) {
+                // A released slot may retain a larger previous tenant's
+                // backing. Drop it so this owner's admitted bound stays exact.
+                destination.discardPrivateSlot(destination_slot);
+                destination_slot = try destination.allocateSlot();
+                allocation = try destination.slotAllocationInfo(destination_slot);
+                if (allocation.installed_live_bytes != 0) return error.DeviceKvCloneBudgetExceeded;
+            }
+            try destination.reserveSlotCapacity(
+                destination_slot,
+                request.capacity,
+                request.page_size,
+                0,
+                entry.layout.key_row_bytes,
+                entry.layout.v_row_stride,
+            );
+            allocation = try destination.slotAllocationInfo(destination_slot);
+            if (try slotLiveBytes(allocation) > per_donor_bound)
+                return error.DeviceKvCloneBudgetExceeded;
+
+            const clone_rc = metal_runtime.termite_metal_decode_runtime_clone_attention_span_slot_prefix(
+                destination.runtime,
+                source_slot,
+                destination_slot,
+                @backingInt(destination.format),
+                request.tokens,
+                entry.layout.key_row_bytes,
+                entry.layout.v_row_stride,
+                0,
+            );
+            if (clone_rc != 0) return error.DeviceKvCloneUnsupported;
+            entry.slot = destination_slot;
+            destination.slot_ring_page_count[destination_slot] = 0;
+            destination.slot_ring_policy_initialized[destination_slot] = true;
+            copied_bytes = try std.math.add(usize, copied_bytes, try std.math.mul(
+                usize,
+                request.tokens,
+                try std.math.mul(usize, entry.layout.key_row_bytes, 2),
+            ));
+            staged_count += 1;
+        }
+        try request.check();
+
+        // Map capacity was reserved before any device mutation. Publication is
+        // now infallible and transfers ownership of every staged slot together.
+        for (staged[0..staged_count]) |entry| {
+            destination.slot_map.putAssumeCapacityNoClobber(entry.key, .{
+                .slot = entry.slot,
+                .sequence_owned = true,
+                .logical_contiguous = true,
+                .physical_base_tokens = 0,
+                .written_tokens = request.tokens,
+                .position_offset = 0,
+            });
+        }
+        staged_count = 0;
+        destination.attention_match_revision +|= 1;
+        return .{
+            .allocation_bound_bytes = allocation_bound,
+            .copied_bytes = copied_bytes,
+            .donors = request.donors.len,
         };
     }
 
@@ -475,6 +915,7 @@ pub const MetalKvStorage = struct {
         v: storage_runtime.DeviceKvRef,
     ) anyerror!void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (self.attention_match_binding != null) return error.UnsupportedAttentionMatchRoute;
         const num_kv_heads: u32 = write.num_kv_heads;
         const head_dim: u32 = write.head_dim;
 
@@ -499,6 +940,7 @@ pub const MetalKvStorage = struct {
                 .layer_index = @intCast(write.layer_index),
             },
             requested_ring_pages,
+            if (requested_ring_pages > 0) write.sliding_window else 0,
             write.logical_blocks != null and !write.sequence_owned_global,
             write.sequence_owned_global,
         );
@@ -566,6 +1008,7 @@ pub const MetalKvStorage = struct {
             binding.written_tokens = write.total_token_count;
             binding.position_offset = positions[0];
             self.allocator.free(old_positions);
+            self.attention_match_revision +|= 1;
             return;
         }
         const slot = binding.slot;
@@ -665,6 +1108,7 @@ pub const MetalKvStorage = struct {
         if (rc != 0) return error.DeviceWriteFallback;
         binding.written_tokens = write.total_token_count;
         binding.position_offset = write.position_offset;
+        self.attention_match_revision +|= 1;
     }
 
     fn reserveLayerKvDevice(
@@ -672,6 +1116,7 @@ pub const MetalKvStorage = struct {
         reserve: storage_runtime.DeviceKvLayerReserve,
     ) anyerror!void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (self.attention_match_binding != null) return error.UnsupportedAttentionMatchRoute;
         if (reserve.token_capacity == 0) return;
         const layout = self.rowLayout(reserve.num_kv_heads, reserve.head_dim);
         if (layout.key_row_bytes == 0 or layout.v_row_stride == 0) return error.InvalidKvShape;
@@ -688,6 +1133,7 @@ pub const MetalKvStorage = struct {
                 .layer_index = @intCast(reserve.layer_index),
             },
             requested_ring_pages,
+            if (requested_ring_pages > 0) reserve.sliding_window else 0,
             reserve.logical_blocks != null and !reserve.sequence_owned_global,
             reserve.sequence_owned_global,
         );
@@ -770,12 +1216,14 @@ pub const MetalKvStorage = struct {
         commit: storage_runtime.DeviceKvLayerWriteCommit,
     ) anyerror!void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (self.attention_match_binding != null) return error.UnsupportedAttentionMatchRoute;
         const binding = self.slot_map.getPtr(.{
             .sequence_id = commit.sequence_id,
             .layer_index = @intCast(commit.layer_index),
         }) orelse return error.DeviceWriteFallback;
         if (binding.selected_positions != null) return error.DeviceWriteFallback;
         if (!binding.commitWrite(commit.total_token_count, commit.position_offset)) return error.DeviceWriteFallback;
+        self.attention_match_revision +|= 1;
     }
 
     fn repackSelectedGlobalKv(
@@ -809,16 +1257,14 @@ pub const MetalKvStorage = struct {
         errdefer self.discardPrivateSlot(destination_slot);
         const destination_capacity = try selection.defaults.transientRows();
         if (positions.len > destination_capacity) return error.SelectedKvCapacityExceeded;
-        const reserve_rc = metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
-            self.runtime,
+        try self.reserveSlotCapacity(
             destination_slot,
-            @backingInt(self.format),
             destination_capacity,
+            self.page_size_tokens,
+            0,
             layout.key_row_bytes,
             layout.v_row_stride,
         );
-        if (reserve_rc != 0) return error.DeviceWriteFallback;
-        self.slot_buffer_capacity_tokens[destination_slot] = destination_capacity;
         self.slot_ring_page_count[destination_slot] = 0;
         self.slot_ring_policy_initialized[destination_slot] = true;
 
@@ -871,9 +1317,15 @@ pub const MetalKvStorage = struct {
 
     fn scoreSelectedAttention(ctx: *anyopaque, request: storage_runtime.SelectedAttentionScore) anyerror!void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
-        const binding = self.slot_map.get(.{ .sequence_id = request.sequence_id, .layer_index = @intCast(request.layer_index) }) orelse return error.DeviceReadFallback;
+        const layer_index = std.math.cast(u32, request.layer_index) orelse return error.InvalidKvShape;
+        const binding = self.slot_map.get(.{ .sequence_id = request.sequence_id, .layer_index = layer_index }) orelse return error.DeviceReadFallback;
         if (request.key_positions.len == 0 or request.scores_out.len != request.key_positions.len) return error.InvalidKvShape;
-        if (request.query_positions.len == 0 or request.queries.len != request.query_positions.len * request.num_heads * request.head_dim) return error.InvalidKvShape;
+        const query_head_values = std.math.mul(usize, request.query_positions.len, request.num_heads) catch return error.InvalidKvShape;
+        const query_values = std.math.mul(usize, query_head_values, request.head_dim) catch return error.InvalidKvShape;
+        if (request.query_positions.len == 0 or request.queries.len != query_values) return error.InvalidKvShape;
+        if (request.num_heads == 0 or request.num_heads > 256 or request.num_kv_heads == 0 or request.head_dim == 0 or
+            request.num_kv_heads > std.math.maxInt(u32) or request.head_dim > std.math.maxInt(u32) or
+            request.num_heads % request.num_kv_heads != 0) return error.InvalidKvShape;
         if (request.query_positions.len > selection.defaults.query_horizon or
             request.key_positions.len > try selection.defaults.transientRows()) return error.InvalidKvShape;
         for (request.query_positions[1..], request.query_positions[0 .. request.query_positions.len - 1]) |position, previous| {
@@ -885,6 +1337,11 @@ pub const MetalKvStorage = struct {
         if (binding.selected_positions) |positions| {
             if (!std.mem.eql(u32, positions, request.key_positions)) return error.StaleKvSelection;
         } else if (request.key_positions.len != binding.written_tokens) return error.StaleKvSelection;
+        // The scorer consumes compact physical rows from zero. A paged/ring
+        // binding with a nonzero physical base needs the generic attention
+        // route; silently treating its logical row zero as physical row zero
+        // would score another sequence's keys.
+        if (!binding.logical_contiguous or binding.physical_base_tokens != 0) return error.DeviceReadFallback;
         const layout = self.rowLayout(@intCast(request.num_kv_heads), @intCast(request.head_dim));
         const rc = metal_runtime.termite_metal_decode_runtime_score_selected_attention(
             self.runtime,
@@ -929,8 +1386,19 @@ pub const MetalKvStorage = struct {
         }
     }
 
-    fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    fn hookDeinit(ctx: *anyopaque, _: std.mem.Allocator) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        // The hook owns its allocator-backed state. The storage runtime may
+        // have a different allocator; destruction must use the one that
+        // created the hook and its maps.
+        const allocator = self.allocator;
+        drainForOwnerSnapshot(self) catch
+            @panic("request-exclusive Metal KV drain failed during teardown");
+        if (self.attention_match_binding) |binding| {
+            binding.deinit();
+            allocator.destroy(binding);
+            self.attention_match_binding = null;
+        }
         var binding_it = self.slot_map.valueIterator();
         while (binding_it.next()) |binding| {
             if (binding.selected_positions) |positions| allocator.free(positions);
@@ -938,17 +1406,33 @@ pub const MetalKvStorage = struct {
         }
         for (&self.leased_slots, 0..) |*leased, slot| {
             if (!leased.*) continue;
-            _ = metal_runtime.termite_metal_decode_runtime_release_paged_kv_slot(self.runtime, slot);
-            leased.* = false;
+            self.reclaimSlot(slot);
         }
         self.slot_map.deinit(allocator);
         self.global_layer_slots.deinit(allocator);
         self.cyclic_page_table_cache.deinit(allocator);
+        if (self.attention_match_runner) |*runner| runner.deinit();
         allocator.destroy(self);
+    }
+
+    fn drainForOwnerSnapshot(ctx: *anyopaque) anyerror!void {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        const runtime = self.runtime;
+        if (metal_runtime.hasActiveFrame(runtime)) try metal_runtime.cancelFrame(runtime);
+        if (metal_runtime.hasSubmittedFrame(runtime)) try metal_runtime.waitFrame(runtime);
+        for (self.leased_slots, 0..) |leased, slot| {
+            if (!leased) continue;
+            try self.reconcileSlotAccounting(slot, 0);
+        }
     }
 
     fn releaseSequenceOp(ctx: *anyopaque, sequence_id: storage_runtime.SequenceId) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (self.attention_match_binding) |binding| if (binding.sequence == sequence_id) {
+            binding.deinit();
+            self.allocator.destroy(binding);
+            self.attention_match_binding = null;
+        };
         self.releaseSequenceSlots(sequence_id);
     }
 
@@ -966,6 +1450,17 @@ pub const MetalKvStorage = struct {
         retained_token_count: usize,
     ) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        self.attention_match_revision +|= 1;
+        if (self.attention_match_binding) |binding| if (binding.sequence == sequence_id) {
+            if (binding.invalid) return;
+            const previous = binding.device.logical_length;
+            binding.device.truncate(@intCast(retained_token_count), .{}) catch {
+                binding.invalid = true;
+                return;
+            };
+            binding.rollback_tokens +|= @intCast(previous - @as(u64, @intCast(retained_token_count)));
+            return;
+        };
         var it = self.slot_map.iterator();
         while (it.next()) |entry| {
             if (entry.key_ptr.sequence_id != sequence_id) continue;
@@ -1062,6 +1557,74 @@ pub const MetalKvStorage = struct {
                     const src_f32: [*]const f32 = @ptrCast(@alignCast(v_row_src.ptr));
                     @memcpy(v_row_dst, src_f32[0..token_width]);
                 },
+            }
+        }
+    }
+
+    fn readExactAttentionMatchKv(
+        ctx: *anyopaque,
+        range: storage_runtime.attention_match_snapshot.Range,
+        keys: []f32,
+        values: []f32,
+    ) anyerror!void {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (self.attention_match_binding != null) return error.UnsupportedAttentionMatchRoute;
+        if (self.format != .f16 or range.count == 0 or range.heads == 0 or range.dim == 0 or
+            range.start > range.logical_length or range.count > range.logical_length - range.start)
+            return error.UnsupportedKvSnapshotLayout;
+        const width = std.math.mul(usize, range.heads, range.dim) catch return error.InvalidKvCheckpoint;
+        const elements = std.math.mul(usize, range.count, width) catch return error.InvalidKvCheckpoint;
+        if (keys.len != elements or values.len != elements or
+            elements > storage_runtime.attention_match_snapshot.chunk_elements)
+            return error.InvalidKvCheckpoint;
+        const binding = self.slot_map.get(.{
+            .sequence_id = range.sequence,
+            .layer_index = range.layer,
+        }) orelse return error.DeviceReadUnsupported;
+        if (binding.selected_positions != null or binding.ring_page_count != 0 or
+            !binding.logical_contiguous or binding.position_offset != 0 or
+            binding.written_tokens != range.logical_length)
+            return error.UnsupportedKvSnapshotLayout;
+        const info = try self.slotInfo(binding.slot);
+        const row_bytes = std.math.mul(usize, width, @sizeOf(f16)) catch return error.InvalidKvCheckpoint;
+        if (info.key_row_bytes != row_bytes or info.v_row_stride != width or info.tokens < range.logical_length)
+            return error.UnsupportedKvSnapshotLayout;
+        const first_row = std.math.add(usize, binding.physical_base_tokens, range.start) catch return error.InvalidKvCheckpoint;
+        const byte_offset = std.math.mul(usize, first_row, row_bytes) catch return error.InvalidKvCheckpoint;
+        const byte_count = std.math.mul(usize, range.count, row_bytes) catch return error.InvalidKvCheckpoint;
+        if (byte_offset > info.encoded_key_capacity or byte_count > info.encoded_key_capacity - byte_offset or
+            byte_offset > info.v_capacity or byte_count > info.v_capacity - byte_offset)
+            return error.InvalidKvCheckpoint;
+        const encoded_keys = std.mem.sliceAsBytes(keys)[0..byte_count];
+        const encoded_values = std.mem.sliceAsBytes(values)[0..byte_count];
+        if (metal_runtime.termite_metal_buffer_download(
+            self.runtime,
+            info.encoded_key_handle orelse return error.DeviceReadUnsupported,
+            byte_offset,
+            @ptrCast(encoded_keys.ptr),
+            byte_count,
+        ) != 0) return error.MetalDeviceReadFailed;
+        if (metal_runtime.termite_metal_buffer_download(
+            self.runtime,
+            info.v_handle orelse return error.DeviceReadUnsupported,
+            byte_offset,
+            @ptrCast(encoded_values.ptr),
+            byte_count,
+        ) != 0) return error.MetalDeviceReadFailed;
+        const readback_bytes = std.math.mul(usize, byte_count, 2) catch return error.InvalidKvCheckpoint;
+        if (metal_runtime.termite_metal_decode_runtime_attention_span_slot_note_readback(
+            self.runtime,
+            binding.slot,
+            readback_bytes,
+        ) != 0) return error.DeviceAllocationSnapshotUnavailable;
+        // Expand backwards so the caller's bounded f32 output is also the
+        // only staging allocation needed for exact f16 readback.
+        for ([_][]f32{ keys, values }) |output| {
+            const half: [*]const f16 = @ptrCast(@alignCast(output.ptr));
+            var index = output.len;
+            while (index != 0) {
+                index -= 1;
+                output[index] = @floatCast(half[index]);
             }
         }
     }
@@ -1255,6 +1818,192 @@ pub const MetalKvStorage = struct {
         return binding.slot;
     }
 
+    pub const QualificationFingerprintRequest = struct {
+        context_instance_id: u64,
+        sequence_id: storage_runtime.SequenceId,
+        logical_tokens: u32,
+        position_offset: u32,
+        logical_blocks: []const block.KvBlockId,
+        /// Actual KV owners in canonical loaded-layout order. Pool
+        /// `num_layers_packed` is a physical stride/capacity and includes
+        /// shared consumers that never own a storage binding.
+        owner_layers: []const u32,
+    };
+
+    /// Qualification-only raw fingerprint of an ordinary exact Metal KV
+    /// context. Serving never calls this method: it deliberately drains and
+    /// downloads every logically visible K/V byte into bounded page staging.
+    /// Reserved capacity and overwritten SWA rows are excluded. Payload order
+    /// is layer, logical token, K row, V row.
+    pub fn qualificationFingerprintDeviceHook(
+        hook: storage_runtime.DeviceWriteHook,
+        allocator: std.mem.Allocator,
+        request: QualificationFingerprintRequest,
+    ) !context_teacher_forced.QualityFingerprint {
+        if (!builtin.is_test) return error.QualificationOnly;
+        if (hook.vtable != &hook_vtable) return error.OrdinaryExactMetalKvRequired;
+        const self: *MetalKvStorage = @ptrCast(@alignCast(hook.ctx));
+        return self.qualificationFingerprint(allocator, request);
+    }
+
+    fn qualificationPhysicalRow(
+        binding: SlotBinding,
+        logical_blocks: []const block.KvBlockId,
+        page_size: usize,
+        logical_token: usize,
+    ) !usize {
+        if (page_size == 0) return error.InvalidQualificationFingerprint;
+        const logical_page = logical_token / page_size;
+        const in_page = logical_token % page_size;
+        const physical_page = if (binding.ring_page_count > 0)
+            storage_runtime.physicalPageForLogical(logical_page, binding.ring_page_count)
+        else blk: {
+            if (logical_page >= logical_blocks.len) return error.InvalidQualificationFingerprint;
+            break :blk @as(usize, logical_blocks[logical_page]);
+        };
+        return std.math.add(
+            usize,
+            try std.math.mul(usize, physical_page, page_size),
+            in_page,
+        ) catch return error.QualificationFingerprintOverflow;
+    }
+
+    fn qualificationFingerprint(
+        self: *MetalKvStorage,
+        allocator: std.mem.Allocator,
+        request: QualificationFingerprintRequest,
+    ) !context_teacher_forced.QualityFingerprint {
+        const owner_count = request.owner_layers.len;
+        if (self.format != .f16 or request.context_instance_id == 0 or request.logical_tokens == 0 or
+            request.position_offset != 0)
+            return error.InvalidQualificationFingerprint;
+        try validateQualificationOwnerLayers(
+            request.owner_layers,
+            self.global_layer_slots.count() + @as(usize, self.countSequenceOwnedLayers(request.sequence_id)),
+        );
+        if (metal_runtime.hasActiveFrame(self.runtime)) return error.QualificationFingerprintFrameActive;
+        if (metal_runtime.hasSubmittedFrame(self.runtime)) try metal_runtime.waitFrame(self.runtime);
+        if (metal_runtime.hasActiveFrame(self.runtime) or metal_runtime.hasSubmittedFrame(self.runtime))
+            return error.QualificationFingerprintFrameActive;
+
+        const logical_tokens: usize = request.logical_tokens;
+        const page_size: usize = self.page_size_tokens;
+        if (page_size == 0) return error.InvalidQualificationFingerprint;
+        const needed_blocks = std.math.divCeil(usize, logical_tokens, page_size) catch
+            return error.QualificationFingerprintOverflow;
+        if (request.logical_blocks.len < needed_blocks) return error.InvalidQualificationFingerprint;
+
+        var descriptor = std.crypto.hash.sha2.Sha256.init(.{});
+        descriptor.update("antfly.ordinary-exact-context.descriptor.v1\x00");
+        try fingerprintU32(&descriptor, @backingInt(self.format));
+        try fingerprintU32(&descriptor, self.num_kv_heads);
+        try fingerprintU32(&descriptor, self.head_dim);
+        try fingerprintU32(&descriptor, page_size);
+        try fingerprintU32(&descriptor, owner_count);
+        try fingerprintU32(&descriptor, logical_tokens);
+        try fingerprintU32(&descriptor, request.position_offset);
+
+        for (request.owner_layers) |layer_u32| {
+            const layer: usize = @intCast(layer_u32);
+            const binding = self.slot_map.get(.{
+                .sequence_id = request.sequence_id,
+                .layer_index = layer_u32,
+            }) orelse return error.InvalidQualificationFingerprint;
+            if (binding.written_tokens != logical_tokens) return error.InvalidQualificationFingerprint;
+            const info = try self.slotInfo(binding.slot);
+            const v_element_bytes: usize = if (self.format == .f16) @sizeOf(u16) else @sizeOf(f32);
+            const v_row_bytes = std.math.mul(usize, info.v_row_stride, v_element_bytes) catch
+                return error.QualificationFingerprintOverflow;
+            if (info.key_row_bytes == 0 or v_row_bytes == 0 or info.encoded_key_handle == null or info.v_handle == null)
+                return error.InvalidQualificationFingerprint;
+            if (info.tokens != binding.written_tokens or info.position_offset != binding.position_offset)
+                return error.InvalidQualificationFingerprint;
+            const visible = try qualificationVisibleRange(binding, logical_tokens, page_size);
+            const visible_tokens = visible.count;
+            const logical_start = visible.start;
+            try fingerprintQualificationLayer(
+                &descriptor,
+                layer,
+                binding,
+                logical_start,
+                visible_tokens,
+                logical_tokens,
+                page_size,
+                info.key_row_bytes,
+                info.v_row_stride,
+                v_element_bytes,
+            );
+        }
+        var descriptor_sha256: [32]u8 = undefined;
+        descriptor.final(&descriptor_sha256);
+
+        var payload = std.crypto.hash.sha2.Sha256.init(.{});
+        payload.update("antfly.ordinary-exact-context.payload.v1\x00");
+        var readback_bytes: u64 = 0;
+        for (request.owner_layers) |layer_u32| {
+            const binding = self.slot_map.get(.{
+                .sequence_id = request.sequence_id,
+                .layer_index = layer_u32,
+            }).?;
+            const info = try self.slotInfo(binding.slot);
+            const key_handle = info.encoded_key_handle.?;
+            const v_handle = info.v_handle.?;
+            const v_element_bytes: usize = if (self.format == .f16) @sizeOf(u16) else @sizeOf(f32);
+            const v_row_bytes = try std.math.mul(usize, info.v_row_stride, v_element_bytes);
+            const visible = try qualificationVisibleRange(binding, logical_tokens, page_size);
+            var logical_token = visible.start;
+            while (logical_token < logical_tokens) {
+                const page_end = @min(logical_tokens, (logical_token / page_size + 1) * page_size);
+                const row_count = page_end - logical_token;
+                const physical_row = try qualificationPhysicalRow(binding, request.logical_blocks, page_size, logical_token);
+                const key_bytes = try std.math.mul(usize, row_count, info.key_row_bytes);
+                const value_bytes = try std.math.mul(usize, row_count, v_row_bytes);
+                const key_offset = try std.math.mul(usize, physical_row, info.key_row_bytes);
+                const value_offset = try std.math.mul(usize, physical_row, v_row_bytes);
+                if (key_offset > info.encoded_key_capacity or key_bytes > info.encoded_key_capacity - key_offset or
+                    value_offset > info.v_capacity or value_bytes > info.v_capacity - value_offset)
+                    return error.InvalidQualificationFingerprint;
+                const keys = try allocator.alloc(u8, key_bytes);
+                defer allocator.free(keys);
+                const values = try allocator.alloc(u8, value_bytes);
+                defer allocator.free(values);
+                if (metal_runtime.termite_metal_buffer_download(self.runtime, key_handle, key_offset, @ptrCast(keys.ptr), keys.len) != 0 or
+                    metal_runtime.termite_metal_buffer_download(self.runtime, v_handle, value_offset, @ptrCast(values.ptr), values.len) != 0)
+                    return error.QualificationFingerprintReadbackFailed;
+                var row: usize = 0;
+                while (row < row_count) : (row += 1) {
+                    payload.update(keys[row * info.key_row_bytes ..][0..info.key_row_bytes]);
+                    payload.update(values[row * v_row_bytes ..][0..v_row_bytes]);
+                }
+                const segment_bytes = std.math.add(usize, key_bytes, value_bytes) catch return error.QualificationFingerprintOverflow;
+                readback_bytes = std.math.add(u64, readback_bytes, std.math.cast(u64, segment_bytes) orelse
+                    return error.QualificationFingerprintOverflow) catch return error.QualificationFingerprintOverflow;
+                logical_token = page_end;
+            }
+        }
+        payload.update(&descriptor_sha256);
+        var payload_sha256: [32]u8 = undefined;
+        payload.final(&payload_sha256);
+        if (readback_bytes == 0) return error.QualificationFingerprintOverflow;
+        return .{
+            .context_instance_id = request.context_instance_id,
+            .publication_epoch = 1,
+            .logical_tokens = request.logical_tokens,
+            .payload_sha256 = payload_sha256,
+            .descriptor_sha256 = descriptor_sha256,
+            .diagnostic_kv_readback_bytes = readback_bytes,
+        };
+    }
+
+    fn countSequenceOwnedLayers(self: *const MetalKvStorage, sequence_id: storage_runtime.SequenceId) u32 {
+        var count: u32 = 0;
+        var iterator = self.slot_map.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.key_ptr.sequence_id == sequence_id and entry.value_ptr.sequence_owned) count +|= 1;
+        }
+        return count;
+    }
+
     pub const SlotInfo = struct {
         encoded_key_handle: ?*anyopaque = null,
         encoded_key_capacity: usize = 0,
@@ -1303,7 +2052,114 @@ test "Metal KV binding only covers successfully encoded tokens" {
     try std.testing.expect(binding.commitWrite(33, 4));
 }
 
+test "context ordinary exact fingerprint maps logical pages canonically" {
+    const blocks = [_]block.KvBlockId{ 7, 3, 11, 2 };
+    const full = SlotBinding{ .slot = 1 };
+    try std.testing.expectEqual(@as(usize, 28), try MetalKvStorage.qualificationPhysicalRow(full, &blocks, 4, 0));
+    try std.testing.expectEqual(@as(usize, 13), try MetalKvStorage.qualificationPhysicalRow(full, &blocks, 4, 5));
+    try std.testing.expectEqual(@as(usize, 9), try MetalKvStorage.qualificationPhysicalRow(full, &blocks, 4, 13));
+
+    const ring = SlotBinding{ .slot = 2, .ring_page_count = 3, .sequence_owned = true };
+    try std.testing.expectEqual(@as(usize, 0), try MetalKvStorage.qualificationPhysicalRow(ring, &blocks, 4, 0));
+    try std.testing.expectEqual(@as(usize, 9), try MetalKvStorage.qualificationPhysicalRow(ring, &blocks, 4, 9));
+    try std.testing.expectEqual(@as(usize, 1), try MetalKvStorage.qualificationPhysicalRow(ring, &blocks, 4, 13));
+    try std.testing.expectError(error.InvalidQualificationFingerprint, MetalKvStorage.qualificationPhysicalRow(full, &.{}, 4, 0));
+    try std.testing.expectError(error.InvalidQualificationFingerprint, MetalKvStorage.qualificationPhysicalRow(full, &blocks, 0, 0));
+}
+
+test "context ordinary exact fingerprint uses actual owners rather than pool layer capacity" {
+    // The pool reserves a stride for every model layer. Shared-tail consumers
+    // do not own bindings, so the canonical list contains only the loaded
+    // layout's non-shared owner prefix.
+    var owners: [24]u32 = undefined;
+    for (&owners, 0..) |*owner, layer| owner.* = @intCast(layer);
+    try validateQualificationOwnerLayers(&owners, owners.len);
+    try std.testing.expectError(
+        error.InvalidQualificationFingerprint,
+        validateQualificationOwnerLayers(&owners, 35),
+    );
+    var duplicate = owners;
+    duplicate[23] = 22;
+    try std.testing.expectError(
+        error.InvalidQualificationFingerprint,
+        validateQualificationOwnerLayers(&duplicate, duplicate.len),
+    );
+    var reordered = owners;
+    std.mem.swap(u32, &reordered[7], &reordered[8]);
+    try std.testing.expectError(
+        error.InvalidQualificationFingerprint,
+        validateQualificationOwnerLayers(&reordered, reordered.len),
+    );
+}
+
+test "context ordinary exact fingerprint excludes allocator page identity" {
+    const binding = SlotBinding{ .slot = 1, .written_tokens = 13 };
+    const sibling_binding = SlotBinding{ .slot = 9, .written_tokens = 13 };
+    const blocks_a = [_]block.KvBlockId{ 7, 3, 11, 2 };
+    const blocks_b = [_]block.KvBlockId{ 17, 13, 21, 12 };
+    try std.testing.expect(try MetalKvStorage.qualificationPhysicalRow(binding, &blocks_a, 4, 5) !=
+        try MetalKvStorage.qualificationPhysicalRow(binding, &blocks_b, 4, 5));
+
+    var a = std.crypto.hash.sha2.Sha256.init(.{});
+    var b = std.crypto.hash.sha2.Sha256.init(.{});
+    try fingerprintQualificationLayer(&a, 0, binding, 0, 13, 13, 4, 32, 16, 2);
+    try fingerprintQualificationLayer(&b, 0, sibling_binding, 0, 13, 13, 4, 32, 16, 2);
+    var digest_a: [32]u8 = undefined;
+    var digest_b: [32]u8 = undefined;
+    a.final(&digest_a);
+    b.final(&digest_b);
+    try std.testing.expectEqualSlices(u8, &digest_a, &digest_b);
+
+    var changed = std.crypto.hash.sha2.Sha256.init(.{});
+    try fingerprintQualificationLayer(&changed, 0, binding, 1, 12, 13, 4, 32, 16, 2);
+    var changed_digest: [32]u8 = undefined;
+    changed.final(&changed_digest);
+    try std.testing.expect(!std.mem.eql(u8, &digest_a, &changed_digest));
+}
+
+test "context ordinary exact fingerprint excludes SWA ring slack" {
+    const binding = SlotBinding{
+        .slot = 3,
+        .ring_page_count = 2,
+        .sliding_window_tokens = 5,
+        .sequence_owned = true,
+    };
+    const visible = try qualificationVisibleRange(binding, 11, 4);
+    try std.testing.expectEqual(@as(usize, 6), visible.start);
+    try std.testing.expectEqual(@as(usize, 5), visible.count);
+
+    const blocks = [_]block.KvBlockId{ 0, 1, 2 };
+    const base = [_]u8{ 10, 11, 12, 90, 91, 92, 16, 17 };
+    var poisoned_slack = base;
+    poisoned_slack[3] = 1;
+    poisoned_slack[4] = 2;
+    poisoned_slack[5] = 3;
+    var changed_visible = base;
+    changed_visible[0] ^= 0xff; // Logical token 8 maps to physical row zero.
+
+    var base_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var slack_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var changed_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var token = visible.start;
+    while (token < visible.start + visible.count) : (token += 1) {
+        const physical = try MetalKvStorage.qualificationPhysicalRow(binding, &blocks, 4, token);
+        base_hash.update(base[physical..][0..1]);
+        slack_hash.update(poisoned_slack[physical..][0..1]);
+        changed_hash.update(changed_visible[physical..][0..1]);
+    }
+    var base_digest: [32]u8 = undefined;
+    var slack_digest: [32]u8 = undefined;
+    var changed_digest: [32]u8 = undefined;
+    base_hash.final(&base_digest);
+    slack_hash.final(&slack_digest);
+    changed_hash.final(&changed_digest);
+    try std.testing.expectEqualSlices(u8, &base_digest, &slack_digest);
+    try std.testing.expect(!std.mem.eql(u8, &base_digest, &changed_digest));
+}
+
 const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
+    .readExactAttentionMatchKv = MetalKvStorage.readExactAttentionMatchKv,
+    .cloneExactPrefix = MetalKvStorage.cloneExactPrefix,
     .writeLayerKvSuffix = MetalKvStorage.writeLayerKvSuffix,
     .gatherLayerKv = MetalKvStorage.gatherLayerKv,
     .gatherLayerKeys = MetalKvStorage.gatherLayerKeys,
@@ -1316,6 +2172,8 @@ const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
     .truncateSequence = MetalKvStorage.truncateSequenceOp,
     .releaseSequence = MetalKvStorage.releaseSequenceOp,
     .supportsSelectedGlobalKv = MetalKvStorage.supportsSelectedGlobalKv,
+    .allocationSnapshot = MetalKvStorage.allocationSnapshotOp,
+    .drainForOwnerSnapshot = MetalKvStorage.drainForOwnerSnapshot,
     .deinit = MetalKvStorage.hookDeinit,
 };
 
@@ -1351,6 +2209,239 @@ test "KeyFormat.fromKvDType covers supported dtypes" {
     try std.testing.expect(!KeyFormat.raw_f32.isCompressed());
     try std.testing.expect(!KeyFormat.f16.isCompressed());
     try std.testing.expect(KeyFormat.int8_per_head.isCompressed());
+}
+
+test "attention_match Metal exact prefix clone is transactional owner independent and records readback" {
+    if (!build_options.enable_metal or builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const metal = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(metal);
+    if (metal_runtime.termite_metal_decode_runtime_ready(metal) == 0) return error.SkipZigTest;
+
+    const source = try MetalKvStorage.create(allocator, metal, .f16, 1, 2, 4);
+    const source_hook = source.deviceWriteHook();
+    defer source_hook.deinit(allocator);
+    const destination = try MetalKvStorage.create(allocator, metal, .f16, 1, 2, 4);
+    const destination_hook = destination.deviceWriteHook();
+    defer destination_hook.deinit(allocator);
+
+    const tokens: usize = 3;
+    const width: usize = 2;
+    const blocks = [_]u32{0};
+    const layer_one_keys = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const layer_one_values = [_]f32{ -1, -2, -3, -4, -5, -6 };
+    const layer_four_keys = [_]f32{ 7, 8, 9, 10, 11, 12 };
+    const layer_four_values = [_]f32{ -7, -8, -9, -10, -11, -12 };
+    const bytes = tokens * width * @sizeOf(f32);
+    const key_handle = metal_runtime.termite_metal_buffer_alloc(metal, bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(key_handle);
+    const value_handle = metal_runtime.termite_metal_buffer_alloc(metal, bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(value_handle);
+    const fixtures = [_]struct { layer: u32, keys: []const f32, values: []const f32 }{
+        .{ .layer = 1, .keys = &layer_one_keys, .values = &layer_one_values },
+        .{ .layer = 4, .keys = &layer_four_keys, .values = &layer_four_values },
+    };
+    for (fixtures) |fixture| {
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(
+            metal,
+            key_handle,
+            0,
+            @ptrCast(fixture.keys.ptr),
+            bytes,
+        ));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(
+            metal,
+            value_handle,
+            0,
+            @ptrCast(fixture.values.ptr),
+            bytes,
+        ));
+        try source_hook.writeLayerKvSuffix(.{
+            .sequence_id = 11,
+            .layer_index = fixture.layer,
+            .total_token_count = tokens,
+            .suffix_token_count = tokens,
+            .position_offset = 0,
+            .num_kv_heads = 1,
+            .head_dim = 2,
+            .logical_blocks = &blocks,
+            .page_size_tokens = 4,
+        }, .{ .handle = key_handle, .byte_offset = 0, .byte_len = bytes }, .{
+            .handle = value_handle,
+            .byte_offset = 0,
+            .byte_len = bytes,
+        });
+    }
+
+    const request: storage_runtime.device_clone.Request = .{
+        .source_sequence = 11,
+        .destination_sequence = 22,
+        .tokens = tokens,
+        .capacity = 8,
+        .page_size = 4,
+        .source_blocks = &blocks,
+        .destination_blocks = &blocks,
+        .donors = &.{
+            .{ .layer = 1, .heads = 1, .dim = 2 },
+            .{ .layer = 4, .heads = 1, .dim = 2 },
+        },
+        .max_bytes = 1024 * 1024,
+    };
+    var oom_owner = owner_alloc.HostAllocationTracker.init(null, 0);
+    const oom_destination = try MetalKvStorage.createTracked(
+        oom_owner.allocator(),
+        metal,
+        .f16,
+        1,
+        2,
+        4,
+        &oom_owner,
+    );
+    const oom_hook = oom_destination.deviceWriteHook();
+    defer oom_hook.deinit(allocator);
+    try oom_owner.armNextPositiveAllocationFailure();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        oom_hook.cloneExactPrefix(source_hook, request),
+    );
+    try std.testing.expectEqual(@as(usize, 0), oom_destination.slot_map.count());
+    try std.testing.expectEqual(@as(u64, 0), oom_hook.allocationSnapshot().live_bytes);
+
+    var over_budget = request;
+    over_budget.max_bytes = 1;
+    try std.testing.expectError(
+        error.DeviceKvCloneBudgetExceeded,
+        destination_hook.cloneExactPrefix(source_hook, over_budget),
+    );
+    try std.testing.expectEqual(@as(usize, 0), destination.slot_map.count());
+
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            // The hook wrapper, preflight, and first donor pass. Cancel before
+            // the second donor and require the first staged slot to roll back.
+            if (self.calls == 4) return error.CompactionCancelled;
+        }
+    };
+    var cancel: Cancel = .{};
+    var cancelled = request;
+    cancelled.check_ctx = &cancel;
+    cancelled.check_fn = Cancel.check;
+    try std.testing.expectError(
+        error.CompactionCancelled,
+        destination_hook.cloneExactPrefix(source_hook, cancelled),
+    );
+    try std.testing.expectEqual(@as(usize, 0), destination.slot_map.count());
+    try std.testing.expectEqual(@as(u64, 0), destination_hook.allocationSnapshot().live_bytes);
+
+    const result = try destination_hook.cloneExactPrefix(source_hook, request);
+    try std.testing.expectEqual(@as(usize, 2), result.donors);
+    try std.testing.expectEqual(@as(usize, tokens * width * @sizeOf(f16) * 2 * 2), result.copied_bytes);
+    try std.testing.expect(result.allocation_bound_bytes <= request.max_bytes);
+
+    var source_k: [tokens * width]f32 = undefined;
+    var source_v: [tokens * width]f32 = undefined;
+    var destination_k: [tokens * width]f32 = undefined;
+    var destination_v: [tokens * width]f32 = undefined;
+    try source_hook.gatherLayerKv(.{
+        .sequence_id = 11,
+        .layer_index = 1,
+        .token_count = tokens,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    }, &source_k, &source_v);
+    try destination_hook.gatherLayerKv(.{
+        .sequence_id = 22,
+        .layer_index = 1,
+        .token_count = tokens,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    }, &destination_k, &destination_v);
+    try std.testing.expectEqualSlices(f32, &source_k, &destination_k);
+    try std.testing.expectEqualSlices(f32, &source_v, &destination_v);
+
+    const suffix_keys = [_]f32{ 13, 14 };
+    const suffix_values = [_]f32{ -13, -14 };
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(
+        metal,
+        key_handle,
+        0,
+        @ptrCast(&suffix_keys),
+        suffix_keys.len * @sizeOf(f32),
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(
+        metal,
+        value_handle,
+        0,
+        @ptrCast(&suffix_values),
+        suffix_values.len * @sizeOf(f32),
+    ));
+    try destination_hook.writeLayerKvSuffix(.{
+        .sequence_id = 22,
+        .layer_index = 1,
+        .total_token_count = 4,
+        .suffix_token_count = 1,
+        .position_offset = 0,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+        .logical_blocks = &blocks,
+        .page_size_tokens = 4,
+    }, .{ .handle = key_handle, .byte_offset = 0, .byte_len = suffix_keys.len * @sizeOf(f32) }, .{
+        .handle = value_handle,
+        .byte_offset = 0,
+        .byte_len = suffix_values.len * @sizeOf(f32),
+    });
+    var destination_appended_k: [4 * width]f32 = undefined;
+    var destination_appended_v: [4 * width]f32 = undefined;
+    try destination_hook.gatherLayerKv(.{
+        .sequence_id = 22,
+        .layer_index = 1,
+        .token_count = 4,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    }, &destination_appended_k, &destination_appended_v);
+    try std.testing.expectEqualSlices(f32, &source_k, destination_appended_k[0 .. tokens * width]);
+    try std.testing.expectApproxEqAbs(@as(f32, 13), destination_appended_k[6], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 14), destination_appended_k[7], 1e-3);
+
+    const readback_before = source_hook.allocationSnapshot().readback_bytes;
+    var readback_k: [2 * width]f32 = undefined;
+    var readback_v: [2 * width]f32 = undefined;
+    const reader = try source_hook.attentionMatchReader();
+    try reader.read_fn(reader.context, .{
+        .sequence = 11,
+        .layer = 1,
+        .logical_length = tokens,
+        .start = 1,
+        .count = 2,
+        .heads = 1,
+        .dim = 2,
+    }, &readback_k, &readback_v);
+    const readback_after = source_hook.allocationSnapshot().readback_bytes;
+    try std.testing.expectEqual(
+        @as(u64, 2 * width * @sizeOf(f16) * 2),
+        readback_after - readback_before,
+    );
+    for (readback_k, layer_one_keys[width..]) |actual, expected|
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+
+    destination_hook.releaseSequence(22);
+    try std.testing.expectEqual(@as(usize, 0), destination.slot_map.count());
+    var source_after_release_k: [tokens * width]f32 = undefined;
+    var source_after_release_v: [tokens * width]f32 = undefined;
+    try source_hook.gatherLayerKv(.{
+        .sequence_id = 11,
+        .layer_index = 1,
+        .token_count = tokens,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    }, &source_after_release_k, &source_after_release_v);
+    try std.testing.expectEqualSlices(f32, &source_k, &source_after_release_k);
+    try std.testing.expectEqualSlices(f32, &source_v, &source_after_release_v);
 }
 
 test "selected Metal repack validates committed physical source rows" {
@@ -1401,7 +2492,12 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
     inline for ([_]pool_mod.KvDType{ .polar4, .turbo3, .f32, .f16, .int8 }) |dtype| {
         const owned = try MetalKvStorage.create(allocator, metal, dtype, kv_heads, head_dim, 4);
         defer owned.deviceWriteHook().deinit(allocator);
-        const binding = try owned.acquireBinding(.{ .sequence_id = 91, .layer_index = 0 }, 0, false, true);
+        const binding = try owned.acquireBinding(.{ .sequence_id = 91, .layer_index = 0 }, 0, 0, false, true);
+        // This fixture seeds the native slot ABI directly instead of going
+        // through reserveLayerKvDevice, so publish the same compact-contiguous
+        // layout metadata that the production reserve path would establish.
+        binding.logical_contiguous = true;
+        binding.physical_base_tokens = 0;
         const layout = owned.rowLayout(kv_heads, head_dim);
         try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot(
             metal,
@@ -1442,6 +2538,7 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .head_dim = head_dim,
             .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
             .scores_out = &gpu_scores,
+            .check_ctx = null,
             .check_fn = selectionTestNotCancelled,
         });
         const oracle = try selection.scoreConsumerNormalizedAttention(allocator, .{
@@ -1482,6 +2579,7 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .head_dim = head_dim,
             .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
             .scores_out = &compact_scores,
+            .check_ctx = null,
             .check_fn = selectionTestNotCancelled,
         });
         var compact_keys: [3 * width]f32 = undefined;
@@ -1621,11 +2719,11 @@ test "Metal paged KV hooks sharing a runtime lease disjoint slots" {
 
     const cached = try MetalKvStorage.create(allocator, runtime, .f16, 1, 2, 2);
     defer cached.deviceWriteHook().deinit(allocator);
-    const cached_binding = try cached.acquireBinding(.{ .sequence_id = 1, .layer_index = 0 }, 0, true, false);
+    const cached_binding = try cached.acquireBinding(.{ .sequence_id = 1, .layer_index = 0 }, 0, 0, true, false);
     const cached_slot = cached_binding.slot;
 
     const request_local = try MetalKvStorage.create(allocator, runtime, .f32, 1, 2, 2);
-    const local_binding = try request_local.acquireBinding(.{ .sequence_id = 1, .layer_index = 0 }, 0, true, false);
+    const local_binding = try request_local.acquireBinding(.{ .sequence_id = 1, .layer_index = 0 }, 0, 0, true, false);
     const local_slot = local_binding.slot;
     try std.testing.expect(cached_slot >= metal_runtime.paged_kv_slot_base);
     try std.testing.expect(local_slot >= metal_runtime.paged_kv_slot_base);
@@ -1635,7 +2733,7 @@ test "Metal paged KV hooks sharing a runtime lease disjoint slots" {
     // still owns its original slot, while its next layer can reuse the slot
     // that the completed request returned to the shared runtime.
     request_local.deviceWriteHook().deinit(allocator);
-    const cached_layer_1 = try cached.acquireBinding(.{ .sequence_id = 1, .layer_index = 1 }, 0, true, false);
+    const cached_layer_1 = try cached.acquireBinding(.{ .sequence_id = 1, .layer_index = 1 }, 0, 0, true, false);
     try std.testing.expectEqual(local_slot, cached_layer_1.slot);
     try std.testing.expect(cached_layer_1.slot != cached_slot);
 }

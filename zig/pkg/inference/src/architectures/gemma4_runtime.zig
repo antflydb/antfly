@@ -332,6 +332,8 @@ pub fn layerSpecConfigFingerprint(config: gpt_mod.Config, configured_layer_count
     std.hash.autoHash(&hasher, @as(u32, @bitCast(config.rope_partial_factor)));
     std.hash.autoHash(&hasher, config.rope_dim_override);
     std.hash.autoHash(&hasher, config.sliding_window_pattern);
+    std.hash.autoHash(&hasher, config.attention_schedule_len);
+    for (config.attention_schedule[0..config.attention_schedule_len]) |kind| std.hash.autoHash(&hasher, kind);
     return hasher.final();
 }
 
@@ -359,8 +361,11 @@ pub fn fillLayerSpecsCached(
     }
     cache.valid = false;
     if (cache.layers.len < layer_count) {
-        if (cache.layers.len > 0) allocator.free(cache.layers);
-        cache.layers = try allocator.alloc(contracts.DecoderRuntimeLayerSpec, layer_count);
+        const replacement = try allocator.alloc(contracts.DecoderRuntimeLayerSpec, layer_count);
+        if (cache.layers.len > 0)
+            (cache.layers_allocator orelse allocator).free(cache.layers);
+        cache.layers = replacement;
+        cache.layers_allocator = allocator;
     }
     const layers = try fillLayerSpecs(
         cb,

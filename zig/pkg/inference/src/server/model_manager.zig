@@ -71,6 +71,68 @@ const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_mod = @import("../graph/root.zig");
 const kernel_jit_profile_output = @import("../kernel_jit_profile_output.zig");
 const runtime = @import("../runtime/root.zig");
+const compaction_profile = @import("../runtime/kv/compaction_profile.zig");
+const context_execution_pool = @import("../backends/context_execution_pool.zig");
+const context_query_protocol = @import("../backends/context_query_protocol.zig");
+
+/// A qualification candidate exists only in test binaries. Release builds use
+/// `void`, eliminating both storage and a callable selector input.
+pub const CompactionCandidateSlot = if (builtin.is_test)
+    ?*const compaction_profile.Profile
+else
+    void;
+
+comptime {
+    if (!builtin.is_test and CompactionCandidateSlot != void)
+        @compileError("release builds must not expose compaction candidate storage");
+}
+
+fn cloneCompactionProfile(
+    allocator: std.mem.Allocator,
+    source: compaction_profile.Profile,
+) !*const compaction_profile.Profile {
+    const profile = try allocator.create(compaction_profile.Profile);
+    errdefer allocator.destroy(profile);
+    const owners = try allocator.alloc(compaction_profile.Owner, source.owners.len);
+    var copied: usize = 0;
+    errdefer {
+        for (owners[0..copied]) |owner| allocator.free(owner.retained);
+        allocator.free(owners);
+    }
+    for (source.owners, owners) |owner, *out| {
+        out.* = .{
+            .layer = owner.layer,
+            .retained = try allocator.dupe(u32, owner.retained),
+        };
+        copied += 1;
+    }
+    const query_protocols = try allocator.alloc(compaction_profile.QueryProtocolAuthority, source.query_protocols.len);
+    var copied_protocols: usize = 0;
+    errdefer {
+        for (query_protocols[0..copied_protocols]) |protocol| allocator.free(protocol.strata);
+        allocator.free(query_protocols);
+    }
+    for (source.query_protocols, query_protocols) |protocol, *out| {
+        out.* = protocol;
+        out.strata = try allocator.dupe(compaction_profile.QueryStratum, protocol.strata);
+        copied_protocols += 1;
+    }
+    profile.* = source;
+    profile.owners = owners;
+    profile.query_protocols = query_protocols;
+    return profile;
+}
+
+fn destroyCompactionProfile(
+    allocator: std.mem.Allocator,
+    profile: *const compaction_profile.Profile,
+) void {
+    for (profile.owners) |owner| allocator.free(owner.retained);
+    allocator.free(profile.owners);
+    for (profile.query_protocols) |protocol| allocator.free(protocol.strata);
+    allocator.free(profile.query_protocols);
+    allocator.destroy(profile);
+}
 const onnx_graph = @import("onnx_graph");
 const ml = @import("ml");
 
@@ -1764,11 +1826,17 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
     var parsed = try gguf_format.parse(parse_allocator, region.data);
     defer parsed.deinit(parse_allocator);
 
-    const view = gguf_metadata.View.init(&parsed);
-    const model_name = view.getString("tokenizer.ggml.model") orelse return error.NoTokenizerFound;
+    return loadHuggingFaceTokenizerFromParsedGguf(allocator, &parsed);
+}
 
-    const tokenizer_bytes = if (std.mem.eql(u8, model_name, "t5"))
-        try unigramTokenizerJsonFromGguf(allocator, &parsed)
+fn tokenizerJsonFromParsedGguf(
+    allocator: std.mem.Allocator,
+    parsed: *const gguf_format.File,
+) ![]u8 {
+    const view = gguf_metadata.View.init(parsed);
+    const model_name = view.getString("tokenizer.ggml.model") orelse return error.NoTokenizerFound;
+    return if (std.mem.eql(u8, model_name, "t5"))
+        try unigramTokenizerJsonFromGguf(allocator, parsed)
     else blk: {
         const flavor: GgufBpeTokenizerFlavor = if (std.mem.eql(u8, model_name, "gpt2"))
             .byte_level
@@ -1776,13 +1844,21 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
             .gemma4
         else
             return error.NoTokenizerFound;
-        break :blk try bpeTokenizerJsonFromGguf(allocator, &parsed, flavor);
+        break :blk try bpeTokenizerJsonFromGguf(allocator, parsed, flavor);
     };
+}
+
+fn loadHuggingFaceTokenizerFromParsedGguf(
+    allocator: std.mem.Allocator,
+    parsed: *const gguf_format.File,
+) !*hf_tokenizer.HfTokenizer {
+    const tokenizer_bytes = try tokenizerJsonFromParsedGguf(allocator, parsed);
     defer allocator.free(tokenizer_bytes);
+    const source_identity = ggufTokenizerIdentity(parsed, tokenizer_bytes);
 
     const tok = try hf_tokenizer.HfTokenizer.loadFromBytesAllowDuplicateFields(allocator, tokenizer_bytes);
     errdefer tok.deinitSelf();
-    const tokens = try getRequiredMetadataArray(&parsed, "tokenizer.ggml.tokens", .string);
+    const tokens = try getRequiredMetadataArray(parsed, "tokenizer.ggml.tokens", .string);
     for (tokens.values, 0..) |token_value, index| {
         const token = switch (token_value) {
             .string => |value| value,
@@ -1791,13 +1867,13 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
         const id = std.math.cast(i32, index) orelse return error.InvalidTokenizerMetadata;
         try tok.addTokenIdAliasForDecode(token, id);
     }
-    const bos_id = metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id");
-    const eos_id = metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id");
+    const bos_id = metadataTokenId(parsed, "tokenizer.ggml.bos_token_id");
+    const eos_id = metadataTokenId(parsed, "tokenizer.ggml.eos_token_id");
     tok.applySpecialTokenIds(
         bos_id,
         eos_id,
-        metadataTokenId(&parsed, "tokenizer.ggml.padding_token_id"),
-        metadataTokenId(&parsed, "tokenizer.ggml.unknown_token_id"),
+        metadataTokenId(parsed, "tokenizer.ggml.padding_token_id"),
+        metadataTokenId(parsed, "tokenizer.ggml.unknown_token_id"),
     );
     // Honor the checkpoint's declared wrap semantics when present. Without
     // this, encodeForModel wraps with bos AND eos unconditionally — for
@@ -1805,7 +1881,7 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
     // injects a leading <|endoftext|> the HF reference does not produce,
     // shifting every position and breaking embedding parity. GGUFs that
     // declare neither flag keep the legacy wrap unchanged.
-    const gguf_view = gguf_metadata.View.init(&parsed);
+    const gguf_view = gguf_metadata.View.init(parsed);
     const add_bos = gguf_view.getBool("tokenizer.ggml.add_bos_token");
     const add_eos = gguf_view.getBool("tokenizer.ggml.add_eos_token");
     if (add_bos != null or add_eos != null) {
@@ -1823,13 +1899,125 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
         }
         try tok.applyModelWrapTemplate(prepend, append);
     }
+    tok.source_identity = source_identity;
     return tok;
+}
+
+fn ggufTokenizerIdentity(parsed: *const gguf_format.File, tokenizer_json: []const u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.hf-tokenizer.gguf.v1\x00");
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(tokenizer_json.len), .little);
+    hash.update(&length);
+    hash.update(tokenizer_json);
+    inline for (.{
+        "tokenizer.ggml.bos_token_id",
+        "tokenizer.ggml.eos_token_id",
+        "tokenizer.ggml.padding_token_id",
+        "tokenizer.ggml.unknown_token_id",
+    }) |key| {
+        if (metadataTokenId(parsed, key)) |value| {
+            hash.update(&.{1});
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(i32, &bytes, value, .little);
+            hash.update(&bytes);
+        } else hash.update(&.{0});
+    }
+    const view = gguf_metadata.View.init(parsed);
+    inline for (.{ "tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token" }) |key| {
+        if (view.getBool(key)) |value|
+            hash.update(&.{if (value) 2 else 1})
+        else
+            hash.update(&.{0});
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn tokenizerIdentityFromLoadedGgufBytes(allocator: std.mem.Allocator, bytes: []const u8) ![32]u8 {
+    const parse_allocator = platform.allocator.processAllocator(allocator);
+    var parsed = try gguf_format.parse(parse_allocator, bytes);
+    defer parsed.deinit(parse_allocator);
+    const tokenizer_json = try tokenizerJsonFromParsedGguf(allocator, &parsed);
+    defer allocator.free(tokenizer_json);
+    return ggufTokenizerIdentity(&parsed, tokenizer_json);
 }
 
 const GgufBpeTokenizerFlavor = enum {
     byte_level,
     gemma4,
 };
+
+test "context loaded tokenizer policy identity binds effective BOS wrapping" {
+    const parsed: [32]u8 = @splat(7);
+    const plain = loadedTokenizerPolicyIdentity(parsed, false, "<bos>");
+    const enabled = loadedTokenizerPolicyIdentity(parsed, true, "<bos>");
+    const changed_token = loadedTokenizerPolicyIdentity(parsed, true, "<start>");
+    try std.testing.expect(!std.mem.eql(u8, &plain, &enabled));
+    try std.testing.expect(!std.mem.eql(u8, &enabled, &changed_token));
+    try std.testing.expectEqual(enabled, loadedTokenizerPolicyIdentity(parsed, true, "<bos>"));
+}
+
+test "context qualification candidate is manager scoped and deeply copied" {
+    try std.testing.expect(builtin.is_test);
+    try std.testing.expect(CompactionCandidateSlot != void);
+    try std.testing.expect(@TypeOf(ModelManager.configureCompactionCandidateForTesting) != void);
+    try std.testing.expect(@TypeOf(ModelManager.admissionSnapshotForTesting) != void);
+
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionSnapshotForTesting());
+    var retained = [_]u32{256};
+    const identity: compaction_profile.Identity = .{
+        .artifact = @splat(1),
+        .tokenizer = @splat(2),
+        .template = @splat(3),
+        .layout = @splat(4),
+        .runtime = @splat(5),
+    };
+    var strata = [_]compaction_profile.QueryStratum{
+        .{ .consumer_layer = 0, .query_head = 0, .kv_head = 0 },
+    };
+    const query_protocol = compaction_profile.QueryProtocolAuthority{
+        .schema_version = 2,
+        .layer = 0,
+        .sha256 = @splat(6),
+        .query_sampling = .source_uniform_partition_v3,
+        .accounting = .serial_physical_branch_upper_bound_v2,
+        .max_training_rows = 3072,
+        .max_validation_rows = 1024,
+        .sources = .{
+            .{ .kind = .request_question_replay, .partition = .training, .physical_branch = 0 },
+            .{ .kind = .fixed_study_prefill, .partition = .training, .physical_branch = 1 },
+            .{ .kind = .fixed_study_generated_response, .partition = .training, .physical_branch = 1 },
+            .{ .kind = .fixed_study_prefill, .partition = .validation, .physical_branch = 2 },
+            .{ .kind = .fixed_study_generated_response, .partition = .validation, .physical_branch = 2 },
+        },
+        .owner_kv_heads = 1,
+        .owner_query_heads = 1,
+        .owner_head_dim = 64,
+        .strata = &strata,
+        .fit = .{ .template_sha256 = @splat(7), .generation_contract_sha256 = @splat(8), .response_tokens = 128, .generation_mode = .greedy_fixed_length_ignore_eos },
+        .gate = .{ .template_sha256 = @splat(9), .generation_contract_sha256 = @splat(10), .response_tokens = 64, .generation_mode = .greedy_fixed_length_ignore_eos },
+    };
+    try manager.configureCompactionCandidateForTesting(.{
+        .identity = identity,
+        .artifact_sha256 = @splat(9),
+        .owners = &.{.{ .layer = 0, .retained = &retained }},
+        .query_protocols = &.{query_protocol},
+        .max_prompt_tokens = 1024,
+        .max_output_tokens = 8,
+        .minimum_saved_bytes = 4096,
+    });
+    retained[0] = 512;
+    strata[0].query_head = 1;
+    try std.testing.expectEqual(@as(u32, 256), manager.compaction_candidate.?.owners[0].retained[0]);
+    try std.testing.expectEqual(@as(u32, 0), manager.compaction_candidate.?.query_protocols[0].strata[0].query_head);
+    try std.testing.expectEqual(@as([32]u8, @splat(9)), try compaction_profile.profileArtifactDigest(manager.compaction_candidate.?.*));
+    try std.testing.expectError(error.CompactionCandidateAfterModelLoad, manager.configureCompactionCandidateForTesting(manager.compaction_candidate.?.*));
+}
 
 fn unigramTokenizerJsonFromGguf(
     allocator: std.mem.Allocator,
@@ -2298,6 +2486,24 @@ fn ownSelectedFirstBackendPreference(
     return result;
 }
 
+fn loadedTokenizerPolicyIdentity(
+    parsed_identity: [32]u8,
+    add_bos_token: bool,
+    bos_token: []const u8,
+) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.loaded-tokenizer-policy.v1\x00");
+    hash.update(&parsed_identity);
+    hash.update(&.{@intFromBool(add_bos_token)});
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(bos_token.len), .little);
+    hash.update(&length);
+    hash.update(bos_token);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
 fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest) ![32]u8 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -2651,6 +2857,13 @@ pub const LoadedModel = struct {
     native_kv_artifact_digest: ?[32]u8 = null,
     native_kv_tokenizer_contract: ?native_kv_identity.TokenizerContract = null,
     native_kv_identity_mutex: std.atomic.Mutex = .unlocked,
+    /// Monotonic publication token. ModelHandle pins this exact object, while
+    /// semantic release identity remains independent of reload order.
+    load_generation: u64 = 0,
+    /// Test binaries may pin one manager-owned release candidate to this exact
+    /// loaded generation. Production builds have no candidate storage or
+    /// selector input; the frozen release registry remains the sole authority.
+    compaction_candidate: CompactionCandidateSlot = if (builtin.is_test) null else {},
     embedding_identity: ?[64]u8 = null,
     embedding_validation: ?@import("../models/embedding_gemma2_identity.zig").SnapshotValidation = null,
     embedding_identity_mutex: std.atomic.Mutex = .unlocked,
@@ -2681,6 +2894,12 @@ pub const LoadedModel = struct {
     prompt_prefix_cache: runtime.kv.prompt_cache.PromptPrefixCache,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     native_generation_graph_cache: graph_mod.cache.GraphCache,
+    /// Generation-pinned immutable Metal execution resources for qualified
+    /// packed context. Construction is lazy after release-profile selection;
+    /// the retained lease charges its fixed model-resident backend scratch.
+    context_execution_pool: ?context_execution_pool.Pool = null,
+    context_execution_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    context_execution_init_mutex: std.atomic.Mutex = .unlocked,
     // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
     native_generate_lock: std.atomic.Mutex = .unlocked,
     /// The GGUF projector kept open for Gemma media prompts, opened on the
@@ -2861,6 +3080,296 @@ pub const LoadedModel = struct {
         // A pinned handle keeps both tokenizer and backend provider alive.
         tokenizer.cache_identity = if (self.embedding_identity) |signature| std.hash.Wyhash.hash(0, &signature) else null;
         return tokenizer;
+    }
+
+    /// GGUF fields included in the loaded tokenizer's source identity.
+    pub const GgufTokenizerMetadata = struct {
+        bos_token_id: ?i32,
+        eos_token_id: ?i32,
+        padding_token_id: ?i32,
+        unknown_token_id: ?i32,
+        add_bos_token: ?bool,
+        add_eos_token: ?bool,
+    };
+
+    pub const CompactionTokenizerSourceKind = enum { hf_json, gguf_derived };
+
+    pub const CompactionProvenanceExport = struct {
+        allocator: std.mem.Allocator,
+        load_generation: u64,
+        artifact_sha256: [32]u8,
+        tokenizer_kind: CompactionTokenizerSourceKind,
+        tokenizer_source: []u8,
+        tokenizer_parsed_source_sha256: [32]u8,
+        tokenizer_gguf_metadata: ?GgufTokenizerMetadata,
+        tokenizer_add_bos_token: bool,
+        tokenizer_bos_token: []u8,
+        tokenizer_loaded_sha256: [32]u8,
+        template_source: []u8,
+        template_bos_token: []u8,
+        template_eos_token: []u8,
+        template_unk_token: []u8,
+        template_pad_token: []u8,
+        template_loaded_sha256: [32]u8,
+
+        pub fn deinit(self: *CompactionProvenanceExport) void {
+            self.allocator.free(self.template_pad_token);
+            self.allocator.free(self.template_unk_token);
+            self.allocator.free(self.template_eos_token);
+            self.allocator.free(self.template_bos_token);
+            self.allocator.free(self.template_source);
+            self.allocator.free(self.tokenizer_bos_token);
+            self.allocator.free(self.tokenizer_source);
+            self.* = undefined;
+        }
+    };
+
+    fn compactionTemplateIdentity(
+        source: []const u8,
+        bos_token: []const u8,
+        eos_token: []const u8,
+        unk_token: []const u8,
+        pad_token: []const u8,
+    ) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly.chat-template.v1\x00");
+        for ([_][]const u8{ source, bos_token, eos_token, unk_token, pad_token }) |field| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, @intCast(field.len), .little);
+            hash.update(&length);
+            hash.update(field);
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+
+    /// Export the exact tokenizer/template hash preimages retained by this loaded
+    /// generation. The caller must hold its ModelHandle through synchronous export.
+    /// No request value or environment digest enters this receipt.
+    pub fn exportCompactionProvenance(
+        self: *LoadedModel,
+        allocator: std.mem.Allocator,
+    ) !CompactionProvenanceExport {
+        const loaded = try self.compactionLoadedIdentity();
+        const tokenizer = self.hf_tok orelse return error.UnsupportedCompactionTokenizer;
+        var source: []u8 = undefined;
+        var kind: CompactionTokenizerSourceKind = undefined;
+        var parsed_identity: [32]u8 = undefined;
+        var gguf_source_metadata: ?GgufTokenizerMetadata = null;
+        if (self.manifest.tokenizer_json_path) |path| {
+            source = try c_file.readFile(allocator, path);
+            std.crypto.hash.sha2.Sha256.hash(source, &parsed_identity, .{});
+            kind = .hf_json;
+        } else {
+            const artifact = session_factory.getLoadedGgufArtifactBytes(self.session) orelse
+                return error.UnsupportedCompactionTokenizer;
+            const parse_allocator = platform.allocator.processAllocator(allocator);
+            var parsed = try gguf_format.parse(parse_allocator, artifact);
+            defer parsed.deinit(parse_allocator);
+            source = try tokenizerJsonFromParsedGguf(allocator, &parsed);
+            parsed_identity = ggufTokenizerIdentity(&parsed, source);
+            const view = gguf_metadata.View.init(&parsed);
+            gguf_source_metadata = .{
+                .bos_token_id = metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id"),
+                .eos_token_id = metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id"),
+                .padding_token_id = metadataTokenId(&parsed, "tokenizer.ggml.padding_token_id"),
+                .unknown_token_id = metadataTokenId(&parsed, "tokenizer.ggml.unknown_token_id"),
+                .add_bos_token = view.getBool("tokenizer.ggml.add_bos_token"),
+                .add_eos_token = view.getBool("tokenizer.ggml.add_eos_token"),
+            };
+            kind = .gguf_derived;
+        }
+        errdefer allocator.free(source);
+        if (!std.mem.eql(u8, &parsed_identity, &tokenizer.source_identity))
+            return error.ModelArtifactsChanging;
+        const tokenizer_loaded = loadedTokenizerPolicyIdentity(
+            parsed_identity,
+            self.manifest.add_bos_token,
+            self.manifest.bos_token,
+        );
+        if (!std.mem.eql(u8, &tokenizer_loaded, &loaded.bytes.tokenizer))
+            return error.ModelArtifactsChanging;
+        const owned_tokenizer_bos = try allocator.dupe(u8, self.manifest.bos_token);
+        errdefer allocator.free(owned_tokenizer_bos);
+        const chat = self.chat_tmpl orelse return error.UnsupportedCompactionTemplate;
+        const template_source = self.manifest.chat_template orelse return error.UnsupportedCompactionTemplate;
+        const template_loaded = compactionTemplateIdentity(
+            template_source,
+            chat.bos_token,
+            chat.eos_token,
+            chat.unk_token,
+            chat.pad_token,
+        );
+        if (!std.mem.eql(u8, &template_loaded, &chat.source_identity) or
+            !std.mem.eql(u8, &template_loaded, &loaded.bytes.template))
+            return error.ModelArtifactsChanging;
+        const owned_template_source = try allocator.dupe(u8, template_source);
+        errdefer allocator.free(owned_template_source);
+        const owned_bos_token = try allocator.dupe(u8, chat.bos_token);
+        errdefer allocator.free(owned_bos_token);
+        const owned_eos_token = try allocator.dupe(u8, chat.eos_token);
+        errdefer allocator.free(owned_eos_token);
+        const owned_unk_token = try allocator.dupe(u8, chat.unk_token);
+        errdefer allocator.free(owned_unk_token);
+        const owned_pad_token = try allocator.dupe(u8, chat.pad_token);
+        errdefer allocator.free(owned_pad_token);
+        return .{
+            .allocator = allocator,
+            .load_generation = loaded.generation,
+            .artifact_sha256 = loaded.bytes.artifact,
+            .tokenizer_kind = kind,
+            .tokenizer_source = source,
+            .tokenizer_parsed_source_sha256 = parsed_identity,
+            .tokenizer_gguf_metadata = gguf_source_metadata,
+            .tokenizer_add_bos_token = self.manifest.add_bos_token,
+            .tokenizer_bos_token = owned_tokenizer_bos,
+            .tokenizer_loaded_sha256 = tokenizer_loaded,
+            .template_source = owned_template_source,
+            .template_bos_token = owned_bos_token,
+            .template_eos_token = owned_eos_token,
+            .template_unk_token = owned_unk_token,
+            .template_pad_token = owned_pad_token,
+            .template_loaded_sha256 = template_loaded,
+        };
+    }
+
+    pub const CompactionLoadedIdentity = struct {
+        generation: u64,
+        bytes: compaction_profile.LoadedBytes,
+    };
+
+    pub const CompactionSelection = struct {
+        load_generation: u64,
+        identity: compaction_profile.Identity,
+        profile: *const compaction_profile.Profile,
+        profile_sha256: [32]u8,
+        profile_semantic_digest: [32]u8,
+        query_protocols: []const compaction_profile.QueryProtocolAuthority = &.{},
+    };
+
+    pub const CompactionIdentity = struct {
+        load_generation: u64,
+        identity: compaction_profile.Identity,
+    };
+
+    /// One canonical semantic identity for the optimized serving route. Every
+    /// capture, candidate lookup and publication receipt must call this helper
+    /// so evidence cannot silently bind the correctness kernel or old solver.
+    pub fn compactionIdentity(
+        self: *LoadedModel,
+        layout: runtime.context_policy.Layout,
+        implementation: compaction_profile.Implementation,
+    ) !CompactionIdentity {
+        const loaded = try self.compactionLoadedIdentity();
+        return .{
+            .load_generation = loaded.generation,
+            .identity = try compaction_profile.Identity.fromLoaded(loaded.bytes, layout, implementation),
+        };
+    }
+
+    /// Revalidate a captured selection against the exact model generation
+    /// pinned by the caller. A reload must reject a selection captured from
+    /// the retired object even when all immutable byte identities match.
+    pub fn validatePinnedCompactionSelection(
+        self: *LoadedModel,
+        layout: runtime.context_policy.Layout,
+        implementation: compaction_profile.Implementation,
+        selection: CompactionSelection,
+    ) !CompactionIdentity {
+        const loaded = try self.compactionIdentity(layout, implementation);
+        if (loaded.load_generation != self.load_generation or
+            loaded.load_generation != selection.load_generation or
+            !std.meta.eql(loaded.identity, selection.identity))
+            return error.StaleContextView;
+        return loaded;
+    }
+
+    /// Resolve provenance only for a fully bound GGUF/HF-template generation.
+    /// Artifact hashing is cached by the retained session and happens only
+    /// when this dormant feature is explicitly considered for admission.
+    pub fn compactionLoadedIdentity(self: *LoadedModel) !CompactionLoadedIdentity {
+        if (self.load_generation == 0) return error.UnpublishedModelGeneration;
+        const artifact = session_factory.getLoadedGgufArtifactDigest(self.session) orelse
+            return error.UnsupportedCompactionArtifact;
+        const tokenizer = if (self.hf_tok) |tok|
+            loadedTokenizerPolicyIdentity(tok.source_identity, self.manifest.add_bos_token, self.manifest.bos_token)
+        else
+            return error.UnsupportedCompactionTokenizer;
+        const template = if (self.chat_tmpl) |chat| chat.source_identity else return error.UnsupportedCompactionTemplate;
+        return .{
+            .generation = self.load_generation,
+            .bytes = .{ .artifact = artifact, .tokenizer = tokenizer, .template = template },
+        };
+    }
+
+    /// Bind release selection to the bytes and generation already pinned by
+    /// the caller's ModelHandle. The registry is the sole authority; its empty
+    /// production state keeps this capability disabled until evidence lands.
+    pub fn selectCompactionProfile(
+        self: *LoadedModel,
+        layout: runtime.context_policy.Layout,
+        implementation: compaction_profile.Implementation,
+    ) !CompactionSelection {
+        const loaded = try self.compactionIdentity(layout, implementation);
+        const identity = loaded.identity;
+        const profile = compaction_profile.select(identity) catch |err| blk: {
+            if (comptime !builtin.is_test) return err;
+            if (err != error.UnqualifiedCompactionArtifact) return err;
+            const candidate = self.compaction_candidate orelse return err;
+            _ = try compaction_profile.profileArtifactDigest(candidate.*);
+            // Validate the complete layout/owner contract at the selection
+            // boundary. Exact prompt/output bounds are validated again from
+            // the immutable payload by compaction_coordinator.preparePlan.
+            try candidate.validate(identity, layout, 1, 1);
+            break :blk candidate;
+        };
+        for (profile.query_protocols) |authority|
+            try context_query_protocol.validateRuntimeAuthority(authority, layout);
+        return .{
+            .load_generation = loaded.load_generation,
+            .identity = identity,
+            .profile = profile,
+            .profile_sha256 = try compaction_profile.profileArtifactDigest(profile.*),
+            .profile_semantic_digest = profile.semanticDigest(),
+            .query_protocols = profile.query_protocols,
+        };
+    }
+
+    /// Lazily reserve and construct the one bounded context execution lane.
+    /// The caller must hold a ModelHandle for this generation and must have
+    /// already selected a registry-qualified profile (or the manager-scoped
+    /// test candidate). Request input cannot reach this method directly.
+    pub fn ensureContextExecutionPool(
+        self: *LoadedModel,
+        limits: runtime.tier.memory.Limits,
+        device_bytes_before: ?u64,
+        control: InferenceExecutionControl,
+    ) !*context_execution_pool.Pool {
+        if (self.session.backend() != .metal) return error.UnsupportedContextCombination;
+        try control.lock(&self.context_execution_init_mutex);
+        defer self.context_execution_init_mutex.unlock();
+        if (self.context_execution_pool) |*pool| return pool;
+        if (self.context_execution_resource_lease != null)
+            return error.InvalidContextExecutionAdmission;
+
+        var lease = try self.model_manager.acquireRunResourceAmounts(
+            .gpu,
+            limits,
+            .{ .backend_scratch_bytes = context_execution_pool.admitted_backend_bytes },
+        );
+        errdefer lease.release();
+        self.context_execution_pool = try context_execution_pool.Pool.init(
+            self.load_generation,
+            context_execution_pool.admitted_backend_bytes,
+        );
+        errdefer {
+            self.context_execution_pool.?.deinit();
+            self.context_execution_pool = null;
+        }
+        try self.context_execution_pool.?.warm(device_bytes_before);
+        self.context_execution_resource_lease = lease;
+        return &self.context_execution_pool.?;
     }
 
     pub fn getEmbeddingPrototypeCache(self: *LoadedModel, limits: runtime.tier.memory.Limits, control: InferenceExecutionControl) !*@import("../extractors/embedding_prototypes.zig").Cache {
@@ -3513,6 +4022,17 @@ pub const LoadedModel = struct {
         if (self.projector_store) |store| {
             store.close();
             self.projector_store = null;
+        }
+        // No ModelHandle or request lease remains. Drain and destroy shared
+        // context execution before closing model/backend buffers, then return
+        // its separately retained residency charge.
+        if (self.context_execution_pool) |*pool| {
+            pool.deinit();
+            self.context_execution_pool = null;
+        }
+        if (self.context_execution_resource_lease) |*lease| {
+            lease.release();
+            self.context_execution_resource_lease = null;
         }
         // Cache destruction may enter a driver before Session.close. Protect
         // every retained component first, without borrowing request controls.
@@ -4820,6 +5340,7 @@ pub const ModelManager = struct {
     composite_startup_backends: std.StringHashMapUnmanaged(backends.BackendType) = .{},
     runtime_epoch: u64,
     next_runtime_sequence: u64 = 1,
+    next_loaded_generation: std.atomic.Value(u64) = .init(1),
     /// Protects loaded-model maps and the in-flight registry. Expensive tokenizer,
     /// weight, and backend initialization always runs outside this lock.
     load_lock: std.atomic.Mutex = .unlocked,
@@ -4859,6 +5380,7 @@ pub const ModelManager = struct {
     resource_domain: ?*ResourceDomain = null,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
+    compaction_candidate: CompactionCandidateSlot = if (builtin.is_test) null else {},
 
     pub fn init(allocator: std.mem.Allocator, session_manager: backends.SessionManager) ModelManager {
         return initWithRuntimeEpoch(
@@ -4887,6 +5409,29 @@ pub const ModelManager = struct {
         self.next_runtime_sequence +%= 1;
         if (self.next_runtime_sequence == 0) self.next_runtime_sequence = 1;
         return (@as(RuntimeId, self.runtime_epoch) << 64) | sequence;
+    }
+
+    fn configureCompactionCandidateForTestingImpl(
+        self: *ModelManager,
+        candidate: compaction_profile.Profile,
+    ) !void {
+        std.debug.assert(builtin.is_test);
+        if (self.loaded.count() != 0 or self.loaded_aliases.count() != 0 or
+            self.in_flight_loads.count() != 0 or self.compaction_candidate != null)
+            return error.CompactionCandidateAfterModelLoad;
+        self.compaction_candidate = try cloneCompactionProfile(self.allocator, candidate);
+    }
+
+    /// Qualification harnesses inject a copied candidate into one manager.
+    /// In production this declaration is `void`, so no callable injection API
+    /// or process-global/request-controlled bypass is compiled.
+    pub const configureCompactionCandidateForTesting = if (builtin.is_test)
+        configureCompactionCandidateForTestingImpl
+    else {};
+
+    comptime {
+        if (!builtin.is_test and @TypeOf(configureCompactionCandidateForTesting) != void)
+            @compileError("release builds must not compile compaction candidate injection");
     }
 
     pub fn configureServingPolicy(self: *ModelManager, policy: model_compatibility.Policy) void {
@@ -5023,6 +5568,25 @@ pub const ModelManager = struct {
             if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(bytes) == 0) return err;
             return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
         };
+    }
+
+    fn admissionSnapshotForTestingImpl(
+        self: *const ModelManager,
+    ) runtime.tier.memory.AdmissionAmounts {
+        std.debug.assert(builtin.is_test);
+        const domain = self.resource_domain orelse return .{};
+        return domain.admission.snapshot();
+    }
+
+    /// Qualification observers may prove that all request-scoped admission
+    /// returned to its exact baseline. Release builds expose no callable hook.
+    pub const admissionSnapshotForTesting = if (builtin.is_test)
+        admissionSnapshotForTestingImpl
+    else {};
+
+    comptime {
+        if (!builtin.is_test and @TypeOf(admissionSnapshotForTesting) != void)
+            @compileError("release builds must not compile admission observation hooks");
     }
 
     /// Exact admission ownership held by the live Hugging Face tokenizer
@@ -7094,6 +7658,12 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
+        if (comptime builtin.is_test) {
+            if (self.compaction_candidate) |candidate| {
+                destroyCompactionProfile(self.allocator, candidate);
+                self.compaction_candidate = null;
+            }
+        }
         if (self.resource_domain) |lifetime| {
             lifetime.close();
             self.tokenizer_cache_config.resource_budget = null;
@@ -8651,6 +9221,20 @@ pub const ModelManager = struct {
         defer loaded_session.deinit();
         if (control) |active| try active.update(.loading_model, 3, 4);
         const session = loaded_session.session;
+        // A GGUF-derived tokenizer was parsed before backend construction.
+        // When the selected backend retains the GGUF, re-derive only its
+        // compact tokenizer identity from that exact mapping. Converted and
+        // composite sessions remain valid for exact serving but cannot later
+        // produce a compaction artifact identity.
+        if (tokenizer_type == .huggingface and man.tokenizer_json_path == null and
+            man.vocab_txt_path == null and man.gguf_path != null)
+        {
+            if (session_factory.getLoadedGgufArtifactBytes(session)) |loaded_bytes| {
+                const loaded_tokenizer_identity = try tokenizerIdentityFromLoadedGgufBytes(self.allocator, loaded_bytes);
+                if (!std.mem.eql(u8, &loaded_tokenizer_identity, &hf_tok.?.source_identity))
+                    return error.ModelArtifactsChanging;
+            }
+        }
         if (man.gliner_architecture == .boundary) {
             const identity = try session_factory.getGlinerBoundaryIdentity(session);
             try identity.verifySidecars(try man.boundarySidecarDigests());
@@ -8767,8 +9351,12 @@ pub const ModelManager = struct {
         const chunk_planning = try chunkPlanningSnapshotWithControl(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision, control orelse .{});
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
         if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
+        const load_generation = self.next_loaded_generation.fetchAdd(1, .monotonic);
+        if (load_generation == 0) return error.ModelLoadGenerationExhausted;
         model.* = .{
             .chunk_planning = chunk_planning,
+            .load_generation = load_generation,
+            .compaction_candidate = if (builtin.is_test) self.compaction_candidate else {},
             .resolution_revision = resolution_revision,
             .native_kv_asset_generation = native_kv_asset_generation,
             .native_kv_tokenizer_contract = if (native_kv_asset_generation != null) .{

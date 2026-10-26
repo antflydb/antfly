@@ -259,6 +259,7 @@ pub const StepBudget = struct {
 
 pub const Stats = struct {
     turn_yields_total: u64 = 0,
+    execution_gate_yields_total: u64 = 0,
 
     // Unified-step counters. A "step" is a single fused forward pass that may
     // contain any mix of prefill chunks and decode tokens.
@@ -276,6 +277,13 @@ pub const Stats = struct {
     step_batch_size_9_16_total: u64 = 0,
 };
 
+const ExecutionGate = enum {
+    queued,
+    shared_active,
+    exclusive_waiting,
+    exclusive_active,
+};
+
 const Entry = struct {
     id: RequestId,
     requested_units: usize,
@@ -287,6 +295,7 @@ const Entry = struct {
     prompt_tokens_processed: usize = 0,
     total_prompt_tokens: usize = 0,
     generated_tokens: usize = 0,
+    gate: ExecutionGate = .queued,
     /// Total sequence length of the next decode work this request is expected
     /// to enqueue. This bridges the gap after a scheduled forward completes
     /// and before its owner samples the result and enqueues the next step.
@@ -440,6 +449,126 @@ pub const NativeGenerateCoordinator = struct {
         }
         entry.prefill_chunk_plan.deinit(self.allocator);
         _ = self.entries.swapRemove(idx);
+    }
+
+    /// Convert an admitted request into an exclusive FIFO waiter. Callers do
+    /// this only after resource admission and before waiting for the model
+    /// execution lock. The coordinator mutex is never held while waiting.
+    pub fn markExclusive(self: *NativeGenerateCoordinator, lease: *Lease) !void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        const idx = self.indexOf(lease.request_id) orelse return error.InvalidSchedulerLease;
+        if (self.entries.items[idx].gate != .queued) return error.InvalidSchedulerLease;
+        self.entries.items[idx].gate = .exclusive_waiting;
+    }
+
+    pub fn awaitSharedExecution(self: *NativeGenerateCoordinator, lease: *Lease, io: std.Io) !void {
+        while (!self.tryAcquireSharedExecution(lease)) {
+            self.noteExecutionGateYield();
+            try io.sleep(std.Io.Duration.fromMilliseconds(0), .awake);
+        }
+    }
+
+    pub fn awaitSharedExecutionControlled(self: *NativeGenerateCoordinator, lease: *Lease, io: std.Io, control: anytype) !void {
+        while (true) {
+            try control.check();
+            if (self.tryAcquireSharedExecution(lease)) return;
+            self.noteExecutionGateYield();
+            try io.sleep(std.Io.Duration.fromMilliseconds(0), .awake);
+        }
+    }
+
+    /// Admit a batch atomically at the acquisition position of its oldest
+    /// member. This prevents an exclusive waiter interleaved between lease
+    /// acquisitions from deadlocking against a partially activated batch.
+    pub fn awaitSharedExecutionGroupControlled(self: *NativeGenerateCoordinator, leases: []const Lease, io: std.Io, control: anytype) !void {
+        while (true) {
+            try control.check();
+            if (self.tryAcquireSharedExecutionGroup(leases)) return;
+            self.noteExecutionGateYield();
+            try io.sleep(std.Io.Duration.fromMilliseconds(0), .awake);
+        }
+    }
+
+    pub fn tryAcquireSharedExecutionGroup(self: *NativeGenerateCoordinator, leases: []const Lease) bool {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        var oldest: ?RequestId = null;
+        var active_count: usize = 0;
+        for (leases) |lease| {
+            if (lease.request_id == 0) continue;
+            const idx = self.indexOf(lease.request_id) orelse return false;
+            const gate = self.entries.items[idx].gate;
+            if (gate != .queued and gate != .shared_active) return false;
+            oldest = if (oldest) |id| @min(id, lease.request_id) else lease.request_id;
+            active_count += 1;
+        }
+        const group_start = oldest orelse return false;
+        for (self.entries.items) |other| {
+            if (other.id < group_start and (other.gate == .exclusive_waiting or other.gate == .exclusive_active))
+                return false;
+        }
+        for (leases) |lease| {
+            if (lease.request_id == 0) continue;
+            self.entries.items[self.indexOf(lease.request_id).?].gate = .shared_active;
+        }
+        return active_count != 0;
+    }
+
+    pub fn tryAcquireSharedExecution(self: *NativeGenerateCoordinator, lease: *Lease) bool {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        const idx = self.indexOf(lease.request_id) orelse return false;
+        const entry = &self.entries.items[idx];
+        if (entry.gate == .shared_active) return true;
+        if (entry.gate != .queued) return false;
+        for (self.entries.items) |other| {
+            if (other.id < entry.id and (other.gate == .exclusive_waiting or other.gate == .exclusive_active))
+                return false;
+        }
+        entry.gate = .shared_active;
+        return true;
+    }
+
+    pub fn awaitExclusiveExecution(self: *NativeGenerateCoordinator, lease: *Lease, io: std.Io) !void {
+        while (!self.tryAcquireExclusiveExecution(lease)) {
+            self.noteExecutionGateYield();
+            try io.sleep(std.Io.Duration.fromMilliseconds(0), .awake);
+        }
+    }
+
+    pub fn awaitExclusiveExecutionControlled(self: *NativeGenerateCoordinator, lease: *Lease, io: std.Io, control: anytype) !void {
+        while (true) {
+            try control.check();
+            if (self.tryAcquireExclusiveExecution(lease)) return;
+            self.noteExecutionGateYield();
+            try io.sleep(std.Io.Duration.fromMilliseconds(0), .awake);
+        }
+    }
+
+    pub fn tryAcquireExclusiveExecution(self: *NativeGenerateCoordinator, lease: *Lease) bool {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        const idx = self.indexOf(lease.request_id) orelse return false;
+        const entry = &self.entries.items[idx];
+        if (entry.gate == .exclusive_active) return true;
+        if (entry.gate != .exclusive_waiting) return false;
+        for (self.entries.items) |other| {
+            if (other.id == entry.id) continue;
+            // Older requests retain FIFO priority. A shared request that
+            // crossed its barrier before this request became exclusive must
+            // also drain, even when it has a newer request id.
+            if (other.id < entry.id or other.gate == .shared_active or other.gate == .exclusive_active)
+                return false;
+        }
+        entry.gate = .exclusive_active;
+        return true;
+    }
+
+    fn noteExecutionGateYield(self: *NativeGenerateCoordinator) void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        self.stats.execution_gate_yields_total += 1;
     }
 
     /// Finalize the request's immutable prefill geometry after memory
@@ -1326,6 +1455,7 @@ pub fn aggregateStats(models: anytype) struct { snapshot: Snapshot, stats: Stats
 
         const st = coordinator.schedulerStats();
         stats.turn_yields_total += st.turn_yields_total;
+        stats.execution_gate_yields_total += st.execution_gate_yields_total;
         stats.step_batches_total += st.step_batches_total;
         stats.step_prefill_items_total += st.step_prefill_items_total;
         stats.step_decode_items_total += st.step_decode_items_total;
@@ -2838,6 +2968,77 @@ test "coordinator serializes concurrent acquire and release" {
     try std.testing.expectEqual(@as(usize, 0), state.active_units);
     try std.testing.expectEqual(@as(usize, 0), state.waiting_requests);
     try std.testing.expectEqual(@as(RequestId, 513), coordinator.next_request_id);
+}
+
+test "context exclusive execution gate drains prior shared work and blocks later shared work" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    var exclusive = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    var later = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    try std.testing.expect(coordinator.tryAcquireSharedExecution(&first));
+    try coordinator.markExclusive(&exclusive);
+    try std.testing.expect(!coordinator.tryAcquireExclusiveExecution(&exclusive));
+    try std.testing.expect(!coordinator.tryAcquireSharedExecution(&later));
+
+    coordinator.release(first);
+    try std.testing.expect(coordinator.tryAcquireExclusiveExecution(&exclusive));
+    try std.testing.expect(!coordinator.tryAcquireSharedExecution(&later));
+    coordinator.release(exclusive);
+    try std.testing.expect(coordinator.tryAcquireSharedExecution(&later));
+    coordinator.release(later);
+}
+
+test "context exclusive execution gate grants FIFO ownership" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    try coordinator.markExclusive(&first);
+    try coordinator.markExclusive(&second);
+    try std.testing.expect(!coordinator.tryAcquireExclusiveExecution(&second));
+    try std.testing.expect(coordinator.tryAcquireExclusiveExecution(&first));
+    coordinator.release(first);
+    try std.testing.expect(coordinator.tryAcquireExclusiveExecution(&second));
+    coordinator.release(second);
+}
+
+test "context shared batch crosses an interleaved exclusive waiter atomically" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+
+    const first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    var exclusive = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    const second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    try coordinator.markExclusive(&exclusive);
+    try std.testing.expect(coordinator.tryAcquireSharedExecutionGroup(&.{ first, second }));
+    try std.testing.expect(!coordinator.tryAcquireExclusiveExecution(&exclusive));
+    coordinator.release(first);
+    coordinator.release(second);
+    try std.testing.expect(coordinator.tryAcquireExclusiveExecution(&exclusive));
+    coordinator.release(exclusive);
+}
+
+test "context execution gate wait checks cancellation without retaining coordinator mutex" {
+    const Control = struct {
+        fn check(_: @This()) !void {
+            return error.Canceled;
+        }
+    };
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    var exclusive = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    var shared = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(exclusive);
+    defer coordinator.release(shared);
+    try coordinator.markExclusive(&exclusive);
+    try std.testing.expectError(
+        error.Canceled,
+        coordinator.awaitSharedExecutionControlled(&shared, std.testing.io, Control{}),
+    );
+    _ = coordinator.snapshot();
 }
 
 test "active request rollout cap forces singleton budgets" {

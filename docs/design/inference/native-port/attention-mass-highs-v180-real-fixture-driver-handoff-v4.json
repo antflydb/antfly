@@ -1,0 +1,56 @@
+{
+  "artifacts": {
+    "driver": {
+      "bytes": 31631,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_highs_v180_real_fixture_driver_v4.zig",
+      "sha256": "2de9b9e8b48740b5ba9264530147210b56945a034f692a3bf0d4f0d0b796affe"
+    },
+    "frontend_resource": {
+      "bytes": 1587,
+      "path": "/private/tmp/attention-matching-highs-v180-driver-v4-frontend-resource-v1.json",
+      "sha256": "ef839c3473f1881d0bc0af04d956c6edb8b6004ed1f9d4ba3c771c9209c27e9a"
+    },
+    "frontend_stderr": {
+      "bytes": 0,
+      "path": "/private/tmp/attention-matching-highs-v180-driver-v4-frontend-resource-v1.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "predecessor_driver": {
+      "bytes": 31551,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_highs_v180_real_fixture_driver_v3.zig",
+      "sha256": "1528159416928a87b76934f362f0a0b9b8406afe53c4c412749727a075c3b792"
+    },
+    "predecessor_frontend_failure": {
+      "bytes": 1214,
+      "path": "/private/tmp/attention-matching-highs-v180-driver-v3-frontend-resource-v1.stderr",
+      "sha256": "fd5684a1433f09312e7d3f54889c581bffcfa900170734d5873da6c7b47f461d"
+    },
+    "predecessor_handoff": {
+      "bytes": 5067,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-highs-v180-real-fixture-driver-handoff-v3.json",
+      "sha256": "2404677263977387b52fd62019602704446c84bbe68c3f31a38151c2fbb920a4"
+    },
+    "predecessor_review": {
+      "bytes": 3329,
+      "path": "/private/tmp/attention-matching-native-highs-v180-real-fixture-driver-independent-review-v3.json",
+      "sha256": "8d226c2cbe88c62c5f37e616edeef9855a52aa2b36b0d54504e76bccb9d7a61a"
+    }
+  },
+  "completed": true,
+  "delta": [
+    "Clock.now has typed *Clock receiver for member calls; separate nowCallback casts opaque C/control context and calls typed clock method.",
+    "Result schema successor v4; solver/options/witness/policy/provenance unchanged."
+  ],
+  "diagnostic_only": true,
+  "execution_authorized": false,
+  "publication_authority": false,
+  "schema": "antfly.design.attention-mass-highs-v180-real-fixture-driver-handoff.v4",
+  "validation": {
+    "linked": false,
+    "physical_memory_savings_qualified": false,
+    "production_qualified": false,
+    "solver_executed": false,
+    "zig_fmt_check": true,
+    "zig_frontend_no_emit": true
+  }
+}

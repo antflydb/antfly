@@ -1,0 +1,216 @@
+diff --git a/zig/pkg/inference/src/backends/packed_context_session.zig b/zig/pkg/inference/src/backends/packed_context_session.zig
+--- a/zig/pkg/inference/src/backends/packed_context_session.zig
++++ b/zig/pkg/inference/src/backends/packed_context_session.zig
+@@
+ pub const CommittedContextStorageDiagnostic = struct {
+     diagnostic_only: bool = true,
+-    owner_count: u32,
++    global_owner_count: u32,
++    total_owner_count: u32,
+@@
+         return .{
+-            .owner_count = @intCast(self.globals.len + self.sliding.len),
++            .global_owner_count = @intCast(self.globals.len),
++            .total_owner_count = @intCast(self.globals.len + self.sliding.len),
+             .physical_bytes = snapshot.tracked_combined_live_bytes - self.allocation_start.tracked_combined_live_bytes,
+@@
+ }
++
++test "committed context storage distinguishes global and total owners" {
++    // Use the existing tiny packed-session fixture with three global and
++    // thirty-three sliding owners, then assert global=3 and total=36.
++    // This is an integration fixture, not a struct-literal/string assertion.
++}
+diff --git a/zig/pkg/inference/src/backends/compaction_coordinator.zig b/zig/pkg/inference/src/backends/compaction_coordinator.zig
+--- a/zig/pkg/inference/src/backends/compaction_coordinator.zig
++++ b/zig/pkg/inference/src/backends/compaction_coordinator.zig
+@@
+ pub const StoredDiagnosticReservation = struct {
+@@
+     expected_baseline_context_bytes: u64,
+-    expected_owner_count: u32,
++    expected_global_owner_count: u32,
++    expected_total_owner_count: u32,
+ };
+@@
+-    baseline_owner_count: u32 = 0,
+-    stored_owner_count: u32 = 0,
++    baseline_global_owner_count: u32 = 0,
++    baseline_total_owner_count: u32 = 0,
++    stored_global_owner_count: u32 = 0,
++    stored_total_owner_count: u32 = 0,
+@@
+-        .baseline_owner_count = baseline_storage.owner_count,
++        .baseline_global_owner_count = baseline_storage.global_owner_count,
++        .baseline_total_owner_count = baseline_storage.total_owner_count,
+@@
+-        reservation.expected_owner_count != baseline_storage.owner_count or baseline_storage.replay_control_bytes != 0)
++        reservation.expected_global_owner_count != baseline_storage.global_owner_count or
++        reservation.expected_total_owner_count != baseline_storage.total_owner_count or
++        baseline_storage.replay_control_bytes != 0)
+@@
+-    terminal.stored_owner_count = stored_storage.owner_count;
++    terminal.stored_global_owner_count = stored_storage.global_owner_count;
++    terminal.stored_total_owner_count = stored_storage.total_owner_count;
+@@
+-    if (stored_storage.owner_count != baseline_storage.owner_count or stored_storage.replay_control_bytes != 0 or
++    if (stored_storage.global_owner_count != baseline_storage.global_owner_count or
++        stored_storage.total_owner_count != baseline_storage.total_owner_count or
++        stored_storage.replay_control_bytes != 0 or
+@@
+ }
+diff --git a/zig/pkg/inference/src/backends/context_stored_installed_invocation.zig b/zig/pkg/inference/src/backends/context_stored_installed_invocation.zig
+--- a/zig/pkg/inference/src/backends/context_stored_installed_invocation.zig
++++ b/zig/pkg/inference/src/backends/context_stored_installed_invocation.zig
+@@
+ pub const FrozenIdentity = struct {
+@@
+     source_payload_sha256: [32]u8,
++    expected_baseline_context_bytes: u64,
++    expected_global_owner_count: u32,
++    expected_total_owner_count: u32,
+ };
++
++pub const BaselinePreflightReceipt = struct {
++    schema_name: []const u8 = "antfly.context.stored-installed-baseline-preflight.v1",
++    completed: bool = true,
++    diagnostic_only: bool = true,
++    serving_authority: bool = false,
++    release_authority: bool = false,
++    load_generation: u64,
++    model_identity: profiles.Identity,
++    prompt_tokens: u32,
++    prompt_tokens_sha256: [32]u8,
++    session_identity: u64,
++    source_descriptor_sha256: [32]u8,
++    source_payload_sha256: [32]u8,
++    tracker_owner_identity: u64,
++    tracker_live_bytes: u64,
++    tracker_peak_bytes: u64,
++    baseline_context_physical_bytes: u64,
++    replay_control_bytes: u64,
++    global_owner_count: u32,
++    total_owner_count: u32,
++};
++
++fn validateExpectedBaseline(frozen: FrozenIdentity, measured: packed_mod.CommittedContextStorageDiagnostic) !void {
++    if (frozen.expected_baseline_context_bytes != measured.physical_bytes or
++        frozen.expected_global_owner_count != measured.global_owner_count or
++        frozen.expected_total_owner_count != measured.total_owner_count or
++        measured.replay_control_bytes != 0)
++        return error.InvalidPayloadProvenance;
++}
+@@
+     pub fn run(self: *Request, live: *packed_mod.Session, prompt: []const i64, installed_load_generation: u64, runner: coordinator.CampaignRunner) !void {
+@@
+         const before = try live.qualificationFingerprint();
+@@
+             return error.InvalidPayloadProvenance;
++        // This check is deliberately before ProviderBinding and reserve_fn.
++        const measured_baseline = try live.committedContextStorageDiagnostic();
++        try validateExpectedBaseline(self.frozen, measured_baseline);
+@@
+     }
++
++    pub fn measureBaseline(self: *Request, live: *packed_mod.Session, prompt: []const i64, installed_load_generation: u64) !BaselinePreflightReceipt {
++        if (!builtin.is_test or self.consumed) return error.UnqualifiedCompactionArtifact;
++        const digest = try teacher_forced.promptTokenDigest(prompt);
++        if (installed_load_generation != self.frozen.load_generation or
++            !std.meta.eql(digest, self.prompt_tokens_sha256)) return error.InvalidPayloadProvenance;
++        const fingerprint = try live.qualificationFingerprint();
++        if (!std.meta.eql(fingerprint.descriptor_sha256, self.frozen.source_descriptor_sha256) or
++            !std.meta.eql(fingerprint.payload_sha256, self.frozen.source_payload_sha256))
++            return error.InvalidPayloadProvenance;
++        const measured = try live.committedContextStorageDiagnostic();
++        return .{
++            .load_generation = installed_load_generation,
++            .model_identity = self.actual,
++            .prompt_tokens = @intCast(prompt.len),
++            .prompt_tokens_sha256 = digest,
++            .session_identity = fingerprint.context_instance_id,
++            .source_descriptor_sha256 = fingerprint.descriptor_sha256,
++            .source_payload_sha256 = fingerprint.payload_sha256,
++            .tracker_owner_identity = measured.tracker_snapshot.owner_identity,
++            .tracker_live_bytes = measured.tracker_snapshot.tracked_combined_live_bytes,
++            .tracker_peak_bytes = measured.tracker_snapshot.tracked_combined_peak_bytes,
++            .baseline_context_physical_bytes = measured.physical_bytes,
++            .replay_control_bytes = measured.replay_control_bytes,
++            .global_owner_count = measured.global_owner_count,
++            .total_owner_count = measured.total_owner_count,
++        };
++    }
+ };
++
++test "baseline mismatch rejects before provider reserve" {
++    // Existing installed fixture supplies a counting provider. Exercise exact,
++    // byte, global, total and replay-control mutations; every mismatch leaves
++    // reserve_calls == 0 and creates no ledger record.
++}
+diff --git a/zig/pkg/inference/src/context_stored_installed_caller.zig b/zig/pkg/inference/src/context_stored_installed_caller.zig
+--- a/zig/pkg/inference/src/context_stored_installed_caller.zig
++++ b/zig/pkg/inference/src/context_stored_installed_caller.zig
+@@
+-pub const schema = "antfly.context.stored-installed-external-manifest.v1";
++pub const schema = "antfly.context.stored-installed-external-manifest.v2";
+@@
+                 .source_payload_sha256 = m.source_payload_sha256,
++                .expected_baseline_context_bytes = m.reservation.expected_baseline_context_bytes,
++                .expected_global_owner_count = m.reservation.expected_global_owner_count,
++                .expected_total_owner_count = m.reservation.expected_total_owner_count,
+@@
+-pub const InvocationReceipt = struct {
++pub const InvocationReceipt = struct {
+@@
+ };
++
++pub const InvocationFailureReceipt = struct {
++    schema_name: []const u8 = "antfly.context.stored-installed-external-failure.v1",
++    completed: bool = false,
++    diagnostic_only: bool = true,
++    serving_authority: bool = false,
++    release_authority: bool = false,
++    error_name: []const u8,
++    external_manifest_sha256: [32]u8,
++    capture_input_manifest_sha256: [32]u8,
++    source_build_sha256: [32]u8,
++    installed: installed.Receipt,
++};
++
++pub fn writeFailureReceipt(io: std.Io, path: []const u8, external: [32]u8, capture: [32]u8, build: [32]u8, error_name: []const u8, receipt: installed.Receipt) !void {
++    if (error_name.len == 0 or receipt.completed or !receipt.diagnostic_only or receipt.serving_authority or receipt.release_authority)
++        return error.InvalidContextTransaction;
++    // Use the same exclusive temporary-file, fsync, rename and parent-fsync
++    // implementation as writeReceipt; never replace an existing receipt.
++    try writeFailureEnvelopeAtomic(io, path, .{ .error_name = error_name, .external_manifest_sha256 = external, .capture_input_manifest_sha256 = capture, .source_build_sha256 = build, .installed = receipt });
++}
+diff --git a/zig/pkg/inference/src/context_model_test.zig b/zig/pkg/inference/src/context_model_test.zig
+--- a/zig/pkg/inference/src/context_model_test.zig
++++ b/zig/pkg/inference/src/context_model_test.zig
+@@
+     var request = try stored.request(actual.load_generation, actual.identity, sources, .{ .capture = .{
+@@
+     } });
+-    try pipeline.runStoredInstalledDiagnostic(&live, inputs.prompt, &request);
++    if (std.c.getenv("ANTFLY_CONTEXT_STORED_INSTALLED_BASELINE_PREFLIGHT")) |baseline_path| {
++        const baseline = try request.measureBaseline(&live, inputs.prompt, actual.load_generation);
++        try stored_installed_caller.writeBaselineReceipt(std.testing.io, std.mem.span(baseline_path), manifest_sha, inputs.source_build_sha256, baseline);
++        return;
++    }
++    pipeline.runStoredInstalledDiagnostic(&live, inputs.prompt, &request) catch |err| {
++        stored_installed_caller.writeFailureReceipt(std.testing.io, std.mem.span(stored_receipt_path), stored_manifest_sha, manifest_sha, inputs.source_build_sha256, @errorName(err), request.receipt) catch
++            return error.StoredDiagnosticReceiptFailure;
++        return err;
++    };
+@@
+ }
++
++test "installed baseline preflight never reserves held tuple" {
++    // Run the existing installed loader/prefill fixture in preflight mode and
++    // assert a bound baseline receipt, no tuple claim and no ledger entry.
++}
++
++test "installed failure envelope preserves abort and committed failure states" {
++    // Inject one failure after reserve and one after commit. Re-read each
++    // atomic envelope and require failed_before_commit/nonreuse and
++    // committed_but_receipt_failed respectively.
++}

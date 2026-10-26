@@ -21,11 +21,17 @@
 
 const std = @import("std");
 const native_kv_checkpoint = @import("../runtime/kv/attention_match_checkpoint.zig");
+const builtin = @import("builtin");
+const context_fault_injection = @import("../context_fault_injection.zig");
 const Gemma4Projection = @import("gemma4_channels.zig").Projection;
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const cuda_compute = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
+const metal_compute = if (build_options.enable_metal) @import("../ops/metal_compute.zig") else struct {
+    pub const MetalCompute = opaque {};
+};
+const metal_attention_storage = if (build_options.enable_metal) @import("../ops/metal_attention_match_storage.zig") else struct {};
 const tokenizer_mod = @import("inference_tokenizer");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
@@ -36,6 +42,8 @@ const ComputeBackend = ops.ComputeBackend;
 const activations = @import("../backends/activations.zig");
 const backends = @import("../backends/backends.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
+const context_study_runner = @import("../backends/context_study_runner.zig");
+const context_teacher_forced = @import("../backends/context_teacher_forced.zig");
 const decoder_tail_runtime = @import("../backends/decoder_tail_runtime.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const runtime = @import("../runtime/root.zig");
@@ -56,6 +64,39 @@ fn selectedScoreCancellationCheck(raw: ?*anyopaque) callconv(.c) c_int {
     const control: *const InferenceExecutionControl = @ptrCast(@alignCast(raw orelse return 0));
     control.check() catch return 1;
     return 0;
+}
+
+var next_quality_context_instance: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) std.atomic.Value(u64).init(1) else {};
+
+fn allocateMonotonicQualificationIdentity(counter: *std.atomic.Value(u64)) !u64 {
+    var current = counter.load(.monotonic);
+    while (true) {
+        if (current == 0 or current == std.math.maxInt(u64))
+            return error.QualificationFingerprintOverflow;
+        if (counter.cmpxchgWeak(
+            current,
+            current + 1,
+            .monotonic,
+            .monotonic,
+        )) |observed| {
+            current = observed;
+            continue;
+        }
+        return current;
+    }
+}
+
+fn allocateQualityContextInstance() !u64 {
+    if (comptime !builtin.is_test) return error.QualificationOnly;
+    return allocateMonotonicQualificationIdentity(&next_quality_context_instance);
+}
+
+test "context qualification identity is monotonic and refuses wrap" {
+    var counter = std.atomic.Value(u64).init(7);
+    try std.testing.expectEqual(@as(u64, 7), try allocateMonotonicQualificationIdentity(&counter));
+    try std.testing.expectEqual(@as(u64, 8), try allocateMonotonicQualificationIdentity(&counter));
+    counter.store(std.math.maxInt(u64), .monotonic);
+    try std.testing.expectError(error.QualificationFingerprintOverflow, allocateMonotonicQualificationIdentity(&counter));
 }
 
 fn setWorkloadProfileRegime(cb: *const ComputeBackend, regime: ops.WorkloadRegime) !void {
@@ -348,8 +389,53 @@ pub fn parseSpeculationCalibration(raw: []const u8) ?SpeculationCalibration {
 }
 
 pub const token_logprobs = @import("token_logprobs.zig");
+pub const CompactionQualification = struct {
+    selection: runtime.context_policy.Policy,
+    profile: @import("../runtime/kv/compaction_profile.zig").Profile,
+    identity: @import("../runtime/kv/compaction_profile.zig").Identity,
+    publish: bool = false,
+};
+
 pub const GenerationConfig = struct {
     token_observer: ?token_logprobs.Observer = null,
+    /// No qualification bypass exists in native/server release builds.
+    context_qualification: if (@import("builtin").is_test) ?CompactionQualification else void = if (@import("builtin").is_test) null else {},
+    /// Internal serving receipt finalized by the loaded-model preflight owner.
+    /// The pointed request must outlive generation and is consumed exactly once
+    /// after packed ingestion. It is never populated from request JSON.
+    context_request: ?*@import("../backends/compaction_coordinator.zig").CampaignRequest = null,
+    /// Qualification-only paired quality request. Reference tokens remain
+    /// behind an opaque provider and cannot be revealed until publication and
+    /// sibling fingerprint equality have both been verified.
+    context_quality_request: if (@import("builtin").is_test) ?context_teacher_forced.Request else void = if (@import("builtin").is_test) null else {},
+    /// Test-binary-only request-scoped cancellation controller. Release
+    /// GenerationConfig contains `void`, so request/env input cannot enable it.
+    context_fault_controller: context_fault_injection.Slot = if (@import("builtin").is_test) null else {},
+    /// Test/qualification-binary-only ingress for the portable f16/FP8
+    /// Metal checkpoint path. Production availability remains release-profile
+    /// gated and is intentionally absent until hardware qualification seals it.
+    metal_native_checkpoint_qualification: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    metal_checkpoint_qualification_route: if (builtin.is_test) MetalCheckpointQualificationRoute else void = if (builtin.is_test) .none else {},
+    metal_checkpoint_qualification_request: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    /// Request-wide owner ledger created before compaction preflight. Packed
+    /// session allocations join this ledger but do not own its lifetime.
+    context_owner_allocation_tracker: ?*@import("../runtime/kv/host_allocation_tracker.zig").HostAllocationTracker = null,
+    context_execution_lease: ?*@import("../backends/context_execution_pool.zig").Lease = null,
+    context_load_generation: u64 = 0,
+    context_policy: runtime.context_policy.Policy = .{},
+    /// Physical context reservation made by the CLI/HTTP admission owner.
+    /// Zero cannot authorize approximate allocation, including direct callers.
+    context_budget_bytes: usize = 0,
+    /// Internal explicit storage selection for exact packed-route qualification.
+    /// CLI/HTTP do not expose this switch; approximate policies still require
+    /// validateExecution qualification before any storage owner is created.
+    context_storage: enum { automatic, packed_exact } = .automatic,
+    /// Internal qualified implementation selection. Request JSON has no field
+    /// for either switch; the loaded profile owner sets them from a matching
+    /// semantic identity before admission.
+    context_split_decode: bool = false,
+    context_flash_prefill: bool = false,
+    context_fit_engine: @import("../runtime/kv/compaction_profile.zig").FitEngine = .block_v1,
     max_tokens: i32 = 256,
     temperature: f32 = 0,
     top_p: f32 = 0,
@@ -412,6 +498,13 @@ pub const GenerationConfig = struct {
     /// Optional canonical little-endian f32 logits for the final Qwen3-VL
     /// prefill row. Qualification-only; requires qwen3vl_parity_json_path.
     qwen3vl_parity_logits_path: ?[]const u8 = null,
+};
+
+pub const MetalCheckpointQualificationRoute = enum {
+    none,
+    exact,
+    checkpoint_prepare,
+    checkpoint_resume,
 };
 
 pub const KvCacheMode = enum {
@@ -640,8 +733,8 @@ pub fn requestKvManagerPoolConfig(storage_config: runtime.kv.pool.KvPoolConfig) 
 /// Both request pools track only the original logical positions. Preparation
 /// snapshots through the CUDA reader; host mirrors are unnecessary on this
 /// route, and trimming logical positions would violate the checkpoint contract.
-pub fn attentionMatchCheckpointPoolConfig(dtype: runtime.kv.pool.KvDType, config: gpt_mod.Config) runtime.kv.pool.KvPoolConfig {
-    var result = kvPoolConfig(.cuda, dtype, config, false);
+pub fn attentionMatchCheckpointPoolConfig(backend: runtime.kv.pool.BackendKind, dtype: runtime.kv.pool.KvDType, config: gpt_mod.Config) runtime.kv.pool.KvPoolConfig {
+    var result = kvPoolConfig(backend, dtype, config, false);
     result.store_cpu_bytes = false;
     result.sliding_window_size = null;
     return result;
@@ -650,6 +743,9 @@ pub fn attentionMatchCheckpointPoolConfig(dtype: runtime.kv.pool.KvDType, config
 /// Parsed chat template for rendering messages via Jinja2.
 pub const ChatTemplate = struct {
     template: jinja.Template,
+    /// Canonical digest of the source and special-token strings parsed by
+    /// this instance, not a second pathname read during request admission.
+    source_identity: [32]u8,
     bos_token: []const u8,
     eos_token: []const u8,
     unk_token: []const u8,
@@ -663,8 +759,19 @@ pub const ChatTemplate = struct {
         unk_token: []const u8,
         pad_token: []const u8,
     ) !ChatTemplate {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly.chat-template.v1\x00");
+        for ([_][]const u8{ source, bos_token, eos_token, unk_token, pad_token }) |field| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, @intCast(field.len), .little);
+            hash.update(&length);
+            hash.update(field);
+        }
+        var source_identity: [32]u8 = undefined;
+        hash.final(&source_identity);
         return .{
             .template = try jinja.Template.initHuggingFace(allocator, source),
+            .source_identity = source_identity,
             .bos_token = bos_token,
             .eos_token = eos_token,
             .unk_token = unk_token,
@@ -684,12 +791,24 @@ pub const ChatTemplate = struct {
     }
 
     pub fn applyWithOptions(self: *const ChatTemplate, allocator: std.mem.Allocator, messages: []const Message, options: ApplyOptions) ![]u8 {
+        const result = try self.applyImpl(allocator, messages, options, null);
+        return @constCast(result.text);
+    }
+
+    /// Caller owns both slices. Every target is validated before rendering.
+    pub fn applyWithProvenance(self: *const ChatTemplate, allocator: std.mem.Allocator, messages: []const Message, options: ApplyOptions, targets: *const runtime.context_policy.payload.Targets) !jinja.Rendered {
+        try targets.validateMessages(messages);
+        return self.applyImpl(allocator, messages, options, targets);
+    }
+
+    fn applyImpl(self: *const ChatTemplate, allocator: std.mem.Allocator, messages: []const Message, options: ApplyOptions, targets: ?*const runtime.context_policy.payload.Targets) !jinja.Rendered {
         // Rendering builds a tree of temporary Jinja values and strings. Keep
         // those allocations in a request-local arena and return only the
         // duplicated result to the caller's allocator.
         var render_arena = std.heap.ArenaAllocator.init(allocator);
         defer render_arena.deinit();
         const arena = render_arena.allocator();
+        var provenance = jinja.Provenance{ .arena = arena };
 
         // Convert Message into jinja.ChatMessage, preserving structured
         // image/text parts when available for multimodal chat templates.
@@ -701,7 +820,7 @@ pub const ChatTemplate = struct {
                 const chat_parts = try arena.alloc(jinja.ChatContentPart, message_parts.len);
                 for (message_parts, 0..) |part, part_idx| {
                     chat_parts[part_idx] = switch (part) {
-                        .text => |text| .{ .text = text },
+                        .text => |text| .{ .text = if (targets != null and targets.?.label(i, part_idx) != 0) try provenance.select(text, targets.?.label(i, part_idx)) else text },
                         .image => .image,
                         .audio => .audio,
                     };
@@ -710,7 +829,7 @@ pub const ChatTemplate = struct {
             }
             chat_msgs[i] = .{
                 .role = m.role,
-                .content = if (m.video_bytes != null) try std.fmt.allocPrint(arena, "<|video|> {s}", .{m.content}) else m.content,
+                .content = if (m.video_bytes != null) try std.fmt.allocPrint(arena, "<|video|> {s}", .{m.content}) else if (parts == null and targets != null and targets.?.label(i, 0) != 0) try provenance.select(m.content, targets.?.label(i, 0)) else m.content,
                 .parts = parts,
                 .content_is_null = m.content_is_null,
                 .tool_calls = m.tool_calls,
@@ -727,8 +846,18 @@ pub const ChatTemplate = struct {
             .enable_thinking = options.enable_thinking,
         });
 
-        const result = try self.template.render(arena, &ctx);
-        return try allocator.dupe(u8, result);
+        if (targets) |selection| {
+            const result = try self.template.renderWithProvenance(&provenance, &ctx);
+            var seen: [runtime.context_policy.payload.max_targets]bool = @splat(false);
+            for (result.labels) |label| if (label != 0) {
+                seen[label - 1] = true;
+            };
+            for (seen[0..selection.count]) |present| if (!present) return error.UnrenderedCompactionTarget;
+            const text = try allocator.dupe(u8, result.text);
+            errdefer allocator.free(text);
+            return .{ .text = text, .labels = try allocator.dupe(u32, result.labels) };
+        }
+        return .{ .text = try allocator.dupe(u8, try self.template.render(arena, &ctx)), .labels = &.{} };
     }
 
     pub fn deinit(self: *ChatTemplate) void {
@@ -743,6 +872,10 @@ pub const NativeCheckpointPrepare = struct {
     // with this ceiling above the request-specific geometry plan. Query capture
     // and transfer buffers remain separately reserved. Process RSS is also gated.
     pub const max_transient_host_bytes: usize = 3840 * 1024 * 1024;
+    /// Prefer the tighter aggregate for ordinary 8K Metal fits. Larger source
+    /// snapshots (notably 32K) still use the unchanged 3,840 MiB hard ceiling;
+    /// source+candidate alone can exceed two GiB there.
+    pub const metal_parallel_target_host_bytes: usize = 2 * 1024 * 1024 * 1024;
     pub const auxiliary_host_bytes: usize = 128 * 1024 * 1024;
     pub const fit_workers: usize = 4;
     pub const collection_options: runtime.kv.attention_match_queries.Options = .{ .samples_per_consumer = 320 };
@@ -765,16 +898,20 @@ pub const NativeCheckpointPrepare = struct {
     /// Exact-prefix preparation only. Admission uses the same per-head sizing
     /// as fitting, including the largest worker and a full-size fallback cache.
     /// Existing compacted states must use their own coverage-aware planner.
-    pub fn hostPlan(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding) !HostPlan {
-        if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
+    pub fn hostPlan(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding, metal: bool) !HostPlan {
+        if (metal) {
+            if (comptime !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
+            if (encoding != .f16 and encoding != .fp8) return error.UnsupportedMetalKvCheckpointEncoding;
+        } else if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
         if (config.family != .gemma or !config.usesGemma4Channels() or
             config.num_hidden_layers == 0 or config.num_hidden_layers > 256)
             return error.UnsupportedCompactionQueryModel;
         if (tokens < 2 or tokens > native_kv_checkpoint.max_context_tokens) return error.CompactionQueryLimit;
         const engine = runtime.kv.attention_match_engine;
         const snapshot = runtime.kv.attention_match_snapshot;
-        const Fitter = @import("../ops/cuda/attention_match_fit.zig").Fitter;
         var options = fittingOptions();
+        options.independent_fp64_publication = metal;
+        options.fp8_checkpoint = encoding == .fp8;
         options.rotated4_checkpoint = encoding == .rotated4;
         // Reserve for the largest bounded retry, even when 4:1 succeeds.
         options.retention_divisor = options.min_retention_divisor.?;
@@ -821,21 +958,54 @@ pub const NativeCheckpointPrepare = struct {
             };
             if (config.num_attention_heads == 0 or config.num_attention_heads % donor.heads != 0) return error.InvalidCompactionQueries;
             const width = try std.math.mul(usize, try std.math.mul(usize, consumers, config.num_attention_heads / donor.heads), donor.dim);
-            const workspace = try Fitter.headHostWorkspace(tokens, target, @min(old_rows - prefix, options.chunk_rows), try std.math.mul(usize, width, samples - heldout), try std.math.mul(usize, width, heldout), donor.dim, options);
+            const workspace = if (metal) workspace: {
+                if (comptime build_options.enable_metal) {
+                    const value = try @import("../ops/metal_attention_match_fit.zig").Fitter.headHostWorkspace(tokens, target, @min(old_rows - prefix, options.chunk_rows), try std.math.mul(usize, width, samples - heldout), try std.math.mul(usize, width, heldout), donor.dim, options);
+                    break :workspace .{ .bytes = value.bytes, .solver_bytes = value.solver_bytes };
+                }
+                unreachable;
+            } else workspace: {
+                if (comptime build_options.enable_cuda) {
+                    const value = try @import("../ops/cuda/attention_match_fit.zig").Fitter.headHostWorkspace(tokens, target, @min(old_rows - prefix, options.chunk_rows), try std.math.mul(usize, width, samples - heldout), try std.math.mul(usize, width, heldout), donor.dim, options);
+                    break :workspace .{ .bytes = value.bytes, .solver_bytes = value.solver_bytes };
+                }
+                unreachable;
+            };
             if (workspace.solver_bytes > options.fit.max_workspace_bytes) return error.CompactionWorkspaceLimit;
             maximum = @max(maximum, workspace.bytes);
         }
-        const resident = try engine.parallelResidentBytes(source_bytes, heads);
-        if (resident > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
-        const workers = if (maximum == 0) fit_workers else @min(fit_workers, (max_transient_host_bytes - resident) / maximum);
-        if (workers == 0) return error.CompactionWorkspaceLimit;
-        const fit_bytes = try engine.parallelHostBytes(source_bytes, heads, maximum, workers);
-        if (fit_bytes > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
+        const fit_bytes, const workers = if (metal) plan: {
+            if (comptime build_options.enable_metal) {
+                const resident = try engine.parallelResidentBytes(source_bytes, heads);
+                const aggregate_limit = if (resident <= metal_parallel_target_host_bytes)
+                    metal_parallel_target_host_bytes
+                else
+                    max_transient_host_bytes;
+                const worker_plan = try @import("../ops/metal_attention_match_fit.zig").Fitter.parallelPlan(
+                    source_bytes,
+                    heads,
+                    maximum,
+                    aggregate_limit,
+                    fit_workers,
+                );
+                break :plan .{ worker_plan.admitted_bytes, worker_plan.workers };
+            }
+            unreachable;
+        } else plan: {
+            const resident = try engine.parallelResidentBytes(source_bytes, heads);
+            if (resident > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
+            const selected = if (maximum == 0) fit_workers else @min(fit_workers, (max_transient_host_bytes - resident) / maximum);
+            if (selected == 0) return error.CompactionWorkspaceLimit;
+            const bytes = try engine.parallelHostBytes(source_bytes, heads, maximum, selected);
+            if (bytes > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
+            break :plan .{ bytes, selected };
+        };
         return .{ .fit_bytes = fit_bytes, .reservation_bytes = try std.math.add(usize, fit_bytes, auxiliary_host_bytes), .source_bytes = source_bytes, .head_workspace_bytes = maximum, .workers = workers };
     }
 
     planned_fit_host_bytes: ?usize = null,
     planned_fit_workers: ?usize = null,
+    planned_fit_head_workspace_bytes: ?usize = null,
 
     encoding: runtime.kv.attention_match_checkpoint.Encoding = .f16,
     minimum_savings_ratio: f64 = 1.5,
@@ -872,12 +1042,12 @@ test "native checkpoint exact host plan sizes Gemma4 E4B and preserves the relea
         .vocab_size = 262144,
         .max_position_embeddings = 131072,
     };
-    const small = try NativeCheckpointPrepare.hostPlan(config, 8189, .f16);
-    const large = try NativeCheckpointPrepare.hostPlan(config, 32752, .f16);
-    const boundary = try NativeCheckpointPrepare.hostPlan(config, 32768, .f16);
+    const small = try NativeCheckpointPrepare.hostPlan(config, 8189, .f16, false);
+    const large = try NativeCheckpointPrepare.hostPlan(config, 32752, .f16, false);
+    const boundary = try NativeCheckpointPrepare.hostPlan(config, 32768, .f16, false);
     for ([_]usize{ 8189, 32752, 32768 }) |tokens| {
-        const fp16 = try NativeCheckpointPrepare.hostPlan(config, tokens, .f16);
-        const rotated = try NativeCheckpointPrepare.hostPlan(config, tokens, .rotated4);
+        const fp16 = try NativeCheckpointPrepare.hostPlan(config, tokens, .f16, false);
+        const rotated = try NativeCheckpointPrepare.hostPlan(config, tokens, .rotated4, false);
         try std.testing.expectEqual(fp16.source_bytes, rotated.source_bytes);
         try std.testing.expect(rotated.head_workspace_bytes > fp16.head_workspace_bytes);
         try std.testing.expect(rotated.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
@@ -901,12 +1071,62 @@ test "native checkpoint exact host plan sizes Gemma4 E4B and preserves the relea
     // The live-host capacity observed in the failed campaign remains unchanged.
     try std.testing.expect(large.reservation_bytes < 4_153_092_096);
     try std.testing.expectEqual(large.fit_bytes + NativeCheckpointPrepare.auxiliary_host_bytes, large.reservation_bytes);
-    try std.testing.expectError(error.CompactionQueryLimit, NativeCheckpointPrepare.hostPlan(config, 32769, .f16));
-    try std.testing.expectError(error.CompactionQueryLimit, NativeCheckpointPrepare.hostPlan(config, 1, .f16));
+    try std.testing.expectError(error.CompactionQueryLimit, NativeCheckpointPrepare.hostPlan(config, 32769, .f16, false));
+    try std.testing.expectError(error.CompactionQueryLimit, NativeCheckpointPrepare.hostPlan(config, 1, .f16, false));
     var wider = config;
     wider.num_key_value_heads = 4;
-    try std.testing.expectError(error.KvCheckpointLimit, NativeCheckpointPrepare.hostPlan(wider, 32752, .f16));
+    try std.testing.expectError(error.KvCheckpointLimit, NativeCheckpointPrepare.hostPlan(wider, 32752, .f16, false));
     std.debug.print("native_checkpoint_host_plan_fixture tokens=32752 source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d} workers={d}\n", .{ large.source_bytes, large.head_workspace_bytes, large.fit_bytes, large.reservation_bytes, large.workers });
+}
+
+test "Metal checkpoint host plan admits bounded parallel fitters and rejects rotated4" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const config: gpt_mod.Config = .{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .num_kv_shared_layers = 18,
+        .ple_hidden_size = 256,
+        .vocab_size = 262144,
+        .max_position_embeddings = 131072,
+    };
+    const f16_plan = try NativeCheckpointPrepare.hostPlan(config, 8189, .f16, true);
+    const fp8_plan = try NativeCheckpointPrepare.hostPlan(config, 8189, .fp8, true);
+    const long_plan = try NativeCheckpointPrepare.hostPlan(config, 32752, .f16, true);
+    try std.testing.expect(f16_plan.workers >= 2 and f16_plan.workers <= NativeCheckpointPrepare.fit_workers);
+    try std.testing.expect(fp8_plan.workers >= 2 and fp8_plan.workers <= NativeCheckpointPrepare.fit_workers);
+    try std.testing.expect(f16_plan.fit_bytes <= NativeCheckpointPrepare.metal_parallel_target_host_bytes);
+    try std.testing.expect(fp8_plan.fit_bytes <= NativeCheckpointPrepare.metal_parallel_target_host_bytes);
+    try std.testing.expectEqual(
+        f16_plan.fit_bytes + NativeCheckpointPrepare.auxiliary_host_bytes,
+        f16_plan.reservation_bytes,
+    );
+    try std.testing.expectEqual(
+        try runtime.kv.attention_match_engine.parallelHostBytes(
+            f16_plan.source_bytes,
+            8,
+            f16_plan.head_workspace_bytes,
+            f16_plan.workers,
+        ),
+        f16_plan.fit_bytes,
+    );
+    try std.testing.expect(long_plan.workers >= 1 and long_plan.workers <= NativeCheckpointPrepare.fit_workers);
+    try std.testing.expect(long_plan.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+    try std.testing.expectEqual(
+        try runtime.kv.attention_match_engine.parallelHostBytes(
+            long_plan.source_bytes,
+            8,
+            long_plan.head_workspace_bytes,
+            long_plan.workers,
+        ),
+        long_plan.fit_bytes,
+    );
+    try std.testing.expectError(error.UnsupportedMetalKvCheckpointEncoding, NativeCheckpointPrepare.hostPlan(config, 8189, .rotated4, true));
 }
 
 /// The pipeline retires decoded host arrays after successful GPU restoration.
@@ -915,12 +1135,285 @@ pub const NativeCheckpointResume = struct {
     checkpoint: ?runtime.kv.attention_match_checkpoint.Owned = null,
     restored_tokens: usize = 0,
     appended_tokens: usize = 0,
+    validation_ns: u64 = 0,
+    upload_ns: u64 = 0,
+    install_ns: u64 = 0,
+    suffix_prefill_ns: u64 = 0,
     pub fn deinit(self: *@This()) void {
         if (self.checkpoint) |*saved| saved.deinit();
         self.checkpoint = null;
     }
 };
 
+/// Shared post-ingestion preparation boundary for native/CLI/HTTP callers.
+/// It changes neither template bytes nor tokenization. This prepares evidence;
+/// it does not authorize an unqualified approximate execution capability.
+pub const PreparedCompactionPayload = struct {
+    allocator: std.mem.Allocator,
+    rendered: jinja.Rendered,
+    encoded: tokenizer_mod.EncodeResult,
+    eligible: runtime.context_policy.payload.Eligible,
+    pub fn deinit(self: *PreparedCompactionPayload) void {
+        self.eligible.deinit();
+        self.encoded.deinit();
+        self.allocator.free(self.rendered.text);
+        self.allocator.free(self.rendered.labels);
+    }
+};
+
+pub fn prepareCompactionPayload(allocator: std.mem.Allocator, template: *const ChatTemplate, tokenizer: tokenizer_mod.Tokenizer, messages: []const Message, options: ChatTemplate.ApplyOptions, policy: runtime.context_policy.Policy, prompt_token_limit: usize, add_bos_token: bool) !PreparedCompactionPayload {
+    try policy.validate();
+    if (policy.mode != .attention_matching or prompt_token_limit == 0 or prompt_token_limit == std.math.maxInt(usize)) return error.InvalidContextPolicy;
+    const rendered = try template.applyWithProvenance(allocator, messages, options, &policy.compaction_targets);
+    errdefer {
+        allocator.free(rendered.text);
+        allocator.free(rendered.labels);
+    }
+    var encoded = try tokenizer.encodeGenerationWithOffsets(allocator, rendered.text, prompt_token_limit + 1, shouldAddBosToken(rendered.text, add_bos_token, template.bos_token));
+    errdefer encoded.deinit();
+    var count: usize = 0;
+    while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
+    if (count == 0 or count > prompt_token_limit) return error.PromptTooLong;
+    const specials = try tokenizer.allSpecialTokenIds(allocator);
+    defer allocator.free(specials);
+    const eligible = try runtime.context_policy.payload.tokenizeEligibility(allocator, rendered.labels, encoded.offsets.?[0..count], encoded.ids[0..count], specials, policy.compaction_targets.count, policy.keep_prefix_tokens, policy.keep_recent_tokens);
+    return .{ .allocator = allocator, .rendered = rendered, .encoded = encoded, .eligible = eligible };
+}
+
+pub const AttributedCompactionQuestion = struct {
+    allocator: std.mem.Allocator,
+    ids: []i64,
+    source_start: u32,
+    source_end: u32,
+    prompt_tokens: u32,
+    prompt_tokens_sha256: [32]u8,
+    attribution: enum { nonselected_user_message, nonselected_user_part },
+    message_index: u32,
+    part_index: ?u32,
+
+    pub fn deinit(self: *AttributedCompactionQuestion) void {
+        self.allocator.free(self.ids);
+        self.* = undefined;
+    }
+};
+
+/// Attribute one separate question in the final user message to tokens from
+/// the actual complete prompt. A second provenance render labels that source;
+/// its bytes must equal the already prepared prompt. Tokenization is never
+/// repeated on a substring, and protected payload tails are never questions.
+pub fn prepareCompactionQuestion(
+    allocator: std.mem.Allocator,
+    template: *const ChatTemplate,
+    tokenizer: tokenizer_mod.Tokenizer,
+    messages: []const Message,
+    options: ChatTemplate.ApplyOptions,
+    policy: runtime.context_policy.Policy,
+    prepared: *const PreparedCompactionPayload,
+) !AttributedCompactionQuestion {
+    try policy.validate();
+    if (policy.mode != .attention_matching) return error.InvalidContextPolicy;
+    var last_user: ?usize = null;
+    for (messages, 0..) |message, index| {
+        if (std.mem.eql(u8, message.role, "user")) last_user = index;
+    }
+    const message_index = last_user orelse return error.UnsupportedCompactionQuerySource;
+    const message = messages[message_index];
+    var part_index: ?u32 = null;
+    if (message.content_parts) |parts| {
+        for (parts, 0..) |part, index| {
+            if (part != .text) return error.UnsupportedCompactionQuerySource;
+            if (part.text.len == 0 or policy.compaction_targets.label(message_index, index) != 0) continue;
+            if (part_index != null) return error.UnsupportedCompactionQuerySource;
+            part_index = std.math.cast(u32, index) orelse return error.UnsupportedCompactionQuerySource;
+        }
+        if (part_index == null) return error.UnsupportedCompactionQuerySource;
+    } else if (message.content_is_null or message.content.len == 0 or policy.compaction_targets.label(message_index, 0) != 0) {
+        return error.UnsupportedCompactionQuerySource;
+    }
+    var question_target = runtime.context_policy.payload.Targets{};
+    try question_target.add(.{
+        .message_index = std.math.cast(u32, message_index) orelse return error.UnsupportedCompactionQuerySource,
+        .part_index = part_index orelse 0,
+    });
+    const rendered = try template.applyWithProvenance(allocator, messages, options, &question_target);
+    defer allocator.free(rendered.text);
+    defer allocator.free(rendered.labels);
+    if (!std.mem.eql(u8, rendered.text, prepared.rendered.text) or
+        rendered.labels.len != rendered.text.len or prepared.rendered.labels.len != prepared.rendered.text.len)
+        return error.InvalidPayloadProvenance;
+    // A duplicated or transformed source with separate occurrences is
+    // ambiguous. Require one contiguous, wholly nonselected byte interval.
+    const first_byte = std.mem.indexOfScalar(u32, rendered.labels, 1) orelse return error.UnsupportedCompactionQuerySource;
+    const last_byte = (std.mem.lastIndexOfScalar(u32, rendered.labels, 1) orelse unreachable) + 1;
+    if (!std.mem.allEqual(u32, rendered.labels[first_byte..last_byte], 1) or
+        !std.mem.allEqual(u32, prepared.rendered.labels[first_byte..last_byte], 0))
+        return error.UnsupportedCompactionQuerySource;
+    const count = prepared.eligible.labels.len;
+    const encoded = prepared.encoded;
+    const offsets = encoded.offsets orelse return error.InvalidPayloadProvenance;
+    if (count == 0 or count > encoded.ids.len or count > encoded.attention_mask.len or count > offsets.len)
+        return error.InvalidPayloadProvenance;
+    if (!std.mem.allEqual(i32, encoded.attention_mask[0..count], 1) or
+        !std.mem.allEqual(i32, encoded.attention_mask[count..], 0)) return error.InvalidPayloadProvenance;
+    const specials = try tokenizer.allSpecialTokenIds(allocator);
+    defer allocator.free(specials);
+    var first_token: ?usize = null;
+    var token_end: usize = 0;
+    var digest = std.crypto.hash.sha2.Sha256.init(.{});
+    for (encoded.ids[0..count], offsets[0..count], 0..) |id, span, index| {
+        if (id < 0 or span[0] > span[1] or span[1] > rendered.text.len) return error.InvalidPayloadProvenance;
+        var token_bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &token_bytes, id, .little);
+        digest.update(&token_bytes);
+        if (span[0] == span[1] or span[1] <= first_byte or span[0] >= last_byte) continue;
+        if (span[0] < first_byte or span[1] > last_byte or prepared.eligible.labels[index] != 0 or
+            std.mem.indexOfScalar(u32, specials, @intCast(id)) != null)
+            return error.UnsupportedCompactionQuerySource;
+        if (first_token != null and index != token_end) return error.UnsupportedCompactionQuerySource;
+        if (first_token == null) first_token = index;
+        token_end = index + 1;
+    }
+    const start = first_token orelse return error.UnsupportedCompactionQuerySource;
+    if (token_end - start > context_study_runner.max_prefill_tokens) return error.ContextReplayBudgetExceeded;
+    const ids = try allocator.alloc(i64, token_end - start);
+    for (ids, encoded.ids[start..token_end]) |*out, id| out.* = id;
+    var prompt_digest: [32]u8 = undefined;
+    digest.final(&prompt_digest);
+    return .{
+        .allocator = allocator,
+        .ids = ids,
+        .source_start = @intCast(start),
+        .source_end = @intCast(token_end),
+        .prompt_tokens = @intCast(count),
+        .prompt_tokens_sha256 = prompt_digest,
+        .attribution = if (part_index == null) .nonselected_user_message else .nonselected_user_part,
+        .message_index = @intCast(message_index),
+        .part_index = part_index,
+    };
+}
+
+pub const PreparedCompactionStudy = struct {
+    allocator: std.mem.Allocator,
+    ids: []i64,
+    template_bytes: []const u8,
+    generation_contract_bytes: []const u8,
+    prompt_tokens: u32,
+    prompt_tokens_sha256: [32]u8,
+    rendered_suffix_sha256: [32]u8,
+
+    pub fn deinit(self: *PreparedCompactionStudy) void {
+        self.allocator.free(self.ids);
+        self.* = undefined;
+    }
+};
+
+fn validateCompactionStudySuffixOffsets(
+    ids: []const i32,
+    offsets: []const [2]u32,
+    prefix_bytes: usize,
+    rendered_bytes: usize,
+    special_ids: []const u32,
+) !void {
+    if (ids.len == 0 or ids.len != offsets.len or prefix_bytes >= rendered_bytes)
+        return error.InvalidPayloadProvenance;
+    var has_source_span = false;
+    for (ids, offsets) |id, span| {
+        if (id < 0 or span[0] > span[1] or span[1] > rendered_bytes)
+            return error.InvalidPayloadProvenance;
+        // Added special tokens intentionally have no source-byte attribution.
+        // The already-verified complete token prefix fixes the boundary; only
+        // a known special token may use the tokenizer's (0, 0) sentinel here.
+        if (span[0] == span[1]) {
+            if (span[0] == 0 and std.mem.indexOfScalar(u32, special_ids, @intCast(id)) != null) continue;
+            return error.UnsupportedCompactionStudyTemplate;
+        }
+        if (span[0] < prefix_bytes) return error.UnsupportedCompactionStudyTemplate;
+        has_source_span = true;
+    }
+    if (!has_source_span) return error.UnsupportedCompactionStudyTemplate;
+}
+
+/// Render a real continuation of the complete request using the loaded chat
+/// template. No model-specific role delimiters are synthesized. If closing an
+/// empty assistant turn would change the ingested prefix, this template cannot
+/// safely support the compiled study protocol.
+pub fn prepareCompactionStudy(
+    allocator: std.mem.Allocator,
+    template: *const ChatTemplate,
+    tokenizer: tokenizer_mod.Tokenizer,
+    messages: []const Message,
+    options: ChatTemplate.ApplyOptions,
+    prepared: *const PreparedCompactionPayload,
+    kind: @import("../backends/context_study_templates.zig").Kind,
+    authority: @import("../runtime/kv/compaction_profile.zig").QueryStudyAuthority,
+    position_limit: usize,
+    add_bos_token: bool,
+) !PreparedCompactionStudy {
+    const studies = @import("../backends/context_study_templates.zig");
+    try studies.validate(kind, authority);
+    const count = prepared.eligible.labels.len;
+    if (!options.add_generation_prompt or messages.len == 0 or count == 0 or
+        count >= position_limit or position_limit > 131072 or
+        count > prepared.encoded.ids.len or count > prepared.encoded.attention_mask.len or
+        !std.mem.allEqual(i32, prepared.encoded.attention_mask[0..count], 1) or
+        !std.mem.allEqual(i32, prepared.encoded.attention_mask[count..], 0))
+        return error.InvalidPayloadProvenance;
+    const extended = try allocator.alloc(Message, try std.math.add(usize, messages.len, 2));
+    defer allocator.free(extended);
+    @memcpy(extended[0..messages.len], messages);
+    extended[messages.len] = .{ .role = "assistant", .content = "" };
+    extended[messages.len + 1] = .{ .role = "user", .content = studies.template(kind) };
+    const rendered = try template.applyWithOptions(allocator, extended, options);
+    defer allocator.free(rendered);
+    if (rendered.len <= prepared.rendered.text.len or !std.mem.startsWith(u8, rendered, prepared.rendered.text))
+        return error.UnsupportedCompactionStudyTemplate;
+    var encoded = try tokenizer.encodeGenerationWithOffsets(allocator, rendered, position_limit + 1, shouldAddBosToken(rendered, add_bos_token, template.bos_token));
+    defer encoded.deinit();
+    var full_count: usize = 0;
+    while (full_count < encoded.attention_mask.len and encoded.attention_mask[full_count] != 0) : (full_count += 1) {}
+    if (full_count <= count or full_count > position_limit -| studies.response_tokens or
+        full_count - count > context_study_runner.max_prefill_tokens)
+        return error.ContextReplayBudgetExceeded;
+    if (full_count > encoded.ids.len or !std.mem.eql(i32, encoded.ids[0..count], prepared.encoded.ids[0..count]))
+        return error.UnsupportedCompactionStudyTemplate;
+    const offsets = encoded.offsets orelse return error.InvalidPayloadProvenance;
+    if (full_count > offsets.len) return error.InvalidPayloadProvenance;
+    const special_ids = try tokenizer.allSpecialTokenIds(allocator);
+    defer allocator.free(special_ids);
+    try validateCompactionStudySuffixOffsets(
+        encoded.ids[count..full_count],
+        offsets[count..full_count],
+        prepared.rendered.text.len,
+        rendered.len,
+        special_ids,
+    );
+    var digest = std.crypto.hash.sha2.Sha256.init(.{});
+    for (prepared.encoded.ids[0..count]) |id| {
+        if (id < 0) return error.InvalidPayloadProvenance;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &bytes, id, .little);
+        digest.update(&bytes);
+    }
+    var prompt_digest: [32]u8 = undefined;
+    digest.final(&prompt_digest);
+    var rendered_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(rendered[prepared.rendered.text.len..], &rendered_digest, .{});
+    const ids = try allocator.alloc(i64, full_count - count);
+    errdefer allocator.free(ids);
+    for (ids, encoded.ids[count..full_count]) |*out, id| {
+        if (id < 0) return error.InvalidPayloadProvenance;
+        out.* = id;
+    }
+    return .{
+        .allocator = allocator,
+        .ids = ids,
+        .template_bytes = studies.template(kind),
+        .generation_contract_bytes = studies.generation_contract,
+        .prompt_tokens = @intCast(count),
+        .prompt_tokens_sha256 = prompt_digest,
+        .rendered_suffix_sha256 = rendered_digest,
+    };
+}
 pub const GenerationResult = struct {
     text: []const u8,
     reasoning_text: ?[]const u8 = null,
@@ -931,12 +1424,21 @@ pub const GenerationResult = struct {
     cached_prompt_tokens: usize = 0,
     timing_ms: ?GenerationTimingMs = null,
     speculative: ?SpeculativeDecodeStats = null,
+    teacher_forced_evidence: if (@import("builtin").is_test) ?context_teacher_forced.Evidence else void = if (@import("builtin").is_test) null else {},
     allocator: std.mem.Allocator,
+
+    pub fn takeTeacherForcedEvidence(self: *GenerationResult) ?context_teacher_forced.Evidence {
+        if (comptime !builtin.is_test) return null;
+        const evidence = self.teacher_forced_evidence;
+        self.teacher_forced_evidence = null;
+        return evidence;
+    }
 
     pub fn deinit(self: *GenerationResult) void {
         self.allocator.free(self.text);
         if (self.reasoning_text) |reasoning| self.allocator.free(reasoning);
         if (self.token_ids) |ids| self.allocator.free(ids);
+        if (comptime @import("builtin").is_test) if (self.teacher_forced_evidence) |*evidence| evidence.deinit();
     }
 };
 
@@ -948,13 +1450,18 @@ pub const GenerationTimingMs = struct {
     multimodal_prepare: u64 = 0,
     runtime_prepare: u64 = 0,
     prefill: u64 = 0,
+    /// Post-prefill context maintenance is charged before decoding starts.
+    maintenance: u64 = 0,
     decode: u64 = 0,
     text_decode: u64 = 0,
     total: u64 = 0,
+    /// Request-local time to the first nonempty streaming callback. Null for
+    /// non-streaming requests or streams which never emit visible text.
+    first_token: ?u64 = null,
 
     /// Round cumulative milestones, then subtract adjacent boundaries. This
     /// keeps the exclusive phases additive even for sub-millisecond stages.
-    fn fromElapsedMs(milestones: [7]u64) GenerationTimingMs {
+    fn fromElapsedMs(milestones: [8]u64) GenerationTimingMs {
         var elapsed = milestones;
         for (1..elapsed.len) |i| elapsed[i] = @max(elapsed[i], elapsed[i - 1]);
         return .{
@@ -963,20 +1470,22 @@ pub const GenerationTimingMs = struct {
             .multimodal_prepare = elapsed[2] - elapsed[1],
             .runtime_prepare = elapsed[3] - elapsed[2],
             .prefill = elapsed[4] - elapsed[3],
-            .decode = elapsed[5] - elapsed[4],
-            .text_decode = elapsed[6] - elapsed[5],
-            .total = elapsed[6],
+            .maintenance = elapsed[5] - elapsed[4],
+            .decode = elapsed[6] - elapsed[5],
+            .text_decode = elapsed[7] - elapsed[6],
+            .total = elapsed[7],
         };
     }
 };
 
-test "generation timing excludes detokenization from decode and reconciles rounded phases" {
-    const timing = GenerationTimingMs.fromElapsedMs(.{ 0, 1, 1, 2, 10, 23, 26 });
+test "context generation timing separates maintenance decode and detokenization" {
+    const timing = GenerationTimingMs.fromElapsedMs(.{ 0, 1, 1, 2, 10, 17, 30, 33 });
+    try std.testing.expectEqual(@as(u64, 7), timing.maintenance);
     try std.testing.expectEqual(@as(u64, 13), timing.decode);
     try std.testing.expectEqual(@as(u64, 3), timing.text_decode);
     try std.testing.expectEqual(@as(u64, 0), timing.multimodal_prepare);
     try std.testing.expectEqual(timing.total, timing.prompt_format + timing.tokenize +
-        timing.multimodal_prepare + timing.runtime_prepare + timing.prefill +
+        timing.multimodal_prepare + timing.runtime_prepare + timing.prefill + timing.maintenance +
         timing.decode + timing.text_decode);
 }
 
@@ -1123,6 +1632,41 @@ pub const SpeculativeDecodeStats = struct {
 /// Streaming token callback. Called with each decoded text delta.
 /// Return `true` to continue generation, `false` to stop early.
 pub const TokenCallback = *const fn (ctx: *anyopaque, token_text: []const u8) bool;
+
+const TimedTokenCallback = struct {
+    io: ?std.Io,
+    downstream: ?TokenCallback,
+    context: ?*anyopaque,
+    first: ?std.Io.Timestamp = null,
+
+    fn emit(raw: *anyopaque, text: []const u8) bool {
+        const self: *TimedTokenCallback = @ptrCast(@alignCast(raw));
+        if (text.len != 0 and self.first == null) {
+            if (self.io) |io| self.first = std.Io.Timestamp.now(io, .awake);
+        }
+        return self.downstream.?(self.context.?, text);
+    }
+};
+
+test "context first token timing ignores empty callbacks and preserves cancellation" {
+    const Sink = struct {
+        calls: usize = 0,
+        fn emit(raw: *anyopaque, text: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return text.len == 0;
+        }
+    };
+    var sink: Sink = .{};
+    var timed: TimedTokenCallback = .{ .io = std.testing.io, .downstream = Sink.emit, .context = &sink };
+    try std.testing.expect(TimedTokenCallback.emit(&timed, ""));
+    try std.testing.expect(timed.first == null);
+    try std.testing.expect(!TimedTokenCallback.emit(&timed, "hello"));
+    const first = timed.first orelse return error.MissingFirstTokenTime;
+    try std.testing.expect(!TimedTokenCallback.emit(&timed, "again"));
+    try std.testing.expectEqual(first, timed.first.?);
+    try std.testing.expectEqual(@as(usize, 3), sink.calls);
+}
 
 fn emitCompletedStreamingText(ctx: *anyopaque, on_token: TokenCallback, text: []const u8) bool {
     return on_token(ctx, text);
@@ -2752,8 +3296,45 @@ test "CUDA prefill KV reservation respects admitted length and supported geometr
     try std.testing.expect(cudaE4bPrefillKvCapacity(other, 8189, 16) == null);
 }
 
+fn contextFaultTokenDigest(ids: []const i64) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (ids) |id| {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &bytes, id, .little);
+        hash.update(&bytes);
+    }
+    var result: [32]u8 = undefined;
+    hash.final(&result);
+    return result;
+}
+
 pub const NativeDecodeState = struct {
     allocator: std.mem.Allocator,
+    /// Owns only context block-view metadata. Configure before any KV work;
+    /// model activation/MoE scratch continues to use the general allocator.
+    context_metadata_allocator: ?std.mem.Allocator = null,
+    /// Borrowed request-owned context store. The request must retain it through
+    /// all forwards; it does not use the legacy logical block/page pool.
+    context_session: ?runtime.kv.context_session.Hook = null,
+    /// Final accounting survives teardown of a request-owned context. Cleared
+    /// at the start of each generation, including rejected requests.
+    last_context_metrics: ?runtime.kv.context_session.Metrics = null,
+    last_context_split_decode_dispatches: u64 = 0,
+    last_context_flash_prefill_dispatches: u64 = 0,
+    last_context_framed_attention_dispatches: u64 = 0,
+    last_context_standalone_attention_dispatches: u64 = 0,
+    last_context_device_allocation_start: runtime.kv.storage_runtime.DeviceAllocationSnapshot = .{},
+    last_context_device_allocation_end: runtime.kv.storage_runtime.DeviceAllocationSnapshot = .{},
+    last_context_session_allocation_start: runtime.kv.host_allocation_tracker.Snapshot = .{},
+    last_context_session_allocation_end: runtime.kv.host_allocation_tracker.Snapshot = .{},
+    last_context_owner_committed: ?runtime.kv.host_allocation_tracker.Snapshot = null,
+    last_context_fault_before: if (@import("builtin").is_test) ?@import("../backends/packed_context_session.zig").FailureFingerprint else void = if (@import("builtin").is_test) null else {},
+    last_context_fault_after: if (@import("builtin").is_test) ?@import("../backends/packed_context_session.zig").FailureFingerprint else void = if (@import("builtin").is_test) null else {},
+    last_context_fault_partial: if (@import("builtin").is_test) ?@import("../backends/packed_context_session.zig").FailureFingerprint else void = if (@import("builtin").is_test) null else {},
+    last_context_session_allocation_exclusive: bool = false,
+    last_context_session_released: bool = false,
+    last_context_session_post_release_live_bytes: ?u64 = null,
+    last_context_full_owner_physical_available: bool = false,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
     /// Optional external lock for shared paged KV metadata/storage. Batch
@@ -2781,6 +3362,9 @@ pub const NativeDecodeState = struct {
     selection_capture_enabled: bool = false,
     selection_queries: std.ArrayListUnmanaged(SelectionQueryEntry) = .empty,
     selection_protected_spans: []const runtime.kv.selection.ProtectedSpan = &.{},
+    /// Assigned lazily only by the qualification fingerprint path. The value
+    /// survives repeated snapshots of this state and is never a sequence id.
+    quality_context_instance_id: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
 
     pub fn initContiguous(allocator: std.mem.Allocator) NativeDecodeState {
         return .{
@@ -2811,7 +3395,13 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn isPaged(self: *const NativeDecodeState) bool {
-        return self.kv_manager != null and !self.force_full_recompute;
+        return self.context_session != null or (self.kv_manager != null and !self.force_full_recompute);
+    }
+
+    /// Context sessions own retained attention state without a legacy KvView.
+    /// Generic sampled/grammar decoding must still forward only the new token.
+    fn hasRetainedAttention(self: *const NativeDecodeState) bool {
+        return self.context_session != null or self.kvView() != null;
     }
 
     pub fn isKvCompacted(self: *const NativeDecodeState) bool {
@@ -2950,6 +3540,7 @@ pub const NativeDecodeState = struct {
     }
 
     fn ensureAttachedUnlocked(self: *NativeDecodeState) !void {
+        if (self.context_session != null) return;
         if (!self.isPaged()) return;
         if (self.sequence_id != null) return;
         self.sequence_id = try self.kv_manager.?.attachSequence(self.pool_id orelse return error.InvalidPoolId);
@@ -3207,6 +3798,10 @@ pub const NativeDecodeState = struct {
         };
     }
 
+    fn contextMetadataAllocator(self: *const NativeDecodeState) std.mem.Allocator {
+        return self.context_metadata_allocator orelse self.allocator;
+    }
+
     fn syncPagedKvBlockTable(self: *NativeDecodeState) !void {
         const manager = self.kv_manager orelse {
             self.kv_block_ids.clearRetainingCapacity();
@@ -3216,7 +3811,7 @@ pub const NativeDecodeState = struct {
             self.kv_block_ids.clearRetainingCapacity();
             return;
         };
-        _ = try manager.logicalBlocksWithReservations(sequence_id, &self.kv_block_ids);
+        _ = try manager.logicalBlocksWithReservationsAllocated(self.contextMetadataAllocator(), sequence_id, &self.kv_block_ids);
     }
 
     fn syncPagedKvViewForPrefill(self: *NativeDecodeState) void {
@@ -3289,7 +3884,7 @@ pub const NativeDecodeState = struct {
         if (self.deepseek_v4_compressed_cache) |*cache| cache.deinit();
         self.clearSelectionQueries();
         self.selection_queries.deinit(self.allocator);
-        self.kv_block_ids.deinit(self.allocator);
+        self.kv_block_ids.deinit(self.contextMetadataAllocator());
         self.sequence_id = null;
         self.kv_view = null;
         self.kv_compacted = false;
@@ -3310,7 +3905,7 @@ pub const NativeDecodeState = struct {
 
     pub fn notePrefill(self: *NativeDecodeState, token_count: usize) !void {
         self.total_tokens = token_count;
-        if (self.isPaged()) {
+        if (self.context_session == null and self.isPaged()) {
             const lock = self.lockPagedKv();
             defer if (lock) |mutex| mutex.unlock();
             try self.ensureAttachedUnlocked();
@@ -3331,7 +3926,7 @@ pub const NativeDecodeState = struct {
 
     pub fn appendPrefillChunk(self: *NativeDecodeState, token_count: usize) !void {
         self.total_tokens += token_count;
-        if (self.isPaged()) {
+        if (self.context_session == null and self.isPaged()) {
             const lock = self.lockPagedKv();
             defer if (lock) |mutex| mutex.unlock();
             try self.ensureAttachedUnlocked();
@@ -3352,7 +3947,7 @@ pub const NativeDecodeState = struct {
 
     pub fn appendGeneratedToken(self: *NativeDecodeState) !void {
         self.total_tokens += 1;
-        if (self.isPaged()) {
+        if (self.context_session == null and self.isPaged()) {
             const lock = self.lockPagedKv();
             defer if (lock) |mutex| mutex.unlock();
             try self.ensureAttachedUnlocked();
@@ -3378,7 +3973,7 @@ pub const NativeDecodeState = struct {
     /// after accepting a batch of draft tokens).
     pub fn appendGeneratedTokens(self: *NativeDecodeState, count: usize) !void {
         self.total_tokens += count;
-        if (self.isPaged()) {
+        if (self.context_session == null and self.isPaged()) {
             const lock = self.lockPagedKv();
             defer if (lock) |mutex| mutex.unlock();
             try self.ensureAttachedUnlocked();
@@ -3406,6 +4001,7 @@ pub const NativeDecodeState = struct {
     /// decoding when draft tokens are rejected).
     pub fn truncateTokens(self: *NativeDecodeState, count: usize) !void {
         if (count == 0) return;
+        if (self.context_session != null) return error.ContextRollbackUnsupported;
         if (count > self.total_tokens) return error.TruncateBeyondStart;
         const was_paged = self.isPaged();
         self.total_tokens -= count;
@@ -3477,13 +4073,13 @@ pub const NativeDecodeState = struct {
         const new_state = try manager.sequenceMut(new_seq_id);
         new_state.compacted = true;
         var new_block_ids = std.ArrayListUnmanaged(runtime.kv.block.KvBlockId).empty;
-        errdefer new_block_ids.deinit(self.allocator);
-        _ = try manager.logicalBlocksWithReservations(new_seq_id, &new_block_ids);
+        errdefer new_block_ids.deinit(self.contextMetadataAllocator());
+        _ = try manager.logicalBlocksWithReservationsAllocated(self.contextMetadataAllocator(), new_seq_id, &new_block_ids);
 
         // Swap: release old sequence, adopt new one.
         try manager.releaseSequence(seq_id);
         self.sequence_id = new_seq_id;
-        self.kv_block_ids.deinit(self.allocator);
+        self.kv_block_ids.deinit(self.contextMetadataAllocator());
         self.kv_block_ids = new_block_ids;
         new_block_ids = .empty;
         self.kv_compacted = true;
@@ -3504,7 +4100,68 @@ pub const NativeDecodeState = struct {
         return self.kv_view;
     }
 
+    /// Qualification-only ordinary exact context fingerprint. Call after the
+    /// prompt forward has completed and before appending any continuation.
+    /// Packed exact and attention-matching contexts use their own session
+    /// fingerprints and are deliberately rejected here.
+    pub fn qualificationOrdinaryExactFingerprint(
+        self: *NativeDecodeState,
+        allocator: std.mem.Allocator,
+        expected_prompt_tokens: usize,
+        layout: runtime.context_policy.Layout,
+    ) !context_teacher_forced.QualityFingerprint {
+        if (comptime !builtin.is_test) return error.QualificationOnly;
+        if (!build_options.enable_metal) return error.OrdinaryExactMetalKvRequired;
+        if (self.context_session != null or self.kv_compacted or self.force_full_recompute)
+            return error.OrdinaryExactMetalKvRequired;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const storage = self.kv_storage orelse return error.OrdinaryExactMetalKvRequired;
+        const hook = storage.device_write_hook orelse return error.OrdinaryExactMetalKvRequired;
+        const view = self.kv_view orelse return error.InvalidQualificationFingerprint;
+        if (expected_prompt_tokens == 0 or self.total_tokens != expected_prompt_tokens or
+            view.token_count != expected_prompt_tokens or self.sequence_id == null or
+            view.sequence_id != self.sequence_id.?)
+            return error.InvalidQualificationFingerprint;
+        const logical_blocks = view.logical_blocks orelse return error.InvalidQualificationFingerprint;
+        if (layout.len == 0 or layout.len > gpt_mod.max_attention_layers)
+            return error.InvalidQualificationFingerprint;
+        var owner_layers: [gpt_mod.max_attention_layers]u32 = undefined;
+        var owner_count: usize = 0;
+        for (layout.layers[0..layout.len], 0..) |layer, index| {
+            if (layer.owner != index) continue;
+            owner_layers[owner_count] = @intCast(index);
+            owner_count += 1;
+        }
+        if (owner_count == 0) return error.InvalidQualificationFingerprint;
+        if (comptime builtin.is_test) {
+            if (self.quality_context_instance_id == 0)
+                self.quality_context_instance_id = try allocateQualityContextInstance();
+        }
+        return backends.metal_kv_storage.MetalKvStorage.qualificationFingerprintDeviceHook(
+            hook,
+            allocator,
+            .{
+                .context_instance_id = self.quality_context_instance_id,
+                .sequence_id = view.sequence_id,
+                .logical_tokens = std.math.cast(u32, expected_prompt_tokens) orelse return error.QualificationFingerprintOverflow,
+                .position_offset = std.math.cast(u32, view.position_offset) orelse return error.QualificationFingerprintOverflow,
+                .logical_blocks = logical_blocks,
+                .owner_layers = owner_layers[0..owner_count],
+            },
+        );
+    }
+
     pub fn gptDecodeContext(self: *NativeDecodeState, seq_len: usize, query_seq_len: usize) gpt_arch.DecodeContext {
+        if (self.context_session) |hook| return .{
+            .context_session = hook,
+            .attention_mode = if (query_seq_len == 1 and seq_len > 1) .paged_decode else .paged_prefill,
+            .total_sequence_len = seq_len,
+            .query_sequence_len = query_seq_len,
+            .kv_sequence_len = seq_len,
+            .moe_runtime = &self.moe_runtime,
+            .gemma4_layer_spec_cache = &self.gemma4_layer_spec_cache,
+        };
         const decode_positions: ?[]const u32 = if (self.qwen3vl_mrope_position_delta != null and query_seq_len == 1 and seq_len > 0) blk: {
             const position = @as(i64, @intCast(seq_len - 1)) + self.qwen3vl_mrope_position_delta.?;
             if (position < 0 or position > std.math.maxInt(u32)) break :blk null;
@@ -3694,6 +4351,9 @@ fn retryDirectPrefillAfterMemoryBudgetExceeded(
     err: anyerror,
 ) !bool {
     if (err != error.MemoryBudgetExceeded or attempted_chunk_size <= 1) return false;
+    // A context-session forward may have appended owner KV before failing.
+    // It cannot roll back/replay a smaller chunk against that partial state.
+    if (decode_runtime.state.context_session != null) return false;
     try decode_runtime.rollbackReservedPrefill(reserved_tokens);
     if (!allow_resize) return false;
     current_chunk_size.* = @max(attempted_chunk_size / 2, 1);
@@ -3990,6 +4650,112 @@ pub const PreEncodedPrompt = struct {
     prompt_token_limit: usize,
 };
 
+const MetalQualificationCompletion = struct {
+    logical_tokens: usize,
+    materialized_tokens: usize,
+    pending_sampled_tokens: u8,
+};
+
+const AutoregressiveKvBoundary = struct {
+    pending_unmaterialized_tokens: u8 = 0,
+
+    fn init(has_initial_sampled_token: bool) AutoregressiveKvBoundary {
+        return .{ .pending_unmaterialized_tokens = @intFromBool(has_initial_sampled_token) };
+    }
+
+    fn noteForwardConsumedSample(self: *AutoregressiveKvBoundary) void {
+        self.pending_unmaterialized_tokens = 0;
+    }
+
+    fn noteAcceptedSample(self: *AutoregressiveKvBoundary) void {
+        self.pending_unmaterialized_tokens = 1;
+    }
+};
+
+const MetalQualificationBindingBaseline = struct {
+    logical_tokens: u64,
+    attention_calls: usize,
+    donor_appends: usize,
+};
+
+const MetalQualificationKvEvidence = struct {
+    materialized_tokens: usize,
+    pending_sampled_tokens: u8,
+    attention_calls_per_materialized_token: usize = 0,
+    donor_appends_per_materialized_token: usize = 0,
+};
+
+fn metalQualificationCompletion(
+    logical_tokens: usize,
+    materialized_tokens: usize,
+    pending_sampled_tokens: u8,
+) !MetalQualificationCompletion {
+    if (pending_sampled_tokens > 1) return error.InvalidKvCheckpoint;
+    const accounted = std.math.add(usize, materialized_tokens, pending_sampled_tokens) catch
+        return error.InvalidKvCheckpoint;
+    if (accounted != logical_tokens) return error.InvalidKvCheckpoint;
+    return .{
+        .logical_tokens = logical_tokens,
+        .materialized_tokens = materialized_tokens,
+        .pending_sampled_tokens = pending_sampled_tokens,
+    };
+}
+
+fn metalQualificationKvEvidence(
+    phase: []const u8,
+    logical_tokens: usize,
+    completion: ?MetalQualificationCompletion,
+    activity: ?metal_compute.MetalCompute.AttentionMatchActivity,
+    baseline: ?MetalQualificationBindingBaseline,
+    expected_attention_calls_per_token: usize,
+    expected_donor_appends_per_token: usize,
+) !MetalQualificationKvEvidence {
+    const committed = std.mem.eql(u8, phase, "generation_committed");
+    const boundary = if (committed)
+        completion orelse return error.InvalidKvCheckpoint
+    else
+        try metalQualificationCompletion(logical_tokens, logical_tokens, 0);
+    if (boundary.logical_tokens != logical_tokens) return error.InvalidKvCheckpoint;
+    _ = try metalQualificationCompletion(
+        boundary.logical_tokens,
+        boundary.materialized_tokens,
+        boundary.pending_sampled_tokens,
+    );
+
+    var evidence = MetalQualificationKvEvidence{
+        .materialized_tokens = boundary.materialized_tokens,
+        .pending_sampled_tokens = boundary.pending_sampled_tokens,
+    };
+    const installed = activity orelse return evidence;
+    if (expected_attention_calls_per_token == 0 or expected_donor_appends_per_token == 0)
+        return error.InvalidKvCheckpoint;
+    evidence.attention_calls_per_materialized_token = expected_attention_calls_per_token;
+    evidence.donor_appends_per_materialized_token = expected_donor_appends_per_token;
+    if (installed.invalid or installed.logical_tokens != boundary.materialized_tokens)
+        return error.InvalidKvCheckpoint;
+    if (!committed) return evidence;
+    const before = baseline orelse return error.InvalidKvCheckpoint;
+    if (installed.logical_tokens < before.logical_tokens or
+        installed.attention_calls < before.attention_calls or
+        installed.donor_appends < before.donor_appends)
+        return error.InvalidKvCheckpoint;
+    const materialized_delta_u64 = installed.logical_tokens - before.logical_tokens;
+    const materialized_delta = std.math.cast(usize, materialized_delta_u64) orelse return error.InvalidKvCheckpoint;
+    const attention_delta = installed.attention_calls - before.attention_calls;
+    const append_delta = installed.donor_appends - before.donor_appends;
+    if (materialized_delta == 0) {
+        if (attention_delta != 0 or append_delta != 0) return error.InvalidKvCheckpoint;
+        return evidence;
+    }
+    const expected_attention_delta = std.math.mul(usize, materialized_delta, expected_attention_calls_per_token) catch
+        return error.InvalidKvCheckpoint;
+    const expected_append_delta = std.math.mul(usize, materialized_delta, expected_donor_appends_per_token) catch
+        return error.InvalidKvCheckpoint;
+    if (attention_delta != expected_attention_delta or append_delta != expected_append_delta)
+        return error.InvalidKvCheckpoint;
+    return evidence;
+}
+
 /// Native generation pipeline using ComputeBackend + GPT arch directly.
 /// Runs autoregressive decoding: tokenize → loop(gpt_arch.forward → sample → append).
 pub const NativeGenerationPipeline = struct {
@@ -3997,6 +4763,16 @@ pub const NativeGenerationPipeline = struct {
     io: ?std.Io = null,
     cb: ComputeBackend,
     session: ?backends.Session = null,
+    /// Publication generation pinned by the serving ModelHandle.
+    load_generation: u64 = 0,
+    /// Set only by qualification generation mode. The server copies this
+    /// immutable value after native, HTTP, or streaming completion.
+    last_quality_generation_binding: if (builtin.is_test) ?context_teacher_forced.ContextBinding else void = if (builtin.is_test) null else {},
+    /// Qualification-only proof of the autoregressive KV boundary. A sampled
+    /// token becomes logical/output state immediately, but its KV row is not
+    /// materialized until the following forward consumes it.
+    metal_qualification_completion: if (builtin.is_test) ?MetalQualificationCompletion else void = if (builtin.is_test) null else {},
+    metal_qualification_binding_baseline: if (builtin.is_test) ?MetalQualificationBindingBaseline else void = if (builtin.is_test) null else {},
     gpt_config: gpt_mod.Config,
     kv_dtype: ?runtime.kv.pool.KvDType = null,
     /// Content-bound identity of this loaded model generation.
@@ -4079,8 +4855,103 @@ pub const NativeGenerationPipeline = struct {
             platform.sync.lockYielding(mutex);
     }
 
+    /// Stable, owner-scoped machine evidence for the private Metal checkpoint
+    /// qualification server. Process RSS and global device deltas are
+    /// deliberately excluded: every byte below belongs to the request ledger.
+    pub fn logMetalCheckpointQualificationPhase(
+        self: *NativeGenerationPipeline,
+        state: *const NativeDecodeState,
+        config: GenerationConfig,
+        phase: []const u8,
+        timings: ?*const NativeCheckpointResume,
+    ) !void {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return;
+        if (!config.metal_native_checkpoint_qualification or
+            config.metal_checkpoint_qualification_route == .none or
+            config.metal_checkpoint_qualification_request == 0 or self.cb.kind() != .metal)
+            return;
+        const storage = state.kv_storage orelse return error.ContextPhysicalAccountingUnavailable;
+        const tracker = storage.ownerAllocationTracker() orelse return error.ContextPhysicalAccountingUnavailable;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        try compute.synchronizeAttentionMatchKv();
+        try storage.drainDeviceWritesForOwnerSnapshot();
+        const snapshot = tracker.snapshot();
+        const revision = try compute.attentionMatchRevision(storage);
+        const activity = if (state.sequence_id) |sequence|
+            try compute.installedAttentionMatchActivity(storage, sequence)
+        else
+            null;
+        var expected_donor_appends_per_token: usize = 0;
+        for (0..self.gpt_config.num_hidden_layers) |layer| {
+            if (self.gpt_config.isKvDonorLayer(layer)) expected_donor_appends_per_token += 1;
+        }
+        const kv_evidence = try metalQualificationKvEvidence(
+            phase,
+            state.total_tokens,
+            self.metal_qualification_completion,
+            activity,
+            self.metal_qualification_binding_baseline,
+            self.gpt_config.num_hidden_layers,
+            expected_donor_appends_per_token,
+        );
+        if (std.mem.eql(u8, phase, "resumed_ready")) {
+            const installed = activity orelse return error.InvalidKvCheckpoint;
+            self.metal_qualification_binding_baseline = .{
+                .logical_tokens = installed.logical_tokens,
+                .attention_calls = installed.attention_calls,
+                .donor_appends = installed.donor_appends,
+            };
+        }
+        var line_storage: [8192]u8 = undefined;
+        var line_writer = std.Io.Writer.fixed(&line_storage);
+        try std.json.Stringify.value(.{
+            .schema = "antfly.metal-checkpoint-phase.v1",
+            .phase = phase,
+            .request = config.metal_checkpoint_qualification_request,
+            .route = @tagName(config.metal_checkpoint_qualification_route),
+            .owner_id = snapshot.owner_identity,
+            .logical_tokens = state.total_tokens,
+            .kv_materialized_tokens = kv_evidence.materialized_tokens,
+            .pending_sampled_tokens = kv_evidence.pending_sampled_tokens,
+            .kv_boundary_proven = true,
+            .binding_attention_calls_per_materialized_token = kv_evidence.attention_calls_per_materialized_token,
+            .binding_donor_appends_per_materialized_token = kv_evidence.donor_appends_per_materialized_token,
+            .revision = revision,
+            .owner_available = snapshot.available,
+            .physical_available = snapshot.physical_available,
+            .combined_available = snapshot.tracked_combined_physical_available,
+            .host_logical_live_bytes = snapshot.logical_live_bytes,
+            .host_physical_live_bytes = snapshot.physical_live_bytes,
+            .shared_backing_live_bytes = snapshot.shared_backing_live_bytes,
+            .private_device_live_bytes = snapshot.private_device_live_bytes,
+            .tracked_combined_live_bytes = snapshot.tracked_combined_live_bytes,
+            .tracked_combined_peak_bytes = snapshot.tracked_combined_peak_bytes,
+            .binding = activity != null,
+            .binding_representation = if (activity) |value| if (value.fp8_heads != 0) @as([]const u8, "fp8") else "f16" else "none",
+            .binding_logical_tokens = if (activity) |value| value.logical_tokens else 0,
+            .binding_allocated_bytes = if (activity) |value| value.allocated_bytes else 0,
+            .binding_fp8_heads = if (activity) |value| value.fp8_heads else 0,
+            .binding_fp8_rows = if (activity) |value| value.fp8_rows else 0,
+            .binding_exact_resident_bytes = if (activity) |value| value.exact_resident_bytes else 0,
+            .binding_encoded_resident_bytes = if (activity) |value| value.encoded_resident_bytes else 0,
+            .binding_metadata_resident_bytes = if (activity) |value| value.metadata_resident_bytes else 0,
+            .attention_calls = if (activity) |value| value.attention_calls else 0,
+            .donor_appends = if (activity) |value| value.donor_appends else 0,
+            .invalid = if (activity) |value| value.invalid else false,
+            .validation_ns = if (timings) |value| value.validation_ns else 0,
+            .upload_ns = if (timings) |value| value.upload_ns else 0,
+            .install_ns = if (timings) |value| value.install_ns else 0,
+            .suffix_prefill_ns = if (timings) |value| value.suffix_prefill_ns else 0,
+        }, .{}, &line_writer);
+        // Keep each machine-evidence record in one print call so concurrent
+        // qualification requests cannot interleave fragments into invalid JSON.
+        std.debug.print("metal_checkpoint_qualification {s}\n", .{line_writer.buffered()});
+    }
+
     pub const AttentionMatchQueryOptions = struct {
         prefix_mode: enum { clone, replay } = .clone,
+        /// Exact and split repeat kernels are CUDA-only. Metal captures queries
+        /// through its ordinary bias/coverage-aware attention route.
         repeat_mode: enum { reference, exact, exact_split } = .reference,
         stats: ?*AttentionMatchQueryStats = null,
         collection: runtime.kv.attention_match_queries.Options = .{},
@@ -4196,40 +5067,71 @@ pub const NativeGenerationPipeline = struct {
             mapping[layer] = index orelse return error.UnsupportedKvSnapshotLayout;
         }
         _ = try resume_contract.validateWithControl(saved, .{ .identity = identity, .vocab_size = self.gpt_config.vocab_size, .max_logical_tokens = native_kv_checkpoint.max_context_tokens, .max_appended_tokens = 8192, .layer_donors = mapping[0..self.gpt_config.num_hidden_layers], .donors = donors[0..count] }, full_prompt, limits, control);
-        _ = try @import("../ops/cuda/attention_match_storage.zig").allocationBytesWithControl(saved, .f16, limits, control);
+        switch (self.cb.kind()) {
+            .cuda => if (comptime build_options.enable_cuda) {
+                _ = try @import("../ops/cuda/attention_match_storage.zig").allocationBytesWithControl(saved, .f16, limits, control);
+            } else return error.UnsupportedAttentionMatchRoute,
+            .metal => if (comptime build_options.enable_metal) {
+                _ = try metal_attention_storage.allocationBytesWithControl(saved, limits, control);
+            } else return error.UnsupportedAttentionMatchRoute,
+            else => return error.UnsupportedAttentionMatchRoute,
+        }
     }
 
-    pub fn restoreAttentionMatchState(self: *NativeGenerationPipeline, saved: runtime.kv.attention_match_checkpoint.State, full_prompt: []const u32, max_new_tokens: usize, diagnostic_only: bool, destination: *NativeDecodeState) ![]f32 {
-        if (comptime !build_options.enable_cuda) return error.UnsupportedAttentionMatchRoute;
+    pub fn restoreAttentionMatchState(self: *NativeGenerationPipeline, saved: runtime.kv.attention_match_checkpoint.State, full_prompt: []const u32, max_new_tokens: usize, diagnostic_only: bool, destination: *NativeDecodeState, timings: ?*NativeCheckpointResume) ![]f32 {
         const checkpoint = runtime.kv.attention_match_checkpoint;
-        const device_storage = @import("../ops/cuda/attention_match_storage.zig");
-        if (self.cb.kind() != .cuda or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
+        if ((self.cb.kind() != .cuda and self.cb.kind() != .metal) or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
             !self.gpt_config.usesGemma4Channels() or self.gpt_config.gemma4_mtp_assistant or
             self.graph_cache != null or self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null or
             !destination.isPaged() or destination.isKvCompacted() or destination.total_tokens != 0 or destination.sequence_id != null or
             self.gpt_config.num_hidden_layers == 0 or self.gpt_config.num_hidden_layers > 256)
             return error.UnsupportedAttentionMatchRoute;
+        const validation_started = mtpProfileTimestamp(true, self.io);
         try self.validateAttentionMatchResume(saved, full_prompt, max_new_tokens);
+        if (timings) |request| request.validation_ns = mtpProfileElapsedNs(true, self.io, validation_started);
         const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
         const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
         const logits = try self.allocator.dupe(f32, saved.logits);
         errdefer self.allocator.free(logits);
         if (self.execution_lock) |mutex| try self.lockExecution(mutex);
         defer if (self.execution_lock) |mutex| mutex.unlock();
-        const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
         const storage = destination.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
         if (storage.sequences.items.len != 0 or storage.storage.config.store_cpu_bytes) return error.UnsupportedAttentionMatchRoute;
-        const revision = try cuda_compute.attentionMatchRevision(compute, storage);
         try control.check();
         // This request owner is disposable on any failure. Metadata establishes
         // the original logical positions without forwarding or replaying tokens.
         destination.allow_swa_ring = false;
         try destination.notePrefill(saved.tokens.len);
-        const backend: device_storage.Backend = .{ .allocator = self.allocator, .context = &compute.ctx, .precision = .f16, .limits = limits };
-        const bound = @min(compute.ctx.device_allocations.snapshot().limit, 18 * 1024 * 1024 * 1024);
-        var uploaded: ?device_storage.DeviceState = try backend.upload(saved, bound, control);
-        defer if (uploaded) |*device| device.deinit();
-        try cuda_compute.restoreAttentionMatch(compute, storage, destination.sequence_id orelse return error.InvalidCompactionProbe, &uploaded, saved.tokens.len, revision, bound, control, .{ .diagnostic_only = diagnostic_only });
+        switch (self.cb.kind()) {
+            .cuda => if (comptime build_options.enable_cuda) {
+                const device_storage = @import("../ops/cuda/attention_match_storage.zig");
+                const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                const revision = try cuda_compute.attentionMatchRevision(compute, storage);
+                const backend: device_storage.Backend = .{ .allocator = self.allocator, .context = &compute.ctx, .precision = .f16, .limits = limits };
+                const bound = @min(compute.ctx.device_allocations.snapshot().limit, 18 * 1024 * 1024 * 1024);
+                const upload_started = mtpProfileTimestamp(true, self.io);
+                var uploaded: ?device_storage.DeviceState = try backend.upload(saved, bound, control);
+                defer if (uploaded) |*device| device.deinit();
+                if (timings) |request| request.upload_ns = mtpProfileElapsedNs(true, self.io, upload_started);
+                const install_started = mtpProfileTimestamp(true, self.io);
+                try cuda_compute.restoreAttentionMatch(compute, storage, destination.sequence_id orelse return error.InvalidCompactionProbe, &uploaded, saved.tokens.len, revision, bound, control, .{ .diagnostic_only = diagnostic_only });
+                if (timings) |request| request.install_ns = mtpProfileElapsedNs(true, self.io, install_started);
+            } else return error.UnsupportedAttentionMatchRoute,
+            .metal => if (comptime build_options.enable_metal) {
+                const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+                const revision = try compute.attentionMatchRevision(storage);
+                const bound: usize = 18 * 1024 * 1024 * 1024;
+                const backend = try compute.attentionMatchStorageBackend(storage, self.allocator, limits, bound);
+                const upload_started = mtpProfileTimestamp(true, self.io);
+                var uploaded: ?metal_attention_storage.DeviceState = try backend.upload(saved, bound, control);
+                defer if (uploaded) |*device| device.deinit();
+                if (timings) |request| request.upload_ns = mtpProfileElapsedNs(true, self.io, upload_started);
+                const install_started = mtpProfileTimestamp(true, self.io);
+                try compute.restoreAttentionMatch(storage, destination.sequence_id orelse return error.InvalidCompactionProbe, &uploaded, saved.tokens.len, revision, bound, control, .{ .diagnostic_only = diagnostic_only });
+                if (timings) |request| request.install_ns = mtpProfileElapsedNs(true, self.io, install_started);
+            } else return error.UnsupportedAttentionMatchRoute,
+            else => return error.UnsupportedAttentionMatchRoute,
+        }
         return logits;
     }
 
@@ -4280,7 +5182,7 @@ pub const NativeGenerationPipeline = struct {
         defer fresh.deinit();
         var clone_logits = try self.allocator.dupe(f32, logits);
         defer self.allocator.free(clone_logits);
-        var fresh_logits = try self.restoreAttentionMatchState(restored.state, ids, answer_limit, true, &fresh.state.?);
+        var fresh_logits = try self.restoreAttentionMatchState(restored.state, ids, answer_limit, true, &fresh.state.?, null);
         defer self.allocator.free(fresh_logits);
         var comparisons: usize = 0;
         var appended: usize = 0;
@@ -4336,20 +5238,27 @@ pub const NativeGenerationPipeline = struct {
             append_config.prefill_chunk_plan = append_plan.?;
             append_config.prefill_chunk_size = append_plan.?.max_chunk_rows;
         }
-        const logits = try self.restoreAttentionMatchState(saved, ids, max_new_tokens, false, state);
+        const logits = try self.restoreAttentionMatchState(saved, ids, max_new_tokens, false, state, request);
         request.checkpoint.?.deinit();
         request.checkpoint = null;
         request.restored_tokens = restored_tokens;
         request.appended_tokens = appended_tokens;
-        if (appended_tokens == 0) return .{ .last_logits = logits };
+        if (appended_tokens == 0) {
+            try self.logMetalCheckpointQualificationPhase(state, config, "resumed_ready", request);
+            return .{ .last_logits = logits };
+        }
         self.allocator.free(logits);
-        return self.executePrefill(tokens[restored_tokens..], tokens.len, restored_tokens, state, append_config, false, false);
+        const suffix_started = mtpProfileTimestamp(true, self.io);
+        const output = try self.executePrefill(tokens[restored_tokens..], tokens.len, restored_tokens, state, append_config, false, false, false);
+        request.suffix_prefill_ns = mtpProfileElapsedNs(true, self.io, suffix_started);
+        try self.logMetalCheckpointQualificationPhase(state, config, "resumed_ready", request);
+        return output;
     }
 
-    fn prepareNativeCheckpoint(self: *NativeGenerationPipeline, request: *NativeCheckpointPrepare, tokens: []const i64, logits: []const f32, source: *const NativeDecodeState) !void {
+    fn prepareNativeCheckpoint(self: *NativeGenerationPipeline, request: *NativeCheckpointPrepare, tokens: []const i64, logits: []const f32, source: *const NativeDecodeState, config: GenerationConfig) !void {
         if (request.result != null or !std.math.isFinite(request.minimum_savings_ratio) or request.minimum_savings_ratio <= 1 or request.minimum_savings_ratio > 4 or request.validation_workers != 1)
             return error.InvalidNativeCheckpointRequest;
-        const plan = try NativeCheckpointPrepare.hostPlan(self.gpt_config, tokens.len, request.encoding);
+        const plan = try NativeCheckpointPrepare.hostPlan(self.gpt_config, tokens.len, request.encoding, self.cb.kind() == .metal);
         if (request.planned_fit_host_bytes) |admitted| {
             if (admitted != plan.fit_bytes) return error.InvalidNativeCheckpointRequest;
         }
@@ -4358,10 +5267,15 @@ pub const NativeGenerationPipeline = struct {
             if (admitted != plan.workers) return error.InvalidNativeCheckpointRequest;
         }
         request.planned_fit_workers = plan.workers;
+        if (request.planned_fit_head_workspace_bytes) |admitted| {
+            if (admitted != plan.head_workspace_bytes) return error.InvalidNativeCheckpointRequest;
+        }
+        request.planned_fit_head_workspace_bytes = plan.head_workspace_bytes;
+        try self.logMetalCheckpointQualificationPhase(source, config, "checkpoint_source", null);
         const started = mtpProfileTimestamp(true, self.io);
         var queries = try self.collectAttentionMatchQueries(tokens, source, .{
             .prefix_mode = .clone,
-            .repeat_mode = .exact_split,
+            .repeat_mode = if (self.cb.kind() == .metal) .reference else .exact_split,
             .collection = NativeCheckpointPrepare.collection_options,
             .chunk_size = 256,
             .max_repeat_tokens = NativeCheckpointPrepare.max_repeat_tokens,
@@ -4373,6 +5287,192 @@ pub const NativeGenerationPipeline = struct {
         if (request.result == null) return error.InvalidNativeCheckpointResult;
     }
 
+    /// Baseline f16/FP8 Metal preparation uses the common checkpoint/engine
+    /// contracts and a single Metal matrix adapter. Publication remains
+    /// request-private until every rounded whole-head gate has passed.
+    fn prepareMetalAttentionMatchFit(
+        self: *NativeGenerationPipeline,
+        tokens: []const i64,
+        logits: []const f32,
+        source: *const NativeDecodeState,
+        queries: *runtime.kv.attention_match_queries.Collector,
+        query_ns: u64,
+        request: *NativeCheckpointPrepare,
+    ) !runtime.kv.attention_match_engine.Stats {
+        if (comptime !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
+        if (self.cb.kind() != .metal or self.kv_dtype != .f16) return error.UnsupportedCompactionQueryDType;
+        if (request.encoding != .f16 and request.encoding != .fp8)
+            return error.UnsupportedMetalKvCheckpointEncoding;
+        if (request.validation_workers != 1)
+            return error.InvalidNativeCheckpointRequest;
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        const checkpoint = runtime.kv.attention_match_checkpoint;
+        const engine = runtime.kv.attention_match_engine;
+        const Fitter = @import("../ops/metal_attention_match_fit.zig").Fitter;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
+        const source_storage = source.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
+        const source_revision = try compute.attentionMatchRevision(source_storage);
+        const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
+        var stats: engine.Stats = .{};
+        const started = mtpProfileTimestamp(true, self.io);
+        const ids = try self.allocator.alloc(u32, tokens.len);
+        defer self.allocator.free(ids);
+        for (tokens, ids) |token, *id| id.* = std.math.cast(u32, token) orelse return error.InvalidCompactionQueries;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        var original = try self.snapshotAttentionMatchState(ids, logits, source, identity, limits, 2 * 1024 * 1024 * 1024);
+        var original_live = true;
+        defer if (original_live) original.deinit();
+        const source_host_bytes = try original.state.residentBytes();
+        const snapshot_ns = mtpProfileElapsedNs(true, self.io, started);
+
+        var query_heads: [256]u32 = undefined;
+        @memset(query_heads[0..original.state.layer_donors.len], self.gpt_config.num_attention_heads);
+        var scales: [256]f64 = undefined;
+        var caps: [256]f64 = undefined;
+        for (original.state.donors, 0..) |donor, i| {
+            scales[i] = 1.0 / @sqrt(@as(f64, @floatFromInt(donor.heads[0].dim)));
+            caps[i] = 0;
+        }
+        const fit_started = mtpProfileTimestamp(true, self.io);
+        const fit_host_bytes = request.planned_fit_host_bytes orelse return error.InvalidNativeCheckpointRequest;
+        const fit_workers = request.planned_fit_workers orelse return error.InvalidNativeCheckpointRequest;
+        const head_workspace_bytes = request.planned_fit_head_workspace_bytes orelse return error.InvalidNativeCheckpointRequest;
+        if (fit_host_bytes == 0 or fit_host_bytes > NativeCheckpointPrepare.max_transient_host_bytes or
+            fit_workers == 0 or fit_workers > NativeCheckpointPrepare.fit_workers)
+            return error.InvalidNativeCheckpointRequest;
+        var fit_head_count: usize = 0;
+        for (original.state.donors) |donor| if (donor.window == 0) {
+            fit_head_count = try std.math.add(usize, fit_head_count, donor.heads.len);
+        };
+        const actual_worker_plan = try Fitter.parallelPlan(
+            source_host_bytes,
+            fit_head_count,
+            head_workspace_bytes,
+            fit_host_bytes,
+            fit_workers,
+        );
+        if (actual_worker_plan.workers != fit_workers or
+            actual_worker_plan.admitted_bytes != fit_host_bytes or
+            actual_worker_plan.per_worker_bytes > head_workspace_bytes)
+            return error.InvalidNativeCheckpointRequest;
+        var metal_fitters: [NativeCheckpointPrepare.fit_workers]Fitter = undefined;
+        var metal_fitter_count: usize = 0;
+        defer for (metal_fitters[0..metal_fitter_count]) |*fitter| fitter.deinit();
+        var fit_backends: [NativeCheckpointPrepare.fit_workers]runtime.kv.attention_match.Backend = undefined;
+        if (head_workspace_bytes != 0) {
+            for (metal_fitters[0..fit_workers], fit_backends[0..fit_workers]) |*fitter, *backend| {
+                fitter.* = try Fitter.initWorker(
+                    self.allocator,
+                    source_storage.ownerAllocationTracker(),
+                    fit_host_bytes,
+                    head_workspace_bytes,
+                );
+                metal_fitter_count += 1;
+                backend.* = fitter.backend();
+            }
+        }
+        var options = NativeCheckpointPrepare.fittingOptions();
+        options.independent_fp64_publication = true;
+        options.fp8_checkpoint = request.encoding == .fp8;
+        options.stats = &stats;
+        options.fit.control = control;
+        if (metal_fitter_count != 0) options.fit.backend = fit_backends[0];
+        options.max_parallel_validations = 1;
+        options.max_transient_host_bytes = fit_host_bytes;
+        options.min_global_savings_ratio = request.minimum_savings_ratio;
+        options.rejected_head_policy = .preserve_original;
+        const source_has_metadata = (try compute.installedAttentionMatchActivity(
+            source_storage,
+            source.sequence_id orelse return error.UnsupportedAttentionMatchRoute,
+        )) != null;
+        options.source_has_metadata = source_has_metadata;
+        const layout: engine.Layout = .{
+            .query_heads_by_layer = query_heads[0..original.state.layer_donors.len],
+            .scales_by_donor = scales[0..original.state.donors.len],
+            .softcaps_by_donor = caps[0..original.state.donors.len],
+        };
+        const fit_queries = try queries.finish();
+        var candidate = (if (metal_fitter_count > 1)
+            engine.prepareParallel(original.state, fit_queries, layout, options, fit_backends[0..metal_fitter_count])
+        else
+            engine.prepare(self.allocator, original.state, fit_queries, layout, options)) catch |err| {
+            if (err == error.CompactionSavingsInsufficient) {
+                try control.check();
+                request.result = .{
+                    .checkpoint = original,
+                    .outcome = .unchanged_insufficient_savings,
+                    .stats = stats,
+                    .source_host_bytes = source_host_bytes,
+                    .query_ns = query_ns,
+                    .snapshot_ns = snapshot_ns,
+                    .fit_ns = mtpProfileElapsedNs(true, self.io, fit_started),
+                };
+                original_live = false;
+                return stats;
+            }
+            return err;
+        };
+        // All Metal calls are synchronous. Retire the independent runtimes and
+        // their tracked dummy buffers before physical savings validation and
+        // candidate publication; error paths retain the defer above.
+        for (metal_fitters[0..metal_fitter_count]) |*fitter| fitter.deinit();
+        metal_fitter_count = 0;
+        var candidate_live = true;
+        defer if (candidate_live) candidate.deinit();
+        // The common engine's logical storage estimate is backend-neutral.
+        // Installed Metal matching state uses explicitly page-rounded shared
+        // K/V, metadata, and FP8 buffers. An ordinary exact source instead has
+        // two combined-head private buffers whose allocatedSize may equal the
+        // bare payload. Use the conservative representation-specific cost
+        // before the immutable source snapshot can be released.
+        const source_global_bytes = if (source_has_metadata)
+            try metal_attention_storage.globalAllocationBytesWithControl(original.state, limits, control)
+        else
+            try metal_attention_storage.ordinaryGlobalAllocationBytesWithControl(original.state, limits, control);
+        const candidate_global_bytes = try metal_attention_storage.globalAllocationBytesWithControl(candidate.state, limits, control);
+        const actual_global_savings_ratio = if (candidate_global_bytes == 0)
+            @as(f64, 1)
+        else
+            @as(f64, @floatFromInt(source_global_bytes)) / @as(f64, @floatFromInt(candidate_global_bytes));
+        stats.source_global_bytes = source_global_bytes;
+        stats.candidate_global_bytes = candidate_global_bytes;
+        stats.actual_global_savings_ratio = actual_global_savings_ratio;
+        if (actual_global_savings_ratio < request.minimum_savings_ratio) {
+            candidate.deinit();
+            candidate_live = false;
+            try control.check();
+            request.result = .{
+                .checkpoint = original,
+                .outcome = .unchanged_insufficient_savings,
+                .stats = stats,
+                .source_host_bytes = source_host_bytes,
+                .query_ns = query_ns,
+                .snapshot_ns = snapshot_ns,
+                .fit_ns = mtpProfileElapsedNs(true, self.io, fit_started),
+            };
+            original_live = false;
+            return stats;
+        }
+        const guard: checkpoint.Store = .{ .current = original, .generation = source_revision };
+        try guard.validateCompactionWithControl(candidate.state, source_revision, limits, control);
+        original.deinit();
+        original_live = false;
+        try control.check();
+        request.result = .{
+            .checkpoint = candidate,
+            .outcome = .compacted,
+            .stats = stats,
+            .source_host_bytes = source_host_bytes,
+            .query_ns = query_ns,
+            .snapshot_ns = snapshot_ns,
+            .fit_ns = mtpProfileElapsedNs(true, self.io, fit_started),
+        };
+        candidate_live = false;
+        return stats;
+    }
+
     fn probeAttentionMatchFit(
         self: *NativeGenerationPipeline,
         tokens: []const i64,
@@ -4382,6 +5482,12 @@ pub const NativeGenerationPipeline = struct {
         query_ns: u64,
         probe_options: AttentionMatchFitProbeOptions,
     ) !runtime.kv.attention_match_engine.Stats {
+        if (self.cb.kind() == .metal) {
+            if (comptime build_options.enable_metal) {
+                const request = probe_options.prepare_request orelse return error.UnsupportedCompactionQueryRoute;
+                return self.prepareMetalAttentionMatchFit(tokens, logits, source, queries, query_ns, request);
+            } else return error.UnsupportedCompactionQueryRoute;
+        }
         if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
         if (self.cb.kind() != .cuda or self.kv_dtype != .f16) return error.UnsupportedCompactionQueryDType;
         if (self.execution_lock) |mutex| try self.lockExecution(mutex);
@@ -4672,12 +5778,12 @@ pub const NativeGenerationPipeline = struct {
         fn initEmpty(self: *@This(), pipeline: *NativeGenerationPipeline) !void {
             if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
             const dtype = pipeline.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
-            if (pipeline.cb.kind() != .cuda or dtype != .f16) return error.UnsupportedCompactionQueryRoute;
+            if ((pipeline.cb.kind() != .cuda and pipeline.cb.kind() != .metal) or dtype != .f16) return error.UnsupportedCompactionQueryRoute;
             if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
             defer if (pipeline.execution_lock) |mutex| mutex.unlock();
             self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
             errdefer self.deinit();
-            const config = attentionMatchCheckpointPoolConfig(dtype, pipeline.gpt_config);
+            const config = attentionMatchCheckpointPoolConfig(if (pipeline.cb.kind() == .metal) .metal else .cuda, dtype, pipeline.gpt_config);
             const pool = try self.manager.?.addPool(config);
             self.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(pipeline.allocator, config);
             try pipeline.cb.provisionKvDeviceWriteHook(&self.storage.?);
@@ -4690,7 +5796,7 @@ pub const NativeGenerationPipeline = struct {
         fn init(self: *@This(), pipeline: *NativeGenerationPipeline, source: *const NativeDecodeState, capacity: usize) !void {
             if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
             const dtype = pipeline.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
-            if (pipeline.cb.kind() != .cuda or dtype != .f16 or !source.isPaged() or source.isKvCompacted()) return error.UnsupportedCompactionQueryRoute;
+            if ((pipeline.cb.kind() != .cuda and pipeline.cb.kind() != .metal) or dtype != .f16 or !source.isPaged() or source.isKvCompacted()) return error.UnsupportedCompactionQueryRoute;
             const source_storage = source.kv_storage orelse return error.UnsupportedCompactionQueryRoute;
             const view = source.kv_view orelse return error.UnsupportedCompactionQueryRoute;
             if (view.position_offset != 0 or view.token_count != source.total_tokens or source.sequence_id != view.sequence_id or capacity < source.total_tokens or capacity > native_kv_checkpoint.max_context_tokens) return error.InvalidCompactionProbe;
@@ -4707,7 +5813,7 @@ pub const NativeGenerationPipeline = struct {
             defer if (pipeline.execution_lock) |mutex| mutex.unlock();
             self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
             errdefer self.deinit();
-            var config = kvPoolConfig(.cuda, dtype, pipeline.gpt_config, false);
+            var config = kvPoolConfig(if (pipeline.cb.kind() == .metal) .metal else .cuda, dtype, pipeline.gpt_config, false);
             config.store_cpu_bytes = false;
             config.sliding_window_size = null;
             const pool = try self.manager.?.addPool(config);
@@ -4732,12 +5838,25 @@ pub const NativeGenerationPipeline = struct {
                 .check_ctx = pipeline,
                 .check_fn = checkAttentionMatchQueryWork,
             };
-            const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(pipeline.cb.ptr));
-            if ((try cuda_compute.installedAttentionMatchActivity(compute, source_storage, view.sequence_id)) != null) {
-                _ = (try cuda_compute.cloneInstalledAttentionMatch(compute, &self.storage.?, source_storage, clone_request)) orelse return error.UnsupportedAttentionMatchRoute;
-            } else {
+            const cloned_fitted = switch (pipeline.cb.kind()) {
+                .cuda => if (comptime build_options.enable_cuda) blk: {
+                    const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(pipeline.cb.ptr));
+                    break :blk if ((try cuda_compute.installedAttentionMatchActivity(compute, source_storage, view.sequence_id)) != null)
+                        (try cuda_compute.cloneInstalledAttentionMatch(compute, &self.storage.?, source_storage, clone_request)) orelse return error.UnsupportedAttentionMatchRoute
+                    else
+                        null;
+                } else null,
+                .metal => if (comptime build_options.enable_metal) blk: {
+                    const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(pipeline.cb.ptr));
+                    break :blk if ((try compute.installedAttentionMatchActivity(source_storage, view.sequence_id)) != null)
+                        (try compute.cloneInstalledAttentionMatch(&self.storage.?, source_storage, clone_request)) orelse return error.UnsupportedAttentionMatchRoute
+                    else
+                        null;
+                } else null,
+                else => null,
+            };
+            if (cloned_fitted == null)
                 _ = try hook.cloneExactPrefix(source_storage.device_write_hook orelse return error.UnsupportedCompactionQueryRoute, clone_request);
-            }
         }
     };
 
@@ -4900,7 +6019,7 @@ pub const NativeGenerationPipeline = struct {
         limits: runtime.kv.attention_match_checkpoint.Limits,
         max_host_bytes: usize,
     ) !runtime.kv.attention_match_checkpoint.Owned {
-        if (self.cb.kind() != .cuda or self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or
+        if ((self.cb.kind() != .cuda and self.cb.kind() != .metal) or self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or
             self.graph_cache != null or self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null or
             !source.isPaged() or source.isKvCompacted() or source.total_tokens != tokens.len or
             logits.len != self.gpt_config.vocab_size or self.gpt_config.num_hidden_layers > 256)
@@ -4939,9 +6058,16 @@ pub const NativeGenerationPipeline = struct {
             .max_host_bytes = max_host_bytes,
             .control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork },
         };
-        if (comptime build_options.enable_cuda) {
-            const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
-            if (try cuda_compute.snapshotInstalledAttentionMatch(compute, storage, self.allocator, request)) |snapshot| return snapshot;
+        switch (self.cb.kind()) {
+            .cuda => if (comptime build_options.enable_cuda) {
+                const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                if (try cuda_compute.snapshotInstalledAttentionMatch(compute, storage, self.allocator, request)) |snapshot| return snapshot;
+            },
+            .metal => if (comptime build_options.enable_metal) {
+                const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+                if (try compute.snapshotInstalledAttentionMatch(storage, self.allocator, request)) |snapshot| return snapshot;
+            },
+            else => return error.UnsupportedKvSnapshotLayout,
         }
         return runtime.kv.attention_match_snapshot.capture(self.allocator, request, try hook.attentionMatchReader());
     }
@@ -4962,18 +6088,20 @@ pub const NativeGenerationPipeline = struct {
         defer if (options.stats) |stats| {
             if (cleanup_started) |started| stats.cleanup_ns = mtpProfileElapsedNs(true, self.io, started);
         };
-        if (self.cb.kind() != .cuda or self.gpt_config.family != .gemma or
+        if ((self.cb.kind() != .cuda and self.cb.kind() != .metal) or self.gpt_config.family != .gemma or
             !self.gpt_config.usesGemma4Channels()) return error.UnsupportedCompactionQueryModel;
+        if (self.cb.kind() == .metal and options.repeat_mode != .reference)
+            return error.UnsupportedCompactionQueryRoute;
         if (self.graph_cache != null or
             self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null)
             return error.UnsupportedCompactionQueryRoute;
         // Graph and pinned-temporary state belongs to the live request. Never
         // reset it or accidentally capture pointers to short-lived shadow KV.
         const replay = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") orelse "off";
-        if (!std.mem.eql(u8, replay, "off") or cudaReplayLastLogitsEnabled() or
+        if (self.cb.kind() == .cuda and (!std.mem.eql(u8, replay, "off") or cudaReplayLastLogitsEnabled() or
             (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse 0) != 0 or
             (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD") orelse 0) != 0 or
-            platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"))
+            platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN")))
             return error.UnsupportedCompactionQueryReplay;
         const dtype = self.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
         if (dtype != .f16 and dtype != .f32) return error.UnsupportedCompactionQueryDType;
@@ -5025,9 +6153,16 @@ pub const NativeGenerationPipeline = struct {
         errdefer collector.deinit();
         if (self.execution_lock) |mutex| try self.lockExecution(mutex);
         defer if (self.execution_lock) |mutex| mutex.unlock();
+        if (comptime build_options.enable_metal) {
+            if (self.cb.kind() == .metal) {
+                const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+                try compute.synchronizeAttentionMatchKv();
+                try checkAttentionMatchQueryWork(self);
+            }
+        }
         var manager = runtime.kv.manager.KvManager.init(self.allocator);
         defer manager.deinit();
-        var pool_config = kvPoolConfig(.cuda, dtype, self.gpt_config, false);
+        var pool_config = kvPoolConfig(if (self.cb.kind() == .metal) .metal else .cuda, dtype, self.gpt_config, false);
         pool_config.store_cpu_bytes = false;
         pool_config.sliding_window_size = null;
         const pool_id = try manager.addPool(pool_config);
@@ -5055,10 +6190,17 @@ pub const NativeGenerationPipeline = struct {
             const source_blocks = source_view.logical_blocks orelse return error.UnsupportedDeviceKvCloneLayout;
             try shadow.notePrefill(source_tokens.len);
             const clone_request: runtime.kv.device_clone.Request = .{ .source_sequence = source_view.sequence_id, .destination_sequence = shadow.sequence_id.?, .tokens = source_tokens.len, .capacity = shadow_rows, .page_size = pool_config.page_size_tokens, .source_blocks = source_blocks, .destination_blocks = shadow.kv_block_ids.items, .donors = donors[0..donor_count], .max_bytes = options.max_shadow_kv_bytes, .check_ctx = self, .check_fn = checkAttentionMatchQueryWork };
-            const fitted_clone = if (comptime build_options.enable_cuda) blk: {
-                const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
-                break :blk try cuda_compute.cloneInstalledAttentionMatch(compute, &storage, source_storage, clone_request);
-            } else null;
+            const fitted_clone = switch (self.cb.kind()) {
+                .cuda => if (comptime build_options.enable_cuda) blk: {
+                    const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                    break :blk try cuda_compute.cloneInstalledAttentionMatch(compute, &storage, source_storage, clone_request);
+                } else null,
+                .metal => if (comptime build_options.enable_metal) blk: {
+                    const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+                    break :blk try compute.cloneInstalledAttentionMatch(&storage, source_storage, clone_request);
+                } else null,
+                else => null,
+            };
             const clone = if (fitted_clone) |value| blk: {
                 // The reference mode follows the installed bias/coverage-aware
                 // backend. Dense exact-repeat kernel options cannot describe it.
@@ -5073,16 +6215,19 @@ pub const NativeGenerationPipeline = struct {
             }
         } else if (options.stats) |stats| stats.shadow_allocation_bound_bytes = shadow_kv_bytes;
         const first_pass: usize = if (options.prefix_mode == .clone) 1 else 0;
-        const profile_repeat = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_PROFILE_PREFILL_OPS");
+        const profile_repeat = self.cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_PROFILE_PREFILL_OPS");
         for (first_pass..2) |pass| {
             var capture_metrics = gpt_arch.DecodeContext.SelectionQueryCapture.Metrics{};
             const profile_before = if (comptime build_options.enable_cuda) blk: {
-                const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
-                break :blk if (profile_repeat) compute.attentionMatchProfile() else cuda_compute.CudaCompute.AttentionMatchProfile{};
+                if (self.cb.kind() == .cuda and profile_repeat) {
+                    const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                    break :blk compute.attentionMatchProfile();
+                }
+                break :blk cuda_compute.CudaCompute.AttentionMatchProfile{};
             } else {};
             var repeat_scope: if (build_options.enable_cuda) ?cuda_compute.CudaCompute.AttentionMatchRepeatScope else ?void = null;
             if (comptime build_options.enable_cuda) {
-                if (pass == 1 and options.repeat_mode != .reference and !ragged_shadow) {
+                if (self.cb.kind() == .cuda and pass == 1 and options.repeat_mode != .reference and !ragged_shadow) {
                     const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
                     repeat_scope = try compute.beginAttentionMatchRepeat(options.repeat_mode == .exact_split, options.chunk_size);
                     compute.kernels.attention_match_repeat_check_ctx = self;
@@ -5110,13 +6255,22 @@ pub const NativeGenerationPipeline = struct {
                 try gpt_arch.forwardHiddenOnly(&self.cb, self.allocator, self.gpt_config, pass_tokens[offset..end], 1, shadow.total_tokens, &context);
                 offset = end;
             }
+            if (ragged_shadow) {
+                const activity = switch (self.cb.kind()) {
+                    .cuda => if (comptime build_options.enable_cuda) activity: {
+                        const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                        break :activity (try cuda_compute.installedAttentionMatchActivity(compute, &storage, shadow.sequence_id.?)) orelse return error.UnsupportedCompactionQueryRoute;
+                    } else return error.UnsupportedCompactionQueryRoute,
+                    .metal => if (comptime build_options.enable_metal) activity: {
+                        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+                        break :activity (try compute.installedAttentionMatchActivity(&storage, shadow.sequence_id.?)) orelse return error.UnsupportedCompactionQueryRoute;
+                    } else return error.UnsupportedCompactionQueryRoute,
+                    else => return error.UnsupportedCompactionQueryRoute,
+                };
+                if (activity.invalid or activity.attention_calls == 0 or activity.donor_appends == 0) return error.UnsupportedCompactionQueryRoute;
+                if (options.stats) |stats| stats.ragged_repeat_calls = activity.attention_calls;
+            }
             if (comptime build_options.enable_cuda) {
-                if (ragged_shadow) {
-                    const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
-                    const activity = (try cuda_compute.installedAttentionMatchActivity(compute, &storage, shadow.sequence_id.?)) orelse return error.UnsupportedCompactionQueryRoute;
-                    if (activity.invalid or activity.attention_calls == 0 or activity.donor_appends == 0) return error.UnsupportedCompactionQueryRoute;
-                    if (options.stats) |stats| stats.ragged_repeat_calls = activity.attention_calls;
-                }
                 if (repeat_scope) |scope| {
                     const launches = scope.compute.kernels.attention_match_repeat_launches;
                     if (launches == 0) return error.UnsupportedCompactionQueryRoute;
@@ -5131,7 +6285,7 @@ pub const NativeGenerationPipeline = struct {
                 }
             }
             if (comptime build_options.enable_cuda) {
-                if (profile_repeat) {
+                if (self.cb.kind() == .cuda and profile_repeat) {
                     const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
                     const after = compute.attentionMatchProfile();
                     std.log.info("attention_match_phase phase={s} repeat_mode={s} attention_us={d} other_gpu_us={d} downloads={d} download_bytes={d} allocations={d} events={d} capture_calls={d} capture_bytes={d} capture_host_wait_ns={d} capture_callback_ns={d}", .{
@@ -5234,23 +6388,444 @@ pub const NativeGenerationPipeline = struct {
         return self.generateWithCallback(messages, config, on_token, on_token_ctx);
     }
 
+    fn runCompactionReplay(ctx: *anyopaque, hook: runtime.kv.context_session.Hook, position: usize, ids: []const i64) !void {
+        const self: *NativeGenerationPipeline = @ptrCast(@alignCast(ctx));
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        if (self.execution_control) |control| try control.check();
+        const dc = gpt_arch.DecodeContext{ .context_session = hook, .attention_mode = .paged_prefill, .total_sequence_len = position + ids.len, .query_sequence_len = ids.len, .kv_sequence_len = position + ids.len };
+        var cb = self.cb;
+        cb.execution_control = self.execution_control orelse cb.execution_control;
+        try gpt_arch.forwardHiddenOnly(&cb, self.allocator, self.gpt_config, ids, 1, position + ids.len, &dc);
+    }
+
+    const CompactionStudyForwardContext = struct {
+        pipeline: *NativeGenerationPipeline,
+        singleton_paged_decode: bool,
+        decode_start: u32,
+    };
+
+    fn compactionStudyAttentionMode(adapter: *const CompactionStudyForwardContext, hook: runtime.kv.context_session.Hook, position: u32, rows: usize) !gpt_arch.DecodeContext.AttentionMode {
+        if (!adapter.singleton_paged_decode or rows != 1 or position < adapter.decode_start) return .paged_prefill;
+        // The explicit qualification route must be able to keep attention in
+        // the owning model frame. Reject before forwarding or mutating the
+        // private hook; never silently benchmark synchronous legacy attention.
+        if (!hook.supportsFramedAttention()) return error.ContextFramedExecutionUnsupported;
+        return .paged_decode;
+    }
+
+    fn runCompactionStudyHidden(ctx: *anyopaque, allocator: std.mem.Allocator, hook: runtime.kv.context_session.Hook, position: u32, ids: []const i64) !void {
+        const adapter: *CompactionStudyForwardContext = @ptrCast(@alignCast(ctx));
+        const self = adapter.pipeline;
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        var cb = self.cb;
+        cb.execution_control = self.execution_control orelse cb.execution_control;
+        try cb.checkExecutionControl();
+        const end = try std.math.add(usize, position, ids.len);
+        const mode = try compactionStudyAttentionMode(adapter, hook, position, ids.len);
+        const dc = gpt_arch.DecodeContext{ .context_session = hook, .attention_mode = mode, .qualification_require_context_decode_frame = mode == .paged_decode, .total_sequence_len = end, .query_sequence_len = ids.len, .kv_sequence_len = end };
+        try gpt_arch.forwardHiddenOnly(&cb, allocator, self.gpt_config, ids, 1, end, &dc);
+        try cb.checkExecutionControl();
+    }
+
+    fn runCompactionStudyLogits(ctx: *anyopaque, allocator: std.mem.Allocator, hook: runtime.kv.context_session.Hook, position: u32, ids: []const i64) ![]f32 {
+        // The private runner requests exactly one row. Reject a larger slice
+        // rather than materializing a vocabulary projection per prefill token.
+        if (ids.len != 1) return error.InvalidStudyChunk;
+        const adapter: *CompactionStudyForwardContext = @ptrCast(@alignCast(ctx));
+        const self = adapter.pipeline;
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        var cb = self.cb;
+        cb.execution_control = self.execution_control orelse cb.execution_control;
+        try cb.checkExecutionControl();
+        const end = try std.math.add(usize, position, 1);
+        const mode = try compactionStudyAttentionMode(adapter, hook, position, 1);
+        const dc = gpt_arch.DecodeContext{ .context_session = hook, .attention_mode = mode, .qualification_require_context_decode_frame = mode == .paged_decode, .total_sequence_len = end, .query_sequence_len = 1, .kv_sequence_len = end };
+        const logits = try gpt_arch.forward(&cb, allocator, self.gpt_config, ids, 1, end, &dc);
+        errdefer allocator.free(logits);
+        try cb.checkExecutionControl();
+        return logits;
+    }
+
+    fn runCompactionStudyPreparedToken(ctx: *anyopaque, allocator: std.mem.Allocator, hook: runtime.kv.context_session.Hook, position: u32, token: i64, require_output: bool) !?i64 {
+        const adapter: *CompactionStudyForwardContext = @ptrCast(@alignCast(ctx));
+        if (!adapter.singleton_paged_decode or position < adapter.decode_start)
+            return error.PreparedStudyRouteUnsupported;
+        const self = adapter.pipeline;
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        var cb = self.cb;
+        cb.execution_control = self.execution_control orelse cb.execution_control;
+        try cb.checkExecutionControl();
+        const end = try std.math.add(usize, position, 1);
+        const mode = try compactionStudyAttentionMode(adapter, hook, position, 1);
+        if (mode != .paged_decode) return error.PreparedStudyRouteUnsupported;
+        const dc = gpt_arch.DecodeContext{
+            .context_session = hook,
+            .attention_mode = .paged_decode,
+            .qualification_require_context_decode_frame = true,
+            .total_sequence_len = end,
+            .query_sequence_len = 1,
+            .kv_sequence_len = end,
+            .gemma4_layer_spec_cache = if (self.decode_state) |state| &state.gemma4_layer_spec_cache else null,
+        };
+        const result = try decoder_gated_runtime.forwardQualificationPreparedGreedyToken(
+            &cb,
+            allocator,
+            self.gpt_config,
+            self.gpt_config.num_hidden_layers,
+            token,
+            end,
+            &dc,
+            require_output,
+        );
+        try cb.checkExecutionControl();
+        return result;
+    }
+
+    fn runCompactionStudyConfigured(
+        self: *NativeGenerationPipeline,
+        allocator: std.mem.Allocator,
+        hook: runtime.kv.context_session.Hook,
+        prefix: []const i64,
+        response_tokens: u32,
+        options: @import("../backends/compaction_coordinator.zig").CampaignStudyExecutionOptions,
+        output_tokens: ?[]i64,
+    ) !context_study_runner.Receipt {
+        if (output_tokens != null and !@import("builtin").is_test) return error.InvalidStudyCapture;
+        const logical_limit = std.math.cast(u32, hook.plan.logical_token_limit) orelse return error.InvalidStudyGeneration;
+        const response_start = std.math.sub(u32, logical_limit, response_tokens) catch return error.InvalidStudyGeneration;
+        var adapter = CompactionStudyForwardContext{
+            .pipeline = self,
+            .singleton_paged_decode = options.singleton_paged_decode,
+            // A singleton remainder in the hidden prefix is still prefill.
+            // Only the final prefix-logits token and generated tokens belong
+            // to the response_tokens + 1 qualification decode count.
+            .decode_start = std.math.sub(u32, response_start, 1) catch return error.InvalidStudyGeneration,
+        };
+        return context_study_runner.runWithCapture(allocator, .{
+            .ctx = &adapter,
+            .hidden_fn = runCompactionStudyHidden,
+            .logits_fn = runCompactionStudyLogits,
+            .prepared_token_fn = if (options.singleton_paged_decode) runCompactionStudyPreparedToken else null,
+        }, hook, prefix, response_tokens, std.math.cast(u32, self.gpt_config.vocab_size) orelse return error.InvalidStudyGeneration, if (self.execution_control) |*control| control else null, output_tokens);
+    }
+
+    /// The coordinator supplies an isolated hook and provenance-validated
+    /// study prefix. Generated tokens never enter serving history or callbacks.
+    pub fn runCompactionStudy(self: *NativeGenerationPipeline, allocator: std.mem.Allocator, hook: runtime.kv.context_session.Hook, prefix: []const i64, response_tokens: u32) !context_study_runner.Receipt {
+        return self.runCompactionStudyConfigured(allocator, hook, prefix, response_tokens, .{}, null);
+    }
+
+    /// Bounded observation for installed-artifact qualification. It shares the
+    /// exact private generation loop; it cannot emit serving tokens or usage.
+    pub fn runCompactionStudyCaptured(self: *NativeGenerationPipeline, allocator: std.mem.Allocator, hook: runtime.kv.context_session.Hook, prefix: []const i64, response_tokens: u32, output_tokens: []i64) !context_study_runner.Receipt {
+        return self.runCompactionStudyConfigured(allocator, hook, prefix, response_tokens, .{}, output_tokens);
+    }
+
+    test "context private study singleton paged decode is explicit and framed" {
+        const Probe = struct {
+            fn next(_: *anyopaque, _: u64, _: u32, requested: u32) !u32 {
+                return requested;
+            }
+            fn attention(_: *anyopaque, _: u64, _: runtime.kv.context_session.Attention, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef) !void {}
+            fn framed(_: *anyopaque, _: u64, _: runtime.kv.context_session.Frame, _: runtime.kv.context_session.Attention, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef) !void {}
+            const legacy = runtime.kv.context_session.Hook.VTable{ .next_chunk = next, .attention = attention };
+            const framed_hook = runtime.kv.context_session.Hook.VTable{ .next_chunk = next, .attention = attention, .attention_framed = framed };
+        };
+        var marker: u8 = 0;
+        var adapter: CompactionStudyForwardContext = undefined;
+        adapter.singleton_paged_decode = false;
+        adapter.decode_start = 8;
+        var hook = runtime.kv.context_session.Hook{ .ctx = &marker, .identity = 1, .plan = undefined, .vtable = &Probe.legacy };
+        try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.paged_prefill, try compactionStudyAttentionMode(&adapter, hook, 8, 1));
+        adapter.singleton_paged_decode = true;
+        try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.paged_prefill, try compactionStudyAttentionMode(&adapter, hook, 8, 2));
+        try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.paged_prefill, try compactionStudyAttentionMode(&adapter, hook, 7, 1));
+        try std.testing.expectError(error.ContextFramedExecutionUnsupported, compactionStudyAttentionMode(&adapter, hook, 8, 1));
+        hook.vtable = &Probe.framed_hook;
+        try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.paged_decode, try compactionStudyAttentionMode(&adapter, hook, 8, 1));
+    }
+
+    fn monotonicStudyDelta(comptime T: type, before: T, after: T) ?T {
+        return std.math.sub(T, after, before) catch null;
+    }
+
+    fn compactionStudyProviderDelta(before_snapshot: ops.BackendDebugTimingSnapshot, after_snapshot: ops.BackendDebugTimingSnapshot) ?@import("../backends/compaction_coordinator.zig").StudyProviderDelta {
+        if (before_snapshot.native_quant_null or after_snapshot.native_quant_null) return null;
+        const before = before_snapshot.provider;
+        const after = after_snapshot.provider;
+        return .{
+            .frame_begins = monotonicStudyDelta(u64, before.decoder_runtime_frame_begins, after.decoder_runtime_frame_begins) orelse return null,
+            .frame_submits = monotonicStudyDelta(u64, before.decoder_runtime_frame_submits, after.decoder_runtime_frame_submits) orelse return null,
+            .frame_wait_ns = monotonicStudyDelta(u128, before.decoder_runtime_frame_wait_nanos, after.decoder_runtime_frame_wait_nanos) orelse return null,
+            .frame_gpu_ns = monotonicStudyDelta(u128, before.decoder_runtime_frame_gpu_nanos, after.decoder_runtime_frame_gpu_nanos) orelse return null,
+            .compute_encoders = monotonicStudyDelta(u64, before.metal_runtime_compute_encoder_count, after.metal_runtime_compute_encoder_count) orelse return null,
+            .blit_encoders = monotonicStudyDelta(u64, before.metal_runtime_blit_encoder_count, after.metal_runtime_blit_encoder_count) orelse return null,
+            .precomputed_tail_blocks = monotonicStudyDelta(u64, before.context_precomputed_tail_blocks, after.context_precomputed_tail_blocks) orelse return null,
+            .precomputed_tail_failures = monotonicStudyDelta(u64, before.context_precomputed_tail_failures, after.context_precomputed_tail_failures) orelse return null,
+            .paged_attention_1x_calls = monotonicStudyDelta(u64, before.metal_runtime_paged_attention_1x_calls, after.metal_runtime_paged_attention_1x_calls) orelse return null,
+            .context_session_paged_decode_framed_dispatches = monotonicStudyDelta(u64, before.context_session_paged_decode_framed_dispatches, after.context_session_paged_decode_framed_dispatches) orelse return null,
+            .decode_gqa_split_calls = monotonicStudyDelta(u64, before.metal_runtime_decode_gqa_split_calls, after.metal_runtime_decode_gqa_split_calls) orelse return null,
+            .generated_attention_decode_1x_calls = monotonicStudyDelta(u64, before.metal_runtime_generated_attention_decode_1x_calls, after.metal_runtime_generated_attention_decode_1x_calls) orelse return null,
+            .generated_attention_flash_prefill_calls = monotonicStudyDelta(u64, before.metal_runtime_generated_attention_flash_prefill_calls, after.metal_runtime_generated_attention_flash_prefill_calls) orelse return null,
+            .attention_prefill_direct_kv_calls = monotonicStudyDelta(u64, before.metal_runtime_attention_prefill_direct_kv_calls, after.metal_runtime_attention_prefill_direct_kv_calls) orelse return null,
+            .attention_prefill_paged_kv_calls = monotonicStudyDelta(u64, before.metal_runtime_attention_prefill_paged_kv_calls, after.metal_runtime_attention_prefill_paged_kv_calls) orelse return null,
+            .to_host_calls = monotonicStudyDelta(u64, before.metal_tensor_to_host_calls, after.metal_tensor_to_host_calls) orelse return null,
+            .to_host_device_calls = monotonicStudyDelta(u64, before.metal_tensor_to_host_device_calls, after.metal_tensor_to_host_device_calls) orelse return null,
+            .host_download_bytes = monotonicStudyDelta(u64, before.metal_tensor_host_mirror_download_bytes, after.metal_tensor_host_mirror_download_bytes) orelse return null,
+        };
+    }
+
+    fn compactionCampaignProviderSnapshot(ctx: *anyopaque) ?@import("../backends/compaction_coordinator.zig").StudyProviderSnapshot {
+        const self: *NativeGenerationPipeline = @ptrCast(@alignCast(ctx));
+        const snapshot = self.cb.debugTimingSnapshot();
+        if (snapshot.native_quant_null) return null;
+        const provider = snapshot.provider;
+        return .{ .frame_begins = provider.decoder_runtime_frame_begins, .frame_submits = provider.decoder_runtime_frame_submits, .frame_wait_ns = provider.decoder_runtime_frame_wait_nanos, .frame_gpu_ns = provider.decoder_runtime_frame_gpu_nanos, .compute_encoders = provider.metal_runtime_compute_encoder_count, .blit_encoders = provider.metal_runtime_blit_encoder_count, .precomputed_tail_blocks = provider.context_precomputed_tail_blocks, .precomputed_tail_failures = provider.context_precomputed_tail_failures, .paged_attention_1x_calls = provider.metal_runtime_paged_attention_1x_calls, .context_session_paged_decode_framed_dispatches = provider.context_session_paged_decode_framed_dispatches, .decode_gqa_split_calls = provider.metal_runtime_decode_gqa_split_calls, .generated_attention_decode_1x_calls = provider.metal_runtime_generated_attention_decode_1x_calls, .generated_attention_flash_prefill_calls = provider.metal_runtime_generated_attention_flash_prefill_calls, .attention_prefill_direct_kv_calls = provider.metal_runtime_attention_prefill_direct_kv_calls, .attention_prefill_paged_kv_calls = provider.metal_runtime_attention_prefill_paged_kv_calls, .to_host_calls = provider.metal_tensor_to_host_calls, .to_host_device_calls = provider.metal_tensor_to_host_device_calls, .host_download_bytes = provider.metal_tensor_host_mirror_download_bytes };
+    }
+
+    fn runCompactionCampaignStudy(ctx: *anyopaque, allocator: std.mem.Allocator, hook: runtime.kv.context_session.Hook, prefix: []const i64, response_tokens: u32, options: @import("../backends/compaction_coordinator.zig").CampaignStudyExecutionOptions, captured_tokens: ?[]i64) !@import("../backends/compaction_coordinator.zig").CampaignStudyReceipt {
+        const self: *NativeGenerationPipeline = @ptrCast(@alignCast(ctx));
+        const provider_before = if (captured_tokens != null) self.cb.debugTimingSnapshot() else undefined;
+        const receipt = if (captured_tokens) |tokens|
+            try self.runCompactionStudyConfigured(allocator, hook, prefix, response_tokens, options, tokens)
+        else
+            try self.runCompactionStudyConfigured(allocator, hook, prefix, response_tokens, options, null);
+        const provider_delta = if (captured_tokens != null)
+            compactionStudyProviderDelta(provider_before, self.cb.debugTimingSnapshot())
+        else
+            null;
+        return .{
+            .session_identity = receipt.session_identity,
+            .prefill_tokens = receipt.prefill_tokens,
+            .generated_tokens = receipt.generated_tokens,
+            .generated_tokens_sha256 = receipt.generated_tokens_sha256,
+            .study_timing = if (receipt.timing) |timing| .{
+                .prefill_hidden_ns = timing.prefill_hidden_ns,
+                .initial_logits_ns = timing.initial_logits_ns,
+                .generated_loop_ns = timing.generated_loop_ns,
+            } else null,
+            .provider_delta = provider_delta,
+            .singleton_paged_decode_forwards = if (options.singleton_paged_decode)
+                try std.math.add(u32, response_tokens, 1)
+            else
+                0,
+            .singleton_paged_decode_expected_layer_dispatches = if (options.singleton_paged_decode)
+                try std.math.mul(u64, try std.math.add(u64, @as(u64, response_tokens), 1), std.math.cast(u64, self.gpt_config.num_hidden_layers) orelse return error.InvalidStudyGeneration)
+            else
+                0,
+        };
+    }
+
+    /// Serving and installed-artifact capture use the same native branch
+    /// adapters, execution control, and fixed-length generation loop.
+    pub fn compactionCampaignRunner(self: *NativeGenerationPipeline) @import("../backends/compaction_coordinator.zig").CampaignRunner {
+        return self.compactionCampaignRunnerWithFault(if (@import("builtin").is_test) null else {});
+    }
+
+    pub fn compactionCampaignRunnerWithFault(self: *NativeGenerationPipeline, fault_controller: context_fault_injection.Slot) @import("../backends/compaction_coordinator.zig").CampaignRunner {
+        return .{ .ctx = self, .replay_fn = runCompactionReplay, .study_fn = runCompactionCampaignStudy, .provider_snapshot_fn = if (@import("builtin").is_test) compactionCampaignProviderSnapshot else null, .fault_controller = fault_controller };
+    }
+
+    /// Test-only installed-model seam. The caller supplies the already-prefilled
+    /// live packed Session; this method contributes only this loaded pipeline's
+    /// genuine replay/study runner and load-generation identity.
+    pub fn runStoredInstalledDiagnostic(
+        self: *NativeGenerationPipeline,
+        live: *@import("../backends/packed_context_session.zig").Session,
+        prompt: []const i64,
+        request: *@import("../backends/context_stored_installed_invocation.zig").Request,
+    ) !void {
+        if (!@import("builtin").is_test) return error.UnqualifiedCompactionArtifact;
+        try request.run(live, prompt, self.load_generation, self.compactionCampaignRunner());
+    }
+
+    /// Qualification-only packed prefill. This uses the production prefill
+    /// chunk/admission loop but requests KV-only output for every chunk,
+    /// including the final row, so capture never allocates prompt-sized
+    /// vocabulary logits. The loaded model, packed hook, and execution lease
+    /// are supplied by the installed-model test and remain externally owned.
+    pub fn runCompactionCapturePrefill(
+        self: *NativeGenerationPipeline,
+        prompt_ids: []const i64,
+        decode_state: *NativeDecodeState,
+        config: GenerationConfig,
+        admitted_chunk_rows: u32,
+    ) !void {
+        if (!@import("builtin").is_test) return error.UnqualifiedCompactionArtifact;
+        if (prompt_ids.len == 0 or decode_state.context_session == null or !decode_state.isPaged() or
+            decode_state.total_tokens != 0 or admitted_chunk_rows == 0 or
+            config.prefill_chunk_size != admitted_chunk_rows or config.prefill_chunk_plan != null or
+            config.context_storage != .packed_exact or !config.context_flash_prefill or
+            self.scheduler != null or self.scheduler_lease != null or self.graph_cache != null or
+            self.compiled_partition_backend != null)
+            return error.UnsupportedCompactionCapturePrefill;
+        try setWorkloadProfileRegime(&self.cb, .prefill);
+        const output = try self.executePrefill(
+            prompt_ids,
+            prompt_ids.len,
+            0,
+            decode_state,
+            config,
+            false,
+            false,
+            true,
+        );
+        if (output.last_logits != null or output.greedy_token != null or output.last_hidden != null or output.last_hidden_rows != 0) {
+            if (output.last_logits) |logits| self.allocator.free(logits);
+            if (output.last_hidden) |hidden| self.cb.free(hidden);
+            return error.InvalidCompactionCapturePrefill;
+        }
+        if (decode_state.total_tokens != prompt_ids.len) return error.InvalidCompactionCapturePrefill;
+    }
+
+    pub fn scoreTeacherForcedContinuation(
+        self: *NativeGenerationPipeline,
+        token_ids: []i64,
+        seq_len: *usize,
+        decode_state: *NativeDecodeState,
+        prefill_last_logits: []const f32,
+        reference: []const i64,
+        binding: context_teacher_forced.ContextBinding,
+    ) !context_teacher_forced.Receipt {
+        if (reference.len < context_teacher_forced.min_reference_tokens or reference.len > context_teacher_forced.max_reference_tokens or
+            seq_len.* > token_ids.len or reference.len > token_ids.len - seq_len.* or
+            @as(usize, binding.prompt_tokens) != seq_len.* or
+            binding.context_logical_tokens != binding.prompt_tokens or
+            binding.loaded_generation != self.load_generation or
+            decode_state.total_tokens != seq_len.* or
+            self.scheduler != null or self.scheduler_lease != null or
+            prefill_last_logits.len != @as(usize, @intCast(self.gpt_config.vocab_size)))
+            return error.InvalidTeacherForcedRequest;
+        if (decode_state.context_session) |hook| {
+            if (hook.identity != binding.context_instance_id) return error.InvalidTeacherForcedContext;
+        } else if (binding.variant == .attention_matching) {
+            return error.InvalidTeacherForcedContext;
+        }
+        if (binding.variant == .attention_matching and
+            (!decode_state.hasRetainedAttention() or binding.publication_epoch <= 1))
+            return error.InvalidTeacherForcedContext;
+        const reference_digest = try context_teacher_forced.referenceSequenceDigest(reference);
+        if (!std.mem.eql(u8, &binding.reference_sequence_sha256, &reference_digest))
+            return error.InvalidTeacherForcedReference;
+        const prompt_digest = try context_teacher_forced.promptTokenDigest(token_ids[0..seq_len.*]);
+        if (!std.mem.eql(u8, &binding.prompt_tokens_sha256, &prompt_digest) or
+            std.mem.allEqual(u8, &binding.rendered_prompt_sha256, 0) or
+            std.mem.allEqual(u8, &binding.profile_artifact_sha256, 0) or
+            std.mem.allEqual(u8, &binding.profile_semantic_sha256, 0) or
+            std.mem.allEqual(u8, &binding.implementation_sha256, 0) or
+            std.mem.allEqual(u8, &binding.published_payload_sha256, 0) or
+            std.mem.allEqual(u8, &binding.published_descriptor_sha256, 0) or
+            binding.diagnostic_kv_readback_bytes == 0)
+            return error.InvalidTeacherForcedContext;
+
+        const rows = try self.allocator.alloc(context_teacher_forced.TokenScore, reference.len);
+        errdefer self.allocator.free(rows);
+        const timing_io = self.io orelse return error.MissingTeacherForcedTiming;
+        const started_at = std.Io.Timestamp.now(timing_io, .awake);
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+
+        for (reference, 0..) |raw_target, index| {
+            if (self.execution_control) |control|
+                try control.update(.executing, @intCast(index), @intCast(reference.len));
+            if (raw_target < 0 or raw_target > std.math.maxInt(u32) or
+                @as(usize, @intCast(raw_target)) >= @as(usize, @intCast(self.gpt_config.vocab_size)))
+                return error.InvalidTeacherForcedToken;
+            const target: u32 = @intCast(raw_target);
+            var owned_logits: ?[]f32 = null;
+            defer if (owned_logits) |logits| self.allocator.free(logits);
+            const logits: []const f32 = if (index == 0)
+                prefill_last_logits
+            else blk: {
+                // This is exactly standardDecode's fallback query selection. For a
+                // retained packed context it is one token; other supported modes
+                // recompute the same complete accepted prefix.
+                const query_seq_len = if (decode_state.hasRetainedAttention()) 1 else seq_len.*;
+                const context = decode_runtime.makeDecodeContext(seq_len.*, query_seq_len);
+                const inputs = if (query_seq_len == seq_len.*)
+                    token_ids[0..seq_len.*]
+                else
+                    token_ids[seq_len.* - query_seq_len .. seq_len.*];
+                if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+                defer if (self.execution_lock) |mutex| mutex.unlock();
+                owned_logits = try self.forwardLastLogits(inputs, 1, seq_len.*, &context);
+                break :blk owned_logits.?;
+            };
+            if (logits.len != prefill_last_logits.len) return error.InvalidTeacherForcedLogits;
+            rows[index] = .{
+                .sequence_position = @intCast(index),
+                .token_id = target,
+                .conditioned_on_token_id = if (index == 0) null else @intCast(reference[index - 1]),
+                .log_probability = try context_teacher_forced.logProbability(logits, target),
+                .source = if (index == 0)
+                    .prefill_final_row
+                else if (binding.variant == .attention_matching)
+                    .published_compacted_context
+                else
+                    .exact_context_continuation,
+            };
+
+            // Accept the supplied reference token without sampling, EOS stopping,
+            // grammar masking, penalties, or suppress-token policy. Mutation order
+            // is byte-for-byte the standardDecode order: publish token in the host
+            // sequence, increment its length, then advance the KV state.
+            token_ids[seq_len.*] = raw_target;
+            seq_len.* += 1;
+            const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
+            if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex);
+            defer if (kv_mutation_mutex) |mutex| mutex.unlock();
+            _ = try decode_runtime.appendGeneratedToken();
+        }
+        if (decode_state.total_tokens != @as(usize, binding.prompt_tokens) + reference.len)
+            return error.InvalidTeacherForcedContext;
+        const receipt = context_teacher_forced.Receipt{
+            .allocator = self.allocator,
+            .binding = binding,
+            .rows = rows,
+            .elapsed_ns = blk: {
+                const elapsed = started_at.durationTo(std.Io.Timestamp.now(timing_io, .awake)).nanoseconds;
+                if (elapsed <= 0) return error.InvalidTeacherForcedTiming;
+                break :blk std.math.cast(u64, elapsed) orelse return error.InvalidTeacherForcedTiming;
+            },
+            .continuation_forward_steps = @intCast(reference.len - 1),
+            .published_compaction_forward_steps = if (binding.variant == .attention_matching)
+                @intCast(reference.len - 1)
+            else
+                0,
+        };
+        try context_teacher_forced.validateReceipt(receipt, reference);
+        return receipt;
+    }
+
     fn generateWithCallback(
         self: *NativeGenerationPipeline,
         messages: []const Message,
-        config: GenerationConfig,
-        on_token_fn: ?TokenCallback,
-        on_token_ctx: ?*anyopaque,
+        requested_config: GenerationConfig,
+        requested_on_token_fn: ?TokenCallback,
+        requested_on_token_ctx: ?*anyopaque,
     ) !GenerationResult {
+        var config = requested_config;
         try validateKvCachePolicy(config);
         const native_checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null;
         if (native_checkpoint and (self.checkpoint_prepare != null and self.checkpoint_resume != null or
-            self.cb.kind() != .cuda or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
+            (self.cb.kind() != .cuda and self.cb.kind() != .metal) or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
             !self.gpt_config.usesGemma4Channels() or self.gpt_config.gemma4_mtp_assistant or
             self.attention_match_identity == null or self.scheduler != null or self.scheduler_lease != null or
             self.graph_cache != null or self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null or
             messagesHaveImages(messages) or messagesHaveAudio(messages) or config.kv_cache_mode != .exact_hybrid or
             config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.speculation_requested))
             return error.UnsupportedAttentionMatchRoute;
+        if (native_checkpoint and self.cb.kind() == .metal) {
+            if (comptime builtin.is_test) {
+                if (!config.metal_native_checkpoint_qualification) return error.UnqualifiedCompactionArtifact;
+            } else return error.UnqualifiedCompactionArtifact;
+        }
+        if (native_checkpoint and self.cb.kind() == .metal and self.checkpoint_prepare != null and
+            self.checkpoint_prepare.?.encoding != .f16 and self.checkpoint_prepare.?.encoding != .fp8)
+            return error.UnsupportedMetalKvCheckpointEncoding;
         // select_v1 currently has a complete explicit-position storage and
         // attention implementation only on Metal. CUDA exposes contiguous or
         // page-table KV descriptors without selected positions, repack, or
@@ -5268,6 +6843,60 @@ pub const NativeGenerationPipeline = struct {
             (!isPureGreedyConfig(config) or config.grammar != null) and
             (self.scheduler != null or self.graph_cache != null or self.compiled_partition_backend != null))
             return error.UnsupportedKvCachePolicy;
+
+        if (comptime builtin.is_test) {
+            self.last_quality_generation_binding = null;
+            self.metal_qualification_completion = null;
+            self.metal_qualification_binding_baseline = null;
+        }
+        if (self.decode_state) |state| {
+            state.last_context_metrics = null;
+            state.last_context_split_decode_dispatches = 0;
+            state.last_context_flash_prefill_dispatches = 0;
+            state.last_context_framed_attention_dispatches = 0;
+            state.last_context_standalone_attention_dispatches = 0;
+            state.last_context_device_allocation_start = if (state.kv_storage) |storage| storage.deviceAllocationSnapshot() else .{};
+            state.last_context_device_allocation_end = .{};
+            state.last_context_session_allocation_start = .{};
+            state.last_context_session_allocation_end = .{};
+            state.last_context_owner_committed = null;
+            if (comptime @import("builtin").is_test) {
+                state.last_context_fault_before = null;
+                state.last_context_fault_after = null;
+                state.last_context_fault_partial = null;
+            }
+            state.last_context_session_allocation_exclusive = false;
+            state.last_context_session_released = false;
+            state.last_context_session_post_release_live_bytes = null;
+            state.last_context_full_owner_physical_available = false;
+        }
+        defer if (self.decode_state) |state| {
+            state.last_context_device_allocation_end = if (state.kv_storage) |storage| storage.deviceAllocationSnapshot() else .{};
+        };
+        const qualification: ?CompactionQualification = if (comptime @import("builtin").is_test) config.context_qualification else null;
+        const serving_compaction = config.context_request;
+        if (qualification != null and (config.context_storage != .packed_exact or self.prompt_override != null or self.preformatted_prompt != null or config.grammar != null)) return error.UnsupportedContextCombination;
+        if (serving_compaction != null and (qualification != null or config.context_policy.mode != .attention_matching or
+            config.context_load_generation == 0 or config.context_load_generation != self.load_generation or config.context_storage != .automatic))
+            return error.InvalidContextTransaction;
+        // Metal's explicit context-policy route does not inherit the legacy
+        // CUDA ratio switch. Keep non-Metal ratios intact for the upstream
+        // CUDA attention-matching path below; identity ratio normalization for
+        // HTTP requests happens in the server adapter.
+        if (self.cb.kind() == .metal) {
+            try runtime.context_policy.validateLegacyRatio(requested_config.cache_compaction_ratio);
+            config.cache_compaction_ratio = null;
+        }
+        try runtime.context_policy.validateExecution(config.context_policy, .{
+            .metal = self.cb.kind() == .metal,
+            .f16_kv = self.kv_dtype == .f16,
+            .multimodal = messagesHaveImages(messages) or messagesHaveAudio(messages),
+            .speculation = config.speculation_requested,
+            .prompt_cache = config.prompt_cache_enabled,
+            .forced_global_trim = self.gpt_config.hasGlobalAttentionLayers() and self.gpt_config.sliding_window > 0 and kvSlidingTrimForced(),
+        }, .{ .attention_matching = serving_compaction != null or qualification != null });
+        if (self.gpt_config.family == .gemma and !self.gpt_config.gemma4_mtp_assistant)
+            _ = try runtime.context_policy.Layout.init(self.gpt_config);
         if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
@@ -5300,6 +6929,10 @@ pub const NativeGenerationPipeline = struct {
         const ocr_profile_start = if (self.cb.kind() == .metal and self.execution_lock == null and
             platform.env.getenvBoolDefault("ANTFLY_GEMMA4_OCR_PROFILE", false)) self.cb.debugTimingSnapshot().provider else null;
 
+        var timed_callback = TimedTokenCallback{ .io = self.io, .downstream = requested_on_token_fn, .context = requested_on_token_ctx };
+        const has_callback = requested_on_token_fn != null and requested_on_token_ctx != null;
+        const on_token_fn: ?TokenCallback = if (has_callback) TimedTokenCallback.emit else requested_on_token_fn;
+        const on_token_ctx: ?*anyopaque = if (has_callback) &timed_callback else requested_on_token_ctx;
         const grammar_opens_public_final_channel =
             config.grammar != null and
             self.gpt_config.usesGemma4Channels();
@@ -5307,6 +6940,19 @@ pub const NativeGenerationPipeline = struct {
         defer fallback_decode_state.deinit();
         const decode_state = self.decode_state orelse &fallback_decode_state;
         decode_state.configureForGptConfig(self.gpt_config);
+        if (decode_state.context_session) |hook| {
+            if (!std.meta.eql(hook.plan.policy, config.context_policy)) return error.InvalidContextPolicy;
+        }
+        if (config.context_storage == .packed_exact and (decode_state.context_session != null or config.context_policy.mode != .exact)) return error.UnsupportedContextCombination;
+        if (decode_state.context_session != null or config.context_policy.mode != .exact or config.context_storage == .packed_exact) {
+            // Prepared graphs, shared scheduler batches and prompt caches have
+            // independent KV ownership; they must not bypass this session.
+            if (self.cb.kind() != .metal or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
+                self.scheduler != null or self.graph_cache != null or self.compiled_partition_backend != null or
+                config.prefill_chunk_plan != null or config.prompt_cache_enabled or config.speculation_requested or
+                self.draft_decode_state != null or messagesHaveImages(messages) or messagesHaveAudio(messages))
+                return error.UnsupportedContextCombination;
+        }
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         try decode_state.ensureDeepSeekV4CompressedCache(self.gpt_config);
         if (self.draft_decode_state) |draft_state| {
@@ -5419,24 +7065,26 @@ pub const NativeGenerationPipeline = struct {
 
         const relevant_draft_config = if (use_speculative) self.draft_gpt_config else null;
         const speculative_bonus_tokens: usize = if (use_speculative and config.speculative_k > 0) 1 else 0;
-        const expanded_prompt_token_limit = try nativeGenerationPromptTokenLimit(
+        const expanded_prompt_token_limit = try nativeGenerationPromptTokenLimitWithPolicy(
             self.gpt_config,
             relevant_draft_config,
             requested_max_tokens,
             speculative_bonus_tokens,
             0,
+            config.context_policy,
         );
         // Qwen replaces textual image markers with exact visual-token spans
         // below, then validates the fully expanded prompt. Reserving its
         // coarse media allowance during this preliminary text-only encode can
         // reject text that the real multimodal encode accepts.
         const preliminary_media_allowance = nativeGenerationPreliminaryMediaTokenAllowance(messages, self.gpt_config);
-        const text_prompt_token_limit = try nativeGenerationPromptTokenLimit(
+        const text_prompt_token_limit = try nativeGenerationPromptTokenLimitWithPolicy(
             self.gpt_config,
             relevant_draft_config,
             requested_max_tokens,
             speculative_bonus_tokens,
             preliminary_media_allowance,
+            config.context_policy,
         );
         // Reuse the caller's pre-encode only when it tokenized these exact
         // prompt bytes under this exact truncation limit; the grammar channel
@@ -5448,11 +7096,20 @@ pub const NativeGenerationPipeline = struct {
                 null
         else
             null;
+        var prepared_compaction: ?PreparedCompactionPayload = null;
+        defer if (prepared_compaction) |*prepared| prepared.deinit();
+        if (qualification) |q| {
+            prepared_compaction = try prepareCompactionPayload(allocator, self.chat_template orelse return error.MissingChatTemplate, self.tokenizer, messages, .{ .enable_thinking = config.enable_thinking }, q.selection, text_prompt_token_limit, self.add_bos_token);
+            if (!std.mem.eql(u8, prompt, prepared_compaction.?.rendered.text)) return error.InvalidPayloadProvenance;
+        }
         var owned_encoded: ?tokenizer_mod.EncodeResult = null;
         defer if (owned_encoded) |*owned| owned.deinit();
         var encoded_ids: []const i32 = undefined;
         var encoded_attention_mask: []const i32 = undefined;
-        if (reusable_pre_encoded) |pre| {
+        if (prepared_compaction) |prepared| {
+            encoded_ids = prepared.encoded.ids;
+            encoded_attention_mask = prepared.encoded.attention_mask;
+        } else if (reusable_pre_encoded) |pre| {
             encoded_ids = pre.ids;
             encoded_attention_mask = pre.attention_mask;
         } else {
@@ -5473,6 +7130,12 @@ pub const NativeGenerationPipeline = struct {
         var actual_prompt_tokens: usize = 0;
         while (actual_prompt_tokens < encoded_attention_mask.len and encoded_attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
         if (actual_prompt_tokens == 0) return error.EmptyPrompt;
+        if (serving_compaction) |request| {
+            if (request.prompt.len != actual_prompt_tokens) return error.InvalidPayloadProvenance;
+            for (request.prompt, encoded_ids[0..actual_prompt_tokens]) |expected, actual| {
+                if (expected != actual) return error.InvalidPayloadProvenance;
+            }
+        }
         debugGenerationStage(
             "encoded prompt chars={d} actual_prompt_tokens={d}",
             .{ prompt.len, actual_prompt_tokens },
@@ -5796,6 +7459,122 @@ pub const NativeGenerationPipeline = struct {
             speculative_bonus_tokens,
         );
 
+        const context_plan = try config.context_policy.admit(
+            self.gpt_config.max_position_embeddings,
+            if (relevant_draft_config) |draft| draft.max_position_embeddings else null,
+            prompt_token_count,
+            requested_max_tokens,
+            speculative_bonus_tokens,
+        );
+        if (serving_compaction) |request| {
+            if (!std.meta.eql(request.admission_plan, context_plan) or
+                !std.meta.eql(request.config.plan, try runtime.context_policy.exactStoragePlan(context_plan)) or
+                context_plan.policy.max_kv_tokens != request.retained_limit or
+                request.config.max_query_rows != (std.math.cast(u32, @max(config.prefill_chunk_size, 1)) orelse return error.InvalidContextPolicy))
+                return error.InvalidContextTransaction;
+        }
+        if (decode_state.context_session) |hook| {
+            if (context_plan.logical_token_limit > hook.plan.logical_token_limit or
+                context_plan.retained_row_limit > hook.plan.retained_row_limit) return error.ContextKvBudgetExceeded;
+        }
+
+        const coordinator = @import("../backends/compaction_coordinator.zig");
+        var coordinated_request: ?coordinator.Request = null;
+        defer if (coordinated_request) |*request| request.deinit();
+        if (qualification) |q| {
+            const prepared = &prepared_compaction.?;
+            const prompt_ids = try allocator.alloc(i64, prompt_token_count);
+            defer allocator.free(prompt_ids);
+            for (prompt_ids, encoded_ids[0..prompt_token_count]) |*id, value| id.* = value;
+            const raw_instruction = try self.tokenizer.encode(allocator, @import("../runtime/kv/reference_replay.zig").instruction);
+            defer allocator.free(raw_instruction);
+            const instruction = try allocator.alloc(i64, raw_instruction.len);
+            defer allocator.free(instruction);
+            for (instruction, raw_instruction) |*id, value| id.* = value;
+            var prepared_plan = try coordinator.preparePlan(allocator, .{ .plan = context_plan, .layout = try runtime.context_policy.Layout.init(self.gpt_config), .max_query_rows = std.math.cast(u32, @max(config.prefill_chunk_size, 1)) orelse return error.InvalidContextPolicy, .physical_budget_bytes = config.context_budget_bytes, .optimize_decode = config.context_split_decode, .optimize_prefill = config.context_flash_prefill }, prompt_ids, &prepared.eligible, instruction, q.profile, q.identity, q.selection.max_kv_tokens orelse return error.InvalidContextPolicy);
+            defer prepared_plan.deinit();
+            const sizes = try prepared_plan.estimate(config.prefill_chunk_size);
+            // This test-only caller supplies one combined reservation. Public
+            // preflight must reserve each tier before finalizing the plan.
+            if (sizes.combined_peak_bytes > config.context_budget_bytes)
+                return error.ContextStagingBudgetExceeded;
+            coordinated_request = try prepared_plan.finalize(config.prefill_chunk_size, sizes.backend_peak_bytes, sizes.host_peak_bytes);
+        }
+
+        var owned_context: ?@import("../backends/metal_context_session.zig").Session = null;
+        var owned_packed: ?@import("../backends/packed_context_session.zig").Session = null;
+        defer if (comptime @import("build_options").enable_metal) {
+            if (owned_packed) |*context| {
+                // Capture while the complete context is still live. The
+                // serving caller only regains control after this defer has
+                // freed packed KV, so a caller-side snapshot is too late.
+                decode_state.last_context_owner_committed = context.drainedOwnerSnapshot() catch null;
+                const m = context.metrics;
+                decode_state.last_context_metrics = m;
+                decode_state.last_context_split_decode_dispatches = context.split_decode_dispatches;
+                decode_state.last_context_flash_prefill_dispatches = context.flash_prefill_dispatches;
+                decode_state.last_context_framed_attention_dispatches = context.framed_attention_dispatches;
+                decode_state.last_context_standalone_attention_dispatches = context.attention.standalone_dispatches;
+                const session_allocation = context.ownerAllocationSnapshot();
+                decode_state.last_context_session_allocation_end = session_allocation.allocation;
+                decode_state.last_context_session_allocation_exclusive = session_allocation.session_scope_exclusive;
+                decode_state.last_context_full_owner_physical_available = session_allocation.full_owner_physical_available;
+                std.log.info("packed_context_session: id={d} logical={d} retained={d} live_bytes={d} peak_bytes={d} epoch={d} attention_status_readback_bytes={d} kv_readback_bytes={d} derived_attention_readback_bytes={d}", .{ context.identity, m.logical_tokens, m.retained_rows, m.live_bytes, m.peak_bytes, m.epoch, m.attention_status_readback_bytes, m.kv_readback_bytes, m.derived_attention_readback_bytes });
+                const release = context.deinitMeasured();
+                decode_state.last_context_session_released = release.released;
+                decode_state.last_context_session_post_release_live_bytes = if (release.physical_available) release.post_release_live_bytes else null;
+            }
+        };
+        defer if (comptime @import("build_options").enable_metal) {
+            // A nullable Metal owner still instantiates its cleanup even if
+            // every non-Metal creation path returns early. Exclude that
+            // cleanup at compile time so CPU/CUDA binaries need no Metal ABI.
+            if (owned_context) |*context| {
+                const m = context.metrics;
+                decode_state.last_context_metrics = m;
+                std.log.info("context_session: id={d} logical={d} retained={d} live_bytes={d} staged_bytes={d} query_bytes={d} admitted_peak_bytes={d} blocks={d} maintenance_ns={d} rejected={d} epoch={d} status_readback_bytes={d} attention_status_readback_bytes={d} kv_readback_bytes={d} fit_fallbacks={d} exact_tail_fallbacks={d} source_gather_bytes={d}", .{
+                    context.identity,                  m.logical_tokens,    m.retained_rows,          m.live_bytes,            m.staging_bytes,       m.query_bytes,
+                    m.peak_bytes,                      m.compacted_blocks,  m.compaction_nanoseconds, m.rejected_transactions, m.epoch,               m.status_readback_bytes,
+                    m.attention_status_readback_bytes, m.kv_readback_bytes, m.fit_fallbacks,          m.exact_tail_fallbacks,  m.source_gather_bytes,
+                });
+                context.deinit();
+            }
+        };
+        const borrowed_context = decode_state.context_session;
+        defer decode_state.context_session = borrowed_context;
+        if (config.context_storage == .packed_exact or serving_compaction != null or coordinated_request != null) {
+            if (comptime !@import("build_options").enable_metal) return error.BackendUnavailable;
+            var packed_config = if (serving_compaction) |request| request.config else if (coordinated_request) |request| request.config else @import("../backends/packed_context_session.zig").Config{
+                .plan = context_plan,
+                .layout = try runtime.context_policy.Layout.init(self.gpt_config),
+                .max_query_rows = std.math.cast(u32, @max(config.prefill_chunk_size, 1)) orelse return error.InvalidContextPolicy,
+                .physical_budget_bytes = config.context_budget_bytes,
+                .optimize_decode = config.context_split_decode,
+                .optimize_prefill = config.context_flash_prefill,
+            };
+            packed_config.physical_budget_bytes = config.context_budget_bytes;
+            packed_config.execution_control = self.execution_control;
+            packed_config.owner_allocation_tracker = config.context_owner_allocation_tracker;
+            packed_config.execution_lease = config.context_execution_lease;
+            owned_packed = try @import("../backends/packed_context_session.zig").Session.init(allocator, packed_config);
+            const session_allocation = owned_packed.?.ownerAllocationStart();
+            decode_state.last_context_session_allocation_start = session_allocation.allocation;
+            decode_state.last_context_session_allocation_exclusive = session_allocation.session_scope_exclusive;
+            decode_state.last_context_full_owner_physical_available = session_allocation.full_owner_physical_available;
+            decode_state.context_session = owned_packed.?.hook();
+        }
+        if (config.context_policy.mode == .rolling and borrowed_context == null) {
+            if (comptime !@import("build_options").enable_metal) return error.BackendUnavailable;
+            owned_context = try @import("../backends/metal_context_session.zig").Session.init(allocator, .{
+                .plan = context_plan,
+                .layout = try runtime.context_policy.Layout.init(self.gpt_config),
+                .max_query_rows = std.math.cast(u32, @max(config.prefill_chunk_size, 1)) orelse return error.InvalidContextPolicy,
+                .physical_budget_bytes = config.context_budget_bytes,
+                .execution_control = self.execution_control,
+            });
+            decode_state.context_session = owned_context.?.hook();
+        }
+
         // Build token sequence. Add slack only when speculative decoding is
         // active; the bonus token can write one position past max_tokens.
         const max_tokens = requested_max_tokens;
@@ -5919,7 +7698,8 @@ pub const NativeGenerationPipeline = struct {
 
         // Prefill
         try setWorkloadProfileRegime(&self.cb, .prefill);
-        const allow_prefill_greedy_token = !use_speculative or (use_speculative and draft_is_gemma4_mtp);
+        const quality_requested = if (comptime builtin.is_test) config.context_quality_request != null else false;
+        const allow_prefill_greedy_token = !quality_requested and (!use_speculative or (use_speculative and draft_is_gemma4_mtp));
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
         const prefill_output = if (self.checkpoint_resume) |request|
             try self.resumeNativeCheckpoint(request, token_ids[0..seq_len], max_tokens, decode_state, config)
@@ -5928,7 +7708,20 @@ pub const NativeGenerationPipeline = struct {
         else if (prepared_multimodal_prompt) |*prepared|
             try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden)
         else
-            try self.executePrefill(prefill_ids, seq_len, cached_prompt_tokens, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
+            self.executePrefill(prefill_ids, seq_len, cached_prompt_tokens, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden, false) catch |err| {
+                if (comptime @import("builtin").is_test) if (config.context_fault_controller) |fault| {
+                    const observed = fault.snapshot();
+                    const completed: usize = observed.completed_units;
+                    if (observed.injected and observed.kind == .cancel_prefill and
+                        completed > 0 and completed <= token_ids.len and
+                        owned_packed != null)
+                    {
+                        const prefix = token_ids[0..completed];
+                        decode_state.last_context_fault_partial = owned_packed.?.failureFingerprint(contextFaultTokenDigest(prefix)) catch null;
+                    }
+                };
+                return err;
+            };
         if (self.checkpoint_resume) |request| cached_prompt_tokens = request.restored_tokens;
         var prefill_last_logits = prefill_output.last_logits;
         var prefill_greedy_token = prefill_output.greedy_token;
@@ -5937,6 +7730,97 @@ pub const NativeGenerationPipeline = struct {
         const finished_prefill_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         defer if (prefill_last_logits) |logits| allocator.free(logits);
         defer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
+        if (serving_compaction) |request| {
+            if (comptime !@import("build_options").enable_metal) return error.BackendUnavailable;
+            if (comptime @import("builtin").is_test) if (config.context_fault_controller != null) {
+                decode_state.last_context_fault_before = try owned_packed.?.failureFingerprint(request.sources.question.prompt_tokens_sha256);
+            };
+            request.run(&owned_packed.?, self.compactionCampaignRunnerWithFault(config.context_fault_controller)) catch |err| {
+                if (comptime @import("builtin").is_test) if (config.context_fault_controller != null) {
+                    decode_state.last_context_fault_after = owned_packed.?.failureFingerprint(request.sources.question.prompt_tokens_sha256) catch null;
+                };
+                return err;
+            };
+        } else if (coordinated_request) |*request| {
+            if (comptime !@import("builtin").is_test or !@import("build_options").enable_metal)
+                return error.UnqualifiedCompactionArtifact;
+            try request.run(&owned_packed.?, self, runCompactionReplay, qualification.?.publish);
+        }
+        var quality_generation_evidence: if (builtin.is_test) ?context_teacher_forced.Evidence else void = if (builtin.is_test) null else {};
+        if (comptime builtin.is_test) if (config.context_quality_request) |quality| {
+            var rendered_prompt_sha256: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(prompt, &rendered_prompt_sha256, .{});
+            if (quality.loaded_generation != self.load_generation or quality.reference_token_count < context_teacher_forced.min_reference_tokens or
+                quality.reference_token_count > context_teacher_forced.max_reference_tokens or
+                !std.mem.eql(u8, &quality.rendered_prompt_sha256, &rendered_prompt_sha256) or
+                @as(usize, quality.reference_token_count) > token_ids.len - seq_len)
+                return error.InvalidTeacherForcedRequest;
+            const prompt_tokens_sha256 = try context_teacher_forced.promptTokenDigest(token_ids[0..seq_len]);
+            const fingerprint = switch (quality.variant) {
+                .exact => blk: {
+                    const layout = try runtime.context_policy.Layout.init(self.gpt_config);
+                    if (layout.len != self.gpt_config.num_hidden_layers)
+                        return error.InvalidQualificationFingerprint;
+                    break :blk try decode_state.qualificationOrdinaryExactFingerprint(allocator, seq_len, layout);
+                },
+                .attention_matching => blk: {
+                    if (owned_packed == null or !decode_state.hasRetainedAttention())
+                        return error.InvalidTeacherForcedContext;
+                    break :blk try owned_packed.?.qualificationFingerprint();
+                },
+            };
+            const binding = context_teacher_forced.ContextBinding{
+                .variant = quality.variant,
+                .context_instance_id = fingerprint.context_instance_id,
+                .publication_epoch = fingerprint.publication_epoch,
+                .context_logical_tokens = fingerprint.logical_tokens,
+                .prompt_tokens = std.math.cast(u32, seq_len) orelse return error.InvalidTeacherForcedRequest,
+                .rendered_prompt_sha256 = rendered_prompt_sha256,
+                .prompt_tokens_sha256 = prompt_tokens_sha256,
+                .reference_token_count = quality.reference_token_count,
+                .reference_sequence_sha256 = quality.reference_sequence_sha256,
+                .loaded_generation = self.load_generation,
+                .profile_artifact_sha256 = quality.profile_artifact_sha256,
+                .profile_semantic_sha256 = quality.profile_semantic_sha256,
+                .implementation_sha256 = quality.implementation_sha256,
+                .published_payload_sha256 = fingerprint.payload_sha256,
+                .published_descriptor_sha256 = fingerprint.descriptor_sha256,
+                .diagnostic_kv_readback_bytes = fingerprint.diagnostic_kv_readback_bytes,
+            };
+            if (quality.mode == .teacher) {
+                const logits = prefill_last_logits orelse return error.MissingTeacherForcedPrefillLogits;
+                const reference = try context_teacher_forced.revealVerifiedReference(quality, binding);
+                var receipt = try self.scoreTeacherForcedContinuation(
+                    token_ids,
+                    &seq_len,
+                    decode_state,
+                    logits,
+                    reference,
+                    binding,
+                );
+                var receipt_owned = true;
+                errdefer if (receipt_owned) receipt.deinit();
+                prefill_last_logits = null;
+                allocator.free(logits);
+                const empty_text = try allocator.alloc(u8, 0);
+                errdefer allocator.free(empty_text);
+                const empty_ids = try allocator.alloc(i32, 0);
+                receipt_owned = false;
+                return .{
+                    .text = empty_text,
+                    .token_ids = empty_ids,
+                    .prompt_tokens = prompt_token_count,
+                    .tokens_used = reference.len,
+                    .finish_reason = "teacher_forced",
+                    .cached_prompt_tokens = cached_prompt_tokens,
+                    .teacher_forced_evidence = .{ .teacher = receipt },
+                    .allocator = allocator,
+                };
+            }
+            quality_generation_evidence = .{ .generation = binding };
+            self.last_quality_generation_binding = binding;
+        };
+        const finished_maintenance_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         if (config.qwen3vl_parity_logits_path) |path| {
             if (prepared_qwen3vl_prompt == null or prefill_last_logits == null or
                 prefill_last_logits.?.len != self.gpt_config.vocab_size)
@@ -5951,7 +7835,23 @@ pub const NativeGenerationPipeline = struct {
         );
 
         if (self.checkpoint_prepare) |request| {
-            try self.prepareNativeCheckpoint(request, token_ids[0..seq_len], prefill_last_logits orelse return error.MissingCompactionResumeLogits, decode_state);
+            try self.prepareNativeCheckpoint(request, token_ids[0..seq_len], prefill_last_logits orelse return error.MissingCompactionResumeLogits, decode_state, config);
+            if (comptime builtin.is_test) {
+                if (config.metal_native_checkpoint_qualification and
+                    config.metal_checkpoint_qualification_route != .none and
+                    self.cb.kind() == .metal)
+                {
+                    if (decode_state.total_tokens != seq_len) return error.InvalidKvCheckpoint;
+                    // Preparation ends immediately after a complete prefill:
+                    // every logical prompt token already owns a materialized
+                    // KV row, and no sampled decode token is pending.
+                    self.metal_qualification_completion = try metalQualificationCompletion(
+                        seq_len,
+                        decode_state.total_tokens,
+                        0,
+                    );
+                }
+            }
             return .{
                 .text = try allocator.dupe(u8, ""),
                 .prompt_tokens = seq_len,
@@ -6083,6 +7983,7 @@ pub const NativeGenerationPipeline = struct {
 
         var finish_reason: []const u8 = "length";
         var tokens_generated: usize = 0;
+        var pending_unmaterialized_tokens: u8 = 0;
         var speculative_stats = SpeculativeDecodeStats{};
         speculative_stats.speculation_policy = speculation_policy;
         speculative_stats.speculation_calibration = config.speculation_calibration;
@@ -6203,6 +8104,7 @@ pub const NativeGenerationPipeline = struct {
             )) |decode_result| {
                 tokens_generated = decode_result.tokens_generated;
                 finish_reason = decode_result.finish_reason;
+                pending_unmaterialized_tokens = decode_result.pending_unmaterialized_tokens;
                 prefill_decode_complete = tokens_generated >= max_tokens or std.mem.eql(u8, finish_reason, "stop");
                 if (!prefill_decode_complete and tokens_generated > 0) {
                     // The first token came from the prompt's final row. Clear
@@ -6731,6 +8633,7 @@ pub const NativeGenerationPipeline = struct {
             );
             tokens_generated = decode_result.tokens_generated;
             finish_reason = decode_result.finish_reason;
+            pending_unmaterialized_tokens = decode_result.pending_unmaterialized_tokens;
             debugGenerationStage(
                 "standard decode returned tokens_generated={d} finish_reason={s} seq_len={d}",
                 .{ tokens_generated, finish_reason, seq_len },
@@ -6850,25 +8753,30 @@ pub const NativeGenerationPipeline = struct {
             );
         }
         const finished_generate_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        const timing_ms: ?GenerationTimingMs = if (self.io != null) GenerationTimingMs.fromElapsedMs(.{
+        var timing_ms: ?GenerationTimingMs = if (self.io != null) GenerationTimingMs.fromElapsedMs(.{
             timestampDurationMillis(started_at, formatted_prompt_at),
             timestampDurationMillis(started_at, encoded_prompt_at),
             timestampDurationMillis(started_at, runtime_prepare_started_at),
             timestampDurationMillis(started_at, prefill_started_at),
             timestampDurationMillis(started_at, finished_prefill_at),
+            timestampDurationMillis(started_at, finished_maintenance_at),
             timestampDurationMillis(started_at, text_decode_started_at),
             timestampDurationMillis(started_at, finished_generate_at),
         }) else null;
+        if (timing_ms) |*timing| {
+            if (timed_callback.first) |first| timing.first_token = timestampDurationMillis(started_at, first);
+        }
         if (self.print_timing and timing_ms != null) {
             const timing = timing_ms.?;
             std.debug.print(
-                "generate_timing_ms: prompt_format={d} tokenize={d} multimodal_prepare={d} runtime_prepare={d} prefill={d} decode={d} text_decode={d} total={d}\n",
+                "generate_timing_ms: prompt_format={d} tokenize={d} multimodal_prepare={d} runtime_prepare={d} prefill={d} maintenance={d} decode={d} text_decode={d} total={d}\n",
                 .{
                     timing.prompt_format,
                     timing.tokenize,
                     timing.multimodal_prepare,
                     timing.runtime_prepare,
                     timing.prefill,
+                    timing.maintenance,
                     timing.decode,
                     timing.text_decode,
                     timing.total,
@@ -6942,6 +8850,21 @@ pub const NativeGenerationPipeline = struct {
                 profile.host_draft_steps,          profile.draft_target_embedding_cross_copies,
             });
         }
+        if (comptime builtin.is_test) {
+            if (config.metal_native_checkpoint_qualification and
+                config.metal_checkpoint_qualification_route != .none and
+                self.cb.kind() == .metal)
+            {
+                if (pending_unmaterialized_tokens > 1 or pending_unmaterialized_tokens > decode_state.total_tokens)
+                    return error.InvalidKvCheckpoint;
+                if (decode_state.total_tokens != seq_len) return error.InvalidKvCheckpoint;
+                self.metal_qualification_completion = try metalQualificationCompletion(
+                    decode_state.total_tokens,
+                    decode_state.total_tokens - pending_unmaterialized_tokens,
+                    pending_unmaterialized_tokens,
+                );
+            }
+        }
         return .{
             .text = text,
             .reasoning_text = reasoning_text,
@@ -6952,6 +8875,7 @@ pub const NativeGenerationPipeline = struct {
             .cached_prompt_tokens = cached_prompt_tokens,
             .timing_ms = timing_ms,
             .speculative = if (use_speculative or draft_requested) speculative_stats else null,
+            .teacher_forced_evidence = if (comptime builtin.is_test) quality_generation_evidence else {},
             .allocator = allocator,
         };
     }
@@ -7167,7 +9091,10 @@ pub const NativeGenerationPipeline = struct {
         config: GenerationConfig,
         allow_resident_greedy_token: bool,
         capture_last_hidden: bool,
+        discard_final_output: bool,
     ) !PrefillOutput {
+        if (discard_final_output and self.compiled_partition_backend != null)
+            return error.UnsupportedCompactionCapturePrefill;
         const allocator = self.allocator;
         // Private opt-in qualification only. Preserve admitted chunk shapes,
         // scheduler turns and the original final-logit projection.
@@ -7211,7 +9138,7 @@ pub const NativeGenerationPipeline = struct {
             isPureGreedyConfig(config) and
             config.grammar == null;
         const use_prefill_greedy_token = use_cuda_prefill_greedy_token or use_metal_prefill_greedy_token;
-        const use_metal_target_last_logits = shouldUseMetalGemmaTargetLastLogits(
+        const use_metal_target_last_logits = decode_state.context_session == null and shouldUseMetalGemmaTargetLastLogits(
             self.cb.kind(),
             &self.gpt_config,
             capture_last_hidden,
@@ -7346,6 +9273,8 @@ pub const NativeGenerationPipeline = struct {
                     prefill_last_logits = try output.takeHostLogits(allocator);
                 }
                 processed = chunk_end;
+                if (comptime @import("builtin").is_test) if (config.context_fault_controller) |fault|
+                    try fault.checkpoint(.prefill, @intCast(processed), @intCast(prompt_ids.len));
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         scheduler.notePrefillProgress(lease, total_chunk_end, seq_len);
@@ -7443,6 +9372,9 @@ pub const NativeGenerationPipeline = struct {
                 @max(current_chunk_size, max_speculative_rows),
                 self.cb.kind() == .metal and
                     prefilled_tokens == 0 and
+                    // Portable checkpoint fitting clones the complete exact
+                    // prefix, including local donors before window eviction.
+                    self.checkpoint_prepare == null and self.checkpoint_resume == null and
                     metalRingDecodeRequestEligible(config),
             );
             var processed: usize = 0;
@@ -7464,17 +9396,23 @@ pub const NativeGenerationPipeline = struct {
                         ), 1);
                     },
                 };
-                const chunk_size = planned_chunk.rows;
+                const chunk_size = if (decode_state.context_session) |hook|
+                    try hook.nextChunk(@intCast(prefilled_tokens + processed), @intCast(planned_chunk.rows))
+                else
+                    planned_chunk.rows;
                 const chunk_end = @min(query_len, processed + chunk_size);
                 if (admitted_plan != null and chunk_end - processed != chunk_size)
                     return error.InvalidPrefillChunkPlan;
                 const total_chunk_end = prefilled_tokens + chunk_end;
                 const chunk = prompt_ids[processed..chunk_end];
-                const output_intent = prefillOutputIntent(
-                    total_chunk_end == seq_len,
-                    use_prefill_greedy_token,
-                    capture_last_hidden,
-                );
+                const output_intent: PrefillOutputIntent = if (discard_final_output)
+                    .kv_only
+                else
+                    prefillOutputIntent(
+                        total_chunk_end == seq_len,
+                        use_prefill_greedy_token,
+                        capture_last_hidden,
+                    );
                 debugGenerationStage(
                     "executePrefill chunk start processed={d} chunk_len={d} total_chunk_end={d} current_chunk_size={d} output={s} weight_route_hint={s}",
                     .{ processed, chunk.len, total_chunk_end, current_chunk_size, @tagName(output_intent), @tagName(planned_chunk.weight_route_hint) },
@@ -7500,6 +9438,8 @@ pub const NativeGenerationPipeline = struct {
                                 processed = chunk_end;
                                 if (admitted_plan != null) plan_chunk_index += 1;
                                 scheduler.notePrefillProgress(lease, prefilled_tokens + processed, seq_len);
+                                if (comptime @import("builtin").is_test) if (config.context_fault_controller) |fault|
+                                    try fault.checkpoint(.prefill, @intCast(processed), @intCast(query_len));
                                 continue;
                             }
                         }
@@ -7707,6 +9647,8 @@ pub const NativeGenerationPipeline = struct {
                 if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control);
                 processed = chunk_end;
                 if (admitted_plan != null) plan_chunk_index += 1;
+                if (comptime @import("builtin").is_test) if (config.context_fault_controller) |fault|
+                    try fault.checkpoint(.prefill, @intCast(processed), @intCast(query_len));
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         scheduler.notePrefillProgress(lease, prefilled_tokens + processed, seq_len);
@@ -7967,6 +9909,9 @@ pub const NativeGenerationPipeline = struct {
     const DecodeResult = struct {
         tokens_generated: usize,
         finish_reason: []const u8,
+        /// Accepted output tokens which have not yet been consumed by a
+        /// following model forward and therefore have no materialized KV row.
+        pending_unmaterialized_tokens: u8 = 0,
     };
 
     const DeviceDecodeOutcome = struct {
@@ -8130,7 +10075,11 @@ pub const NativeGenerationPipeline = struct {
             "prefill_first_token returned token={d} seq_len={d} finish_reason={s}",
             .{ next_token, seq_len.*, finish_reason },
         );
-        return .{ .tokens_generated = 1, .finish_reason = finish_reason };
+        return .{
+            .tokens_generated = 1,
+            .finish_reason = finish_reason,
+            .pending_unmaterialized_tokens = 1,
+        };
     }
 
     fn finishPrefillFirstTokenSchedulerTurn(self: *NativeGenerationPipeline, tokens_generated: usize) void {
@@ -8201,6 +10150,7 @@ pub const NativeGenerationPipeline = struct {
         const allocator = self.allocator;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var tokens_generated = initial_tokens_generated;
+        var kv_boundary = AutoregressiveKvBoundary.init(initial_tokens_generated > 0);
         var finish_reason: []const u8 = "length";
         var device_token_tensor: ?ops.CT = null;
         defer if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
@@ -8257,14 +10207,17 @@ pub const NativeGenerationPipeline = struct {
                     emitted_text,
                     &tokens_generated,
                     &finish_reason,
+                    &kv_boundary,
                 )) {
                     break;
                 }
             }
+            var sampled_without_forward = false;
             const outcome: SampleOutcome = blk: {
                 if (tokens_generated == 0) {
                     if (prefill_greedy_token.*) |token| {
                         prefill_greedy_token.* = null;
+                        sampled_without_forward = true;
                         break :blk .{ .token = token, .grammar_complete = false };
                     }
                 }
@@ -8322,7 +10275,7 @@ pub const NativeGenerationPipeline = struct {
                         next_device_token_tensor = token.token_tensor;
                         break :blk .{ .token = token.token, .grammar_complete = false };
                     }
-                    const fallback_query_seq_len = if (decode_runtime.kvView() != null and
+                    const fallback_query_seq_len = if (decode_state.hasRetainedAttention() and
                         (tokens_generated > 0 or prefill_last_logits.* == null)) 1 else seq_len.*;
                     if (requiresCudaDecodeGraphBeforeEagerFallback(
                         self.cb.kind(),
@@ -8338,6 +10291,7 @@ pub const NativeGenerationPipeline = struct {
                 const last_logits: []const f32 = logits_blk: {
                     if (tokens_generated == 0) {
                         if (prefill_last_logits.*) |cached| {
+                            sampled_without_forward = true;
                             debugGenerationStage(
                                 "standardDecode iter={d} using cached prefill logits len={d}",
                                 .{ tokens_generated, cached.len },
@@ -8361,7 +10315,7 @@ pub const NativeGenerationPipeline = struct {
                     }
 
                     self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
-                    const query_seq_len = if (decode_runtime.kvView() != null and (tokens_generated > 0 or prefill_last_logits.* == null)) 1 else seq_len.*;
+                    const query_seq_len = if (decode_state.hasRetainedAttention() and (tokens_generated > 0 or prefill_last_logits.* == null)) 1 else seq_len.*;
                     const decode_context = decode_runtime.makeDecodeContext(seq_len.*, query_seq_len);
                     const input_ids = if (query_seq_len == seq_len.*)
                         token_ids[0..seq_len.*]
@@ -8414,6 +10368,7 @@ pub const NativeGenerationPipeline = struct {
                 );
             };
             const next_token = outcome.token;
+            if (!sampled_without_forward) kv_boundary.noteForwardConsumedSample();
             debugGenerationStage(
                 "standardDecode iter={d} sampled next_token={d} grammar_complete={}",
                 .{ tokens_generated, next_token, outcome.grammar_complete },
@@ -8447,6 +10402,7 @@ pub const NativeGenerationPipeline = struct {
                 defer if (kv_mutation_mutex) |mutex| mutex.unlock();
                 _ = try decode_runtime.appendGeneratedToken();
             }
+            kv_boundary.noteAcceptedSample();
             try penalty_state.noteToken(allocator, @intCast(next_token));
             debugGenerationStage(
                 "standardDecode iter={d} appended token new_seq_len={d}",
@@ -8482,7 +10438,11 @@ pub const NativeGenerationPipeline = struct {
             "standardDecode exit tokens_generated={d} finish_reason={s}",
             .{ tokens_generated, finish_reason },
         );
-        return .{ .tokens_generated = tokens_generated, .finish_reason = finish_reason };
+        return .{
+            .tokens_generated = tokens_generated,
+            .finish_reason = finish_reason,
+            .pending_unmaterialized_tokens = kv_boundary.pending_unmaterialized_tokens,
+        };
     }
 
     fn pipelinedGreedyEligible(
@@ -8521,6 +10481,7 @@ pub const NativeGenerationPipeline = struct {
         emitted_text: ?*StreamingTextState,
         tokens_generated: *usize,
         finish_reason: *[]const u8,
+        kv_boundary: *AutoregressiveKvBoundary,
     ) !bool {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         if (tokens_generated.* >= max_tokens) return false;
@@ -8539,6 +10500,9 @@ pub const NativeGenerationPipeline = struct {
             ) catch false;
             if (!armed) return false;
         }
+        // Arming consumes the previously sampled token, so its KV row is now
+        // materialized before any replacement token is accepted.
+        kv_boundary.noteForwardConsumedSample();
         errdefer {
             _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .cancel_pending) catch {};
             _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only) catch {};
@@ -8592,6 +10556,12 @@ pub const NativeGenerationPipeline = struct {
             if (!speculative_appended) {
                 _ = try decode_runtime.appendGeneratedToken();
             }
+            // A successful step has already forwarded the accepted token;
+            // an await-only result is the usual terminal sampled token.
+            if (stepped)
+                kv_boundary.noteForwardConsumedSample()
+            else
+                kv_boundary.noteAcceptedSample();
             try penalty_state.noteToken(self.allocator, @intCast(token));
             if (on_token_fn != null and on_token_ctx != null and emitted_text != null) {
                 const keep_streaming = try self.emitDecodedDelta(
@@ -8997,11 +10967,11 @@ pub const NativeGenerationPipeline = struct {
             decoder_runtime_debug_stats.graph_blocked += 1;
             return null;
         }
-        if (tokens_generated == 0 and decode_runtime.kvView() == null) {
+        if (tokens_generated == 0 and !decode_state.hasRetainedAttention()) {
             decoder_runtime_debug_stats.first_token_blocked += 1;
             return null;
         }
-        if (decode_runtime.kvView() == null) {
+        if (!decode_state.hasRetainedAttention()) {
             decoder_runtime_debug_stats.kv_missing += 1;
             return null;
         }
@@ -12859,6 +14829,12 @@ pub const NativeGenerationPipeline = struct {
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
 
         const result = self.forwardScheduledStep(claimed) catch |err| {
+            if (comptime builtin.is_test) {
+                if (self.cb.kind() == .metal and platform.env.getenvBool("TERMITE_SERVER_GENERATE_TIMING")) {
+                    std.debug.print("metal_scheduled_step_failure: {s} items={d}\n", .{ @errorName(err), claimed.len });
+                    if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+                }
+            }
             completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
             return;
         };
@@ -13264,22 +15240,24 @@ pub fn nativeGenerationPromptTokenLimit(
     speculative_bonus_tokens: usize,
     media_token_allowance: usize,
 ) !usize {
-    var context_tokens: usize = @intCast(target_config.max_position_embeddings);
-    if (draft_config) |draft| {
-        context_tokens = @min(context_tokens, @as(usize, @intCast(draft.max_position_embeddings)));
-    }
-    const output_tokens = std.math.add(
-        usize,
-        @max(requested_output_tokens, 1),
+    return nativeGenerationPromptTokenLimitWithPolicy(target_config, draft_config, requested_output_tokens, speculative_bonus_tokens, media_token_allowance, .{});
+}
+
+pub fn nativeGenerationPromptTokenLimitWithPolicy(
+    target_config: gpt_mod.Config,
+    draft_config: ?gpt_mod.Config,
+    requested_output_tokens: usize,
+    speculative_bonus_tokens: usize,
+    media_token_allowance: usize,
+    policy: runtime.context_policy.Policy,
+) !usize {
+    return policy.promptLimit(
+        target_config.max_position_embeddings,
+        if (draft_config) |draft| draft.max_position_embeddings else null,
+        requested_output_tokens,
         speculative_bonus_tokens,
-    ) catch return error.PromptTooLong;
-    const reserved_tokens = std.math.add(
-        usize,
-        output_tokens,
         media_token_allowance,
-    ) catch return error.PromptTooLong;
-    if (context_tokens <= reserved_tokens) return error.PromptTooLong;
-    return context_tokens - reserved_tokens;
+    );
 }
 
 pub fn validateNativeGenerationPromptTokenCount(
@@ -13666,6 +15644,28 @@ test "grammar prompt opens Gemma4 public answer after an empty thought block" {
         error.GrammarRequiresGemma4ChannelPrompt,
         openGemma4FinalChannelForGrammar(allocator, "<bos>raw prompt"),
     );
+}
+
+test "context chat template identity binds parsed source and special token boundaries" {
+    const a = std.testing.allocator;
+    const source = "{{ bos_token }}{{ eos_token }}";
+    var first = try ChatTemplate.init(a, source, "ab", "c", "", "");
+    defer first.deinit();
+    var same = try ChatTemplate.init(a, source, "ab", "c", "", "");
+    defer same.deinit();
+    var boundary = try ChatTemplate.init(a, source, "a", "bc", "", "");
+    defer boundary.deinit();
+    var changed_source = try ChatTemplate.init(a, source ++ " ", "ab", "c", "", "");
+    defer changed_source.deinit();
+    try std.testing.expectEqual(first.source_identity, same.source_identity);
+    try std.testing.expect(!std.mem.eql(u8, &first.source_identity, &boundary.source_identity));
+    try std.testing.expect(!std.mem.eql(u8, &first.source_identity, &changed_source.source_identity));
+    // Equal concatenated token strings must not have the same provenance.
+    const left = try first.apply(a, &.{}, true);
+    defer a.free(left);
+    const right = try boundary.apply(a, &.{}, true);
+    defer a.free(right);
+    try std.testing.expectEqualStrings(left, right);
 }
 
 test "chat template preserves tool history and structured arguments" {
@@ -15227,6 +17227,7 @@ test "native decode state attaches DeepSeek V4 compressed cache without disablin
     try state.ensureDeepSeekV4CompressedCache(config);
     try std.testing.expect(!state.requiresFullRecompute());
     try std.testing.expect(state.isPaged());
+    try std.testing.expect(state.hasRetainedAttention());
 
     try state.notePrefill(10);
     try std.testing.expectEqual(@as(usize, 10), state.total_tokens);
@@ -15385,7 +17386,7 @@ test "CUDA prefill KV reservation keeps manager and storage counts aligned" {
 
 test "attention match checkpoint owner retains logical history without host KV mirrors" {
     const allocator = std.testing.allocator;
-    const config = attentionMatchCheckpointPoolConfig(.f16, .{
+    const config = attentionMatchCheckpointPoolConfig(.cuda, .f16, .{
         .family = .gemma,
         .num_hidden_layers = 2,
         .num_attention_heads = 2,
@@ -16563,6 +18564,132 @@ test "gemma4 mtp pending token bookkeeping holds kv invariant across round shape
     seq_len += 1;
     try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
     try mtp_activation.validateKvTokensInSync(&decode, seq_len);
+}
+
+test "attention_match qualification autoregressive boundary distinguishes sampled from materialized" {
+    var lifecycle = AutoregressiveKvBoundary.init(false);
+    lifecycle.noteAcceptedSample();
+    try std.testing.expectEqual(@as(u8, 1), lifecycle.pending_unmaterialized_tokens); // max length / grammar / callback
+    lifecycle.noteForwardConsumedSample();
+    try std.testing.expectEqual(@as(u8, 0), lifecycle.pending_unmaterialized_tokens); // EOS sampled by that forward
+    lifecycle.noteAcceptedSample();
+    lifecycle.noteForwardConsumedSample();
+    lifecycle.noteAcceptedSample();
+    try std.testing.expectEqual(@as(u8, 1), lifecycle.pending_unmaterialized_tokens); // next accepted sample
+
+    const prepared = try metalQualificationCompletion(128, 128, 0);
+    try std.testing.expectEqual(@as(usize, 128), prepared.logical_tokens);
+    try std.testing.expectEqual(@as(usize, 128), prepared.materialized_tokens);
+    try std.testing.expectEqual(@as(u8, 0), prepared.pending_sampled_tokens);
+    try std.testing.expectError(error.InvalidKvCheckpoint, metalQualificationCompletion(128, 127, 0));
+    try std.testing.expectError(error.InvalidKvCheckpoint, metalQualificationKvEvidence(
+        "generation_committed",
+        128,
+        null,
+        null,
+        null,
+        42,
+        24,
+    ));
+
+    const ready = try metalQualificationKvEvidence("resumed_ready", 128, null, null, null, 42, 24);
+    try std.testing.expectEqual(@as(usize, 128), ready.materialized_tokens);
+    try std.testing.expectEqual(@as(u8, 0), ready.pending_sampled_tokens);
+
+    const committed = try metalQualificationKvEvidence("generation_committed", 192, .{
+        .logical_tokens = 192,
+        .materialized_tokens = 191,
+        .pending_sampled_tokens = 1,
+    }, null, null, 42, 24);
+    try std.testing.expectEqual(@as(usize, 191), committed.materialized_tokens);
+    try std.testing.expectEqual(@as(u8, 1), committed.pending_sampled_tokens);
+
+    try std.testing.expectError(error.InvalidKvCheckpoint, metalQualificationKvEvidence(
+        "generation_committed",
+        192,
+        .{ .logical_tokens = 192, .materialized_tokens = 192, .pending_sampled_tokens = 1 },
+        null,
+        null,
+        42,
+        24,
+    ));
+    try std.testing.expectError(error.InvalidKvCheckpoint, metalQualificationKvEvidence(
+        "generation_committed",
+        192,
+        .{ .logical_tokens = 192, .materialized_tokens = 190, .pending_sampled_tokens = 2 },
+        null,
+        null,
+        42,
+        24,
+    ));
+}
+
+test "attention_match qualification installed binding proves every materialized suffix forward" {
+    const baseline = MetalQualificationBindingBaseline{
+        .logical_tokens = 128,
+        .attention_calls = 0,
+        .donor_appends = 0,
+    };
+    const activity = metal_compute.MetalCompute.AttentionMatchActivity{
+        .attention_calls = 63 * 42,
+        .donor_appends = 63 * 24,
+        .invalid = false,
+        .allocated_bytes = 4096,
+        .logical_tokens = 191,
+        .revision = 64,
+        .fp8_heads = 0,
+        .fp8_rows = 0,
+        .exact_resident_bytes = 2048,
+        .encoded_resident_bytes = 0,
+        .metadata_resident_bytes = 2048,
+    };
+    var ready_activity = activity;
+    ready_activity.logical_tokens = 128;
+    ready_activity.attention_calls = 0;
+    ready_activity.donor_appends = 0;
+    const ready = try metalQualificationKvEvidence("resumed_ready", 128, null, ready_activity, null, 42, 24);
+    try std.testing.expectEqual(@as(usize, 42), ready.attention_calls_per_materialized_token);
+    try std.testing.expectEqual(@as(usize, 24), ready.donor_appends_per_materialized_token);
+    const evidence = try metalQualificationKvEvidence("generation_committed", 192, .{
+        .logical_tokens = 192,
+        .materialized_tokens = 191,
+        .pending_sampled_tokens = 1,
+    }, activity, baseline, 42, 24);
+    try std.testing.expectEqual(@as(usize, 42), evidence.attention_calls_per_materialized_token);
+    try std.testing.expectEqual(@as(usize, 24), evidence.donor_appends_per_materialized_token);
+
+    try std.testing.expectError(error.InvalidKvCheckpoint, metalQualificationKvEvidence(
+        "generation_committed",
+        192,
+        .{ .logical_tokens = 192, .materialized_tokens = 191, .pending_sampled_tokens = 1 },
+        activity,
+        baseline,
+        21,
+        12,
+    ));
+
+    var malformed = activity;
+    malformed.attention_calls -= 1;
+    try std.testing.expectError(error.InvalidKvCheckpoint, metalQualificationKvEvidence(
+        "generation_committed",
+        192,
+        .{ .logical_tokens = 192, .materialized_tokens = 191, .pending_sampled_tokens = 1 },
+        malformed,
+        baseline,
+        42,
+        24,
+    ));
+    malformed = activity;
+    malformed.logical_tokens = 192;
+    try std.testing.expectError(error.InvalidKvCheckpoint, metalQualificationKvEvidence(
+        "generation_committed",
+        192,
+        .{ .logical_tokens = 192, .materialized_tokens = 191, .pending_sampled_tokens = 1 },
+        malformed,
+        baseline,
+        42,
+        24,
+    ));
 }
 
 test "Gemma4 MTP cached first choice covers single draft" {
@@ -17950,6 +20077,25 @@ test "attention match collector rejects CPU before accessing source state" {
     try std.testing.expectError(error.UnsupportedCompactionQueryModel, pipeline.collectAttentionMatchQueries(&.{ 1, 2 }, &source, .{ .repeat_mode = .exact }));
 }
 
+test "attention_match Metal rejects CUDA repeat modes before cloning source KV" {
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(std.testing.allocator);
+    defer model.deinit(std.testing.allocator);
+    var pipeline = model.pipeline(std.testing.allocator, .{ .family = .gemma, .gemma4_channel_protocol = true });
+    // Route validation must finish before touching the deliberately absent KV
+    // owner or dispatching through any of the native compute operations.
+    var vtable = pipeline.cb.vtable.*;
+    vtable.backendKind = struct {
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .metal;
+        }
+    }.kind;
+    pipeline.cb.vtable = &vtable;
+    var source: NativeDecodeState = undefined;
+    try std.testing.expectError(error.UnsupportedCompactionQueryRoute, pipeline.collectAttentionMatchQueries(&.{ 1, 2 }, &source, .{ .repeat_mode = .exact }));
+    try std.testing.expectError(error.UnsupportedCompactionQueryRoute, pipeline.collectAttentionMatchQueries(&.{ 1, 2 }, &source, .{ .repeat_mode = .exact_split }));
+}
+
 test "attention match snapshot pipeline adapter compiles" {
     std.mem.doNotOptimizeAway(&NativeGenerationPipeline.snapshotAttentionMatchState);
 }
@@ -17981,4 +20127,250 @@ test "raw token bytes keep grammar streaming aligned with the constrained output
     try std.testing.expect(try emitDecodedDeltaForTokenizer(tokenizer, a, &.{ 0, 1 }, &state, Fixture.emit, &fixture));
     try std.testing.expectEqualStrings("x 1", fixture.bytes.items);
     try std.testing.expectEqualStrings("x 1", state.emitted_text);
+}
+
+test "context decode state uses session positions without legacy page allocations" {
+    const context = runtime.kv.context_session;
+    const Fake = struct {
+        fn next(_: *anyopaque, _: u64, _: u32, requested: u32) !u32 {
+            return @min(requested, 4);
+        }
+        fn attention(_: *anyopaque, _: u64, _: context.Attention, _: context.DeviceRef, _: context.DeviceRef, _: context.DeviceRef, _: context.DeviceRef) !void {}
+    };
+    var marker: u8 = 0;
+    var state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer state.deinit();
+    state.context_session = .{ .ctx = &marker, .identity = 1, .plan = try (runtime.context_policy.Policy{}).admit(32, null, 4, 4, 0), .vtable = &.{ .next_chunk = Fake.next, .attention = Fake.attention } };
+    try state.ensureAttached();
+    try state.notePrefill(4);
+    try state.appendGeneratedToken();
+    try std.testing.expect(state.isPaged());
+    // A packed context session owns retained KV without exposing the legacy
+    // KvView. Device decode admission must use this predicate so the Gemma
+    // whole-token frame remains eligible after packed prefill.
+    try std.testing.expect(state.hasRetainedAttention());
+    try std.testing.expectEqual(@as(usize, 5), state.total_tokens);
+    try std.testing.expect(state.sequence_id == null and state.kvView() == null);
+    const dc = state.gptDecodeContext(5, 1);
+    try std.testing.expectEqual(@as(usize, 4), gpt_arch.positionOffset(5, 1, &dc));
+    try std.testing.expectEqual(@as(u64, 1), dc.context_session.?.identity);
+    try std.testing.expectError(error.ContextRollbackUnsupported, state.truncateTokens(1));
+    try std.testing.expectEqual(@as(usize, 5), state.total_tokens);
+    var borrowed = BorrowedDecodeStateRuntime.init(&state);
+    var chunk: usize = 4;
+    try std.testing.expect(!try retryDirectPrefillAfterMemoryBudgetExceeded(&borrowed, 4, 4, &chunk, true, error.MemoryBudgetExceeded));
+    try std.testing.expectEqual(@as(usize, 5), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 4), chunk);
+}
+
+test "context payload preparation preserves prompt token identity and protects duplicate message text" {
+    const a = std.testing.allocator;
+    const profile =
+        \\{"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},"pre_tokenizer":{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false},"model":{"type":"BPE","vocab":{"a":0,"▁":1,"▁a":2,"|":3},"merges":["▁ a"]},"added_tokens":[{"id":4,"content":"<r>","special":true}]}
+    ;
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(a, profile);
+    defer tok.tokenizer().deinitTokenizer();
+    tok.applySpecialTokenIds(9, 8, 10, 11);
+    var template = try ChatTemplate.init(a, "{% for m in messages %}<r>{{ m.content }}|{% endfor %}", "", "", "", "");
+    defer template.deinit();
+    const messages = [_]Message{ .{ .role = "system", .content = "a a" }, .{ .role = "user", .content = "a a" }, .{ .role = "assistant", .content = "a a" } };
+    var policy = runtime.context_policy.Policy{ .mode = .attention_matching, .max_kv_tokens = 1024, .keep_prefix_tokens = 0, .keep_recent_tokens = 1 };
+    try policy.compaction_targets.add(.{ .message_index = 1, .part_index = 0 });
+    var prepared = try prepareCompactionPayload(a, &template, tok.tokenizer(), &messages, .{}, policy, 64, false);
+    defer prepared.deinit();
+    const ordinary_prompt = try template.apply(a, &messages, true);
+    defer a.free(ordinary_prompt);
+    var ordinary = try encodeNativeGenerationPrompt(tok.tokenizer(), a, ordinary_prompt, 64, false, "");
+    defer ordinary.deinit();
+    try std.testing.expectEqualStrings(ordinary_prompt, prepared.rendered.text);
+    try std.testing.expectEqualSlices(i32, ordinary.ids, prepared.encoded.ids);
+    try std.testing.expectEqualSlices(i32, ordinary.attention_mask, prepared.encoded.attention_mask);
+    try std.testing.expectEqual(@as(usize, 1), prepared.eligible.ranges.len);
+    try std.testing.expectEqual(@as(u32, 5), prepared.eligible.ranges[0].start);
+    try std.testing.expectEqual(@as(u32, 7), prepared.eligible.ranges[0].end);
+    policy.compaction_targets.items[0].message_index = 0;
+    try std.testing.expectError(error.InvalidCompactionTarget, prepareCompactionPayload(a, &template, tok.tokenizer(), &messages, .{}, policy, 64, false));
+    policy.compaction_targets.items[0].message_index = 2;
+    try std.testing.expectError(error.InvalidCompactionTarget, prepareCompactionPayload(a, &template, tok.tokenizer(), &messages, .{}, policy, 64, false));
+}
+
+test "context question uses actual renderer attribution and rejects payload substitution" {
+    const a = std.testing.allocator;
+    const profile =
+        \\{"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},"pre_tokenizer":{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false},"model":{"type":"BPE","vocab":{"a":0,"▁":1,"▁a":2,"|":3},"merges":["▁ a"]},"added_tokens":[{"id":4,"content":"<r>","special":true}]}
+    ;
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(a, profile);
+    defer tok.tokenizer().deinitTokenizer();
+    tok.applySpecialTokenIds(9, 8, 10, 11);
+    var template = try ChatTemplate.init(a, "{% for m in messages %}<r>{{ m.content }}|{% endfor %}", "", "", "", "");
+    defer template.deinit();
+    const messages = [_]Message{
+        .{ .role = "system", .content = "a a" },
+        .{ .role = "user", .content = "a a" },
+        .{ .role = "user", .content = "a a" },
+    };
+    var policy = runtime.context_policy.Policy{ .mode = .attention_matching, .max_kv_tokens = 1024, .keep_prefix_tokens = 0, .keep_recent_tokens = 1 };
+    try policy.compaction_targets.add(.{ .message_index = 1, .part_index = 0 });
+    var prepared = try prepareCompactionPayload(a, &template, tok.tokenizer(), &messages, .{}, policy, 64, false);
+    defer prepared.deinit();
+    var question = try prepareCompactionQuestion(a, &template, tok.tokenizer(), &messages, .{}, policy, &prepared);
+    defer question.deinit();
+    try std.testing.expectEqual(@as(u32, 2), question.message_index);
+    try std.testing.expect(question.part_index == null);
+    try std.testing.expectEqual(.nonselected_user_message, question.attribution);
+    try std.testing.expectEqual(@as(u32, 9), question.source_start);
+    try std.testing.expectEqual(@as(u32, 11), question.source_end);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 2 }, question.ids);
+    try std.testing.expect(!std.mem.allEqual(u8, &question.prompt_tokens_sha256, 0));
+
+    // An identical protected tail inside the selected payload is still not a
+    // separately attributable question.
+    var selected_question = policy;
+    try selected_question.compaction_targets.add(.{ .message_index = 2, .part_index = 0 });
+    try std.testing.expectError(error.UnsupportedCompactionQuerySource, prepareCompactionQuestion(a, &template, tok.tokenizer(), &messages, .{}, selected_question, &prepared));
+    const ambiguous = [_]Message{.{ .role = "user", .content = "", .content_parts = &.{ .{ .text = "a" }, .{ .text = "a" } } }};
+    try std.testing.expectError(error.UnsupportedCompactionQuerySource, prepareCompactionQuestion(a, &template, tok.tokenizer(), &ambiguous, .{}, policy, &prepared));
+    const no_user = [_]Message{.{ .role = "system", .content = "a" }};
+    try std.testing.expectError(error.UnsupportedCompactionQuerySource, prepareCompactionQuestion(a, &template, tok.tokenizer(), &no_user, .{}, policy, &prepared));
+
+    const saved_offset = prepared.encoded.offsets.?[question.source_start];
+    @constCast(prepared.encoded.offsets.?)[question.source_start][0] -= 1;
+    try std.testing.expectError(error.UnsupportedCompactionQuerySource, prepareCompactionQuestion(a, &template, tok.tokenizer(), &messages, .{}, policy, &prepared));
+    @constCast(prepared.encoded.offsets.?)[question.source_start] = saved_offset;
+    const saved_id = prepared.encoded.ids[question.source_start];
+    prepared.encoded.ids[question.source_start] = 4;
+    try std.testing.expectError(error.UnsupportedCompactionQuerySource, prepareCompactionQuestion(a, &template, tok.tokenizer(), &messages, .{}, policy, &prepared));
+    prepared.encoded.ids[question.source_start] = saved_id;
+
+    const Probe = struct {
+        fn run(allocator: std.mem.Allocator, ct: *const ChatTemplate, tokenizer: tokenizer_mod.Tokenizer, input: []const Message, selection: runtime.context_policy.Policy, payload: *const PreparedCompactionPayload) !void {
+            var result = try prepareCompactionQuestion(allocator, ct, tokenizer, input, .{}, selection, payload);
+            result.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{ &template, tok.tokenizer(), @as([]const Message, &messages), policy, &prepared });
+}
+
+test "context study preparation suffix permits only known zero-span specials" {
+    const ids = [_]i32{ 300, 7, 301 };
+    const specials = [_]u32{ 300, 301 };
+    try validateCompactionStudySuffixOffsets(&ids, &.{ .{ 0, 0 }, .{ 100, 110 }, .{ 0, 0 } }, 100, 120, &specials);
+    try std.testing.expectError(error.UnsupportedCompactionStudyTemplate, validateCompactionStudySuffixOffsets(&ids, &.{ .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } }, 100, 120, &specials));
+    try std.testing.expectError(error.UnsupportedCompactionStudyTemplate, validateCompactionStudySuffixOffsets(&ids, &.{ .{ 0, 0 }, .{ 99, 110 }, .{ 0, 0 } }, 100, 120, &specials));
+    try std.testing.expectError(error.UnsupportedCompactionStudyTemplate, validateCompactionStudySuffixOffsets(&ids, &.{ .{ 0, 0 }, .{ 100, 100 }, .{ 0, 0 } }, 100, 120, &specials));
+    try std.testing.expectError(error.UnsupportedCompactionStudyTemplate, validateCompactionStudySuffixOffsets(&.{300}, &.{.{ 0, 0 }}, 100, 120, &specials));
+    try std.testing.expectError(error.InvalidPayloadProvenance, validateCompactionStudySuffixOffsets(&ids, &.{ .{ 0, 0 }, .{ 110, 100 }, .{ 0, 0 } }, 100, 120, &specials));
+    try std.testing.expectError(error.InvalidPayloadProvenance, validateCompactionStudySuffixOffsets(&ids, &.{ .{ 0, 0 }, .{ 100, 121 }, .{ 0, 0 } }, 100, 120, &specials));
+}
+
+test "context study preparation preserves loaded renderer and full token prefix" {
+    const a = std.testing.allocator;
+    const studies = @import("../backends/context_study_templates.zig");
+    const profile = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"!\":33,\"\\\"\":34,\"#\":35,\"$\":36,\"%\":37,\"&\":38,\"'\":39,\"(\":40,\")\":41,\"*\":42,\"+\":43,\",\":44,\"-\":45,\".\":46,\"/\":47,\"0\":48,\"1\":49,\"2\":50,\"3\":51,\"4\":52,\"5\":53,\"6\":54,\"7\":55,\"8\":56,\"9\":57,\":\":58,\";\":59,\"<\":60,\"=\":61,\">\":62,\"?\":63,\"@\":64,\"A\":65,\"B\":66,\"C\":67,\"D\":68,\"E\":69,\"F\":70,\"G\":71,\"H\":72,\"I\":73,\"J\":74,\"K\":75,\"L\":76,\"M\":77,\"N\":78,\"O\":79,\"P\":80,\"Q\":81,\"R\":82,\"S\":83,\"T\":84,\"U\":85,\"V\":86,\"W\":87,\"X\":88,\"Y\":89,\"Z\":90,\"[\":91,\"\\\\\":92,\"]\":93,\"^\":94,\"_\":95,\"`\":96,\"a\":97,\"b\":98,\"c\":99,\"d\":100,\"e\":101,\"f\":102,\"g\":103,\"h\":104,\"i\":105,\"j\":106,\"k\":107,\"l\":108,\"m\":109,\"n\":110,\"o\":111,\"p\":112,\"q\":113,\"r\":114,\"s\":115,\"t\":116,\"u\":117,\"v\":118,\"w\":119,\"x\":120,\"y\":121,\"z\":122,\"{\":123,\"|\":124,\"}\":125,\"~\":126,\"▁\":32},\"merges\":[]},\"normalizer\":{\"type\":\"Replace\",\"pattern\":{\"String\":\" \"},\"content\":\"▁\"},\"pre_tokenizer\":{\"type\":\"Split\",\"pattern\":{\"String\":\" \"},\"behavior\":\"MergedWithPrevious\",\"invert\":false}}";
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(a, profile);
+    defer tok.tokenizer().deinitTokenizer();
+    var template = try ChatTemplate.init(a, "{% for m in messages %}{{ m.role }}:{{ m.content }}|{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}", "", "", "", "");
+    defer template.deinit();
+    const messages = [_]Message{ .{ .role = "user", .content = "document" }, .{ .role = "user", .content = "question" } };
+    var policy = runtime.context_policy.Policy{ .mode = .attention_matching, .max_kv_tokens = 1024, .keep_prefix_tokens = 0, .keep_recent_tokens = 1 };
+    try policy.compaction_targets.add(.{ .message_index = 0, .part_index = 0 });
+    var prepared = try prepareCompactionPayload(a, &template, tok.tokenizer(), &messages, .{}, policy, 1024, false);
+    defer prepared.deinit();
+    var question = try prepareCompactionQuestion(a, &template, tok.tokenizer(), &messages, .{}, policy, &prepared);
+    defer question.deinit();
+    inline for (.{ studies.Kind.fit, studies.Kind.gate }) |kind| {
+        var study = try prepareCompactionStudy(a, &template, tok.tokenizer(), &messages, .{}, &prepared, kind, studies.authority(kind), 4096, false);
+        defer study.deinit();
+        try std.testing.expectEqual(question.prompt_tokens, study.prompt_tokens);
+        try std.testing.expectEqualSlices(u8, &question.prompt_tokens_sha256, &study.prompt_tokens_sha256);
+        try std.testing.expectEqualStrings(studies.template(kind), study.template_bytes);
+        const expected = try std.mem.concat(a, u8, &.{ "|user:", studies.template(kind), "|assistant:" });
+        defer a.free(expected);
+        try std.testing.expectEqual(expected.len, study.ids.len);
+        for (study.ids, expected) |id, byte| try std.testing.expectEqual(@as(i64, byte), id);
+        try std.testing.expectError(error.ContextReplayBudgetExceeded, prepareCompactionStudy(a, &template, tok.tokenizer(), &messages, .{}, &prepared, kind, studies.authority(kind), question.prompt_tokens + 1, false));
+    }
+    var changed = studies.authority(.fit);
+    changed.response_tokens -= 1;
+    try std.testing.expectError(error.CompactionQueryProtocolMismatch, prepareCompactionStudy(a, &template, tok.tokenizer(), &messages, .{}, &prepared, .fit, changed, 4096, false));
+    var incompatible = try ChatTemplate.init(a, "{% for m in messages %}{{ m.role }}:{{ m.content }}|{% endfor %}{% if add_generation_prompt %}GEN{% endif %}", "", "", "", "");
+    defer incompatible.deinit();
+    var incompatible_payload = try prepareCompactionPayload(a, &incompatible, tok.tokenizer(), &messages, .{}, policy, 1024, false);
+    defer incompatible_payload.deinit();
+    try std.testing.expectError(error.UnsupportedCompactionStudyTemplate, prepareCompactionStudy(a, &incompatible, tok.tokenizer(), &messages, .{}, &incompatible_payload, .fit, studies.authority(.fit), 4096, false));
+    const Probe = struct {
+        fn run(allocator: std.mem.Allocator, ct: *const ChatTemplate, tokenizer: tokenizer_mod.Tokenizer, input: []const Message, payload: *const PreparedCompactionPayload) !void {
+            var value = try prepareCompactionStudy(allocator, ct, tokenizer, input, .{}, payload, .fit, studies.authority(.fit), 4096, false);
+            value.deinit();
+        }
+    };
+    // The renderer's arena and tokenizer scratch may grow through remap.
+    // Force the allocation fallback so every injected-failure run traverses
+    // the same allocation indices regardless of neighboring heap mappings.
+    var allocation_only = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(allocation_only.allocator(), Probe.run, .{ &template, tok.tokenizer(), @as([]const Message, &messages), &prepared });
+    try std.testing.expectEqual(allocation_only.allocated_bytes, allocation_only.freed_bytes);
+
+    // Gemma's real template closes the empty assistant with an added special
+    // token. Its tokenizer reports (0, 0), not a byte position, for that token.
+    const special_profile = try std.mem.concat(a, u8, &.{
+        profile[0 .. profile.len - 1],
+        ",\"added_tokens\":[{\"id\":300,\"content\":\"<turn>\",\"special\":true},{\"id\":301,\"content\":\"<end>\",\"special\":true}]}",
+    });
+    defer a.free(special_profile);
+    const special_tok = try hf_tokenizer.HfTokenizer.loadFromBytes(a, special_profile);
+    defer special_tok.tokenizer().deinitTokenizer();
+    var special_template = try ChatTemplate.init(a, "{% for m in messages %}<turn>{{ m.role }}:{{ m.content }}<end>{% endfor %}{% if add_generation_prompt %}<turn>assistant:{% endif %}", "", "", "", "");
+    defer special_template.deinit();
+    var special_payload = try prepareCompactionPayload(a, &special_template, special_tok.tokenizer(), &messages, .{}, policy, 1024, false);
+    defer special_payload.deinit();
+    var special_study = try prepareCompactionStudy(a, &special_template, special_tok.tokenizer(), &messages, .{}, &special_payload, .fit, studies.authority(.fit), 4096, false);
+    defer special_study.deinit();
+    try std.testing.expectEqual(@as(i64, 301), special_study.ids[0]);
+    try std.testing.expectEqual(@as(u32, @intCast(special_payload.eligible.labels.len)), special_study.prompt_tokens);
+}
+
+test "context metadata allocator owns block views independently of manager and model scratch" {
+    const a = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4 });
+    var tracker = runtime.kv.host_allocation_tracker.HostAllocationTracker.init(null, 0);
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    state.context_metadata_allocator = tracker.allocator();
+    state.sequence_id = try manager.attachSequence(pool);
+    try manager.appendTokens(state.sequence_id.?, 2);
+    try manager.reserveTokenCapacity(state.sequence_id.?, 10);
+    try state.syncPagedKvBlockTable();
+    try std.testing.expectEqual(@as(usize, 3), state.kv_block_ids.items.len);
+    try std.testing.expect(tracker.snapshot().logical_live_bytes > 0);
+    state.deinit();
+    try std.testing.expectEqual(@as(u64, 0), tracker.snapshot().logical_live_bytes);
+}
+
+test "context private study provider deltas are monotonic and fail closed on reset" {
+    var before: ops.BackendDebugTimingSnapshot = .{ .native_quant_null = false };
+    before.provider.decoder_runtime_frame_begins = 10;
+    before.provider.decoder_runtime_frame_gpu_nanos = 100;
+    before.provider.metal_runtime_compute_encoder_count = 20;
+    before.provider.context_session_paged_decode_framed_dispatches = 40;
+    before.provider.metal_tensor_host_mirror_download_bytes = 30;
+    var after = before;
+    after.provider.decoder_runtime_frame_begins = 13;
+    after.provider.decoder_runtime_frame_gpu_nanos = 145;
+    after.provider.metal_runtime_compute_encoder_count = 27;
+    after.provider.context_session_paged_decode_framed_dispatches = 45;
+    after.provider.metal_tensor_host_mirror_download_bytes = 41;
+    const delta = NativeGenerationPipeline.compactionStudyProviderDelta(before, after) orelse return error.MissingStudyProviderDelta;
+    try std.testing.expectEqual(@as(u64, 3), delta.frame_begins);
+    try std.testing.expectEqual(@as(u128, 45), delta.frame_gpu_ns);
+    try std.testing.expectEqual(@as(u64, 7), delta.compute_encoders);
+    try std.testing.expectEqual(@as(u64, 5), delta.context_session_paged_decode_framed_dispatches);
+    try std.testing.expectEqual(@as(u64, 11), delta.host_download_bytes);
+
+    after.provider.metal_runtime_compute_encoder_count = 19;
+    try std.testing.expect(NativeGenerationPipeline.compactionStudyProviderDelta(before, after) == null);
+    after = before;
+    after.native_quant_null = true;
+    try std.testing.expect(NativeGenerationPipeline.compactionStudyProviderDelta(before, after) == null);
 }

@@ -29177,6 +29177,74 @@ pub const InferenceGenerateChunkChoice = struct {
     }
 };
 
+pub const InferenceGenerateCompactionTarget = struct {
+    message_index: i64,
+    /// Zero-based text part; string message content is part zero.
+    part_index: i64,
+};
+
+/// Separate positional context limits from retained KV storage. Exact is the default. Approximate modes require a qualified Metal f16 implementation and reject unsupported combinations; setting a policy never extends the artifact's positional limit.
+pub const InferenceGenerateContextPolicy = struct {
+    /// Explicit user/tool text payloads eligible for attention matching. Other roles, metadata, special tokens and boundary-crossing tokens remain exact. Unsupported renderer/tokenizer provenance is rejected. Approximate serving is not yet qualified.
+    compaction_targets: ?[]const InferenceGenerateCompactionTarget = null,
+    mode: ?[]const u8 = null,
+    /// Optional cap on prompt plus output positions, bounded by the model limit.
+    max_context_tokens: ?i64 = null,
+    /// Retained rows per global KV head. Required for approximate modes.
+    max_kv_tokens: ?i64 = null,
+    /// Exact prefix protection in approximate modes; does not identify message boundaries.
+    keep_prefix_tokens: ?i64 = null,
+    /// Minimum recent exact tail in approximate modes.
+    keep_recent_tokens: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "compaction_targets", "compaction_targets", true },
+        .{ "mode", "mode", true },
+        .{ "max_context_tokens", "max_context_tokens", true },
+        .{ "max_kv_tokens", "max_kv_tokens", true },
+        .{ "keep_prefix_tokens", "keep_prefix_tokens", true },
+        .{ "keep_recent_tokens", "keep_recent_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.compaction_targets) |value| {
+            try jw.objectField("compaction_targets");
+            try jw.write(value);
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.max_context_tokens) |value| {
+            try jw.objectField("max_context_tokens");
+            try jw.write(value);
+        }
+        if (self.max_kv_tokens) |value| {
+            try jw.objectField("max_kv_tokens");
+            try jw.write(value);
+        }
+        if (self.keep_prefix_tokens) |value| {
+            try jw.objectField("keep_prefix_tokens");
+            try jw.write(value);
+        }
+        if (self.keep_recent_tokens) |value| {
+            try jw.objectField("keep_recent_tokens");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Delta content for streaming
 pub const InferenceGenerateDelta = struct {
     /// Opaque provider stream metadata, including native Anthropic thinking and signature events. Preserve it when assembling provider-native assistant history.
@@ -29400,7 +29468,8 @@ pub const InferenceGenerateRequest = struct {
     speculation_calibration: ?[]const u8 = null,
     /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
     cache_dtype: ?[]const u8 = null,
-    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction. The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`; device-backed compaction is not yet supported.
+    context_policy: ?InferenceGenerateContextPolicy = null,
+    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction. The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`; device-backed compaction is not yet supported. Cannot be combined with context_policy.
     cache_compaction_ratio: ?f32 = null,
     context_management: ?InferenceContextManagement = null,
     kv_cache: ?InferenceKvCachePolicy = null,
@@ -29442,6 +29511,7 @@ pub const InferenceGenerateRequest = struct {
         .{ "speculation_policy", "speculation_policy", true },
         .{ "speculation_calibration", "speculation_calibration", true },
         .{ "cache_dtype", "cache_dtype", true },
+        .{ "context_policy", "context_policy", true },
         .{ "cache_compaction_ratio", "cache_compaction_ratio", true },
         .{ "context_management", "context_management", true },
         .{ "kv_cache", "kv_cache", true },
@@ -29553,6 +29623,10 @@ pub const InferenceGenerateRequest = struct {
         }
         if (self.cache_dtype) |value| {
             try jw.objectField("cache_dtype");
+            try jw.write(value);
+        }
+        if (self.context_policy) |value| {
+            try jw.objectField("context_policy");
             try jw.write(value);
         }
         if (self.cache_compaction_ratio) |value| {

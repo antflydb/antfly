@@ -1,0 +1,36 @@
+{
+  "artifacts": {
+    "libhighs": null,
+    "link_inventory": null,
+    "symbol_inventory": null
+  },
+  "build": {
+    "architecture": null,
+    "built_static": null,
+    "cmake": null,
+    "cmake_sha256": null,
+    "compiler": null,
+    "compiler_sha256": null,
+    "flags": null,
+    "highs_no_default_threads": false,
+    "highsint64": null,
+    "target": null
+  },
+  "completed": false,
+  "diagnostic_only": true,
+  "execution_authority": false,
+  "publication_authority": false,
+  "schema": "antfly.attention-matching.highs-v180-static-library.template.v2",
+  "source": {
+    "archive": null,
+    "callback_header": null,
+    "commit": "fcfb5341462f8a7db5ef5038613413f97d6cac3d",
+    "generated_hconfig": null,
+    "highs_c_api_header": null,
+    "license": null,
+    "runtime_githash": null,
+    "tag": "v1.8.0",
+    "tree_sha256": null
+  },
+  "status": "unresolved template; runtime_githash and all artifact fields required; rejected by driver"
+}

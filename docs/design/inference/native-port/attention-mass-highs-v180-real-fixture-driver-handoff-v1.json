@@ -1,0 +1,96 @@
+{
+  "artifacts": {
+    "adapter": {
+      "bytes": 29057,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_highs_v180_adapter_v3.zig",
+      "sha256": "493637b21fec53d07813fddac5cc874d232ae6680befe504bf639e9e3e6c5525"
+    },
+    "adapter_review": {
+      "bytes": 1752,
+      "path": "/private/tmp/attention-matching-native-highs-v180-adapter-independent-review-v3.json",
+      "sha256": "f574f049a7a37819f2edebbd6aea23c0203a5f289903f8ca70f6b25b864119f7"
+    },
+    "controller": {
+      "bytes": 41830,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v5.zig",
+      "sha256": "abdcc63e7d914b174f3fb8db2302db16af126386b610fcf6e80bf1dbb2ec82fa"
+    },
+    "controller_audit": {
+      "bytes": 1901,
+      "path": "/private/tmp/attention-matching-native-mass-cg-v5-compiled-tests-terminal-audit-root-v1.json",
+      "sha256": "faddb16f6f90a0b5ca6ece1ace2e1bd71ca35efa2b7638586020f392d2daad8b"
+    },
+    "design": {
+      "bytes": 3719,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-highs-v180-real-fixture-driver-v1.md",
+      "sha256": "9b970e48c5551106290f59fe700b594aeda53b2833a5aa6fa003a05deaac10c8"
+    },
+    "driver": {
+      "bytes": 24917,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_highs_v180_real_fixture_driver_v1.zig",
+      "sha256": "bf11695870d15161a1849316855fb2e3b0e42591ea87dded75b319e01c0f0bc2"
+    },
+    "fixture_exporter": {
+      "bytes": 14035,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/export_attention_mass_highs_restricted_fixture_v1.py",
+      "sha256": "1c277ae899839278ee60d001a56e78d751074755c4eaf7856ff6f6194baa916a"
+    },
+    "lp": {
+      "bytes": 24314,
+      "path": "/private/tmp/attention_mass_lp_v4.zig",
+      "sha256": "ff1d98cab21450271694ab524dd0733294ae0ff15793c57ed105f4d18d9354de"
+    },
+    "readiness": {
+      "bytes": 12924,
+      "path": "/private/tmp/attention-matching-native-highs-v180-c-abi-integration-readiness-v2.json",
+      "sha256": "a4b23dbf7e04525dd7f4a3ea07ee06d92ed4fbddd162d7c8fb0aac2de0baef91"
+    },
+    "test": {
+      "bytes": 2768,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/test_attention_mass_highs_v180_real_fixture_driver_v1.py",
+      "sha256": "81946cfec83ef3876dd9f6debd4db906a9c17621a34d6d028667fa2fcb45ea00"
+    },
+    "unresolved_library_receipt_template": {
+      "bytes": 860,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-highs-v180-static-library-receipt-template-v1.json",
+      "sha256": "b36725d95a7dc6cf72ac38da1568a0111fe8cc58beaad0009d9e55a35e23cdbc"
+    }
+  },
+  "completed": true,
+  "diagnostic_only": true,
+  "execution_authorized": false,
+  "library": {
+    "archive_downloaded": false,
+    "commit": "fcfb5341462f8a7db5ef5038613413f97d6cac3d",
+    "compiled": false,
+    "linked": false,
+    "receipt_resolved": false,
+    "solver_executed": false,
+    "tag": "v1.8.0"
+  },
+  "publication_authority": false,
+  "schema": "antfly.design.attention-mass-highs-v180-real-fixture-driver-handoff.v1",
+  "scientific_contract": {
+    "constraint_order": "upper then lower",
+    "dual_mapping": "alpha=-upper raw row dual; beta=-lower raw row dual",
+    "first_tolerance": 1e-09,
+    "fixture_shape": [
+      1128,
+      288
+    ],
+    "fresh_highs_instance_per_attempt": true,
+    "full_original_cg_witness_proven": false,
+    "persistent_model_or_basis_reuse": false,
+    "retry_count_max": 1,
+    "retry_tolerance": 1e-10,
+    "retry_trigger": "exact frozen witness rejection only"
+  },
+  "validation": {
+    "fixture_arrays_loaded": false,
+    "metadata_test": "1/1 passed",
+    "real_c_abi_link": "not run",
+    "solver": "not run",
+    "zig_compile": "not run",
+    "zig_fmt": "passed"
+  }
+}

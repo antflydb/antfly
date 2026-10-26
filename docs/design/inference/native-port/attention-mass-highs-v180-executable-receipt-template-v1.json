@@ -1,0 +1,22 @@
+{
+  "binary": null,
+  "completed": false,
+  "diagnostic_only": true,
+  "execution_authority": false,
+  "libhighs": null,
+  "library_receipt": null,
+  "link_argv": null,
+  "optimize": "ReleaseSafe",
+  "publication_authority": false,
+  "schema": "antfly.attention-matching.highs-v180-real-driver-executable.template.v1",
+  "sources": {
+    "adapter": null,
+    "controller": null,
+    "driver": null,
+    "lp": null
+  },
+  "status": "unresolved template; rejected by driver",
+  "strip": true,
+  "target": null,
+  "zig_executable": null
+}

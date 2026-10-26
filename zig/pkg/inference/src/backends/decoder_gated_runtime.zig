@@ -420,6 +420,17 @@ fn disableGatedFamilyPrefillFrameBarriersRequested() bool {
     return getenvBool("TERMITE_METAL_DISABLE_GATED_FAMILY_PREFILL_FRAME_BARRIERS");
 }
 
+fn disableGatedFamilyDecodeFrameRequested() bool {
+    return getenvBool("TERMITE_METAL_DISABLE_GATED_FAMILY_DECODE_FRAME");
+}
+
+fn gatedFamilyFramePhaseAllowed(phase: BlockTimingPhase, disable_decode: bool) bool {
+    return switch (phase) {
+        .prefill => true,
+        .greedy, .sampled => !disable_decode,
+    };
+}
+
 fn disableActivePagedGatedBlockForDecodeRequested() bool {
     return getenvBool("TERMITE_METAL_DISABLE_ACTIVE_PAGED_GATED_BLOCK") or
         getenvBool("TERMITE_METAL_DISABLE_ACTIVE_PAGED_GATED_BLOCK_DECODE");
@@ -646,13 +657,15 @@ fn prepareGemmaQueryForAttention(
     head_dim: usize,
     q_dim: usize,
 ) !ops.CT {
-    if (gpt_config.global_head_dim == 0) return q_input;
+    // Both fused head-norm RoPE and the unfused attention RoPE path already
+    // apply sqrt(head_dim). Scaling here as well changes attention logits.
+    if (!gpt_arch.shouldScaleGemma4QBeforeAttention(gpt_config, false)) return q_input;
     const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
     if (try cb.multiplyScalar(q_input, scale)) |scaled| return scaled;
     const q_data = try cb.toFloat32(q_input, allocator);
     defer allocator.free(q_data);
     const scaled = try allocator.alloc(f32, q_data.len);
-    errdefer allocator.free(scaled);
+    defer allocator.free(scaled);
     @memcpy(scaled, q_data);
     for (scaled) |*value| value.* *= scale;
     const shape = [_]i32{ @intCast(rows), @intCast(q_dim) };
@@ -1567,6 +1580,8 @@ fn tryBackendOwnedGreedyTokenResult(
         capture_final_hidden,
         false,
         .full,
+        gpt_config.suppressTokenIds(),
+        false,
     );
 }
 
@@ -1592,6 +1607,8 @@ fn tryBackendOwnedGreedyTokenResultPhase(
         capture_final_hidden,
         false,
         phase,
+        gpt_config.suppressTokenIds(),
+        false,
     );
 }
 
@@ -1606,6 +1623,8 @@ fn tryBackendOwnedGreedyTokenResultPhaseHidden(
     capture_final_hidden: bool,
     capture_pre_norm_hidden: bool,
     phase: contracts.DecoderRuntimeDecodePhase,
+    suppress_token_ids: []const i32,
+    qualification_require_finite_logits: bool,
 ) !?BackendOwnedGreedyTokenResult {
     return tryBackendOwnedTokenResultPhaseHidden(
         cb,
@@ -1620,6 +1639,8 @@ fn tryBackendOwnedGreedyTokenResultPhaseHidden(
         phase,
         .greedy_argmax,
         null,
+        suppress_token_ids,
+        qualification_require_finite_logits,
     );
 }
 
@@ -1636,6 +1657,8 @@ fn tryBackendOwnedTokenResultPhaseHidden(
     phase: contracts.DecoderRuntimeDecodePhase,
     mode: contracts.DecoderRuntimeDecodeMode,
     sampling: ?contracts.DecoderRuntimeSamplingRequest,
+    suppress_token_ids: []const i32,
+    qualification_require_finite_logits: bool,
 ) !?BackendOwnedGreedyTokenResult {
     const trace = getenvBool("TERMITE_METAL_TRACE_DECODER_RUNTIME_DECODE");
     if (gatedFamilyCompareRequested()) {
@@ -1749,7 +1772,9 @@ fn tryBackendOwnedTokenResultPhaseHidden(
         .items = items[0..],
         .token_embedding_weight = token_embedding_weight,
         .ple_token_embedding_weight = ple_token_embedding_weight,
-        .suppress_token_ids = gpt_config.suppressTokenIds(),
+        .qualification_require_finite_logits = qualification_require_finite_logits,
+        .qualification_final_logit_softcap = qualificationFinalLogitSoftcap(gpt_config, qualification_require_finite_logits),
+        .suppress_token_ids = suppress_token_ids,
         .output_hidden = if (capture_final_hidden) &output_hidden else null,
         .output_hidden_pre_norm = capture_pre_norm_hidden,
         .output_token_ids = output_token_ids[0..],
@@ -1947,6 +1972,8 @@ fn tryBackendOwnedSampledToken(
         true,
         true,
         .full,
+        gpt_config.suppressTokenIds(),
+        false,
     )) orelse return null;
     defer result.deinit(cb);
     const pre_norm_hidden = result.final_hidden orelse return null;
@@ -2126,6 +2153,8 @@ pub fn forwardResidentSampledToken(
             .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
             .token_history = token_history,
         },
+        gpt_config.suppressTokenIds(),
+        false,
     )) orelse return error.ResidentSamplingFrameFailed;
     return result.token_id;
 }
@@ -2166,12 +2195,95 @@ fn tryBackendOwnedGreedyToken(
     return result.token_id;
 }
 
+fn qualificationGreedySuppressTokenIds() []const i32 {
+    // The frozen qualification contract computes an unconstrained argmax over
+    // the complete vocabulary. Serving-only suppression must not alter it.
+    return &.{};
+}
+
+fn qualificationFinalLogitSoftcap(gpt_config: gpt_mod.Config, require_output: bool) f32 {
+    return if (require_output) gpt_config.final_logit_softcapping else 0;
+}
+
+/// Strict prepared singleton decode for context qualification. Once admitted,
+/// failure is terminal because the private context may already be mutated.
+pub fn forwardQualificationPreparedGreedyToken(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    require_output: bool,
+) !i64 {
+    if (!decode_context.qualification_require_context_decode_frame or
+        decode_context.context_session == null or
+        decode_context.query_sequence_len != 1 or
+        decode_context.attention_mode != .paged_decode)
+        return error.PreparedStudyRouteUnsupported;
+    timing_stats.greedy_calls += 1;
+    var result = (try tryBackendOwnedGreedyTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        false,
+        false,
+        .full,
+        qualificationGreedySuppressTokenIds(),
+        require_output,
+    )) orelse return error.PreparedStudyRouteUnsupported;
+    defer result.deinit(cb);
+    if (require_output) {
+        const vocab_size = std.math.cast(i64, gpt_config.vocab_size) orelse return error.InvalidStudyToken;
+        if (result.token_id < 0 or result.token_id >= vocab_size) return error.InvalidStudyToken;
+    }
+    return result.token_id;
+}
+
+test "context prepared study greedy keeps the frozen unconstrained contract" {
+    var config = gpt_mod.Config{ .final_logit_softcapping = 30 };
+    config.suppress_token_ids[0] = 7;
+    config.suppress_token_ids[1] = 11;
+    config.suppress_token_ids_len = 2;
+    try std.testing.expectEqual(@as(usize, 2), config.suppressTokenIds().len);
+    try std.testing.expectEqual(@as(usize, 0), qualificationGreedySuppressTokenIds().len);
+    try std.testing.expectEqual(@as(f32, 30), qualificationFinalLogitSoftcap(config, true));
+    try std.testing.expectEqual(@as(f32, 0), qualificationFinalLogitSoftcap(config, false));
+}
+
+test "context prepared study rejects an unqualified request before backend execution" {
+    var cb: ops.ComputeBackend = undefined;
+    const config = gpt_mod.Config{ .vocab_size = 4 };
+    const dc = gpt_arch.DecodeContext{
+        .attention_mode = .paged_decode,
+        .total_sequence_len = 2,
+        .query_sequence_len = 1,
+        .kv_sequence_len = 2,
+    };
+    try std.testing.expectError(error.PreparedStudyRouteUnsupported, forwardQualificationPreparedGreedyToken(
+        &cb,
+        std.testing.allocator,
+        config,
+        1,
+        0,
+        2,
+        &dc,
+        true,
+    ));
+}
+
 fn shouldUseDecoderRuntimeFrame(
     phase: BlockTimingPhase,
     gpt_config: gpt_mod.Config,
     configured_layer_count: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) bool {
+    if (!gatedFamilyFramePhaseAllowed(phase, disableGatedFamilyDecodeFrameRequested())) return false;
     switch (phase) {
         .prefill => {
             if (decode_context.attention_mode != .paged_prefill) return false;
@@ -2188,6 +2300,14 @@ fn shouldUseDecoderRuntimeFrame(
     if (c_std.getenv("TERMITE_DEBUG_GPT_STATS") != null) return false;
     if (disableGatedFamilyRuntimePrefillBlockRequested(gpt_config, configured_layer_count)) return false;
     return true;
+}
+
+test "context gated decode frame diagnostic preserves prefill frames" {
+    try std.testing.expect(gatedFamilyFramePhaseAllowed(.prefill, true));
+    try std.testing.expect(!gatedFamilyFramePhaseAllowed(.greedy, true));
+    try std.testing.expect(!gatedFamilyFramePhaseAllowed(.sampled, true));
+    try std.testing.expect(gatedFamilyFramePhaseAllowed(.greedy, false));
+    try std.testing.expect(gatedFamilyFramePhaseAllowed(.sampled, false));
 }
 
 pub fn preplanPrefillFrame(
@@ -2260,12 +2380,12 @@ pub fn prewarmPleTokenEmbedding(
     return true;
 }
 
-fn finishDecoderRuntimeFrame(cb: *const ops.ComputeBackend, active: *bool) void {
+fn finishDecoderRuntimeFrame(cb: *const ops.ComputeBackend, active: *bool) !void {
     if (!active.*) return;
-    cb.decoderRuntimeSubmitAndWaitFrame() catch |err| {
-        std.log.warn("decoder runtime frame submit failed: {s}", .{@errorName(err)});
-    };
-    active.* = false;
+    // The backend cancels/poisons its pending frame on submission or wait
+    // failure. Never return apparently valid hidden states after that error.
+    defer active.* = false;
+    try cb.decoderRuntimeSubmitAndWaitFrame();
 }
 
 fn cancelDecoderRuntimeFrame(cb: *const ops.ComputeBackend, active: *bool) void {
@@ -2339,6 +2459,8 @@ fn forwardFinalHiddenTensorGemmaDirect(
         cb.decoderRuntimeHasActiveFrame() or try cb.decoderRuntimeBeginFrame()
     else
         false;
+    var return_decoder_frame = false;
+    defer if (!return_decoder_frame) cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
     if (decoder_frame_active and phase == .prefill) {
         try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
     }
@@ -2357,16 +2479,15 @@ fn forwardFinalHiddenTensorGemmaDirect(
         },
     );
     var planned_barriers_suppressed = false;
-    if (decoder_frame_active) {
+    if (decoder_frame_active and decode_context.context_session == null) {
         // Gemma direct-runtime frames encode their full producer/consumer order
         // in one backend-owned command plan. Avoid per-dispatch buffer barriers
-        // on this hot path; the benchmark harness already uses this policy.
+        // on this hot path. Context attention deliberately takes the staged
+        // route, whose ordinary runtime operations need range-tracked barriers
+        // between producers and consumers in the shared frame.
         planned_barriers_suppressed = try cb.decoderRuntimePushPlannedComputeBarrierSuppression();
     }
     defer if (planned_barriers_suppressed) cb.decoderRuntimePopPlannedComputeBarrierSuppression() catch {};
-    var return_decoder_frame = false;
-    defer if (!return_decoder_frame) finishDecoderRuntimeFrame(cb, &decoder_frame_active);
-    errdefer cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
     var frame_layers_buf: [256]contracts.DecoderRuntimeLayerSpec = undefined;
     var prefill_frame_planned = false;
     var planned_frame_layers: []const contracts.DecoderRuntimeLayerSpec = &.{};
@@ -2445,9 +2566,10 @@ fn forwardFinalHiddenTensorGemmaDirect(
             if (frame_execute_finished_at > frame_execute_started_at) {
                 timing_stats.prefill_frame_execute_nanos += frame_execute_finished_at - frame_execute_started_at;
             }
+            const completed_hidden = frame_hidden orelse return error.UnexpectedNull;
             return_decoder_frame = decoder_frame_active;
             return .{
-                .hidden = frame_hidden orelse return error.UnexpectedNull,
+                .hidden = completed_hidden,
                 .total_rows = decode_context.query_sequence_len,
                 .decoder_frame_active = return_decoder_frame,
             };
@@ -2814,7 +2936,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             const rope_theta = gpt_config.layerRopeEffectiveTheta(layer);
             const position_offset = gpt_arch.positionOffset(seq_len, decode_context.query_sequence_len, decode_context);
             const rope_consecutive_pairs = gpt_config.rope_layout == .consecutive_pairs;
-            const q_scale: f32 = @sqrt(@as(f32, @floatFromInt(head_dim)));
+            const q_scale: f32 = if (gpt_config.global_head_dim != 0) @sqrt(@as(f32, @floatFromInt(head_dim))) else 1.0;
             fused_q_rope = try gpt_arch.maybeApplyQKHeadNormRope(
                 cb,
                 allocator,
@@ -3075,6 +3197,12 @@ fn forwardFinalHiddenTensorGemmaDirect(
         }
 
         var prefill_span_seeded = false;
+        const installed_attention_match = if (comptime build_options.enable_metal) blk: {
+            if (cb.kind() != .metal) break :blk false;
+            const storage = decode_context.kv_storage orelse break :blk false;
+            const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            break :blk compute.hasInstalledAttentionMatch(storage);
+        } else false;
         if (tracePrefillSeedRequested()) {
             std.debug.print(
                 "metal-prefill-seed-check layer={d} kv_layer={d} mode={s} shares_kv={} disabled={} q={d} kv={d} pos={d}\n",
@@ -3090,7 +3218,9 @@ fn forwardFinalHiddenTensorGemmaDirect(
                 },
             );
         }
-        if (decode_context.attention_mode == .paged_prefill and !shares_kv and !disableDirectPrefillSeedRequested()) {
+        if (decode_context.attention_mode == .paged_prefill and !shares_kv and
+            !installed_attention_match and !disableDirectPrefillSeedRequested())
+        {
             var attention_seed = gpt_arch.attentionContextFromDecode(decode_context);
             attention_seed.layer_index = kv_layer_index;
             attention_seed.skip_kv_write = shares_kv;
@@ -5007,11 +5137,12 @@ fn forwardFinalHiddenTensorGemmaDirect(
         }
     }
 
+    return_decoder_frame = decoder_frame_active and phase == .prefill and decode_context.query_sequence_len > 1;
+    if (!return_decoder_frame) try finishDecoderRuntimeFrame(cb, &decoder_frame_active);
     if (reserved_hidden) |*carrier| {
         carrier.deinit(cb, true);
         reserved_hidden = null;
     }
-    return_decoder_frame = decoder_frame_active and phase == .prefill and decode_context.query_sequence_len > 1;
     return .{
         .hidden = hidden,
         .total_rows = decode_context.query_sequence_len,
@@ -5047,7 +5178,7 @@ fn forwardFinalHiddenTensorDirect(
         try cb.decoderRuntimeBeginFrame()
     else
         false;
-    defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    defer cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
 
     const use_copy_based_reserved_hidden = !decoder_frame_active or phase != .prefill or decode_context.query_sequence_len <= 1;
     var reserved_hidden = if (use_copy_based_reserved_hidden)
@@ -5121,6 +5252,7 @@ fn forwardFinalHiddenTensorDirect(
         }
     }
 
+    try finishDecoderRuntimeFrame(cb, &decoder_frame_active);
     if (reserved_hidden) |*carrier| {
         carrier.deinit(cb, true);
         reserved_hidden = null;
@@ -5922,6 +6054,8 @@ pub fn forwardGreedyToken(
 
     var started_at = monotonicNowNs();
     const hidden = try decoder_rms_runtime.embedToken(cb, allocator, gpt_config, token_id);
+    var hidden_owned = true;
+    defer if (hidden_owned) cb.free(hidden);
     var finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.greedy_embed_nanos += finished_at - started_at;
     const ple_input_ids = [_]i64{token_id};
@@ -5963,6 +6097,10 @@ pub fn forwardGreedyToken(
         direct_hidden_row
     else blk: {
         const overrides = buildOverrides(gpt_config, configured_layer_count);
+        // The canonical architecture path consumes its positioned embedding
+        // input. The direct runtime borrows it, so only transfer ownership on
+        // this fallback branch.
+        hidden_owned = false;
         break :blk try gpt_arch.forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
             cb,
             allocator,
@@ -5977,7 +6115,7 @@ pub fn forwardGreedyToken(
     };
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.greedy_block_nanos += finished_at - started_at;
-    errdefer cb.free(final_hidden);
+    defer cb.free(final_hidden);
 
     var compare_fallback_hidden: ?ops.CT = null;
     defer if (compare_fallback_hidden) |ct| cb.free(ct);
@@ -6137,6 +6275,8 @@ pub fn forwardSampledTokenPipelinedArm(
             .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
             .token_history = token_history,
         },
+        gpt_config.suppressTokenIds(),
+        false,
     );
     return result != null;
 }
@@ -6179,6 +6319,8 @@ pub fn forwardSampledTokenPipelinedStep(
             .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
             .token_history = token_history,
         },
+        gpt_config.suppressTokenIds(),
+        false,
     )) orelse return null;
     if (result.token_id < 0) return error.InvalidModelOutput;
     return result.token_id;
@@ -6505,10 +6647,14 @@ pub fn forwardLastLogits(
         seq_len,
         decode_context,
     )) orelse return null;
-    const logits_host = try cb.toFloat32(logits, allocator);
-    cb.free(logits);
+    const logits_host = try readbackOwnedLogits(cb, allocator, logits);
     gpt_arch.applyFinalLogitSoftcapInPlace(gpt_config, logits_host);
     return logits_host;
+}
+
+fn readbackOwnedLogits(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, logits: ops.CT) ![]f32 {
+    defer cb.free(logits);
+    return cb.toFloat32(logits, allocator);
 }
 
 pub const PrefillPreparedTail = struct {
@@ -6539,6 +6685,12 @@ pub fn forwardPrefillLastPreparedTail(
 
     var started_at = monotonicNowNs();
     const hidden = try decoder_rms_runtime.embedTokens(cb, allocator, gpt_config, input_ids);
+    // Embedding succeeds before the optional direct PLE/frame setup. Those
+    // steps can still fail (including admission while resolving the PLE
+    // embedding table), so own the tensor immediately instead of waiting for
+    // the transformer result to establish its final-hidden owner.
+    var owns_hidden = true;
+    errdefer if (owns_hidden) cb.free(hidden);
     var finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_embed_nanos += finished_at - started_at;
 
@@ -6615,6 +6767,7 @@ pub fn forwardPrefillLastPreparedTail(
     if (direct_hidden_result == null) {
         cancelDecoderRuntimeFrame(cb, &ple_frame_active);
         cb.free(hidden);
+        owns_hidden = false;
         return null;
     }
     var decoder_frame_active = if (direct_hidden_result) |direct_hidden|
@@ -6622,7 +6775,7 @@ pub fn forwardPrefillLastPreparedTail(
     else
         false;
     if (decoder_frame_active) ple_frame_active = false;
-    defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    defer cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
     var final_hidden, var total_rows = if (direct_hidden_result) |direct_hidden|
         .{ direct_hidden.hidden, direct_hidden.total_rows }
     else blk: {
@@ -6645,6 +6798,9 @@ pub fn forwardPrefillLastPreparedTail(
     // The embedded rows were borrowed by the block stack (the direct paths
     // copy them into their own hidden buffers); release them here.
     if (final_hidden != hidden) cb.free(hidden);
+    // Either the original embedding was released above or ownership moved to
+    // `owns_final_hidden` when a backend returned it as the final tensor.
+    owns_hidden = false;
     var owns_final_hidden = true;
     errdefer if (owns_final_hidden) cb.free(final_hidden);
     if (direct_hidden_result != null and compare_hidden_input != null) {
@@ -6689,7 +6845,7 @@ pub fn forwardPrefillLastPreparedTail(
     }
     if (syncGatedFamilyFinalHiddenRequested()) {
         const sync_started_at = monotonicNowNs();
-        finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+        try finishDecoderRuntimeFrame(cb, &decoder_frame_active);
         const synced_hidden = try cb.toFloat32(final_hidden, allocator);
         allocator.free(synced_hidden);
         const sync_finished_at = monotonicNowNs();
@@ -6710,7 +6866,7 @@ pub fn forwardPrefillLastPreparedTail(
         owns_final_hidden = false;
     }
     const frame_finish_started_at = monotonicNowNs();
-    finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    try finishDecoderRuntimeFrame(cb, &decoder_frame_active);
     const frame_finish_finished_at = monotonicNowNs();
     if (frame_finish_finished_at > frame_finish_started_at) {
         timing_stats.prefill_frame_finish_nanos += frame_finish_finished_at - frame_finish_started_at;
@@ -6881,7 +7037,7 @@ fn forwardFinalHiddenRowsFromHidden(
     // an owned input is done once they return.
     if (owns_hidden and hidden_result.hidden != hidden) cb.free(hidden);
     var decoder_frame_active = hidden_result.decoder_frame_active;
-    defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    defer cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
     finished_at = monotonicNowNs();
     if (finished_at > started_at) {
         if (phase == .greedy) {
@@ -6920,6 +7076,7 @@ fn forwardFinalHiddenRowsFromHidden(
             if (!cb.decoderRuntimeHasActiveFrame()) decoder_frame_active = false;
         }
     }
+    try finishDecoderRuntimeFrame(cb, &decoder_frame_active);
     return .{
         .final_hidden = final_hidden,
         .rows = hidden_result.total_rows,
@@ -7122,6 +7279,8 @@ pub fn forwardLastLogitsTensor(
     if (decode_context.attention_mode != .paged_decode and decode_context.attention_mode != .paged_prefill) return null;
 
     const hidden = try decoder_rms_runtime.embedToken(cb, allocator, gpt_config, token_id);
+    var hidden_owned = true;
+    defer if (hidden_owned) cb.free(hidden);
     const ple_input_ids = [_]i64{token_id};
     const ple_vectors = try gpt_arch.computePleVectors(cb, allocator, gpt_config, &ple_input_ids, hidden, 1);
     defer if (ple_vectors) |pv| cb.free(pv);
@@ -7154,6 +7313,8 @@ pub fn forwardLastLogitsTensor(
         direct_hidden_row
     else blk: {
         const overrides = buildOverrides(gpt_config, configured_layer_count);
+        // Direct execution borrows the embedding; the canonical path consumes it.
+        hidden_owned = false;
         break :blk try gpt_arch.forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
             cb,
             allocator,
@@ -7252,6 +7413,8 @@ pub fn forwardSampledToken(
 
     var started_at = monotonicNowNs();
     const hidden = try decoder_rms_runtime.embedToken(cb, allocator, gpt_config, token_id);
+    var hidden_owned = true;
+    defer if (hidden_owned) cb.free(hidden);
     var finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.sampled_embed_nanos += finished_at - started_at;
     const ple_input_ids = [_]i64{token_id};
@@ -7273,6 +7436,8 @@ pub fn forwardSampledToken(
         direct_hidden
     else blk: {
         const overrides = buildOverrides(gpt_config, configured_layer_count);
+        // Transfer before calling: the canonical path also consumes input on error.
+        hidden_owned = false;
         break :blk try gpt_arch.forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
             cb,
             allocator,
@@ -7323,6 +7488,38 @@ pub fn forwardSampledToken(
 
 fn sampledBackendSupportsTokenConstraints(gpt_config: gpt_mod.Config) bool {
     return gpt_config.suppressTokenIds().len == 0;
+}
+
+test "context gated logits readback releases device ownership on success and failure" {
+    const Probe = struct {
+        frees: usize = 0,
+        fail: bool,
+        fn readback(raw: *anyopaque, _: ops.CT, allocator: std.mem.Allocator) ![]f32 {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            if (probe.fail) return error.InjectedReadbackFailure;
+            return allocator.dupe(f32, &.{ 1, 2 });
+        }
+        fn free(raw: *anyopaque, _: ops.CT) void {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            probe.frees += 1;
+        }
+    };
+    var table: ops.ComputeBackend.VTable = undefined;
+    table.toFloat32 = Probe.readback;
+    table.freeTensor = Probe.free;
+    inline for (.{ true, false }) |fail| {
+        var probe = Probe{ .fail = fail };
+        const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
+        const tensor: ops.CT = @ptrCast(&probe);
+        if (fail) {
+            try std.testing.expectError(error.InjectedReadbackFailure, readbackOwnedLogits(&cb, std.testing.allocator, tensor));
+        } else {
+            const values = try readbackOwnedLogits(&cb, std.testing.allocator, tensor);
+            defer std.testing.allocator.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, values);
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.frees);
+    }
 }
 
 test "sampled gated runtime defers configs with suppressed tokens" {
@@ -7563,4 +7760,147 @@ test "gemma4 shared kv layers do not own decode runtime kv weights" {
     try std.testing.expect(layerHasOwnKvWeights(config, 3));
     try std.testing.expect(!layerHasOwnKvWeights(config, 4));
     try std.testing.expect(!layerHasOwnKvWeights(config, 5));
+}
+
+test "context gemma4 direct query correction preserves rope scaling exactly once" {
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    // Force the host fallback as well as exercising the no-allocation RoPE path.
+    var table = native.vtable_impl;
+    table.multiplyScalar = null;
+    const cb = ops.ComputeBackend{ .ptr = &compute, .vtable = &table };
+    inline for (.{ @as(usize, 256), @as(usize, 512) }) |dim| {
+        const scale = @sqrt(@as(f32, @floatFromInt(dim)));
+        var values: [dim]f32 = undefined;
+        @memset(&values, 1.0);
+        const input = try cb.fromFloat32Shape(&values, &.{ 1, dim });
+        defer cb.free(input);
+        var config = gpt_mod.Config{ .family = .gemma, .global_head_dim = 512, .position_encoding = .rope };
+        // Unfused attention will apply sqrt(dim) during RoPE.
+        const rope_query = try prepareGemmaQueryForAttention(&cb, a, config, input, 1, dim, dim);
+        defer if (rope_query != input) cb.free(rope_query);
+        try std.testing.expect(input == rope_query);
+        @memset(&values, scale);
+        const fused = try cb.fromFloat32Shape(&values, &.{ 1, dim });
+        defer cb.free(fused);
+        // Fused head-norm RoPE has already applied the same correction.
+        const fused_query = try prepareGemmaQueryForAttention(&cb, a, config, fused, 1, dim, dim);
+        defer if (fused_query != fused) cb.free(fused_query);
+        try std.testing.expect(fused == fused_query);
+        config.position_encoding = .absolute;
+        const corrected = try prepareGemmaQueryForAttention(&cb, a, config, input, 1, dim, dim);
+        defer cb.free(corrected);
+        const data = try cb.toFloat32(corrected, a);
+        defer a.free(data);
+        for (data) |value| try std.testing.expectApproxEqAbs(scale, value, 1e-6);
+        config.global_head_dim = 0;
+        const ordinary_query = try prepareGemmaQueryForAttention(&cb, a, config, input, 1, dim, dim);
+        defer if (ordinary_query != input) cb.free(ordinary_query);
+        try std.testing.expect(input == ordinary_query);
+    }
+}
+
+test "context gemma4 prepared prefill releases hidden when PLE weight lookup is denied" {
+    const allocator = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    const Tensor = @import("tensor.zig").Tensor;
+
+    var weights = native.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+
+    const embedding_name = try allocator.dupe(u8, "model.embed_tokens.weight");
+    var embedding_transferred = false;
+    errdefer if (!embedding_transferred) allocator.free(embedding_name);
+    var embedding = try Tensor.initFloat32(
+        allocator,
+        embedding_name,
+        &.{ 4, 2 },
+        &.{
+            1.0, 2.0,
+            3.0, 4.0,
+            5.0, 6.0,
+            7.0, 8.0,
+        },
+    );
+    errdefer if (!embedding_transferred) embedding.deinit();
+    try weights.resident_weights.put(allocator, embedding_name, .{ .tensor = embedding });
+    embedding_transferred = true;
+
+    var compute = native.NativeCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    const Failure = struct {
+        fn getEmbeddingWeight(ctx: *anyopaque, name: []const u8) anyerror!ops.CT {
+            if (std.mem.eql(u8, name, "model.per_layer_input.per_layer_token_embd.weight")) {
+                return error.ResourceTemporarilyUnavailable;
+            }
+            return @import("../ops/native_compute.zig").vtable_impl.getEmbeddingWeight.?(ctx, name);
+        }
+    };
+    var table = native.vtable_impl;
+    table.getEmbeddingWeight = Failure.getEmbeddingWeight;
+    const cb = ops.ComputeBackend{ .ptr = &compute, .vtable = &table };
+
+    const config: gpt_mod.Config = .{
+        .family = .gemma,
+        .hidden_size = 2,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 2,
+        .intermediate_size = 4,
+        .vocab_size = 4,
+        .ple_hidden_size = 2,
+        .norm_type = .rms_norm,
+        .position_encoding = .rope,
+        .activation = .gelu,
+    };
+    const input_ids = [_]i64{ 1, 3 };
+    const decode_context: gpt_arch.DecodeContext = .{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = input_ids.len,
+        .query_sequence_len = input_ids.len,
+        .kv_sequence_len = input_ids.len,
+    };
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        forwardPrefillLastPreparedTail(
+            &cb,
+            allocator,
+            config,
+            @intCast(config.num_hidden_layers),
+            &input_ids,
+            input_ids.len,
+            &decode_context,
+            false,
+        ),
+    );
+}
+
+test "context gated frame completion propagates device failure and never resubmits" {
+    const Probe = struct {
+        calls: usize = 0,
+        fail: bool,
+        fn submit(raw: *anyopaque) !void {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            probe.calls += 1;
+            if (probe.fail) return error.InjectedFrameWaitFailure;
+        }
+    };
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.decoderRuntimeSubmitAndWaitFrame = Probe.submit;
+    inline for (.{ true, false }) |fail| {
+        var probe = Probe{ .fail = fail };
+        const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
+        var active = true;
+        if (fail) {
+            try std.testing.expectError(error.InjectedFrameWaitFailure, finishDecoderRuntimeFrame(&cb, &active));
+        } else try finishDecoderRuntimeFrame(&cb, &active);
+        try std.testing.expect(!active);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        try finishDecoderRuntimeFrame(&cb, &active);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    }
 }

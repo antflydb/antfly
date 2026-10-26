@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..models.inference_chat_message import InferenceChatMessage
     from ..models.inference_context_management import InferenceContextManagement
     from ..models.inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
+    from ..models.inference_generate_context_policy import InferenceGenerateContextPolicy
     from ..models.inference_generate_response_format import InferenceGenerateResponseFormat
     from ..models.inference_generate_stream_options import InferenceGenerateStreamOptions
     from ..models.inference_kv_cache_policy import InferenceKvCachePolicy
@@ -84,12 +85,16 @@ class InferenceGenerateRequest:
         cache_dtype (InferenceGenerateRequestCacheDtype | Unset): inference-native KV cache quantization format. Lower
             precision reduces memory usage but may
             affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
+        context_policy (InferenceGenerateContextPolicy | Unset): Separate positional context limits from retained KV
+            storage. Exact is the default.
+            Approximate modes require a qualified Metal f16 implementation and reject unsupported
+            combinations; setting a policy never extends the artifact's positional limit.
         cache_compaction_ratio (float | Unset): inference-native KV cache compaction ratio applied after prefill via
             Attention Matching.
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
             The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
-            device-backed compaction is not yet supported.
+            device-backed compaction is not yet supported. Cannot be combined with context_policy.
         context_management (InferenceContextManagement | Unset):
         kv_cache (InferenceKvCachePolicy | Unset):
         prompt_cache_key (str | Unset): inference-native prompt prefix cache namespace key. Requests with the same key
@@ -147,6 +152,7 @@ class InferenceGenerateRequest:
     speculation_policy: InferenceGenerateRequestSpeculationPolicy | Unset = UNSET
     speculation_calibration: InferenceGenerateRequestSpeculationCalibration | Unset = UNSET
     cache_dtype: InferenceGenerateRequestCacheDtype | Unset = UNSET
+    context_policy: InferenceGenerateContextPolicy | Unset = UNSET
     cache_compaction_ratio: float | Unset = UNSET
     context_management: InferenceContextManagement | Unset = UNSET
     kv_cache: InferenceKvCachePolicy | Unset = UNSET
@@ -226,6 +232,10 @@ class InferenceGenerateRequest:
         cache_dtype: str | Unset = UNSET
         if not isinstance(self.cache_dtype, Unset):
             cache_dtype = self.cache_dtype.value
+
+        context_policy: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.context_policy, Unset):
+            context_policy = self.context_policy.to_dict()
 
         cache_compaction_ratio = self.cache_compaction_ratio
 
@@ -313,6 +323,8 @@ class InferenceGenerateRequest:
             field_dict["speculation_calibration"] = speculation_calibration
         if cache_dtype is not UNSET:
             field_dict["cache_dtype"] = cache_dtype
+        if context_policy is not UNSET:
+            field_dict["context_policy"] = context_policy
         if cache_compaction_ratio is not UNSET:
             field_dict["cache_compaction_ratio"] = cache_compaction_ratio
         if context_management is not UNSET:
@@ -339,6 +351,7 @@ class InferenceGenerateRequest:
         from ..models.inference_chat_message import InferenceChatMessage
         from ..models.inference_context_management import InferenceContextManagement
         from ..models.inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
+        from ..models.inference_generate_context_policy import InferenceGenerateContextPolicy
         from ..models.inference_generate_response_format import InferenceGenerateResponseFormat
         from ..models.inference_generate_stream_options import InferenceGenerateStreamOptions
         from ..models.inference_kv_cache_policy import InferenceKvCachePolicy
@@ -436,6 +449,13 @@ class InferenceGenerateRequest:
         else:
             cache_dtype = InferenceGenerateRequestCacheDtype(_cache_dtype)
 
+        _context_policy = d.pop("context_policy", UNSET)
+        context_policy: InferenceGenerateContextPolicy | Unset
+        if isinstance(_context_policy, Unset):
+            context_policy = UNSET
+        else:
+            context_policy = InferenceGenerateContextPolicy.from_dict(_context_policy)
+
         cache_compaction_ratio = d.pop("cache_compaction_ratio", UNSET)
 
         _context_management = d.pop("context_management", UNSET)
@@ -521,6 +541,7 @@ class InferenceGenerateRequest:
             speculation_policy=speculation_policy,
             speculation_calibration=speculation_calibration,
             cache_dtype=cache_dtype,
+            context_policy=context_policy,
             cache_compaction_ratio=cache_compaction_ratio,
             context_management=context_management,
             kv_cache=kv_cache,

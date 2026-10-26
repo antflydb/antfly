@@ -17,12 +17,22 @@
 
 import math
 
+LEGACY_GENERATION_PHASES = (
+    "prompt_format",
+    "tokenize",
+    "multimodal_prepare",
+    "runtime_prepare",
+    "prefill",
+    "decode",
+    "text_decode",
+)
 GENERATION_PHASES = (
     "prompt_format",
     "tokenize",
     "multimodal_prepare",
     "runtime_prepare",
     "prefill",
+    "maintenance",
     "decode",
     "text_decode",
 )
@@ -67,8 +77,14 @@ def wall_limit(seconds, units, rounding=0):
 
 
 def generation_timing(text, wall_seconds):
-    fields = GENERATION_PHASES + ("total",)
-    row = integer_fields(one_record(text, "generate_timing_ms: ", fields), fields)
+    legacy_fields = LEGACY_GENERATION_PHASES + ("total",)
+    row = one_record(
+        text, "generate_timing_ms: ", legacy_fields, ("maintenance",)
+    )
+    integer_fields(row, tuple(row))
+    # Historical receipts predate the explicit post-prefill maintenance
+    # interval. Normalize them without folding current maintenance into decode.
+    row.setdefault("maintenance", 0)
     if row["total"] != sum(row[k] for k in GENERATION_PHASES):
         raise ValueError("generation phases do not reconcile")
     if not 0 < row["total"] <= wall_limit(wall_seconds, 1000, rounding=2):

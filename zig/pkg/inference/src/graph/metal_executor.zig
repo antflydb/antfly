@@ -1592,6 +1592,8 @@ const RuntimeContext = struct {
     }
 
     fn compactKvCache(self: *RuntimeContext, config: runtime.kv.compaction.CompactionConfig) !void {
+        try config.validate();
+        if (self.currentTokenCount() > 512) return error.InvalidCompactionShape;
         try self.invalidateDecoderRuntimeSpanState();
         const sequence_id = self.kv_metadata.sequence_id orelse return;
         const kv_view = self.kv_metadata.kv_view orelse return error.InvalidPagedKvState;

@@ -68,6 +68,10 @@ pub const Options = struct {
     /// Whole-head validation includes the exact prefix/recent rows and applies
     /// the same thresholds after rounding. Chunk mode retains the strict oracle.
     validation: enum { chunk, whole_head } = .chunk,
+    /// Re-authorize final whole-head and encoded publication using the common
+    /// scalar FP64 attention path. Off by default so existing CUDA/common
+    /// execution and performance remain unchanged; the Metal adapter opts in.
+    independent_fp64_publication: bool = false,
     /// Bound concurrent whole-head conversion/validation, independently of fit workers.
     max_parallel_validations: usize = 2,
     chunk_rows: usize = 512,
@@ -129,6 +133,16 @@ pub const HeadWorkspace = struct {
     solver_bytes: usize,
 };
 
+/// The accelerator is allowed to construct fitting matrices, but publication
+/// is authorized against the common FP64 attention semantics. Keeping this a
+/// distinct config also makes the extra scalar validation storage visible to
+/// preflight admission instead of silently allocating it after admission.
+fn finalAuthorizationConfig(fit: solver.Config, independent: bool) solver.Config {
+    var authorization = fit;
+    if (independent) authorization.backend = null;
+    return authorization;
+}
+
 /// Shared by preflight admission and compactHead. Includes the replacement
 /// arrays even though the resident bound also reserves a full-size candidate.
 pub fn headWorkspaceBytes(
@@ -162,8 +176,9 @@ pub fn headWorkspaceBytes(
         0;
     const conversion_bytes = try mul(try add(try mul(block_rows, try add(try mul(d, 4), 6)), try mul(d, 2)), 8);
     const scratch_max = try solver.fitWorkspaceBytes(block_rows, std.math.divCeil(usize, block_rows, options.retention_divisor) catch unreachable, train_elements / d, d, heldout_elements / d, options.fit);
+    const authorization = finalAuthorizationConfig(options.fit, options.independent_fp64_publication);
     const head_validation_bytes = if (options.validation == .whole_head)
-        try add(try mul(try mul(try add(original_rows, target_rows), try add(try mul(d, 2), 1)), 8), try solver.validationBytes(original_rows, target_rows, d, heldout_elements / d, options.fit))
+        try add(try mul(try mul(try add(original_rows, target_rows), try add(try mul(d, 2), 1)), 8), try solver.validationBytes(original_rows, target_rows, d, heldout_elements / d, authorization))
     else
         0;
     return .{
@@ -415,7 +430,7 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
         compact.values = cv;
         compact.bias = cb;
         compact.rows = target_rows;
-        var cfg = options.fit;
+        var cfg = finalAuthorizationConfig(options.fit, options.independent_fp64_publication);
         if (options.stats) |stats| cfg.metrics = &stats.rounded_fit;
         try validateRounded(allocator, h, compact, heldout, cfg);
         if (options.fp8_checkpoint) {
@@ -1076,6 +1091,29 @@ const ParallelTestBackend = struct {
     }
     const backend: solver.Backend = .{ .workspace_fn = workspace };
 };
+test "attention_match explicit final publication authorization is independent FP64" {
+    const control: solver.Control = .{};
+    const accelerated: solver.Config = .{
+        .target_rows = 4,
+        .backend = ParallelTestBackend.backend,
+        .max_relative_mass_error = 0.0125,
+        .max_relative_output_rmse = 0.025,
+        .control = control,
+    };
+    const unchanged = finalAuthorizationConfig(accelerated, false);
+    try std.testing.expect(unchanged.backend != null);
+    const authorization = finalAuthorizationConfig(accelerated, true);
+    try std.testing.expect(authorization.backend == null);
+    try std.testing.expectEqual(accelerated.target_rows, authorization.target_rows);
+    try std.testing.expectEqual(accelerated.max_relative_mass_error, authorization.max_relative_mass_error);
+    try std.testing.expectEqual(accelerated.max_relative_output_rmse, authorization.max_relative_output_rmse);
+    try std.testing.expectEqual(accelerated.control.context, authorization.control.context);
+
+    // Scalar validation streams one query at a time, so the independently
+    // admitted storage is bounded by source+candidate rows, not query count.
+    const expected = try mul(try add(512, try add(256, try add(try mul(64, 2), 2))), 8);
+    try std.testing.expectEqual(expected, try solver.validationBytes(512, 256, 64, 4096, authorization));
+}
 test "attention_match planned host bound admits parallel fitting and rejects one byte less" {
     const batches = batchesFixture();
     const backends: [4]solver.Backend = @splat(ParallelTestBackend.backend);

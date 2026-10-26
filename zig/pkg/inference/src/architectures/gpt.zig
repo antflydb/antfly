@@ -525,6 +525,10 @@ fn deepSeekV4DecodeContextWithInputIds(
 
 pub const Gemma4LayerSpecCache = struct {
     layers: []backend_contracts.DecoderRuntimeLayerSpec = &.{},
+    /// Allocator that owns `layers`. Decode-state metadata and model runtime
+    /// allocations may use different allocators, so teardown must not infer
+    /// this ownership from its caller.
+    layers_allocator: ?std.mem.Allocator = null,
     configured_layer_count: usize = 0,
     num_hidden_layers: usize = 0,
     include_output_scale: bool = false,
@@ -536,7 +540,7 @@ pub const Gemma4LayerSpecCache = struct {
     }
 
     pub fn deinit(self: *Gemma4LayerSpecCache, allocator: std.mem.Allocator) void {
-        if (self.layers.len > 0) allocator.free(self.layers);
+        if (self.layers.len > 0) (self.layers_allocator orelse allocator).free(self.layers);
         self.* = .{};
     }
 
@@ -611,7 +615,11 @@ pub const DecodeContext = struct {
         per_item_mode: ?@import("../ops/ops.zig").AttentionMode = null,
     };
 
+    context_session: ?runtime.kv.context_session.Hook = null,
     attention_mode: AttentionMode = .full_recompute,
+    /// Qualification-only demand for a single full-model context decode frame.
+    /// Default false preserves every serving and ordinary decode route.
+    qualification_require_context_decode_frame: bool = false,
     total_sequence_len: usize,
     query_sequence_len: usize,
     kv_sequence_len: usize,
@@ -659,6 +667,69 @@ pub const DecodeContext = struct {
     }
 };
 
+fn contextForwardFrameEligible(decode_context: ?*const DecodeContext, has_trace_sink: bool) bool {
+    if (has_trace_sink) return false;
+    const dc = decode_context orelse return false;
+    const session = dc.context_session orelse return false;
+    const eligible_mode = dc.attention_mode == .paged_prefill or
+        (dc.qualification_require_context_decode_frame and
+            dc.attention_mode == .paged_decode and dc.query_sequence_len == 1);
+    return eligible_mode and contextSessionFrameCompatible(decode_context) and session.supportsFramedAttention();
+}
+
+fn contextSessionFrameCompatible(decode_context: ?*const DecodeContext) bool {
+    const dc = decode_context orelse return true;
+    const session = dc.context_session orelse return true;
+    return session.supportsFramedAttention();
+}
+
+test "context legacy hook does not request generic model forward frame" {
+    const Probe = struct {
+        fn next(_: *anyopaque, _: u64, _: u32, requested: u32) !u32 {
+            return requested;
+        }
+        fn attention(_: *anyopaque, _: u64, _: runtime.kv.context_session.Attention, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef) !void {}
+        fn attentionFramed(_: *anyopaque, _: u64, _: runtime.kv.context_session.Frame, _: runtime.kv.context_session.Attention, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef, _: runtime.kv.context_session.DeviceRef) !void {}
+        const legacy_vtable = runtime.kv.context_session.Hook.VTable{
+            .next_chunk = next,
+            .attention = attention,
+        };
+        const framed_vtable = runtime.kv.context_session.Hook.VTable{
+            .next_chunk = next,
+            .attention = attention,
+            .attention_framed = attentionFramed,
+        };
+    };
+    var marker: u8 = 0;
+    var dc = DecodeContext{
+        .context_session = .{ .ctx = &marker, .identity = 1, .plan = undefined, .vtable = &Probe.legacy_vtable },
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 8,
+        .query_sequence_len = 4,
+        .kv_sequence_len = 8,
+    };
+    try std.testing.expect(!contextForwardFrameEligible(&dc, false));
+    try std.testing.expect(!contextSessionFrameCompatible(&dc));
+    dc.context_session = .{ .ctx = &marker, .identity = 1, .plan = undefined, .vtable = &Probe.framed_vtable };
+    try std.testing.expect(contextForwardFrameEligible(&dc, false));
+    try std.testing.expect(contextSessionFrameCompatible(&dc));
+    try std.testing.expect(!contextForwardFrameEligible(&dc, true));
+    dc.attention_mode = .paged_decode;
+    try std.testing.expect(!contextForwardFrameEligible(&dc, false));
+    try std.testing.expectEqual(ops.AttentionMode.paged_prefill, attentionContextFromDecode(&dc).mode);
+    dc.query_sequence_len = 1;
+    try std.testing.expect(!contextForwardFrameEligible(&dc, false));
+    dc.qualification_require_context_decode_frame = true;
+    try std.testing.expect(contextForwardFrameEligible(&dc, false));
+    const framed_decode = attentionContextFromDecode(&dc);
+    try std.testing.expectEqual(ops.AttentionMode.paged_decode, framed_decode.mode);
+    try std.testing.expect(framed_decode.context_session != null);
+    try std.testing.expect(framed_decode.kv_cache == null);
+    dc.context_session.?.vtable = &Probe.legacy_vtable;
+    try std.testing.expectEqual(ops.AttentionMode.paged_prefill, attentionContextFromDecode(&dc).mode);
+    try std.testing.expect(!contextForwardFrameEligible(&dc, false));
+}
+
 test "Gemma4LayerSpecCache matches only exact spec shape" {
     var layers: [35]backend_contracts.DecoderRuntimeLayerSpec = undefined;
     var cache = Gemma4LayerSpecCache{
@@ -675,6 +746,22 @@ test "Gemma4LayerSpecCache matches only exact spec shape" {
     try std.testing.expect(!cache.matches(35, 35, true, 5678));
     cache.reset();
     try std.testing.expect(!cache.matches(35, 35, true, 1234));
+}
+
+test "Gemma4LayerSpecCache frees layers with their recorded allocator" {
+    var owner = runtime.kv.host_allocation_tracker.HostAllocationTracker.init(null, 0);
+    var unrelated = runtime.kv.host_allocation_tracker.HostAllocationTracker.init(null, 0);
+    const owner_allocator = owner.allocator();
+    const unrelated_allocator = unrelated.allocator();
+
+    var cache = Gemma4LayerSpecCache{
+        .layers = try owner_allocator.alloc(backend_contracts.DecoderRuntimeLayerSpec, 2),
+        .layers_allocator = owner_allocator,
+    };
+    try std.testing.expect(owner.snapshot().logical_live_bytes > 0);
+    cache.deinit(unrelated_allocator);
+    try std.testing.expectEqual(@as(u64, 0), owner.snapshot().logical_live_bytes);
+    try std.testing.expectEqual(@as(u64, 0), unrelated.snapshot().logical_live_bytes);
 }
 
 /// GPT decoder forward pass. Returns logits: [batch * seq_len * vocab_size] as f32.
@@ -694,9 +781,13 @@ pub fn forward(
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
+    var owned_input = embedded;
+    var input_owned = true;
+    errdefer if (input_owned) cb.free(owned_input);
     try maybeDebugTensorLastRow(cb, allocator, "embed", embedded, hidden_size);
     try maybeDebugTensor(cb, allocator, "embed_full", embedded);
     const hidden = try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+    owned_input = hidden;
     if (hidden != embedded) try maybeDebugTensorLastRow(cb, allocator, "embed_scaled", hidden, hidden_size);
     if (hidden != embedded) try maybeDebugTensor(cb, allocator, "embed_scaled_full", hidden);
 
@@ -713,6 +804,7 @@ pub fn forward(
         decode_context,
         &deepseek_v4_decode_context_storage,
     );
+    input_owned = false; // The transformer entrypoint consumes input on every exit.
     return forwardFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
 }
 
@@ -734,6 +826,8 @@ pub fn forwardHiddenOnly(
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
+    var input_owned = true;
+    errdefer if (input_owned) cb.free(hidden);
 
     const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
@@ -748,6 +842,7 @@ pub fn forwardHiddenOnly(
         decode_context,
         &deepseek_v4_decode_context_storage,
     );
+    input_owned = false; // Ownership transfers even if the transformer fails.
     const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
     cb.free(hidden_result.hidden);
 }
@@ -769,6 +864,8 @@ pub fn forwardHiddenTensorWithCudaReplay(
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
+    var input_owned = true;
+    errdefer if (input_owned) cb.free(hidden);
 
     const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
@@ -783,6 +880,7 @@ pub fn forwardHiddenTensorWithCudaReplay(
         decode_context,
         &deepseek_v4_decode_context_storage,
     );
+    input_owned = false; // The CUDA replay wrapper consumes input on every exit.
     const hidden_result = try forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
         cb,
         allocator,
@@ -886,10 +984,13 @@ pub fn forwardHiddenTensorFromTokenTensorWithCudaReplay(
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
+    var input_owned = true;
+    errdefer if (input_owned) cb.free(hidden);
 
     const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
 
+    input_owned = false; // The CUDA replay wrapper consumes input on every exit.
     const hidden_result = try forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
         cb,
         allocator,
@@ -959,6 +1060,8 @@ pub fn forwardGreedyLastToken(
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
+    var input_owned = true;
+    errdefer if (input_owned) cb.free(hidden);
 
     const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
@@ -973,6 +1076,7 @@ pub fn forwardGreedyLastToken(
         decode_context,
         &deepseek_v4_decode_context_storage,
     );
+    input_owned = false; // The greedy transformer entrypoint consumes input on every exit.
     return forwardGreedyLastTokenFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
 }
 
@@ -992,6 +1096,8 @@ pub fn forwardGreedyLastTokenWithFinalHidden(
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
+    var input_owned = true;
+    errdefer if (input_owned) cb.free(hidden);
 
     const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
@@ -1006,6 +1112,7 @@ pub fn forwardGreedyLastTokenWithFinalHidden(
         decode_context,
         &deepseek_v4_decode_context_storage,
     );
+    input_owned = false; // The transformer entrypoint consumes input on every exit.
     const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
     errdefer cb.free(hidden_result.hidden);
     const token_result = try greedyLastTokenTensorFromFinalHiddenRetain(cb, allocator, config, hidden_result);
@@ -1035,10 +1142,13 @@ pub fn forwardGreedyLastTokenFromTokenTensor(
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
+    var input_owned = true;
+    errdefer if (input_owned) cb.free(hidden);
 
     const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
 
+    input_owned = false; // The greedy transformer entrypoint consumes input on every exit.
     return try forwardGreedyLastTokenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors);
 }
 
@@ -1059,10 +1169,13 @@ pub fn forwardGreedyLastTokenTensorOnlyFromTokenTensor(
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
+    var input_owned = true;
+    errdefer if (input_owned) cb.free(hidden);
 
     const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
 
+    input_owned = false; // The tensor-only transformer entrypoint consumes input on every exit.
     return try forwardGreedyLastTokenTensorOnlyFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors);
 }
 
@@ -2890,6 +3003,191 @@ test "E4B shared KV prefill excludes query capture and unsupported contexts" {
     try std.testing.expect(sharedKvPrefillBoundary(model, dc) == null);
 }
 
+test "attention_match query capture disables pre projection fusion and suppresses residual fallback duplicates" {
+    const Capture = struct {
+        fn capture(_: *anyopaque, _: usize, _: usize, _: usize, _: usize, _: usize, _: []const f32) anyerror!void {}
+    };
+    var marker: u8 = 0;
+    const config: Config = .{
+        .family = .gemma,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 32,
+        .hidden_size = 64,
+        .position_encoding = .rope,
+        .global_head_dim = 32,
+    };
+    var dc: DecodeContext = .{
+        .attention_mode = .paged_decode,
+        .total_sequence_len = 9,
+        .query_sequence_len = 1,
+        .kv_sequence_len = 9,
+        .selection_query_capture = .{
+            .ctx = &marker,
+            .allocator = std.testing.allocator,
+            .horizon = 1,
+            .captureFn = Capture.capture,
+        },
+    };
+    try std.testing.expect(!preProjectionGatedBlockAllowed(&dc));
+    try std.testing.expect(preProjectionGatedBlockAllowed(null));
+    try std.testing.expect(selectionQueryCaptureRequested(&dc, false));
+    try std.testing.expect(!selectionQueryCaptureRequested(&dc, true));
+    try std.testing.expect(attentionResidualCapturesSelectionQueries(config, &dc, 1, 9, 0));
+
+    var fallback: DecodeContext = undefined;
+    const suppressed = decodeContextAfterSelectionCapture(&dc, true, &fallback).?;
+    try std.testing.expect(suppressed != &dc);
+    try std.testing.expect(suppressed.selection_query_capture == null);
+    try std.testing.expect(dc.selection_query_capture != null);
+    try std.testing.expectEqual(dc.total_sequence_len, suppressed.total_sequence_len);
+    try std.testing.expect(decodeContextAfterSelectionCapture(&dc, false, &fallback).? == &dc);
+
+    dc.attention_mode = .paged_prefill;
+    dc.query_sequence_len = 4;
+    try std.testing.expect(!attentionResidualCapturesSelectionQueries(config, &dc, 1, 9, 0));
+    dc.selection_query_capture = null;
+    try std.testing.expect(preProjectionGatedBlockAllowed(&dc));
+}
+
+test "attention_match residual decline and paged fallback capture post RoPE queries once" {
+    const Probe = struct {
+        const Record = struct {
+            residual_calls: usize = 0,
+            fallback_calls: usize = 0,
+            capture_calls: usize = 0,
+            first_position: usize = 0,
+            captured: [2]f32 = @splat(0),
+        };
+        var active: ?*Record = null;
+
+        fn residual(_: *anyopaque, _: *const ops.RunAttentionResidualRequest) anyerror!?CT {
+            const record = active orelse return error.MissingAttentionCaptureProbe;
+            record.residual_calls += 1;
+            return null;
+        }
+
+        fn fallback(
+            ctx: *anyopaque,
+            _: CT,
+            _: CT,
+            _: CT,
+            _: ?CT,
+            _: ops.AttentionContext,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+        ) anyerror!CT {
+            const record = active orelse return error.MissingAttentionCaptureProbe;
+            record.fallback_calls += 1;
+            return native_compute_mod.vtable_impl.fromFloat32Shape(ctx, &.{ 0, 0 }, &.{ 1, 2 });
+        }
+
+        fn capture(raw: *anyopaque, _: usize, _: usize, first_position: usize, heads: usize, dim: usize, values: []const f32) anyerror!void {
+            const record: *Record = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), heads);
+            try std.testing.expectEqual(@as(usize, 2), dim);
+            try std.testing.expectEqual(@as(usize, 2), values.len);
+            record.capture_calls += 1;
+            record.first_position = first_position;
+            @memcpy(record.captured[0..], values);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var table = native_compute_mod.vtable_impl;
+    table.runAttention = null;
+    table.runAttentionResidual = Probe.residual;
+    table.gqaPagedAttention = Probe.fallback;
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &table };
+
+    const q = try cb.fromFloat32Shape(&.{ 0.25, -0.5 }, &.{ 1, 2 });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(&.{ 0.75, 0.125 }, &.{ 1, 2 });
+    defer cb.free(k);
+    const v = try cb.fromFloat32Shape(&.{ 1.5, -2 }, &.{ 1, 2 });
+    defer cb.free(v);
+    const residual = try cb.fromFloat32Shape(&.{ 0, 0 }, &.{ 1, 2 });
+    defer cb.free(residual);
+
+    var record = Probe.Record{};
+    Probe.active = &record;
+    defer Probe.active = null;
+    const config: Config = .{
+        .family = .gemma,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 2,
+        .hidden_size = 2,
+        .position_encoding = .rope,
+        .global_head_dim = 2,
+    };
+    const dc: DecodeContext = .{
+        .attention_mode = .paged_decode,
+        .total_sequence_len = 2,
+        .query_sequence_len = 1,
+        .kv_sequence_len = 2,
+        .selection_query_capture = .{
+            .ctx = &record,
+            .allocator = allocator,
+            .horizon = 1,
+            .captureFn = Probe.capture,
+        },
+    };
+    try std.testing.expect(attentionResidualCapturesSelectionQueries(config, &dc, 1, 2, 0));
+    try std.testing.expect((try applyAttentionResidual(
+        &cb,
+        config,
+        q,
+        k,
+        v,
+        residual,
+        1,
+        2,
+        1,
+        1,
+        2,
+        2,
+        0,
+        0,
+        false,
+        0,
+        null,
+        null,
+        &dc,
+    )) == null);
+    var fallback_context: DecodeContext = undefined;
+    const output = try applyAttention(
+        &cb,
+        config,
+        q,
+        k,
+        v,
+        1,
+        2,
+        1,
+        1,
+        2,
+        0,
+        0,
+        false,
+        decodeContextAfterSelectionCapture(&dc, true, &fallback_context),
+    );
+    defer cb.free(output);
+    try std.testing.expectEqual(@as(usize, 1), record.residual_calls);
+    try std.testing.expectEqual(@as(usize, 1), record.fallback_calls);
+    try std.testing.expectEqual(@as(usize, 1), record.capture_calls);
+    try std.testing.expectEqual(@as(usize, 1), record.first_position);
+    for (record.captured) |value| try std.testing.expect(std.math.isFinite(value));
+}
+
 test "E4B shared KV last row retains absolute positions and full donor KV extent" {
     const ids = [_]i64{ 11, 22, 33 };
     const dc: DecodeContext = .{
@@ -3073,6 +3371,8 @@ fn forwardFinalHiddenWithSharedKvOutput(
     var owns_a4b_forward_frame = false;
     if (cb.kind() == .metal and
         isDecodeStep(decode_context) and
+        !metalAttentionMatchInstalled(cb, decode_context) and
+        contextSessionFrameCompatible(decode_context) and
         gemma4_runtime.isQualifiedA4bArchitecture(config) and
         !getenvBool("TERMITE_METAL_DISABLE_A4B_LAYER_FRAME") and
         !getenvBool("TERMITE_METAL_DISABLE_A4B_FORWARD_FRAME") and
@@ -3100,6 +3400,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
         qwen3vl_forward_context.?.query_sequence_len > 1;
     if (cb.kind() == .metal and
         config.family == .qwen3_vl and
+        contextSessionFrameCompatible(decode_context) and
         trace_sink == null and
         (qwen3vl_eager_decode_frame or qwen3vl_prepared_prefill_frame) and
         !cb.decoderRuntimeHasActiveFrame())
@@ -3111,6 +3412,34 @@ fn forwardFinalHiddenWithSharedKvOutput(
     }
     defer if (owns_qwen3vl_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
 
+    // Packed context owns KV transaction finalization at the terminal Metal
+    // wait. Keep the generic prefill stack in one frame so every layer either
+    // commits together or the frame-cancel callback rolls the session back.
+    var owns_context_forward_frame = false;
+    defer if (owns_context_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
+    const require_context_decode_frame = if (decode_context) |dc|
+        dc.qualification_require_context_decode_frame
+    else
+        false;
+    if (require_context_decode_frame and
+        (!@import("builtin").is_test or cb.kind() != .metal or trace_sink != null or
+            !contextForwardFrameEligible(decode_context, trace_sink != null) or
+            cb.decoderRuntimeHasActiveFrame()))
+        return error.ContextFramedExecutionUnsupported;
+    if (cb.kind() == .metal and
+        contextForwardFrameEligible(decode_context, trace_sink != null) and
+        trace_sink == null and
+        !cb.decoderRuntimeHasActiveFrame())
+    {
+        owns_context_forward_frame = try cb.decoderRuntimeBeginFrame();
+        if (owns_context_forward_frame) try cb.decoderRuntimeSetActiveFrameRegime(
+            if (require_context_decode_frame) .decode else .prefill,
+        );
+    }
+    // The qualification route cannot fall through to per-layer synchronous
+    // attention after the hook has begun mutating its private branch.
+    if (require_context_decode_frame and !owns_context_forward_frame)
+        return error.ContextFramedExecutionUnsupported;
     // A long-lived Metal frame may recycle a released buffer immediately for
     // a later encoded layer even though an earlier command still reads it.
     // Keep prior hidden tensors owned until frame completion; this retains the
@@ -3120,7 +3449,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
         for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
         deferred_a4b_hidden_frees.deinit(allocator);
     }
-    if (owns_a4b_forward_frame) {
+    if (owns_a4b_forward_frame or owns_context_forward_frame) {
         try deferred_a4b_hidden_frees.ensureTotalCapacity(
             allocator,
             config.num_hidden_layers * 2 + 2,
@@ -3150,7 +3479,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
     // buffers. Those copies are useful for per-layer frames, but inside this
     // cross-layer frame they add one blit and a long dependency chain per
     // layer. Let the naturally device-resident result flow directly instead.
-    var reserved_hidden: ?ReservedHiddenCarrier = if (owns_a4b_forward_frame)
+    var reserved_hidden: ?ReservedHiddenCarrier = if (owns_a4b_forward_frame or owns_context_forward_frame)
         null
     else
         try ReservedHiddenCarrier.init(cb, hidden, total, hidden_size);
@@ -3234,7 +3563,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
             owns_hidden = false;
         } else {
             if (new_hidden != hidden) {
-                if (owns_a4b_forward_frame)
+                if (owns_a4b_forward_frame or owns_context_forward_frame)
                     deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
                 else
                     cb.free(hidden);
@@ -3246,7 +3575,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
         if (cb.kind() == .metal and forceLayerCloneDebug()) {
             const cloned_hidden = try cloneTensorMaterialized(cb, allocator, hidden);
             if (owns_hidden) {
-                if (owns_a4b_forward_frame)
+                if (owns_a4b_forward_frame or owns_context_forward_frame)
                     deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
                 else
                     cb.free(hidden);
@@ -3308,7 +3637,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
         reserved_hidden = null;
         owns_hidden = true;
     } else if (final_hidden != hidden) {
-        if (owns_a4b_forward_frame)
+        if (owns_a4b_forward_frame or owns_context_forward_frame)
             deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
         else
             cb.free(hidden);
@@ -3317,6 +3646,12 @@ fn forwardFinalHiddenWithSharedKvOutput(
     if (owns_qwen3vl_forward_frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         owns_qwen3vl_forward_frame = false;
+    }
+    if (owns_context_forward_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        owns_context_forward_frame = false;
+        for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
+        deferred_a4b_hidden_frees.clearRetainingCapacity();
     }
     if (!is_freestanding and prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
         debugPrint("prefill-trace: gpt final norm done\n", .{});
@@ -6013,6 +6348,7 @@ fn decoderBlock(
     var owns_a4b_layer_frame = false;
     if (cb.kind() == .metal and
         isDecodeStep(decode_context) and
+        contextSessionFrameCompatible(decode_context) and
         gemma4_runtime.isQualifiedA4bArchitecture(config) and
         !getenvBool("TERMITE_METAL_DISABLE_A4B_LAYER_FRAME") and
         !cb.decoderRuntimeHasActiveFrame())
@@ -6032,6 +6368,7 @@ fn decoderBlock(
     if (cb.kind() == .metal and
         config.family == .qwen3_vl and
         isDecodeStep(decode_context) and
+        contextSessionFrameCompatible(decode_context) and
         qwen3VlMetalDecodeFrameEnabled() and
         !cb.decoderRuntimeHasActiveFrame())
     {
@@ -6049,6 +6386,7 @@ fn decoderBlock(
         decoderOverrideLayerSlot(raw_overrides.mlp_down_slots, layer) != null;
     if (cb.kind() == .metal and
         config.family == .qwen3_vl and
+        contextSessionFrameCompatible(decode_context) and
         qwen3VlMetalPrefillFastPathEnabled() and
         qwen3vl_prepared_layer and
         decode_context != null and
@@ -6262,7 +6600,9 @@ fn decoderBlockImpl(
     // Shared KV layers read K/V from their donor layer's cache — create placeholder zeros.
     const kv_dim: usize = @as(usize, num_kv_heads) * head_dim;
     const q_dim: usize = @as(usize, num_heads) * head_dim;
-    if (!disableDecoderRuntimeActivationDebug() and !shares_kv and config.family != .gpt2 and
+    if (!disableDecoderRuntimeActivationDebug() and !shares_kv and
+        preProjectionGatedBlockAllowed(decode_context) and
+        config.family != .gpt2 and
         config.family != .qwen3 and config.family != .qwen3_vl and config.family != .qwen3_5 and
         attn_q_slot != null and attn_k_slot != null and attn_v_slot != null and
         attn_out_proj_linear_slot != null and mlp_gate_slot != null and
@@ -6301,6 +6641,7 @@ fn decoderBlockImpl(
             .attention = blk: {
                 var attention = attentionContext(seq_len, decode_context);
                 attention.layer_index = kv_layer_index;
+                attention.context_consumer_layer = @intCast(layer);
                 attention.skip_kv_write = shares_kv;
                 attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
                 if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
@@ -6369,6 +6710,7 @@ fn decoderBlockImpl(
             .attention = blk: {
                 var attention = attentionContext(seq_len, decode_context);
                 attention.layer_index = kv_layer_index;
+                attention.context_consumer_layer = @intCast(layer);
                 attention.skip_kv_write = shares_kv;
                 attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
                 if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
@@ -6675,8 +7017,11 @@ fn decoderBlockImpl(
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "q_attn", layer, Q_for_attn, num_heads * head_dim);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "k_attn", layer, K_attn, num_kv_heads * head_dim);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "v_attn", layer, V_normed, num_kv_heads * head_dim);
-    if (qk_already_roped and !config.layerUsesSlidingAttention(layer))
+    var selection_queries_captured = false;
+    if (qk_already_roped and !config.layerUsesSlidingAttention(layer)) {
         try captureSelectionQueries(cb, decode_context, Q_for_attn, kv_layer_index, layer, num_heads, head_dim);
+        selection_queries_captured = selectionQueryCaptureRequested(decode_context, false);
+    }
     debug_timing_stats.attention_qkv_nanos += @intCast(monotonicNowNs() - attn_qkv_started_at);
 
     if (!disableDecoderRuntimeActivationDebug() and attn_out_proj_linear_slot != null and ffn_norm_slot != null) {
@@ -6693,6 +7038,7 @@ fn decoderBlockImpl(
                         .attention = blk: {
                             var attention = attentionContext(seq_len, decode_context);
                             attention.layer_index = kv_layer_index;
+                            attention.context_consumer_layer = @intCast(layer);
                             attention.skip_kv_write = shares_kv;
                             attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
                             if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
@@ -6732,6 +7078,7 @@ fn decoderBlockImpl(
                         .attention = blk: {
                             var attention = attentionContext(seq_len, decode_context);
                             attention.layer_index = kv_layer_index;
+                            attention.context_consumer_layer = @intCast(layer);
                             attention.skip_kv_write = shares_kv;
                             attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
                             if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
@@ -6773,6 +7120,13 @@ fn decoderBlockImpl(
             (!config.hasPle() or ple_vectors != null) and allowGemmaRmsNormAddResidualFusion(trace_sink))
         {
             const fused_attn_started_at = monotonicNowNs();
+            const residual_captures_queries = !qk_already_roped and attentionResidualCapturesSelectionQueries(
+                config,
+                decode_context,
+                batch,
+                seq_len,
+                layer,
+            );
             const fused_sa_out = if (qk_already_roped)
                 try applyPreparedAttentionResidual(
                     cb,
@@ -6817,6 +7171,7 @@ fn decoderBlockImpl(
                     attn_sub_norm_slot,
                     decode_context,
                 );
+            selection_queries_captured = selection_queries_captured or residual_captures_queries;
             if (fused_sa_out) |sa_out| {
                 const fused_attn_elapsed = monotonicNowNs() - fused_attn_started_at;
                 debug_timing_stats.attention_nanos += @intCast(monotonicNowNs() - attn_started_at);
@@ -6846,7 +7201,14 @@ fn decoderBlockImpl(
 
         if (!qk_already_roped and attn_out_proj_linear_slot != null and config.family != .qwen3_vl and config.family != .qwen3_5 and config.family != .gemma) {
             const fused_attn_started_at = monotonicNowNs();
-            if (try applyAttentionResidual(
+            const residual_captures_queries = attentionResidualCapturesSelectionQueries(
+                config,
+                decode_context,
+                batch,
+                seq_len,
+                layer,
+            );
+            const fused_attn_res = try applyAttentionResidual(
                 cb,
                 config,
                 Q_for_attn,
@@ -6866,19 +7228,27 @@ fn decoderBlockImpl(
                 if (config.family == .bitnet) attn_sub_norm_slot else null,
                 if (config.family == .gemma) ffn_norm_slot else null,
                 decode_context,
-            )) |fused_attn_res| {
+            );
+            selection_queries_captured = selection_queries_captured or residual_captures_queries;
+            if (fused_attn_res) |result| {
                 debug_timing_stats.attention_nanos += @intCast(monotonicNowNs() - attn_started_at);
                 debug_timing_stats.attention_core_nanos += @intCast(monotonicNowNs() - fused_attn_started_at);
-                break :blk fused_attn_res;
+                break :blk result;
             }
         }
 
         // Attention (with optional RoPE)
         const attn_core_started_at = monotonicNowNs();
+        var uncaptured_context_storage: DecodeContext = undefined;
+        const uncaptured_context = decodeContextAfterSelectionCapture(
+            decode_context,
+            selection_queries_captured,
+            &uncaptured_context_storage,
+        );
         const attn_out = if (qk_already_roped)
             try applyPreparedAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context)
         else
-            try applyAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context);
+            try applyAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, uncaptured_context);
         defer cb.free(attn_out);
         debug_timing_stats.attention_core_nanos += @intCast(monotonicNowNs() - attn_core_started_at);
         const gated_attn_out = if (q_gate) |gate| blk_gate: {
@@ -7561,6 +7931,7 @@ pub fn lookupScaledTokenEmbeddings(
     const scale = config.tokenEmbeddingScale();
     if (try cb.embeddingLookupScaled(embed_w, input_ids, total, hidden_size, scale)) |scaled| return scaled;
     const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
+    errdefer cb.free(embedded);
     return try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
 }
 
@@ -7576,6 +7947,7 @@ pub fn lookupScaledTokenEmbeddingsTensor(
     const scale = config.tokenEmbeddingScale();
     if (try cb.embeddingLookupTensorScaled(embed_w, input_token, total, hidden_size, scale)) |scaled| return scaled;
     const embedded = (try cb.embeddingLookupTensor(embed_w, input_token, total, hidden_size)) orelse return null;
+    errdefer cb.free(embedded);
     return try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
 }
 
@@ -7622,7 +7994,9 @@ fn applyFinalLogitSoftcap(config: Config, logits: []f32) void {
     }
 }
 
-fn shouldScaleGemma4QBeforeAttention(config: Config, qk_already_roped: bool) bool {
+/// RoPE attention owns the Gemma query correction, including fused head-norm
+/// RoPE. Direct decoder callers must follow the same single-scaling contract.
+pub fn shouldScaleGemma4QBeforeAttention(config: Config, qk_already_roped: bool) bool {
     if (config.global_head_dim == 0) return false;
     if (qk_already_roped) return false;
     if (config.position_encoding == .rope) return false;
@@ -7666,6 +8040,18 @@ fn isDecodeStep(decode_context: ?*const DecodeContext) bool {
     const dc = decode_context orelse return false;
     return dc.attention_mode == .paged_decode or
         (dc.query_sequence_len == 1 and dc.kv_sequence_len > dc.query_sequence_len);
+}
+
+fn metalAttentionMatchInstalled(
+    cb: *const ComputeBackend,
+    decode_context: ?*const DecodeContext,
+) bool {
+    if (comptime !build_options.enable_metal) return false;
+    if (cb.kind() != .metal) return false;
+    const dc = decode_context orelse return false;
+    const storage = dc.kv_storage orelse return false;
+    const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    return compute.hasInstalledAttentionMatch(storage);
 }
 
 /// Add one Qwen3-VL DeepStack tap to visual rows after the corresponding text
@@ -8717,6 +9103,7 @@ pub fn applyPreparedAttention(
 ) !CT {
     var attention = attentionContext(seq_len, decode_context);
     attention.layer_index = kv_layer_index;
+    attention.context_consumer_layer = @intCast(layer);
     attention.skip_kv_write = skip_kv_write;
     attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
     if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
@@ -8782,6 +9169,49 @@ fn captureSelectionQueries(
         metrics.callback_ns += @intCast(monotonicNowNs() - callback_started);
     };
     try capture.captureFn(capture.ctx, donor_layer, consumer_layer, first_position, num_heads, head_dim, values);
+}
+
+fn selectionQueryCaptureRequested(
+    decode_context: ?*const DecodeContext,
+    sliding_attention: bool,
+) bool {
+    if (sliding_attention) return false;
+    const dc = decode_context orelse return false;
+    const capture = dc.selection_query_capture orelse return false;
+    return capture.horizon != 0 and dc.query_sequence_len != 0;
+}
+
+fn preProjectionGatedBlockAllowed(decode_context: ?*const DecodeContext) bool {
+    const dc = decode_context orelse return true;
+    return dc.selection_query_capture == null;
+}
+
+fn attentionResidualCapturesSelectionQueries(
+    config: Config,
+    decode_context: ?*const DecodeContext,
+    batch: usize,
+    seq_len: usize,
+    layer: usize,
+) bool {
+    if (!selectionQueryCaptureRequested(decode_context, config.layerUsesSlidingAttention(layer)) or
+        config.isQwen3Vl() or config.position_encoding != .rope or batch != 1)
+        return false;
+    const dc = decode_context.?;
+    const attention = attentionContext(seq_len, dc);
+    return attention.mode == .paged_decode and attention.query_sequence_len == 1 and
+        attention.attn_or_mask == null and !dc.isMixedBatch();
+}
+
+fn decodeContextAfterSelectionCapture(
+    decode_context: ?*const DecodeContext,
+    already_captured: bool,
+    scratch: *DecodeContext,
+) ?*const DecodeContext {
+    if (!already_captured) return decode_context;
+    const dc = decode_context orelse return null;
+    scratch.* = dc.*;
+    scratch.selection_query_capture = null;
+    return scratch;
 }
 
 fn runPreparedAttentionWithSinkMetadata(
@@ -8874,6 +9304,7 @@ fn applyAttentionWithSink(
 ) !CT {
     var attention = attentionContext(seq_len, decode_context);
     attention.layer_index = kv_layer_index;
+    attention.context_consumer_layer = @intCast(layer);
     attention.skip_kv_write = skip_kv_write;
     attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
     if (disableSlidingAttentionDebug()) {
@@ -9230,6 +9661,7 @@ pub fn applyAttentionResidual(
     if (config.isQwen3Vl()) return null;
     var attention = attentionContext(seq_len, decode_context);
     attention.layer_index = kv_layer_index;
+    attention.context_consumer_layer = @intCast(layer);
     attention.skip_kv_write = skip_kv_write;
     attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
     if (disableSlidingAttentionDebug()) {
@@ -9324,6 +9756,7 @@ pub fn applyPreparedAttentionResidual(
 ) !?CT {
     var attention = attentionContext(seq_len, decode_context);
     attention.layer_index = kv_layer_index;
+    attention.context_consumer_layer = @intCast(layer);
     attention.skip_kv_write = skip_kv_write;
     attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
     if (disableSlidingAttentionDebug()) {
@@ -9416,7 +9849,17 @@ fn attentionContext(seq_len: usize, decode_context: ?*const DecodeContext) ops.A
     };
 
     return .{
-        .mode = switch (dc.attention_mode) {
+        .context_session = dc.context_session,
+        // Framed context hooks support the backend-owned singleton decode
+        // path. Labelling every context call as prefill made its admission
+        // silently decline before reaching the optimized projection/FFN tail.
+        // Legacy synchronous hooks retain their established prefill route.
+        .mode = if (dc.context_session) |session|
+            if (dc.attention_mode == .paged_decode and dc.query_sequence_len == 1 and session.supportsFramedAttention())
+                .paged_decode
+            else
+                .paged_prefill
+        else switch (dc.attention_mode) {
             .full_recompute => .dense_causal,
             .paged_prefill => .paged_prefill,
             .paged_decode => .paged_decode,
@@ -12793,4 +13236,171 @@ pub fn getLmHeadWeight(cb: *const ComputeBackend, config: Config) !CT {
         return try getEmbeddingWeight(cb, config);
     }
     return cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+}
+
+test "context Metal model attention routes post RoPE queries through bounded storage" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const metal = @import("../ops/metal_compute.zig");
+    const sessions = @import("../backends/metal_context_session.zig");
+    const policy = @import("../runtime/context_policy.zig");
+    const allocator = std.testing.allocator;
+    var store = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = allocator, .prefix = "", .lazy_weights = .empty };
+    defer {
+        if (store.shared_metal_native_provider) |provider| {
+            provider.deinitOwned();
+            std.heap.c_allocator.destroy(provider);
+        }
+        store.lazy_weights.deinit(allocator);
+    }
+    var compute = try metal.MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const config = Config{ .family = .gemma, .num_hidden_layers = 1, .num_attention_heads = 2, .num_key_value_heads = 1, .attention_head_dim = 32, .hidden_size = 64, .position_encoding = .rope, .global_head_dim = 32, .max_position_embeddings = 2048 };
+    const p = policy.Policy{ .mode = .attention_matching, .max_kv_tokens = 1024, .keep_prefix_tokens = 0, .keep_recent_tokens = 512 };
+    var session_config = sessions.Config{ .plan = try p.admit(2048, null, 11, 1, 0), .layout = try policy.Layout.init(config), .max_query_rows = 4, .physical_budget_bytes = 0 };
+    session_config.physical_budget_bytes = (try sessions.allocation(session_config)).physical_bytes;
+    var session = try sessions.Session.init(allocator, session_config);
+    defer session.deinit();
+    var qs: [12 * 64]f32 = undefined;
+    var ks: [12 * 32]f32 = undefined;
+    var vs: [12 * 32]f32 = undefined;
+    for (&qs, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 17)) / 17;
+    for (&ks, &vs, 0..) |*key, *value, i| {
+        key.* = @as(f32, @floatFromInt(i % 13)) / 13;
+        value.* = @as(f32, @floatFromInt(i % 7)) / 7;
+    }
+    const all_q = try cb.fromFloat32Shape(&qs, &.{ 12, 64 });
+    defer cb.free(all_q);
+    const all_k = try cb.fromFloat32Shape(&ks, &.{ 12, 32 });
+    defer cb.free(all_k);
+    const all_v = try cb.fromFloat32Shape(&vs, &.{ 12, 32 });
+    defer cb.free(all_v);
+    const expected = try applyAttentionWithSink(&cb, config, all_q, all_k, all_v, null, 1, 12, 2, 1, 32, 0, 0, false, null);
+    defer cb.free(expected);
+    const expected_host = try cb.toFloat32(expected, allocator);
+    defer allocator.free(expected_host);
+    for (0..3) |chunk| {
+        const start = chunk * 4;
+        const q = try cb.fromFloat32Shape(qs[start * 64 ..][0 .. 4 * 64], &.{ 4, 64 });
+        defer cb.free(q);
+        const k = try cb.fromFloat32Shape(ks[start * 32 ..][0 .. 4 * 32], &.{ 4, 32 });
+        defer cb.free(k);
+        const v = try cb.fromFloat32Shape(vs[start * 32 ..][0 .. 4 * 32], &.{ 4, 32 });
+        defer cb.free(v);
+        const dc = DecodeContext{ .context_session = session.hook(), .attention_mode = .paged_prefill, .total_sequence_len = start + 4, .query_sequence_len = 4, .kv_sequence_len = start + 4 };
+        const actual = try applyAttentionWithSink(&cb, config, q, k, v, null, 1, start + 4, 2, 1, 32, 0, 0, false, &dc);
+        defer cb.free(actual);
+        const host = try cb.toFloat32(actual, allocator);
+        defer allocator.free(host);
+        for (host, expected_host[start * 64 ..][0 .. 4 * 64]) |got, want| try std.testing.expectApproxEqAbs(want, got, 0.001);
+    }
+    try std.testing.expectEqual(@as(u32, 12), session.metrics.logical_tokens);
+    try std.testing.expectEqual(@as(u64, 0), session.metrics.kv_readback_bytes);
+    // Every captured vector must equal the actual post-RoPE/scaled model Q,
+    // including held-out rows and both GQA query heads.
+    const rotated = try cb.rope(all_q, 12, 32, config.layerRopeActiveDim(0), config.layerRopeEffectiveTheta(0), config.rope_freq_scale, 0, config.rope_layout == .consecutive_pairs);
+    defer cb.free(rotated);
+    const rotated_host = try cb.toFloat32(rotated, allocator);
+    defer allocator.free(rotated_host);
+    const owner = &session.owners.items[0];
+    for (owner.positions, 0..) |position, slot| {
+        if (position == std.math.maxInt(u32)) continue;
+        const head = if (slot < owner.geometry.training_rows) slot / owner.geometry.train_per_stratum else (slot - owner.geometry.training_rows) / owner.geometry.held_per_stratum;
+        for (owner.queries.?.floats()[slot * 32 ..][0..32], rotated_host[position * 64 + head * 32 ..][0..32]) |got, want|
+            try std.testing.expectApproxEqAbs(want * @sqrt(@as(f32, 32)), got, 2e-5);
+    }
+}
+
+test "context study forwards release embeddings on scaling and PLE preparation failure" {
+    const Probe = struct {
+        tokens: [3]u8 = @splat(0),
+        input_token: u8 = 0,
+        freed: [3]bool = @splat(false),
+        fail_scale: bool,
+        fn self(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .metal;
+        }
+        fn weight(raw: *anyopaque, name: []const u8) !CT {
+            if (std.mem.eql(u8, name, "model.embed_tokens.weight")) return &self(raw).tokens[0];
+            return error.InjectedStudyPreparationFailure;
+        }
+        fn free(raw: *anyopaque, tensor: CT) void {
+            const probe = self(raw);
+            for (&probe.tokens, 0..) |*token, i| if (tensor == @as(CT, @ptrCast(token))) {
+                if (probe.freed[i]) @panic("study preparation double free");
+                probe.freed[i] = true;
+                return;
+            };
+            @panic("study preparation freed unknown tensor");
+        }
+        fn embedding(raw: *anyopaque, _: CT, _: []const i64, _: usize, _: usize) !CT {
+            return &self(raw).tokens[1];
+        }
+        fn embeddingTensor(raw: *anyopaque, _: CT, _: CT, _: usize, _: usize) !?CT {
+            return &self(raw).tokens[1];
+        }
+        fn scale(raw: *anyopaque, _: CT, _: f32) !?CT {
+            const probe = self(raw);
+            if (probe.fail_scale) return error.InjectedStudyPreparationFailure;
+            return &probe.tokens[2];
+        }
+        fn table() ComputeBackend.VTable {
+            var result = native_compute_mod.vtable_impl;
+            result.backendKind = kind;
+            result.getWeight = weight;
+            result.getEmbeddingWeight = null;
+            result.freeTensor = free;
+            result.embeddingLookup = embedding;
+            result.embeddingLookupScaled = null;
+            result.embeddingLookupTensor = embeddingTensor;
+            result.embeddingLookupTensorScaled = null;
+            result.multiplyScalar = scale;
+            return result;
+        }
+    };
+    const config: Config = .{
+        .family = .gemma,
+        .hidden_size = 4,
+        .num_attention_heads = 1,
+        .num_key_value_heads = 1,
+        .num_hidden_layers = 1,
+        .intermediate_size = 8,
+        .ple_hidden_size = 2,
+        .norm_type = .rms_norm,
+        .position_encoding = .rope,
+        .activation = .gelu,
+    };
+    const table = Probe.table();
+    const Entry = enum {
+        forward,
+        hidden_only,
+        hidden_cuda_replay,
+        greedy,
+        greedy_with_hidden,
+        tensor_hidden_cuda_replay,
+        tensor_hidden_discard,
+        tensor_greedy,
+        tensor_greedy_only,
+    };
+    inline for (std.meta.tags(Entry)) |entry| {
+        inline for (.{ true, false }) |fail_scale| {
+            var probe = Probe{ .fail_scale = fail_scale };
+            const cb = ComputeBackend{ .ptr = &probe, .vtable = &table };
+            switch (entry) {
+                .forward => try std.testing.expectError(error.InjectedStudyPreparationFailure, forward(&cb, std.testing.allocator, config, &.{1}, 1, 1, null)),
+                .hidden_only => try std.testing.expectError(error.InjectedStudyPreparationFailure, forwardHiddenOnly(&cb, std.testing.allocator, config, &.{1}, 1, 1, null)),
+                .hidden_cuda_replay => try std.testing.expectError(error.InjectedStudyPreparationFailure, forwardHiddenTensorWithCudaReplay(&cb, std.testing.allocator, config, &.{1}, 1, 1, null, "ownership-fixture")),
+                .greedy => try std.testing.expectError(error.InjectedStudyPreparationFailure, forwardGreedyLastToken(&cb, std.testing.allocator, config, &.{1}, 1, 1, null)),
+                .greedy_with_hidden => try std.testing.expectError(error.InjectedStudyPreparationFailure, forwardGreedyLastTokenWithFinalHidden(&cb, std.testing.allocator, config, &.{1}, 1, 1, null)),
+                .tensor_hidden_cuda_replay => try std.testing.expectError(error.InjectedStudyPreparationFailure, forwardHiddenTensorFromTokenTensorWithCudaReplay(&cb, std.testing.allocator, config, &probe.input_token, 1, 1, null, "ownership-fixture")),
+                .tensor_hidden_discard => try std.testing.expectError(error.InjectedStudyPreparationFailure, forwardHiddenOnlyFromTokenTensorWithCudaReplayDiscard(&cb, std.testing.allocator, config, &probe.input_token, 1, 1, null, "ownership-fixture")),
+                .tensor_greedy => try std.testing.expectError(error.InjectedStudyPreparationFailure, forwardGreedyLastTokenFromTokenTensor(&cb, std.testing.allocator, config, &probe.input_token, 1, 1, null)),
+                .tensor_greedy_only => try std.testing.expectError(error.InjectedStudyPreparationFailure, forwardGreedyLastTokenTensorOnlyFromTokenTensor(&cb, std.testing.allocator, config, &probe.input_token, 1, 1, null)),
+            }
+            try std.testing.expectEqualSlices(bool, &.{ true, true, !fail_scale }, &probe.freed);
+        }
+    }
 }

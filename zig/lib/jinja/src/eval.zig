@@ -92,6 +92,8 @@ pub const Value = union(enum) {
 // --- Evaluator ---
 
 pub const Eval = struct {
+    provenance: ?*@import("provenance.zig").Provenance = null,
+    output_labels: std.ArrayListUnmanaged(u32) = .empty,
     arena: std.mem.Allocator,
     scopes: [16]?*ValueMap,
     scope_depth: usize,
@@ -130,7 +132,7 @@ pub const Eval = struct {
                     self.strip_next = false;
                     t = std.mem.trimStart(u8, t, &.{ ' ', '\t', '\n', '\r' });
                 }
-                try self.output.appendSlice(self.arena, t);
+                try self.appendOutput(t, false);
             },
             .output => |out| {
                 if (out.strip_left) {
@@ -138,7 +140,7 @@ pub const Eval = struct {
                 }
                 const val = try self.evalExpr(out.expr);
                 const s = try self.valueToString(val);
-                try self.output.appendSlice(self.arena, s);
+                try self.appendOutput(s, true);
                 // Protect expression output from being stripped by subsequent {%-
                 self.strip_fence = self.output.items.len;
                 if (out.strip_right) {
@@ -201,28 +203,28 @@ pub const Eval = struct {
                     if (for_stmt.value_name) |val_name| {
                         switch (item) {
                             .list => |pair| {
-                                if (pair.len >= 1) scope.put(self.arena, for_stmt.var_name, pair[0]) catch return;
-                                if (pair.len >= 2) scope.put(self.arena, val_name, pair[1]) catch return;
+                                if (pair.len >= 1) try scope.put(self.arena, for_stmt.var_name, pair[0]);
+                                if (pair.len >= 2) try scope.put(self.arena, val_name, pair[1]);
                             },
                             else => {
-                                scope.put(self.arena, for_stmt.var_name, item) catch return;
-                                scope.put(self.arena, val_name, .undefined) catch return;
+                                try scope.put(self.arena, for_stmt.var_name, item);
+                                try scope.put(self.arena, val_name, .undefined);
                             },
                         }
                     } else {
-                        scope.put(self.arena, for_stmt.var_name, item) catch return;
+                        try scope.put(self.arena, for_stmt.var_name, item);
                     }
 
                     // Build loop object
                     var loop_map = ValueMap{};
-                    loop_map.put(self.arena, "index", Value.int(@intCast(i + 1))) catch return;
-                    loop_map.put(self.arena, "index0", Value.int(@intCast(i))) catch return;
-                    loop_map.put(self.arena, "first", Value.bln(i == 0)) catch return;
-                    loop_map.put(self.arena, "last", Value.bln(i == items.len - 1)) catch return;
-                    loop_map.put(self.arena, "length", Value.int(@intCast(items.len))) catch return;
-                    loop_map.put(self.arena, "revindex", Value.int(@intCast(items.len - i))) catch return;
-                    loop_map.put(self.arena, "revindex0", Value.int(@intCast(items.len - i - 1))) catch return;
-                    scope.put(self.arena, "loop", .{ .map = loop_map }) catch return;
+                    try loop_map.put(self.arena, "index", Value.int(@intCast(i + 1)));
+                    try loop_map.put(self.arena, "index0", Value.int(@intCast(i)));
+                    try loop_map.put(self.arena, "first", Value.bln(i == 0));
+                    try loop_map.put(self.arena, "last", Value.bln(i == items.len - 1));
+                    try loop_map.put(self.arena, "length", Value.int(@intCast(items.len)));
+                    try loop_map.put(self.arena, "revindex", Value.int(@intCast(items.len - i)));
+                    try loop_map.put(self.arena, "revindex0", Value.int(@intCast(items.len - i - 1)));
+                    try scope.put(self.arena, "loop", .{ .map = loop_map });
 
                     // The whitespace adjacent to a for/endfor tag is part of
                     // the repeated body. Jinja applies both controls on every
@@ -258,20 +260,25 @@ pub const Eval = struct {
                 // Capture into a separate buffer, retaining the enclosing
                 // scope so namespace mutations have normal Jinja semantics.
                 const outer_output = self.output;
+                const outer_labels = self.output_labels;
                 const outer_fence = self.strip_fence;
                 const outer_strip = self.strip_next;
                 self.output = .empty;
+                self.output_labels = .empty;
                 self.strip_fence = 0;
                 self.strip_next = capture.open_strip_right;
                 const captured = blk: {
                     defer {
                         self.output = outer_output;
+                        self.output_labels = outer_labels;
                         self.strip_fence = outer_fence;
                         self.strip_next = outer_strip or capture.close_strip_right;
                     }
                     for (capture.body) |child| try self.execNode(child);
                     if (capture.close_strip_left) self.stripTrailingWhitespace();
-                    break :blk try self.output.toOwnedSlice(self.arena);
+                    const bytes = try self.output.toOwnedSlice(self.arena);
+                    if (self.provenance) |p| try p.register(bytes, try self.output_labels.toOwnedSlice(self.arena));
+                    break :blk bytes;
                 };
                 if (self.scope_depth > 0) {
                     if (self.scopes[self.scope_depth - 1]) |scope| {
@@ -428,6 +435,7 @@ pub const Eval = struct {
                     const ls = try self.valueToString(left);
                     const rs = try self.valueToString(right);
                     const result = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ ls, rs });
+                    if (self.provenance) |p| try p.concat(result, ls, rs);
                     return Value.str(result);
                 }
                 return self.numericOp(left, right, .add);
@@ -440,6 +448,7 @@ pub const Eval = struct {
                 const ls = try self.valueToString(left);
                 const rs = try self.valueToString(right);
                 const result = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ ls, rs });
+                if (self.provenance) |p| try p.concat(result, ls, rs);
                 return Value.str(result);
             },
         }
@@ -520,7 +529,7 @@ pub const Eval = struct {
         };
     }
 
-    fn getItem(self: *Eval, obj: Value, key: Value) Value {
+    fn getItem(_: *Eval, obj: Value, key: Value) Value {
         switch (obj) {
             .map => |m| {
                 if (key == .string) return m.get(key.string) orelse .undefined;
@@ -545,9 +554,7 @@ pub const Eval = struct {
                     else
                         @intCast(idx);
                     if (uidx < s.len) {
-                        const c = self.arena.alloc(u8, 1) catch return .undefined;
-                        c[0] = s[uidx];
-                        return Value.str(c);
+                        return Value.str(s[uidx .. uidx + 1]);
                     }
                 }
                 return .undefined;
@@ -601,6 +608,7 @@ pub const Eval = struct {
         }
         if (std.mem.eql(u8, name, "lower")) {
             if (val == .string) {
+                if (self.provenance) |p| if (p.lookup(val.string) != null) return error.UnsupportedPayloadTransform;
                 const s = try self.arena.dupe(u8, val.string);
                 for (s) |*c| c.* = std.ascii.toLower(c.*);
                 return Value.str(s);
@@ -608,6 +616,7 @@ pub const Eval = struct {
         }
         if (std.mem.eql(u8, name, "upper")) {
             if (val == .string) {
+                if (self.provenance) |p| if (p.lookup(val.string) != null) return error.UnsupportedPayloadTransform;
                 const s = try self.arena.dupe(u8, val.string);
                 for (s) |*c| c.* = std.ascii.toUpper(c.*);
                 return Value.str(s);
@@ -673,11 +682,19 @@ pub const Eval = struct {
                     if (sep_val == .string) sep = sep_val.string;
                 }
                 var result = std.ArrayListUnmanaged(u8).empty;
+                var labels: std.ArrayListUnmanaged(u32) = .empty;
                 for (val.list, 0..) |item, i| {
-                    if (i > 0) try result.appendSlice(self.arena, sep);
-                    try result.appendSlice(self.arena, try self.valueToString(item));
+                    if (i > 0) {
+                        try result.appendSlice(self.arena, sep);
+                        if (self.provenance) |p| try p.append(&labels, sep, true);
+                    }
+                    const bytes = try self.valueToString(item);
+                    try result.appendSlice(self.arena, bytes);
+                    if (self.provenance) |p| try p.append(&labels, bytes, true);
                 }
-                return Value.str(try result.toOwnedSlice(self.arena));
+                const bytes = try result.toOwnedSlice(self.arena);
+                if (self.provenance) |p| try p.register(bytes, try labels.toOwnedSlice(self.arena));
+                return Value.str(bytes);
             }
         }
         return val; // unknown filter — pass through
@@ -714,9 +731,11 @@ pub const Eval = struct {
 
         // Save output state — macro captures its own output
         const saved_output = self.output;
+        const saved_labels = self.output_labels;
         const saved_fence = self.strip_fence;
         const saved_strip = self.strip_next;
         self.output = std.ArrayListUnmanaged(u8).empty;
+        self.output_labels = .empty;
         self.strip_fence = 0;
         self.strip_next = false;
 
@@ -725,7 +744,9 @@ pub const Eval = struct {
         self.popScope();
 
         const result = try self.output.toOwnedSlice(self.arena);
+        if (self.provenance) |p| try p.register(result, try self.output_labels.toOwnedSlice(self.arena));
         self.output = saved_output;
+        self.output_labels = saved_labels;
         self.strip_fence = saved_fence;
         self.strip_next = saved_strip;
 
@@ -840,6 +861,11 @@ pub const Eval = struct {
 
     // --- Output helpers ---
 
+    fn appendOutput(self: *Eval, bytes: []const u8, tracked: bool) !void {
+        if (self.provenance) |p| try p.append(&self.output_labels, bytes, tracked);
+        try self.output.appendSlice(self.arena, bytes);
+    }
+
     fn valueToString(self: *Eval, val: Value) ![]const u8 {
         return switch (val) {
             .string => |s| s,
@@ -861,6 +887,7 @@ pub const Eval = struct {
             const last = self.output.items[self.output.items.len - 1];
             if (last == ' ' or last == '\t' or last == '\n' or last == '\r') {
                 self.output.items.len -= 1;
+                if (self.provenance != null) self.output_labels.items.len -= 1;
             } else break;
         }
     }

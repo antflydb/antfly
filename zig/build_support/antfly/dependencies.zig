@@ -847,18 +847,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
 
     const transcribing_mod = inference_graph.transcribing_mod;
     const reader_config_mod = inference_graph.reader_config_mod;
-    const readers_mod = b.createModule(.{
-        .root_source_file = b.path("lib/readers/src/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    readers_mod.addImport("httpx", httpx_mod);
-    readers_mod.addImport("inference_api", inference_api_mod);
-    readers_mod.addImport("antfly_google", google_mod);
-    readers_mod.addImport("antfly_reader_config", reader_config_mod);
-    readers_mod.addImport("antfly_scraping", scraping_mod);
-    readers_mod.addImport("antfly_image", image_mod);
-    inference_server_mod.addImport("antfly_readers", readers_mod);
+    const readers_mod = inference_server_mod.import_table.get("antfly_readers").?;
     inference_server_mod.addImport("antfly_reader_config", reader_config_mod);
     inference_server_mod.addImport("antfly_extracting", extracting_mod);
     const synthesizing_mod = b.createModule(.{
@@ -998,13 +987,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     inference_types_mod.addImport("antfly_generating", generating_mod);
-    const inference_work_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/inference/src/host/work.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    inference_work_mod.addImport("antfly_scraping", scraping_mod);
-    inference_work_mod.addImport("antfly_image", image_mod);
+    const inference_work_mod = readers_mod.import_table.get("antfly_inference_work").?;
     const inference_worker_wire_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/host/worker_wire.zig"),
         .target = target,

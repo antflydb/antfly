@@ -1,0 +1,81 @@
+{
+  "completed": true,
+  "delta": [
+    "replace legacy fixed-array repetition with typed @splat arrays",
+    "make immutable restricted-storage slice binding const",
+    "run zig fmt on V3 only"
+  ],
+  "design": {
+    "path": "/private/tmp/attention-matching-native-mass-cg-control-readiness-v1.json",
+    "sha256": "84a48621fa26fdbc3255ab6dd5a2209b64e4c52197f93e9fe509343077647003"
+  },
+  "diagnostic_only": true,
+  "execution_authorized": false,
+  "immutable_v1_snapshot": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v1.zig",
+    "sha256": "646a7d21add4f1189ad467277ea267c5ce915082fa1abe31bfaf65278f414853"
+  },
+  "limitations": [
+    "solver callback remains injected; no optimizer linked",
+    "no numerical/native parity claim",
+    "support/value/tangent/transaction/serving integration remain out of scope"
+  ],
+  "named_test_module": {
+    "path": "/private/tmp/attention_mass_lp_v4.zig",
+    "sha256": "ff1d98cab21450271694ab524dd0733294ae0ff15793c57ed105f4d18d9354de"
+  },
+  "native_parity_claimed": false,
+  "native_solver_integrated": false,
+  "predecessor_compile_failure": {
+    "reason": "Zig 0.17 rejects legacy array repetition syntax before tests",
+    "resource": {
+      "path": "/private/tmp/attention-matching-native-mass-cg-v2-compiled-tests-resource-v1.json",
+      "sha256": "7d47ca6db91167a100887819f9b588c556d3d56979aaff379244b268ed53ddef"
+    },
+    "stderr": {
+      "path": "/private/tmp/attention-matching-native-mass-cg-v2-compiled-tests-resource-v1.stderr",
+      "sha256": "c66fdd94897fa05b8879e8fdffccc4d16f0a5b592c9224d4ed4b61b99b884cb7"
+    }
+  },
+  "predecessor_handoff": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-cg-controller-handoff-v2.json",
+    "sha256": "ffac1f012078b06400bd2f50c28fbb535e82d0d9f395bc8e1cbaf9449763fed4"
+  },
+  "predecessor_source": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v2.zig",
+    "sha256": "4cbae68d0b7a29a9a33d346a5571426d72b62384c62fb0297d9a2d69643662a5"
+  },
+  "publication_authority": false,
+  "readme": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-cg-controller-v3.md",
+    "sha256": "6a1b69270116330144fe76a540f8d62e4537ebd00ea805927527d5d7fa3a5d06"
+  },
+  "schema": "antfly.attention-matching.native-mass-cg-controller-draft-handoff.v3",
+  "scientific_control_delta_from_v2": false,
+  "serving_authority": false,
+  "source": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v3.zig",
+    "sha256": "4010875b9b2a09e8c0d75920ee88531777112badbe470ee4e65a6631ee54e8b2"
+  },
+  "test_command": [
+    "/opt/homebrew/Cellar/zig/0.17.0/bin/zig",
+    "test",
+    "-OReleaseSafe",
+    "--dep",
+    "attention_mass_lp",
+    "-Mroot=docs/design/inference/native-port/attention_mass_constraint_generation_v3.zig",
+    "-Mattention_mass_lp=/private/tmp/attention_mass_lp_v4.zig",
+    "--cache-dir",
+    ".zig-cache",
+    "--global-cache-dir",
+    ".zig-cache/global"
+  ],
+  "unapplied": true,
+  "verification": {
+    "git_diff_check": "PASS",
+    "reason": "root coordinates guarded pinned-Zig testing",
+    "zig_compile": "NOT RUN",
+    "zig_fmt": "PASS",
+    "zig_tests": "NOT RUN"
+  }
+}

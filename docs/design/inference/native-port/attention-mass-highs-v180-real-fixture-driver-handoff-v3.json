@@ -1,0 +1,102 @@
+{
+  "artifacts": {
+    "adapter": {
+      "bytes": 29057,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_highs_v180_adapter_v3.zig",
+      "sha256": "493637b21fec53d07813fddac5cc874d232ae6680befe504bf639e9e3e6c5525"
+    },
+    "controller": {
+      "bytes": 41830,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v5.zig",
+      "sha256": "abdcc63e7d914b174f3fb8db2302db16af126386b610fcf6e80bf1dbb2ec82fa"
+    },
+    "design": {
+      "bytes": 4662,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-highs-v180-real-fixture-driver-v3.md",
+      "sha256": "eb8788d3b0c581234b4a716a4f1836c8234ef475c2c1c72b6140cb8bc39a6cb4"
+    },
+    "driver": {
+      "bytes": 31551,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_highs_v180_real_fixture_driver_v3.zig",
+      "sha256": "1528159416928a87b76934f362f0a0b9b8406afe53c4c412749727a075c3b792"
+    },
+    "fixture_exporter": {
+      "bytes": 14035,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/export_attention_mass_highs_restricted_fixture_v1.py",
+      "sha256": "1c277ae899839278ee60d001a56e78d751074755c4eaf7856ff6f6194baa916a"
+    },
+    "lp": {
+      "bytes": 24314,
+      "path": "/private/tmp/attention_mass_lp_v4.zig",
+      "sha256": "ff1d98cab21450271694ab524dd0733294ae0ff15793c57ed105f4d18d9354de"
+    },
+    "predecessor_handoff": {
+      "bytes": 5009,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-highs-v180-real-fixture-driver-handoff-v2.json",
+      "sha256": "e0bf998fc78b277007f8359cb4d3a949f1229975aeeec9e2b6dc1e24135cee77"
+    },
+    "test": {
+      "bytes": 4303,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/test_attention_mass_highs_v180_real_fixture_driver_v3.py",
+      "sha256": "21568bc198fddc40ee8e732c4c39a8042186be52b0777811a30f0d6bdb8d3996"
+    },
+    "unresolved_executable_receipt_template": {
+      "bytes": 536,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-highs-v180-executable-receipt-template-v1.json",
+      "sha256": "3256e167c5e6f6fef56e1c4d0b9e0857609e643da68d6aef94d03a8f52b5e8fe"
+    },
+    "unresolved_library_receipt_template": {
+      "bytes": 955,
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-highs-v180-static-library-receipt-template-v2.json",
+      "sha256": "4ab745d7f75b153f94879c58e15d871c0c8fd7cecdc6915042d3efe3a59953e4"
+    },
+    "v2_hold": {
+      "bytes": 7906,
+      "path": "/private/tmp/attention-matching-native-highs-v180-real-fixture-driver-independent-review-v2-hold.json",
+      "sha256": "b0f62d2872b3d6306845aede0991a9835179ab26819510d3067c690b11f001b3"
+    }
+  },
+  "closed_v2_holds": {
+    "first_build_thread_policy": "library receipt requires highs_no_default_threads false; separate variant required for true",
+    "linked_archive_identity": "required executable receipt binds compiler/link argv/modules/library receipt/libhighs/final binary; runtime rehashes binary and argv0 equality",
+    "runtime_githash": "full source commit remains exact; reviewed generated runtime_githash is a separate required value",
+    "terminal_toctou": "terminally rehashes fixture/library/executable receipts and all consumed/nested edges before output directory creation"
+  },
+  "completed": true,
+  "diagnostic_only": true,
+  "execution_authorized": false,
+  "library": {
+    "archive_downloaded": false,
+    "commit": "fcfb5341462f8a7db5ef5038613413f97d6cac3d",
+    "compiled": false,
+    "executable_receipt_resolved": false,
+    "linked": false,
+    "receipt_resolved": false,
+    "runtime_githash_resolved": false,
+    "solver_executed": false,
+    "tag": "v1.8.0"
+  },
+  "publication_authority": false,
+  "schema": "antfly.design.attention-mass-highs-v180-real-fixture-driver-handoff.v3",
+  "scientific_contract": {
+    "first_tolerance": 1e-09,
+    "fixture_shape": [
+      1128,
+      288
+    ],
+    "fresh_highs_instance_per_attempt": true,
+    "full_original_cg_witness_proven": false,
+    "persistent_model_or_basis_reuse": false,
+    "retry_count_max": 1,
+    "retry_tolerance": 1e-10,
+    "retry_trigger": "exact frozen witness rejection only"
+  },
+  "validation": {
+    "fixture_arrays_loaded": false,
+    "metadata_and_mutation_tests": "2/2 passed",
+    "real_c_abi_link": "not run",
+    "solver": "not run",
+    "zig_compile": "not run",
+    "zig_fmt": "passed"
+  }
+}

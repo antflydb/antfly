@@ -97,6 +97,13 @@ pub fn compactLayerHead(
     config: CompactionConfig,
 ) !CompactionResult {
     try config.validate();
+    if (n_tokens == 0 or n_tokens > 512 or n_ref == 0 or n_ref > 512 or head_dim == 0 or head_dim > 512)
+        return error.InvalidCompactionShape;
+    if (K.len != n_tokens * head_dim or V.len != n_tokens * head_dim or Q_ref.len != n_ref * head_dim)
+        return error.InvalidCompactionShape;
+    for ([_][]const f32{ K, V, Q_ref }) |values| for (values) |value| {
+        if (!std.math.isFinite(value)) return error.NonFiniteCompactionInput;
+    };
     const M = @max(1, @as(usize, @intFromFloat(@ceil(@as(f32, @floatFromInt(n_tokens)) * config.target_ratio))));
 
     // Degenerate: keep everything.
@@ -187,6 +194,7 @@ pub fn compactSequence(
     const token_count = kv_manager.tokenCount(sequence_id) orelse return error.InvalidSequenceId;
 
     if (token_count == 0) return error.EmptySequence;
+    if (token_count > 512) return error.InvalidCompactionShape;
 
     // Gather reference queries from layer 0's K values.
     const ref_count = @min(config.num_ref_queries, token_count);
@@ -279,6 +287,7 @@ pub fn compactStorageSequence(
     const token_count = kv_storage.tokenCount(sequence_id) orelse return error.InvalidSequenceId;
 
     if (token_count == 0) return error.EmptySequence;
+    if (token_count > 512) return error.InvalidCompactionShape;
 
     const ref_count = @min(config.num_ref_queries, token_count);
     const layer0_kv = try kv_storage.gatherLayerKv(allocator, sequence_id, 0, token_count);
@@ -357,6 +366,7 @@ pub fn compactGatheredSequence(
     try config.validate();
     if (gathered_layers.len == 0) return error.EmptySequence;
     if (token_count == 0) return error.EmptySequence;
+    if (token_count > 512) return error.InvalidCompactionShape;
 
     const ref_count = @min(config.num_ref_queries, token_count);
     const layer0_k = gathered_layers[0].k;

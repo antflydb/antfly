@@ -150,7 +150,9 @@ def receive_checkpoint(response, destination, *, allow_rotated4=False):
     }
 
 
-def send_resume(connection, path, metadata, checkpoint, mutate=None):
+def send_resume(
+    connection, path, metadata, checkpoint, mutate=None, on_upload_complete=None
+):
     """Stream a checkpoint from disk without a file-sized request allocation."""
     checkpoint = Path(checkpoint)
     with checkpoint.open("rb") as source:
@@ -172,6 +174,8 @@ def send_resume(connection, path, metadata, checkpoint, mutate=None):
                         raise ValueError("test mutation must preserve transfer length")
                 connection.send(block)
                 offset += len(block)
+            if on_upload_complete is not None:
+                on_upload_complete()
         except (BrokenPipeError, ConnectionResetError) as upload_error:
             # A server can reject metadata and close before consuming the file.
             # Preserve that HTTP rejection, but never accept a partial upload.

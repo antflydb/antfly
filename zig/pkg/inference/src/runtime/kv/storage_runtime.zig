@@ -20,6 +20,7 @@ const manager_mod = @import("manager.zig");
 const pool_mod = @import("pool.zig");
 const storage_mod = @import("storage.zig");
 pub const device_clone = @import("device_clone.zig");
+const owner_alloc = @import("host_allocation_tracker.zig");
 
 pub const SequenceId = manager_mod.SequenceId;
 
@@ -302,6 +303,12 @@ pub const attention_match_snapshot = @import("attention_match_snapshot.zig");
 pub const DeviceWriteHook = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
+    owner_accounting: OwnerAccounting = .unavailable,
+
+    pub const OwnerAccounting = enum {
+        unavailable,
+        exact_private_device,
+    };
 
     pub const VTable = struct {
         /// Authoritative, fenced exact-prefix readback. Unlike gatherLayerKv,
@@ -385,6 +392,8 @@ pub const DeviceWriteHook = struct {
         /// leave this false until storage, attention kernels, and transactional
         /// replacement are all wired; callers use it to fail closed.
         supportsSelectedGlobalKv: ?*const fn (ctx: *const anyopaque) bool = null,
+        allocationSnapshot: ?*const fn (ctx: *anyopaque) DeviceAllocationSnapshot = null,
+        drainForOwnerSnapshot: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
     };
 
@@ -463,13 +472,32 @@ pub const DeviceWriteHook = struct {
         return supports_fn(self.ctx);
     }
 
+    pub fn allocationSnapshot(self: DeviceWriteHook) DeviceAllocationSnapshot {
+        const snapshot_fn = self.vtable.allocationSnapshot orelse return .{};
+        return snapshot_fn(self.ctx);
+    }
+
+    pub fn drainForOwnerSnapshot(self: DeviceWriteHook) !void {
+        const drain = self.vtable.drainForOwnerSnapshot orelse return error.ContextOwnerDrainUnsupported;
+        try drain(self.ctx);
+    }
+
     pub fn deinit(self: DeviceWriteHook, allocator: std.mem.Allocator) void {
         self.vtable.deinit(self.ctx, allocator);
     }
 };
 
+pub const DeviceAllocationSnapshot = struct {
+    available: bool = false,
+    live_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+    kv_bytes: u64 = 0,
+    readback_bytes: u64 = 0,
+};
+
 pub const KvStorageRuntime = struct {
     allocator: std.mem.Allocator,
+    owner_allocation_tracker: ?*owner_alloc.HostAllocationTracker = null,
     storage: storage_mod.KvStorage,
     sequences: std.ArrayListUnmanaged(SequenceState) = .empty,
     free_sequence_indices: std.ArrayListUnmanaged(usize) = .empty,
@@ -480,12 +508,42 @@ pub const KvStorageRuntime = struct {
     device_write_hook: ?DeviceWriteHook = null,
 
     pub fn init(allocator: std.mem.Allocator, config: pool_mod.KvPoolConfig) !KvStorageRuntime {
+        return initTracked(allocator, config, null);
+    }
+
+    pub fn initTracked(
+        allocator: std.mem.Allocator,
+        config: pool_mod.KvPoolConfig,
+        owner_allocation_tracker: ?*owner_alloc.HostAllocationTracker,
+    ) !KvStorageRuntime {
         var storage = try storage_mod.initHost(allocator, config);
         storage.setPoolId(0);
         return .{
             .allocator = allocator,
+            .owner_allocation_tracker = owner_allocation_tracker,
             .storage = storage,
         };
+    }
+
+    pub fn ownerAllocator(self: *const KvStorageRuntime) std.mem.Allocator {
+        return self.allocator;
+    }
+
+    pub fn ownerAllocationTracker(self: *const KvStorageRuntime) ?*owner_alloc.HostAllocationTracker {
+        return self.owner_allocation_tracker;
+    }
+
+    pub fn bindContextOwnerScope(
+        self: *KvStorageRuntime,
+        owner: *owner_alloc.RequestAllocationOwner,
+        witness: owner_alloc.RequestAllocationOwner.ContextScopeWitness,
+    ) !void {
+        const tracker = self.owner_allocation_tracker orelse return error.ContextPhysicalAccountingUnavailable;
+        const hook = self.device_write_hook orelse return error.ContextPhysicalAccountingUnavailable;
+        if (hook.owner_accounting != .exact_private_device or
+            hook.vtable.allocationSnapshot == null or hook.vtable.drainForOwnerSnapshot == null)
+            return error.ContextPhysicalAccountingUnavailable;
+        try owner.bindTypedStorage(witness, tracker);
     }
 
     /// Construct a runtime over a caller-provided storage. The runtime takes
@@ -575,6 +633,16 @@ pub const KvStorageRuntime = struct {
     pub fn scoreSelectedAttention(self: *KvStorageRuntime, request: SelectedAttentionScore) !void {
         const hook = self.device_write_hook orelse return error.DeviceReadUnsupported;
         return hook.scoreSelectedAttention(request);
+    }
+
+    pub fn deviceAllocationSnapshot(self: *const KvStorageRuntime) DeviceAllocationSnapshot {
+        const hook = self.device_write_hook orelse return .{};
+        return hook.allocationSnapshot();
+    }
+
+    pub fn drainDeviceWritesForOwnerSnapshot(self: *KvStorageRuntime) !void {
+        const hook = self.device_write_hook orelse return error.ContextOwnerDrainUnsupported;
+        try hook.drainForOwnerSnapshot();
     }
 
     /// Device-resident suffix write. Requires a device-write hook installed.

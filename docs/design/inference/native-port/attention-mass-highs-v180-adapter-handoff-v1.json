@@ -1,0 +1,100 @@
+{
+  "attention_mass_lp": {
+    "path": "/private/tmp/attention_mass_lp_v4.zig",
+    "sha256": "ff1d98cab21450271694ab524dd0733294ae0ff15793c57ed105f4d18d9354de"
+  },
+  "completed": true,
+  "contract": {
+    "absolute_deadline": true,
+    "adapter_dual_negation": false,
+    "highs_int_bytes": 4,
+    "matrix_format": "rowwise CSR, dense entries retained in original order",
+    "raw_row_duals": true,
+    "simplex_interrupt_callback": true,
+    "solve_restricted_fn": "exact attention_mass_constraint_generation_v5 SolveRestrictedFn",
+    "tolerances": [
+      1e-09,
+      1e-10
+    ]
+  },
+  "controller": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v5.zig",
+    "sha256": "abdcc63e7d914b174f3fb8db2302db16af126386b610fcf6e80bf1dbb2ec82fa"
+  },
+  "controller_compiled_terminal": {
+    "path": "/private/tmp/attention-matching-native-mass-cg-v5-compiled-tests-terminal-audit-root-v1.json",
+    "sha256": "faddb16f6f90a0b5ca6ece1ace2e1bd71ca35efa2b7638586020f392d2daad8b"
+  },
+  "controller_review": {
+    "path": "/private/tmp/attention-matching-native-mass-cg-controller-independent-review-v5.json",
+    "sha256": "0834e1f1cf5ce5e7a8c18771bfdaaa68ceccbecc52ad495b2f4bf1af729c92be"
+  },
+  "diagnostic_only": true,
+  "execution_authorized": false,
+  "fixture_tests": [
+    "rowwise ABI/options/raw dual sign",
+    "terminal owned-empty result",
+    "callback exact control error and cleanup",
+    "pass failure and allocation sweep"
+  ],
+  "highs": {
+    "commit": "fcfb5341462f8a7db5ef5038613413f97d6cac3d",
+    "library_built": false,
+    "library_linked": false,
+    "license": "MIT",
+    "solver_executed": false,
+    "source_downloaded": false,
+    "tag": "v1.8.0"
+  },
+  "limitations": [
+    "injected API fixture only",
+    "no pinned source tree/archive receipt or built static library",
+    "no real callback timing guarantee outside simplex bailout checkpoints",
+    "no native/SciPy numerical, lifecycle, memory, or timing parity",
+    "HIGHS_NO_DEFAULT_THREADS remains an unproven trajectory variable"
+  ],
+  "publication_authority": false,
+  "readiness": {
+    "path": "/private/tmp/attention-matching-native-highs-v180-c-abi-integration-readiness-v2.json",
+    "sha256": "a4b23dbf7e04525dd7f4a3ea07ee06d92ed4fbddd162d7c8fb0aac2de0baef91"
+  },
+  "readme": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-highs-v180-adapter-v1.md",
+    "sha256": "494bfb512c12d3c68a2b9b11b337fd57d0b107d5d2823cc2fa36d6366ddd8081"
+  },
+  "schema": "antfly.attention-matching.native-highs-v180-c-abi-adapter-draft-handoff.v1",
+  "serving_authority": false,
+  "source": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_highs_v180_adapter_v1.zig",
+    "sha256": "afbdd1ba655e85e3b78903ca0728ce831a3b187a4d9ba61f98745da15f04ad77"
+  },
+  "test_command": [
+    "/opt/homebrew/Cellar/zig/0.17.0/bin/zig",
+    "test",
+    "-OReleaseSafe",
+    "--dep",
+    "attention_mass_lp",
+    "--dep",
+    "attention_mass_cg",
+    "-Mroot=../docs/design/inference/native-port/attention_mass_highs_v180_adapter_v1.zig",
+    "-OReleaseSafe",
+    "--dep",
+    "attention_mass_lp",
+    "-Mattention_mass_cg=../docs/design/inference/native-port/attention_mass_constraint_generation_v5.zig",
+    "-OReleaseSafe",
+    "-Mattention_mass_lp=/private/tmp/attention_mass_lp_v4.zig",
+    "--cache-dir",
+    "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig/.zig-cache",
+    "--global-cache-dir",
+    "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig/.zig-cache/global"
+  ],
+  "test_cwd": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig",
+  "unapplied": true,
+  "verification": {
+    "fixture_tests": "NOT RUN",
+    "highs_build": "NOT RUN",
+    "real_c_abi": "NOT RUN",
+    "zig_compile": "NOT RUN",
+    "zig_fmt_check": "PASS"
+  }
+}

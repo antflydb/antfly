@@ -1,0 +1,57 @@
+{
+  "applied": false,
+  "artifacts": [
+    {
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-stored-installed-baseline-preflight-v1.md",
+      "sha256": "7e6d8e42c69a2d5c1713f91e79e389bb3d75711384cd86a968244ca164c0e85b"
+    },
+    {
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-stored-installed-baseline-preflight-v1.patch",
+      "sha256": "6b747c22b40b6c132577ec50c486d09acbf844edf96e10a2de9a54839ea7e9e9"
+    },
+    {
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/test_attention_stored_installed_baseline_preflight_v1.py",
+      "sha256": "d104dbbb726c1d944e4efe50a7f1a1ec3d9fb23c9a03020e0e73175bf63ac9af"
+    }
+  ],
+  "checks": {
+    "canonical_source_unchanged": true,
+    "metadata_tests": "5/5 PASS"
+  },
+  "compiled": false,
+  "completed": true,
+  "diagnostic_only": true,
+  "known_integration_work": [
+    "replace the patch test placeholders with existing real packed-session/provider fixtures",
+    "implement shared atomic baseline/failure receipt writers using repository IO API",
+    "update all manifest fixtures and exact schema consumers",
+    "compile and run focused Zig tests before applying"
+  ],
+  "native_tested": false,
+  "release_authority": false,
+  "schema": "antfly.context.stored-installed-baseline-preflight-draft-handoff.v1",
+  "scope_note": "Reviewable unapplied draft. It is not execution authority and must not be used to consume another held tuple.",
+  "serving_authority": false,
+  "source_basis": [
+    {
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig/pkg/inference/src/backends/packed_context_session.zig",
+      "sha256": "cbae851a040fff378c56ac78cbdb0c4af14f8e47aada645f8e1287e221b299f4"
+    },
+    {
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig/pkg/inference/src/backends/compaction_coordinator.zig",
+      "sha256": "e0e37e85497db2a75f8d2b6908429014584a677065fbdfa2796d0e03622d083c"
+    },
+    {
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig/pkg/inference/src/backends/context_stored_installed_invocation.zig",
+      "sha256": "b01d25ad2e7e612406740d97e316f9954114bf9bb2730f4324bcf4a7117b1531"
+    },
+    {
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig/pkg/inference/src/context_stored_installed_caller.zig",
+      "sha256": "286e596c69420a27c70c1d3871f6e016bb630bdb467ac2cb2c5bf4286bbca77e"
+    },
+    {
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/zig/pkg/inference/src/context_model_test.zig",
+      "sha256": "55552593d4ad4f52947b5337861e2e0c3c1c81b1e3353b97248e4e7f2700b3d1"
+    }
+  ]
+}

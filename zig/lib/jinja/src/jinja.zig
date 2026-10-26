@@ -33,6 +33,8 @@ pub const Token = @import("lexer.zig").Token;
 pub const TokenKind = @import("lexer.zig").TokenKind;
 pub const Parser = @import("parser.zig").Parser;
 pub const ParseError = @import("parser.zig").ParseError;
+pub const Provenance = @import("provenance.zig").Provenance;
+pub const Rendered = struct { text: []const u8, labels: []const u32 };
 pub const Eval = @import("eval.zig").Eval;
 pub const Value = @import("eval.zig").Value;
 pub const ValueMap = @import("eval.zig").ValueMap;
@@ -81,6 +83,14 @@ pub const Template = struct {
 
     pub fn deinit(self: *Template) void {
         self.parse_arena.deinit();
+    }
+
+    /// Render with request-arena byte provenance, preserving ordinary bytes.
+    pub fn renderWithProvenance(self: *const Template, tracker: *Provenance, context: *ValueMap) !Rendered {
+        var eval = Eval.init(tracker.arena, context);
+        eval.provenance = tracker;
+        const text = try eval.exec(self.nodes);
+        return .{ .text = text, .labels = try eval.output_labels.toOwnedSlice(tracker.arena) };
     }
 
     /// Render the template with the given context.
@@ -935,4 +945,89 @@ test {
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
     _ = @import("eval.zig");
+}
+
+test "context provenance distinguishes duplicate aliases and tracks template operations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var provenance = Provenance{ .arena = a };
+    const source = "  café café  ";
+    const selected = try provenance.select(source, 7);
+    var ctx = ValueMap{};
+    try ctx.put(a, "selected", Value.str(selected));
+    try ctx.put(a, "protected", Value.str(source));
+    const source_template = "{% macro copy(x) %}{{ x|trim }}{% endmacro %}" ++
+        "{% set captured %}{{ 'X' ~ copy(selected) ~ 'Y' }}{% endset %}" ++
+        "{{ protected }}|{{ captured }}|{{ selected.split(' ')|join('-') }}|{{ selected[2] }}";
+    var template = try Template.init(std.testing.allocator, source_template);
+    defer template.deinit();
+    const plain = try template.render(a, &ctx);
+    const traced = try template.renderWithProvenance(&provenance, &ctx);
+    try std.testing.expectEqualStrings(plain, traced.text);
+    try std.testing.expectEqual(plain.len, traced.labels.len);
+    try std.testing.expect(std.mem.allEqual(u32, traced.labels[0 .. source.len + 2], 0));
+    const middle = source.len + 2;
+    try std.testing.expect(std.mem.allEqual(u32, traced.labels[middle..][0.."café café".len], 7));
+    try std.testing.expectEqual(@as(u32, 0), traced.labels[middle + "café café".len]);
+    try std.testing.expectEqual(@as(u32, 7), traced.labels[traced.labels.len - 1]);
+    for (traced.text, traced.labels) |byte, label| if (byte == '-' or byte == '|') {
+        try std.testing.expectEqual(@as(u32, 0), label);
+    };
+}
+
+test "context provenance rejects unsupported transforms and enforces bounded arena charge" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var provenance = Provenance{ .arena = arena.allocator() };
+    var ctx = ValueMap{};
+    try ctx.put(arena.allocator(), "payload", Value.str(try provenance.select("Data", 1)));
+    var template = try Template.init(std.testing.allocator, "{{ payload|upper }}");
+    defer template.deinit();
+    try std.testing.expectError(error.UnsupportedPayloadTransform, template.renderWithProvenance(&provenance, &ctx));
+    provenance.limit_bytes = provenance.charged_bytes;
+    try std.testing.expectError(error.ProvenanceBudgetExceeded, provenance.select("other", 2));
+}
+
+test "context provenance whitespace capture and duplicate selected parts remain separate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var provenance = Provenance{ .arena = a };
+    var ctx = ValueMap{};
+    try ctx.put(a, "a", Value.str(try provenance.select("same", 1)));
+    try ctx.put(a, "b", Value.str(try provenance.select("same", 2)));
+    var template = try Template.init(std.testing.allocator, "  {%- set c -%}{{ a }}  {%- endset %}{{ c }}{{ b }}  {%- if true %}!{% endif %}");
+    defer template.deinit();
+    const result = try template.renderWithProvenance(&provenance, &ctx);
+    try std.testing.expectEqualStrings(try template.render(a, &ctx), result.text);
+    try std.testing.expectEqualStrings("samesame!", result.text);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 1, 1, 2, 2, 2, 2, 0 }, result.labels);
+}
+
+test "context template loop allocation failures never return a truncated prompt" {
+    const Probe = struct {
+        fn run(allocator: std.mem.Allocator, template: *const Template, tuples: bool) !void {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const pair = [_]Value{ Value.str("key"), Value.str("payload") };
+            const item: Value = if (tuples) .{ .list = &pair } else Value.str("payload");
+            const items: [32]Value = @splat(item);
+            var ctx = ValueMap{};
+            try ctx.put(arena.allocator(), "items", .{ .list = &items });
+            const result = try template.render(arena.allocator(), &ctx);
+            try std.testing.expectEqual(@as(usize, 32 * "payload".len), result.len);
+            for (0..32) |index| try std.testing.expectEqualStrings("payload", result[index * "payload".len ..][0.."payload".len]);
+        }
+    };
+    inline for (.{ false, true }) |tuples| {
+        var template = try Template.init(std.testing.allocator, if (tuples)
+            "{% for key, value in items %}{{ value }}{% endfor %}"
+        else
+            "{% for value in items %}{{ value }}{% endfor %}");
+        defer template.deinit();
+        var allocation_only = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(allocation_only.allocator(), Probe.run, .{ &template, tuples });
+        try std.testing.expectEqual(allocation_only.allocated_bytes, allocation_only.freed_bytes);
+    }
 }

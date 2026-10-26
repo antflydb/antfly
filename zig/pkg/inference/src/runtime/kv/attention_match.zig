@@ -99,6 +99,10 @@ pub const Config = struct {
 };
 
 pub const Metrics = struct {
+    /// True only after held-out attention metrics were actually evaluated.
+    /// Matrix-only device adapters populate solver counters but do not own a
+    /// held-out acceptance decision.
+    quality_evaluated: bool = false,
     max_relative_mass_error: f64 = 0,
     relative_output_rmse: f64 = 0,
     nnls_sweeps: usize = 0,
@@ -508,55 +512,101 @@ fn fitValues(allocator: std.mem.Allocator, a: []const f64, y: []const f64, q: us
     try finite(out);
 }
 
-/// Fit a single donor KV head. Held-out queries are mandatory, and callers must
-/// collect independent queries from every consumer/GQA head. No source mutation
-/// occurs, including on OOM, poor fit, or convergence failure.
-pub fn fit(allocator: std.mem.Allocator, source: Head, train: []const f64, heldout: []const f64, cfg: Config) !Result {
+/// Device adapters may supply only derived attention matrices. The original
+/// source K/V and captured queries remain device-resident. Rows of P must be
+/// normalized probabilities for the immutable source; Y is its attention output.
+pub const MatrixInput = struct {
+    probabilities: []const f64,
+    targets: []const f64,
+    bias: ?[]const f64 = null,
+    rows: usize,
+    dim: usize,
+    query_rows: usize,
+
+    fn validate(self: MatrixInput) !void {
+        if (self.rows == 0 or self.dim == 0 or self.query_rows == 0 or
+            self.probabilities.len != try mul(self.query_rows, self.rows) or
+            self.targets.len != try mul(self.query_rows, self.dim)) return error.InvalidAttentionShape;
+        try finite(self.targets);
+        if (self.bias) |bias| {
+            if (bias.len != self.rows) return error.InvalidAttentionShape;
+            try finite(bias);
+        }
+        for (0..self.query_rows) |q| {
+            var sum: f64 = 0;
+            for (self.probabilities[q * self.rows ..][0..self.rows]) |p| {
+                if (!std.math.isFinite(p) or p < 0 or p > 1) return error.InvalidAttentionProbabilities;
+                sum += p;
+            }
+            // Allow normalization roundoff from an explicitly FP32 device
+            // frontend; the native OMP/NNLS/QR solve itself remains FP64.
+            if (@abs(sum - 1) > 1e-5) return error.InvalidAttentionProbabilities;
+        }
+    }
+};
+
+/// Unvalidated private staging. This object has no publication authority:
+/// acceptance must evaluate rounded K/V and f32 bias against the full source.
+pub const MatrixResult = struct {
+    allocator: std.mem.Allocator,
+    values: []f64,
+    bias: []f64,
+    source_indices: []usize,
+    metrics: Metrics = .{},
+
+    pub fn deinit(self: *MatrixResult) void {
+        self.allocator.free(self.values);
+        self.allocator.free(self.bias);
+        self.allocator.free(self.source_indices);
+        self.* = undefined;
+    }
+};
+
+/// Conservative simultaneous host scratch + private result bound. Caller-owned
+/// P/Y, device buffers, and the live source must be admitted separately.
+pub fn matrixWorkspaceBytes(n: usize, m: usize, q: usize, d: usize) !usize {
+    return workspaceBytes(n, m, q, d);
+}
+
+pub fn fitMatrices(allocator: std.mem.Allocator, input: MatrixInput, cfg: Config) !MatrixResult {
     if (cfg.metrics) |metrics| metrics.* = .{};
     try cfg.control.check();
-    try source.validate();
-    try cfg.validate(source.rows);
-    if (train.len == 0 or heldout.len == 0 or train.len % source.dim != 0 or heldout.len % source.dim != 0)
-        return error.InvalidAttentionShape;
-    try finite(train);
-    try finite(heldout);
-    const n = source.rows;
+    try input.validate();
+    try cfg.validate(input.rows);
+    // Keeping every row is an exact device copy, never a fitted substitute.
+    if (cfg.target_rows == input.rows) return error.ExactAttentionCopyRequired;
     const m = cfg.target_rows;
-    const d = source.dim;
-    const q = train.len / d;
-    const result_bytes = try add(try mul(try mul(m, d), 2 * @sizeOf(f64)), try mul(m, @sizeOf(f64) + @sizeOf(usize)));
-    const workspace = if (m == n) result_bytes else try fitWorkspaceBytes(n, m, q, d, heldout.len / d, cfg);
+    const workspace = try matrixWorkspaceBytes(input.rows, m, input.query_rows, input.dim);
     if (workspace > cfg.max_workspace_bytes) return error.CompactionWorkspaceLimit;
+    const result_bytes = try add(try mul(try mul(m, input.dim), @sizeOf(f64)), try mul(m, @sizeOf(f64) + @sizeOf(usize)));
     const scratch_buffer = try allocator.alignedAlloc(u8, .of(f64), workspace - result_bytes);
     defer allocator.free(scratch_buffer);
     var fixed = std.heap.FixedBufferAllocator.init(scratch_buffer);
-    const scratch = fixed.allocator();
-    const keys = try allocator.alloc(f64, try mul(m, d));
-    errdefer allocator.free(keys);
-    const values = try allocator.alloc(f64, try mul(m, d));
+    const values = try allocator.alloc(f64, try mul(m, input.dim));
     errdefer allocator.free(values);
     const bias = try allocator.alloc(f64, m);
     errdefer allocator.free(bias);
     const indices = try allocator.alloc(usize, m);
     errdefer allocator.free(indices);
-    var result: Result = .{ .allocator = allocator, .keys = keys, .values = values, .bias = bias, .source_indices = indices };
-    defer {
-        if (cfg.metrics) |metrics| metrics.* = result.metrics;
-    }
-    if (m == n) {
-        @memcpy(keys, source.keys);
-        @memcpy(values, source.values);
-        for (bias, indices, 0..) |*b, *idx, i| {
-            b.* = if (source.bias) |bs| bs[i] else 0;
-            idx.* = i;
-        }
-        return result;
-    }
-    const probabilities = try scratch.alloc(f64, try mul(q, n));
-    const targets = try scratch.alloc(f64, try mul(q, d));
+    var result = MatrixResult{ .allocator = allocator, .values = values, .bias = bias, .source_indices = indices };
+    defer if (cfg.metrics) |metrics| {
+        metrics.* = result.metrics;
+    };
+    try solveMatrices(&fixed, input, cfg, values, bias, indices, &result.metrics);
+    try cfg.control.check();
+    return result;
+}
+
+fn solveMatrices(fixed: *std.heap.FixedBufferAllocator, input: MatrixInput, cfg: Config, values: []f64, bias: []f64, indices: []usize, metrics: *Metrics) !void {
+    const scratch = fixed.allocator();
+    const n = input.rows;
+    const m = cfg.target_rows;
+    const q = input.query_rows;
+    const d = input.dim;
+    const probabilities = input.probabilities;
+    const targets = input.targets;
     const importance = try scratch.alloc(f64, n);
     @memset(importance, 0);
-    try attendBatch(scratch, source, train, probabilities, targets, null, cfg);
     for (0..q) |i| {
         const ps = probabilities[i * n ..][0..n];
         for (importance, ps) |*score, p| score.* += p * p; // RMS ranking
@@ -574,7 +624,7 @@ pub fn fit(allocator: std.mem.Allocator, source: Head, train: []const f64, heldo
         const selection_mark = fixed.end_index;
         const selected_weights = try scratch.alloc(f64, m);
         const backend = cfg.backend.?;
-        result.metrics.selection_active_solves = try backend.select_fn.?(backend.context, scratch, probabilities, importance, q, n, indices, selected_weights, cfg);
+        metrics.selection_active_solves = try backend.select_fn.?(backend.context, scratch, probabilities, importance, q, n, indices, selected_weights, cfg);
         try cfg.control.check();
         // Validate accelerator output before using it for indexing. The final
         // native NNLS solve below verifies direct KKT convergence independently.
@@ -582,7 +632,7 @@ pub fn fit(allocator: std.mem.Allocator, source: Head, train: []const f64, heldo
             if (idx >= n or std.mem.indexOfScalar(usize, indices[0..i], idx) != null or !std.math.isFinite(weight) or weight < 0) return error.InvalidSelectionResult;
             importance[idx] = weight;
         }
-        result.metrics.selection_steps = m;
+        metrics.selection_steps = m;
         fixed.end_index = selection_mark;
     } else {
         const selection_mark = fixed.end_index;
@@ -685,8 +735,8 @@ pub fn fit(allocator: std.mem.Allocator, source: Head, train: []const f64, heldo
                     }
                     feasible = feasible and violation <= cfg.nnls_tolerance * @sqrt(@as(f64, @floatFromInt(q)));
                 }
-                if (feasible) @memcpy(weights[0..count], trial[0..count]) else result.metrics.selection_active_solves += try fitMassActive(scratch, basis[0 .. q * count], q, count, weights[0..count], residual, norms[0..count], cfg, true);
-                result.metrics.selection_steps += 1;
+                if (feasible) @memcpy(weights[0..count], trial[0..count]) else metrics.selection_active_solves += try fitMassActive(scratch, basis[0 .. q * count], q, count, weights[0..count], residual, norms[0..count], cfg, true);
+                metrics.selection_steps += 1;
             }
             for (indices, weights) |idx, w| importance[idx] = w;
         }
@@ -695,7 +745,6 @@ pub fn fit(allocator: std.mem.Allocator, source: Head, train: []const f64, heldo
     std.mem.sort(usize, indices, {}, std.sort.asc(usize));
     const basis = try scratch.alloc(f64, try mul(q, m));
     for (indices, 0..) |idx, j| {
-        @memcpy(keys[j * d ..][0..d], source.keys[idx * d ..][0..d]);
         for (0..q) |i| basis[i * m + j] = probabilities[i * n + idx];
     }
     const weights = try scratch.alloc(f64, m);
@@ -704,25 +753,127 @@ pub fn fit(allocator: std.mem.Allocator, source: Head, train: []const f64, heldo
     if (cfg.selection == .residual_omp) for (indices, weights) |idx, *w| {
         w.* = importance[idx];
     };
-    result.metrics.nnls_sweeps = if (cfg.mass_solver == .active_set)
+    metrics.nnls_sweeps = if (cfg.mass_solver == .active_set)
         try fitMassActive(scratch, basis, q, m, weights, residual, norms, cfg, cfg.selection == .residual_omp)
     else
         try fitMass(basis, q, m, weights, residual, norms, cfg);
-    for (indices, bias, weights) |idx, *b, w| b.* = (if (source.bias) |bs| bs[idx] else @as(f64, 0)) + @log(@max(w, cfg.min_weight));
+    for (indices, bias, weights) |idx, *b, w| b.* = (if (input.bias) |bs| bs[idx] else @as(f64, 0)) + @log(@max(w, cfg.min_weight));
     try finite(bias);
     const fitted = try scratch.alloc(f64, try mul(q, m));
-    // Values are not read by attend when the output is null.
-    const compact = result.head(source);
-    try attendBatch(scratch, compact, train, fitted, null, null, cfg);
+    // Reweight the original normalized probabilities. This is algebraically
+    // identical to softmax over the selected keys plus their new log mass,
+    // including any bias already represented by the source. No source KV or
+    // query readback is needed by a device adapter.
+    for (0..q) |i| {
+        var sum: f64 = 0;
+        for (indices, 0..) |idx, j| {
+            const weight = @max(weights[j], cfg.min_weight);
+            fitted[i * m + j] = probabilities[i * n + idx] * weight;
+            sum += fitted[i * m + j];
+        }
+        if (!std.math.isFinite(sum) or sum <= 0) return error.NonFiniteAttention;
+        for (fitted[i * m ..][0..m]) |*p| p.* /= sum;
+    }
     try solveValues(scratch, fitted, targets, q, m, d, cfg.ridge, cfg, values);
+}
+
+/// Fit a single donor KV head. Held-out queries are mandatory, and callers must
+/// collect independent queries from every consumer/GQA head. No source mutation
+/// occurs, including on OOM, poor fit, or convergence failure.
+pub fn fit(allocator: std.mem.Allocator, source: Head, train: []const f64, heldout: []const f64, cfg: Config) !Result {
+    if (cfg.metrics) |metrics| metrics.* = .{};
+    try cfg.control.check();
+    try source.validate();
+    try cfg.validate(source.rows);
+    if (train.len == 0 or heldout.len == 0 or train.len % source.dim != 0 or heldout.len % source.dim != 0)
+        return error.InvalidAttentionShape;
+    try finite(train);
+    try finite(heldout);
+    const n = source.rows;
+    const m = cfg.target_rows;
+    const d = source.dim;
+    const q = train.len / d;
+    const result_bytes = try add(try mul(try mul(m, d), 2 * @sizeOf(f64)), try mul(m, @sizeOf(f64) + @sizeOf(usize)));
+    const workspace = if (m == n) result_bytes else try fitWorkspaceBytes(n, m, q, d, heldout.len / d, cfg);
+    if (workspace > cfg.max_workspace_bytes) return error.CompactionWorkspaceLimit;
+    const scratch_buffer = try allocator.alignedAlloc(u8, .of(f64), workspace - result_bytes);
+    defer allocator.free(scratch_buffer);
+    var fixed = std.heap.FixedBufferAllocator.init(scratch_buffer);
+    const scratch = fixed.allocator();
+    const keys = try allocator.alloc(f64, try mul(m, d));
+    errdefer allocator.free(keys);
+    const values = try allocator.alloc(f64, try mul(m, d));
+    errdefer allocator.free(values);
+    const bias = try allocator.alloc(f64, m);
+    errdefer allocator.free(bias);
+    const indices = try allocator.alloc(usize, m);
+    errdefer allocator.free(indices);
+    var result: Result = .{ .allocator = allocator, .keys = keys, .values = values, .bias = bias, .source_indices = indices };
+    defer {
+        if (cfg.metrics) |metrics| metrics.* = result.metrics;
+    }
+    if (m == n) {
+        @memcpy(keys, source.keys);
+        @memcpy(values, source.values);
+        for (bias, indices, 0..) |*b, *idx, i| {
+            b.* = if (source.bias) |bs| bs[i] else 0;
+            idx.* = i;
+        }
+        return result;
+    }
+    const probabilities = try scratch.alloc(f64, try mul(q, n));
+    const targets = try scratch.alloc(f64, try mul(q, d));
+    try attendBatch(scratch, source, train, probabilities, targets, null, cfg);
+    try solveMatrices(&fixed, .{ .probabilities = probabilities, .targets = targets, .bias = source.bias, .rows = n, .dim = d, .query_rows = q }, cfg, values, bias, indices, &result.metrics);
+    for (indices, 0..) |idx, j| @memcpy(keys[j * d ..][0..d], source.keys[idx * d ..][0..d]);
+    const compact = result.head(source);
     const validation = try validationMetrics(scratch, source, compact, heldout, cfg);
     result.metrics.max_relative_mass_error = validation.max_relative_mass_error;
     result.metrics.relative_output_rmse = validation.relative_output_rmse;
+    result.metrics.quality_evaluated = true;
     if (!std.math.isFinite(result.metrics.max_relative_mass_error) or
         !std.math.isFinite(result.metrics.relative_output_rmse) or
         result.metrics.max_relative_mass_error > cfg.max_relative_mass_error or
         result.metrics.relative_output_rmse > cfg.max_relative_output_rmse) return error.CompactionFitRejected;
     return result;
+}
+
+test "attention_match matrix adapter matches native source fit without source KV" {
+    const h: Head = .{ .keys = &.{ -1, 0, 0.5, 1 }, .values = &.{ 3, 2, 1, 4 }, .bias = &.{ 0.1, -0.2, 0.3, 0 }, .rows = 4, .dim = 1, .scale = 0.5, .softcap = 0.7 };
+    const queries = [_]f64{ -2, -1, 0, 1, 2, 3 };
+    var p: [queries.len * 4]f64 = undefined;
+    var y: [queries.len]f64 = undefined;
+    const cfg: Config = .{ .target_rows = 2, .selection = .residual_omp, .mass_solver = .active_set, .max_relative_mass_error = 10, .max_relative_output_rmse = 10 };
+    try attendBatch(std.testing.allocator, h, &queries, &p, &y, null, cfg);
+    var matrix = try fitMatrices(std.testing.allocator, .{ .probabilities = &p, .targets = &y, .bias = h.bias, .rows = h.rows, .dim = h.dim, .query_rows = queries.len }, cfg);
+    defer matrix.deinit();
+    var native = try fit(std.testing.allocator, h, &queries, &.{ -0.5, 0.5 }, cfg);
+    defer native.deinit();
+    try std.testing.expectEqualSlices(usize, native.source_indices, matrix.source_indices);
+    try std.testing.expectEqualSlices(f64, native.bias, matrix.bias);
+    try std.testing.expectEqualSlices(f64, native.values, matrix.values);
+    try std.testing.expect(!matrix.metrics.quality_evaluated);
+    try std.testing.expect(native.metrics.quality_evaluated);
+}
+
+test "attention_match matrix input rejects invalid probabilities and enforces scratch admission" {
+    const input: MatrixInput = .{ .probabilities = &.{ 0.5, 0.5, 0.25, 0.75 }, .targets = &.{ 1, 2 }, .rows = 2, .dim = 1, .query_rows = 2 };
+    var cfg: Config = .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set };
+    cfg.max_workspace_bytes = (try matrixWorkspaceBytes(2, 1, 2, 1)) - 1;
+    try std.testing.expectError(error.CompactionWorkspaceLimit, fitMatrices(std.testing.failing_allocator, input, cfg));
+    var invalid = input;
+    invalid.probabilities = &.{ 0.5, 0.4, 0.25, 0.75 };
+    try std.testing.expectError(error.InvalidAttentionProbabilities, fitMatrices(std.testing.failing_allocator, invalid, cfg));
+}
+
+test "attention_match matrix fitting frees every failed allocation" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var r = try fitMatrices(a, .{ .probabilities = &.{ 0.5, 0.5, 0.5, 0.5 }, .targets = &.{ 3, 3 }, .rows = 2, .dim = 1, .query_rows = 2 }, .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set });
+            defer r.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "attention_match identity preserves fitted bias and values exactly" {
@@ -774,6 +925,7 @@ test "attention_match rejected fit retains diagnostics and resets them on early 
     var metrics: Metrics = .{};
     try std.testing.expectError(error.CompactionFitRejected, fit(std.testing.allocator, h, &.{0}, &.{10}, .{ .target_rows = 1, .metrics = &metrics }));
     try std.testing.expect(metrics.max_relative_mass_error > 0.99);
+    try std.testing.expect(metrics.quality_evaluated);
     try std.testing.expect(metrics.nnls_sweeps > 0);
     try std.testing.expect(metrics.relative_output_rmse < 0.05);
     try std.testing.expectError(error.CompactionWorkspaceLimit, fit(std.testing.allocator, h, &.{0}, &.{10}, .{ .target_rows = 1, .max_workspace_bytes = 1, .metrics = &metrics }));
@@ -946,7 +1098,7 @@ fn backendAllocationFailure(allocator: std.mem.Allocator) !void {
     defer result.deinit();
     try std.testing.expectApproxEqAbs(@as(f64, 5), result.values[0], 1e-6);
     try std.testing.expectEqual(@as(usize, 64), backend.largest_batch);
-    try std.testing.expectEqual(@as(usize, 8), backend.calls);
+    try std.testing.expectEqual(@as(usize, 7), backend.calls);
 }
 
 test "attention_match backend bounds heldout batches independently of training count and unwinds failures" {
@@ -980,7 +1132,7 @@ fn backend256AllocationFailure(allocator: std.mem.Allocator) !void {
     defer result.deinit();
     try std.testing.expectApproxEqAbs(@as(f64, 5), result.values[0], 1e-6);
     try std.testing.expectEqual(@as(usize, 256), backend.largest_batch);
-    try std.testing.expectEqual(@as(usize, 8), backend.calls);
+    try std.testing.expectEqual(@as(usize, 7), backend.calls);
 }
 test "attention_match bounded 256-row validation handles tails and unwinds allocations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, backend256AllocationFailure, .{});

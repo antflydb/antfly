@@ -87,6 +87,12 @@ fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
 const Options = struct {
     model_dir: []const u8,
     prompt: []const u8,
+    context_document_file: ?[]const u8 = null,
+    context_question_file: ?[]const u8 = null,
+    context_document_sha256: ?[]const u8 = null,
+    context_question_sha256: ?[]const u8 = null,
+    context_document: ?[]const u8 = null,
+    context_question: ?[]const u8 = null,
     image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
     video_path: ?[]const u8 = null,
@@ -134,6 +140,8 @@ const Options = struct {
     ignore_eos: bool = false,
     cache_dtype: ?[]const u8 = null,
     cache_compaction_ratio: ?f32 = null,
+    context_policy: runtime.context_policy.Policy = .{},
+    context_policy_explicit: bool = false,
     mode: ?ExecutionMode = null,
     compiled_target: ?CompiledTarget = null,
     artifact_dir: ?[]const u8 = null,
@@ -280,9 +288,81 @@ fn shouldSkipMetalAutoDraftLoad(opts: Options, draft_is_gemma4_mtp: bool) bool {
 }
 
 fn validateCacheCompactionOption(ratio: ?f32) !void {
-    const value = ratio orelse return;
-    try (runtime.kv.compaction.CompactionConfig{ .target_ratio = value }).validate();
-    return error.KvStorageCompactionNotSupported;
+    try runtime.context_policy.validateLegacyRatio(ratio);
+}
+
+const StructuredCliInput = struct {
+    allocator: std.mem.Allocator,
+    document: []u8,
+    question: []u8,
+
+    fn deinit(self: *@This()) void {
+        self.allocator.free(self.document);
+        self.allocator.free(self.question);
+        self.* = undefined;
+    }
+};
+
+fn parseDigest32(text: []const u8) ![32]u8 {
+    if (text.len != 64) return error.InvalidStructuredCliInputDigest;
+    var result: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&result, text) catch return error.InvalidStructuredCliInputDigest;
+    return result;
+}
+
+fn readStructuredCliFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, expected_hex: []const u8) ![]u8 {
+    if (path.len == 0) return error.InvalidStructuredCliInput;
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file or stat.size == 0 or stat.size > 16 * 1024 * 1024)
+        return error.InvalidStructuredCliInput;
+    const size = std.math.cast(usize, stat.size) orelse return error.InvalidStructuredCliInput;
+    const bytes = try allocator.alloc(u8, size);
+    errdefer allocator.free(bytes);
+    if (try file.readPositionalAll(io, bytes, 0) != size or !std.unicode.utf8ValidateSlice(bytes))
+        return error.InvalidStructuredCliInput;
+    var actual: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+    const expected = try parseDigest32(expected_hex);
+    if (!std.mem.eql(u8, &actual, &expected)) return error.StructuredCliInputDigestMismatch;
+    return bytes;
+}
+
+fn loadStructuredCliInput(allocator: std.mem.Allocator, io: std.Io, opts: Options) !?StructuredCliInput {
+    const present = .{
+        opts.context_document_file != null,
+        opts.context_question_file != null,
+        opts.context_document_sha256 != null,
+        opts.context_question_sha256 != null,
+    };
+    if (!present[0] and !present[1] and !present[2] and !present[3]) return null;
+    if (!present[0] or !present[1] or !present[2] or !present[3] or !std.mem.eql(u8, opts.prompt, "-") or
+        opts.image_count != 0 or opts.audio_count != 0 or opts.video_path != null or opts.context_policy.mode != .attention_matching or
+        opts.context_policy.compaction_targets.count != 1)
+        return error.InvalidStructuredCliInput;
+    const target = opts.context_policy.compaction_targets.slice()[0];
+    if (target.message_index != 0 or target.part_index != 0)
+        return error.InvalidStructuredCliInput;
+    const document = try readStructuredCliFile(allocator, io, opts.context_document_file.?, opts.context_document_sha256.?);
+    errdefer allocator.free(document);
+    const question = try readStructuredCliFile(allocator, io, opts.context_question_file.?, opts.context_question_sha256.?);
+    return .{ .allocator = allocator, .document = document, .question = question };
+}
+
+fn contextRequestFeatures(opts: Options) runtime.context_policy.RequestFeatures {
+    return .{
+        // Auto is resolved by the warm server. Local approximate execution
+        // remains gated by validateExecution with no qualified capabilities.
+        .metal = opts.backend == .auto or opts.backend == .metal,
+        .f16_kv = opts.cache_dtype == null or std.mem.eql(u8, opts.cache_dtype.?, "f16"),
+        .multimodal = opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null,
+        .speculation = opts.draft_model != null,
+    };
 }
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -290,10 +370,21 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         printUsage();
         return;
     }
-    const opts = try parseArgs(args);
+    var opts = try parseArgs(args);
+    var structured_cli = try loadStructuredCliInput(allocator, io, opts);
+    defer if (structured_cli) |*value| value.deinit();
+    if (structured_cli) |value| {
+        opts.context_document = value.document;
+        opts.context_question = value.question;
+    }
     try validateVideoOptions(opts);
     const jit_config = try validateKernelJitOptions(io, opts);
     try validateCacheCompactionOption(opts.cache_compaction_ratio);
+    const context_features = contextRequestFeatures(opts);
+    // The client owns structural and immutable request-feature validation. The
+    // warm server alone owns loaded-profile capability and publication state.
+    try runtime.context_policy.validateRequestFeatures(opts.context_policy, context_features);
+    try validateContextExecutionMode(opts);
     try native_backend_choice.validate(opts.backend);
     if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null)) return error.RawDecodeBenchRequiresTextOnly;
     if (opts.raw_decode_bench and opts.draft_model != null and opts.speculation_policy != .off) return error.RawDecodeBenchSpeculationUnsupported;
@@ -311,6 +402,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (!serverGenerateSupportsOptions(opts)) return error.UnsupportedServerGenerateOption;
         return error.WarmInferenceServerUnavailable;
     }
+
+    // Local execution has no loaded, release-qualified compaction profile. It
+    // stays fail-closed even though the same structurally valid request may be
+    // transported to a warm server that owns that authority.
+    try runtime.context_policy.validateExecution(opts.context_policy, context_features, .{});
 
     var preflight_draft_gpt_config: ?gpt_mod.Config = null;
     const effective_draft_model = if (opts.speculation_policy == .off) null else if (opts.backend == .metal and opts.speculation_policy == .auto) blk: {
@@ -349,6 +445,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var content_parts = std.ArrayListUnmanaged(generation.Message.ContentPart).empty;
     defer content_parts.deinit(allocator);
 
+    if (opts.context_document) |document| {
+        try content_parts.append(allocator, .{ .text = document });
+        try content_parts.append(allocator, .{ .text = opts.context_question.? });
+    }
     for (0..opts.image_count) |idx| {
         const image_bytes = try std.Io.Dir.cwd().readFileAlloc(io, opts.image_paths[idx], allocator, .limited(std.math.maxInt(usize)));
         try loaded_images.append(allocator, image_bytes);
@@ -384,7 +484,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const messages = [_]generation.Message{
         .{
             .role = "user",
-            .content = opts.prompt,
+            .content = if (opts.context_document == null) opts.prompt else "",
             .image_bytes = message_image_slice,
             .video_bytes = loaded_video,
             .audio_bytes = message_audio_slice,
@@ -405,6 +505,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .speculation_policy = opts.speculation_policy,
         .speculation_calibration = opts.speculation_calibration,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .context_policy = opts.context_policy,
         .ignore_eos = opts.ignore_eos,
         .enable_thinking = opts.enable_thinking,
         .qwen3vl_parity_json_path = opts.qwen3vl_parity_json_path,
@@ -451,7 +552,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var draft_model_manager = model_manager_mod.ModelManager.init(allocator, draft_session_manager);
     defer draft_model_manager.deinit();
 
-    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
+    if (!opts.context_policy_explicit and artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
         var artifact_arena = std.heap.ArenaAllocator.init(allocator);
         defer artifact_arena.deinit();
         const artifact_allocator = artifact_arena.allocator();
@@ -486,6 +587,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (opts.disable_gemma_embedding_scale and gpt_config.family == .gemma) {
         gpt_config.disable_token_embedding_scale = true;
     }
+    if (gpt_config.family == .gemma and !gpt_config.gemma4_mtp_assistant) _ = try runtime.context_policy.Layout.init(gpt_config);
+    if (generation.kvSlidingTrimForced() and gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers()) return error.UnsafeGlobalContextTrim;
     const tokenizer = model.getTokenizer();
     if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null)) {
         return error.MultimodalSpeculativeDecodingNotSupported;
@@ -530,12 +633,13 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         gpt_config,
     );
     const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(&messages, gpt_config);
-    const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+    const prompt_token_limit = try generation.nativeGenerationPromptTokenLimitWithPolicy(
         gpt_config,
         if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config else null,
         @intCast(@max(opts.max_tokens, 1)),
         if (draft_model != null and opts.speculation_policy != .off and opts.speculative_k > 0) 1 else 0,
         preliminary_media_allowance,
+        opts.context_policy,
     );
     var prompt_encoded = try generation.encodeNativeGenerationPrompt(
         tokenizer,
@@ -553,7 +657,19 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         prompt_media_allowance,
     ) catch return error.PromptTooLong;
 
-    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
+    // Dynamic media admission can overestimate the final visual span. Keep
+    // scheduler/memory accounting conservative and defer its exact context
+    // check to the pipeline after expansion.
+    const policy_prompt_tokens = std.math.add(usize, countPromptTokens(prompt_encoded.attention_mask), preliminary_media_allowance) catch return error.PromptTooLong;
+    _ = try opts.context_policy.admit(
+        gpt_config.max_position_embeddings,
+        if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config.?.max_position_embeddings else null,
+        policy_prompt_tokens,
+        @intCast(@max(opts.max_tokens, 1)),
+        if (draft_model != null and opts.speculation_policy != .off and opts.speculative_k > 0) 1 else 0,
+    );
+
+    if (!opts.context_policy_explicit and artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
         if (try tryRunArtifactForPromptShape(
             allocator,
             io,
@@ -734,6 +850,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     } else null;
     var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
     budget_components[0] = .{
+        .context_policy = config.context_policy,
         .backend = backend_kind,
         .kv_dtype = kv_dtype,
         .config = gpt_config,
@@ -782,6 +899,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
         return err;
     };
+
+    // Memory admission precedes the execution barrier. Approximate context
+    // owns replay/publication state exclusively; exact requests may share the
+    // normal scheduler until an older exclusive waiter reaches the front.
+    if (native_generate_lease) |*lease| {
+        if (model.native_generate_coordinator) |coordinator| {
+            if (config.context_policy.mode == .exact) {
+                try coordinator.awaitSharedExecution(lease, io);
+            } else {
+                try coordinator.markExclusive(lease);
+                try coordinator.awaitExclusiveExecution(lease, io);
+            }
+        }
+    }
 
     // The live executor is an alternate implementation of this admitted
     // route, not an admission bypass. Reuse the effective KV dtype, capacity
@@ -848,6 +979,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var kv_manager = runtime.kv.manager.KvManager.init(allocator);
     defer kv_manager.deinit();
+
+    if (config.context_policy.mode != .exact) {
+        config.context_budget_bytes = (try budget_components[0].estimate(prompt_tokens, budget_max_tokens, config.prefill_chunk_size)).kv_bytes;
+    }
 
     debugGenerateSetup("compute backend begin", .{});
     var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
@@ -922,7 +1057,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
     }
 
-    const use_scheduler = !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and !graph_mode and !decoder_runtime_scheduler_override and nativeGenerateSchedulerEnabled();
+    const use_scheduler = config.context_policy.mode == .exact and !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and !graph_mode and !decoder_runtime_scheduler_override and nativeGenerateSchedulerEnabled();
     var graph_cache = graph_mod.cache.GraphCache.init(allocator);
     defer graph_cache.deinit();
     var pjrt_client: ?pjrt_lib.pjrt.Client = null;
@@ -5721,6 +5856,7 @@ fn writeJsonTiming(
         \\"backend":{f},
         \\"tokens":{d},
         \\"token_ids":{s},
+        \\"prompt_tokens":{d},
         \\"finish_reason":{f},
         \\"decode_tok_per_s":{d:.6},
         \\"timing_ms":{{
@@ -5736,6 +5872,8 @@ fn writeJsonTiming(
         \\"multimodal_prepare_inner":{d},
         \\"runtime_prepare_inner":{d},
         \\"prefill_inner":{d},
+        \\"maintenance_inner":{d},
+        \\"first_token_inner":{f},
         \\"decode_inner":{d},
         \\"text_decode_inner":{d},
         \\"total_inner":{d}
@@ -5756,6 +5894,7 @@ fn writeJsonTiming(
             std.json.fmt(backend_name, .{}),
             result.tokens_used,
             token_ids_json,
+            result.prompt_tokens,
             std.json.fmt(result.finish_reason, .{}),
             tokensPerSecond(result.tokens_used, decode_ms),
             load_model_ms,
@@ -5770,6 +5909,8 @@ fn writeJsonTiming(
             inner_timing.multimodal_prepare,
             inner_timing.runtime_prepare,
             inner_timing.prefill,
+            inner_timing.maintenance,
+            std.json.fmt(inner_timing.first_token, .{}),
             inner_timing.decode,
             inner_timing.text_decode,
             inner_timing.total,
@@ -6487,6 +6628,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     loaded_model_at: std.Io.Timestamp,
     encoded_prompt_at: std.Io.Timestamp,
 ) !bool {
+    if (config.context_policy.mode != .exact) return false;
     if (!liveWholeModelExecutorRequested(opts, gpt_config)) return false;
     if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
     if (config.draft_model != null or config.speculation_requested) return false;
@@ -7154,7 +7296,14 @@ fn generateWithOptionalStreaming(
     return result;
 }
 
-fn serverGenerateRequest(opts: Options, messages: []const api.ChatMessage) api.GenerateRequest {
+fn serverGenerateRequest(allocator: std.mem.Allocator, opts: Options, messages: []const api.ChatMessage) !api.GenerateRequest {
+    try validateContextExecutionMode(opts);
+    const targets: ?[]api.GenerateCompactionTarget = if (opts.context_policy_explicit and opts.context_policy.compaction_targets.count != 0) blk: {
+        const selected = opts.context_policy.compaction_targets.slice();
+        const wire = try allocator.alloc(api.GenerateCompactionTarget, selected.len);
+        for (selected, wire) |target, *entry| entry.* = .{ .message_index = target.message_index, .part_index = target.part_index };
+        break :blk wire;
+    } else null;
     const draft_requested = opts.draft_model != null;
     return .{
         .model = opts.model_dir,
@@ -7167,16 +7316,29 @@ fn serverGenerateRequest(opts: Options, messages: []const api.ChatMessage) api.G
         .repetition_penalty = opts.repetition_penalty,
         .stream = if (opts.stream) true else null,
         .stream_options = if (opts.stream) .{ .include_usage = true } else null,
+        .chat_template_kwargs = if (opts.enable_thinking) |value| .{ .enable_thinking = value } else null,
         .draft_model = opts.draft_model,
         .speculative_k = if (draft_requested) opts.speculative_k else null,
         .speculation_policy = if (draft_requested) opts.speculation_policy.name() else null,
         .speculation_calibration = if (draft_requested) opts.speculation_calibration.name() else null,
         .cache_dtype = opts.cache_dtype,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .context_policy = if (opts.context_policy_explicit) .{
+            .mode = @tagName(opts.context_policy.mode),
+            .max_context_tokens = if (opts.context_policy.max_context_tokens) |v| v else null,
+            .max_kv_tokens = if (opts.context_policy.max_kv_tokens) |v| v else null,
+            .keep_prefix_tokens = opts.context_policy.keep_prefix_tokens,
+            .keep_recent_tokens = opts.context_policy.keep_recent_tokens,
+            .compaction_targets = targets,
+        } else null,
         .backend = generateBackendOverrideForChoice(opts.backend),
         .mode = serverGenerateModeName(opts),
         .compiled_target = serverGenerateCompiledTargetName(opts),
     };
+}
+
+fn freeServerGenerateTargets(allocator: std.mem.Allocator, request: api.GenerateRequest) void {
+    if (request.context_policy) |policy| if (policy.compaction_targets) |targets| allocator.free(targets);
 }
 
 fn serializeServerGenerateRequest(allocator: std.mem.Allocator, request: api.GenerateRequest) ![]u8 {
@@ -7196,11 +7358,24 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
     const url = try generateEndpointUrl(allocator, opts.server_url.?);
     defer allocator.free(url);
 
-    const messages = [_]api.ChatMessage{.{
-        .role = .user,
-        .content = .{ .string = opts.prompt },
-    }};
-    const request = serverGenerateRequest(opts, &messages);
+    var document_object: std.json.ObjectMap = .empty;
+    defer document_object.deinit(allocator);
+    var question_object: std.json.ObjectMap = .empty;
+    defer question_object.deinit(allocator);
+    var structured_parts = std.json.Array.init(allocator);
+    defer structured_parts.deinit();
+    const content: std.json.Value = if (opts.context_document) |document| blk: {
+        try document_object.put(allocator, "type", .{ .string = "text" });
+        try document_object.put(allocator, "text", .{ .string = document });
+        try question_object.put(allocator, "type", .{ .string = "text" });
+        try question_object.put(allocator, "text", .{ .string = opts.context_question.? });
+        try structured_parts.append(.{ .object = document_object });
+        try structured_parts.append(.{ .object = question_object });
+        break :blk .{ .array = structured_parts };
+    } else .{ .string = opts.prompt };
+    const messages = [_]api.ChatMessage{.{ .role = .user, .content = content }};
+    const request = try serverGenerateRequest(allocator, opts, &messages);
+    defer freeServerGenerateTargets(allocator, request);
     const body = try serializeServerGenerateRequest(allocator, request);
     defer allocator.free(body);
 
@@ -7227,7 +7402,11 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
     defer parsed.deinit();
     const choice = if (parsed.value.choices.len > 0) parsed.value.choices[0] else return error.EmptyResponse;
 
-    print("{s}\n", .{choice.message.content.valueOrNull() orelse ""});
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    try stdout_writer.interface.writeAll(choice.message.content.valueOrNull() orelse "");
+    try stdout_writer.interface.writeByte('\n');
+    try stdout_writer.interface.flush();
     if (opts.print_finish_reason or opts.print_token_count) {
         if (opts.print_finish_reason) print("finish_reason={s}", .{@tagName(choice.finish_reason)});
         if (opts.print_token_count) {
@@ -7284,6 +7463,21 @@ pub const ServerGenerateSseWriter = struct {
     /// When set, streamed content deltas are also appended here so callers
     /// (chat) can retain the assistant reply for multi-turn history.
     capture: ?*std.ArrayListUnmanaged(u8) = null,
+    /// Exact public response sink. Diagnostics and reasoning never enter this
+    /// writer. A null sink preserves legacy callers that only inspect SSE
+    /// metadata or use `capture` for chat history.
+    public_output: ?*std.Io.Writer = null,
+
+    fn writePublic(self: *@This(), bytes: []const u8) !void {
+        if (self.public_output) |writer| {
+            try writer.writeAll(bytes);
+            // Preserve streaming visibility rather than buffering the first
+            // public bytes until process exit.
+            try writer.flush();
+        } else {
+            print("{s}", .{bytes});
+        }
+    }
 
     pub fn deinit(self: *@This()) void {
         self.buffer.deinit(self.allocator);
@@ -7349,7 +7543,7 @@ pub const ServerGenerateSseWriter = struct {
         if (parsed.value.usage.valueOrNull()) |usage| self.usage = usage;
         for (parsed.value.choices) |choice| {
             if (choice.delta.content.valueOrNull()) |content| {
-                print("{s}", .{content});
+                try self.writePublic(content);
                 if (self.capture) |capture| {
                     try capture.appendSlice(self.allocator, content);
                 }
@@ -7380,7 +7574,12 @@ fn runServerGenerateStream(
     opts: Options,
     quiet_errors: bool,
 ) !void {
-    var stream_writer = ServerGenerateSseWriter{ .allocator = allocator };
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    var stream_writer = ServerGenerateSseWriter{
+        .allocator = allocator,
+        .public_output = &stdout_writer.interface,
+    };
     defer stream_writer.deinit();
 
     const headers = [_][2][]const u8{
@@ -7409,7 +7608,7 @@ fn runServerGenerateStream(
     try stream_writer.finish();
     if (stream_writer.stream_error) return error.GenerateRequestFailed;
 
-    print("\n", .{});
+    try stream_writer.writePublic("\n");
     if (opts.print_finish_reason or opts.print_token_count) {
         const finish_reason = if (stream_writer.finish_reason) |reason| @tagName(reason) else "unknown";
         const completion_tokens = if (stream_writer.usage) |usage|
@@ -7498,13 +7697,23 @@ fn compiledTargetName(target: CompiledTarget) []const u8 {
     };
 }
 
+fn validateContextExecutionMode(opts: Options) !void {
+    // Rolling and attention-matching contexts are owned by the eager paged or
+    // packed KV pipeline. A compiled request cannot silently bypass that owner.
+    if (opts.context_policy.mode != .exact and
+        (opts.mode == .compiled or opts.compiled_target != null))
+        return error.UnsupportedContextCombination;
+}
+
 fn serverGenerateModeName(opts: Options) ?[]const u8 {
     if (opts.mode) |mode| return @tagName(mode);
+    if (opts.context_policy.mode != .exact) return @tagName(ExecutionMode.eager);
     if (opts.backend == .metal) return @tagName(ExecutionMode.compiled);
     return null;
 }
 
 fn serverGenerateCompiledTargetName(opts: Options) ?[]const u8 {
+    if (opts.context_policy.mode != .exact) return null;
     if (opts.compiled_target) |target| return compiledTargetName(target);
     if (opts.backend == .metal and (opts.mode == null or opts.mode.? != .eager)) return compiledTargetName(.whole_model);
     return null;
@@ -7633,6 +7842,17 @@ fn parseArgs(args: []const []const u8) !Options {
             if (i >= args.len) return error.MissingVideoPath;
             if (opts.video_path != null) return error.VideoLimitExceeded;
             opts.video_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--context-document-file") or
+            std.mem.eql(u8, arg, "--context-question-file") or
+            std.mem.eql(u8, arg, "--context-document-sha256") or
+            std.mem.eql(u8, arg, "--context-question-sha256"))
+        {
+            i += 1;
+            if (i >= args.len) return error.InvalidStructuredCliInput;
+            if (std.mem.eql(u8, arg, "--context-document-file")) opts.context_document_file = args[i];
+            if (std.mem.eql(u8, arg, "--context-question-file")) opts.context_question_file = args[i];
+            if (std.mem.eql(u8, arg, "--context-document-sha256")) opts.context_document_sha256 = args[i];
+            if (std.mem.eql(u8, arg, "--context-question-sha256")) opts.context_question_sha256 = args[i];
         } else if (std.mem.eql(u8, arg, "--image")) {
             i += 1;
             if (i >= args.len) return error.MissingImagePath;
@@ -7745,6 +7965,26 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingCacheDtype;
             opts.cache_dtype = args[i];
+        } else if (std.mem.eql(u8, arg, "--context-mode")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidContextPolicy;
+            opts.context_policy.mode = std.meta.stringToEnum(runtime.context_policy.Mode, args[i]) orelse return error.InvalidContextPolicy;
+            opts.context_policy_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--compact-part")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidCompactionTarget;
+            try opts.context_policy.compaction_targets.parse(args[i]);
+            opts.context_policy_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--context-window") or
+            std.mem.eql(u8, arg, "--max-kv-tokens") or
+            std.mem.eql(u8, arg, "--keep-prefix-tokens") or
+            std.mem.eql(u8, arg, "--keep-recent-tokens"))
+        {
+            i += 1;
+            if (i >= args.len) return error.InvalidContextPolicy;
+            const value = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidContextPolicy;
+            if (std.mem.eql(u8, arg, "--context-window")) opts.context_policy.max_context_tokens = value else if (std.mem.eql(u8, arg, "--max-kv-tokens")) opts.context_policy.max_kv_tokens = value else if (std.mem.eql(u8, arg, "--keep-prefix-tokens")) opts.context_policy.keep_prefix_tokens = value else opts.context_policy.keep_recent_tokens = value;
+            opts.context_policy_explicit = true;
         } else if (std.mem.eql(u8, arg, "--cache-compaction-ratio")) {
             i += 1;
             if (i >= args.len) return error.MissingCacheCompactionRatio;
@@ -7817,6 +8057,9 @@ fn parseArgs(args: []const []const u8) !Options {
         }
     }
 
+    try opts.context_policy.validate();
+    if (opts.context_policy_explicit and opts.cache_compaction_ratio != null) return error.InvalidContextPolicy;
+    if (opts.cache_compaction_ratio == 1) opts.cache_compaction_ratio = null;
     return opts;
 }
 
@@ -8249,12 +8492,14 @@ test "video CLI accepts one clip and rejects conflicting inputs" {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--video h264.mp4] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--video h264.mp4] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--context-mode exact|rolling|attention_matching] [--context-window N] [--max-kv-tokens N] [--keep-prefix-tokens N] [--keep-recent-tokens N] [--compact-part MESSAGE:PART]... [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
         \\  --video accepts one progressive 8-bit H.264 MP4 clip on local CUDA Gemma4 (up to 60s, sampled at 1 FPS).
         \\  Video currently excludes audio, mixed image inputs, HDR, rotation, and non-square pixels.
+        \\  Sealed attention-matching CLI input requires prompt '-' plus --context-document-file,
+        \\  --context-document-sha256, --context-question-file, and --context-question-sha256.
         \\  --require-server or ANTFLY_INFERENCE_REQUIRE_WARM_SERVER=1 fails unless a server URL is configured.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  speculation-calibration defaults to none; Gemma4 MTP auto mode requires probe or positive to run the drafter.
@@ -8682,6 +8927,8 @@ test "draft KV backend follows the loaded draft session" {
 
 test "generate CLI rejects unsupported cache compaction before model loading" {
     try validateCacheCompactionOption(null);
+    try validateCacheCompactionOption(1);
+    try std.testing.expectEqual(@as(?f32, null), (try parseArgs(&.{ "m", "p", "--cache-compaction-ratio", "1" })).cache_compaction_ratio);
     try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionOption(0.0));
     try std.testing.expectError(error.KvStorageCompactionNotSupported, validateCacheCompactionOption(0.5));
 }
@@ -9153,21 +9400,23 @@ test "server generate forwards only explicit ignore eos" {
         .role = .user,
         .content = .{ .string = "hello" },
     }};
-    const defaults = serverGenerateRequest(.{
+    const defaults = try serverGenerateRequest(std.testing.allocator, .{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
         .backend = .cuda,
     }, &messages);
+    defer freeServerGenerateTargets(std.testing.allocator, defaults);
     const default_body = try serializeServerGenerateRequest(std.testing.allocator, defaults);
     defer std.testing.allocator.free(default_body);
     try std.testing.expect(std.mem.indexOf(u8, default_body, "\"ignore_eos\"") == null);
 
-    const controlled = serverGenerateRequest(.{
+    const controlled = try serverGenerateRequest(std.testing.allocator, .{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
         .backend = .cuda,
         .ignore_eos = true,
     }, &messages);
+    defer freeServerGenerateTargets(std.testing.allocator, controlled);
     const controlled_body = try serializeServerGenerateRequest(std.testing.allocator, controlled);
     defer std.testing.allocator.free(controlled_body);
     try std.testing.expect(std.mem.indexOf(u8, controlled_body, "\"ignore_eos\":true") != null);
@@ -9178,12 +9427,13 @@ test "server generate stream requests terminal usage accounting" {
         .role = .user,
         .content = .{ .string = "hello" },
     }};
-    const request = serverGenerateRequest(.{
+    const request = try serverGenerateRequest(std.testing.allocator, .{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
         .backend = .cuda,
         .stream = true,
     }, &messages);
+    defer freeServerGenerateTargets(std.testing.allocator, request);
     const body = try serializeServerGenerateRequest(std.testing.allocator, request);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream_options\":{\"include_usage\":true}") != null);
@@ -9205,7 +9455,8 @@ test "server generate forwards supported speculation options" {
         .role = .user,
         .content = .{ .string = opts.prompt },
     }};
-    const request = serverGenerateRequest(opts, &messages);
+    const request = try serverGenerateRequest(std.testing.allocator, opts, &messages);
+    defer freeServerGenerateTargets(std.testing.allocator, request);
     const body = try serializeServerGenerateRequest(std.testing.allocator, request);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"draft_model\":\"gemma-e2b-mtp\"") != null);
@@ -9231,6 +9482,57 @@ test "server generate stream retains final speculation status" {
     try std.testing.expectEqual(api.FinishReason.stop, writer.finish_reason.?);
     try std.testing.expectEqual(@as(i64, 2003), writer.usage.?.prompt_tokens);
     try std.testing.expectEqual(@as(i64, 300), writer.usage.?.completion_tokens);
+}
+
+test "server generate stream writes only fragmented public content to injected sink" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var writer = ServerGenerateSseWriter{
+        .allocator = std.testing.allocator,
+        .public_output = &output.writer,
+    };
+    defer writer.deinit();
+    try writer.writeAll(
+        "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pub",
+    );
+    try writer.writeAll(
+        "lic\"}}]}\n\ndata: {\"id\":\"chunk-2\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private\"}}]}\n\n",
+    );
+    try writer.writeAll(
+        "data: {\"id\":\"chunk-3\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+    );
+    try writer.finish();
+    try writer.writePublic("\n");
+    try std.testing.expectEqualStrings("public answer\n", output.writer.buffered());
+}
+
+test "server generate stream errors never enter injected public sink" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var writer = ServerGenerateSseWriter{
+        .allocator = std.testing.allocator,
+        .public_output = &output.writer,
+    };
+    defer writer.deinit();
+    try writer.writeAll("event: error\ndata: server failure\n\n");
+    try writer.finish();
+    try std.testing.expect(writer.stream_error);
+    try std.testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
+}
+
+test "server generate stream propagates injected public sink failures" {
+    var output = std.Io.Writer.fixed(&.{});
+    var writer = ServerGenerateSseWriter{
+        .allocator = std.testing.allocator,
+        .public_output = &output,
+    };
+    defer writer.deinit();
+    try std.testing.expectError(
+        error.WriteFailed,
+        writer.writeAll(
+            "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"public\"}}]}\n\n",
+        ),
+    );
 }
 
 test "server model name strips local models dir prefix" {
@@ -9404,4 +9706,112 @@ test "cuda gemma prefill prewarm defaults on with bidirectional env overrides" {
     try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM"));
     try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM", "1", 1));
     try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+}
+
+test "context CLI policy roundtrips through server requests" {
+    const opts = try parseArgs(&.{ "gemma-e2b", "hello", "--context-window", "8192", "--max-kv-tokens", "4096" });
+    try std.testing.expect(opts.context_policy_explicit);
+    const body = try serverGenerateRequest(std.testing.allocator, opts, &.{});
+    defer freeServerGenerateTargets(std.testing.allocator, body);
+    const policy = try runtime.context_policy.fromApi(body.context_policy);
+    try std.testing.expectEqual(opts.context_policy, policy);
+    try std.testing.expectError(error.InvalidContextPolicy, parseArgs(&.{ "m", "p", "--context-window", "0" }));
+    try std.testing.expectError(error.InvalidContextPolicy, parseArgs(&.{ "m", "p", "--context-mode", "unknown" }));
+    try std.testing.expectError(error.InvalidContextPolicy, parseArgs(&.{ "m", "p", "--context-window", "4096", "--cache-compaction-ratio", "0.5" }));
+}
+
+test "context CLI remote attention matching stays eager and preserves template controls" {
+    const a = std.testing.allocator;
+    const opts = try parseArgs(&.{
+        "gemma-e2b",      "hello",              "--backend",        "metal", "--disable-thinking",
+        "--context-mode", "attention_matching", "--context-window", "8192",  "--max-kv-tokens",
+        "4096",           "--compact-part",     "0:0",
+    });
+    for ([_]BackendChoice{ .auto, .metal }) |backend| {
+        var selected = opts;
+        selected.backend = backend;
+        const features = contextRequestFeatures(selected);
+        try runtime.context_policy.validateRequestFeatures(selected.context_policy, features);
+        try std.testing.expectError(
+            error.ContextPolicyNotQualified,
+            runtime.context_policy.validateExecution(selected.context_policy, features, .{}),
+        );
+    }
+    var native = opts;
+    native.backend = .native;
+    try std.testing.expectError(error.UnsupportedContextCombination, runtime.context_policy.validateRequestFeatures(
+        native.context_policy,
+        contextRequestFeatures(native),
+    ));
+    const body = try serverGenerateRequest(a, opts, &.{});
+    defer freeServerGenerateTargets(a, body);
+    try std.testing.expectEqualStrings("eager", body.mode.?);
+    try std.testing.expect(body.compiled_target == null);
+    try std.testing.expectEqual(false, body.chat_template_kwargs.?.enable_thinking.?);
+
+    var enabled = opts;
+    enabled.enable_thinking = true;
+    const thinking = try serverGenerateRequest(a, enabled, &.{});
+    defer freeServerGenerateTargets(a, thinking);
+    try std.testing.expectEqual(true, thinking.chat_template_kwargs.?.enable_thinking.?);
+    var omitted = opts;
+    omitted.enable_thinking = null;
+    const defaults = try serverGenerateRequest(a, omitted, &.{});
+    defer freeServerGenerateTargets(a, defaults);
+    try std.testing.expect(defaults.chat_template_kwargs == null);
+
+    var explicit_compiled = opts;
+    explicit_compiled.mode = .compiled;
+    try std.testing.expectError(
+        error.UnsupportedContextCombination,
+        serverGenerateRequest(a, explicit_compiled, &.{}),
+    );
+    var explicit_target = opts;
+    explicit_target.context_policy.mode = .rolling;
+    explicit_target.compiled_target = .whole_model;
+    try std.testing.expectError(
+        error.UnsupportedContextCombination,
+        serverGenerateRequest(a, explicit_target, &.{}),
+    );
+}
+
+test "context CLI selected payloads roundtrip without retaining stack storage" {
+    const a = std.testing.allocator;
+    const opts = try parseArgs(&.{ "gemma-e2b", "hello", "--context-mode", "attention_matching", "--max-kv-tokens", "4096", "--compact-part", "1:0", "--compact-part", "3:2" });
+    const body = try serverGenerateRequest(a, opts, &.{});
+    defer freeServerGenerateTargets(a, body);
+    const policy = try runtime.context_policy.fromApi(body.context_policy);
+    try std.testing.expectEqual(opts.context_policy, policy);
+    const json = try serializeServerGenerateRequest(a, body);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compaction_targets\":[{\"message_index\":1,\"part_index\":0}") != null);
+    try std.testing.expectError(error.InvalidCompactionTarget, parseArgs(&.{ "m", "p", "--compact-part", "0:0" }));
+}
+
+test "context structured CLI requires complete sealed two-part input" {
+    var opts = Options{ .model_dir = "model", .prompt = "-" };
+    opts.context_document_file = "document.txt";
+    try std.testing.expectError(
+        error.InvalidStructuredCliInput,
+        loadStructuredCliInput(std.testing.allocator, std.testing.io, opts),
+    );
+    try std.testing.expectError(
+        error.InvalidStructuredCliInputDigest,
+        parseDigest32("not-a-sha256"),
+    );
+}
+
+test "context structured CLI rejects video before opening sealed text inputs" {
+    const digest = "0000000000000000000000000000000000000000000000000000000000000000";
+    const opts = try parseArgs(&.{
+        "model",                   "-",                  "--video",                   "clip.mp4",
+        "--context-mode",          "attention_matching", "--context-window",          "8192",
+        "--max-kv-tokens",         "4096",               "--compact-part",            "0:0",
+        "--context-document-file", "missing-document",   "--context-document-sha256", digest,
+        "--context-question-file", "missing-question",   "--context-question-sha256", digest,
+    });
+    try std.testing.expectError(
+        error.InvalidStructuredCliInput,
+        loadStructuredCliInput(std.testing.allocator, std.testing.io, opts),
+    );
 }

@@ -1,0 +1,67 @@
+{
+  "schema": "antfly.design.attention-mass-highs-v180-adapter-handoff.v3",
+  "completed": true,
+  "diagnostic_only": true,
+  "execution_authorized": false,
+  "publication_authority": false,
+  "adapter": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_highs_v180_adapter_v3.zig",
+    "sha256": "493637b21fec53d07813fddac5cc874d232ae6680befe504bf639e9e3e6c5525"
+  },
+  "design": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention-mass-highs-v180-adapter-v3.md",
+    "sha256": "22f7dd2efa029f1a2743182d1616ac24557bcfec4a9e0c0cd7ae8324d55e1dd5"
+  },
+  "fixture_exporter": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/export_attention_mass_highs_restricted_fixture_v1.py",
+    "sha256": "1c277ae899839278ee60d001a56e78d751074755c4eaf7856ff6f6194baa916a"
+  },
+  "fixture_test": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/test_export_attention_mass_highs_restricted_fixture_v1.py",
+    "sha256": "15185e275923fa7028a9e2e15cf4708e284200ce0ccb17c51f2002cb75d7fe74"
+  },
+  "dependencies": {
+    "controller": {
+      "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation_v5.zig",
+      "sha256": "abdcc63e7d914b174f3fb8db2302db16af126386b610fcf6e80bf1dbb2ec82fa"
+    },
+    "lp": {
+      "path": "/private/tmp/attention_mass_lp_v4.zig",
+      "sha256": "ff1d98cab21450271694ab524dd0733294ae0ff15793c57ed105f4d18d9354de"
+    },
+    "controller_compiled_audit": {
+      "path": "/private/tmp/attention-matching-native-mass-cg-v5-compiled-tests-terminal-audit-root-v1.json",
+      "sha256": "faddb16f6f90a0b5ca6ece1ace2e1bd71ca35efa2b7638586020f392d2daad8b"
+    },
+    "highs_readiness": {
+      "path": "/private/tmp/attention-matching-native-highs-v180-c-abi-integration-readiness-v2.json",
+      "sha256": "a4b23dbf7e04525dd7f4a3ea07ee06d92ed4fbddd162d7c8fb0aac2de0baef91"
+    },
+    "v1_compiled_fixture_resource": {
+      "path": "/private/tmp/attention-matching-native-highs-adapter-v1-fixture-tests-resource-v1.json",
+      "scope": "3/4 passed; callback fixture cancelled before Highs_create"
+    }
+  },
+  "changes_from_v1": [
+    "map every adapter-owned absolute deadline crossing to CG V5 error.Timeout",
+    "check control and absolute deadline after solution/info extraction and before output ownership transfer",
+    "exercise pre-assembly, callback, and post-solution crossings through the actual CG V5 controller"
+  ],
+  "changes_from_v2": [
+    "inject callback cancellation during fake Highs_run instead of before Highs_create",
+    "assert the callback ran exactly once, set user_interrupt, and destroyed the HiGHS instance"
+  ],
+  "validation": {
+    "zig_fmt_check": "passed",
+    "fixture_exporter_tests": "2/2 passed",
+    "adapter_v3_compile_or_tests": "not run",
+    "highs_link_or_solver_run": "not run"
+  },
+  "fixture_scope": {
+    "restricted_matrix_shape": [1128, 288],
+    "original_1e_9_vectors": "exact frozen bytes",
+    "retry_1e_10": "metrics only; retry vectors were not preserved",
+    "numpy_or_scipy_imported": false,
+    "optimizer_run": false
+  }
+}

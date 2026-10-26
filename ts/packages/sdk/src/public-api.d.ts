@@ -23289,6 +23289,43 @@ export interface components {
              */
             enable_thinking?: boolean;
         };
+        InferenceGenerateCompactionTarget: {
+            message_index: number;
+            /** @description Zero-based text part; string message content is part zero. */
+            part_index: number;
+        };
+        /**
+         * @description Separate positional context limits from retained KV storage. Exact is the default.
+         *     Approximate modes require a qualified Metal f16 implementation and reject unsupported
+         *     combinations; setting a policy never extends the artifact's positional limit.
+         */
+        InferenceGenerateContextPolicy: {
+            /**
+             * @description Explicit user/tool text payloads eligible for attention matching. Other roles,
+             *     metadata, special tokens and boundary-crossing tokens remain exact. Unsupported
+             *     renderer/tokenizer provenance is rejected. Approximate serving is not yet qualified.
+             */
+            compaction_targets?: components["schemas"]["InferenceGenerateCompactionTarget"][];
+            /**
+             * @default exact
+             * @enum {string}
+             */
+            mode?: "exact" | "rolling" | "attention_matching";
+            /** @description Optional cap on prompt plus output positions, bounded by the model limit. */
+            max_context_tokens?: number;
+            /** @description Retained rows per global KV head. Required for approximate modes. */
+            max_kv_tokens?: number;
+            /**
+             * @description Exact prefix protection in approximate modes; does not identify message boundaries.
+             * @default 256
+             */
+            keep_prefix_tokens?: number;
+            /**
+             * @description Minimum recent exact tail in approximate modes.
+             * @default 2048
+             */
+            keep_recent_tokens?: number;
+        };
         InferenceGenerateRequest: {
             /**
              * @description Name of the generator model from models_dir/generators/
@@ -23411,13 +23448,14 @@ export interface components {
              * @enum {string}
              */
             cache_dtype?: "f16" | "f32" | "int8" | "fp8" | "int4";
+            context_policy?: components["schemas"]["InferenceGenerateContextPolicy"];
             /**
              * Format: float
              * @description inference-native KV cache compaction ratio applied after prefill via Attention Matching.
              *     Selects a subset of keys and fits new values via OLS to preserve attention behavior.
              *     0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
              *     The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
-             *     device-backed compaction is not yet supported.
+             *     device-backed compaction is not yet supported. Cannot be combined with context_policy.
              */
             cache_compaction_ratio?: number;
             context_management?: components["schemas"]["InferenceContextManagement"];

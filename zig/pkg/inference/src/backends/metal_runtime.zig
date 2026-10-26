@@ -4197,6 +4197,23 @@ pub fn sampleLogitsDevice(self: anytype, request: anytype) !?usize {
     return token_id;
 }
 
+pub const QualificationArgmaxPolicy = struct {
+    require_finite: bool = false,
+    softcap: f32 = 0,
+};
+
+/// Scope strict qualification to an exclusive decoder call and restore the
+/// returned policy on all exits. Apply the study's final softcap before checking
+/// finiteness and lowest-index ties. UINT_MAX means a post-softcap logit was
+/// non-finite; the qualification caller must reject that result.
+pub fn setQualificationArgmaxPolicy(runtime: ?*RawMetalDecodeRuntime, policy: QualificationArgmaxPolicy) !QualificationArgmaxPolicy {
+    const raw = runtime orelse return error.StrictArgmaxUnsupported;
+    var previous_softcap_bits: u32 = 0;
+    const previous = termite_metal_decode_runtime_set_qualification_argmax_policy(raw, @intFromBool(policy.require_finite), @bitCast(policy.softcap), &previous_softcap_bits);
+    if (previous < 0) return error.StrictArgmaxUnsupported;
+    return .{ .require_finite = previous != 0, .softcap = @bitCast(previous_softcap_bits) };
+}
+
 pub fn argmaxLogitsDevice(self: anytype, input: MetalTensor, out_dim: usize) !?usize {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -14659,6 +14676,123 @@ pub extern fn termite_metal_generated_pipeline_create(
     error_buffer: [*c]u8,
     error_capacity: usize,
 ) ?*RawMetalGeneratedPipeline;
+pub extern fn termite_metal_generated_alias(
+    runtime: ?*RawMetalDecodeRuntime,
+    data: [*]u8,
+    bytes: usize,
+) ?*anyopaque;
+pub extern fn termite_metal_generated_dispatch(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    threads: usize,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    threads: usize,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_pair(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    first_handles: [*]const ?*anyopaque,
+    first_offsets: [*]const usize,
+    first_lengths: [*]const usize,
+    first_count: usize,
+    first_params: *const anyopaque,
+    first_params_bytes: usize,
+    first_threads: usize,
+    second_handles: [*]const ?*anyopaque,
+    second_offsets: [*]const usize,
+    second_lengths: [*]const usize,
+    second_count: usize,
+    second_params: *const anyopaque,
+    second_params_bytes: usize,
+    second_threads: usize,
+    wait_nanos_out: *u64,
+    gpu_nanos_out: *u64,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_threadgroups_owned(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    grid_x: usize,
+    grid_y: usize,
+    grid_z: usize,
+    group_x: usize,
+    group_y: usize,
+    group_z: usize,
+    wait_nanos_out: *u64,
+    gpu_nanos_out: *u64,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_threadgroups_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    grid_x: usize,
+    grid_y: usize,
+    grid_z: usize,
+    group_x: usize,
+    group_y: usize,
+    group_z: usize,
+) c_int;
+pub extern fn termite_metal_context_split_dispatch_pair_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    stage_handles: [*]const ?*anyopaque,
+    stage_offsets: [*]const usize,
+    stage_lengths: [*]const usize,
+    stage_count: usize,
+    stage_params: *const anyopaque,
+    stage_params_bytes: usize,
+    stage_threads: usize,
+    reduce_handles: [*]const ?*anyopaque,
+    reduce_offsets: [*]const usize,
+    reduce_lengths: [*]const usize,
+    reduce_count: usize,
+    reduce_params: *const anyopaque,
+    reduce_params_bytes: usize,
+    reduce_threads: usize,
+) c_int;
+pub extern fn termite_metal_replay_split_dispatch_pair_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    stage_handles: [*]const ?*anyopaque,
+    stage_offsets: [*]const usize,
+    stage_lengths: [*]const usize,
+    stage_count: usize,
+    stage_params: *const anyopaque,
+    stage_params_bytes: usize,
+    stage_threads: usize,
+    reduce_handles: [*]const ?*anyopaque,
+    reduce_offsets: [*]const usize,
+    reduce_lengths: [*]const usize,
+    reduce_count: usize,
+    reduce_params: *const anyopaque,
+    reduce_params_bytes: usize,
+    reduce_threads: usize,
+) c_int;
 pub extern fn termite_metal_generated_pipeline_info_get(
     generated: ?*const RawMetalGeneratedPipeline,
     info: *MetalGeneratedPipelineInfo,
@@ -19187,6 +19321,12 @@ pub extern fn termite_metal_decode_runtime_begin_prepared_frame(runtime: ?*RawMe
 pub extern fn termite_metal_decode_runtime_submit_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_cancel_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_wait_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub const ContextFrameCompletion = *const fn (?*anyopaque, c_int) callconv(.c) c_int;
+pub extern fn termite_metal_decode_runtime_set_context_frame_completion(
+    runtime: ?*RawMetalDecodeRuntime,
+    ctx: ?*anyopaque,
+    completion: ContextFrameCompletion,
+) c_int;
 pub extern fn termite_metal_decode_runtime_flush_active_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_active_frame_has_work(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_has_active_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -19308,6 +19448,7 @@ pub extern fn termite_metal_decode_runtime_device(runtime: ?*RawMetalDecodeRunti
 pub extern fn termite_metal_buffer_retain_external(runtime: ?*RawMetalDecodeRuntime, handle: *anyopaque, length: usize) ?*anyopaque;
 pub extern fn termite_metal_buffer_alloc(runtime: ?*RawMetalDecodeRuntime, length: usize, storage_mode: c_int) ?*anyopaque;
 pub extern fn termite_metal_buffer_release(handle: ?*anyopaque) void;
+pub extern fn termite_metal_buffer_allocated_bytes(handle: ?*anyopaque) u64;
 extern fn termite_metal_decode_runtime_release_buffer(runtime: ?*RawMetalDecodeRuntime, handle: ?*anyopaque) void;
 pub extern fn termite_metal_buffer_contents(handle: ?*anyopaque) ?*anyopaque;
 pub extern fn termite_metal_buffer_upload(
@@ -21185,6 +21326,12 @@ pub extern fn termite_metal_decode_runtime_borrow_active_layer_projection_scratc
     bytes: usize,
     output_handle: *?*anyopaque,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_borrow_active_direct_hidden_scratch_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    index: usize,
+    bytes: usize,
+    output_handle: *?*anyopaque,
+) c_int;
 pub extern fn termite_metal_decode_runtime_borrow_nomic_encoder_hidden_scratch_device(
     runtime: ?*RawMetalDecodeRuntime,
     index: usize,
@@ -21908,6 +22055,13 @@ pub extern fn termite_metal_decode_runtime_apply_attention_output_residual_devic
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_set_qualification_argmax_policy(
+    runtime: ?*RawMetalDecodeRuntime,
+    required: c_int,
+    softcap_bits: u32,
+    previous_softcap_bits: *u32,
+) c_int;
+
 pub extern fn termite_metal_decode_runtime_read_token_id(
     runtime: ?*RawMetalDecodeRuntime,
     output_token_id: [*c]u32,
@@ -23397,6 +23551,51 @@ pub extern fn termite_metal_decode_runtime_discard_paged_kv_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
 ) c_int;
+pub const PagedKvAllocationSnapshot = extern struct {
+    live_bytes: u64,
+    peak_bytes: u64,
+    readback_bytes: u64,
+    allocation_count: u64,
+    growth_count: u64,
+    leased_slot_count: u64,
+};
+pub const PagedKvSlotAllocationInfo = extern struct {
+    key_allocated_bytes: u64,
+    value_allocated_bytes: u64,
+    installed_live_bytes: u64,
+    active_frame_retained_bytes: u64,
+    submitted_frame_retained_bytes: u64,
+    lease_readback_bytes: u64,
+    key_requested_bytes: u64,
+    value_requested_bytes: u64,
+    leased: u8,
+    reserved: [7]u8,
+};
+pub const PagedKvSlotTransitionInfo = extern struct {
+    operation_nonce: u64,
+    newly_allocated_bytes: u64,
+    overflow: u8,
+    reserved: [7]u8,
+};
+pub extern fn termite_metal_decode_runtime_paged_kv_allocation_snapshot(
+    runtime: ?*const RawMetalDecodeRuntime,
+    snapshot: *PagedKvAllocationSnapshot,
+) c_int;
+pub extern fn termite_metal_decode_runtime_attention_span_slot_allocation_info(
+    runtime: ?*const RawMetalDecodeRuntime,
+    slot: usize,
+    info: *PagedKvSlotAllocationInfo,
+) c_int;
+pub extern fn termite_metal_decode_runtime_attention_span_slot_transition_info(
+    runtime: ?*const RawMetalDecodeRuntime,
+    slot: usize,
+    info: *PagedKvSlotTransitionInfo,
+) c_int;
+pub extern fn termite_metal_decode_runtime_attention_span_slot_note_readback(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    bytes: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -23412,6 +23611,16 @@ pub extern fn termite_metal_decode_runtime_compact_attention_span_slot(
     format: u32,
     source_token_offsets: [*c]const u32,
     selected_count: usize,
+    key_row_bytes: usize,
+    v_row_stride: usize,
+    position_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_clone_attention_span_slot_prefix(
+    runtime: ?*RawMetalDecodeRuntime,
+    source_slot: usize,
+    destination_slot: usize,
+    format: u32,
+    token_count: usize,
     key_row_bytes: usize,
     v_row_stride: usize,
     position_offset: usize,
@@ -23904,6 +24113,7 @@ pub extern fn termite_metal_decode_runtime_apply_attention_f32_gated_block_quant
     paged_base_key_row_bytes: usize,
     paged_v_row_stride: usize,
     suffix_tokens: usize,
+    precomputed_attention_handle: ?*anyopaque,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_attention_gated_block_q_slot_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -27660,6 +27870,27 @@ pub fn decoderRuntimeBorrowActiveLayerProjectionScratch(
     return MetalTensor.deviceBorrowed(@ptrCast(runtime), handle orelse return null, 0, bytes, &shape);
 }
 
+/// Borrow one pre-reserved direct-block hidden buffer. This API never grows
+/// storage: callers must reserve the full layer plan before beginning the
+/// frame, then keep the value alive only until its last encoded consumer.
+pub fn decoderRuntimeBorrowActiveDirectHiddenScratch(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    index: usize,
+    rows: usize,
+    cols: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !hasActiveFrame(runtime) or hasSubmittedFrame(runtime)) return null;
+    if (index >= 4 or rows == 0 or cols == 0 or rows > std.math.maxInt(i32) or cols > std.math.maxInt(i32)) return null;
+    const elements = std.math.mul(usize, rows, cols) catch return null;
+    const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return null;
+    var handle: ?*anyopaque = null;
+    if (termite_metal_decode_runtime_borrow_active_direct_hidden_scratch_device(runtime, index, bytes, &handle) != 0) return null;
+    const shape = [_]i32{ @intCast(rows), @intCast(cols) };
+    return try MetalTensor.deviceBorrowedWithAllocator(allocator, @ptrCast(runtime), handle orelse return null, 0, bytes, &shape);
+}
+
 /// Two Nomic hidden-state buffers are ping-ponged across encoder layers. They
 /// stay private and runtime-owned, so a completed layer can hand its result to
 /// the next layer without creating a per-layer MTLBuffer.
@@ -30440,6 +30671,415 @@ pub fn supportsDirectPagedGatedDecoderBlockSlots(self: anytype, request: anytype
     return true;
 }
 
+/// Admission for the precomputed packed-attention tail uses the same prepared
+/// quantized slots as ordinary direct decode, without touching KV storage or
+/// preparing/uploading a runtime slot. This check runs before the packed hook
+/// mutates its transaction, so it must remain side-effect free.
+fn precomputedGatedBlockFormatForSlot(
+    self: anytype,
+    slot: usize,
+    in_dim: usize,
+    out_dim: usize,
+) ?MetalQuantFormat {
+    if (slot >= decoder_runtime_linear_slot_capacity or
+        !self.raw_linear_slots_prepared[slot] or
+        self.raw_linear_slot_kinds[slot] != .quantized or
+        self.raw_linear_slot_in_dims[slot] != in_dim or
+        self.raw_linear_slot_out_dims[slot] != out_dim) return null;
+    const storage = self.raw_linear_slot_quantized_storage[slot] orelse return null;
+    const raw_kind = quantizedRuntimeLinearKind(storage);
+    const prepared_kind = self.raw_linear_slot_runtime_prepared_kind[slot];
+    if (prepared_kind == .none or prepared_kind != raw_kind) return null;
+    return directQuantizedBlockFormatForKind(prepared_kind);
+}
+
+fn precomputedGatedBlockFormats(self: anytype, request: anytype, layer_index: usize, ple: ?MetalTensor) ?DirectQuantizedBlockFormats {
+    _ = layer_index;
+    const attention_width = std.math.mul(usize, request.num_heads, request.head_dim) catch return null;
+    const attention = precomputedGatedBlockFormatForSlot(self, request.attention_linear_slot, attention_width, request.hidden_size) orelse return null;
+    const gate = precomputedGatedBlockFormatForSlot(self, request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size) orelse return null;
+    const up = precomputedGatedBlockFormatForSlot(self, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size) orelse return null;
+    if (gate != up) return null;
+    const down = precomputedGatedBlockFormatForSlot(self, request.down_ffn_linear_slot, request.intermediate_size, request.hidden_size) orelse return null;
+    var formats: DirectQuantizedBlockFormats = .{
+        .attention = attention,
+        .ffn_gate_up = gate,
+        .ffn_down = down,
+    };
+    if (ple) |_| {
+        const ple_gate_slot = request.ple_gate_linear_slot orelse return null;
+        const ple_proj_slot = request.ple_proj_linear_slot orelse return null;
+        const ple_post_norm_slot = request.ple_post_norm_slot orelse return null;
+        if (request.ple_hidden_size == 0) return null;
+        const ple_gate = precomputedGatedBlockFormatForSlot(self, ple_gate_slot, request.hidden_size, request.ple_hidden_size) orelse return null;
+        const ple_proj = precomputedGatedBlockFormatForSlot(self, ple_proj_slot, request.ple_hidden_size, request.hidden_size) orelse return null;
+        if (ple_gate != ple_proj or
+            !decoderRuntimeRmsNormSlotPrepared(self, ple_post_norm_slot, request.hidden_size)) return null;
+        formats.ple = ple_gate;
+    }
+    return formats;
+}
+
+pub const PrecomputedGatedBlockAdmission = struct {
+    runtime: *RawMetalDecodeRuntime,
+    frame_nonce: u64,
+    layer_index: usize,
+    formats: DirectQuantizedBlockFormats,
+    binding: Binding,
+
+    const Binding = struct {
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        attention_linear_slot: usize,
+        attention_pre_linear_rms_norm_slot: ?usize,
+        attention_post_linear_rms_norm_slot: ?usize,
+        ffn_layer_norm_slot: ?usize,
+        ffn_rms_norm_slot: ?usize,
+        ffn_post_gate_rms_norm_slot: ?usize,
+        ffn_post_down_rms_norm_slot: ?usize,
+        gate_ffn_linear_slot: usize,
+        up_ffn_linear_slot: usize,
+        down_ffn_linear_slot: usize,
+        activation: u8,
+        ple_gate_linear_slot: ?usize,
+        ple_proj_linear_slot: ?usize,
+        ple_post_norm_slot: ?usize,
+        ple_hidden_size: usize,
+        eps_bits: u32,
+        output_scale_bits: ?u32,
+        residual_handle: ?*anyopaque,
+        residual_offset: usize,
+        output_handle: ?*anyopaque,
+        output_offset: usize,
+        ple_handle: ?*anyopaque,
+        ple_offset: usize,
+
+        fn init(request: anytype, residual: MetalTensor, ple: ?MetalTensor, output: MetalTensor) Binding {
+            return .{
+                .num_heads = request.num_heads,
+                .num_kv_heads = request.num_kv_heads,
+                .head_dim = request.head_dim,
+                .hidden_size = request.hidden_size,
+                .intermediate_size = request.intermediate_size,
+                .attention_linear_slot = request.attention_linear_slot,
+                .attention_pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+                .attention_post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+                .ffn_layer_norm_slot = request.ffn_layer_norm_slot,
+                .ffn_rms_norm_slot = request.ffn_rms_norm_slot,
+                .ffn_post_gate_rms_norm_slot = request.ffn_post_gate_rms_norm_slot,
+                .ffn_post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
+                .gate_ffn_linear_slot = request.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = request.up_ffn_linear_slot,
+                .down_ffn_linear_slot = request.down_ffn_linear_slot,
+                .activation = @backingInt(request.activation),
+                .ple_gate_linear_slot = request.ple_gate_linear_slot,
+                .ple_proj_linear_slot = request.ple_proj_linear_slot,
+                .ple_post_norm_slot = request.ple_post_norm_slot,
+                .ple_hidden_size = request.ple_hidden_size,
+                .eps_bits = @bitCast(request.eps),
+                .output_scale_bits = if (request.output_scale_value) |value| @bitCast(value) else null,
+                .residual_handle = residual.deviceHandle(),
+                .residual_offset = residual.deviceByteOffset(),
+                .output_handle = output.deviceHandle(),
+                .output_offset = output.deviceByteOffset(),
+                .ple_handle = if (ple) |value| value.deviceHandle() else null,
+                .ple_offset = if (ple) |value| value.deviceByteOffset() else 0,
+            };
+        }
+
+        fn matches(self: Binding, request: anytype, residual: MetalTensor, ple: ?MetalTensor, output: MetalTensor) bool {
+            return std.meta.eql(self, Binding.init(request, residual, ple, output));
+        }
+    };
+};
+
+pub extern fn termite_metal_decode_runtime_active_frame_nonce(runtime: ?*RawMetalDecodeRuntime) u64;
+
+fn rejectedPrecomputedAdmission(layer_index: usize, comptime reason: []const u8) ?PrecomputedGatedBlockAdmission {
+    _ = precomputedTailSkip(layer_index, reason);
+    return null;
+}
+
+pub extern fn termite_metal_decode_runtime_preflight_precomputed_gated_tail(
+    runtime: ?*RawMetalDecodeRuntime,
+    num_heads: usize,
+    head_dim: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    residual_handle: ?*anyopaque,
+    residual_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    ple_handle: ?*anyopaque,
+    ple_offset: usize,
+    ple_hidden_size: usize,
+) c_int;
+
+fn precomputedShape(value: MetalTensor, width: usize) bool {
+    const dimension = std.math.cast(i32, width) orelse return false;
+    const bytes = std.math.mul(usize, width, @sizeOf(f32)) catch return false;
+    return value.isDevice() and value.dtype == .f32 and value.deviceByteLen() >= bytes and
+        value.ndim() == 2 and value.dim(0) == 1 and value.dim(1) == dimension;
+}
+
+fn precomputedTailSkip(layer_index: usize, comptime reason: []const u8) bool {
+    if (traceQuantBlockRequested()) std.debug.print("metal-context-precomputed-tail-skip layer={d} reason={s}\n", .{ layer_index, reason });
+    return false;
+}
+
+pub fn admitPrecomputedGatedBlockDevice(
+    self: anytype,
+    request: anytype,
+    layer_index: usize,
+    residual: MetalTensor,
+    ple: ?MetalTensor,
+    output: ?MetalTensor,
+) ?PrecomputedGatedBlockAdmission {
+    const runtime = self.raw_decode_runtime orelse return null;
+    const destination = output orelse return rejectedPrecomputedAdmission(layer_index, "output-unavailable");
+    if (!hasActiveFrame(runtime) or hasSubmittedFrame(runtime)) return null;
+    if (request.hidden_size == 0 or request.intermediate_size == 0) return null;
+    if (request.num_heads == 0 or request.num_kv_heads == 0 or request.head_dim == 0 or
+        request.num_heads % request.num_kv_heads != 0 or request.num_heads > std.math.maxInt(u32) or
+        request.num_kv_heads > std.math.maxInt(u32) or request.head_dim > std.math.maxInt(u32)) return null;
+    const width = std.math.mul(usize, request.num_heads, request.head_dim) catch return null;
+    if (!precomputedShape(residual, request.hidden_size) or !precomputedShape(destination, request.hidden_size)) return rejectedPrecomputedAdmission(layer_index, "hidden-shape");
+    const has_ple_slots = request.ple_gate_linear_slot != null or
+        request.ple_proj_linear_slot != null or request.ple_post_norm_slot != null or
+        request.ple_hidden_size != 0;
+    if ((ple != null) != has_ple_slots) return rejectedPrecomputedAdmission(layer_index, "ple-presence");
+    if (ple != null and (request.ple_gate_linear_slot == null or
+        request.ple_proj_linear_slot == null or request.ple_post_norm_slot == null or
+        request.ple_hidden_size == 0)) return null;
+    if (ple) |value| if (!precomputedShape(value, request.ple_hidden_size)) return rejectedPrecomputedAdmission(layer_index, "ple-shape");
+    if (request.attention_pre_linear_rms_norm_slot) |slot|
+        if (!decoderRuntimeRmsNormSlotPrepared(self, slot, width)) return rejectedPrecomputedAdmission(layer_index, "attention-pre-norm");
+    if (request.attention_post_linear_rms_norm_slot) |slot|
+        if (!decoderRuntimeRmsNormSlotPrepared(self, slot, request.hidden_size)) return rejectedPrecomputedAdmission(layer_index, "attention-post-norm");
+    if (request.ffn_layer_norm_slot != null and request.ffn_rms_norm_slot != null) return null;
+    if (request.ffn_layer_norm_slot) |slot|
+        if (!decoderRuntimeLayerNormSlotPrepared(self, slot, request.hidden_size)) return null;
+    if (request.ffn_rms_norm_slot) |slot|
+        if (!decoderRuntimeRmsNormSlotPrepared(self, slot, request.hidden_size)) return rejectedPrecomputedAdmission(layer_index, "ffn-pre-norm");
+    if (request.ffn_post_gate_rms_norm_slot) |slot|
+        if (!decoderRuntimeRmsNormSlotPrepared(self, slot, request.intermediate_size)) return null;
+    if (request.ffn_post_down_rms_norm_slot) |slot|
+        if (!decoderRuntimeRmsNormSlotPrepared(self, slot, request.hidden_size)) return rejectedPrecomputedAdmission(layer_index, "ffn-post-norm");
+    if (request.output_scale_value) |value| if (!std.math.isFinite(value)) return null;
+    if (!std.math.isFinite(request.eps) or request.eps <= 0) return null;
+    const formats = precomputedGatedBlockFormats(self, request, layer_index, ple) orelse return rejectedPrecomputedAdmission(layer_index, "prepared-formats");
+    const rc = termite_metal_decode_runtime_preflight_precomputed_gated_tail(
+        runtime,
+        request.num_heads,
+        request.head_dim,
+        request.hidden_size,
+        request.intermediate_size,
+        residual.deviceHandle(),
+        residual.deviceByteOffset(),
+        destination.deviceHandle(),
+        destination.deviceByteOffset(),
+        if (ple) |value| value.deviceHandle() else null,
+        if (ple) |value| value.deviceByteOffset() else 0,
+        if (ple != null) request.ple_hidden_size else 0,
+    );
+    if (rc != 0) {
+        if (traceQuantBlockRequested()) std.debug.print("metal-context-precomputed-tail-skip layer={d} reason=scratch-preflight rc={d}\n", .{ layer_index, rc });
+        return null;
+    }
+    const frame_nonce = termite_metal_decode_runtime_active_frame_nonce(runtime);
+    if (frame_nonce == 0 or frame_nonce == std.math.maxInt(u64)) return null;
+    return .{
+        .runtime = runtime,
+        .frame_nonce = frame_nonce,
+        .layer_index = layer_index,
+        .formats = formats,
+        .binding = .init(request, residual, ple, destination),
+    };
+}
+
+pub fn supportsPrecomputedGatedBlockDevice(
+    self: anytype,
+    request: anytype,
+    layer_index: usize,
+    residual: MetalTensor,
+    ple: ?MetalTensor,
+    output: ?MetalTensor,
+) bool {
+    return admitPrecomputedGatedBlockDevice(self, request, layer_index, residual, ple, output) != null;
+}
+
+/// Called only after packed attention has encoded on the active owner frame.
+/// Errors are terminal for that frame: no fallback can repeat a packed write.
+/// The caller supplies its preallocated output. Runtime scratch
+/// is pre-reserved and C rejects growth, aliasing, or an attention command plan.
+pub fn runAdmittedPrecomputedGatedBlockDevice(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    request: anytype,
+    layer_index: usize,
+    attention_output: MetalTensor,
+    residual: MetalTensor,
+    ple: ?MetalTensor,
+    destination: MetalTensor,
+    stats: anytype,
+    admission: PrecomputedGatedBlockAdmission,
+) !MetalTensor {
+    // This entry is reached only after packed attention has mutated the
+    // pending session transaction. Every error is terminal and must be
+    // visible in the request-local route receipt, including failures before
+    // the C encoder is entered.
+    errdefer stats.context_precomputed_tail_failures += 1;
+    _ = allocator; // Output and all Metal scratch are reserved before the packed hook.
+    const runtime = self.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+    if (runtime != admission.runtime or layer_index != admission.layer_index or
+        !admission.binding.matches(request, residual, ple, destination) or
+        !precomputedShape(residual, request.hidden_size) or
+        !precomputedShape(destination, request.hidden_size) or
+        (if (ple) |value| !precomputedShape(value, request.ple_hidden_size) else false) or
+        termite_metal_decode_runtime_active_frame_nonce(runtime) != admission.frame_nonce or
+        !hasActiveFrame(runtime) or hasSubmittedFrame(runtime))
+        return error.ContextFramedExecutionUnsupported;
+    const formats = admission.formats;
+    const attention_width = try std.math.mul(usize, request.num_heads, request.head_dim);
+    if (!precomputedShape(attention_output, attention_width) or attention_output.deviceByteOffset() != 0)
+        return error.InvalidAttentionShape;
+    var output = try destination.retainedCopy();
+    errdefer output.deinit();
+    const none = std.math.maxInt(usize);
+    var timing: RawAttentionGatedBlockTiming = .{};
+    const started_at = monotonicNowNs();
+    const rc = termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_device_kv_device(
+        runtime,
+        @backingInt(formats.attention),
+        @backingInt(formats.ffn_gate_up),
+        @backingInt(formats.ffn_down),
+        @backingInt(formats.ple),
+        null,
+        0,
+        null,
+        0,
+        null,
+        0,
+        1,
+        1,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        0,
+        0,
+        0,
+        1,
+        request.attention_linear_slot,
+        request.attention_pre_linear_rms_norm_slot orelse none,
+        request.attention_post_linear_rms_norm_slot orelse none,
+        residual.deviceHandle(),
+        residual.deviceByteOffset(),
+        attention_width,
+        request.hidden_size,
+        request.eps,
+        request.ffn_layer_norm_slot orelse none,
+        request.ffn_rms_norm_slot orelse none,
+        request.ffn_post_gate_rms_norm_slot orelse none,
+        request.ffn_post_down_rms_norm_slot orelse none,
+        request.gate_ffn_linear_slot,
+        request.up_ffn_linear_slot,
+        request.down_ffn_linear_slot,
+        request.intermediate_size,
+        @backingInt(request.activation),
+        layer_index,
+        if (ple) |value| value.deviceHandle() else null,
+        if (ple) |value| value.deviceByteOffset() else 0,
+        request.ple_gate_linear_slot orelse none,
+        request.ple_proj_linear_slot orelse none,
+        request.ple_post_norm_slot orelse none,
+        if (ple != null) request.ple_hidden_size else 0,
+        if (request.output_scale_value != null) 1 else 0,
+        request.output_scale_value orelse 1.0,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+        .{},
+        &timing,
+        none,
+        0,
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        attention_output.deviceHandle(),
+    );
+    stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - started_at);
+    stats.compressed_block_attention_prefix_nanos += timing.attention_prefix_nanos;
+    stats.compressed_block_gated_ffn_residual_nanos += timing.gated_ffn_residual_nanos;
+    stats.compressed_block_command_wait_nanos += timing.command_wait_nanos;
+    stats.compressed_block_gpu_nanos += timing.gpu_nanos;
+    stats.active_decode_quant_linear_kernels += timing.quant_linear_kernels;
+    stats.active_decode_quant_attention_linear_kernels += timing.quant_attention_linear_kernels;
+    stats.active_decode_quant_ffn_down_linear_kernels += timing.quant_ffn_down_linear_kernels;
+    stats.active_decode_quant_ple_linear_kernels += timing.quant_ple_linear_kernels;
+    stats.active_decode_quant_gate_up_pair_kernels += timing.quant_gate_up_pair_kernels;
+    stats.active_decode_rms_norm_kernels += timing.rms_norm_kernels;
+    stats.active_decode_rms_norm_add_kernels += timing.rms_norm_add_kernels;
+    stats.active_decode_layer_norm_kernels += timing.layer_norm_kernels;
+    stats.active_decode_add_kernels += timing.add_kernels;
+    stats.active_decode_blit_copies += timing.blit_copies;
+    if (rc != 0 or timing.attention_f32_kernels != 0) {
+        if (traceQuantBlockRequested()) std.debug.print("metal-context-precomputed-tail-failed layer={d} rc={d} stage={d} stage_rc={d}\n", .{ layer_index, rc, timing.failure_stage, timing.failure_code });
+        return error.ContextFramedExecutionUnsupported;
+    }
+    stats.context_precomputed_tail_blocks += 1;
+    stats.quantized_gated_ffn_direct_successes += 1;
+    return output;
+}
+
+pub fn runPrecomputedGatedBlockDevice(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    request: anytype,
+    layer_index: usize,
+    attention_output: MetalTensor,
+    residual: MetalTensor,
+    ple: ?MetalTensor,
+    destination: MetalTensor,
+    stats: anytype,
+) !MetalTensor {
+    // Preserve the legacy wrapper error while charging every rejected
+    // post-hook invocation exactly once. Once admission succeeds, the admitted
+    // runner owns failure accounting for all later validation/C errors.
+    if (self.raw_decode_runtime == null) {
+        stats.context_precomputed_tail_failures += 1;
+        return error.MetalRuntimeUnavailable;
+    }
+    const admission = admitPrecomputedGatedBlockDevice(
+        self,
+        request,
+        layer_index,
+        residual,
+        ple,
+        destination,
+    ) orelse {
+        stats.context_precomputed_tail_failures += 1;
+        return error.ContextFramedExecutionUnsupported;
+    };
+    return runAdmittedPrecomputedGatedBlockDevice(
+        self,
+        allocator,
+        request,
+        layer_index,
+        attention_output,
+        residual,
+        ple,
+        destination,
+        stats,
+        admission,
+    );
+}
+
 fn traceQuantBlockRequested() bool {
     return getenvBool("TERMITE_METAL_TRACE_QUANT_BLOCK") or
         getenvBool("TERMITE_METAL_TRACE_Q80_BLOCK");
@@ -30562,6 +31202,7 @@ fn runAttentionF32GatedDecoderBlockQuantizedDevice(
         0,
         0,
         0,
+        null,
     );
     stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - started_at);
     stats.compressed_block_attention_span_nanos += timing.attention_span_nanos;
@@ -30838,6 +31479,7 @@ fn runAttentionPagedGatedDecoderBlockQuantizedDeviceInto(
         paged_layer.base_key_row_bytes,
         paged_layer.v_row_stride,
         suffix_tokens,
+        null,
     );
     stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - started_at);
     stats.compressed_block_attention_span_nanos += timing.attention_span_nanos;
@@ -31008,6 +31650,7 @@ fn runAttentionF32GatedDecoderBlockQuantizedDeviceInto(
         0,
         0,
         0,
+        null,
     );
     stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - started_at);
     stats.compressed_block_attention_span_nanos += timing.attention_span_nanos;
@@ -45452,6 +46095,121 @@ test "metal native decoder runtime dense linear and rms-linear preserve device t
     try std.testing.expect(token_id < out_dim);
 }
 
+test "context strict device argmax rejects every nonfinite logit and preserves lowest ties" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.UnexpectedNull;
+    const strict = QualificationArgmaxPolicy{ .require_finite = true };
+    try std.testing.expectError(error.StrictArgmaxUnsupported, setQualificationArgmaxPolicy(null, strict));
+    const old = try setQualificationArgmaxPolicy(runtime, strict);
+    defer _ = setQualificationArgmaxPolicy(runtime, old) catch {};
+    try std.testing.expectEqual(QualificationArgmaxPolicy{}, old);
+    try std.testing.expectEqual(strict, try setQualificationArgmaxPolicy(runtime, strict));
+
+    // Include scalar, exact parallel boundary, and a partial block with only
+    // one active lane. Inactive lanes must not look like non-finite inputs.
+    for ([_]usize{ 17, 2048, 4097 }) |out_dim| {
+        const logits = try std.testing.allocator.alloc(f32, out_dim);
+        defer std.testing.allocator.free(logits);
+        @memset(logits, -100.0);
+        logits[1] = 11.0;
+        logits[out_dim - 1] = 11.0;
+        var finite = try testDeviceTensorFromSlice(runtime, logits, &[_]i32{ 1, @intCast(out_dim) });
+        defer finite.deinit();
+        try std.testing.expectEqual(@as(usize, 1), (try argmaxLogitsDevice(&provider, finite, out_dim)) orelse return error.UnexpectedNull);
+        // Strict qualification has no suppression; refuse it rather than
+        // accidentally changing which logits are checked for finiteness.
+        try std.testing.expectEqual(@as(?usize, null), try argmaxLogitsSuppressDevice(&provider, finite, out_dim, &.{1}));
+
+        for ([_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |bad| {
+            for ([_]usize{ 0, out_dim / 2, out_dim - 1 }) |index| {
+                const saved = logits[index];
+                logits[index] = bad;
+                var nonfinite = try testDeviceTensorFromSlice(runtime, logits, &[_]i32{ 1, @intCast(out_dim) });
+                defer nonfinite.deinit();
+                try std.testing.expectEqual(@as(usize, std.math.maxInt(u32)), (try argmaxLogitsDevice(&provider, nonfinite, out_dim)) orelse return error.UnexpectedNull);
+                logits[index] = saved;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(strict, try setQualificationArgmaxPolicy(runtime, .{}));
+    // Normal inference still accepts masked -Inf and suppression afterwards.
+    const ordinary = [_]f32{ -std.math.inf(f32), 3.0, 2.0 };
+    var ordinary_tensor = try testDeviceTensorFromSlice(runtime, &ordinary, &.{ 1, ordinary.len });
+    defer ordinary_tensor.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try argmaxLogitsDevice(&provider, ordinary_tensor, ordinary.len)) orelse return error.UnexpectedNull);
+    try std.testing.expectEqual(@as(usize, 2), (try argmaxLogitsSuppressDevice(&provider, ordinary_tensor, ordinary.len, &.{1})) orelse return error.UnexpectedNull);
+}
+
+test "context strict device argmax matches final softcap saturation and finite semantics" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.UnexpectedNull;
+    const capped = QualificationArgmaxPolicy{ .require_finite = true, .softcap = 30 };
+    const old = try setQualificationArgmaxPolicy(runtime, capped);
+    defer _ = setQualificationArgmaxPolicy(runtime, old) catch {};
+    for ([_]QualificationArgmaxPolicy{
+        .{ .require_finite = true, .softcap = std.math.nan(f32) },
+        .{ .require_finite = true, .softcap = std.math.inf(f32) },
+        .{ .require_finite = true, .softcap = -1 },
+        .{ .require_finite = false, .softcap = 30 },
+    }) |invalid| {
+        try std.testing.expectError(error.StrictArgmaxUnsupported, setQualificationArgmaxPolicy(runtime, invalid));
+        try std.testing.expectEqual(capped, try setQualificationArgmaxPolicy(runtime, capped));
+    }
+
+    for ([_]usize{ 17, 4097 }) |out_dim| {
+        const logits = try std.testing.allocator.alloc(f32, out_dim);
+        defer std.testing.allocator.free(logits);
+        for ([_][2]f32{
+            .{ 1e20, 2e20 }, // Saturation changes the raw winner to a lowest-ID tie.
+            .{ -1e20, -std.math.inf(f32) },
+            .{ std.math.inf(f32), 1e20 }, // +/-Inf become finite after softcap.
+            .{ 300, 330 }, // The f32 tanh saturation boundary at scaled 10.
+            .{ -300, -330 },
+            .{ 1.0, 2.0 },
+            .{ -0.0, 0.0 },
+            .{ std.math.nan(f32), 2.0 },
+            .{ 2.0, std.math.nan(f32) },
+        }) |pair| {
+            @memset(logits, -std.math.inf(f32));
+            logits[0] = pair[0];
+            logits[out_dim - 1] = pair[1];
+            var expected: usize = 0;
+            var best = -std.math.inf(f32);
+            for (logits, 0..) |raw, index| {
+                // Identical order to gpt.applyFinalLogitSoftcap + study.greedy.
+                const value = std.math.tanh(raw / capped.softcap) * capped.softcap;
+                if (!std.math.isFinite(value)) {
+                    expected = std.math.maxInt(u32);
+                    break;
+                }
+                if (value > best) {
+                    best = value;
+                    expected = index;
+                }
+            }
+            var tensor = try testDeviceTensorFromSlice(runtime, logits, &.{ 1, @intCast(out_dim) });
+            defer tensor.deinit();
+            const actual = (try argmaxLogitsDevice(&provider, tensor, out_dim)) orelse return error.UnexpectedNull;
+            std.testing.expectEqual(expected, actual) catch |err| {
+                std.debug.print("context_softcap_argmax_mismatch: dim={d} input_bits={x},{x} expected={d} actual={d}\n", .{ out_dim, @as(u32, @bitCast(pair[0])), @as(u32, @bitCast(pair[1])), expected, actual });
+                return err;
+            };
+        }
+    }
+    try std.testing.expectEqual(capped, try setQualificationArgmaxPolicy(runtime, .{}));
+}
+
 test "metal native decoder runtime argmax suppress stays device resident" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -49723,3 +50481,572 @@ test "embeddinggemma2 Metal multiplication plans retain full tiles tails and des
 pub extern fn antfly_metal_rotary_table(runtime: ?*RawMetalDecodeRuntime, output: ?*anyopaque, offset: usize, dim: u32, x: u32, y: u32, theta: f32, vision: u32) c_int;
 
 pub extern fn antfly_metal_video_position(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, rows: u32, grid_x: u32, grid_y: u32, axis: u32) c_int;
+
+test "context metal runtime: preallocated direct hidden output survives consume then reuse" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.MetalRuntimeUnavailable;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    const provider = .{ .raw_decode_runtime = @as(?*RawMetalDecodeRuntime, runtime) };
+    // Observed E2B global geometry plus the D256 multi-KV GQA lane used by
+    // the production Gemma4 layout family. Installed E4B still binds its
+    // exact loaded geometry in the model probe.
+    const geometries = [_]struct { query_heads: usize, kv_heads: usize, head_dim: usize, hidden: usize }{
+        .{ .query_heads = 8, .kv_heads = 1, .head_dim = 512, .hidden = 1536 },
+        .{ .query_heads = 8, .kv_heads = 4, .head_dim = 256, .hidden = 2560 },
+    };
+    for (geometries) |geometry| {
+        const width = geometry.query_heads * geometry.head_dim;
+        const lhs_values = try std.testing.allocator.alloc(f32, width);
+        defer std.testing.allocator.free(lhs_values);
+        const rhs_values = try std.testing.allocator.alloc(f32, width);
+        defer std.testing.allocator.free(rhs_values);
+        for (lhs_values, rhs_values, 0..) |*lhs, *rhs, i| {
+            lhs.* = @as(f32, @floatFromInt(i % 31)) * 0.03125;
+            rhs.* = @as(f32, @floatFromInt(i % 17)) * 0.0625;
+        }
+        var lhs = try testDeviceTensorFromSlice(runtime, lhs_values, &.{ 1, @intCast(width) });
+        defer lhs.deinit();
+        var rhs = try testDeviceTensorFromSlice(runtime, rhs_values, &.{ 1, @intCast(width) });
+        defer rhs.deinit();
+
+        try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(
+            provider,
+            1,
+            geometry.query_heads,
+            geometry.kv_heads,
+            geometry.head_dim,
+            geometry.hidden,
+            geometry.hidden,
+            0,
+        ));
+        // Borrow is eligibility-only: no frame and an oversized request both
+        // fail without growing the pre-reserved buffers.
+        const reserved_memory = runtimeMemorySnapshot(runtime);
+        var inactive_borrow = try decoderRuntimeBorrowActiveDirectHiddenScratch(provider, std.testing.allocator, 0, 1, width);
+        defer if (inactive_borrow) |*tensor| tensor.deinit();
+        try std.testing.expect(inactive_borrow == null);
+        try beginFrame(runtime);
+        errdefer cancelFrame(runtime) catch {};
+        var first = (try decoderRuntimeBorrowActiveDirectHiddenScratch(provider, std.testing.allocator, 0, 1, width)) orelse return error.UnexpectedNull;
+        defer first.deinit();
+        // Graph-plan buffers may retain growth headroom. Request beyond the
+        // actual allocation rather than assuming logical width is capacity.
+        const allocated_bytes = termite_metal_buffer_allocated_bytes(first.deviceHandle());
+        try std.testing.expect(allocated_bytes >= width * @sizeOf(f32));
+        const oversized_cols = @as(usize, @intCast(allocated_bytes / @sizeOf(f32))) + 1;
+        var oversized_borrow = try decoderRuntimeBorrowActiveDirectHiddenScratch(
+            provider,
+            std.testing.allocator,
+            0,
+            1,
+            oversized_cols,
+        );
+        defer if (oversized_borrow) |*tensor| tensor.deinit();
+        if (oversized_borrow != null) {
+            std.debug.print("direct hidden oversized borrow unexpectedly succeeded geometry={}x{} requested_cols={}\n", .{ geometry.query_heads, geometry.head_dim, oversized_cols });
+            return error.TestUnexpectedResult;
+        }
+        const rejected_memory = runtimeMemorySnapshot(runtime);
+        try std.testing.expectEqual(reserved_memory.scratch_bytes, rejected_memory.scratch_bytes);
+        try beginPlannedComputeScope(runtime, @backingInt(ComputeSource.attention), .attention);
+        var consumed = (try decoderRuntimeBorrowActiveDirectHiddenScratch(provider, std.testing.allocator, 1, 1, width)) orelse return error.UnexpectedNull;
+        defer consumed.deinit();
+        try std.testing.expect(first.deviceHandle() != lhs.deviceHandle());
+        try std.testing.expect(first.deviceHandle() != rhs.deviceHandle());
+        if (!try decoderRuntimeApplyAddInto(provider, lhs, rhs, first, width)) {
+            std.debug.print("direct hidden first producer failed width={}\n", .{width});
+            return error.TestUnexpectedResult;
+        }
+        // Models attention-output projection consuming the borrowed output.
+        if (!try decoderRuntimeApplyAddInto(provider, first, rhs, consumed, width)) {
+            std.debug.print("direct hidden consumer failed width={}\n", .{width});
+            return error.TestUnexpectedResult;
+        }
+        // Models the next layer reusing the same physical attention output.
+        if (!try decoderRuntimeApplyAddInto(provider, consumed, rhs, first, width)) {
+            std.debug.print("direct hidden reuse producer failed width={}\n", .{width});
+            return error.TestUnexpectedResult;
+        }
+        try endPlannedComputeScope(runtime);
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+
+        const actual = try first.toHostSlice();
+        for (actual, lhs_values, rhs_values, 0..) |got, left, right, index| {
+            const expected = left + 3.0 * right;
+            if (!std.math.approxEqAbs(f32, expected, got, 0.00001)) {
+                std.debug.print("direct hidden reuse mismatch geometry={}x{} index={} expected={d} actual={d}\n", .{ geometry.query_heads, geometry.head_dim, index, expected, got });
+                return error.TestUnexpectedResult;
+            }
+        }
+        const snapshot = runtimeMemorySnapshot(runtime);
+        if (snapshot.last_frame_planned_barrier_count < 2) {
+            std.debug.print("direct hidden reuse missing barriers geometry={}x{} barriers={}\n", .{ geometry.query_heads, geometry.head_dim, snapshot.last_frame_planned_barrier_count });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // Reserving a smaller heterogeneous layer after a larger one must not
+    // shrink the capacity recorded for persistent graph-plan slots.
+    try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(provider, 1, 8, 1, 512, 1536, 1536, 0));
+    const large_memory = runtimeMemorySnapshot(runtime);
+    try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(provider, 1, 8, 4, 256, 1536, 1536, 0));
+    const small_memory = runtimeMemorySnapshot(runtime);
+    // Total scratch also includes KV projection slots. The second geometry
+    // increases KV width from 512 to 1024 even though its direct-hidden width
+    // is smaller, so equality of the aggregate is not a direct-capacity
+    // invariant. Persistent scratch must not shrink; the following borrow is
+    // the exact proof that the prior 4096-column direct capacity survived.
+    try std.testing.expect(small_memory.scratch_bytes >= large_memory.scratch_bytes);
+    try beginFrame(runtime);
+    var large_after_small = (try decoderRuntimeBorrowActiveDirectHiddenScratch(
+        provider,
+        std.testing.allocator,
+        0,
+        1,
+        8 * 512,
+    )) orelse return error.UnexpectedNull;
+    large_after_small.deinit();
+    try cancelFrame(runtime);
+}
+
+test "context metal runtime: precomputed attention tail matches mixed q4 q8 full block" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const hidden: usize = 64;
+    const intermediate: usize = 64;
+    const heads: usize = 2;
+    const kv_heads: usize = 1;
+    const head_dim: usize = 32;
+    const attention_width = heads * head_dim;
+    const kv_width = kv_heads * head_dim;
+    const eps: f32 = 1e-5;
+
+    const Fill = struct {
+        fn matrix(a: std.mem.Allocator, rows: usize, cols: usize, seed: usize) ![]f32 {
+            const values = try a.alloc(f32, rows * cols);
+            for (values, 0..) |*value, index| {
+                const row = index / cols;
+                const col = index % cols;
+                const signed = @as(i32, @intCast((row * 17 + col * 11 + seed * 7) % 37)) - 18;
+                value.* = @as(f32, @floatFromInt(signed)) / 97.0;
+            }
+            return values;
+        }
+
+        fn prepare(
+            p: anytype,
+            slot: usize,
+            storage: *const QuantizedStorage,
+            in_dim: usize,
+            out_dim: usize,
+            bias_len: usize,
+            stats: *ops.NativeQuantTimingStats,
+        ) !void {
+            const bias_values = try std.testing.allocator.alloc(f32, bias_len);
+            defer std.testing.allocator.free(bias_values);
+            @memset(bias_values, 0);
+            var bias = try MetalTensor.ownedCloneFrom(bias_values, &.{@intCast(bias_len)});
+            defer bias.deinit();
+            var dummy_value = [_]f32{0};
+            const dummy = MetalTensor.borrowed(&dummy_value, 1, &.{0});
+            try std.testing.expect(try decoderRuntimePrepareLinear(p, .{
+                .slot = slot,
+                .weight = dummy,
+                .bias = bias,
+                .quantized_storage = @as(?*const QuantizedStorage, storage),
+                .in_dim = in_dim,
+                .out_dim = out_dim,
+                .retain_dense_fallback = false,
+            }, stats));
+        }
+    };
+
+    const attention_dense = try Fill.matrix(allocator, hidden, attention_width, 1);
+    defer allocator.free(attention_dense);
+    const gate_dense = try Fill.matrix(allocator, intermediate, hidden, 2);
+    defer allocator.free(gate_dense);
+    const up_dense = try Fill.matrix(allocator, intermediate, hidden, 3);
+    defer allocator.free(up_dense);
+    const down_dense = try Fill.matrix(allocator, hidden, intermediate, 4);
+    defer allocator.free(down_dense);
+    const ple_hidden: usize = 32;
+    const ple_gate_dense = try Fill.matrix(allocator, ple_hidden, hidden, 5);
+    defer allocator.free(ple_gate_dense);
+    const ple_proj_dense = try Fill.matrix(allocator, hidden, ple_hidden, 6);
+    defer allocator.free(ple_proj_dense);
+    const attention_q4 = try quant_codec.quantizeQ4_0FromF32(allocator, attention_dense);
+    defer allocator.free(attention_q4);
+    const gate_q8 = try quant_codec.quantizeQ8_0FromF32(allocator, gate_dense);
+    defer allocator.free(gate_q8);
+    const up_q8 = try quant_codec.quantizeQ8_0FromF32(allocator, up_dense);
+    defer allocator.free(up_q8);
+    const down_q8 = try quant_codec.quantizeQ8_0FromF32(allocator, down_dense);
+    defer allocator.free(down_q8);
+    const ple_gate_q8 = try quant_codec.quantizeQ8_0FromF32(allocator, ple_gate_dense);
+    defer allocator.free(ple_gate_q8);
+    const ple_proj_q8 = try quant_codec.quantizeQ8_0FromF32(allocator, ple_proj_dense);
+    defer allocator.free(ple_proj_q8);
+
+    // Keep source storage descriptors and shape backing alive for the entire
+    // test. The provider owns its prepared copies, but eligibility consults
+    // the retained per-slot storage metadata after preparation.
+    const attention_shape = [_]i64{ hidden, attention_width };
+    const ffn_shape = [_]i64{ intermediate, hidden };
+    const down_shape = [_]i64{ hidden, intermediate };
+    const ple_gate_shape = [_]i64{ ple_hidden, hidden };
+    const ple_proj_shape = [_]i64{ hidden, ple_hidden };
+    const attention_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q4_0 }, .raw_bytes = attention_q4, .shape = &attention_shape, .raw_owned = false, .allocator = allocator };
+    const gate_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = gate_q8, .shape = &ffn_shape, .raw_owned = false, .allocator = allocator };
+    const up_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = up_q8, .shape = &ffn_shape, .raw_owned = false, .allocator = allocator };
+    const down_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = down_q8, .shape = &down_shape, .raw_owned = false, .allocator = allocator };
+    const ple_gate_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = ple_gate_q8, .shape = &ple_gate_shape, .raw_owned = false, .allocator = allocator };
+    const ple_proj_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = ple_proj_q8, .shape = &ple_proj_shape, .raw_owned = false, .allocator = allocator };
+
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    try Fill.prepare(&provider, 0, &attention_storage, attention_width, hidden, hidden, &prep_stats);
+    try Fill.prepare(&provider, 1, &gate_storage, hidden, intermediate, intermediate, &prep_stats);
+    try Fill.prepare(&provider, 2, &up_storage, hidden, intermediate, intermediate, &prep_stats);
+    try Fill.prepare(&provider, 3, &down_storage, intermediate, hidden, hidden, &prep_stats);
+    try Fill.prepare(&provider, 4, &ple_gate_storage, hidden, ple_hidden, ple_hidden, &prep_stats);
+    try Fill.prepare(&provider, 5, &ple_proj_storage, ple_hidden, hidden, hidden, &prep_stats);
+
+    var norm_values: [hidden]f32 = undefined;
+    for (&norm_values, 0..) |*value, index| value.* = 0.75 + @as(f32, @floatFromInt(index % 5)) * 0.03125;
+    var norm = try MetalTensor.ownedCloneFrom(&norm_values, &.{hidden});
+    defer norm.deinit();
+    for (0..4) |slot| try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{
+        .slot = slot,
+        .weight = norm,
+        .hidden_size = hidden,
+    }));
+
+    var q_values: [attention_width]f32 = undefined;
+    var k_values: [kv_width]f32 = undefined;
+    var v_values: [kv_width]f32 = undefined;
+    var attention_values: [attention_width]f32 = undefined;
+    var zero_values: [attention_width]f32 = @splat(0);
+    var residual_values: [hidden]f32 = undefined;
+    var ple_values: [ple_hidden]f32 = undefined;
+    for (&q_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 13)) - 6)) * 0.0625;
+    for (&k_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 11)) - 5)) * 0.05;
+    for (&v_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) * 0.04;
+    for (&attention_values, 0..) |*value, index| value.* = v_values[index % kv_width];
+    for (&residual_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) * 0.025;
+    for (&ple_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 7)) - 3)) * 0.03125;
+
+    var q = try testDeviceTensorFromSlice(runtime, &q_values, &.{ 1, attention_width });
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(runtime, &k_values, &.{ 1, kv_width });
+    defer k.deinit();
+    var v = try testDeviceTensorFromSlice(runtime, &v_values, &.{ 1, kv_width });
+    defer v.deinit();
+    var attention_source = try testDeviceTensorFromSlice(runtime, &attention_values, &.{ 1, attention_width });
+    defer attention_source.deinit();
+    var zeros = try testDeviceTensorFromSlice(runtime, &zero_values, &.{ 1, attention_width });
+    defer zeros.deinit();
+    var residual = try testDeviceTensorFromSlice(runtime, &residual_values, &.{ 1, hidden });
+    defer residual.deinit();
+    var ple = try testDeviceTensorFromSlice(runtime, &ple_values, &.{ 1, ple_hidden });
+    defer ple.deinit();
+
+    const Request = struct {
+        query_sequence_len: usize,
+        kv_tokens: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        query_position_offset: usize,
+        kv_position_offset: usize,
+        sliding_window: usize,
+        total_sequence_len: usize,
+        attention_linear_slot: usize,
+        attention_pre_linear_rms_norm_slot: ?usize,
+        attention_post_linear_rms_norm_slot: ?usize,
+        hidden_size: usize,
+        eps: f32,
+        ffn_layer_norm_slot: ?usize,
+        ffn_rms_norm_slot: ?usize,
+        ffn_post_gate_rms_norm_slot: ?usize,
+        ffn_post_down_rms_norm_slot: ?usize,
+        gate_ffn_linear_slot: usize,
+        up_ffn_linear_slot: usize,
+        down_ffn_linear_slot: usize,
+        intermediate_size: usize,
+        activation: ops.DecoderRuntimeActivationKind,
+        layer_index: usize,
+        ple: ?MetalTensor,
+        ple_gate_linear_slot: ?usize,
+        ple_proj_linear_slot: ?usize,
+        ple_post_norm_slot: ?usize,
+        ple_hidden_size: usize,
+        output_scale_value: ?f32,
+    };
+    const request: Request = .{
+        .query_sequence_len = @as(usize, 1),
+        .kv_tokens = @as(usize, 1),
+        .num_heads = heads,
+        .num_kv_heads = kv_heads,
+        .head_dim = head_dim,
+        .query_position_offset = @as(usize, 0),
+        .kv_position_offset = @as(usize, 0),
+        .sliding_window = @as(usize, 0),
+        .total_sequence_len = @as(usize, 1),
+        .attention_linear_slot = @as(usize, 0),
+        .attention_pre_linear_rms_norm_slot = @as(?usize, null),
+        .attention_post_linear_rms_norm_slot = @as(?usize, 0),
+        .hidden_size = hidden,
+        .eps = eps,
+        .ffn_layer_norm_slot = @as(?usize, null),
+        .ffn_rms_norm_slot = @as(?usize, 1),
+        .ffn_post_gate_rms_norm_slot = @as(?usize, null),
+        .ffn_post_down_rms_norm_slot = @as(?usize, 2),
+        .gate_ffn_linear_slot = @as(usize, 1),
+        .up_ffn_linear_slot = @as(usize, 2),
+        .down_ffn_linear_slot = @as(usize, 3),
+        .intermediate_size = intermediate,
+        .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+        .layer_index = @as(usize, 0),
+        .ple = @as(?MetalTensor, null),
+        .ple_gate_linear_slot = @as(?usize, null),
+        .ple_proj_linear_slot = @as(?usize, null),
+        .ple_post_norm_slot = @as(?usize, null),
+        .ple_hidden_size = @as(usize, 0),
+        .output_scale_value = @as(?f32, 0.75),
+    };
+
+    try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(&provider, 1, heads, kv_heads, head_dim, hidden, intermediate, 0));
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var full_stats: ops.NativeQuantTimingStats = .{};
+    var full = (try runAttentionF32GatedDecoderBlockQuantizedDevice(&provider, request, q, k, v, residual, &full_stats)) orelse return error.UnexpectedNull;
+    defer full.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    const output_shape = [_]i32{ 1, hidden };
+    var output = try MetalTensor.deviceAllocateFreshWithAllocator(allocator, @ptrCast(runtime), hidden * @sizeOf(f32), .private, &output_shape);
+    defer output.deinit();
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var borrowed = (try decoderRuntimeBorrowActiveDirectHiddenScratch(&provider, allocator, 0, 1, attention_width)) orelse return error.UnexpectedNull;
+    defer borrowed.deinit();
+    try std.testing.expect(supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, output));
+    // This active-frame write stands in for packed attention and gives the
+    // range tracker a real producer/consumer dependency to barrier.
+    try std.testing.expect(try decoderRuntimeApplyAddInto(&provider, attention_source, zeros, borrowed, attention_width));
+    var tail_stats: ops.NativeQuantTimingStats = .{};
+    var tail = try runPrecomputedGatedBlockDevice(&provider, allocator, request, 0, borrowed, residual, null, output, &tail_stats);
+    defer tail.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    const expected = try tensorHostSlice(&full);
+    const actual = try tensorHostSlice(&tail);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual, 0..) |want, got, index| {
+        if (!std.math.isFinite(got) or !std.math.approxEqAbs(f32, want, got, 5e-3)) {
+            std.debug.print("precomputed mixed-q4-q8 tail mismatch index={} expected={d} actual={d}\n", .{ index, want, got });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(full_stats.active_decode_attention_f32_kernels >= 1);
+    try std.testing.expectEqual(@as(u64, 0), tail_stats.active_decode_attention_f32_kernels);
+    try std.testing.expectEqual(@as(u64, 1), tail_stats.context_precomputed_tail_blocks);
+    try std.testing.expectEqual(@as(u64, 0), tail_stats.context_precomputed_tail_failures);
+    try std.testing.expectEqual(@as(u64, 0), tail_stats.f32_kv_quant_direct_block_successes);
+    const snapshot = runtimeMemorySnapshot(runtime);
+    try std.testing.expect(snapshot.last_frame_planned_barrier_count >= 1);
+
+    // Exercise PLE through the same mixed quantized tail with output scaling
+    // disabled. This covers both optional branches without changing the
+    // attention producer or the quantized projection/FFN formats.
+    var ple_request = request;
+    ple_request.ple = ple;
+    ple_request.ple_gate_linear_slot = 4;
+    ple_request.ple_proj_linear_slot = 5;
+    ple_request.ple_post_norm_slot = 3;
+    ple_request.ple_hidden_size = ple_hidden;
+    ple_request.output_scale_value = null;
+
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var ple_full_stats: ops.NativeQuantTimingStats = .{};
+    var ple_full = (try runAttentionF32GatedDecoderBlockQuantizedDevice(&provider, ple_request, q, k, v, residual, &ple_full_stats)) orelse return error.UnexpectedNull;
+    defer ple_full.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var ple_borrowed = (try decoderRuntimeBorrowActiveDirectHiddenScratch(&provider, allocator, 0, 1, attention_width)) orelse return error.UnexpectedNull;
+    defer ple_borrowed.deinit();
+    try std.testing.expect(supportsPrecomputedGatedBlockDevice(&provider, ple_request, 0, residual, ple, output));
+    try std.testing.expect(try decoderRuntimeApplyAddInto(&provider, attention_source, zeros, ple_borrowed, attention_width));
+    var ple_tail = try runPrecomputedGatedBlockDevice(&provider, allocator, ple_request, 0, ple_borrowed, residual, ple, output, &tail_stats);
+    defer ple_tail.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    const ple_expected = try tensorHostSlice(&ple_full);
+    const ple_actual = try tensorHostSlice(&ple_tail);
+    try std.testing.expectEqual(ple_expected.len, ple_actual.len);
+    for (ple_expected, ple_actual, 0..) |want, got, index| {
+        if (!std.math.isFinite(got) or !std.math.approxEqAbs(f32, want, got, 5e-3)) {
+            std.debug.print("precomputed PLE mixed-q4-q8 tail mismatch index={} expected={d} actual={d}\n", .{ index, want, got });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(ple_full_stats.active_decode_attention_f32_kernels >= 1);
+    try std.testing.expectEqual(@as(u64, 2), tail_stats.context_precomputed_tail_blocks);
+    try std.testing.expectEqual(@as(u64, 0), tail_stats.context_precomputed_tail_failures);
+    try std.testing.expectEqual(@as(u64, 0), tail_stats.f32_kv_quant_direct_block_successes);
+    try std.testing.expect(tail_stats.active_decode_quant_ple_linear_kernels >= 2);
+
+    const stable_scratch_bytes = runtimeMemorySnapshot(runtime).scratch_bytes;
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, output));
+
+    // A submitted frame is neither reusable nor eligible while its command
+    // buffer is pending completion.
+    try beginFrame(runtime);
+    try submitFrame(runtime);
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, output));
+    try waitFrame(runtime);
+
+    // Eligibility must reject scratch aliases before a packed hook runs.
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    // Eligibility runs before the packed hook. It must reject an unprepared
+    // runtime quant slot without preparing or uploading it as a side effect.
+    const saved_attention_kind = provider.raw_linear_slot_runtime_prepared_kind[0];
+    provider.raw_linear_slot_runtime_prepared_kind[0] = .none;
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, output));
+    try std.testing.expectEqual(@as(RawQuantizedRuntimeLinearKind, .none), provider.raw_linear_slot_runtime_prepared_kind[0]);
+    provider.raw_linear_slot_runtime_prepared_kind[0] = saved_attention_kind;
+    var inconsistent_ple = request;
+    inconsistent_ple.ple_gate_linear_slot = 4;
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, inconsistent_ple, 0, residual, null, output));
+    var ambiguous_ffn_norm = request;
+    ambiguous_ffn_norm.ffn_layer_norm_slot = 0;
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, ambiguous_ffn_norm, 0, residual, null, output));
+    var aliased_output = (try decoderRuntimeBorrowActiveDirectHiddenScratch(&provider, allocator, 1, 1, hidden)) orelse return error.UnexpectedNull;
+    defer aliased_output.deinit();
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, aliased_output));
+    var unprepared_norm = request;
+    unprepared_norm.attention_post_linear_rms_norm_slot = 31;
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, unprepared_norm, 0, residual, null, output));
+    try cancelFrame(runtime);
+
+    // Offset overflow must fail in the side-effect-free preflight rather than
+    // wrapping the destination range. The wrapper owns only its lifetime
+    // record; the output tensor continues to own the Metal allocation.
+    const overflow_shape = [_]i32{ 1, hidden };
+    var overflow_output = try MetalTensor.deviceBorrowedWithAllocator(
+        allocator,
+        @ptrCast(runtime),
+        output.deviceHandle().?,
+        std.math.maxInt(usize) - @sizeOf(f32),
+        hidden * @sizeOf(f32),
+        &overflow_shape,
+    );
+    defer overflow_output.deinit();
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, overflow_output));
+    try cancelFrame(runtime);
+
+    // After the packed producer has written slot zero, passing any other
+    // attention source is terminal. The tail must not fall back or allocate,
+    // and cancellation must leave the runtime reusable.
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var produced = (try decoderRuntimeBorrowActiveDirectHiddenScratch(&provider, allocator, 0, 1, attention_width)) orelse return error.UnexpectedNull;
+    defer produced.deinit();
+    try std.testing.expect(supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, output));
+    try std.testing.expect(try decoderRuntimeApplyAddInto(&provider, attention_source, zeros, produced, attention_width));
+    if (runPrecomputedGatedBlockDevice(&provider, allocator, request, 0, attention_source, residual, null, output, &tail_stats)) |unexpected_result| {
+        var unexpected = unexpected_result;
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(error.ContextFramedExecutionUnsupported, err);
+    }
+    try cancelFrame(runtime);
+    try std.testing.expectEqual(@as(u64, 2), tail_stats.context_precomputed_tail_blocks);
+    try std.testing.expectEqual(@as(u64, 1), tail_stats.context_precomputed_tail_failures);
+    try std.testing.expectEqual(stable_scratch_bytes, runtimeMemorySnapshot(runtime).scratch_bytes);
+
+    // Failures rejected before entering C still occur after the caller's
+    // packed mutation boundary and must be visible in the route receipt.
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var invalid_after_hook = request;
+    invalid_after_hook.ple_gate_linear_slot = 4;
+    if (runPrecomputedGatedBlockDevice(&provider, allocator, invalid_after_hook, 0, attention_source, residual, null, output, &tail_stats)) |unexpected_result| {
+        var unexpected = unexpected_result;
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(error.ContextFramedExecutionUnsupported, err);
+    }
+    try cancelFrame(runtime);
+    try std.testing.expectEqual(@as(u64, 2), tail_stats.context_precomputed_tail_failures);
+}
+
+test "context frame callback failure preserves completed GPU workload accounting" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    const provider = .{ .raw_decode_runtime = @as(?*RawMetalDecodeRuntime, runtime) };
+    const Probe = struct {
+        calls: usize = 0,
+        completed: c_int = -1,
+
+        fn complete(raw: ?*anyopaque, completed: c_int) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return -1));
+            self.calls += 1;
+            self.completed = completed;
+            return -1;
+        }
+    };
+
+    var lhs_values: [32]f32 = undefined;
+    var rhs_values: [32]f32 = undefined;
+    for (&lhs_values, &rhs_values, 0..) |*lhs, *rhs, index| {
+        lhs.* = @floatFromInt(index);
+        rhs.* = 0.25;
+    }
+    var lhs = try testDeviceTensorFromSlice(runtime, &lhs_values, &.{ 1, 32 });
+    defer lhs.deinit();
+    var rhs = try testDeviceTensorFromSlice(runtime, &rhs_values, &.{ 1, 32 });
+    defer rhs.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, 32 * @sizeOf(f32), .private, &.{ 1, 32 });
+    defer output.deinit();
+
+    try workloadProfileBegin(runtime, .decode);
+    errdefer workloadProfileEnd(runtime) catch {};
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try std.testing.expect(try decoderRuntimeApplyAddInto(provider, lhs, rhs, output, 32));
+    var probe = Probe{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_set_context_frame_completion(runtime, &probe, Probe.complete));
+    try submitFrame(runtime);
+    try std.testing.expectError(FrameError.CommandBufferFailed, waitFrame(runtime));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(c_int, 1), probe.completed);
+    try workloadProfileEnd(runtime);
+    const profile = try workloadProfileSnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 1), profile.profiled_frame_count);
+    try std.testing.expectEqual(lastFrameGpuNanos(runtime), profile.whole_frame_gpu_nanos);
+}

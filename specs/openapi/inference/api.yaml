@@ -3859,6 +3859,67 @@ components:
             Controls templates that support an `enable_thinking` variable. False asks the
             template to open a public/final response channel directly. Omitted preserves the
             model template's default behavior.
+    GenerateCompactionTarget:
+      type: object
+      additionalProperties: false
+      required: [message_index, part_index]
+      properties:
+        message_index:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+        part_index:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: Zero-based text part; string message content is part zero.
+
+    GenerateContextPolicy:
+      type: object
+      additionalProperties: false
+      description: |
+        Separate positional context limits from retained KV storage. Exact is the default.
+        Approximate modes require a qualified Metal f16 implementation and reject unsupported
+        combinations; setting a policy never extends the artifact's positional limit.
+      properties:
+        compaction_targets:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/GenerateCompactionTarget'
+          description: |
+            Explicit user/tool text payloads eligible for attention matching. Other roles,
+            metadata, special tokens and boundary-crossing tokens remain exact. Unsupported
+            renderer/tokenizer provenance is rejected. Approximate serving is not yet qualified.
+        mode:
+          type: string
+          enum: [exact, rolling, attention_matching]
+          default: exact
+        max_context_tokens:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          description: Optional cap on prompt plus output positions, bounded by the model limit.
+        max_kv_tokens:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          description: Retained rows per global KV head. Required for approximate modes.
+        keep_prefix_tokens:
+          type: integer
+          x-go-type-skip-optional-pointer: false
+          minimum: 0
+          maximum: 4294967295
+          default: 256
+          description: Exact prefix protection in approximate modes; does not identify message boundaries.
+        keep_recent_tokens:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          default: 2048
+          description: Minimum recent exact tail in approximate modes.
+
     GenerateRequest:
       type: object
       required:
@@ -4018,6 +4079,8 @@ components:
           description: |
             inference-native KV cache quantization format. Lower precision reduces memory usage but may
             affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
+        context_policy:
+          $ref: '#/components/schemas/GenerateContextPolicy'
         cache_compaction_ratio:
           type: number
           format: float
@@ -4029,7 +4092,7 @@ components:
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
             The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
-            device-backed compaction is not yet supported.
+            device-backed compaction is not yet supported. Cannot be combined with context_policy.
         context_management:
           $ref: '#/components/schemas/ContextManagement'
         kv_cache:

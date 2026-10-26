@@ -13,6 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const attention_matching = @import("attention_matching.zig");
+pub const attention_match = @import("attention_match.zig");
+pub const attention_match_study = @import("attention_match_study.zig");
+pub const context_session = @import("context_session.zig");
+pub const context_view = @import("context_view.zig");
+pub const host_allocation_tracker = @import("host_allocation_tracker.zig");
 pub const block = @import("block.zig");
 pub const pool = @import("pool.zig");
 pub const storage = @import("storage.zig");
@@ -21,7 +27,6 @@ pub const manager = @import("manager.zig");
 pub const storage_runtime = @import("storage_runtime.zig");
 pub const linalg = @import("linalg.zig");
 pub const compaction = @import("compaction.zig");
-pub const attention_match = @import("attention_match.zig");
 pub const attention_match_checkpoint = @import("attention_match_checkpoint.zig");
 pub const attention_match_resume = @import("attention_match_resume.zig");
 pub const attention_match_engine = @import("attention_match_engine.zig");
@@ -35,6 +40,12 @@ pub const turboquant = @import("turboquant.zig");
 pub const prompt_cache = @import("prompt_cache.zig");
 
 test {
+    _ = attention_matching;
+    _ = attention_match;
+    _ = attention_match_study;
+    _ = context_session;
+    _ = context_view;
+    _ = host_allocation_tracker;
     _ = block;
     _ = pool;
     _ = storage;
@@ -43,7 +54,6 @@ test {
     _ = storage_runtime;
     _ = linalg;
     _ = compaction;
-    _ = attention_match;
     _ = attention_match_checkpoint;
     _ = attention_match_resume;
     _ = attention_match_engine;

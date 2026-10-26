@@ -216,10 +216,19 @@ pub const KvManager = struct {
         sequence_id: SequenceId,
         out: *std.ArrayListUnmanaged(block.KvBlockId),
     ) ![]const block.KvBlockId {
+        return self.logicalBlocksWithReservationsAllocated(self.allocator, sequence_id, out);
+    }
+
+    pub fn logicalBlocksWithReservationsAllocated(
+        self: *const KvManager,
+        out_allocator: std.mem.Allocator,
+        sequence_id: SequenceId,
+        out: *std.ArrayListUnmanaged(block.KvBlockId),
+    ) ![]const block.KvBlockId {
         const sequence_state = try self.sequenceState(sequence_id);
         out.clearRetainingCapacity();
-        try out.appendSlice(self.allocator, sequence_state.block_table.blocks.items);
-        try out.appendSlice(self.allocator, sequence_state.reserved_tail_blocks.items);
+        try out.appendSlice(out_allocator, sequence_state.block_table.blocks.items);
+        try out.appendSlice(out_allocator, sequence_state.reserved_tail_blocks.items);
         return out.items;
     }
 

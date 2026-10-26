@@ -96,6 +96,9 @@ pub const deepseek_v4_max_layers = 256;
 pub const max_extra_eos_token_ids = 16;
 pub const max_suppress_token_ids = 64;
 pub const max_vision_deepstack_layers = 64;
+pub const max_attention_layers = 256;
+
+pub const AttentionLayerKind = enum(u8) { sliding, global };
 
 pub const Config = struct {
     family: ModelFamily = .gpt2,
@@ -108,6 +111,11 @@ pub const Config = struct {
     vocab_size: u32 = 50257,
     max_position_embeddings: u32 = 1024,
     sliding_window: u32 = 0,
+    /// Artifact-provided attention schedule. A short schedule is a repeating
+    /// pattern; a full schedule preserves exceptions such as a final global
+    /// layer. Value-owned so Config copies never borrow parser storage.
+    attention_schedule_len: u16 = 0,
+    attention_schedule: [max_attention_layers]AttentionLayerKind = @splat(.global),
     num_local_experts: u32 = 0,
     num_experts_per_tok: u32 = 0,
     num_shared_experts: u32 = 0,
@@ -358,6 +366,12 @@ pub const Config = struct {
             return self.deepseekV4AttentionKind(layer_index) == .sliding_attention;
         }
         if (!self.usesGemmaSlidingAttention()) return false;
+        if (self.attention_schedule_len > 0) {
+            return self.attention_schedule[layer_index % self.attention_schedule_len] == .sliding;
+        }
+        // Malformed legacy metadata must never turn a global layer into a
+        // sliding layer or cause division by zero.
+        if (self.sliding_window_pattern == 0) return false;
         return ((layer_index + 1) % self.sliding_window_pattern) != 0;
     }
 
@@ -398,7 +412,8 @@ pub const Config = struct {
     /// attention keeps full history unless the lower-memory override is forced.
     pub fn kvPoolSlidingWindowSize(self: Config, force_sliding_trim: bool) ?u32 {
         if (self.position_encoding == .absolute) return null;
-        if (self.sliding_window > 0 and self.hasMixedSlidingAndGlobalAttentionLayers() and !force_sliding_trim) return null;
+        if (self.sliding_window > 0 and !force_sliding_trim and
+            (self.hasMixedSlidingAndGlobalAttentionLayers() or (self.family == .gemma and self.hasGlobalAttentionLayers()))) return null;
         if (self.sliding_window > 0) return self.sliding_window;
         if (self.max_position_embeddings > 0) return self.max_position_embeddings;
         return null;
@@ -1167,8 +1182,23 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (text_obj.get("_sliding_window_pattern")) |v| if (jsonU32(v)) |val| {
         config.sliding_window_pattern = val;
     };
-    // Gemma 4: derive sliding_window_pattern from layer_types array if present.
+    // Preserve Gemma's complete schedule, including non-periodic exceptions.
+    // Other families retain their existing hybrid-attention parser below.
     if (text_obj.get("layer_types")) |v| {
+        if (config.family == .gemma) {
+            if (v != .array or v.array.items.len == 0 or v.array.items.len > max_attention_layers or
+                v.array.items.len > config.num_hidden_layers) return error.InvalidAttentionSchedule;
+            config.attention_schedule_len = @intCast(v.array.items.len);
+            for (v.array.items, 0..) |item, i| {
+                if (item != .string) return error.InvalidAttentionSchedule;
+                config.attention_schedule[i] = if (std.mem.eql(u8, item.string, "sliding_attention"))
+                    .sliding
+                else if (std.mem.eql(u8, item.string, "full_attention"))
+                    .global
+                else
+                    return error.InvalidAttentionSchedule;
+            }
+        }
         if (v == .array) {
             var has_linear = false;
             for (v.array.items, 0..) |item, i| {
@@ -1439,14 +1469,48 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
 
     // Gemma 4: sliding_window_pattern may be a per-layer bool array.
     if (metaSlidingPatternFromBoolArray(view, &key_buf, arch, "attention.sliding_window_pattern")) |value| config.sliding_window_pattern = value;
+    if (config.family == .gemma) {
+        const schedule_key = std.fmt.bufPrint(&key_buf, "{s}.attention.sliding_window_pattern", .{arch}) catch return null;
+        if (view.find(schedule_key)) |entry| {
+            if (entry.value == .array) {
+                const values = entry.value.array.values;
+                if (values.len == 0 or values.len > max_attention_layers or values.len > config.num_hidden_layers) return null;
+                config.attention_schedule_len = @intCast(values.len);
+                for (values, 0..) |value, i| {
+                    if (value != .bool_) return null;
+                    config.attention_schedule[i] = if (value.bool_) .sliding else .global;
+                }
+            }
+        }
+    }
 
-    // Gemma 4: derive global KV head count from per-layer head_count_kv array if not set explicitly.
-    // Full-attention layers (at sliding_window_pattern-1) may have different KV heads than sliding layers.
-    if (config.num_global_key_value_heads == 0 and config.sliding_window_pattern > 0) {
-        const full_attn_idx = config.sliding_window_pattern - 1;
-        if (metaI32FromArrayAt(view, &key_buf, arch, "attention.head_count_kv", full_attn_idx)) |global_kv| {
-            if (global_kv != config.num_key_value_heads) {
-                config.num_global_key_value_heads = global_kv;
+    // Derive both geometries from the actual schedule. The first layer can
+    // be global, and later global layers need not follow a periodic pattern.
+    // Reject arrays our two-geometry Config cannot represent without loss.
+    if (config.family == .gemma) {
+        const heads_key = std.fmt.bufPrint(&key_buf, "{s}.attention.head_count_kv", .{arch}) catch return null;
+        if (view.find(heads_key)) |entry| {
+            if (entry.value == .array) {
+                const values = entry.value.array.values;
+                if (values.len == 0 or values.len > config.num_hidden_layers) return null;
+                var sliding_heads: ?u32 = null;
+                var global_heads: ?u32 = null;
+                for (values, 0..) |value, i| {
+                    const heads: u32 = switch (value) {
+                        .u32 => |v| v,
+                        .i32 => |v| if (v > 0) @intCast(v) else return null,
+                        else => return null,
+                    };
+                    if (heads == 0 or config.num_attention_heads % heads != 0) return null;
+                    const geometry = if (config.layerUsesSlidingAttention(i)) &sliding_heads else &global_heads;
+                    if (geometry.*) |previous| if (previous != heads) return null;
+                    geometry.* = heads;
+                }
+                if (sliding_heads) |heads| config.num_key_value_heads = heads;
+                if (global_heads) |heads| {
+                    if (config.num_global_key_value_heads != 0 and config.num_global_key_value_heads != heads) return null;
+                    config.num_global_key_value_heads = heads;
+                }
             }
         }
     }
@@ -3714,4 +3778,55 @@ test "parse colqwen2 merged config lacks native vision detail" {
     try std.testing.expectEqual(@as(u32, 1536), config.vision_embed_dim);
     try std.testing.expectEqual(@as(u32, 14), config.vision_patch_size);
     try std.testing.expect(!config.supportsNativeQwen2VlVision());
+}
+
+test "context metadata preserves irregular gemma layer schedules" {
+    const config = try parseConfig(std.testing.allocator,
+        \\{"model_type":"gemma4","num_hidden_layers":4,"num_attention_heads":8,"num_key_value_heads":2,"sliding_window":512,"layer_types":["sliding_attention","full_attention","full_attention","sliding_attention"]}
+    );
+    try std.testing.expectEqual(@as(u16, 4), config.attention_schedule_len);
+    try std.testing.expect(config.layerUsesSlidingAttention(0));
+    try std.testing.expect(!config.layerUsesSlidingAttention(1));
+    try std.testing.expect(!config.layerUsesSlidingAttention(2));
+    try std.testing.expect(config.layerUsesSlidingAttention(3));
+    try std.testing.expectError(error.InvalidAttentionSchedule, parseConfig(std.testing.allocator,
+        \\{"model_type":"gemma4","num_hidden_layers":4,"layer_types":["unknown"]}
+    ));
+}
+
+test "context exact all-global gemma schedule retains full history" {
+    const config = Config{ .family = .gemma, .position_encoding = .rope, .num_hidden_layers = 4, .sliding_window = 512, .sliding_window_pattern = 1 };
+    try std.testing.expect(config.hasGlobalAttentionLayers());
+    try std.testing.expectEqual(@as(?u32, null), config.kvPoolSlidingWindowSize(false));
+    try std.testing.expectEqual(@as(?u32, 512), config.kvPoolSlidingWindowSize(true));
+}
+
+test "context GGUF irregular schedules validate every KV head geometry" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |invalid| {
+        var data = std.ArrayListUnmanaged(u8).empty;
+        defer data.deinit(allocator);
+        try data.appendSlice(allocator, "GGUF");
+        try appendLe(u32, allocator, &data, 3);
+        try appendLe(u64, allocator, &data, 0);
+        try appendLe(u64, allocator, &data, 7);
+        try appendMetadataString(allocator, &data, "general.architecture", "gemma4");
+        try appendMetadataU32(allocator, &data, "gemma4.embedding_length", 2816);
+        try appendMetadataU32(allocator, &data, "gemma4.block_count", 4);
+        try appendMetadataU32(allocator, &data, "gemma4.attention.head_count", 16);
+        try appendMetadataU32Array(allocator, &data, "gemma4.attention.head_count_kv", &.{ 2, 8, if (invalid) 4 else 2, 8 });
+        try appendMetadataU32(allocator, &data, "gemma4.attention.sliding_window", 1024);
+        try appendMetadataBoolArray(allocator, &data, "gemma4.attention.sliding_window_pattern", &.{ false, true, false, true });
+        var parsed = try @import("../gguf/format.zig").parse(allocator, data.items);
+        defer parsed.deinit(allocator);
+        const config = parseGgufMetadata(gguf_metadata.View.init(&parsed));
+        if (invalid) {
+            try std.testing.expect(config == null);
+        } else {
+            try std.testing.expectEqual(@as(u32, 8), config.?.num_key_value_heads);
+            try std.testing.expectEqual(@as(u32, 2), config.?.num_global_key_value_heads);
+            for ([_]u32{ 2, 8, 2, 8 }, 0..) |heads, i|
+                try std.testing.expectEqual(heads, config.?.effectiveKVHeadsForLayer(i));
+        }
+    }
 }

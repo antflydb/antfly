@@ -18,6 +18,7 @@
 
 pub const chunk_response = @import("chunk_response.zig");
 const std = @import("std");
+const context_fault_injection = @import("../context_fault_injection.zig");
 const builtin = @import("builtin");
 const build_info = @import("build_info");
 const build_options = @import("build_options");
@@ -64,8 +65,10 @@ const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").Boun
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
+const metal_attention_storage = if (build_options.enable_metal) @import("../ops/metal_attention_match_storage.zig") else struct {};
 const context_management = @import("context_management.zig");
 const native_kv_wire = @import("native_kv_wire.zig");
+const context_teacher_forced = @import("../backends/context_teacher_forced.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
 const reranking_pipeline = @import("../pipelines/reranking.zig");
 const multimodal_qwen_adapter = @import("../pipelines/multimodal_qwen_adapter.zig");
@@ -97,6 +100,9 @@ const moondream_pipeline = @import("../pipelines/moondream.zig");
 const tool_parser_mod = @import("../pipelines/tool_parser.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
+const context_execution_pool = @import("../backends/context_execution_pool.zig");
+const context_capture_coverage = @import("../context_capture_coverage.zig");
+const context_study_templates = @import("../backends/context_study_templates.zig");
 const tabular_mod = @import("../tabular/root.zig");
 const c_file = @import("../util/c_file.zig");
 const ascii_compat = @import("../util/ascii_compat.zig");
@@ -1223,6 +1229,832 @@ fn rawGenerateChatTemplateKwargsAreValid(
 
 const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
 
+pub const ContextServingLoadedIdentity = struct {
+    load_generation: u64,
+    artifact_sha256: [32]u8,
+    tokenizer_sha256: [32]u8,
+    template_sha256: [32]u8,
+    layout_sha256: [32]u8,
+    profile_sha256: [32]u8,
+    implementation_sha256: [32]u8,
+};
+
+/// Raw request facts captured by the genuine serving path. The qualification
+/// driver is responsible for parsing response token ids and binding them to
+/// this record; this observer never synthesizes output or release evidence.
+pub const ContextServingObservation = struct {
+    route_completed: bool = false,
+    loaded_identity: ContextServingLoadedIdentity = undefined,
+    profile_semantic_digest: [32]u8 = @splat(0),
+    /// SHA-256 of the exact renderer output consumed by tokenization. Source
+    /// document hashes cannot stand in for this value.
+    rendered_prompt_sha256: [32]u8 = @splat(0),
+    prompt_tokens: usize = 0,
+    reserved_output_tokens: usize = 0,
+    output_tokens: usize = 0,
+    output_token_ids: [4096]u32 = @splat(0),
+    output_token_ids_len: u32 = 0,
+    /// SHA-256 and byte length of the exact public content projection emitted
+    /// by the streaming route. Reasoning and protocol framing are excluded.
+    public_output_sha256: [32]u8 = @splat(0),
+    public_output_bytes: u32 = 0,
+    public_output_bound: bool = false,
+    /// Genuine generation-pipeline timings. Zero means the route did not
+    /// expose that boundary and must fail a timing-qualified caller.
+    route_elapsed_ns: u64 = 0,
+    route_ttft_ns: u64 = 0,
+    route_decode_ns: u64 = 0,
+    chunk_rows: u32 = 0,
+    retained_limit: u32 = 0,
+    backend_peak_bytes: usize = 0,
+    host_peak_bytes: usize = 0,
+    execution_peak_bytes: usize = 0,
+    request_bytes: usize = 0,
+    publication_attempted: bool = false,
+    published: bool = false,
+    committed_before_bytes: usize = 0,
+    committed_after_bytes: usize = 0,
+    /// Total committed context bytes are available only from a context owner
+    /// that accounts for both device storage and host metadata. Automatic KV
+    /// snapshots below intentionally remain diagnostic device-only evidence.
+    committed_context_bytes: ?usize = null,
+    context_peak_bytes: ?usize = null,
+    backend_kv_readback_before: u64 = 0,
+    backend_kv_readback_after: u64 = 0,
+    device_allocation_start: runtime.kv.storage_runtime.DeviceAllocationSnapshot = .{},
+    device_allocation_end: runtime.kv.storage_runtime.DeviceAllocationSnapshot = .{},
+    /// Request-owner ledger spanning payload preparation through teardown.
+    /// These counters remain diagnostic until full_owner_physical_available
+    /// is true; opaque request-owned backend objects currently prevent that.
+    owner_allocation: runtime.kv.host_allocation_tracker.Snapshot = .{},
+    owner_allocation_initial: runtime.kv.host_allocation_tracker.Snapshot = .{},
+    owner_allocation_committed: runtime.kv.host_allocation_tracker.Snapshot = .{},
+    owner_allocation_final: runtime.kv.host_allocation_tracker.Snapshot = .{},
+    owner_measurement: runtime.kv.host_allocation_tracker.RequestAllocationOwner.Measurement = .{},
+    owner_released: bool = false,
+    owner_post_release_live_bytes: ?u64 = null,
+    context_allocation_scope_version: u32 = 0,
+    context_allocation_scope_complete: bool = false,
+    model_execution_pool_admission_version: u32 = 0,
+    model_execution_pool_admitted_backend_bytes: u64 = 0,
+    full_owner_physical_available: bool = false,
+    admission_before: runtime.tier.memory.AdmissionAmounts = .{},
+    admission_after: runtime.tier.memory.AdmissionAmounts = .{},
+    /// Immutable generation-sibling context proof. HTTP and streaming copy
+    /// this from the pipeline only after the selected route has completed.
+    quality_generation_binding: ?context_teacher_forced.ContextBinding = null,
+};
+
+fn bindRenderedPromptObservation(
+    observation: *ContextServingObservation,
+    prompt: *const Node.NativePromptEstimate,
+) void {
+    std.crypto.hash.sha2.Sha256.hash(prompt.prompt, &observation.rendered_prompt_sha256, .{});
+}
+
+fn releaseContextRequestOwner(
+    owner: *runtime.kv.host_allocation_tracker.RequestAllocationOwner,
+    observation: ?*ContextServingObservation,
+) void {
+    const receipt = owner.release();
+    if (observation) |value| {
+        value.owner_allocation = receipt.allocation;
+        value.owner_allocation_initial = receipt.initial;
+        value.owner_allocation_committed = receipt.committed;
+        value.owner_allocation_final = receipt.final;
+        value.owner_measurement = receipt.measurement;
+        value.owner_released = receipt.released;
+        value.owner_post_release_live_bytes = receipt.post_release_live_bytes;
+        value.context_allocation_scope_version = receipt.context_allocation_scope_version;
+        value.context_allocation_scope_complete = receipt.context_allocation_scope_complete;
+        value.model_execution_pool_admission_version = receipt.model_execution_pool_admission_version;
+        value.model_execution_pool_admitted_backend_bytes = receipt.model_execution_pool_admitted_backend_bytes;
+        value.full_owner_physical_available = receipt.full_owner_physical_available;
+        if (receipt.full_owner_physical_available and receipt.measurement.available) {
+            value.committed_context_bytes = std.math.cast(usize, receipt.measurement.committed_live_bytes);
+            value.context_peak_bytes = std.math.cast(usize, receipt.measurement.request_peak_bytes);
+            if (value.committed_context_bytes == null or value.context_peak_bytes == null)
+                value.full_owner_physical_available = false;
+        }
+    }
+}
+
+fn logMetalCheckpointQualificationRelease(
+    route: generation.MetalCheckpointQualificationRoute,
+    request: u64,
+    receipt: runtime.kv.host_allocation_tracker.RequestAllocationOwner.ReleaseReceipt,
+) void {
+    if (comptime !builtin.is_test) return;
+    std.debug.print("metal_checkpoint_qualification {{\"schema\":\"antfly.metal-checkpoint-release.v1\",\"phase\":\"final_release\",\"request\":{d},\"route\":\"{s}\",\"owner_id\":{d},\"released\":{},\"scope_complete\":{},\"full_owner_physical_available\":{},\"initial_live_bytes\":{d},\"committed_live_bytes\":{d},\"final_live_bytes\":{d},\"initial_peak_bytes\":{d},\"committed_peak_bytes\":{d},\"final_peak_bytes\":{d},\"measured_available\":{},\"measured_committed_bytes\":{d},\"measured_peak_bytes\":{d},\"post_release_live_bytes\":{d}}}\n", .{
+        request,
+        @tagName(route),
+        receipt.initial.owner_identity,
+        receipt.released,
+        receipt.context_allocation_scope_complete,
+        receipt.full_owner_physical_available,
+        receipt.initial.tracked_combined_live_bytes,
+        receipt.committed.tracked_combined_live_bytes,
+        receipt.final.tracked_combined_live_bytes,
+        receipt.initial.tracked_combined_peak_bytes,
+        receipt.committed.tracked_combined_peak_bytes,
+        receipt.final.tracked_combined_peak_bytes,
+        receipt.measurement.available,
+        receipt.measurement.committed_live_bytes,
+        receipt.measurement.request_peak_bytes,
+        receipt.post_release_live_bytes orelse std.math.maxInt(u64),
+    });
+}
+
+fn releaseBatchContextOwner(
+    owner: *runtime.kv.host_allocation_tracker.RequestAllocationOwner,
+    member_request_indices: []const usize,
+    sink: ContextBatchAllocationSinkSlot,
+) void {
+    const receipt = owner.release();
+    if (comptime builtin.is_test) {
+        if (sink) |target| target.complete_fn(target.ctx, .{
+            .member_request_indices = member_request_indices,
+            .receipt = receipt,
+        });
+    }
+}
+
+fn captureCommittedContextOwner(
+    owner: *runtime.kv.host_allocation_tracker.RequestAllocationOwner,
+    witness: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner.ContextScopeWitness,
+    observation: ?*ContextServingObservation,
+) !void {
+    const committed = owner.tracker.snapshot();
+    if (witness) |proof|
+        try owner.setDrainedCommittedSnapshot(proof, committed)
+    else
+        try owner.setCommittedSnapshot(committed);
+    if (observation) |value| {
+        value.owner_allocation_initial = owner.initial;
+        value.owner_allocation_committed = committed;
+    }
+}
+
+fn preserveCommittedContextOwner(
+    owner: *runtime.kv.host_allocation_tracker.RequestAllocationOwner,
+    witness: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner.ContextScopeWitness,
+    observation: ?*ContextServingObservation,
+    committed: runtime.kv.host_allocation_tracker.Snapshot,
+) !void {
+    if (witness) |proof|
+        try owner.setDrainedCommittedSnapshot(proof, committed)
+    else
+        try owner.setCommittedSnapshot(committed);
+    if (observation) |value| {
+        value.owner_allocation_initial = owner.initial;
+        value.owner_allocation_committed = committed;
+    }
+}
+
+fn finishContextExecutionLease(lease: *context_execution_pool.Lease) !void {
+    try lease.drainForBufferRelease();
+    try lease.release();
+}
+
+fn abandonContextExecutionLease(
+    lease: *context_execution_pool.Lease,
+    observation: ?*ContextServingObservation,
+) void {
+    finishContextExecutionLease(lease) catch {
+        if (observation) |value| value.route_completed = false;
+        // Drain marks terminal GPU failures poisoned. If the strict release
+        // precondition still failed, invalidate the lane and unlock it rather
+        // than stranding the model-wide pool mutex.
+        lease.poisonAndRelease();
+    };
+}
+
+test "context batch allocation sink receives one group owner receipt" {
+    const Capture = struct {
+        calls: usize = 0,
+        member_request_indices: [2]usize = @splat(0),
+        member_count: usize = 0,
+        expected_items: u64 = 0,
+
+        fn complete(raw: *anyopaque, observation: ContextBatchAllocationObservation) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.member_count = observation.member_request_indices.len;
+            @memcpy(self.member_request_indices[0..observation.member_request_indices.len], observation.member_request_indices);
+            self.expected_items = observation.receipt.context_batch_expected_items;
+        }
+    };
+    var capture = Capture{};
+    var owner = try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null);
+    const witness = try owner.beginContextScope(71);
+    try owner.bindBatchGroup(witness, .exact_siblings, 2);
+    releaseBatchContextOwner(&owner, &.{ 9, 12 }, .{ .ctx = &capture, .complete_fn = Capture.complete });
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(usize, 2), capture.member_count);
+    try std.testing.expectEqualSlices(usize, &.{ 9, 12 }, capture.member_request_indices[0..capture.member_count]);
+    try std.testing.expectEqual(@as(u64, 2), capture.expected_items);
+}
+
+pub const ContextServingObservationSink = struct {
+    ctx: *anyopaque,
+    complete_fn: *const fn (*anyopaque, ContextServingObservation) void,
+};
+
+pub const ContextServingFailureObservation = struct {
+    failure: anyerror,
+    loaded_identity: ContextServingLoadedIdentity,
+    original_before: ?@import("../backends/packed_context_session.zig").FailureFingerprint,
+    original_after: ?@import("../backends/packed_context_session.zig").FailureFingerprint,
+    partial_prefill: ?@import("../backends/packed_context_session.zig").FailureFingerprint,
+    injection: context_fault_injection.Observation,
+    maintenance_kv_readback_before: u64,
+    maintenance_kv_readback_after: u64,
+    release_receipt: runtime.kv.host_allocation_tracker.RequestAllocationOwner.ReleaseReceipt = .{},
+};
+
+pub const ContextServingFailureObservationSink = struct {
+    ctx: *anyopaque,
+    complete_fn: *const fn (*anyopaque, ContextServingFailureObservation) void,
+};
+pub const ContextServingFailureSinkSlot = if (builtin.is_test) ?ContextServingFailureObservationSink else void;
+
+/// One receipt per real shared batch execution allocation. Exact siblings use
+/// one record for their shared KV runtime; attention matching is constrained
+/// to a singleton and remains bound to that item's request index.
+pub const ContextBatchAllocationObservation = struct {
+    /// Borrowed only for the synchronous callback. A sink that retains an
+    /// observation must copy this slice before returning.
+    member_request_indices: []const usize,
+    receipt: runtime.kv.host_allocation_tracker.RequestAllocationOwner.ReleaseReceipt,
+};
+
+pub const ContextBatchAllocationObservationSink = struct {
+    ctx: *anyopaque,
+    complete_fn: *const fn (*anyopaque, ContextBatchAllocationObservation) void,
+};
+
+pub const ContextBatchAllocationSinkSlot = if (builtin.is_test)
+    ?ContextBatchAllocationObservationSink
+else
+    void;
+
+/// Per-item completion from the genuine batch generation task. Allocation
+/// ownership remains group-scoped and is joined by request_index at the driver.
+pub const ContextBatchServingObservation = struct {
+    request_index: usize,
+    observation: ContextServingObservation,
+    elapsed_ns: u64,
+    ttft_ns: u64,
+    decode_ns: u64,
+};
+
+pub const ContextBatchServingObservationSink = struct {
+    ctx: *anyopaque,
+    complete_fn: *const fn (*anyopaque, ContextBatchServingObservation) void,
+};
+
+pub const ContextBatchServingSinkSlot = if (builtin.is_test)
+    ?ContextBatchServingObservationSink
+else
+    void;
+const ContextBatchServingObservationSlice = if (builtin.is_test)
+    []?ContextBatchServingObservation
+else
+    void;
+
+pub const ContextServingObservationSlot = if (builtin.is_test)
+    ?ContextServingObservation
+else
+    void;
+pub const ContextServingSinkSlot = if (builtin.is_test)
+    ?ContextServingObservationSink
+else
+    void;
+pub const ContextServingQualification = struct {
+    variant: enum { exact, packed_exact, attention_matching },
+    /// Direct qualification supplies the exact caller-bound policy. HTTP
+    /// qualification leaves this null and uses the parsed request policy.
+    policy: ?runtime.context_policy.Policy = null,
+    optimize_decode: bool = false,
+    optimize_prefill: bool = false,
+    /// Frozen by the qualification entrypoint's loaded profile. It has no
+    /// public request representation and cannot be selected by clients.
+    fit_engine: @import("../runtime/kv/compaction_profile.zig").FitEngine = .block_v1,
+    /// Parent-admitted fixed chunk geometry used by qualification. Zero is
+    /// invalid for coverage and never silently selects an adaptive value.
+    admitted_prefill_chunk_rows: u32 = 0,
+    fault_controller: context_fault_injection.Slot = if (builtin.is_test) null else {},
+    quality: if (builtin.is_test) ?context_teacher_forced.Request else void = if (builtin.is_test) null else {},
+    coverage: ?ContextServingCoverage = null,
+};
+
+/// Fixed test-binary route used to collect genuine preparation coverage before
+/// a retention profile exists. It authorizes no retention or publication.
+pub const context_coverage_reference_route = .{
+    .split_decode = true,
+    .flash_prefill = true,
+};
+
+fn validateQualificationPrefillChunk(prompt_tokens: usize, sealed_rows: u32, admitted_rows: usize) !void {
+    if (prompt_tokens == 0 or sealed_rows == 0 or admitted_rows != @min(prompt_tokens, @as(usize, sealed_rows)))
+        return error.ContextQualificationChunkMismatch;
+}
+
+fn validateContextQualificationOutputCount(actual: usize, reserved: usize, fixed_length: bool) !void {
+    if (actual == 0 or actual > reserved or (fixed_length and actual != reserved))
+        return error.IncompleteContextQualificationTokens;
+}
+
+test "context qualification prefill chunk binds admitted geometry" {
+    try validateQualificationPrefillChunk(8160, 64, 64);
+    try validateQualificationPrefillChunk(31, 64, 31);
+    try std.testing.expectError(error.ContextQualificationChunkMismatch, validateQualificationPrefillChunk(8160, 64, 63));
+    try std.testing.expectError(error.ContextQualificationChunkMismatch, validateQualificationPrefillChunk(8160, 0, 0));
+    try std.testing.expectError(error.ContextQualificationChunkMismatch, validateQualificationPrefillChunk(0, 64, 0));
+}
+
+test "context quality permits bounded early completion while fixed probes do not" {
+    try validateContextQualificationOutputCount(3, 8, false);
+    try validateContextQualificationOutputCount(8, 8, true);
+    try std.testing.expectError(
+        error.IncompleteContextQualificationTokens,
+        validateContextQualificationOutputCount(3, 8, true),
+    );
+    try std.testing.expectError(
+        error.IncompleteContextQualificationTokens,
+        validateContextQualificationOutputCount(0, 8, false),
+    );
+}
+
+pub const ContextServingCoverage = struct {
+    allocator: std.mem.Allocator,
+    request: context_capture_coverage.RequestBinding,
+    document: context_capture_coverage.Document,
+    provenance: context_capture_coverage.Provenance,
+    sink: context_capture_coverage.EvidenceSink,
+};
+
+fn isCoverageReference(qualification: ContextServingQualification) bool {
+    return qualification.coverage != null and qualification.variant == .packed_exact;
+}
+
+fn applyQualificationFitEngine(
+    config: *generation.GenerationConfig,
+    qualification: ContextServingQualification,
+) void {
+    config.context_fit_engine = qualification.fit_engine;
+}
+
+test "context qualification retains profile fit engine in generation config" {
+    var config = generation.GenerationConfig{};
+    const sealed = ContextServingQualification{
+        .variant = .attention_matching,
+        .fit_engine = .native_whole_head_v2,
+    };
+    applyQualificationFitEngine(&config, sealed);
+    try std.testing.expect(config.context_fit_engine == .native_whole_head_v2);
+}
+
+fn exactCoverageReferencePolicy(source: runtime.context_policy.Policy) runtime.context_policy.Policy {
+    return .{
+        .mode = .exact,
+        .max_context_tokens = source.max_context_tokens,
+        .keep_prefix_tokens = source.keep_prefix_tokens,
+        .keep_recent_tokens = source.keep_recent_tokens,
+    };
+}
+pub const ContextServingQualificationSlot = if (builtin.is_test)
+    ?ContextServingQualification
+else
+    void;
+
+comptime {
+    if (!builtin.is_test and (ContextServingObservationSlot != void or ContextServingSinkSlot != void or ContextServingQualificationSlot != void or ContextServingFailureSinkSlot != void))
+        @compileError("release builds must not compile context qualification observer storage");
+}
+
+const ContextRouteCompletion = struct {
+    completed: bool = false,
+    prompt_tokens: usize = 0,
+    output_tokens: usize = 0,
+    output_token_ids: [4096]u32 = @splat(0),
+    output_token_ids_len: u32 = 0,
+    public_output_sha256: [32]u8 = @splat(0),
+    public_output_bytes: u32 = 0,
+    public_output_bound: bool = false,
+    elapsed_ns: u64 = 0,
+    ttft_ns: u64 = 0,
+    decode_ns: u64 = 0,
+
+    fn setTiming(self: *@This(), timing: ?generation.GenerationTimingMs) void {
+        const value = timing orelse return;
+        const first = value.first_token orelse return;
+        self.elapsed_ns = std.math.mul(u64, value.total, std.time.ns_per_ms) catch 0;
+        self.ttft_ns = std.math.mul(u64, first, std.time.ns_per_ms) catch 0;
+        self.decode_ns = std.math.mul(u64, value.decode, std.time.ns_per_ms) catch 0;
+        if (self.elapsed_ns == 0 or self.ttft_ns == 0 or self.decode_ns == 0 or
+            self.ttft_ns > self.elapsed_ns or self.decode_ns > self.elapsed_ns)
+            self.elapsed_ns = 0;
+    }
+
+    fn setTokenIds(self: *@This(), ids: ?[]const i32) void {
+        const values = ids orelse return;
+        if (values.len > self.output_token_ids.len) return;
+        for (values, self.output_token_ids[0..values.len]) |id, *out| {
+            if (id < 0) return;
+            out.* = @intCast(id);
+        }
+        self.output_token_ids_len = @intCast(values.len);
+    }
+
+    fn setPublicOutput(self: *@This(), digest: [32]u8, byte_count: usize) void {
+        self.public_output_bytes = std.math.cast(u32, byte_count) orelse return;
+        self.public_output_sha256 = digest;
+        self.public_output_bound = true;
+    }
+};
+
+fn shouldCommitMetalCheckpointQualificationStream(
+    portable_metal_qualification: bool,
+    completion: ContextRouteCompletion,
+) bool {
+    return portable_metal_qualification and completion.completed;
+}
+
+test "context Metal checkpoint stream owner commits only completed generation" {
+    try std.testing.expect(shouldCommitMetalCheckpointQualificationStream(true, .{ .completed = true }));
+    try std.testing.expect(!shouldCommitMetalCheckpointQualificationStream(true, .{}));
+    try std.testing.expect(!shouldCommitMetalCheckpointQualificationStream(false, .{ .completed = true }));
+}
+
+fn completeContextServingObservation(
+    observation: *ContextServingObservation,
+    selection: model_manager_mod.LoadedModel.CompactionSelection,
+    request: *const @import("../backends/compaction_coordinator.zig").CampaignRequest,
+    completion: ContextRouteCompletion,
+    reserved_output_tokens: usize,
+) void {
+    observation.loaded_identity = .{
+        .load_generation = selection.load_generation,
+        .artifact_sha256 = selection.identity.artifact,
+        .tokenizer_sha256 = selection.identity.tokenizer,
+        .template_sha256 = selection.identity.template,
+        .layout_sha256 = selection.identity.layout,
+        .profile_sha256 = selection.profile_sha256,
+        .implementation_sha256 = selection.identity.runtime,
+    };
+    observation.profile_semantic_digest = selection.profile_semantic_digest;
+    observation.prompt_tokens = completion.prompt_tokens;
+    observation.reserved_output_tokens = reserved_output_tokens;
+    observation.output_tokens = completion.output_tokens;
+    observation.output_token_ids = completion.output_token_ids;
+    observation.output_token_ids_len = completion.output_token_ids_len;
+    observation.public_output_sha256 = completion.public_output_sha256;
+    observation.public_output_bytes = completion.public_output_bytes;
+    observation.public_output_bound = completion.public_output_bound;
+    observation.route_elapsed_ns = completion.elapsed_ns;
+    observation.route_ttft_ns = completion.ttft_ns;
+    observation.route_decode_ns = completion.decode_ns;
+    observation.chunk_rows = request.config.max_query_rows;
+    observation.retained_limit = request.retained_limit;
+    observation.backend_peak_bytes = request.backend_peak_bytes;
+    observation.host_peak_bytes = request.host_peak_bytes;
+    observation.execution_peak_bytes = request.execution_peak_bytes;
+    observation.request_bytes = request.request_bytes;
+    observation.publication_attempted = request.publication_attempted;
+    observation.published = request.published;
+    observation.committed_before_bytes = request.committed_before_bytes;
+    observation.committed_after_bytes = request.committed_after_bytes;
+    observation.backend_kv_readback_before = request.backend_kv_readback_before;
+    observation.backend_kv_readback_after = request.backend_kv_readback_after;
+    observation.route_completed = completion.completed and request.published;
+}
+
+fn captureContextServingCoverage(
+    qualification: ContextServingQualification,
+    policy: runtime.context_policy.Policy,
+    model: *model_manager_mod.LoadedModel,
+    messages: []const generation.Message,
+    prompt: *const Node.NativePromptEstimate,
+    loaded: model_manager_mod.LoadedModel.CompactionIdentity,
+    reserved_output_tokens: u32,
+    elapsed_ns: u64,
+    metrics: ?runtime.kv.context_session.Metrics,
+) !void {
+    const binding = qualification.coverage orelse return;
+    if (!isCoverageReference(qualification) or policy.mode != .attention_matching)
+        return error.InvalidCoverageObservation;
+    const eligible = if (prompt.eligible) |*value| value else return error.InvalidPayloadProvenance;
+    const finalized = metrics orelse return error.MissingContextCoverageMetrics;
+    const prepared = generation.PreparedCompactionPayload{
+        .allocator = prompt.allocator,
+        .rendered = .{ .text = prompt.prompt, .labels = prompt.provenance_labels },
+        .encoded = prompt.encoded,
+        .eligible = eligible.*,
+    };
+    const chat_template = model.chat_tmpl orelse return error.UnsupportedCompactionTemplate;
+    const tokenizer = model.getTokenizer();
+    // Fit and gate are private qualification branches. Their prompt is the
+    // complete admitted request plus a bounded compiled suffix and response,
+    // so the public retained-context window is not their position limit. Use
+    // the loaded model's real positional capacity and let preparation reject
+    // the branch if it cannot fit; never truncate a study prompt.
+    const gpt_config = session_factory.getGptConfig(model.session) orelse
+        return error.UnsupportedContextQualification;
+    const study_position_limit: usize = gpt_config.max_position_embeddings;
+    const template_options: generation.ChatTemplate.ApplyOptions = .{ .enable_thinking = false };
+    var question = try generation.prepareCompactionQuestion(
+        binding.allocator,
+        chat_template,
+        tokenizer,
+        messages,
+        template_options,
+        policy,
+        &prepared,
+    );
+    defer question.deinit();
+    var fit_study = try generation.prepareCompactionStudy(
+        binding.allocator,
+        chat_template,
+        tokenizer,
+        messages,
+        template_options,
+        &prepared,
+        .fit,
+        context_study_templates.authority(.fit),
+        study_position_limit,
+        model.manifest.add_bos_token,
+    );
+    defer fit_study.deinit();
+    var gate_study = try generation.prepareCompactionStudy(
+        binding.allocator,
+        chat_template,
+        tokenizer,
+        messages,
+        template_options,
+        &prepared,
+        .gate,
+        context_study_templates.authority(.gate),
+        study_position_limit,
+        model.manifest.add_bos_token,
+    );
+    defer gate_study.deinit();
+    const evidence = try context_capture_coverage.capturePreparedParts(
+        binding.allocator,
+        binding.request,
+        binding.document,
+        policy,
+        prompt.prompt,
+        &prompt.encoded,
+        prompt.provenance_labels,
+        eligible,
+        &question,
+        &fit_study,
+        &gate_study,
+        reserved_output_tokens,
+        qualification.admitted_prefill_chunk_rows,
+        loaded.load_generation,
+        loaded.identity,
+        binding.provenance,
+        .{
+            .elapsed_ns = elapsed_ns,
+            .status_readback_bytes = finalized.attention_status_readback_bytes,
+            .kv_readback_bytes = finalized.kv_readback_bytes,
+        },
+    );
+    // Ownership transfers unconditionally; do not retain or deinit here.
+    binding.sink.complete(evidence);
+}
+
+fn completeExactServingObservationIdentity(
+    observation: *ContextServingObservation,
+    loaded: model_manager_mod.LoadedModel.CompactionIdentity,
+    profile_sha256: [32]u8,
+    profile_semantic_digest: [32]u8,
+    completion: ContextRouteCompletion,
+    reserved_output_tokens: usize,
+    metrics: ?runtime.kv.context_session.Metrics,
+    device_allocation_start: runtime.kv.storage_runtime.DeviceAllocationSnapshot,
+    device_allocation_end: runtime.kv.storage_runtime.DeviceAllocationSnapshot,
+) void {
+    observation.loaded_identity = .{
+        .load_generation = loaded.load_generation,
+        .artifact_sha256 = loaded.identity.artifact,
+        .tokenizer_sha256 = loaded.identity.tokenizer,
+        .template_sha256 = loaded.identity.template,
+        .layout_sha256 = loaded.identity.layout,
+        .profile_sha256 = profile_sha256,
+        .implementation_sha256 = loaded.identity.runtime,
+    };
+    observation.profile_semantic_digest = profile_semantic_digest;
+    observation.prompt_tokens = completion.prompt_tokens;
+    observation.reserved_output_tokens = reserved_output_tokens;
+    observation.output_tokens = completion.output_tokens;
+    observation.output_token_ids = completion.output_token_ids;
+    observation.output_token_ids_len = completion.output_token_ids_len;
+    observation.route_elapsed_ns = completion.elapsed_ns;
+    observation.route_ttft_ns = completion.ttft_ns;
+    observation.route_decode_ns = completion.decode_ns;
+    observation.device_allocation_start = device_allocation_start;
+    observation.device_allocation_end = device_allocation_end;
+    if (metrics) |value| {
+        // Packed metrics cover its KV/control allocation but exclude prompt
+        // preparation and other request-owner allocations. Preserve the raw
+        // diagnostic without advertising it as total committed context.
+        observation.committed_before_bytes = value.live_bytes;
+        observation.committed_after_bytes = value.live_bytes;
+        observation.backend_kv_readback_before = 0;
+        observation.backend_kv_readback_after = value.kv_readback_bytes;
+    } else {
+        // Automatic KV owns only the device buffers described by these
+        // snapshots. Host page tables and control metadata are not yet
+        // measured, so do not mislabel device KV as total committed context.
+        if (!device_allocation_start.available or !device_allocation_end.available or
+            device_allocation_end.readback_bytes < device_allocation_start.readback_bytes)
+            return;
+        observation.backend_kv_readback_before = device_allocation_start.readback_bytes;
+        observation.backend_kv_readback_after = device_allocation_end.readback_bytes;
+    }
+    observation.route_completed = completion.completed;
+}
+
+fn completeExactServingObservation(
+    observation: *ContextServingObservation,
+    selection: model_manager_mod.LoadedModel.CompactionSelection,
+    completion: ContextRouteCompletion,
+    reserved_output_tokens: usize,
+    metrics: ?runtime.kv.context_session.Metrics,
+    device_allocation_start: runtime.kv.storage_runtime.DeviceAllocationSnapshot,
+    device_allocation_end: runtime.kv.storage_runtime.DeviceAllocationSnapshot,
+) void {
+    completeExactServingObservationIdentity(
+        observation,
+        .{ .load_generation = selection.load_generation, .identity = selection.identity },
+        selection.profile_sha256,
+        selection.profile_semantic_digest,
+        completion,
+        reserved_output_tokens,
+        metrics,
+        device_allocation_start,
+        device_allocation_end,
+    );
+}
+
+test "context serving observation binds finalized request ledger" {
+    const compaction = @import("../backends/compaction_coordinator.zig");
+    const profile = @import("../runtime/kv/compaction_profile.zig").Profile{
+        .identity = .{
+            .artifact = @splat(1),
+            .tokenizer = @splat(2),
+            .template = @splat(3),
+            .layout = @splat(4),
+            .runtime = @splat(5),
+        },
+        .artifact_sha256 = @splat(6),
+        .owners = &.{},
+        .max_prompt_tokens = 1024,
+        .max_output_tokens = 32,
+        .minimum_saved_bytes = 4096,
+    };
+    const selection: model_manager_mod.LoadedModel.CompactionSelection = .{
+        .load_generation = 17,
+        .identity = profile.identity,
+        .profile = &profile,
+        .profile_sha256 = profile.artifact_sha256,
+        .profile_semantic_digest = profile.semanticDigest(),
+    };
+    var request: compaction.CampaignRequest = undefined;
+    request.config.max_query_rows = 64;
+    request.retained_limit = 256;
+    request.backend_peak_bytes = 10;
+    request.host_peak_bytes = 11;
+    request.execution_peak_bytes = 12;
+    request.request_bytes = 13;
+    request.publication_attempted = true;
+    request.published = true;
+    request.committed_before_bytes = 100;
+    request.committed_after_bytes = 40;
+    request.backend_kv_readback_before = 3;
+    request.backend_kv_readback_after = 3;
+    var observation: ContextServingObservation = .{};
+    completeContextServingObservation(&observation, selection, &request, .{
+        .completed = true,
+        .prompt_tokens = 768,
+        .output_tokens = 8,
+    }, 32);
+    try std.testing.expect(observation.route_completed);
+    try std.testing.expectEqual(@as(u64, 17), observation.loaded_identity.load_generation);
+    try std.testing.expectEqual(@as([32]u8, @splat(6)), observation.loaded_identity.profile_sha256);
+    try std.testing.expectEqual(@as([32]u8, @splat(5)), observation.loaded_identity.implementation_sha256);
+    try std.testing.expectEqual(@as(usize, 100), observation.committed_before_bytes);
+    try std.testing.expectEqual(@as(usize, 40), observation.committed_after_bytes);
+    try std.testing.expectEqual(@as(u64, 3), observation.backend_kv_readback_after);
+    try std.testing.expectEqual(@as(u32, 64), observation.chunk_rows);
+}
+
+test "context exact serving observation separates device diagnostics from total accounting" {
+    const profile = @import("../runtime/kv/compaction_profile.zig").Profile{
+        .identity = .{
+            .artifact = @splat(1),
+            .tokenizer = @splat(2),
+            .template = @splat(3),
+            .layout = @splat(4),
+            .runtime = @splat(5),
+        },
+        .artifact_sha256 = @splat(6),
+        .owners = &.{},
+        .max_prompt_tokens = 1024,
+        .max_output_tokens = 32,
+        .minimum_saved_bytes = 4096,
+    };
+    const selection: model_manager_mod.LoadedModel.CompactionSelection = .{
+        .load_generation = 17,
+        .identity = profile.identity,
+        .profile = &profile,
+        .profile_sha256 = profile.artifact_sha256,
+        .profile_semantic_digest = profile.semanticDigest(),
+    };
+    const start = runtime.kv.storage_runtime.DeviceAllocationSnapshot{
+        .available = true,
+        .live_bytes = 100,
+        .peak_bytes = 120,
+        .kv_bytes = 80,
+        .readback_bytes = 7,
+    };
+    const end = runtime.kv.storage_runtime.DeviceAllocationSnapshot{
+        .available = true,
+        .live_bytes = 220,
+        .peak_bytes = 256,
+        .kv_bytes = 192,
+        .readback_bytes = 7,
+    };
+    var observation: ContextServingObservation = .{};
+    completeExactServingObservation(&observation, selection, .{ .completed = true }, 8, null, start, end);
+    try std.testing.expect(observation.route_completed);
+    try std.testing.expect(observation.committed_context_bytes == null);
+    try std.testing.expect(observation.context_peak_bytes == null);
+    try std.testing.expectEqual(start, observation.device_allocation_start);
+    try std.testing.expectEqual(end, observation.device_allocation_end);
+    try std.testing.expectEqual(@as(u64, 7), observation.backend_kv_readback_before);
+    try std.testing.expectEqual(@as(u64, 7), observation.backend_kv_readback_after);
+
+    observation = .{};
+    completeExactServingObservation(&observation, selection, .{ .completed = true }, 8, .{
+        .live_bytes = 144,
+        .peak_bytes = 200,
+        .kv_readback_bytes = 3,
+    }, start, end);
+    try std.testing.expect(observation.committed_context_bytes == null);
+    try std.testing.expect(observation.context_peak_bytes == null);
+    try std.testing.expectEqual(@as(usize, 144), observation.committed_before_bytes);
+    try std.testing.expectEqual(@as(usize, 144), observation.committed_after_bytes);
+    try std.testing.expectEqual(@as(u64, 3), observation.backend_kv_readback_after);
+}
+
+test "context coverage identity binds loaded bytes without retention authorization" {
+    const loaded = model_manager_mod.LoadedModel.CompactionIdentity{
+        .load_generation = 23,
+        .identity = .{
+            .artifact = @splat(1),
+            .tokenizer = @splat(2),
+            .template = @splat(3),
+            .layout = @splat(4),
+            .runtime = @splat(5),
+        },
+    };
+    var observation: ContextServingObservation = .{};
+    completeExactServingObservationIdentity(
+        &observation,
+        loaded,
+        @splat(0),
+        @splat(0),
+        .{ .completed = true, .prompt_tokens = 512, .output_tokens = 4 },
+        4,
+        .{ .live_bytes = 4096 },
+        .{},
+        .{},
+    );
+    try std.testing.expect(observation.route_completed);
+    try std.testing.expectEqual(@as(u64, 23), observation.loaded_identity.load_generation);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), observation.loaded_identity.profile_sha256);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), observation.profile_semantic_digest);
+    try std.testing.expectEqual(@as([32]u8, @splat(5)), observation.loaded_identity.implementation_sha256);
+}
+
+test "context serving owner release remains fail closed for partial physical scope" {
+    var owner = try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null);
+    const bytes = try owner.allocator().alloc(u8, 257);
+    owner.allocator().free(bytes);
+    var observation = ContextServingObservation{};
+    releaseContextRequestOwner(&owner, &observation);
+    try std.testing.expect(observation.owner_released);
+    try std.testing.expect(!observation.full_owner_physical_available);
+    try std.testing.expect(observation.committed_context_bytes == null);
+    try std.testing.expect(observation.context_peak_bytes == null);
+    if (observation.owner_allocation.tracked_combined_physical_available)
+        try std.testing.expectEqual(@as(?u64, 0), observation.owner_post_release_live_bytes);
+}
+
 pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
     if (mib == 0) return error.InvalidHttpBodyLimit;
     return std.math.mul(usize, mib, 1024 * 1024) catch error.InvalidHttpBodyLimit;
@@ -1682,7 +2514,7 @@ fn shouldAutoUseMetalWholeModelGenerate(
 ) bool {
     if (!build_options.enable_metal) return false;
     // The whole-model executor prefills from token ids into its own KV
-    // storage. Image and audio prompts are prefilled from projected
+    // storage. Image, video and audio prompts are prefilled from projected
     // embeddings on the eager decode state instead, so the executor would
     // start decoding with an empty cache and fail its position check.
     if (has_multimodal_input) return false;
@@ -1706,10 +2538,29 @@ fn shouldAutoUseMetalWholeModelGenerate(
 
 fn generateMessagesHaveMedia(messages: []const generation.Message) bool {
     for (messages) |message| {
-        if (message.image_bytes) |images| if (images.len > 0) return true;
+        if (message.hasImages()) return true;
         if (message.audio_bytes) |clips| if (clips.len > 0) return true;
     }
     return false;
+}
+
+test "context video-only request stays off the automatic whole-model route" {
+    const messages = [_]generation.Message{.{
+        .role = "user",
+        .content = "Describe this video.",
+        .video_bytes = "video-fixture",
+    }};
+    const selection = try parseGenerateBackendSelection(null, null, null);
+    try std.testing.expect(generateMessagesHaveMedia(&messages));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(
+        .metal,
+        true,
+        false,
+        false,
+        false,
+        generateMessagesHaveMedia(&messages),
+        selection,
+    ));
 }
 
 fn validatePromptCacheExecutionMode(
@@ -3991,6 +4842,35 @@ test "raw ModernBERT span listing selects only the qualified decision route" {
     try std.testing.expect(decideExecutionContract(manifest) == null);
 }
 
+fn parseMetalCheckpointQualificationMinimumSavings(raw: []const u8) !f64 {
+    const minimum = std.fmt.parseFloat(f64, raw) catch
+        return error.InvalidNativeCheckpointRequest;
+    if (!std.math.isFinite(minimum) or minimum <= 1 or minimum > 4)
+        return error.InvalidNativeCheckpointRequest;
+    return minimum;
+}
+
+fn allowMetalCheckpointQualificationOverride(
+    grant: bool,
+    node_backend: ?backends_mod.BackendType,
+    model_backend: ?backends_mod.BackendType,
+) bool {
+    return grant and node_backend == .metal and model_backend == .metal;
+}
+
+test "context Metal checkpoint qualification minimum savings is bounded and backend gated" {
+    try std.testing.expectEqual(@as(f64, 1.0001), try parseMetalCheckpointQualificationMinimumSavings("1.0001"));
+    try std.testing.expectEqual(@as(f64, 4), try parseMetalCheckpointQualificationMinimumSavings("4"));
+    for ([_][]const u8{ "1", "0", "4.0001", "nan", "inf", "not-a-number" }) |raw|
+        try std.testing.expectError(error.InvalidNativeCheckpointRequest, parseMetalCheckpointQualificationMinimumSavings(raw));
+
+    try std.testing.expect(allowMetalCheckpointQualificationOverride(true, .metal, .metal));
+    try std.testing.expect(!allowMetalCheckpointQualificationOverride(false, .metal, .metal));
+    try std.testing.expect(!allowMetalCheckpointQualificationOverride(true, .native, .metal));
+    try std.testing.expect(!allowMetalCheckpointQualificationOverride(true, .metal, .native));
+    try std.testing.expect(!allowMetalCheckpointQualificationOverride(true, null, .metal));
+}
+
 pub const Node = struct {
     native_checkpoint_active: std.atomic.Value(bool) = .init(false),
     config: NodeConfig,
@@ -4029,6 +4909,27 @@ pub const Node = struct {
     readiness_refresh_io: ?std.Io = null,
     readiness_refresh_started: bool = false,
     hard_cancellation_watchdog: ?*HardCancellationWatchdog = null,
+    /// Manager-scoped qualification output. This is absent from release
+    /// binaries and is never selected through HTTP, environment, or globals.
+    context_serving_observation_sink: ContextServingSinkSlot = if (builtin.is_test) null else {},
+    context_serving_failure_sink: ContextServingFailureSinkSlot = if (builtin.is_test) null else {},
+    /// Test-binary evidence boundary for group-scoped batch allocation. It is
+    /// absent from release binaries and cannot be selected through HTTP.
+    context_batch_allocation_sink: ContextBatchAllocationSinkSlot = if (builtin.is_test) null else {},
+    /// Test-binary per-item batch completion facts. Allocation remains a
+    /// separate group receipt so shared exact bytes cannot be double-counted.
+    context_batch_serving_sink: ContextBatchServingSinkSlot = if (builtin.is_test) null else {},
+    /// Serial qualification drivers may select a storage variant without
+    /// creating a request-controlled or environment-controlled production
+    /// bypass. Release builds contain no value or callable injection path.
+    context_serving_qualification: ContextServingQualificationSlot = if (builtin.is_test) null else {},
+    /// Test-binary-only grant for the public portable Metal checkpoint routes.
+    /// This is deliberately independent from the legacy context-policy/profile
+    /// qualification above: portable checkpoint preparation authenticates the
+    /// loaded model and validates every fitted head within the request. Release
+    /// Node layouts contain no boolean or runtime setter for this capability.
+    test_allow_metal_native_checkpoint: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    test_metal_checkpoint_request_counter: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     /// Only native tests may cross the unpublished boundary-model capability
     /// gate to qualify this handler. Production has no value or runtime knob;
     /// architecture, artifact, backend and resource checks still apply.
@@ -5613,14 +6514,84 @@ pub const Node = struct {
         total_ms: u64 = 0,
     };
 
-    const DirectGenerateOutput = struct {
+    pub const DirectGenerateOutput = struct {
         text: []u8,
+        reasoning_text: ?[]u8 = null,
         prompt_tokens: usize,
         completion_tokens: usize,
         truncated: bool,
         /// Prompt tokens served from the model's prefix KV cache.
         cached_prompt_tokens: usize = 0,
+        context_observation: ?ContextServingObservation = null,
+        teacher_forced_receipt: ?context_teacher_forced.Receipt = null,
+        elapsed_ns: u64 = 0,
+        ttft_ns: u64 = 0,
+        decode_ns: u64 = 0,
     };
+
+    const DirectQualificationClock = struct {
+        started_ns: u128,
+        first_token_ns: u128 = 0,
+
+        fn onToken(raw: *anyopaque, _: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.first_token_ns == 0) self.first_token_ns = embedTimingNowNs();
+            return true;
+        }
+    };
+
+    pub fn generateMessagesDirectQualification(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+        max_tokens: i32,
+        qualification: ContextServingQualification,
+    ) !DirectGenerateOutput {
+        if (!builtin.is_test or messages.len == 0 or max_tokens < 1) return error.UnsupportedContextCombination;
+        const admission_before = self.model_manager.admissionSnapshotForTesting();
+        const preflight = try directGeneratePreflightForMessages(messages);
+        var admission = try self.beginDirectGenerateAdmission(preflight, max_tokens);
+        var admission_live = true;
+        defer if (admission_live) admission.deinit();
+        try admission.prepareMessages(messages);
+        const started_ns = embedTimingNowNs();
+        var clock = DirectQualificationClock{ .started_ns = started_ns };
+        const teacher_forced = if (comptime builtin.is_test)
+            qualification.quality != null and qualification.quality.?.mode == .teacher
+        else
+            false;
+        var output = try self.generateMessagesDirectPrepared(
+            allocator,
+            model_name,
+            messages,
+            max_tokens,
+            admission.expected,
+            admission.reserved_units,
+            &.{.metal},
+            false,
+            null,
+            false,
+            null,
+            if (teacher_forced) null else .{ .ctx = @ptrCast(&clock), .on_token = DirectQualificationClock.onToken },
+            null,
+            try admission.boundExecutionControl(),
+            qualification,
+        );
+        admission.deinit();
+        admission_live = false;
+        const completed_ns = embedTimingNowNs();
+        if (!teacher_forced and (clock.first_token_ns == 0 or clock.first_token_ns < started_ns or completed_ns < clock.first_token_ns))
+            return error.MissingContextQualificationTiming;
+        output.elapsed_ns = std.math.cast(u64, completed_ns - started_ns) orelse return error.InvalidContextQualificationTiming;
+        output.ttft_ns = if (teacher_forced) 0 else std.math.cast(u64, clock.first_token_ns - started_ns) orelse return error.InvalidContextQualificationTiming;
+        output.decode_ns = if (teacher_forced) output.elapsed_ns else std.math.cast(u64, completed_ns - clock.first_token_ns) orelse return error.InvalidContextQualificationTiming;
+        if (output.context_observation) |*observation| {
+            observation.admission_before = admission_before;
+            observation.admission_after = self.model_manager.admissionSnapshotForTesting();
+        }
+        return output;
+    }
 
     const NativePromptTokenCount = struct {
         token_count: usize,
@@ -5746,6 +6717,7 @@ pub const Node = struct {
             stream,
             prompt_cache_key,
             try admission.boundExecutionControl(),
+            null,
         );
         return output.text;
     }
@@ -5769,6 +6741,7 @@ pub const Node = struct {
         /// route because the compiled whole-model path cannot attach a cache.
         prompt_cache_key: ?[]const u8,
         supplied_control: InferenceExecutionControl,
+        qualification: ?ContextServingQualification,
     ) !DirectGenerateOutput {
         var synchronized = executor_microbatch.SynchronizedAllocator{ .child = caller_allocator };
         const allocator = synchronized.allocator();
@@ -5842,7 +6815,7 @@ pub const Node = struct {
         const prompt_cache_requested = prompt_cache_key != null and
             self.config.prompt_cache.enabled and
             promptCacheBackendEligible(self.config.prompt_cache.mode, backend_kind);
-        const use_metal_whole_model = build_options.enable_metal and
+        const use_metal_whole_model = qualification == null and build_options.enable_metal and
             model.session.backend() == .metal and
             graph_mod.metal_executor.supportsSession(model.session) and
             !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
@@ -5854,6 +6827,77 @@ pub const Node = struct {
             .prompt_cache_enabled = prompt_cache_requested,
             .prompt_cache_key = if (prompt_cache_requested) prompt_cache_key else null,
         };
+        var compaction_selection: ?model_manager_mod.LoadedModel.CompactionSelection = null;
+        if (qualification) |q| {
+            if (prompt_cache_requested or backend_kind != .metal or kv_dtype != .f16)
+                return error.UnsupportedContextCombination;
+            if (q.admitted_prefill_chunk_rows == 0)
+                return error.InvalidContextServingQualification;
+            if (q.coverage != null and !isCoverageReference(q))
+                return error.InvalidCoverageObservation;
+            generation_config.prompt_cache_enabled = false;
+            generation_config.prompt_cache_key = null;
+            generation_config.temperature = 0;
+            generation_config.top_p = 0;
+            generation_config.top_k = 1;
+            generation_config.ignore_eos = true;
+            generation_config.enable_thinking = false;
+            generation_config.context_split_decode = q.optimize_decode;
+            generation_config.context_flash_prefill = q.optimize_prefill;
+            applyQualificationFitEngine(&generation_config, q);
+            generation_config.context_fault_controller = q.fault_controller;
+            if (comptime builtin.is_test) generation_config.context_quality_request = q.quality;
+            generation_config.prefill_chunk_size = q.admitted_prefill_chunk_rows;
+            generation_config.context_policy = q.policy orelse return error.InvalidContextPolicy;
+            if (isCoverageReference(q)) {
+                if (generation_config.context_policy.mode != .attention_matching)
+                    return error.InvalidContextPolicy;
+            } else if ((q.variant == .attention_matching) != (generation_config.context_policy.mode == .attention_matching) or
+                (q.variant != .attention_matching and generation_config.context_policy.mode != .exact))
+                return error.InvalidContextPolicy;
+            generation_config.context_storage = if (q.variant == .packed_exact) .packed_exact else .automatic;
+            if (!isCoverageReference(q))
+                compaction_selection = try selectServingCompactionProfile(
+                    model,
+                    try runtime.context_policy.Layout.init(gpt_config),
+                    &generation_config,
+                );
+        }
+        const qualification_payload_policy = generation_config.context_policy;
+        if (qualification) |q| if (isCoverageReference(q)) {
+            generation_config.context_policy = exactCoverageReferencePolicy(qualification_payload_policy);
+        };
+        // Start the compaction owner before rendering/tokenization. The
+        // retained prompt, provenance tables, prepared plan, finalized
+        // request, and packed session all borrow this one stable tracker.
+        var context_request_owner: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner = if (qualification != null)
+            try .init(null)
+        else
+            null;
+        var context_failure_observation: ?ContextServingFailureObservation = null;
+        defer if (context_request_owner) |*owner| {
+            if (context_failure_observation) |*failure| {
+                failure.release_receipt = owner.release();
+                if (comptime builtin.is_test) if (self.context_serving_failure_sink) |sink|
+                    sink.complete_fn(sink.ctx, failure.*);
+            } else releaseContextRequestOwner(owner, null);
+        };
+        const context_scope_witness: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner.ContextScopeWitness = if (context_request_owner) |*owner|
+            try owner.beginContextScope(model.load_generation)
+        else
+            null;
+        var context_execution_lease: ?context_execution_pool.Lease = null;
+        defer if (context_execution_lease) |*lease| abandonContextExecutionLease(lease, null);
+        const context_preflight_allocator = if (context_request_owner) |*owner|
+            owner.allocator()
+        else
+            allocator;
+        if (context_request_owner) |*owner|
+            try owner.bindPreparedAllocator(context_scope_witness.?, context_preflight_allocator);
+        generation_config.context_owner_allocation_tracker = if (context_request_owner) |*owner|
+            owner.tracker
+        else
+            null;
         const kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
             if (use_metal_whole_model) .metal_whole_model else .standard,
             gpt_config,
@@ -5868,9 +6912,38 @@ pub const Node = struct {
             model.session,
             self.defaultGenerationLimits(budget_backend_class),
         ));
+        if (qualification != null) {
+            const pool = try model.ensureContextExecutionPool(budget_limits, null, execution_control);
+            context_execution_lease = try pool.acquire(model.load_generation);
+            try context_execution_lease.?.bindContextOwner(&context_request_owner.?, context_scope_witness.?);
+            generation_config.context_execution_lease = &context_execution_lease.?;
+        }
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        const prompt_estimate = try countPromptTokens(allocator, model_path, model, gpt_config, messages, max_tokens, preflight.enable_thinking, preflight.grammar != null);
-        const prompt_tokens = prompt_estimate.token_count;
+        var retained_prompt: ?NativePromptEstimate = null;
+        defer if (retained_prompt) |*estimate| estimate.deinit();
+        const prompt_tokens = try self.estimateNativePromptTokens(
+            context_preflight_allocator,
+            model_path,
+            model,
+            gpt_config,
+            messages,
+            max_tokens,
+            0,
+            generation_config.enable_thinking,
+            preflight.grammar != null,
+            qualification_payload_policy,
+            &retained_prompt,
+        );
+        if (context_request_owner) |*owner| try owner.bindIsolatedRoute(context_scope_witness.?, .{
+            .metal = backend_kind == .metal,
+            .f16_kv = kv_dtype == .f16,
+            .prompt_cache_disabled = !generation_config.prompt_cache_enabled,
+            .media_disabled = !generation.messagesHaveImages(messages) and !generation.messagesHaveAudio(messages),
+            .speculation_disabled = !generation_config.speculation_requested,
+            .draft_disabled = generation_config.draft_model == null,
+            .legacy_qualification_disabled = if (comptime builtin.is_test) generation_config.context_qualification == null else true,
+            .retained_prepared_payload = retained_prompt != null,
+        });
         try validateGenerateExecutorInvocation(executor_contract, .{
             .item_count = 1,
             .text_bytes_per_item = preflight.text_bytes,
@@ -5883,8 +6956,58 @@ pub const Node = struct {
             .has_image = preflight.image_count > 0,
             .has_audio = preflight.has_audio,
         });
+        const compaction_coordinator = @import("../backends/compaction_coordinator.zig");
+        var prepared_context: ?compaction_coordinator.PreparedCampaignPlan = null;
+        defer if (prepared_context) |*prepared| prepared.deinit();
+        if (qualification) |q| if (q.variant == .attention_matching) {
+            const selection = compaction_selection orelse return error.InvalidContextTransaction;
+            if (comptime builtin.is_test) if (q.fault_controller) |controller|
+                if (controller.kind == .oom)
+                    try context_request_owner.?.tracker.armNextPositiveAllocationFailure();
+            prepared_context = prepareServingCompactionPlan(
+                context_preflight_allocator,
+                model,
+                gpt_config,
+                generation_config,
+                prompt_tokens,
+                &retained_prompt.?,
+                messages,
+                selection,
+            ) catch |err| {
+                if (comptime builtin.is_test) if (q.fault_controller) |controller| if (controller.kind == .oom and err == error.OutOfMemory) {
+                    controller.recordOutOfMemory() catch |fault_err| {
+                        context_failure_observation = .{
+                            .failure = fault_err,
+                            .loaded_identity = .{
+                                .load_generation = selection.load_generation,
+                                .artifact_sha256 = selection.identity.artifact,
+                                .tokenizer_sha256 = selection.identity.tokenizer,
+                                .template_sha256 = selection.identity.template,
+                                .layout_sha256 = selection.identity.layout,
+                                .profile_sha256 = selection.profile_sha256,
+                                .implementation_sha256 = selection.identity.runtime,
+                            },
+                            .original_before = null,
+                            .original_after = null,
+                            .partial_prefill = null,
+                            .injection = controller.snapshot(),
+                            .maintenance_kv_readback_before = 0,
+                            .maintenance_kv_readback_after = 0,
+                        };
+                        return fault_err;
+                    };
+                };
+                return err;
+            };
+        };
         const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
             .{
+                .context_policy = generation_config.context_policy,
+                .context_plan = if (prepared_context) |*prepared| prepared else null,
+                .packed_exact = if (generation_config.context_storage == .packed_exact) .{
+                    .optimize_decode = generation_config.context_split_decode,
+                    .optimize_prefill = generation_config.context_flash_prefill,
+                } else null,
                 .backend = backend_kind,
                 .kv_dtype = kv_dtype,
                 .config = gpt_config,
@@ -5892,7 +7015,7 @@ pub const Node = struct {
                 .workspace_capacity = model.session.generationWorkspaceCapacity(),
             },
         };
-        const direct_prefill_ceiling = @min(
+        var direct_prefill_ceiling = @min(
             prompt_tokens,
             generation.nativeGenerationPrefillChunkCeiling(
                 backend_kind,
@@ -5900,6 +7023,8 @@ pub const Node = struct {
                 self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
             ),
         );
+        if (qualification) |q|
+            direct_prefill_ceiling = @min(direct_prefill_ceiling, q.admitted_prefill_chunk_rows);
         const admitted_prefill_chunk = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
             &run_budget,
             &budget_components,
@@ -5916,23 +7041,30 @@ pub const Node = struct {
             }
             return err;
         };
+        if (qualification) |q| {
+            try validateQualificationPrefillChunk(prompt_tokens, q.admitted_prefill_chunk_rows, admitted_prefill_chunk);
+        }
         generation_config.prefill_chunk_size = admitted_prefill_chunk;
-        const resource_estimate = try runtime.tier.memory.estimateGptGenerationForKvPolicy(
-            backend_kind,
-            kv_dtype,
-            gpt_config,
+        const resource_estimate = try budget_components[0].estimate(
             prompt_tokens,
             @intCast(@max(max_tokens, 1)),
             admitted_prefill_chunk,
-            kv_capacity_policy,
         );
-        var admission_amounts = runtime.tier.memory.AdmissionAmounts.fromEstimate(resource_estimate);
+        const context_sizing = if (prepared_context) |*prepared|
+            try prepared.estimate(admitted_prefill_chunk)
+        else
+            null;
+        if (context_sizing) |sizing|
+            generation_config.context_budget_bytes = sizing.execution_peak_bytes
+        else if (generation_config.context_storage == .packed_exact)
+            generation_config.context_budget_bytes = resource_estimate.kv_bytes;
+        var admission_amounts = contextGenerationAdmissionAmounts(resource_estimate, context_sizing);
         if (generation.messagesHaveImages(messages) or generation.messagesHaveAudio(messages)) {
             admission_amounts = try admission_amounts.merge(
                 try model_manager_mod.projectorRunAdmissionAmounts(
                     model.manifest,
                     backend_kind,
-                    prompt_estimate.media_admission,
+                    retained_prompt.?.media_admission,
                 ),
             );
         }
@@ -5946,6 +7078,21 @@ pub const Node = struct {
         }});
         defer admission_lease.release();
 
+        var compaction_request: ?compaction_coordinator.CampaignRequest = null;
+        defer if (compaction_request) |*request| request.deinit();
+        if (prepared_context) |*prepared| {
+            const selection = compaction_selection orelse return error.InvalidContextTransaction;
+            if (selection.load_generation != model.load_generation) return error.InvalidContextTransaction;
+            const sizing = context_sizing orelse return error.InvalidContextTransaction;
+            compaction_request = try prepared.finalize(
+                admitted_prefill_chunk,
+                sizing.backend_peak_bytes,
+                sizing.host_peak_bytes,
+            );
+            generation_config.context_request = &compaction_request.?;
+            generation_config.context_load_generation = selection.load_generation;
+        }
+
         const execution_mode = batchExecutionMode(backend_kind);
         var scheduler_lease: ?runtime.scheduler.native_generate.Lease = null;
         defer if (scheduler_lease) |lease| model.native_generate_coordinator.?.release(lease);
@@ -5958,10 +7105,21 @@ pub const Node = struct {
                 .max_tokens = max_tokens,
             });
         };
+        if (qualification != null) if (scheduler_lease) |*lease| {
+            const coordinator = model.native_generate_coordinator orelse return error.InvalidContextTransaction;
+            if (generation_config.context_policy.mode == .attention_matching) {
+                try coordinator.markExclusive(lease);
+                try coordinator.awaitExclusiveExecutionControlled(lease, io, execution_control);
+            } else {
+                try coordinator.awaitSharedExecutionControlled(lease, io, execution_control);
+            }
+        };
         var model_lock = try BatchModelLock.initWithControl(execution_mode, model.nativeGenerationMutex(), io, execution_control);
         defer model_lock.deinit();
 
-        var kv_manager = runtime.kv.manager.KvManager.init(allocator);
+        const context_kv_allocator = if (context_request_owner) |*owner| owner.allocator() else allocator;
+        const context_kv_tracker = if (context_request_owner) |*owner| owner.tracker else null;
+        var kv_manager = runtime.kv.manager.KvManager.init(context_kv_allocator);
         defer kv_manager.deinit();
         var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
@@ -6024,12 +7182,18 @@ pub const Node = struct {
             pool_id = try kv_manager.addPool(generation.requestKvManagerPoolConfig(kv_pool_config));
         }
         var kv_storage: ?runtime.kv.storage_runtime.KvStorageRuntime = if (active_kv_storage == null)
-            try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config)
+            try runtime.kv.storage_runtime.KvStorageRuntime.initTracked(context_kv_allocator, kv_pool_config, context_kv_tracker)
         else
             null;
         defer if (kv_storage) |*storage| storage.deinit();
         if (kv_storage) |*storage| try cb.provisionKvDeviceWriteHook(storage);
+        if (context_request_owner) |*owner|
+            try kv_storage.?.bindContextOwnerScope(owner, context_scope_witness.?);
         var decode_state = generation.NativeDecodeState.initPaged(allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        decode_state.context_metadata_allocator = if (context_request_owner != null)
+            context_kv_allocator
+        else
+            null;
         if (active_kv_storage) |storage| {
             decode_state.kv_storage = storage;
         } else if (kv_storage) |*storage| {
@@ -6042,6 +7206,7 @@ pub const Node = struct {
             .io = io,
             .cb = cb,
             .session = model.session,
+            .load_generation = model.load_generation,
             .gpt_config = gpt_config,
             .kv_dtype = kv_dtype,
             .attention_match_identity = if (platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE"))
@@ -6052,13 +7217,23 @@ pub const Node = struct {
             .add_bos_token = model.manifest.add_bos_token,
             .bos_token = model.manifest.bos_token,
             .chat_template = model.chat_tmpl,
+            .preformatted_prompt = retained_prompt.?.prompt,
+            .pre_encoded_prompt = .{
+                .ids = retained_prompt.?.encoded.ids,
+                .attention_mask = retained_prompt.?.encoded.attention_mask,
+                .prompt_token_limit = retained_prompt.?.prompt_token_limit,
+            },
+            .return_raw_token_ids = qualification != null and (if (comptime builtin.is_test)
+                if (qualification) |q| q.quality == null else true
+            else
+                true),
             .print_timing = timing != null,
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
             .projector_store = model.ensureProjectorStore() catch null,
             .decode_state = &decode_state,
-            .scheduler = if (scheduler_lease != null) model.native_generate_coordinator else null,
-            .scheduler_lease = if (scheduler_lease) |*lease| lease else null,
+            .scheduler = if (qualification == null and scheduler_lease != null) model.native_generate_coordinator else null,
+            .scheduler_lease = if (qualification == null) if (scheduler_lease) |*lease| lease else null else null,
             .prompt_cache = prompt_cache,
             .execution_lock = model_lock.pipelineExecutionLock(),
             .graph_cache = if (use_metal_whole_model) &model.native_generation_graph_cache else null,
@@ -6095,6 +7270,29 @@ pub const Node = struct {
             pipeline.generateStreaming(messages, generation_config, active.ctx, active.on_token)
         else
             pipeline.generate(messages, generation_config)) catch |err| {
+            if (comptime builtin.is_test) if (qualification) |q| if (q.fault_controller) |controller| {
+                const selection = compaction_selection orelse return error.InvalidContextTransaction;
+                const injected = controller.snapshot();
+                if (!injected.injected) return error.MissingContextFaultInjection;
+                context_failure_observation = .{
+                    .failure = err,
+                    .loaded_identity = .{
+                        .load_generation = selection.load_generation,
+                        .artifact_sha256 = selection.identity.artifact,
+                        .tokenizer_sha256 = selection.identity.tokenizer,
+                        .template_sha256 = selection.identity.template,
+                        .layout_sha256 = selection.identity.layout,
+                        .profile_sha256 = selection.profile_sha256,
+                        .implementation_sha256 = selection.identity.runtime,
+                    },
+                    .original_before = decode_state.last_context_fault_before,
+                    .original_after = decode_state.last_context_fault_after,
+                    .partial_prefill = decode_state.last_context_fault_partial,
+                    .injection = injected,
+                    .maintenance_kv_readback_before = if (compaction_request) |*request| request.backend_kv_readback_before else 0,
+                    .maintenance_kv_readback_after = if (compaction_request) |*request| request.backend_kv_readback_after else 0,
+                };
+            };
             if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
             if (err == error.MemoryBudgetExceeded)
                 logMemoryBudgetExceeded(model.session, &run_budget);
@@ -6130,14 +7328,139 @@ pub const Node = struct {
                 .total_ms = elapsedMs(started_at_ns, generated_at_ns),
             };
         }
-        const text = try caller_allocator.dupe(u8, result.text);
+        var teacher_forced_receipt: ?context_teacher_forced.Receipt = null;
+        if (comptime builtin.is_test) if (result.takeTeacherForcedEvidence()) |evidence| switch (evidence) {
+            .generation => {},
+            .teacher => |receipt| teacher_forced_receipt = receipt,
+        };
+        errdefer if (teacher_forced_receipt) |*receipt| receipt.deinit();
+        const is_teacher_forced = teacher_forced_receipt != null;
+        const is_quality_generation = if (comptime builtin.is_test)
+            if (qualification) |q| q.quality != null and q.quality.?.mode == .generation else false
+        else
+            false;
+        if (is_quality_generation) {
+            const public_ids = result.token_ids orelse return error.MissingContextQualificationTokens;
+            try validateContextQualificationOutputCount(public_ids.len, @intCast(max_tokens), false);
+        }
+        const text = if (qualification != null and !is_teacher_forced and !is_quality_generation) blk: {
+            const raw_ids = result.token_ids orelse return error.MissingContextQualificationTokens;
+            try validateContextQualificationOutputCount(raw_ids.len, @intCast(max_tokens), true);
+            break :blk try model.getTokenizer().decode(caller_allocator, raw_ids);
+        } else try caller_allocator.dupe(u8, result.text);
+        errdefer caller_allocator.free(text);
+        const reasoning_text = if (result.reasoning_text) |reasoning|
+            try caller_allocator.dupe(u8, reasoning)
+        else
+            null;
+        errdefer if (reasoning_text) |reasoning| caller_allocator.free(reasoning);
+        var context_observation: ?ContextServingObservation = null;
+        if (qualification) |q| {
+            var completion = ContextRouteCompletion{
+                .completed = true,
+                .prompt_tokens = result.prompt_tokens,
+                .output_tokens = if (is_teacher_forced) 0 else result.tokens_used,
+            };
+            if (!is_teacher_forced) completion.setTokenIds(result.token_ids);
+            var observation = ContextServingObservation{};
+            switch (q.variant) {
+                .attention_matching => completeContextServingObservation(
+                    &observation,
+                    compaction_selection orelse return error.InvalidContextTransaction,
+                    if (compaction_request) |*request| request else return error.InvalidContextTransaction,
+                    completion,
+                    @intCast(max_tokens),
+                ),
+                .exact, .packed_exact => if (isCoverageReference(q)) {
+                    const loaded = try model.compactionIdentity(
+                        try runtime.context_policy.Layout.init(gpt_config),
+                        servingCompactionImplementation(generation_config),
+                    );
+                    completeExactServingObservationIdentity(
+                        &observation,
+                        loaded,
+                        @splat(0),
+                        @splat(0),
+                        completion,
+                        @intCast(max_tokens),
+                        decode_state.last_context_metrics,
+                        decode_state.last_context_device_allocation_start,
+                        decode_state.last_context_device_allocation_end,
+                    );
+                    try captureContextServingCoverage(
+                        q,
+                        q.policy orelse return error.InvalidContextPolicy,
+                        model,
+                        messages,
+                        &retained_prompt.?,
+                        loaded,
+                        @intCast(max_tokens),
+                        std.math.cast(u64, generated_at_ns - started_at_ns) orelse return error.InvalidCoverageObservation,
+                        decode_state.last_context_metrics,
+                    );
+                } else completeExactServingObservation(
+                    &observation,
+                    compaction_selection orelse return error.InvalidContextTransaction,
+                    completion,
+                    @intCast(max_tokens),
+                    decode_state.last_context_metrics,
+                    decode_state.last_context_device_allocation_start,
+                    decode_state.last_context_device_allocation_end,
+                ),
+            }
+            bindRenderedPromptObservation(&observation, &retained_prompt.?);
+            if (comptime builtin.is_test)
+                observation.quality_generation_binding = pipeline.last_quality_generation_binding;
+            // The direct qualification result must contain an observation
+            // made after every tracked owner has released. Explicitly close
+            // the otherwise-deferred request graph before copying it into the
+            // return value; nullable defers above become no-ops.
+            if (context_request_owner) |*owner| {
+                if (kv_storage) |*storage|
+                    try storage.drainDeviceWritesForOwnerSnapshot()
+                else
+                    return error.ContextOwnerDrainUnsupported;
+                if (decode_state.last_context_owner_committed) |committed|
+                    try preserveCommittedContextOwner(owner, context_scope_witness, &observation, committed)
+                else if (q.variant == .exact)
+                    try captureCommittedContextOwner(owner, context_scope_witness, &observation)
+                else
+                    return error.MissingContextOwnerCommittedSnapshot;
+                // The pipeline has returned and the hook is drained. Retire
+                // request-local KV state while the model and backend still
+                // live, then leave harmless general-allocator defer targets.
+                decode_state.deinit();
+                decode_state = generation.NativeDecodeState.initContiguous(allocator);
+                if (kv_storage) |*storage| storage.deinit();
+                kv_storage = null;
+                kv_manager.deinit();
+                kv_manager = runtime.kv.manager.KvManager.init(allocator);
+                if (compaction_request) |*request| request.deinit();
+                compaction_request = null;
+                if (prepared_context) |*prepared| prepared.deinit();
+                prepared_context = null;
+                if (retained_prompt) |*estimate| estimate.deinit();
+                retained_prompt = null;
+                if (context_execution_lease) |*lease| try finishContextExecutionLease(lease);
+                context_execution_lease = null;
+                releaseContextRequestOwner(owner, &observation);
+                context_request_owner = null;
+            }
+            if (!observation.route_completed) return error.IncompleteContextQualification;
+            context_observation = observation;
+        }
         if (pin_after_success) model_handle.pin();
+        const returned_teacher_forced_receipt = teacher_forced_receipt;
+        teacher_forced_receipt = null;
         return .{
             .text = text,
+            .reasoning_text = reasoning_text,
             .prompt_tokens = result.prompt_tokens,
-            .completion_tokens = result.tokens_used,
-            .truncated = std.mem.eql(u8, result.finish_reason, "length"),
+            .completion_tokens = if (is_teacher_forced) 0 else result.tokens_used,
+            .truncated = !is_teacher_forced and std.mem.eql(u8, result.finish_reason, "length"),
             .cached_prompt_tokens = result.cached_prompt_tokens,
+            .context_observation = context_observation,
+            .teacher_forced_receipt = returned_teacher_forced_receipt,
         };
     }
 
@@ -7745,6 +9068,7 @@ pub const Node = struct {
                 null,
                 null,
                 control,
+                null,
             );
             if (read_timing_enabled) std.log.info(
                 "qwen3vl_read_timing_ms: page={d} resolve={d} load={d} setup={d} generate={d} total={d}",
@@ -11235,10 +12559,14 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         prompt: []const u8,
         encoded: @import("inference_tokenizer").EncodeResult,
+        provenance_labels: []const u32 = &.{},
+        eligible: ?runtime.context_policy.payload.Eligible = null,
         prompt_token_limit: usize,
         media_admission: generation.NativeGenerationMediaAdmission,
 
         pub fn deinit(self: *NativePromptEstimate) void {
+            if (self.eligible) |*eligible| eligible.deinit();
+            if (self.provenance_labels.len > 0) self.allocator.free(self.provenance_labels);
             self.allocator.free(self.prompt);
             self.encoded.deinit();
         }
@@ -11255,9 +12583,58 @@ pub const Node = struct {
         speculative_bonus_tokens: usize,
         enable_thinking: ?bool,
         has_grammar: bool,
+        context_policy: runtime.context_policy.Policy,
         out_estimate: ?*?NativePromptEstimate,
     ) !usize {
         _ = self;
+        const media_admission = try generation.nativeGenerationMediaAdmission(
+            allocator,
+            model_dir,
+            messages,
+            gpt_config,
+        );
+        const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
+        const prompt_token_limit = try generation.nativeGenerationPromptTokenLimitWithPolicy(
+            gpt_config,
+            null,
+            @intCast(@max(max_tokens, 1)),
+            speculative_bonus_tokens,
+            preliminary_media_allowance,
+            context_policy,
+        );
+        if (context_policy.mode == .attention_matching) {
+            if (has_grammar) return error.UnsupportedContextCombination;
+            var prepared = try generation.prepareCompactionPayload(
+                allocator,
+                model.chat_tmpl orelse return error.UnsupportedCompactionTemplate,
+                model.getTokenizer(),
+                messages,
+                .{ .enable_thinking = enable_thinking },
+                context_policy,
+                prompt_token_limit,
+                model.manifest.add_bos_token,
+            );
+            var prepared_owned = true;
+            defer if (prepared_owned) prepared.deinit();
+            var count: usize = 0;
+            while (count < prepared.encoded.attention_mask.len and prepared.encoded.attention_mask[count] != 0) : (count += 1) {}
+            const total = std.math.add(usize, count, media_admission.token_allowance) catch return error.PromptTooLong;
+            const preliminary_tokens = std.math.add(usize, count, preliminary_media_allowance) catch return error.PromptTooLong;
+            _ = try context_policy.admit(gpt_config.max_position_embeddings, null, preliminary_tokens, @intCast(@max(max_tokens, 1)), speculative_bonus_tokens);
+            if (out_estimate) |out| {
+                out.* = .{
+                    .allocator = allocator,
+                    .prompt = prepared.rendered.text,
+                    .encoded = prepared.encoded,
+                    .provenance_labels = prepared.rendered.labels,
+                    .eligible = prepared.eligible,
+                    .prompt_token_limit = prompt_token_limit,
+                    .media_admission = media_admission,
+                };
+                prepared_owned = false;
+            }
+            return total;
+        }
         var prompt = if (model.chat_tmpl) |ct|
             try ct.applyWithOptions(allocator, messages, .{ .enable_thinking = enable_thinking })
         else
@@ -11269,20 +12646,6 @@ pub const Node = struct {
             allocator.free(prompt);
             prompt = expanded;
         }
-        const media_admission = try generation.nativeGenerationMediaAdmission(
-            allocator,
-            model_dir,
-            messages,
-            gpt_config,
-        );
-        const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
-        const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
-            gpt_config,
-            null,
-            @intCast(@max(max_tokens, 1)),
-            speculative_bonus_tokens,
-            preliminary_media_allowance,
-        );
         var encoded = try generation.encodeNativeGenerationPrompt(
             model.getTokenizer(),
             allocator,
@@ -11296,6 +12659,11 @@ pub const Node = struct {
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
         const total = std.math.add(usize, count, media_admission.token_allowance) catch return error.PromptTooLong;
+        // Dynamic Qwen visual spans use a conservative scheduler estimate.
+        // Enforce only the safe preliminary count here; the native pipeline
+        // applies this same policy to the exact expanded prompt before prefill.
+        const preliminary_tokens = std.math.add(usize, count, preliminary_media_allowance) catch return error.PromptTooLong;
+        _ = try context_policy.admit(gpt_config.max_position_embeddings, null, preliminary_tokens, @intCast(@max(max_tokens, 1)), speculative_bonus_tokens);
         if (out_estimate) |out| {
             out.* = .{
                 .allocator = allocator,
@@ -12719,6 +14087,7 @@ pub const Node = struct {
                 null,
                 null,
                 self.control,
+                null,
             );
             errdefer allocator.free(result.text);
             if (result.truncated) return error.ContextSummaryTruncated;
@@ -12734,6 +14103,20 @@ pub const Node = struct {
             var buffer: [16]u8 = undefined;
             try ctx.setHeader("X-Antfly-Inference-Pid", try std.fmt.bufPrint(&buffer, "{d}", .{pid}));
         }
+    }
+
+    fn maybeSetGenerationRuntimeHeaders(
+        ctx: *httpx.Context,
+        backend: []const u8,
+        route: []const u8,
+        has_context_diagnostics: bool,
+        has_native_transfer: bool,
+        portable_metal_qualification: bool,
+    ) !bool {
+        if (!has_context_diagnostics and !has_native_transfer and
+            !portable_metal_qualification) return false;
+        try setContextRuntimeHeaders(ctx, backend, route);
+        return true;
     }
 
     fn contextRequestFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
@@ -12999,6 +14382,21 @@ pub const Node = struct {
         const encoding = runtime.kv.attention_match_checkpoint.Encoding.parse(ctx.header("X-Antfly-KV-Encoding") orelse "f16") catch |err|
             return nativeCheckpointErrorResponse(ctx, err);
         var prepare: generation.NativeCheckpointPrepare = .{ .encoding = encoding };
+        // Qualification needs an unchanged checkpoint from the same public
+        // route as its compacted candidate. Release binaries contain neither
+        // the grant nor this mutation path and retain the fixed 1.5 threshold.
+        if (comptime builtin.is_test) {
+            if (allowMetalCheckpointQualificationOverride(
+                self.test_allow_metal_native_checkpoint,
+                self.session_manager.required_backend,
+                self.model_manager.session_manager.required_backend,
+            )) {
+                if (ctx.header("X-Antfly-Qualification-Minimum-Savings")) |raw| {
+                    prepare.minimum_savings_ratio = parseMetalCheckpointQualificationMinimumSavings(raw) catch
+                        return nativeCheckpointErrorResponse(ctx, error.InvalidNativeCheckpointRequest);
+                }
+            }
+        }
         defer prepare.deinit();
         var transfer: NativeCheckpointTransfer = .{ .metadata = metadata, .lease = &lease, .prepare = &prepare };
         return self.completeNativeOrOrdinaryGeneration(ctx, &transfer);
@@ -13167,7 +14565,7 @@ pub const Node = struct {
         const body = parsed.value;
         if (native_transfer) |transfer| {
             if ((transfer.prepare == null) == (transfer.resume_request == null) or body.context_management != null or
-                body.kv_cache != null or body.cache_compaction_ratio != null or body.prompt_cache_key != null or
+                body.context_policy != null or body.kv_cache != null or body.cache_compaction_ratio != null or body.prompt_cache_key != null or
                 body.draft_model != null or (transfer.prepare != null and (body.stream orelse false)))
                 return nativeCheckpointErrorResponse(ctx, error.InvalidNativeCheckpointRequest);
         }
@@ -13189,6 +14587,34 @@ pub const Node = struct {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "kv_cache and cache_compaction_ratio are mutually exclusive" });
         }
         const selected_kv = if (body.kv_cache) |policy| std.mem.eql(u8, policy.mode, "select_v1") else false;
+        const context_policy = parseGenerateContextPolicy(body) catch |err| return generationErrorResponse(ctx, err);
+        const context_observation_sink: ContextServingSinkSlot = if (builtin.is_test)
+            self.context_serving_observation_sink
+        else {};
+        var context_observation: ContextServingObservationSlot = if (builtin.is_test)
+            if (native_transfer == null and self.context_serving_qualification != null and context_observation_sink != null)
+                ContextServingObservation{
+                    .admission_before = self.model_manager.admissionSnapshotForTesting(),
+                }
+            else
+                null
+        else {};
+        const context_qualification_started_ns: u128 = if (builtin.is_test and context_observation != null)
+            embedTimingNowNs()
+        else
+            0;
+        // This defer is installed before every model, admission, prepared-plan,
+        // and request owner below. It therefore observes the process baseline
+        // only after those later owners have released.
+        defer if (comptime builtin.is_test) {
+            if (context_observation) |*observation| {
+                if (observation.route_completed) {
+                    observation.admission_after = self.model_manager.admissionSnapshotForTesting();
+                    const sink = context_observation_sink.?;
+                    sink.complete_fn(sink.ctx, observation.*);
+                }
+            }
+        };
         const attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
             envelope.attachments
         else
@@ -13550,7 +14976,7 @@ pub const Node = struct {
                 .message = "cache_compaction_ratio must be finite, greater than 0, and at most 1",
             });
         };
-        if (body.cache_compaction_ratio != null) {
+        if (body.cache_compaction_ratio != null and body.cache_compaction_ratio != 1) {
             return ctx.status(400).json(.{
                 .@"error" = "UNSUPPORTED_FEATURE",
                 .message = "cache_compaction_ratio is not supported by resident server generation",
@@ -13593,11 +15019,52 @@ pub const Node = struct {
             .speculation_calibration = speculation.calibration,
             .prefill_chunk_size = 0,
             .cache_dtype = body.cache_dtype orelse (if (native_transfer != null) "f16" else null),
-            .cache_compaction_ratio = body.cache_compaction_ratio,
+            .cache_compaction_ratio = if (body.cache_compaction_ratio == 1) null else body.cache_compaction_ratio,
             .kv_cache_mode = if (selected_kv) .select_v1 else .exact_hybrid,
+            .context_policy = context_policy,
+            .metal_native_checkpoint_qualification = if (comptime builtin.is_test)
+                self.test_allow_metal_native_checkpoint
+            else {},
             .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
             .prompt_cache_key = prompt_cache_key,
         };
+        const qualification_coverage_reference = if (comptime builtin.is_test)
+            if (native_transfer == null) if (self.context_serving_qualification) |qualification| isCoverageReference(qualification) else false else false
+        else
+            false;
+        if (comptime builtin.is_test) {
+            if (self.context_serving_qualification) |qualification| {
+                if (native_transfer != null) {
+                    if (qualification.variant != .attention_matching)
+                        return error.InvalidContextServingQualification;
+                } else {
+                    if (qualification.coverage != null and !isCoverageReference(qualification))
+                        return error.InvalidCoverageObservation;
+                    switch (qualification.variant) {
+                        .exact => if (context_policy.mode != .exact) return error.InvalidContextPolicy,
+                        .packed_exact => {
+                            const expected_mode: runtime.context_policy.Mode = if (isCoverageReference(qualification)) .attention_matching else .exact;
+                            if (context_policy.mode != expected_mode)
+                                return error.InvalidContextPolicy;
+                            config.context_storage = .packed_exact;
+                            config.context_split_decode = qualification.optimize_decode;
+                            config.context_flash_prefill = qualification.optimize_prefill;
+                        },
+                        .attention_matching => {
+                            if (context_policy.mode != .attention_matching) return error.InvalidContextPolicy;
+                            config.context_split_decode = qualification.optimize_decode;
+                            config.context_flash_prefill = qualification.optimize_prefill;
+                        },
+                    }
+                    applyQualificationFitEngine(&config, qualification);
+                    config.context_fault_controller = qualification.fault_controller;
+                    config.context_quality_request = qualification.quality;
+                    if (qualification.admitted_prefill_chunk_rows == 0)
+                        return error.InvalidContextServingQualification;
+                    config.prefill_chunk_size = qualification.admitted_prefill_chunk_rows;
+                }
+            }
+        }
         const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
@@ -13690,7 +15157,7 @@ pub const Node = struct {
         // last user turn's question; no ONNX Runtime.
         if (moondream_pipeline.isSupportedModelDir(ctx.allocator, model_path)) {
             if (native_transfer != null) return nativeCheckpointErrorResponse(ctx, error.UnsupportedAttentionMatchRoute);
-            if (body.context_management != null or body.kv_cache != null)
+            if (body.context_management != null or body.context_policy != null or body.kv_cache != null)
                 return ctx.status(400).json(.{ .@"error" = "UNSUPPORTED_FEATURE", .message = "context policies require the native decoder runtime" });
             if (config.grammar != null or body.response_format != null) {
                 return ctx.status(400).json(.{
@@ -13709,7 +15176,7 @@ pub const Node = struct {
             defer pipeline.deinit();
             pipeline.execution_control = execution_control;
             if (want_stream) {
-                return self.streamGenerate(ctx, body.model, &pipeline, null, messages.items, config, null, include_stream_usage, null, completion);
+                return self.streamGenerate(ctx, body.model, &pipeline, null, messages.items, config, null, include_stream_usage, null, completion, null);
             }
             var result = pipeline.generate(messages.items, config) catch |err| switch (err) {
                 error.NoImages, error.MultipleImagesUnsupported => return ctx.status(400).json(.{
@@ -13824,9 +15291,24 @@ pub const Node = struct {
             .pjrt => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected PJRT backend in native generation path" }),
             .wasm => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected WASM backend in server generation path" }),
         };
+        const portable_metal_qualification_tracks_owner = if (comptime builtin.is_test)
+            self.test_allow_metal_native_checkpoint and backend_kind == .metal
+        else
+            false;
+        if (comptime builtin.is_test) {
+            if (portable_metal_qualification_tracks_owner) {
+                config.metal_checkpoint_qualification_route = if (native_transfer) |transfer|
+                    if (transfer.prepare != null) .checkpoint_prepare else .checkpoint_resume
+                else
+                    .exact;
+                const prior = self.test_metal_checkpoint_request_counter.fetchAdd(1, .monotonic);
+                if (prior == std.math.maxInt(u64)) return error.MetalCheckpointQualificationRequestOverflow;
+                config.metal_checkpoint_qualification_request = prior + 1;
+            }
+        }
         if (selected_kv and (backend_kind != .metal or !gpt_config.usesGemma4Channels() or gpt_config.usesMoe() or gpt_config.gemma4_mtp_assistant or !gpt_config.supportsSplitSwaGlobalKvRing()))
             return ctx.status(400).json(.{ .@"error" = "UNSUPPORTED_KV_CACHE_POLICY", .message = "select_v1 requires the qualified Gemma4 Metal hybrid-attention route" });
-        const auto_metal_whole_model = !selected_kv and shouldAutoUseMetalWholeModelGenerate(
+        const auto_metal_whole_model = !selected_kv and config.context_policy.mode == .exact and shouldAutoUseMetalWholeModelGenerate(
             model.session.backend(),
             graph_mod.metal_executor.supportsSession(model.session),
             generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
@@ -13852,6 +15334,72 @@ pub const Node = struct {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
         else
             session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+        const compaction_selection: ?model_manager_mod.LoadedModel.CompactionSelection = if (config.context_policy.mode == .attention_matching and !qualification_coverage_reference) blk: {
+            runtime.context_policy.validateExecution(config.context_policy, .{
+                .metal = backend_kind == .metal,
+                .f16_kv = kv_dtype == .f16,
+                .multimodal = generation.messagesHaveImages(messages.items) or generation.messagesHaveAudio(messages.items),
+                .speculation = config.speculation_requested,
+                .prompt_cache = config.prompt_cache_enabled,
+                .forced_global_trim = gpt_config.hasGlobalAttentionLayers() and gpt_config.sliding_window > 0 and generation.kvSlidingTrimForced(),
+            }, .{ .attention_matching = true }) catch |err| return generationErrorResponse(ctx, err);
+            break :blk selectServingCompactionProfile(
+                model,
+                try runtime.context_policy.Layout.init(gpt_config),
+                &config,
+            ) catch |err|
+                return generationErrorResponse(ctx, err);
+        } else null;
+        const qualification_tracks_owner = if (comptime builtin.is_test)
+            (native_transfer == null and self.context_serving_qualification != null) or portable_metal_qualification_tracks_owner
+        else
+            false;
+        if (qualification_coverage_reference)
+            config.context_policy = exactCoverageReferencePolicy(context_policy);
+        var context_request_owner: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner = if (compaction_selection != null or qualification_tracks_owner)
+            runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null) catch |err|
+                return generationErrorResponse(ctx, err)
+        else
+            null;
+        defer if (context_request_owner) |*owner| {
+            if (comptime builtin.is_test) {
+                if (portable_metal_qualification_tracks_owner) {
+                    const receipt = owner.release();
+                    logMetalCheckpointQualificationRelease(
+                        config.metal_checkpoint_qualification_route,
+                        config.metal_checkpoint_qualification_request,
+                        receipt,
+                    );
+                } else {
+                    const observation: ?*ContextServingObservation = if (context_observation) |*value| value else null;
+                    releaseContextRequestOwner(owner, observation);
+                }
+            } else releaseContextRequestOwner(owner, null);
+        };
+        const context_scope_witness: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner.ContextScopeWitness = if (context_request_owner) |*owner|
+            owner.beginContextScope(model.load_generation) catch |err|
+                return generationErrorResponse(ctx, err)
+        else
+            null;
+        var context_execution_lease: ?context_execution_pool.Lease = null;
+        defer if (context_execution_lease) |*lease| {
+            const observation: ?*ContextServingObservation = if (comptime builtin.is_test)
+                if (context_observation) |*value| value else null
+            else
+                null;
+            abandonContextExecutionLease(lease, observation);
+        };
+        const context_preflight_allocator = if (context_request_owner) |*owner|
+            owner.allocator()
+        else
+            ctx.allocator;
+        if (context_request_owner) |*owner|
+            owner.bindPreparedAllocator(context_scope_witness.?, context_preflight_allocator) catch |err|
+                return generationErrorResponse(ctx, err);
+        config.context_owner_allocation_tracker = if (context_request_owner) |*owner|
+            owner.tracker
+        else
+            null;
         const target_kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
             if (build_options.enable_metal and
                 model.session.backend() == .metal and
@@ -13888,7 +15436,7 @@ pub const Node = struct {
         defer if (prompt_estimate) |*estimate| estimate.deinit();
         const tokenize_started: ?i96 = if (admission_started != null) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
         const prompt_tokens = self.estimateNativePromptTokens(
-            ctx.allocator,
+            context_preflight_allocator,
             model_path,
             model,
             gpt_config,
@@ -13897,6 +15445,7 @@ pub const Node = struct {
             if (config.speculation_requested and config.speculation_policy != .off and config.speculative_k > 0) 1 else 0,
             config.enable_thinking,
             config.grammar != null,
+            if (qualification_coverage_reference) context_policy else config.context_policy,
             &prompt_estimate,
         ) catch |err| {
             if (err == error.PromptTooLong) {
@@ -13905,6 +15454,7 @@ pub const Node = struct {
                     .message = "prompt exceeds the model context window after reserving output tokens",
                 });
             }
+            if (generationRequestFailure(err) != null) return generationErrorResponse(ctx, err);
             return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err) });
         };
         if (tokenize_started) |started| {
@@ -13928,6 +15478,17 @@ pub const Node = struct {
                 .kv_cache_version = "v1",
             };
         }
+        if (context_request_owner) |*owner|
+            owner.bindIsolatedRoute(context_scope_witness.?, .{
+                .metal = backend_kind == .metal,
+                .f16_kv = kv_dtype == .f16,
+                .prompt_cache_disabled = !config.prompt_cache_enabled,
+                .media_disabled = !generation.messagesHaveImages(messages.items) and !generation.messagesHaveAudio(messages.items),
+                .speculation_disabled = !config.speculation_requested,
+                .draft_disabled = config.draft_model == null,
+                .legacy_qualification_disabled = if (comptime builtin.is_test) config.context_qualification == null else true,
+                .retained_prepared_payload = prompt_estimate != null,
+            }) catch |err| return generationErrorResponse(ctx, err);
         if (executor_contract.batch.max_input_tokens_per_item) |limit| {
             if (prompt_tokens > limit) {
                 const failure = generateExecutorContractError(error.InferenceInputTokensExceeded);
@@ -13937,6 +15498,22 @@ pub const Node = struct {
                     .retryable = failure.batch.retryable,
                 });
             }
+        }
+        const compaction_coordinator = @import("../backends/compaction_coordinator.zig");
+        var prepared_campaign: ?compaction_coordinator.PreparedCampaignPlan = null;
+        defer if (prepared_campaign) |*prepared| prepared.deinit();
+        if (compaction_selection) |selection| {
+            prepared_campaign = prepareServingCompactionPlan(
+                context_preflight_allocator,
+                model,
+                gpt_config,
+                config,
+                prompt_tokens,
+                &prompt_estimate.?,
+                messages.items,
+                selection,
+            ) catch |err|
+                return generationErrorResponse(ctx, err);
         }
         const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
             backend_kind,
@@ -14179,10 +15756,19 @@ pub const Node = struct {
             budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
         }
         budget_limits = self.config.generation_budget_overrides.apply(budget_limits);
+        if (compaction_selection != null or qualification_tracks_owner) {
+            const pool = model.ensureContextExecutionPool(budget_limits, null, execution_control) catch |err|
+                return generationErrorResponse(ctx, err);
+            context_execution_lease = pool.acquire(model.load_generation) catch |err|
+                return generationErrorResponse(ctx, err);
+            context_execution_lease.?.bindContextOwner(&context_request_owner.?, context_scope_witness.?) catch |err|
+                return generationErrorResponse(ctx, err);
+            config.context_execution_lease = &context_execution_lease.?;
+        }
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const native_host_reservation: usize = if (native_transfer) |transfer|
             if (transfer.prepare) |request| blk: {
-                const plan = generation.NativeCheckpointPrepare.hostPlan(gpt_config, prompt_tokens, request.encoding) catch |err| return nativeCheckpointErrorResponse(ctx, err);
+                const plan = generation.NativeCheckpointPrepare.hostPlan(gpt_config, prompt_tokens, request.encoding, backend_kind == .metal) catch |err| return nativeCheckpointErrorResponse(ctx, err);
                 request.planned_fit_host_bytes = plan.fit_bytes;
                 request.planned_fit_workers = plan.workers;
                 std.log.info("native_checkpoint_host_plan source_tokens={d} source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d} workers={d}", .{ prompt_tokens, plan.source_bytes, plan.head_workspace_bytes, plan.fit_bytes, plan.reservation_bytes, plan.workers });
@@ -14227,12 +15813,13 @@ pub const Node = struct {
         }
 
         if (draft_model_for_generation != null and config.speculation_policy != .off) {
-            const shared_prompt_limit = generation.nativeGenerationPromptTokenLimit(
+            const shared_prompt_limit = generation.nativeGenerationPromptTokenLimitWithPolicy(
                 gpt_config,
                 draft_gpt_config,
                 @intCast(@max(config.max_tokens, 1)),
                 if (config.speculative_k > 0) 1 else 0,
                 0,
+                config.context_policy,
             ) catch return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "requested output leaves no prompt capacity in the target or draft model context window",
@@ -14250,6 +15837,12 @@ pub const Node = struct {
 
         var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
         budget_components[0] = .{
+            .context_policy = config.context_policy,
+            .context_plan = if (prepared_campaign) |*prepared| prepared else null,
+            .packed_exact = if (config.context_storage == .packed_exact) .{
+                .optimize_decode = config.context_split_decode,
+                .optimize_prefill = config.context_flash_prefill,
+            } else null,
             .backend = backend_kind,
             .kv_dtype = kv_dtype,
             .config = gpt_config,
@@ -14297,8 +15890,17 @@ pub const Node = struct {
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
+        if (comptime builtin.is_test) {
+            if (native_transfer == null) if (self.context_serving_qualification) |qualification| {
+                try validateQualificationPrefillChunk(
+                    prompt_tokens,
+                    qualification.admitted_prefill_chunk_rows,
+                    prefill_admission.max_chunk_rows,
+                );
+            };
+        }
         config.prefill_chunk_size = prefill_admission.max_chunk_rows;
-        const isolated_generation = native_transfer == null and canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, draft_model_for_generation != null, config.prompt_cache_enabled, want_stream);
+        const isolated_generation = native_transfer == null and config.context_policy.mode == .exact and canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, draft_model_for_generation != null, config.prompt_cache_enabled, want_stream);
         // Whole-request native owners cannot hold the model gate while waiting
         // for a turn belonging to an isolated peer that needs that same gate.
         if ((backend_kind == .native or native_transfer != null) and !isolated_generation) {
@@ -14307,11 +15909,11 @@ pub const Node = struct {
                 native_generate_lease = null;
             }
         }
-        // Choose the owner before borrowing a plan: releasing the coordinator
-        // lease also frees its plan. Whole-request execution owns its plan below.
+        // Bind the admitted geometry to the coordinator lease when present;
+        // standalone ownership is retained only for routes without one.
         var standalone_prefill_plan: ?runtime.scheduler.native_generate.PrefillChunkPlan = null;
         defer if (standalone_prefill_plan) |*plan| plan.deinit(ctx.allocator);
-        const prefill_plan_applicable = !generation.messagesHaveImages(effective_messages) and
+        const prefill_plan_applicable = config.context_policy.mode == .exact and !generation.messagesHaveImages(effective_messages) and
             !generation.messagesHaveAudio(effective_messages) and
             !(effective_compiled_partition_backend != null and
                 effective_compiled_attachment_target == .whole_model);
@@ -14347,15 +15949,15 @@ pub const Node = struct {
             }
             logAdmittedPrefillChunkPlan(config.prefill_chunk_plan.?);
         }
-        const resource_estimate = try runtime.tier.memory.estimateGptGenerationForKvPolicy(
-            backend_kind,
-            kv_dtype,
-            gpt_config,
-            prompt_tokens,
-            budget_max_tokens,
-            config.prefill_chunk_size,
-            target_kv_capacity_policy,
-        );
+        const resource_estimate = try budget_components[0].estimate(prompt_tokens, budget_max_tokens, config.prefill_chunk_size);
+        const context_sizing = if (prepared_campaign) |*prepared|
+            prepared.estimate(config.prefill_chunk_size) catch |err| return generationErrorResponse(ctx, err)
+        else
+            null;
+        if (context_sizing) |sizing|
+            config.context_budget_bytes = sizing.execution_peak_bytes
+        else if (config.context_storage == .packed_exact or config.context_policy.mode != .exact)
+            config.context_budget_bytes = resource_estimate.kv_bytes;
         if (draft_model_for_generation != null) {
             draft_resource_estimate = try runtime.tier.memory.estimateGptGeneration(
                 draft_backend_kind.?,
@@ -14380,7 +15982,7 @@ pub const Node = struct {
             .resources = .{
                 .backend_class = target_backend_class,
                 .limits = target_admission_limits,
-                .amounts = .fromEstimate(resource_estimate),
+                .amounts = contextGenerationAdmissionAmounts(resource_estimate, context_sizing),
             },
         };
         const native_resume = if (native_transfer) |transfer| transfer.resume_request != null else false;
@@ -14415,10 +16017,18 @@ pub const Node = struct {
             break :blk 2;
         } else 1;
         if (native_transfer != null) {
-            if (backend_kind != .cuda or kv_dtype != .f16 or gpt_config.family != .gemma or !gpt_config.usesGemma4Channels() or
+            if ((backend_kind != .cuda and backend_kind != .metal) or kv_dtype != .f16 or gpt_config.family != .gemma or !gpt_config.usesGemma4Channels() or
                 effective_compiled_partition_backend != null or draft_model_for_generation != null or config.prompt_cache_enabled or
                 backend_selection.graph_mode_requested or graphModeEnabled())
                 return nativeCheckpointErrorResponse(ctx, error.UnsupportedAttentionMatchRoute);
+            if (backend_kind == .metal) {
+                if (comptime builtin.is_test) {
+                    if (!config.metal_native_checkpoint_qualification)
+                        return nativeCheckpointErrorResponse(ctx, error.UnqualifiedCompactionArtifact);
+                } else return nativeCheckpointErrorResponse(ctx, error.UnqualifiedCompactionArtifact);
+                if (native_transfer.?.prepare) |request| if (request.encoding != .f16 and request.encoding != .fp8)
+                    return nativeCheckpointErrorResponse(ctx, error.UnsupportedMetalKvCheckpointEncoding);
+            }
             if (prompt_tokens >= runtime.kv.attention_match_checkpoint.max_context_tokens or @as(usize, @intCast(config.max_tokens)) > runtime.kv.attention_match_checkpoint.max_context_tokens - prompt_tokens)
                 return nativeCheckpointErrorResponse(ctx, error.KvCheckpointAppendLimit);
         }
@@ -14457,6 +16067,15 @@ pub const Node = struct {
                     work.control(),
                 ) catch |err| return nativeCheckpointErrorResponse(ctx, err);
                 native_kv_wire.finish(transfer.reader.?, work.control()) catch |err| return nativeCheckpointErrorResponse(ctx, err);
+                if (backend_kind == .metal) {
+                    if (comptime build_options.enable_metal) {
+                        _ = metal_attention_storage.allocationBytesWithControl(
+                            resume_request.checkpoint.?.state,
+                            runtime.kv.attention_match_checkpoint.serving_limits,
+                            work.control(),
+                        ) catch |err| return nativeCheckpointErrorResponse(ctx, err);
+                    }
+                }
             }
         }
 
@@ -14480,6 +16099,33 @@ pub const Node = struct {
             };
         };
         defer admission_lease.release();
+
+        var compaction_request: ?compaction_coordinator.CampaignRequest = null;
+        defer if (compaction_request) |*request| request.deinit();
+        if (prepared_campaign) |*prepared| {
+            const selection = compaction_selection orelse return generationErrorResponse(ctx, error.InvalidContextTransaction);
+            if (selection.load_generation != model.load_generation) return generationErrorResponse(ctx, error.InvalidContextTransaction);
+            const sizing = context_sizing orelse return generationErrorResponse(ctx, error.InvalidContextTransaction);
+            compaction_request = prepared.finalize(config.prefill_chunk_size, sizing.backend_peak_bytes, sizing.host_peak_bytes) catch |err|
+                return generationErrorResponse(ctx, err);
+            config.context_request = &compaction_request.?;
+            config.context_load_generation = selection.load_generation;
+        }
+
+        // Capacity is reserved before the cancellable execution barrier, and
+        // the model mutex is acquired only after the barrier grants ownership.
+        if (native_generate_lease) |*lease| {
+            if (model.native_generate_coordinator) |coordinator| {
+                if (config.context_policy.mode == .exact) {
+                    coordinator.awaitSharedExecutionControlled(lease, ctx.io, execution_control) catch |err|
+                        return inferenceFailureResponse(ctx, err);
+                } else {
+                    coordinator.markExclusive(lease) catch |err| return inferenceFailureResponse(ctx, err);
+                    coordinator.awaitExclusiveExecutionControlled(lease, ctx.io, execution_control) catch |err|
+                        return inferenceFailureResponse(ctx, err);
+                }
+            }
+        }
 
         const first_locked_model = if (draft_model_for_generation) |draft_model|
             if (@intFromPtr(draft_model) < @intFromPtr(model)) draft_model else model
@@ -14511,6 +16157,8 @@ pub const Node = struct {
         };
         var generation_allocator = executor_microbatch.SynchronizedAllocator{ .child = ctx.allocator };
         const execution_allocator = if (isolated_generation) generation_allocator.allocator() else ctx.allocator;
+        const context_kv_allocator = if (context_request_owner) |*owner| owner.allocator() else execution_allocator;
+        const context_kv_tracker = if (context_request_owner) |*owner| owner.tracker else null;
 
         if (draft_model_for_generation) |draft_model| {
             draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
@@ -14521,7 +16169,7 @@ pub const Node = struct {
             };
         }
 
-        var kv_manager = runtime.kv.manager.KvManager.init(execution_allocator);
+        var kv_manager = runtime.kv.manager.KvManager.init(context_kv_allocator);
         defer kv_manager.deinit();
         var draft_kv_manager: ?runtime.kv.manager.KvManager = null;
         defer if (draft_kv_manager) |*manager| manager.deinit();
@@ -14541,7 +16189,7 @@ pub const Node = struct {
         // and scheduler-batched ordinary generation keep their existing control.
         if (native_transfer != null) cb.execution_control = execution_control;
         const pool_config = if (native_transfer != null)
-            generation.attentionMatchCheckpointPoolConfig(kv_dtype, gpt_config)
+            generation.attentionMatchCheckpointPoolConfig(backend_kind, kv_dtype, gpt_config)
         else
             generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
 
@@ -14604,7 +16252,7 @@ pub const Node = struct {
         }
 
         var kv_storage: ?runtime.kv.storage_runtime.KvStorageRuntime = if (active_kv_storage == null)
-            runtime.kv.storage_runtime.KvStorageRuntime.init(execution_allocator, pool_config) catch |err|
+            runtime.kv.storage_runtime.KvStorageRuntime.initTracked(context_kv_allocator, pool_config, context_kv_tracker) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) })
         else
             null;
@@ -14612,8 +16260,15 @@ pub const Node = struct {
         if (kv_storage) |*storage| {
             cb.provisionKvDeviceWriteHook(storage) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+            if (context_request_owner) |*owner|
+                storage.bindContextOwnerScope(owner, context_scope_witness.?) catch |err|
+                    return generationErrorResponse(ctx, err);
         }
-        var decode_state = generation.NativeDecodeState.initPaged(execution_allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        decode_state.context_metadata_allocator = if (context_request_owner != null)
+            context_kv_allocator
+        else
+            null;
         if (active_kv_storage) |storage| {
             decode_state.kv_storage = storage;
         } else if (kv_storage) |*storage| {
@@ -14621,6 +16276,41 @@ pub const Node = struct {
         }
         var decode_state_live = true;
         defer if (decode_state_live) decode_state.deinit();
+
+        const packed_context_requires_inner_committed = compaction_selection != null or if (comptime builtin.is_test)
+            if (native_transfer == null) if (self.context_serving_qualification) |qualification| qualification.variant != .exact else false else false
+        else
+            false;
+
+        // Runs before decode/storage/manager teardown, while the successful
+        // request context is still committed. The earlier owner-release defer
+        // records the distinct post-release baseline after those defers run.
+        defer if (context_request_owner) |*owner| {
+            const observation: ?*ContextServingObservation = if (comptime builtin.is_test)
+                if (context_observation) |*value| if (value.route_completed) value else null else null
+            else
+                null;
+            if (observation) |value| {
+                const drained = blk: {
+                    const storage = if (kv_storage) |*available| available else break :blk false;
+                    storage.drainDeviceWritesForOwnerSnapshot() catch break :blk false;
+                    break :blk true;
+                };
+                if (!drained) {
+                    value.route_completed = false;
+                } else if (decode_state.last_context_owner_committed) |committed| {
+                    preserveCommittedContextOwner(owner, context_scope_witness, value, committed) catch {
+                        value.route_completed = false;
+                    };
+                } else if (!packed_context_requires_inner_committed) {
+                    captureCommittedContextOwner(owner, context_scope_witness, value) catch {
+                        value.route_completed = false;
+                    };
+                } else {
+                    value.route_completed = false;
+                }
+            }
+        };
 
         var draft_decode_state: ?generation.NativeDecodeState = null;
         defer if (draft_decode_state) |*state| state.deinit();
@@ -14643,7 +16333,7 @@ pub const Node = struct {
         const graph_mode = backend_selection.graph_mode_requested or
             effective_compiled_partition_backend != null or
             graphModeEnabled();
-        const use_scheduler = native_transfer == null and !selected_kv and !graph_mode and (backend_kind != .native or isolated_generation);
+        const use_scheduler = native_transfer == null and !selected_kv and config.context_policy.mode == .exact and !graph_mode and (backend_kind != .native or isolated_generation);
         const use_model_graph_cache = graph_mode and
             build_options.enable_metal and
             model.session.backend() == .metal and
@@ -14684,6 +16374,7 @@ pub const Node = struct {
             .io = ctx.io,
             .cb = cb,
             .session = model.session,
+            .load_generation = model.load_generation,
             .gpt_config = gpt_config,
             .kv_dtype = kv_dtype,
             .attention_match_identity = native_identity,
@@ -14735,20 +16426,30 @@ pub const Node = struct {
             }
         }
 
-        if (context_diagnostics != null or native_transfer != null) {
-            // Runtime observations for qualification clients, independent of
-            // the requested backend. These identify the serving route; kernel
-            // execution and device quality still require their own evidence.
-            try setContextRuntimeHeaders(ctx, @tagName(model.session.backend()), if (effective_compiled_partition_backend != null)
+        // Runtime observations for qualification clients, independent of the
+        // requested backend. These identify the serving route; kernel
+        // execution and device quality still require their own evidence.
+        _ = try maybeSetGenerationRuntimeHeaders(
+            ctx,
+            @tagName(model.session.backend()),
+            if (effective_compiled_partition_backend != null)
                 (if (effective_compiled_attachment_target == .whole_model) "compiled-whole-model" else "compiled-partition")
             else if (use_scheduler)
                 "scheduler-eager"
             else
-                "direct-eager");
-        }
+                "direct-eager",
+            context_diagnostics != null,
+            native_transfer != null,
+            portable_metal_qualification_tracks_owner,
+        );
 
+        var context_route_completion: ContextRouteCompletion = .{};
+        const context_route_completion_ptr: ?*ContextRouteCompletion = if (builtin.is_test)
+            if (context_observation != null or portable_metal_qualification_tracks_owner) &context_route_completion else null
+        else
+            null;
         if (want_stream) {
-            return self.streamGenerate(
+            const response = try self.streamGenerate(
                 ctx,
                 body.model,
                 &pipeline,
@@ -14759,19 +16460,109 @@ pub const Node = struct {
                 include_stream_usage,
                 context_diagnostics,
                 completion,
+                context_route_completion_ptr,
             );
+            if (comptime builtin.is_test) {
+                if (shouldCommitMetalCheckpointQualificationStream(
+                    portable_metal_qualification_tracks_owner,
+                    context_route_completion,
+                )) {
+                    try pipeline.logMetalCheckpointQualificationPhase(
+                        &decode_state,
+                        config,
+                        "generation_committed",
+                        if (native_transfer) |transfer| transfer.resume_request else null,
+                    );
+                    try captureCommittedContextOwner(&context_request_owner.?, context_scope_witness, null);
+                }
+                if (context_observation) |*observation| {
+                    const qualification = self.context_serving_qualification.?;
+                    switch (qualification.variant) {
+                        .attention_matching => {
+                            const selected = compaction_selection orelse return error.InvalidContextTransaction;
+                            const request = if (compaction_request) |*value| value else return error.InvalidContextTransaction;
+                            completeContextServingObservation(observation, selected, request, context_route_completion, @intCast(@max(config.max_tokens, 1)));
+                        },
+                        .exact, .packed_exact => exact_qualification: {
+                            if (isCoverageReference(qualification)) {
+                                const loaded = try model.compactionIdentity(
+                                    try runtime.context_policy.Layout.init(gpt_config),
+                                    servingCompactionImplementation(config),
+                                );
+                                completeExactServingObservationIdentity(
+                                    observation,
+                                    loaded,
+                                    @splat(0),
+                                    @splat(0),
+                                    context_route_completion,
+                                    @intCast(@max(config.max_tokens, 1)),
+                                    decode_state.last_context_metrics,
+                                    decode_state.last_context_device_allocation_start,
+                                    decode_state.last_context_device_allocation_end,
+                                );
+                                try captureContextServingCoverage(
+                                    qualification,
+                                    context_policy,
+                                    model,
+                                    messages.items,
+                                    &prompt_estimate.?,
+                                    loaded,
+                                    @intCast(@max(config.max_tokens, 1)),
+                                    std.math.cast(u64, embedTimingNowNs() - context_qualification_started_ns) orelse return error.InvalidCoverageObservation,
+                                    decode_state.last_context_metrics,
+                                );
+                                break :exact_qualification;
+                            }
+                            const selected = try selectServingCompactionProfile(
+                                model,
+                                try runtime.context_policy.Layout.init(gpt_config),
+                                &config,
+                            );
+                            completeExactServingObservation(
+                                observation,
+                                selected,
+                                context_route_completion,
+                                @intCast(@max(config.max_tokens, 1)),
+                                decode_state.last_context_metrics,
+                                decode_state.last_context_device_allocation_start,
+                                decode_state.last_context_device_allocation_end,
+                            );
+                        },
+                    }
+                    bindRenderedPromptObservation(observation, &prompt_estimate.?);
+                    observation.quality_generation_binding = pipeline.last_quality_generation_binding;
+                }
+            }
+            return response;
         }
 
         const server_a4b_telemetry_before = serverA4bTelemetrySnapshot(&pipeline.cb);
         var telemetry_pending = true;
         defer if (telemetry_pending) logServerA4bTelemetry(&pipeline.cb, server_a4b_telemetry_before, body.model);
         var result = generateMaybeStopOnTool(&pipeline, effective_messages, config, if (tool_parser) |*parser| parser else null) catch |err| {
+            if (comptime builtin.is_test) {
+                if (portable_metal_qualification_tracks_owner) {
+                    std.debug.print("metal_checkpoint_generation_failure: {s}\n", .{@errorName(err)});
+                    if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+                }
+            }
             if (err == error.MemoryBudgetExceeded)
                 return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
             if (native_transfer != null) return nativeCheckpointErrorResponse(ctx, err);
             return generationErrorResponse(ctx, err);
         };
         defer result.deinit();
+        if (comptime builtin.is_test) {
+            if (portable_metal_qualification_tracks_owner) {
+                try pipeline.logMetalCheckpointQualificationPhase(
+                    &decode_state,
+                    config,
+                    "generation_committed",
+                    if (native_transfer) |transfer| transfer.resume_request else null,
+                );
+                try captureCommittedContextOwner(&context_request_owner.?, context_scope_witness, null);
+            }
+        }
         if (native_transfer) |transfer| if (transfer.prepare) |prepare| {
             // The result owns only host arrays. Retire request GPU storage and
             // release the model gate before any network export can block.
@@ -14821,7 +16612,7 @@ pub const Node = struct {
             if (formatted_response_text) |text| response_text = text;
         }
 
-        return self.buildGenerateResponse(
+        const response = try self.buildGenerateResponse(
             ctx,
             body.model,
             response_text,
@@ -14840,6 +16631,72 @@ pub const Node = struct {
             context_diagnostics,
             if (wants_logprobs) token_evidence.entries.items else null,
         );
+        if (comptime builtin.is_test) {
+            if (context_observation) |*observation| {
+                var observed_route_completion: ContextRouteCompletion = .{
+                    .completed = true,
+                    .prompt_tokens = result.prompt_tokens,
+                    .output_tokens = result.tokens_used,
+                };
+                observed_route_completion.setTokenIds(result.token_ids);
+                const qualification = self.context_serving_qualification.?;
+                switch (qualification.variant) {
+                    .attention_matching => {
+                        const selected = compaction_selection orelse return error.InvalidContextTransaction;
+                        const request = if (compaction_request) |*value| value else return error.InvalidContextTransaction;
+                        completeContextServingObservation(observation, selected, request, observed_route_completion, @intCast(@max(config.max_tokens, 1)));
+                    },
+                    .exact, .packed_exact => exact_qualification: {
+                        if (isCoverageReference(qualification)) {
+                            const loaded = try model.compactionIdentity(
+                                try runtime.context_policy.Layout.init(gpt_config),
+                                servingCompactionImplementation(config),
+                            );
+                            completeExactServingObservationIdentity(
+                                observation,
+                                loaded,
+                                @splat(0),
+                                @splat(0),
+                                observed_route_completion,
+                                @intCast(@max(config.max_tokens, 1)),
+                                decode_state.last_context_metrics,
+                                decode_state.last_context_device_allocation_start,
+                                decode_state.last_context_device_allocation_end,
+                            );
+                            try captureContextServingCoverage(
+                                qualification,
+                                context_policy,
+                                model,
+                                messages.items,
+                                &prompt_estimate.?,
+                                loaded,
+                                @intCast(@max(config.max_tokens, 1)),
+                                std.math.cast(u64, embedTimingNowNs() - context_qualification_started_ns) orelse return error.InvalidCoverageObservation,
+                                decode_state.last_context_metrics,
+                            );
+                            break :exact_qualification;
+                        }
+                        const selected = try selectServingCompactionProfile(
+                            model,
+                            try runtime.context_policy.Layout.init(gpt_config),
+                            &config,
+                        );
+                        completeExactServingObservation(
+                            observation,
+                            selected,
+                            observed_route_completion,
+                            @intCast(@max(config.max_tokens, 1)),
+                            decode_state.last_context_metrics,
+                            decode_state.last_context_device_allocation_start,
+                            decode_state.last_context_device_allocation_end,
+                        );
+                    },
+                }
+                bindRenderedPromptObservation(observation, &prompt_estimate.?);
+                observation.quality_generation_binding = pipeline.last_quality_generation_binding;
+            }
+        }
+        return response;
     }
 
     const OwnedGenerateMessages = struct {
@@ -15244,6 +17101,8 @@ pub const Node = struct {
         if (body.context_management != null or body.kv_cache != null)
             return .{ .code = "UNSUPPORTED_CONTEXT_POLICY", .message = "prepare context explicitly before batch generation; batch KV policies are not supported", .retryable = false };
         if (body.logprobs orelse false) return .{ .code = "UNSUPPORTED_TOKEN_LOGPROBS", .message = "token evidence is available on the scalar native grammar route", .retryable = false };
+        const context_policy = parseGenerateContextPolicy(body) catch |err| return batchGenerationError(err);
+        if (context_policy.mode == .rolling) return .{ .code = "UNSUPPORTED_CONTEXT_POLICY", .message = "batch generation does not support rolling context", .retryable = false };
         if (body.stream orelse false) return .{ .code = "UNSUPPORTED_STREAM", .message = "batch generation does not support stream=true", .retryable = false };
         if (body.tools != null or body.tool_choice != null) return .{ .code = "UNSUPPORTED_TOOLS", .message = "batch generation does not support tools yet", .retryable = false };
         _ = parseGenerateNumericOptions(body.max_tokens, body.top_k) catch |err| return .{
@@ -15279,7 +17138,7 @@ pub const Node = struct {
         if (body.cache_compaction_ratio) |ratio| {
             validateCacheCompactionRatio(ratio) catch
                 return .{ .code = "INVALID_CACHE_COMPACTION_RATIO", .message = "cache_compaction_ratio must be finite, greater than 0, and at most 1", .retryable = false };
-            return .{ .code = "UNSUPPORTED_CACHE_COMPACTION", .message = "batch generation does not support cache_compaction_ratio", .retryable = false };
+            if (ratio != 1) return .{ .code = "UNSUPPORTED_CACHE_COMPACTION", .message = "batch generation does not support approximate cache_compaction_ratio", .retryable = false };
         }
         if (body.draft_model != null) return .{ .code = "UNSUPPORTED_DRAFT_MODEL", .message = "batch generation does not support draft_model yet", .retryable = false };
         if (body.mode) |mode| {
@@ -15388,7 +17247,8 @@ pub const Node = struct {
             .speculation_calibration = speculation.calibration,
             .prefill_chunk_size = 0,
             .cache_dtype = body.cache_dtype,
-            .cache_compaction_ratio = body.cache_compaction_ratio,
+            .cache_compaction_ratio = if (body.cache_compaction_ratio == 1) null else body.cache_compaction_ratio,
+            .context_policy = try parseGenerateContextPolicy(body),
         };
         if (body.response_format) |rf| {
             if (std.mem.eql(u8, rf.type, "json_object")) {
@@ -15453,19 +17313,28 @@ pub const Node = struct {
         };
     }
 
+    const BatchQualificationOutput = if (builtin.is_test) struct {
+        output_token_ids: [4096]u32 = @splat(0),
+        output_token_ids_len: u32 = 0,
+        elapsed_ns: u64 = 0,
+        ttft_ns: u64 = 0,
+        decode_ns: u64 = 0,
+    } else void;
+
     const BatchGenerateTaskResult = struct {
         text: ?[]const u8 = null,
         reasoning_text: ?[]const u8 = null,
         finish_reason: []const u8 = "length",
         prompt_tokens: usize = 0,
         completion_tokens: usize = 0,
+        qualification: BatchQualificationOutput = if (builtin.is_test) .{} else {},
         @"error": ?api.GenerateBatchError = null,
     };
 
     fn applyBatchGenerateTaskResult(
         allocator: std.mem.Allocator,
         model_name: []const u8,
-        task_result: BatchGenerateTaskResult,
+        task_result: *const BatchGenerateTaskResult,
         result: *api.GenerateBatchResultItem,
     ) !void {
         if (task_result.@"error") |batch_err| {
@@ -15565,7 +17434,38 @@ pub const Node = struct {
         messages: []const generation.Message,
         config: generation.GenerationConfig,
         response_format: ?api.GenerateResponseFormat,
+        capture_qualification: bool,
         out: *BatchGenerateTaskResult,
+
+        const QualificationClock = struct {
+            started_ns: u128,
+            first_token_ns: u128 = 0,
+
+            const Timing = struct { elapsed_ns: u64, ttft_ns: u64, decode_ns: u64 };
+
+            fn onToken(raw: *anyopaque, text: []const u8) bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (text.len != 0 and self.first_token_ns == 0) self.first_token_ns = embedTimingNowNs();
+                return true;
+            }
+
+            fn finish(self: @This(), completed_ns: u128, decode_ms: u64) !Timing {
+                if (self.first_token_ns == 0 or self.first_token_ns < self.started_ns or
+                    completed_ns < self.first_token_ns)
+                    return error.MissingContextQualificationTiming;
+                const result: Timing = .{
+                    .elapsed_ns = std.math.cast(u64, completed_ns - self.started_ns) orelse
+                        return error.InvalidContextQualificationTiming,
+                    .ttft_ns = std.math.cast(u64, self.first_token_ns - self.started_ns) orelse
+                        return error.InvalidContextQualificationTiming,
+                    .decode_ns = try std.math.mul(u64, decode_ms, std.time.ns_per_ms),
+                };
+                if (result.elapsed_ns == 0 or result.ttft_ns == 0 or result.decode_ns == 0 or
+                    result.ttft_ns > result.elapsed_ns or result.decode_ns > result.elapsed_ns)
+                    return error.MissingContextQualificationTiming;
+                return result;
+            }
+        };
 
         fn run(self: *@This()) std.Io.Cancelable!void {
             // Retire completed coordinated pages immediately. A finished
@@ -15584,8 +17484,28 @@ pub const Node = struct {
         }
 
         fn runInner(self: *@This()) !void {
-            var result = try self.pipeline.generate(self.messages, self.config);
+            const qualification_started_ns = if (comptime builtin.is_test)
+                if (self.capture_qualification) embedTimingNowNs() else 0
+            else
+                0;
+            var clock = QualificationClock{ .started_ns = qualification_started_ns };
+            var result = if (comptime builtin.is_test)
+                if (self.capture_qualification)
+                    try self.pipeline.generateStreaming(
+                        self.messages,
+                        self.config,
+                        @ptrCast(&clock),
+                        QualificationClock.onToken,
+                    )
+                else
+                    try self.pipeline.generate(self.messages, self.config)
+            else
+                try self.pipeline.generate(self.messages, self.config);
             defer result.deinit();
+            const qualification_completed_ns = if (comptime builtin.is_test)
+                if (self.capture_qualification) embedTimingNowNs() else 0
+            else
+                0;
             var response_text = result.text;
             var formatted_response_text: ?[]u8 = null;
             defer if (formatted_response_text) |text| self.allocator.free(text);
@@ -15599,8 +17519,41 @@ pub const Node = struct {
             self.out.finish_reason = result.finish_reason;
             self.out.prompt_tokens = result.prompt_tokens;
             self.out.completion_tokens = result.tokens_used;
+            if (comptime builtin.is_test) if (self.capture_qualification) {
+                const token_ids = result.token_ids orelse return error.MissingContextQualificationTokens;
+                if (token_ids.len > self.out.qualification.output_token_ids.len) return error.ContextQualificationOutputTooLong;
+                for (token_ids, 0..) |token_id, index| {
+                    if (token_id < 0) return error.InvalidModelOutput;
+                    self.out.qualification.output_token_ids[index] = @intCast(token_id);
+                }
+                self.out.qualification.output_token_ids_len = @intCast(token_ids.len);
+                const timing = result.timing_ms orelse return error.MissingContextQualificationTiming;
+                const measured = try clock.finish(qualification_completed_ns, timing.decode);
+                self.out.qualification.elapsed_ns = measured.elapsed_ns;
+                self.out.qualification.ttft_ns = measured.ttft_ns;
+                self.out.qualification.decode_ns = measured.decode_ns;
+            };
         }
     };
+
+    test "context mixed batch timing requires an observed first nonempty token" {
+        const Clock = BatchGenerateTask.QualificationClock;
+        try std.testing.expectError(
+            error.MissingContextQualificationTiming,
+            (Clock{ .started_ns = 1_000_000 }).finish(4_000_000, 1),
+        );
+        const observed = try (Clock{
+            .started_ns = 1_000_000,
+            .first_token_ns = 2_000_000,
+        }).finish(4_000_000, 1);
+        try std.testing.expectEqual(@as(u64, 3_000_000), observed.elapsed_ns);
+        try std.testing.expectEqual(@as(u64, 1_000_000), observed.ttft_ns);
+        try std.testing.expectEqual(@as(u64, 1_000_000), observed.decode_ns);
+        try std.testing.expectError(
+            error.MissingContextQualificationTiming,
+            (Clock{ .started_ns = 1, .first_token_ns = 2 }).finish(3, 1),
+        );
+    }
 
     const PreparedGenerateBatchModel = struct {
         requested_model: []u8,
@@ -15635,6 +17588,21 @@ pub const Node = struct {
             .native => .isolated_parallel,
             .metal, .cuda => .shared_serial,
         };
+    }
+
+    fn requestUsesApproximateContext(body: api.GenerateRequest) bool {
+        const policy = runtime.context_policy.fromApi(body.context_policy) catch return false;
+        return policy.mode != .exact;
+    }
+
+    fn retainBatchContextClass(indices: []usize, approximate: []const bool, target: bool) usize {
+        var retained: usize = 0;
+        for (indices) |idx| {
+            if (approximate[idx] != target) continue;
+            indices[retained] = idx;
+            retained += 1;
+        }
+        return retained;
     }
 
     fn canIsolateGeneration(backend: runtime.kv.pool.BackendKind, graph: bool, draft: bool, prompt_cache: bool, stream: bool) bool {
@@ -15684,6 +17652,7 @@ pub const Node = struct {
     const BatchAdmission = struct {
         lease: model_manager_mod.GenerationAdmissionLease,
         estimate: runtime.tier.memory.Estimate,
+        context_host: runtime.tier.memory.Reservation,
     };
 
     fn mergeSerialBatchEstimate(
@@ -15720,7 +17689,11 @@ pub const Node = struct {
         limits: runtime.tier.memory.Limits,
         run_budget: *runtime.tier.memory.RunBudget,
         estimate: runtime.tier.memory.Estimate,
+        context: ?@import("../backends/compaction_coordinator.zig").CampaignEstimate,
     ) !BatchAdmission {
+        const context_host_bytes = if (context) |sizing| sizing.host_peak_bytes else 0;
+        const context_host = try run_budget.tryReserveKv(.host, context_host_bytes);
+        errdefer run_budget.release(context_host);
         try run_budget.reserveEstimate(estimate);
         errdefer run_budget.releaseEstimate(estimate);
         return .{
@@ -15729,10 +17702,11 @@ pub const Node = struct {
                 .resources = .{
                     .backend_class = backend_class,
                     .limits = limits,
-                    .amounts = .fromEstimate(estimate),
+                    .amounts = contextGenerationAdmissionAmounts(estimate, context),
                 },
             }}),
             .estimate = estimate,
+            .context_host = context_host,
         };
     }
 
@@ -15743,8 +17717,72 @@ pub const Node = struct {
         if (admission.*) |*owned| {
             owned.lease.release();
             run_budget.releaseEstimate(owned.estimate);
+            run_budget.release(owned.context_host);
             admission.* = null;
         }
+    }
+
+    fn completeBatchServingItemObservation(
+        self: *Node,
+        request_index: usize,
+        model: *model_manager_mod.LoadedModel,
+        gpt_config: gpt_model_mod.Config,
+        config: *const generation.GenerationConfig,
+        prompt: *const NativePromptEstimate,
+        compaction_selection: ?model_manager_mod.LoadedModel.CompactionSelection,
+        compaction_request: ?*@import("../backends/compaction_coordinator.zig").CampaignRequest,
+        task_result: *const BatchGenerateTaskResult,
+        decode_state: *const generation.NativeDecodeState,
+    ) !ContextBatchServingObservation {
+        _ = self;
+        if (task_result.@"error" != null or task_result.text == null) return error.IncompleteContextQualification;
+        if (task_result.qualification.elapsed_ns == 0 or task_result.qualification.ttft_ns == 0 or
+            task_result.qualification.decode_ns == 0 or
+            task_result.qualification.ttft_ns > task_result.qualification.elapsed_ns or
+            task_result.qualification.decode_ns > task_result.qualification.elapsed_ns)
+            return error.MissingContextQualificationTiming;
+        const completion: ContextRouteCompletion = .{
+            .completed = true,
+            .prompt_tokens = task_result.prompt_tokens,
+            .output_tokens = task_result.completion_tokens,
+            .output_token_ids = task_result.qualification.output_token_ids,
+            .output_token_ids_len = task_result.qualification.output_token_ids_len,
+        };
+        var observation = ContextServingObservation{};
+        if (config.context_policy.mode == .attention_matching) {
+            const selected = compaction_selection orelse return error.InvalidContextTransaction;
+            const request = compaction_request orelse return error.InvalidContextTransaction;
+            completeContextServingObservation(
+                &observation,
+                selected,
+                request,
+                completion,
+                @intCast(@max(config.max_tokens, 1)),
+            );
+        } else {
+            const selected = try model.selectCompactionProfile(
+                try runtime.context_policy.Layout.init(gpt_config),
+                servingCompactionImplementation(config.*),
+            );
+            completeExactServingObservation(
+                &observation,
+                selected,
+                completion,
+                @intCast(@max(config.max_tokens, 1)),
+                decode_state.last_context_metrics,
+                decode_state.last_context_device_allocation_start,
+                decode_state.last_context_device_allocation_end,
+            );
+        }
+        bindRenderedPromptObservation(&observation, prompt);
+        if (!observation.route_completed) return error.IncompleteContextQualification;
+        return .{
+            .request_index = request_index,
+            .observation = observation,
+            .elapsed_ns = task_result.qualification.elapsed_ns,
+            .ttft_ns = task_result.qualification.ttft_ns,
+            .decode_ns = task_result.qualification.decode_ns,
+        };
     }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -15805,6 +17843,15 @@ pub const Node = struct {
         const response_alloc = response_arena.allocator();
 
         const results = try response_alloc.alloc(api.GenerateBatchResultItem, body.requests.len);
+        const batch_serving_sink: ContextBatchServingSinkSlot = if (builtin.is_test)
+            self.context_batch_serving_sink
+        else {};
+        const batch_serving_observations: ContextBatchServingObservationSlice = if (comptime builtin.is_test) blk: {
+            const values = try ctx.allocator.alloc(?ContextBatchServingObservation, body.requests.len);
+            @memset(values, null);
+            break :blk values;
+        } else {};
+        defer if (comptime builtin.is_test) ctx.allocator.free(batch_serving_observations);
         var owned_messages = try ctx.allocator.alloc(OwnedGenerateMessages, body.requests.len);
         defer {
             for (owned_messages) |*owned| owned.deinit();
@@ -15812,6 +17859,8 @@ pub const Node = struct {
         }
         var pending = try ctx.allocator.alloc(bool, body.requests.len);
         defer ctx.allocator.free(pending);
+        const approximate_context = try ctx.allocator.alloc(bool, body.requests.len);
+        defer ctx.allocator.free(approximate_context);
         const media_shapes = try ctx.allocator.alloc(RequestMediaAdmissionShape, body.requests.len);
         defer ctx.allocator.free(media_shapes);
         var execution_attempted = try ctx.allocator.alloc(bool, body.requests.len);
@@ -15844,6 +17893,7 @@ pub const Node = struct {
             };
             owned_messages[idx] = .{ .allocator = ctx.allocator };
             pending[idx] = true;
+            approximate_context[idx] = requestUsesApproximateContext(item.body);
             media_shapes[idx] = generateRequestMediaShapeWithAttachments(item.body, attachments);
             if (generateBatchUnsupportedReasonPreflight(item.body)) |batch_err| {
                 results[idx].@"error" = batch_err;
@@ -15981,6 +18031,23 @@ pub const Node = struct {
             var group_decoded_pixels: u64 = 0;
             group_indices.items.len = admitted_group_len;
             if (admitted_group_len == 0) continue;
+
+            // One approximate request must not disable scheduler leases for
+            // exact siblings. Preserve response indices and leave the other
+            // class pending for the next compatible execution window.
+            const context_class = approximate_context[group_indices.items[0]];
+            group_indices.items.len = retainBatchContextClass(
+                group_indices.items,
+                approximate_context,
+                context_class,
+            );
+            // Approximate context owns model-wide replay/publication state.
+            // Execute one item per window so each request has a private owner
+            // and releases it before the next approximate item is admitted.
+            if (context_class and group_indices.items.len > 1) {
+                group_indices.items.len = 1;
+            }
+            admitted_group_len = group_indices.items.len;
 
             // Retain only this execution window's materialized media. The
             // independent index copy is intentional: authoritative validation
@@ -16270,20 +18337,32 @@ pub const Node = struct {
                         break;
                     }
                 }
+                const group_uses_context = context_class;
                 const coordinated_metal_ocr = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false) and
                     group_indices.items.len >= 2 and backend_kind == .metal and gpt_config.family == .gemma and gpt_config.gemma4_channel_protocol and gpt_config.hasPle() and model.manifest.gguf_projector_path != null and
                     group_indices.items.len <= self.config.generation_batching.gemma4MetalOcrPolicy().max_active_requests_for_batching.?;
-                const execution_mode = if (coordinated_metal_ocr)
+                var execution_mode = if (coordinated_metal_ocr)
                     BatchExecutionMode.coordinated_shared
                 else if (group_has_media)
                     BatchExecutionMode.shared_serial
                 else
                     batchExecutionMode(backend_kind);
+                if (group_uses_context) execution_mode = .shared_serial;
                 const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
                     backend_kind,
                     gpt_config,
                     self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
                 );
+                const kv_dtype = if (first_body.cache_dtype) |name|
+                    runtime.kv.pool.parseKvDType(name) orelse {
+                        for (group_indices.items) |idx| {
+                            results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "invalid cache_dtype value", .retryable = false };
+                            pending[idx] = false;
+                        }
+                        continue;
+                    }
+                else
+                    session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
 
                 var configs = try ctx.allocator.alloc(generation.GenerationConfig, group_indices.items.len);
                 defer ctx.allocator.free(configs);
@@ -16299,6 +18378,87 @@ pub const Node = struct {
                 defer ctx.allocator.free(prompt_tokens);
                 var prompt_bytes = try ctx.allocator.alloc(usize, group_indices.items.len);
                 defer ctx.allocator.free(prompt_bytes);
+                const compaction_coordinator = @import("../backends/compaction_coordinator.zig");
+                var compaction_selection: ?model_manager_mod.LoadedModel.CompactionSelection = null;
+                var compaction_route: ?struct { split_decode: bool, flash_prefill: bool, engine: @import("../runtime/kv/compaction_profile.zig").FitEngine } = null;
+                const batch_allocation_sink: ContextBatchAllocationSinkSlot = if (builtin.is_test)
+                    self.context_batch_allocation_sink
+                else {};
+                const batch_receipt_members = try ctx.allocator.alloc(usize, group_indices.items.len);
+                var batch_receipt_member_count: usize = 0;
+                defer ctx.allocator.free(batch_receipt_members);
+                const exact_group_tracks_owner = if (comptime builtin.is_test)
+                    self.context_serving_qualification != null and batch_allocation_sink != null and
+                        !group_uses_context and execution_mode == .shared_serial and
+                        backend_kind == .metal and kv_dtype == .f16 and !group_has_media
+                else
+                    false;
+                var exact_group_owner: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner = if (exact_group_tracks_owner)
+                    try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null)
+                else
+                    null;
+                defer if (exact_group_owner) |*owner| {
+                    // Exact siblings borrow one allocator. Release every
+                    // retained prompt before publishing the one group receipt.
+                    for (group_indices.items) |idx| {
+                        if (prompt_estimates[idx]) |*estimate| estimate.deinit();
+                        prompt_estimates[idx] = null;
+                    }
+                    releaseBatchContextOwner(
+                        owner,
+                        batch_receipt_members[0..batch_receipt_member_count],
+                        batch_allocation_sink,
+                    );
+                };
+                const exact_group_witness: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner.ContextScopeWitness = if (exact_group_owner) |*owner| blk: {
+                    const witness = try owner.beginContextScope(model.load_generation);
+                    try owner.bindPreparedAllocator(witness, owner.allocator());
+                    break :blk witness;
+                } else null;
+                const context_request_owners = try ctx.allocator.alloc(?runtime.kv.host_allocation_tracker.RequestAllocationOwner, group_indices.items.len);
+                @memset(context_request_owners, null);
+                const context_scope_witnesses = ctx.allocator.alloc(
+                    ?runtime.kv.host_allocation_tracker.RequestAllocationOwner.ContextScopeWitness,
+                    group_indices.items.len,
+                ) catch |err| {
+                    ctx.allocator.free(context_request_owners);
+                    return err;
+                };
+                @memset(context_scope_witnesses, null);
+                defer {
+                    // The outer prompt-estimate cleanup is registered before
+                    // this group owner. Close its tracked item here so every
+                    // borrowed allocation is gone before releasing the ledger.
+                    for (group_indices.items, 0..) |idx, pos| {
+                        if (context_request_owners[pos] == null) continue;
+                        if (prompt_estimates[idx]) |*estimate| estimate.deinit();
+                        prompt_estimates[idx] = null;
+                        const member_indices: []const usize = if (batch_receipt_member_count == 1 and batch_receipt_members[0] == idx)
+                            batch_receipt_members[0..1]
+                        else
+                            batch_receipt_members[0..0];
+                        releaseBatchContextOwner(&context_request_owners[pos].?, member_indices, batch_allocation_sink);
+                    }
+                    ctx.allocator.free(context_scope_witnesses);
+                    ctx.allocator.free(context_request_owners);
+                }
+                var context_execution_lease: ?context_execution_pool.Lease = null;
+                defer if (context_execution_lease) |*lease| abandonContextExecutionLease(lease, null);
+                const prepared_contexts = try ctx.allocator.alloc(?compaction_coordinator.PreparedCampaignPlan, group_indices.items.len);
+                @memset(prepared_contexts, null);
+                defer {
+                    for (prepared_contexts) |*prepared| if (prepared.*) |*owned| owned.deinit();
+                    ctx.allocator.free(prepared_contexts);
+                }
+                const context_sizings = try ctx.allocator.alloc(?compaction_coordinator.CampaignEstimate, group_indices.items.len);
+                @memset(context_sizings, null);
+                defer ctx.allocator.free(context_sizings);
+                const compaction_requests = try ctx.allocator.alloc(?compaction_coordinator.CampaignRequest, group_indices.items.len);
+                @memset(compaction_requests, null);
+                defer {
+                    for (compaction_requests) |*request| if (request.*) |*owned| owned.deinit();
+                    ctx.allocator.free(compaction_requests);
+                }
                 var valid_count: usize = 0;
                 for (group_indices.items, 0..) |idx, pos| {
                     configs[pos] = generateConfigFromBody(ctx.allocator, body.requests[idx].body, &owned_grammars[pos]) catch |err| {
@@ -16307,8 +18467,83 @@ pub const Node = struct {
                         pending[idx] = false;
                         continue;
                     };
+                    if (comptime builtin.is_test) {
+                        if (self.context_serving_qualification) |qualification| {
+                            if (qualification.admitted_prefill_chunk_rows == 0)
+                                return error.InvalidContextServingQualification;
+                            configs[pos].prefill_chunk_size = qualification.admitted_prefill_chunk_rows;
+                            applyQualificationFitEngine(&configs[pos], qualification);
+                        }
+                    }
+                    std.debug.assert((configs[pos].context_policy.mode != .exact) == group_uses_context);
+                    if (configs[pos].context_policy.mode == .attention_matching) {
+                        runtime.context_policy.validateExecution(configs[pos].context_policy, .{
+                            .metal = backend_kind == .metal,
+                            .f16_kv = kv_dtype == .f16,
+                            .multimodal = generation.messagesHaveImages(owned_messages[idx].messages) or generation.messagesHaveAudio(owned_messages[idx].messages),
+                            .speculation = configs[pos].speculation_requested,
+                            .prompt_cache = configs[pos].prompt_cache_enabled,
+                            .forced_global_trim = gpt_config.hasGlobalAttentionLayers() and gpt_config.sliding_window > 0 and generation.kvSlidingTrimForced(),
+                        }, .{ .attention_matching = true }) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                            continue;
+                        };
+                        if (compaction_selection == null) {
+                            const context_layout = runtime.context_policy.Layout.init(gpt_config) catch |err| {
+                                results[idx].@"error" = batchGenerationError(err);
+                                pending[idx] = false;
+                                continue;
+                            };
+                            compaction_selection = selectServingCompactionProfile(
+                                model,
+                                context_layout,
+                                &configs[pos],
+                            ) catch |err| {
+                                results[idx].@"error" = batchGenerationError(err);
+                                pending[idx] = false;
+                                continue;
+                            };
+                            compaction_route = .{
+                                .split_decode = configs[pos].context_split_decode,
+                                .flash_prefill = configs[pos].context_flash_prefill,
+                                .engine = configs[pos].context_fit_engine,
+                            };
+                        } else {
+                            const route = compaction_route orelse return error.InvalidContextTransaction;
+                            configs[pos].context_split_decode = route.split_decode;
+                            configs[pos].context_flash_prefill = route.flash_prefill;
+                            configs[pos].context_fit_engine = route.engine;
+                        }
+                        context_request_owners[pos] = runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                            continue;
+                        };
+                        const witness = context_request_owners[pos].?.beginContextScope(model.load_generation) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                            continue;
+                        };
+                        context_scope_witnesses[pos] = witness;
+                        context_request_owners[pos].?.bindPreparedAllocator(
+                            witness,
+                            context_request_owners[pos].?.allocator(),
+                        ) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                            continue;
+                        };
+                        configs[pos].context_owner_allocation_tracker = context_request_owners[pos].?.tracker;
+                    }
+                    const item_context_allocator = if (context_request_owners[pos]) |*owner|
+                        owner.allocator()
+                    else if (exact_group_owner) |*owner|
+                        owner.allocator()
+                    else
+                        ctx.allocator;
                     const item_prompt_estimate = self.estimateNativePromptTokens(
-                        ctx.allocator,
+                        item_context_allocator,
                         model_path,
                         model,
                         gpt_config,
@@ -16317,6 +18552,7 @@ pub const Node = struct {
                         if (configs[pos].speculation_requested and configs[pos].speculation_policy != .off and configs[pos].speculative_k > 0) 1 else 0,
                         configs[pos].enable_thinking,
                         configs[pos].grammar != null,
+                        configs[pos].context_policy,
                         &prompt_estimates[idx],
                     ) catch |err| {
                         results[idx].@"error" = if (err == error.PromptTooLong)
@@ -16325,12 +18561,61 @@ pub const Node = struct {
                                 .message = "prompt exceeds the model context window after reserving output tokens",
                                 .retryable = false,
                             }
+                        else if (generationRequestFailure(err) != null)
+                            batchGenerationError(err)
                         else
                             .{ .code = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err), .retryable = false };
                         pending[idx] = false;
                         continue;
                     };
                     prompt_tokens[pos] = item_prompt_estimate;
+                    const scope_owner: ?*runtime.kv.host_allocation_tracker.RequestAllocationOwner = if (context_request_owners[pos]) |*owner|
+                        owner
+                    else if (exact_group_owner) |*owner|
+                        owner
+                    else
+                        null;
+                    const scope_witness: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner.ContextScopeWitness = if (context_scope_witnesses[pos]) |witness|
+                        witness
+                    else
+                        exact_group_witness;
+                    if (scope_owner) |owner| {
+                        const witness = scope_witness orelse return error.InvalidContextOwnerScope;
+                        owner.bindIsolatedRoute(witness, .{
+                            .metal = backend_kind == .metal,
+                            .f16_kv = kv_dtype == .f16,
+                            .prompt_cache_disabled = !configs[pos].prompt_cache_enabled,
+                            .media_disabled = !group_has_media,
+                            .speculation_disabled = !configs[pos].speculation_requested,
+                            .draft_disabled = configs[pos].speculative_k == 0,
+                            .legacy_qualification_disabled = if (comptime builtin.is_test)
+                                configs[pos].context_qualification == null
+                            else
+                                true,
+                            .retained_prepared_payload = prompt_estimates[idx] != null,
+                        }) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                            owner.invalidateContextScope(witness) catch {};
+                            continue;
+                        };
+                    }
+                    if (configs[pos].context_policy.mode == .attention_matching) {
+                        prepared_contexts[pos] = prepareServingCompactionPlan(
+                            item_context_allocator,
+                            model,
+                            gpt_config,
+                            configs[pos],
+                            prompt_tokens[pos],
+                            &prompt_estimates[idx].?,
+                            owned_messages[idx].messages,
+                            compaction_selection.?,
+                        ) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                            continue;
+                        };
+                    }
                     if (executor_contract.batch.max_input_tokens_per_item) |limit| {
                         if (prompt_tokens[pos] > limit) {
                             results[idx].@"error" = generateExecutorContractError(error.InferenceInputTokensExceeded).batch;
@@ -16343,16 +18628,6 @@ pub const Node = struct {
                 }
                 if (valid_count == 0) continue;
 
-                const kv_dtype = if (first_body.cache_dtype) |name|
-                    runtime.kv.pool.parseKvDType(name) orelse {
-                        for (group_indices.items) |idx| {
-                            results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "invalid cache_dtype value", .retryable = false };
-                            pending[idx] = false;
-                        }
-                        continue;
-                    }
-                else
-                    session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
                 const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
                     .native => .cpu,
                     .metal, .cuda => .gpu,
@@ -16361,6 +18636,50 @@ pub const Node = struct {
                     model.session,
                     self.defaultGenerationLimits(budget_backend_class),
                 ));
+                const qualification_warms_pool = if (comptime builtin.is_test)
+                    self.context_serving_qualification != null
+                else
+                    false;
+                if (compaction_selection != null or qualification_warms_pool) {
+                    const pool = model.ensureContextExecutionPool(budget_limits, null, execution_control) catch |err| {
+                        for (group_indices.items) |idx| {
+                            if (!pending[idx]) continue;
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                        }
+                        continue;
+                    };
+                    context_execution_lease = pool.acquire(model.load_generation) catch |err| {
+                        for (group_indices.items) |idx| {
+                            if (!pending[idx]) continue;
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                        }
+                        continue;
+                    };
+                    if (exact_group_owner) |*owner| {
+                        context_execution_lease.?.bindContextOwner(owner, exact_group_witness.?) catch |err| {
+                            for (group_indices.items) |idx| {
+                                if (!pending[idx]) continue;
+                                results[idx].@"error" = batchGenerationError(err);
+                                pending[idx] = false;
+                            }
+                            continue;
+                        };
+                    }
+                    for (configs, group_indices.items, 0..) |*item_config, idx, pos| {
+                        if (!pending[idx] or item_config.context_policy.mode != .attention_matching) continue;
+                        item_config.context_execution_lease = &context_execution_lease.?;
+                        context_execution_lease.?.bindContextOwner(
+                            &context_request_owners[pos].?,
+                            context_scope_witnesses[pos].?,
+                        ) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                            continue;
+                        };
+                    }
+                }
                 var leases = try ctx.allocator.alloc(runtime.scheduler.native_generate.Lease, group_indices.items.len);
                 for (leases) |*lease| lease.* = .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 0, .active_requests_snapshot = 0 };
                 const standalone_prefill_plans = try ctx.allocator.alloc(
@@ -16437,11 +18756,22 @@ pub const Node = struct {
                     ctx.allocator.free(admissions);
                 }
                 var runnable_count: usize = 0;
-                const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
-                    .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config, .workspace_capacity = model.session.generationWorkspaceCapacity() },
-                };
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
+                    const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
+                        .{
+                            .context_policy = configs[pos].context_policy,
+                            .context_plan = if (prepared_contexts[pos]) |*prepared| prepared else null,
+                            .packed_exact = if (configs[pos].context_storage == .packed_exact) .{
+                                .optimize_decode = configs[pos].context_split_decode,
+                                .optimize_prefill = configs[pos].context_flash_prefill,
+                            } else null,
+                            .backend = backend_kind,
+                            .kv_dtype = kv_dtype,
+                            .config = gpt_config,
+                            .workspace_capacity = model.session.generationWorkspaceCapacity(),
+                        },
+                    };
                     const scheduler_ceiling = if (model.native_generate_coordinator != null)
                         leases[pos].prefill_chunk_size
                     else
@@ -16480,54 +18810,70 @@ pub const Node = struct {
                         }
                         continue;
                     };
-                    configs[pos].prefill_chunk_size = prefill_admission.max_chunk_rows;
-                    if (model.native_generate_coordinator) |coordinator| {
-                        coordinator.admitPrefillChunkPlan(
-                            &leases[pos],
-                            prompt_tokens[pos],
-                            prefill_admission.max_chunk_rows,
-                            prefill_admission.max_scratch_bytes,
-                            .fixed_ceiling,
-                        ) catch |err| {
-                            results[idx].@"error" = .{
-                                .code = "PREFILL_PLAN_ADMISSION_FAILED",
-                                .message = @errorName(err),
-                                .retryable = false,
-                            };
-                            pending[idx] = false;
-                            coordinator.release(leases[pos]);
-                            leases[pos].request_id = 0;
-                            continue;
-                        };
-                        configs[pos].prefill_chunk_plan = leases[pos].prefill_chunk_plan;
-                    } else {
-                        standalone_prefill_plans[pos] = runtime.scheduler.native_generate.PrefillChunkPlan.init(
-                            ctx.allocator,
-                            prompt_tokens[pos],
-                            prefill_admission.max_chunk_rows,
-                            prefill_admission.max_scratch_bytes,
-                            if (valid_count == 1) .sole_idle else .shared,
-                            .fixed_ceiling,
-                        ) catch |err| {
-                            results[idx].@"error" = .{
-                                .code = "PREFILL_PLAN_ADMISSION_FAILED",
-                                .message = @errorName(err),
-                                .retryable = false,
-                            };
-                            pending[idx] = false;
-                            continue;
-                        };
-                        configs[pos].prefill_chunk_plan = standalone_prefill_plans[pos].?;
+                    if (comptime builtin.is_test) {
+                        if (self.context_serving_qualification) |qualification| {
+                            if (validateQualificationPrefillChunk(
+                                prompt_tokens[pos],
+                                qualification.admitted_prefill_chunk_rows,
+                                prefill_admission.max_chunk_rows,
+                            )) |_| {} else |_| {
+                                results[idx].@"error" = .{
+                                    .code = "CONTEXT_QUALIFICATION_CHUNK_MISMATCH",
+                                    .message = "admitted prefill chunk differs from sealed qualification geometry",
+                                    .retryable = false,
+                                };
+                                pending[idx] = false;
+                                if (model.native_generate_coordinator) |coordinator| {
+                                    coordinator.release(leases[pos]);
+                                    leases[pos].request_id = 0;
+                                }
+                                continue;
+                            }
+                        }
                     }
-                    logAdmittedPrefillChunkPlan(configs[pos].prefill_chunk_plan.?);
-                    const resource_estimate = runtime.tier.memory.estimateGptGeneration(
-                        backend_kind,
-                        kv_dtype,
-                        gpt_config,
-                        prompt_tokens[pos],
-                        budget_max_tokens,
-                        configs[pos].prefill_chunk_size,
-                    ) catch |err| {
+                    configs[pos].prefill_chunk_size = prefill_admission.max_chunk_rows;
+                    if (configs[pos].context_policy.mode == .exact) {
+                        if (model.native_generate_coordinator) |coordinator| {
+                            coordinator.admitPrefillChunkPlan(
+                                &leases[pos],
+                                prompt_tokens[pos],
+                                prefill_admission.max_chunk_rows,
+                                prefill_admission.max_scratch_bytes,
+                                .fixed_ceiling,
+                            ) catch |err| {
+                                results[idx].@"error" = .{
+                                    .code = "PREFILL_PLAN_ADMISSION_FAILED",
+                                    .message = @errorName(err),
+                                    .retryable = false,
+                                };
+                                pending[idx] = false;
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                                continue;
+                            };
+                            configs[pos].prefill_chunk_plan = leases[pos].prefill_chunk_plan;
+                        } else {
+                            standalone_prefill_plans[pos] = runtime.scheduler.native_generate.PrefillChunkPlan.init(
+                                ctx.allocator,
+                                prompt_tokens[pos],
+                                prefill_admission.max_chunk_rows,
+                                prefill_admission.max_scratch_bytes,
+                                if (valid_count == 1) .sole_idle else .shared,
+                                .fixed_ceiling,
+                            ) catch |err| {
+                                results[idx].@"error" = .{
+                                    .code = "PREFILL_PLAN_ADMISSION_FAILED",
+                                    .message = @errorName(err),
+                                    .retryable = false,
+                                };
+                                pending[idx] = false;
+                                continue;
+                            };
+                            configs[pos].prefill_chunk_plan = standalone_prefill_plans[pos].?;
+                        }
+                        logAdmittedPrefillChunkPlan(configs[pos].prefill_chunk_plan.?);
+                    }
+                    const resource_estimate = budget_components[0].estimate(prompt_tokens[pos], budget_max_tokens, configs[pos].prefill_chunk_size) catch |err| {
                         results[idx].@"error" = .{
                             .code = if (err == error.InvalidModelConfig) "INVALID_MODEL" else "MODEL_RESOURCE_LIMIT",
                             .message = @errorName(err),
@@ -16540,6 +18886,22 @@ pub const Node = struct {
                         }
                         continue;
                     };
+                    context_sizings[pos] = if (prepared_contexts[pos]) |*prepared|
+                        prepared.estimate(configs[pos].prefill_chunk_size) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                            if (model.native_generate_coordinator) |coordinator| {
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                            }
+                            continue;
+                        }
+                    else
+                        null;
+                    if (context_sizings[pos]) |sizing|
+                        configs[pos].context_budget_bytes = sizing.execution_peak_bytes
+                    else if (configs[pos].context_storage == .packed_exact or configs[pos].context_policy.mode != .exact)
+                        configs[pos].context_budget_bytes = resource_estimate.kv_bytes;
                     resource_estimates[pos] = resource_estimate;
                     if (execution_mode != .isolated_parallel) {
                         runnable_count += 1;
@@ -16551,6 +18913,7 @@ pub const Node = struct {
                         budget_limits,
                         &task_run_budgets[pos],
                         resource_estimate,
+                        null,
                     ) catch |err| {
                         results[idx].@"error" = batchAdmissionError(err);
                         pending[idx] = false;
@@ -16595,6 +18958,7 @@ pub const Node = struct {
                             budget_limits,
                             &shared_run_budget,
                             estimate,
+                            if (largest_pos) |pos| context_sizings[pos] else null,
                         ) catch |err| {
                             // Preserve per-item batch semantics: if the largest
                             // request cannot be admitted, reject it and retry a
@@ -16612,6 +18976,101 @@ pub const Node = struct {
                         };
                     }
                     if (shared_batch_admission == null) continue;
+                }
+
+                var executing_items: usize = 0;
+                var attention_matching_pos: ?usize = null;
+                for (group_indices.items, 0..) |idx, pos| {
+                    if (!pending[idx]) continue;
+                    batch_receipt_members[batch_receipt_member_count] = idx;
+                    batch_receipt_member_count += 1;
+                    executing_items += 1;
+                    if (configs[pos].context_policy.mode == .attention_matching)
+                        attention_matching_pos = pos;
+                }
+                if (exact_group_owner) |*owner| {
+                    owner.bindBatchGroup(exact_group_witness.?, .exact_siblings, executing_items) catch |err| {
+                        for (group_indices.items) |idx| {
+                            if (!pending[idx]) continue;
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                        }
+                        continue;
+                    };
+                } else if (attention_matching_pos) |pos| {
+                    if (executing_items != 1) {
+                        const idx = group_indices.items[pos];
+                        results[idx].@"error" = batchGenerationError(error.InvalidContextBatchScope);
+                        pending[idx] = false;
+                        context_request_owners[pos].?.invalidateContextScope(context_scope_witnesses[pos].?) catch {};
+                        continue;
+                    }
+                    context_request_owners[pos].?.bindBatchGroup(
+                        context_scope_witnesses[pos].?,
+                        .attention_matching_singleton,
+                        executing_items,
+                    ) catch |err| {
+                        const idx = group_indices.items[pos];
+                        results[idx].@"error" = batchGenerationError(err);
+                        pending[idx] = false;
+                        continue;
+                    };
+                }
+
+                // Finalize only after process capacity is owned. The same
+                // request object is passed through ingestion, replay and
+                // publication, and its arena stays alive through task cleanup.
+                for (group_indices.items, 0..) |idx, pos| {
+                    if (!pending[idx] or prepared_contexts[pos] == null) continue;
+                    const selection_owner = compaction_selection orelse {
+                        results[idx].@"error" = batchGenerationError(error.InvalidContextTransaction);
+                        pending[idx] = false;
+                        runnable_count -= 1;
+                        continue;
+                    };
+                    if (selection_owner.load_generation != model.load_generation) {
+                        results[idx].@"error" = batchGenerationError(error.InvalidContextTransaction);
+                        pending[idx] = false;
+                        runnable_count -= 1;
+                        continue;
+                    }
+                    const sizing = context_sizings[pos] orelse {
+                        results[idx].@"error" = batchGenerationError(error.InvalidContextTransaction);
+                        pending[idx] = false;
+                        runnable_count -= 1;
+                        continue;
+                    };
+                    compaction_requests[pos] = prepared_contexts[pos].?.finalize(
+                        configs[pos].prefill_chunk_size,
+                        sizing.backend_peak_bytes,
+                        sizing.host_peak_bytes,
+                    ) catch |err| {
+                        results[idx].@"error" = batchGenerationError(err);
+                        pending[idx] = false;
+                        runnable_count -= 1;
+                        continue;
+                    };
+                    configs[pos].context_request = &compaction_requests[pos].?;
+                    configs[pos].context_load_generation = selection_owner.load_generation;
+                }
+                if (runnable_count == 0) continue;
+
+                // Resource admission is complete before either barrier waits
+                // or the model mutex is acquired. Wait loops take and release
+                // only the coordinator's short state mutex on each probe.
+                if (model.native_generate_coordinator) |coordinator| {
+                    if (group_uses_context) {
+                        std.debug.assert(group_indices.items.len == 1);
+                        coordinator.markExclusive(&leases[0]) catch |err| return inferenceFailureResponse(ctx, err);
+                        coordinator.awaitExclusiveExecutionControlled(&leases[0], ctx.io, execution_control) catch |err|
+                            return inferenceFailureResponse(ctx, err);
+                    } else {
+                        coordinator.awaitSharedExecutionGroupControlled(
+                            leases,
+                            ctx.io,
+                            execution_control,
+                        ) catch |err| return inferenceFailureResponse(ctx, err);
+                    }
                 }
 
                 // Match the single-request lock order: scheduler and resource
@@ -16645,7 +19104,21 @@ pub const Node = struct {
                 }
                 defer if (shared_cb) |*cb| cb.deinit();
 
-                var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
+                const batch_context_owner: ?*runtime.kv.host_allocation_tracker.RequestAllocationOwner = if (exact_group_owner) |*owner|
+                    owner
+                else if (attention_matching_pos) |pos|
+                    &context_request_owners[pos].?
+                else
+                    null;
+                const batch_context_witness = if (exact_group_owner != null)
+                    exact_group_witness
+                else if (attention_matching_pos) |pos|
+                    context_scope_witnesses[pos]
+                else
+                    null;
+                const batch_context_allocator = if (batch_context_owner) |owner| owner.allocator() else ctx.allocator;
+                const batch_context_tracker = if (batch_context_owner) |owner| owner.tracker else null;
+                var kv_manager = runtime.kv.manager.KvManager.init(batch_context_allocator);
                 defer kv_manager.deinit();
                 const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
                 const pool_id = kv_manager.addPool(generation.requestKvManagerPoolConfig(kv_pool_config)) catch |err| {
@@ -16656,7 +19129,11 @@ pub const Node = struct {
                     }
                     continue;
                 };
-                var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, kv_pool_config) catch |err| {
+                var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.initTracked(
+                    batch_context_allocator,
+                    kv_pool_config,
+                    batch_context_tracker,
+                ) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
                         results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
@@ -16672,6 +19149,17 @@ pub const Node = struct {
                             results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
                             pending[idx] = false;
                         }
+                        continue;
+                    };
+                }
+                if (batch_context_owner) |owner| {
+                    kv_storage.bindContextOwnerScope(owner, batch_context_witness.?) catch |err| {
+                        for (group_indices.items) |idx| {
+                            if (!pending[idx]) continue;
+                            results[idx].@"error" = batchGenerationError(err);
+                            pending[idx] = false;
+                        }
+                        owner.invalidateContextScope(batch_context_witness.?) catch {};
                         continue;
                     };
                 }
@@ -16731,7 +19219,16 @@ pub const Node = struct {
                         task_cbs[pos].?
                     else
                         shared_cb.?;
-                    decode_states[pos] = generation.NativeDecodeState.initPaged(task_alloc, &kv_manager, pool_id, model.shared_moe_cache);
+                    decode_states[pos] = generation.NativeDecodeState.initPaged(
+                        task_alloc,
+                        &kv_manager,
+                        pool_id,
+                        model.shared_moe_cache,
+                    );
+                    decode_states[pos].context_metadata_allocator = if (batch_context_owner != null)
+                        batch_context_allocator
+                    else
+                        null;
                     decode_states[pos].kv_lock = &kv_mutex;
                     decode_states[pos].kv_storage = &kv_storage;
                     tasks[pos] = .{
@@ -16754,39 +19251,117 @@ pub const Node = struct {
                                 .attention_mask = estimate.encoded.attention_mask,
                                 .prompt_token_limit = estimate.prompt_token_limit,
                             } else null,
+                            .return_raw_token_ids = if (comptime builtin.is_test)
+                                self.context_serving_qualification != null and batch_serving_sink != null
+                            else
+                                false,
                             .print_timing = serverGenerateTimingEnabled(),
                             .model_dir = model_path,
                             .gguf_projector_path = model.manifest.gguf_projector_path,
                             .projector_store = model.ensureProjectorStore() catch null,
                             .decode_state = &decode_states[pos],
-                            .scheduler = model.native_generate_coordinator,
-                            .scheduler_lease = if (model.native_generate_coordinator != null) &leases[pos] else null,
+                            .load_generation = model.load_generation,
+                            .scheduler = if (group_uses_context) null else model.native_generate_coordinator,
+                            .scheduler_lease = if (!group_uses_context and model.native_generate_coordinator != null) &leases[pos] else null,
                             .execution_lock = batch_model_lock.pipelineExecutionLock(),
                             .execution_control = execution_control,
                         },
                         .messages = owned_messages[idx].messages,
                         .config = configs[pos],
                         .response_format = body.requests[idx].body.response_format,
+                        .capture_qualification = if (comptime builtin.is_test)
+                            self.context_serving_qualification != null and batch_serving_sink != null
+                        else
+                            false,
                         .out = &task_results[pos],
                     };
                     task_ran[pos] = true;
                     execution_attempted[idx] = true;
                     if (execution_mode == .shared_serial) {
                         tasks[pos].run() catch {};
+                        if (comptime builtin.is_test) {
+                            if (self.context_serving_qualification != null and batch_serving_sink != null and
+                                task_results[pos].@"error" == null and task_results[pos].text != null)
+                            {
+                                batch_serving_observations[idx] = self.completeBatchServingItemObservation(
+                                    idx,
+                                    model,
+                                    gpt_config,
+                                    &configs[pos],
+                                    &prompt_estimates[idx].?,
+                                    compaction_selection,
+                                    if (compaction_requests[pos]) |*request| request else null,
+                                    &task_results[pos],
+                                    &decode_states[pos],
+                                ) catch |err| blk: {
+                                    task_results[pos].@"error" = batchGenerationError(err);
+                                    if (batch_context_owner) |owner|
+                                        owner.invalidateContextScope(batch_context_witness.?) catch {};
+                                    break :blk null;
+                                };
+                            }
+                        }
                         if (model.native_generate_coordinator) |coordinator| {
                             if (leases[pos].request_id != 0) {
                                 coordinator.release(leases[pos]);
                                 leases[pos].request_id = 0;
                             }
                         }
-                        decode_states[pos].deinit();
-                        decode_states[pos] = generation.NativeDecodeState.initContiguous(ctx.allocator);
+                        if (batch_context_owner) |owner| {
+                            const witness = batch_context_witness.?;
+                            if (task_results[pos].@"error" == null and task_results[pos].text != null) {
+                                if (configs[pos].context_policy.mode == .attention_matching) {
+                                    const committed = decode_states[pos].last_context_owner_committed orelse {
+                                        task_results[pos].@"error" = batchGenerationError(error.MissingContextOwnerCommittedSnapshot);
+                                        owner.invalidateContextScope(witness) catch {};
+                                        decode_states[pos].deinit();
+                                        decode_states[pos] = generation.NativeDecodeState.initContiguous(ctx.allocator);
+                                        try applyBatchGenerateTaskResult(
+                                            response_alloc,
+                                            body.requests[idx].body.model,
+                                            &task_results[pos],
+                                            &results[idx],
+                                        );
+                                        pending[idx] = false;
+                                        task_arenas[pos].deinit();
+                                        task_arenas[pos] = std.heap.ArenaAllocator.init(ctx.allocator);
+                                        continue;
+                                    };
+                                    owner.setDrainedCommittedSnapshotMax(witness, committed) catch |err| {
+                                        task_results[pos].@"error" = batchGenerationError(err);
+                                        owner.invalidateContextScope(witness) catch {};
+                                    };
+                                } else {
+                                    kv_storage.drainDeviceWritesForOwnerSnapshot() catch |err| {
+                                        task_results[pos].@"error" = batchGenerationError(err);
+                                        owner.invalidateContextScope(witness) catch {};
+                                    };
+                                    if (task_results[pos].@"error" == null) {
+                                        owner.setDrainedCommittedSnapshotMax(witness, owner.tracker.snapshot()) catch |err| {
+                                            task_results[pos].@"error" = batchGenerationError(err);
+                                            owner.invalidateContextScope(witness) catch {};
+                                        };
+                                    }
+                                }
+                            } else {
+                                owner.invalidateContextScope(witness) catch {};
+                            }
+                        }
                         try applyBatchGenerateTaskResult(
                             response_alloc,
                             body.requests[idx].body.model,
-                            task_results[pos],
+                            &task_results[pos],
                             &results[idx],
                         );
+                        if (batch_context_owner) |owner| {
+                            if (task_results[pos].@"error" == null and task_results[pos].text != null)
+                                owner.completeBatchItem(batch_context_witness.?) catch |err| {
+                                    owner.invalidateContextScope(batch_context_witness.?) catch {};
+                                    return err;
+                                };
+                        }
+                        decode_states[pos].deinit();
+                        decode_states[pos] = generation.NativeDecodeState.initContiguous(ctx.allocator);
                         pending[idx] = false;
                         task_arenas[pos].deinit();
                         task_arenas[pos] = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -16808,11 +19383,25 @@ pub const Node = struct {
                     try applyBatchGenerateTaskResult(
                         response_alloc,
                         body.requests[idx].body.model,
-                        task_results[pos],
+                        &task_results[pos],
                         &results[idx],
                     );
                     pending[idx] = false;
                 }
+            }
+        }
+
+        if (comptime builtin.is_test) {
+            if (self.context_serving_qualification != null) {
+                const sink = batch_serving_sink orelse return error.MissingContextBatchServingObservationSink;
+                var observed: usize = 0;
+                for (results, batch_serving_observations) |result, maybe_observation| {
+                    if (result.response == null or result.@"error" != null) continue;
+                    const observation = maybe_observation orelse return error.MissingContextBatchServingObservation;
+                    sink.complete_fn(sink.ctx, observation);
+                    observed += 1;
+                }
+                if (observed == 0) return error.MissingContextBatchServingObservation;
             }
         }
 
@@ -17381,6 +19970,7 @@ pub const Node = struct {
         include_usage: bool,
         context_diagnostics: ?api.ContextDiagnostics,
         completion: *?DeferredGenerationCompletion,
+        context_completion: ?*ContextRouteCompletion,
     ) !httpx.Response {
         const server_a4b_telemetry_before = serverA4bTelemetrySnapshot(telemetry_cb);
         defer logServerA4bTelemetry(telemetry_cb, server_a4b_telemetry_before, model_name);
@@ -17402,8 +19992,22 @@ pub const Node = struct {
             parser: ?*tool_parser_mod.Parser,
             request_context: *const httpx.Context,
             defer_content: bool,
+            bind_public_output: bool,
             write_error: ?anyerror = null,
             parser_failed: bool = false,
+            public_output_hash: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
+            public_output_bytes: usize = 0,
+
+            fn recordPublicOutput(stream_state: *@This(), value: []const u8) bool {
+                if (comptime !builtin.is_test) return true;
+                if (!stream_state.bind_public_output) return true;
+                stream_state.public_output_bytes = std.math.add(usize, stream_state.public_output_bytes, value.len) catch {
+                    stream_state.write_error = error.StreamPublicOutputTooLarge;
+                    return false;
+                };
+                stream_state.public_output_hash.update(value);
+                return true;
+            }
 
             fn shouldContinue(raw_ctx: *anyopaque) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
@@ -17429,6 +20033,7 @@ pub const Node = struct {
                             stream.write_error = err;
                             return false;
                         };
+                        if (!stream.recordPublicOutput(update.ready_text)) return false;
                     }
                     if (!parser.streamsIncrementalToolDeltas() and update.new_calls.len > 0) {
                         for (update.new_calls, 0..) |call, idx| {
@@ -17451,6 +20056,7 @@ pub const Node = struct {
                     stream.write_error = err;
                     return false;
                 };
+                if (!stream.recordPublicOutput(token_text)) return false;
                 return true;
             }
         };
@@ -17466,6 +20072,7 @@ pub const Node = struct {
             .parser = tool_parser,
             .request_context = ctx,
             .defer_content = shouldDeferStreamContentForReasoning(pipeline, config),
+            .bind_public_output = builtin.is_test and context_completion != null,
         };
 
         if (comptime @hasField(@TypeOf(pipeline.*), "continue_ctx") and
@@ -17590,6 +20197,10 @@ pub const Node = struct {
                 writer.close() catch {};
                 return ctx.response.build();
             };
+            if (tool_parser == null and !stream_ctx.recordPublicOutput(result.text)) {
+                writer.close() catch {};
+                return ctx.response.build();
+            }
         } else {
             if (result.reasoning_text) |reasoning| {
                 if (reasoning.len > 0) emitReasoningDelta(
@@ -17638,6 +20249,25 @@ pub const Node = struct {
             return ctx.response.build();
         };
         completion.* = .{ .writer = writer, .events = terminal };
+
+        if (context_completion) |context_route_completion| {
+            context_route_completion.* = .{
+                .completed = true,
+                .prompt_tokens = result.prompt_tokens,
+                .output_tokens = result.tokens_used,
+            };
+            context_route_completion.setTokenIds(result.token_ids);
+            context_route_completion.setTiming(result.timing_ms);
+            if (tool_parser == null) {
+                var emitted_digest: [32]u8 = undefined;
+                stream_ctx.public_output_hash.final(&emitted_digest);
+                var result_digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(result.text, &result_digest, .{});
+                if (stream_ctx.public_output_bytes == result.text.len and
+                    std.mem.eql(u8, &emitted_digest, &result_digest))
+                    context_route_completion.setPublicOutput(emitted_digest, stream_ctx.public_output_bytes);
+            }
+        }
 
         return ctx.response.build();
     }
@@ -19997,6 +22627,7 @@ pub const Node = struct {
                 .{ .ctx = @ptrCast(&stream_ctx), .on_token = DictationStreamCtx.onToken, .continue_fn = DictationStreamCtx.shouldContinue },
                 cleanup_cache_key,
                 execution_control,
+                null,
             ) catch |err| {
                 writeGenerationStreamError(&writer, err);
                 writer.close() catch {};
@@ -20042,6 +22673,7 @@ pub const Node = struct {
             null,
             cleanup_cache_key,
             execution_control,
+            null,
         ) catch |err| return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(generated.text);
         const cleaned = try dictation_mod.normalizeOutput(ctx.allocator, generated.text);
@@ -22910,6 +25542,7 @@ pub const Node = struct {
             try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_5_8_total", "counter", "Unified scheduler steps containing five through eight items", aggregate.stats.step_batch_size_5_8_total);
             try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_9_16_total", "counter", "Unified scheduler steps containing nine through sixteen items", aggregate.stats.step_batch_size_9_16_total);
             try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_execution_gate_yields_total", "counter", "Total cooperative waits at shared or exclusive model execution barriers", aggregate.stats.execution_gate_yields_total);
             try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(self.model_manager.loaded));
             try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
             try appendPromptCacheMetrics(&writer.writer, self.model_manager.loaded);
@@ -22942,6 +25575,77 @@ pub const Node = struct {
         });
     }
 };
+
+test "attention_match Metal qualification ordinary SSE commits runtime attestation headers" {
+    const Capture = struct {
+        started: bool = false,
+        closed: bool = false,
+        saw_backend: bool = false,
+        saw_route: bool = false,
+        saw_pid: bool = false,
+
+        fn start(raw: ?*anyopaque, status: u16, content_type: []const u8, headers: *const httpx.Headers) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(u16, 200), status);
+            try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", content_type);
+            self.started = true;
+            self.saw_backend = if (headers.get("X-Antfly-Inference-Backend")) |value|
+                std.mem.eql(u8, value, "metal")
+            else
+                false;
+            self.saw_route = if (headers.get("X-Antfly-Inference-Route")) |value|
+                std.mem.eql(u8, value, "scheduler-eager")
+            else
+                false;
+            self.saw_pid = headers.get("X-Antfly-Inference-Pid") != null;
+        }
+
+        fn write(_: ?*anyopaque, _: []const u8) !void {}
+
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.closed = true;
+        }
+    };
+
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    try std.testing.expect(!try Node.maybeSetGenerationRuntimeHeaders(
+        &ctx,
+        "metal",
+        "scheduler-eager",
+        false,
+        false,
+        false,
+    ));
+    try std.testing.expect(ctx.response.headers.get("X-Antfly-Inference-Backend") == null);
+
+    try std.testing.expect(try Node.maybeSetGenerationRuntimeHeaders(
+        &ctx,
+        "metal",
+        "scheduler-eager",
+        false,
+        false,
+        true,
+    ));
+    var capture: Capture = .{};
+    ctx.stream_delegate = .{
+        .ptr = &capture,
+        .start = Capture.start,
+        .write = Capture.write,
+        .close = Capture.close,
+    };
+    var writer = try ctx.streamResponse(200);
+    try writer.close();
+    try std.testing.expect(capture.started);
+    try std.testing.expect(capture.closed);
+    try std.testing.expect(capture.saw_backend);
+    try std.testing.expect(capture.saw_route);
+    try std.testing.expect(capture.saw_pid);
+}
 
 fn nliEntailmentIndex(id2label: ?[]const []const u8) ?usize {
     const labels = id2label orelse return null;
@@ -28457,6 +31161,11 @@ test "generate batch rejects cache compaction clearly" {
     defer unsupported.deinit();
     const unsupported_reason = Node.generateBatchUnsupportedReasonPreflight(unsupported.value) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("UNSUPPORTED_CACHE_COMPACTION", unsupported_reason.code);
+    unsupported.value.cache_compaction_ratio = 1;
+    try std.testing.expect(Node.generateBatchUnsupportedReasonPreflight(unsupported.value) == null);
+    var identity_grammar: ?[]u8 = null;
+    const identity_config = try Node.generateConfigFromBody(std.testing.allocator, unsupported.value, &identity_grammar);
+    try std.testing.expectEqual(@as(?f32, null), identity_config.cache_compaction_ratio);
 
     const invalid_json =
         \\{"model":"m","cache_compaction_ratio":0,"messages":[{"role":"user","content":"hello"}]}
@@ -30565,6 +33274,7 @@ test "Qwen3-VL read and prepared generation stop cancelled work before model loa
         null,
         null,
         cancelled,
+        null,
     ));
     try std.testing.expectError(error.Timeout, node.readQwen3VlImagesWithAdmission(
         allocator,
@@ -32537,6 +35247,21 @@ test "native generation applies scheduler policy before the first lease" {
 
     try std.testing.expectEqual(@as(usize, 3), leases[2].active_requests_snapshot);
     try std.testing.expectEqual(@as(usize, 1), coordinator.defaultStepBudget().max_items);
+}
+
+test "context batch partition keeps exact siblings together and isolates approximate items" {
+    const approximate = [_]bool{ false, true, false, true, false };
+
+    var exact_indices = [_]usize{ 4, 1, 0, 3, 2 };
+    const exact_len = Node.retainBatchContextClass(&exact_indices, &approximate, false);
+    try std.testing.expectEqualSlices(usize, &.{ 4, 0, 2 }, exact_indices[0..exact_len]);
+
+    var approximate_indices = [_]usize{ 4, 1, 0, 3, 2 };
+    const approximate_len = Node.retainBatchContextClass(&approximate_indices, &approximate, true);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, approximate_indices[0..approximate_len]);
+    // The serving path takes only the first approximate item from this
+    // retained class; the next outer window preserves the second response
+    // index and executes it under a new exclusive owner.
 }
 
 test "generation batching treats every requested CUDA graph replay mode as serialized" {
@@ -38173,6 +40898,240 @@ fn generationMemoryBudgetResponse(
     });
 }
 
+fn contextGenerationAdmissionAmounts(
+    estimate: runtime.tier.memory.Estimate,
+    context: ?@import("../backends/compaction_coordinator.zig").CampaignEstimate,
+) runtime.tier.memory.AdmissionAmounts {
+    var amounts = runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate);
+    if (context) |sizing| {
+        amounts.host_kv_bytes = sizing.host_peak_bytes;
+        amounts.backend_kv_bytes = sizing.backend_peak_bytes;
+    }
+    return amounts;
+}
+
+pub fn contextServingCompactionImplementation(
+    optimize_decode: bool,
+    optimize_prefill: bool,
+) @import("../runtime/kv/compaction_profile.zig").Implementation {
+    return @import("../runtime/kv/compaction_profile.zig").servingImplementation(.block_v1, optimize_decode, optimize_prefill);
+}
+
+/// Qualification sessions derive this engine from their loaded profile. Keep
+/// it separate from the legacy block-v1 helper used by capture paths.
+pub fn contextServingCompactionImplementationForEngine(
+    engine: @import("../runtime/kv/compaction_profile.zig").FitEngine,
+    optimize_decode: bool,
+    optimize_prefill: bool,
+) @import("../runtime/kv/compaction_profile.zig").Implementation {
+    return @import("../runtime/kv/compaction_profile.zig").servingImplementation(engine, optimize_decode, optimize_prefill);
+}
+
+test "context serving qualification engine changes native implementation identity" {
+    const profiles = @import("../runtime/kv/compaction_profile.zig");
+    const legacy = contextServingCompactionImplementation(true, true);
+    const explicit_legacy = contextServingCompactionImplementationForEngine(.block_v1, true, true);
+    const native = contextServingCompactionImplementationForEngine(.native_whole_head_v2, true, true);
+    try std.testing.expectEqualDeep(legacy, explicit_legacy);
+    try std.testing.expect(!std.meta.eql(
+        profiles.implementationDigest(explicit_legacy),
+        profiles.implementationDigest(native),
+    ));
+    try std.testing.expect(native.acceptance == .rounded_whole_head_v2);
+}
+
+fn servingCompactionImplementation(config: generation.GenerationConfig) @import("../runtime/kv/compaction_profile.zig").Implementation {
+    return @import("../runtime/kv/compaction_profile.zig").servingImplementation(config.context_fit_engine, config.context_split_decode, config.context_flash_prefill);
+}
+
+fn selectServingCompactionProfile(
+    model: *model_manager_mod.LoadedModel,
+    layout: runtime.context_policy.Layout,
+    config: *generation.GenerationConfig,
+) !model_manager_mod.LoadedModel.CompactionSelection {
+    if (comptime builtin.is_test) {
+        const selection = try model.selectCompactionProfile(layout, servingCompactionImplementation(config.*));
+        if (selection.profile.engine != config.context_fit_engine)
+            return error.UnqualifiedCompactionArtifact;
+        return selection;
+    }
+
+    // These switches are internal and absent from request JSON. A registry
+    // profile authorizes one exact implementation; try deterministic concrete
+    // implementations and apply the selected flags before sizing/admission.
+    const candidates = [_]struct { split_decode: bool, flash_prefill: bool }{
+        .{ .split_decode = true, .flash_prefill = true },
+        .{ .split_decode = true, .flash_prefill = false },
+        .{ .split_decode = false, .flash_prefill = true },
+        .{ .split_decode = false, .flash_prefill = false },
+    };
+    for ([_]@import("../runtime/kv/compaction_profile.zig").FitEngine{ .native_whole_head_v2, .block_v1 }) |engine| {
+        config.context_fit_engine = engine;
+        for (candidates) |candidate| {
+            config.context_split_decode = candidate.split_decode;
+            config.context_flash_prefill = candidate.flash_prefill;
+            if (model.selectCompactionProfile(layout, servingCompactionImplementation(config.*))) |selection| {
+                if (selection.profile.engine != engine) return error.UnqualifiedCompactionArtifact;
+                return selection;
+            } else |err| switch (err) {
+                error.UnqualifiedCompactionArtifact => continue,
+                else => return err,
+            }
+        }
+    }
+    config.context_fit_engine = .block_v1;
+    config.context_split_decode = false;
+    config.context_flash_prefill = false;
+    return error.UnqualifiedCompactionArtifact;
+}
+
+/// Protocol-neutral inputs for the loaded-model compaction owner. Render and
+/// tokenize exactly once before constructing this value; every caller then
+/// receives the same arena-owned request payload and provenance checks.
+pub const LoadedCompactionPreflight = struct {
+    allocator: std.mem.Allocator,
+    model: *model_manager_mod.LoadedModel,
+    gpt_config: gpt_model_mod.Config,
+    config: generation.GenerationConfig,
+    prompt_tokens: usize,
+    encoded_ids: []const i32,
+    attention_mask: []const i32,
+    eligible: *const @import("../runtime/kv/payload.zig").Eligible,
+    query_sources: ?@import("../backends/compaction_coordinator.zig").PreparedQuerySources = null,
+    selection: model_manager_mod.LoadedModel.CompactionSelection,
+
+    pub fn prepare(self: LoadedCompactionPreflight) !@import("../backends/compaction_coordinator.zig").PreparedCampaignPlan {
+        const compaction_coordinator = @import("../backends/compaction_coordinator.zig");
+        var actual_prompt_tokens: usize = 0;
+        while (actual_prompt_tokens < self.attention_mask.len and
+            self.attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1)
+        {}
+        if (actual_prompt_tokens != self.prompt_tokens or actual_prompt_tokens > self.encoded_ids.len)
+            return error.InvalidPayloadProvenance;
+        for (self.attention_mask[actual_prompt_tokens..]) |mask| if (mask != 0)
+            return error.InvalidPayloadProvenance;
+        const prompt_ids = try self.allocator.alloc(i64, actual_prompt_tokens);
+        defer self.allocator.free(prompt_ids);
+        for (prompt_ids, self.encoded_ids[0..actual_prompt_tokens]) |*out, id| {
+            if (id < 0) return error.InvalidPayloadProvenance;
+            out.* = id;
+        }
+        const sources = self.query_sources orelse return error.UnsupportedCompactionQuerySource;
+        const layout = try runtime.context_policy.Layout.init(self.gpt_config);
+        const loaded = try self.model.validatePinnedCompactionSelection(
+            layout,
+            servingCompactionImplementation(self.config),
+            self.selection,
+        );
+        const admitted_context = try self.config.context_policy.admit(
+            self.gpt_config.max_position_embeddings,
+            null,
+            actual_prompt_tokens,
+            @intCast(@max(self.config.max_tokens, 1)),
+            0,
+        );
+        return compaction_coordinator.prepareCampaignPlan(self.allocator, .{
+            .plan = admitted_context,
+            .layout = try runtime.context_policy.Layout.init(self.gpt_config),
+            .max_query_rows = 1,
+            .physical_budget_bytes = 0,
+            .optimize_decode = self.config.context_split_decode,
+            .optimize_prefill = self.config.context_flash_prefill,
+            .owner_allocation_tracker = self.config.context_owner_allocation_tracker,
+        }, prompt_ids, self.eligible, sources, .{
+            .load_generation = loaded.load_generation,
+            .loaded_position_limit = std.math.cast(u32, self.gpt_config.max_position_embeddings) orelse return error.InvalidContextPolicy,
+            .identity = loaded.identity,
+            .profile_artifact_sha256 = self.selection.profile_sha256,
+            .profile_semantic_sha256 = self.selection.profile_semantic_digest,
+        }, self.selection.profile.*, loaded.identity, self.config.context_policy.max_kv_tokens orelse return error.InvalidContextPolicy);
+    }
+};
+
+test "context loaded preflight rejects mutable token provenance before model access" {
+    var ids = [_]i32{ 7, 8, 9 };
+    var mask = [_]i32{ 1, 0, 1 };
+    var preflight = LoadedCompactionPreflight{
+        .allocator = std.testing.allocator,
+        .model = undefined,
+        .gpt_config = undefined,
+        .config = .{},
+        .prompt_tokens = 1,
+        .encoded_ids = &ids,
+        .attention_mask = &mask,
+        .eligible = undefined,
+        .selection = undefined,
+    };
+    try std.testing.expectError(error.InvalidPayloadProvenance, preflight.prepare());
+    mask = .{ 1, 0, 0 };
+    ids[0] = -1;
+    try std.testing.expectError(error.InvalidPayloadProvenance, preflight.prepare());
+}
+
+fn prepareServingCompactionPlan(
+    allocator: std.mem.Allocator,
+    model: *model_manager_mod.LoadedModel,
+    gpt_config: gpt_model_mod.Config,
+    config: generation.GenerationConfig,
+    prompt_tokens: usize,
+    prompt_estimate: *Node.NativePromptEstimate,
+    messages: []const generation.Message,
+    selection: model_manager_mod.LoadedModel.CompactionSelection,
+) !@import("../backends/compaction_coordinator.zig").PreparedCampaignPlan {
+    const eligible = if (prompt_estimate.eligible) |*value| value else return error.InvalidPayloadProvenance;
+    const prepared = generation.PreparedCompactionPayload{
+        .allocator = prompt_estimate.allocator,
+        .rendered = .{ .text = prompt_estimate.prompt, .labels = prompt_estimate.provenance_labels },
+        .encoded = prompt_estimate.encoded,
+        .eligible = eligible.*,
+    };
+    const chat_template = model.chat_tmpl orelse return error.UnsupportedCompactionTemplate;
+    const tokenizer = model.getTokenizer();
+    const options: generation.ChatTemplate.ApplyOptions = .{ .enable_thinking = config.enable_thinking };
+    var question = try generation.prepareCompactionQuestion(allocator, chat_template, tokenizer, messages, options, config.context_policy, &prepared);
+    defer question.deinit();
+    var fit = try generation.prepareCompactionStudy(allocator, chat_template, tokenizer, messages, options, &prepared, .fit, context_study_templates.authority(.fit), gpt_config.max_position_embeddings, model.manifest.add_bos_token);
+    defer fit.deinit();
+    var gate = try generation.prepareCompactionStudy(allocator, chat_template, tokenizer, messages, options, &prepared, .gate, context_study_templates.authority(.gate), gpt_config.max_position_embeddings, model.manifest.add_bos_token);
+    defer gate.deinit();
+    return (LoadedCompactionPreflight{
+        .allocator = allocator,
+        .model = model,
+        .gpt_config = gpt_config,
+        .config = config,
+        .prompt_tokens = prompt_tokens,
+        .encoded_ids = prompt_estimate.encoded.ids,
+        .attention_mask = prompt_estimate.encoded.attention_mask,
+        .eligible = eligible,
+        .query_sources = .{
+            .question = .{ .ids = question.ids, .source_start = question.source_start, .source_end = question.source_end, .prompt_tokens = question.prompt_tokens, .prompt_tokens_sha256 = question.prompt_tokens_sha256 },
+            .fit = .{ .ids = fit.ids, .template_bytes = fit.template_bytes, .generation_contract_bytes = fit.generation_contract_bytes, .prompt_tokens = fit.prompt_tokens, .prompt_tokens_sha256 = fit.prompt_tokens_sha256, .response_tokens = context_study_templates.response_tokens },
+            .gate = .{ .ids = gate.ids, .template_bytes = gate.template_bytes, .generation_contract_bytes = gate.generation_contract_bytes, .prompt_tokens = gate.prompt_tokens, .prompt_tokens_sha256 = gate.prompt_tokens_sha256, .response_tokens = context_study_templates.response_tokens },
+            .loaded_private_position_limit = std.math.cast(u32, gpt_config.max_position_embeddings) orelse return error.InvalidContextPolicy,
+        },
+        .selection = selection,
+    }).prepare();
+}
+
+fn parseGenerateContextPolicy(body: api.GenerateRequest) !runtime.context_policy.Policy {
+    if (body.context_policy != null and
+        (body.context_management != null or body.kv_cache != null or body.cache_compaction_ratio != null))
+        return error.InvalidContextPolicy;
+    const policy = try runtime.context_policy.fromApi(body.context_policy);
+    try runtime.context_policy.validateExecution(policy, .{
+        // Auto selection is unresolved here. The single and batch routes
+        // validate the actual loaded backend before selecting a profile.
+        .metal = body.backend == null or body.backend == .auto or body.backend == .metal,
+        .f16_kv = if (body.cache_dtype) |dtype| std.mem.eql(u8, dtype, "f16") else true,
+        .speculation = body.draft_model != null,
+        .prompt_cache = (body.prompt_cache orelse true) and body.prompt_cache_key != null,
+        // Attention matching is authorized later against the pinned loaded bytes
+        // and release registry. Allow it to reach that owner; rolling remains
+        // disabled because it has no loaded-artifact qualification boundary.
+    }, .{ .attention_matching = policy.mode == .attention_matching });
+    return policy;
+}
+
 fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
     if (isTransientInferenceCapacityError(err)) return .{
         .status = 503,
@@ -38181,6 +41140,42 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         .retryable = true,
     };
     return switch (err) {
+        error.InvalidCompactionTarget, error.InvalidPayloadProvenance, error.UnrenderedCompactionTarget, error.InvalidContextPolicy, error.InvalidContextLimit, error.InvalidContextQueryWindow, error.UnsafeGlobalContextTrim => .{
+            .status = 400,
+            .code = "INVALID_CONTEXT_POLICY",
+            .message = "context policy limits, mode, or feature combination are invalid",
+            .retryable = false,
+        },
+        error.UnsupportedCompactionQuerySource, error.UnsupportedCompactionStudyTemplate, error.CompactionQueryProtocolMismatch, error.UnsupportedPayloadTransform, error.UnsupportedTokenizerOffsets, error.UnsupportedCompactionArtifact, error.UnsupportedCompactionTokenizer, error.UnsupportedCompactionTemplate, error.UnsupportedCompactionProfile, error.UnqualifiedCompactionArtifact, error.CompactionIdentityMismatch, error.ContextPolicyNotQualified, error.UnsupportedContextCombination => .{
+            .status = 400,
+            .code = "UNSUPPORTED_CONTEXT_POLICY",
+            .message = "requested context policy is not qualified for this execution path",
+            .retryable = false,
+        },
+        error.ContextKvBudgetExceeded => .{
+            .status = 507,
+            .code = "CONTEXT_KV_BUDGET_EXCEEDED",
+            .message = "requested prompt and output exceed the retained KV token budget",
+            .retryable = false,
+        },
+        error.ProvenanceBudgetExceeded, error.ContextReplayBudgetExceeded, error.ContextStagingBudgetExceeded => .{
+            .status = 507,
+            .code = "CONTEXT_PHYSICAL_BUDGET_EXCEEDED",
+            .message = "context storage, query capture and compaction staging exceed the admitted memory budget",
+            .retryable = false,
+        },
+        error.NonFiniteContextAttention => .{
+            .status = 502,
+            .code = "CONTEXT_ATTENTION_REJECTED",
+            .message = "context attention produced nonfinite data; generation was stopped",
+            .retryable = false,
+        },
+        error.CompactionQualityRejected, error.CompactionFitDiverged, error.NonFiniteCompactionInput, error.InsufficientContextQueries => .{
+            .status = 502,
+            .code = "CONTEXT_COMPACTION_REJECTED",
+            .message = "context compaction failed validation; the candidate was not published",
+            .retryable = false,
+        },
         error.InvalidToolArguments => .{
             .status = 502,
             .code = "TOOL_ARGUMENTS_INVALID",
@@ -38229,16 +41224,20 @@ fn nativeCheckpointErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Resp
         error.KvCheckpointChecksum,
         error.KvStoragePrecisionMismatch,
         error.UnsupportedKvCheckpointEncoding,
+        error.UnsupportedMetalKvCheckpointEncoding,
         error.KvCheckpointModelMismatch,
         error.KvCheckpointLayoutMismatch,
         error.KvCheckpointPrefixMismatch,
         error.KvCheckpointAppendLimit,
         error.UnsupportedAttentionMatchRoute,
+        error.UnqualifiedCompactionArtifact,
         error.UnsupportedKvIdentity,
         error.InvalidCompactionQueries,
         error.CompactionQueryLimit,
+        error.UnsupportedCompactionQueryDType,
         => ctx.status(400).json(.{ .@"error" = "INVALID_KV_CHECKPOINT", .message = @errorName(err) }),
         error.NativeKvFrameLimit, error.KvCheckpointLimit => ctx.status(413).json(.{ .@"error" = "KV_CHECKPOINT_TOO_LARGE", .message = "checkpoint exceeds the configured transfer or state limit" }),
+        error.MetalMemoryLimitExceeded => ctx.status(507).json(.{ .@"error" = "INSUFFICIENT_INFERENCE_MEMORY", .message = "Metal checkpoint storage exceeds the admitted device-memory limit" }),
         error.NativeKvFrameBusy => modelResourceBusyResponse(ctx),
         else => inferenceFailureResponse(ctx, err),
     };
@@ -42772,4 +45771,75 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
     try std.testing.expectEqual(@as(usize, 64), model.object.get("model_revision").?.string.len);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "context API and batch defer attention matching authority to loaded profile selection" {
+    var body = api.GenerateRequest{ .model = "gemma-e2b", .messages = &.{} };
+    try std.testing.expectEqual(runtime.context_policy.Policy{}, try parseGenerateContextPolicy(body));
+    body.context_policy = .{ .max_context_tokens = 8192, .max_kv_tokens = 4096 };
+    const policy = try parseGenerateContextPolicy(body);
+    try std.testing.expectEqual(@as(?u32, 8192), policy.max_context_tokens);
+    var grammar: ?[]u8 = null;
+    const config = try Node.generateConfigFromBody(std.testing.allocator, body, &grammar);
+    try std.testing.expectEqual(policy, config.context_policy);
+    try std.testing.expect(Node.generateBatchUnsupportedReasonPreflight(body) == null);
+    body.context_policy.?.max_kv_tokens = -1;
+    try std.testing.expectError(error.InvalidContextPolicy, parseGenerateContextPolicy(body));
+    body.context_policy = .{ .mode = "rolling", .max_kv_tokens = 4096 };
+    body.backend = .metal;
+    try std.testing.expectError(error.ContextPolicyNotQualified, parseGenerateContextPolicy(body));
+    try std.testing.expectEqualStrings("UNSUPPORTED_CONTEXT_POLICY", Node.generateBatchUnsupportedReasonPreflight(body).?.code);
+    body.context_policy = .{ .mode = "attention_matching", .max_kv_tokens = 4096 };
+    for ([_]?api.ModelBackend{ null, .auto, .metal }) |backend| {
+        body.backend = backend;
+        const parsed = try parseGenerateContextPolicy(body);
+        try std.testing.expectEqual(.attention_matching, parsed.mode);
+        try std.testing.expect(Node.generateBatchUnsupportedReasonPreflight(body) == null);
+        // Parsing an unresolved backend does not authorize execution on a
+        // non-Metal loaded session.
+        try std.testing.expectError(error.UnsupportedContextCombination, runtime.context_policy.validateExecution(
+            parsed,
+            .{ .metal = false, .f16_kv = true },
+            .{ .attention_matching = true },
+        ));
+    }
+    body.backend = .native;
+    try std.testing.expectError(error.UnsupportedContextCombination, parseGenerateContextPolicy(body));
+    body.context_policy = .{ .mode = "exact" };
+    body.cache_compaction_ratio = 0.5;
+    try std.testing.expectError(error.InvalidContextPolicy, parseGenerateContextPolicy(body));
+    try std.testing.expectEqual(@as(u16, 507), generationRequestFailure(error.ContextKvBudgetExceeded).?.status);
+    try std.testing.expectEqual(@as(u16, 507), generationRequestFailure(error.ContextStagingBudgetExceeded).?.status);
+    try std.testing.expectEqual(@as(u16, 400), generationRequestFailure(error.InvalidContextQueryWindow).?.status);
+    try std.testing.expectEqual(@as(u16, 400), generationRequestFailure(error.UnqualifiedCompactionArtifact).?.status);
+    try std.testing.expect(!generationRequestFailure(error.CompactionQualityRejected).?.retryable);
+    try std.testing.expect(!generationRequestFailure(error.NonFiniteContextAttention).?.retryable);
+}
+
+test "context serving admission preserves separate finalized host and backend peaks" {
+    const estimate = runtime.tier.memory.Estimate{
+        .prompt_tokens = 1025,
+        .retained_tokens = 768,
+        .kv_bytes = 111,
+        .kv_tier = .backend,
+        .scratch_bytes = 37,
+        .scratch_tier = .backend,
+    };
+    const sizing = @import("../backends/compaction_coordinator.zig").CampaignEstimate{
+        .chunk_rows = 32,
+        .backend_peak_bytes = 4096,
+        .host_peak_bytes = 2048,
+        .execution_peak_bytes = 5000,
+        .combined_peak_bytes = 6144,
+        .request_bytes = 512,
+        .retained_limit = 768,
+        .saved_bytes = 1024,
+        .campaign_bytes = 256,
+        .largest_private_branch_bytes = 512,
+    };
+    const amounts = contextGenerationAdmissionAmounts(estimate, sizing);
+    try std.testing.expectEqual(@as(usize, 2048), amounts.host_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), amounts.backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 37), amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), amounts.host_scratch_bytes);
 }

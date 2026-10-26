@@ -34,7 +34,17 @@ sys.path.insert(0, str(ROOT / "py/packages/sdk/src"))
 from antfly import AntflyClient
 from antfly.client_generated.models import InferenceGenerateRequest
 from native_quality_score import evaluate, score
-from qualify_native_checkpoint_http import server, generate, git_provenance, sha256_file
+from qualify_native_checkpoint_http import (
+    server,
+    generate,
+    git_provenance,
+    metal_ledger_finish,
+    metal_ledger_start,
+    normalize_request_body,
+    sha256_file,
+    validate_backend_configuration,
+    validate_metal_memory,
+)
 
 
 def coverage(cases, baseline, resumed, checkpoints, encoding=None):
@@ -237,11 +247,13 @@ def fp8_noninferiority(
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=["cuda", "metal"], default="cuda")
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument(
-        "--server-kind", choices=["inference", "standalone"], default="inference"
+        "--server-kind", choices=["inference", "standalone", "metal-test"], default="inference"
     )
     parser.add_argument("--models-dir", type=Path, default=Path(".models"))
+    parser.add_argument("--model", default="google/gemma-4-E4B-it-qat-q4_0-gguf")
     parser.add_argument(
         "--suite",
         type=Path,
@@ -266,6 +278,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     args = parser.parse_args()
+    try:
+        validate_backend_configuration(args)
+    except ValueError as error:
+        parser.error(str(error))
     if args.quality_profile == "bounded" and args.size is None:
         parser.error("bounded qualification requires --size")
     if args.output.exists() or args.checkpoint.exists():
@@ -311,6 +327,14 @@ def main():
         "checkpoints": [],
         "fp16_reference": [],
     }
+    if args.backend == "metal":
+        evidence.update(
+            backend="metal",
+            qualification_profile="metal_test_native_checkpoint_v1",
+            production_ready=False,
+            timing_scope="diagnostic_wall_intervals_not_matched_performance",
+            execution_mode="eager",
+        )
 
     def publish():
         temporary = args.output.with_suffix(".json.part")
@@ -324,8 +348,8 @@ def main():
 
             def attest(response):
                 if response.status_code == 200:
-                    if response.headers.get("x-antfly-inference-backend") != "cuda":
-                        raise AssertionError("missing CUDA backend")
+                    if response.headers.get("x-antfly-inference-backend") != args.backend:
+                        raise AssertionError("missing " + args.backend + " backend")
                     if (
                         int(response.headers.get("x-antfly-inference-pid", "0"))
                         != record["worker_pid"]
@@ -360,11 +384,12 @@ def main():
                             "response": baseline,
                         }
                     )
-                    body = copy.deepcopy(case["body"])
+                    body = normalize_request_body(args, copy.deepcopy(case["body"]))
                     body.pop("context_management", None)
                     request = InferenceGenerateRequest.from_dict(body)
-                    prepare_body = copy.deepcopy(
-                        case.get("checkpoint_body", case["body"])
+                    prepare_body = normalize_request_body(
+                        args,
+                        copy.deepcopy(case.get("checkpoint_body", case["body"])),
                     )
                     prepare_body.pop("context_management", None)
                     prepare_request = InferenceGenerateRequest.from_dict(prepare_body)
@@ -377,12 +402,38 @@ def main():
                             ),
                             flush=True,
                         )
+                        ledger_offset = metal_ledger_start(args, record)
                         fp16 = client.prepare_native_kv_checkpoint(
                             prepare_request, args.checkpoint, encoding="f16"
                         )
+                        metal_ledger_finish(
+                            args,
+                            record,
+                            ledger_offset,
+                            "checkpoint_prepare",
+                            require_binding=False,
+                            required_phase="checkpoint_source",
+                        )
+                        if (
+                            args.backend == "metal"
+                            and dict(fp16.identity)
+                            != record["ready"]["loaded_identity"]
+                        ):
+                            raise AssertionError(
+                                "FP16 checkpoint identity differs from loaded Metal model"
+                            )
+                        ledger_offset = metal_ledger_start(args, record)
                         reference_result = client.resume_native_kv_checkpoint(
                             request, fp16
                         ).to_dict()
+                        metal_ledger_finish(
+                            args,
+                            record,
+                            ledger_offset,
+                            "checkpoint_resume",
+                            require_binding=True,
+                            expected_representation="f16",
+                        )
                         if (
                             reference_result["usage"]["cached_prompt_tokens"]
                             != fp16.metadata["logical_tokens"]
@@ -406,9 +457,24 @@ def main():
                         flush=True,
                     )
                     prepare_start = time.monotonic()
+                    ledger_offset = metal_ledger_start(args, record)
                     checkpoint = client.prepare_native_kv_checkpoint(
                         prepare_request, args.checkpoint, encoding=args.encoding
                     )
+                    metal_ledger_finish(
+                        args,
+                        record,
+                        ledger_offset,
+                        "checkpoint_prepare",
+                        require_binding=False,
+                        required_phase="checkpoint_source",
+                    )
+                    if (
+                        args.backend == "metal"
+                        and dict(checkpoint.identity)
+                        != record["ready"]["loaded_identity"]
+                    ):
+                        raise AssertionError("checkpoint identity differs from loaded Metal model")
                     if checkpoint.metadata.get("encoding") != args.encoding:
                         raise AssertionError("server did not honor requested encoding")
                     appended_tokens = (
@@ -442,9 +508,18 @@ def main():
                         flush=True,
                     )
                     resume_start = time.monotonic()
+                    ledger_offset = metal_ledger_start(args, record)
                     result = client.resume_native_kv_checkpoint(
                         request, checkpoint
                     ).to_dict()
+                    metal_ledger_finish(
+                        args,
+                        record,
+                        ledger_offset,
+                        "checkpoint_resume",
+                        require_binding=True,
+                        expected_representation=args.encoding,
+                    )
                     if (
                         result["usage"]["cached_prompt_tokens"]
                         != checkpoint.metadata["logical_tokens"]
@@ -513,14 +588,21 @@ def main():
                 args.quality_profile,
             )
         memory = evidence["worker"]["memory"]
-        if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
-            raise AssertionError("incomplete memory evidence")
-        for key, cap in [
-            ("peak_host_rss_bytes", 8 * 1024**3),
-            ("peak_gpu_memory_bytes", 18 * 1024**3),
-        ]:
-            if memory[key] is None or not 0 < memory[key] <= cap:
-                raise AssertionError(f"{key} exceeds qualification cap")
+        if args.backend == "metal":
+            validate_metal_memory(memory)
+            if not evidence["worker"].get("graceful_stop") or evidence[
+                "worker"
+            ].get("remaining_group_members"):
+                raise AssertionError("Metal test server did not drain")
+        else:
+            if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
+                raise AssertionError("incomplete memory evidence")
+            for key, cap in [
+                ("peak_host_rss_bytes", 8 * 1024**3),
+                ("peak_gpu_memory_bytes", 18 * 1024**3),
+            ]:
+                if memory[key] is None or not 0 < memory[key] <= cap:
+                    raise AssertionError(f"{key} exceeds qualification cap")
         if git_provenance(ROOT) != evidence["source"]:
             raise AssertionError("source changed")
         if (

@@ -1,0 +1,145 @@
+--- attention_mass_constraint_generation_v5.zig
++++ attention_mass_constraint_generation_v6_row_trace.zig
+@@ -1,5 +1,5 @@
+-//! Unapplied, solver-neutral draft of the frozen attention-mass constraint
+-//! generation controller V5. This file deliberately lives outside canonical
++//! Unapplied, solver-neutral row-trace successor to the frozen attention-mass
++//! constraint-generation controller V5. This file deliberately lives outside canonical
+ //! runtime sources. It does not select, link, or authorize an LP solver.
+ //!
+ //! The `attention_mass_lp` named module must be the separately reviewed V4
+@@ -113,6 +113,9 @@
+     objective: f64,
+     worst_full_violation: f64,
+     added_rows: usize,
++    /// Exact pricing order. Only `[0..added_rows]` is authoritative; the
++    /// zeroed tail prevents disclosure if a diagnostic serializer is careless.
++    added_row_indices: [add_rows]usize = @splat(0),
+     retried_witness: bool,
+ };
+ 
+@@ -358,7 +361,7 @@
+     deadline_ns: u64,
+     control: Control,
+     last_now_ns: *u64,
+-) !struct { added: usize, worst: f64 } {
++) !struct { added: usize, added_row_indices: [add_rows]usize, worst: f64 } {
+     if (weights.len != columns or selected.len != rows or !std.math.isFinite(t))
+         return error.InvalidSolverResult;
+     const capacity = try checkedCount(2, rows);
+@@ -393,13 +396,15 @@
+     }
+     std.mem.sort(Violation, candidates[0..count], {}, lessViolation);
+     var added: usize = 0;
++    var added_row_indices: [add_rows]usize = @splat(0);
+     for (candidates[0..count]) |candidate| {
+         if (selected[candidate.row]) continue;
+         selected[candidate.row] = true;
++        added_row_indices[added] = candidate.row;
+         added += 1;
+         if (added == add_rows) break;
+     }
+-    return .{ .added = added, .worst = @max(0, worst) };
++    return .{ .added = added, .added_row_indices = added_row_indices, .worst = @max(0, worst) };
+ }
+ 
+ fn finiteMatrix(
+@@ -614,6 +619,7 @@
+             .objective = solved.objective,
+             .worst_full_violation = scanned.worst,
+             .added_rows = scanned.added,
++            .added_row_indices = scanned.added_row_indices,
+             .retried_witness = retried,
+         };
+         diagnostics.round_count = round_index + 1;
+@@ -925,7 +931,9 @@
+         .accepted => |accepted| {
+             try std.testing.expectEqual(@as(usize, 2), accepted.diagnostics.round_count);
+             try std.testing.expectEqual(@as(usize, 1), accepted.diagnostics.rounds[0].added_rows);
++            try std.testing.expectEqual(violated_row.?, accepted.diagnostics.rounds[0].added_row_indices[0]);
+             try std.testing.expectEqual(@as(usize, 0), accepted.diagnostics.rounds[1].added_rows);
++            try std.testing.expectEqual(@as(usize, 0), accepted.diagnostics.rounds[0].added_row_indices[1]);
+             try std.testing.expectEqual(seed_rows + 1, accepted.selected_row_indices.len);
+             try std.testing.expect(accepted.alpha[violated_row.?] > 0);
+             try std.testing.expectEqual(@as(f64, 0), accepted.alpha[omitted_row.?]);
+@@ -1155,8 +1163,80 @@
+         &last,
+     );
+     try std.testing.expectEqual(@as(usize, 3), scan.added);
++    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, scan.added_row_indices[0..scan.added]);
+     try std.testing.expect(selected[1] and selected[2] and selected[3]);
+     try std.testing.expectEqual(@as(f64, 2), scan.worst);
++}
++
++test "warm hints preserve caller order contract without changing accepted row trace" {
++    var clock = TestClock{};
++    var fake = FakeSolver{};
++    const matrix = [_]f64{ 1, 1, 1, 1 };
++    const warm = [_]usize{ 3, 1 };
++    var result = try solvePrimaryConstraintGeneration(
++        std.testing.allocator,
++        &matrix,
++        4,
++        1,
++        &warm,
++        1000,
++        clock.control(),
++        fake.interface(),
++    );
++    defer result.deinit();
++    switch (result) {
++        .accepted => |accepted| {
++            try std.testing.expectEqual(@as(usize, 2), accepted.diagnostics.warm_hint_rows);
++            try std.testing.expectEqual(@as(usize, 0), accepted.diagnostics.rounds[0].added_rows);
++            try std.testing.expectEqual(@as(usize, 4), accepted.diagnostics.selected_rows);
++        },
++        .terminal => return error.UnexpectedTerminal,
++    }
++}
++
++const AddedThenTerminalSolver = struct {
++    calls: usize = 0,
++    fn solve(raw: ?*anyopaque, allocator: std.mem.Allocator, problem: *const mass_lp.Problem, _: u64, control: Control, _: f64) !RestrictedSolve {
++        const self: *AddedThenTerminalSolver = @ptrCast(@alignCast(raw.?));
++        try control.check();
++        self.calls += 1;
++        if (problem.weight_columns != 1) return error.UnexpectedSolveShape;
++        if (self.calls == 1) {
++            const weights = try allocator.alloc(f64, 1);
++            errdefer allocator.free(weights);
++            weights[0] = 1;
++            const duals = try allocator.alloc(f64, 2 * problem.source_rows);
++            @memset(duals, 0);
++            return .{ .allocator = allocator, .status = .optimal, .weights = weights, .t = 0, .objective = 0, .row_duals = duals, .iterations = 2 };
++        }
++        const weights = try allocator.alloc(f64, 0);
++        errdefer allocator.free(weights);
++        const duals = try allocator.alloc(f64, 0);
++        return .{ .allocator = allocator, .status = .time_limit, .weights = weights, .t = 0, .objective = 0, .row_duals = duals, .iterations = 0 };
++    }
++};
++test "terminal after an added-row round retains exact completed row trace" {
++    var clock = TestClock{};
++    var fake = AddedThenTerminalSolver{};
++    var matrix: [seed_rows + 2]f64 = @splat(1);
++    var seeded: [seed_rows + 2]bool = @splat(false);
++    try seedSelection(&seeded);
++    var violated_row: ?usize = null;
++    for (seeded, 0..) |selected, row| if (!selected and violated_row == null) {
++        violated_row = row;
++    };
++    matrix[violated_row.?] = 1.00001;
++    var result = try solvePrimaryConstraintGeneration(std.testing.allocator, &matrix, matrix.len, 1, null, 1000, clock.control(), .{ .context = &fake, .solve_restricted_fn = AddedThenTerminalSolver.solve });
++    defer result.deinit();
++    switch (result) {
++        .accepted => return error.UnexpectedAccepted,
++        .terminal => |terminal| {
++            try std.testing.expectEqual(TerminalReason.solver_time_limit, terminal.reason);
++            try std.testing.expectEqual(@as(usize, 1), terminal.diagnostics.round_count);
++            try std.testing.expectEqual(@as(usize, 1), terminal.diagnostics.rounds[0].added_rows);
++            try std.testing.expectEqual(violated_row.?, terminal.diagnostics.rounds[0].added_row_indices[0]);
++        },
++    }
+ }
+ 
+ fn allocationFailureTwoRoundAccepted(allocator: std.mem.Allocator) !void {

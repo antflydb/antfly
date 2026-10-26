@@ -384,6 +384,19 @@ pub const RunBudget = struct {
         return reservation;
     }
 
+    /// Reserve request-scoped KV bytes on an explicit physical tier. Context
+    /// compaction uses this for host metadata/ownership that is not represented
+    /// by the backend KV estimate.
+    pub fn tryReserveKv(self: *RunBudget, tier: ResidencyTier, bytes: usize) !Reservation {
+        const reservation = Reservation{
+            .kind = .kv,
+            .tier = tier,
+            .bytes = bytes,
+        };
+        try self.tryReserve(reservation);
+        return reservation;
+    }
+
     pub fn release(self: *RunBudget, reservation: Reservation) void {
         if (reservation.bytes == 0 or reservation.tier == .disk) return;
         switch (reservation.kind) {
@@ -2773,6 +2786,23 @@ pub fn estimateGptGenerationForKvPolicy(
 }
 
 pub const GptGenerationBudgetComponent = struct {
+    pub const PackedExact = struct {
+        optimize_decode: bool = false,
+        optimize_prefill: bool = false,
+    };
+
+    /// A prepared request supplies the actual per-head retention and complete
+    /// lifecycle peak. A half-block estimate cannot admit attention matching.
+    /// This is a resource receipt, never release/profile authorization.
+    context_request: ?*const @import("../../backends/compaction_coordinator.zig").CampaignRequest = null,
+    /// Preferred two-stage admission contract. Unlike a finalized request,
+    /// this can be re-estimated for every candidate prefill chunk.
+    context_plan: ?*const @import("../../backends/compaction_coordinator.zig").PreparedCampaignPlan = null,
+    context_policy: @import("../context_policy.zig").Policy = .{},
+    /// Select the exact packed Metal context store. Its fixed allocation is
+    /// part of KV admission and must also become the session's physical
+    /// execution budget. Null retains the ordinary paged-KV estimator.
+    packed_exact: ?PackedExact = null,
     backend: kv_pool.BackendKind,
     kv_dtype: kv_pool.KvDType,
     config: gpt_mod.Config,
@@ -2782,18 +2812,106 @@ pub const GptGenerationBudgetComponent = struct {
     /// Null means ordinary admission; zero capacity provides no workspace.
     workspace_capacity: ?AdmissionAmounts = null,
 
-    fn reserveEstimate(self: @This(), budget: *RunBudget, estimate: Estimate) !void {
+    pub fn estimate(self: @This(), prompt_tokens: usize, max_tokens: usize, chunk: usize) !Estimate {
+        var result = try estimateGptGenerationForKvPolicy(self.backend, self.kv_dtype, self.config, prompt_tokens, max_tokens, chunk, self.kv_capacity_policy);
+        if (self.packed_exact) |packed_options| {
+            if (self.context_policy.mode != .exact or self.context_plan != null or self.context_request != null or
+                self.backend != .metal or self.kv_dtype != .f16) return error.UnsupportedContextCombination;
+            try self.context_policy.validate();
+            const plan = try self.context_policy.admit(
+                self.config.max_position_embeddings,
+                null,
+                prompt_tokens,
+                @max(max_tokens, 1),
+                0,
+            );
+            const sizes = try @import("../../backends/packed_context_session.zig").allocation(.{
+                .plan = plan,
+                .layout = try @import("../context_policy.zig").Layout.init(self.config),
+                .max_query_rows = std.math.cast(u32, @max(chunk, 1)) orelse return error.ResourceLimitExceeded,
+                .physical_budget_bytes = 0,
+                .optimize_decode = packed_options.optimize_decode,
+                .optimize_prefill = packed_options.optimize_prefill,
+            });
+            // `physical_bytes` is the exact combined packed-session contract.
+            // It is conservatively charged to backend KV for process/workspace
+            // admission. Request-owned host allocations remain independently
+            // measured by the context allocation scope; this estimate never
+            // invents a host-tier split.
+            result.kv_bytes = sizes.physical_bytes;
+            result.retained_tokens = plan.retained_row_limit;
+            return result;
+        }
+        if (self.context_policy.mode != .exact) {
+            if (self.backend != .metal or self.kv_dtype != .f16) return error.UnsupportedContextCombination;
+            if (self.context_policy.mode == .attention_matching) {
+                try self.context_policy.validate();
+                const coordinator = @import("../../backends/compaction_coordinator.zig");
+                const expected_limit = try self.context_policy.contextLimit(self.config.max_position_embeddings, null);
+                const expected_layout = try @import("../context_policy.zig").Layout.init(self.config);
+                const expected_logical = std.math.add(usize, prompt_tokens, @max(max_tokens, 1)) catch return error.ResourceLimitExceeded;
+                const expected_admission = try self.context_policy.admit(self.config.max_position_embeddings, null, prompt_tokens, @max(max_tokens, 1), 0);
+                const expected_storage = try @import("../context_policy.zig").exactStoragePlan(expected_admission);
+                if (self.context_plan) |plan| {
+                    if (self.context_request != null or plan.transferred or !std.meta.eql(plan.admission_plan, expected_admission) or
+                        !std.meta.eql(plan.config.plan, expected_storage) or plan.config.plan.logical_token_limit != expected_logical or
+                        self.context_policy.max_kv_tokens != plan.retained_limit or plan.admission_plan.context_limit != expected_limit or
+                        !coordinator.sameLayout(plan.config.layout, expected_layout)) return error.InvalidContextPolicy;
+                    const sizing = try plan.estimate(chunk);
+                    result.kv_bytes = sizing.backend_peak_bytes;
+                    result.retained_tokens = sizing.retained_limit;
+                } else {
+                    const request = self.context_request orelse return error.UnqualifiedCompactionArtifact;
+                    if (request.consumed or !std.meta.eql(request.admission_plan, expected_admission) or
+                        !std.meta.eql(request.config.plan, expected_storage) or request.config.plan.logical_token_limit != expected_logical or
+                        request.config.max_query_rows != @max(chunk, 1) or self.context_policy.max_kv_tokens != request.retained_limit or
+                        request.admission_plan.context_limit != expected_limit or !coordinator.sameLayout(request.config.layout, expected_layout)) return error.InvalidContextPolicy;
+                    result.kv_bytes = request.backend_peak_bytes;
+                    result.retained_tokens = request.retained_limit;
+                }
+                return result;
+            }
+            const plan = try self.context_policy.admit(self.config.max_position_embeddings, null, prompt_tokens, max_tokens, 0);
+            const sizes = try @import("../../backends/metal_context_session.zig").allocation(.{
+                .plan = plan,
+                .layout = try @import("../context_policy.zig").Layout.init(self.config),
+                .max_query_rows = std.math.cast(u32, @max(chunk, 1)) orelse return error.ResourceLimitExceeded,
+                .physical_budget_bytes = 0,
+            });
+            // Own context data includes old/new generations, query capture,
+            // fitter scratch and metadata. Model activation scratch is separate.
+            result.kv_bytes = sizes.physical_bytes;
+            result.retained_tokens = plan.retained_row_limit;
+        }
+        return result;
+    }
+
+    fn reserveEstimate(self: @This(), budget: *RunBudget, reservation_estimate: Estimate, chunk: usize) !void {
+        var context_host_bytes: usize = 0;
+        if (self.context_policy.mode == .attention_matching) {
+            if (self.context_plan) |plan| {
+                context_host_bytes = (try plan.estimate(chunk)).host_peak_bytes;
+            } else if (self.context_request) |request| {
+                context_host_bytes = request.host_peak_bytes;
+            }
+        }
         if (self.workspace_capacity) |capacity| {
-            if (estimate.kv_tier == .backend and estimate.kv_bytes > capacity.backend_kv_bytes) {
-                budget.recordDenial(.workspace_kv, .{ .kind = .kv, .tier = .backend, .bytes = estimate.kv_bytes }, 0, estimate.kv_bytes, capacity.backend_kv_bytes);
+            if (reservation_estimate.kv_tier == .backend and reservation_estimate.kv_bytes > capacity.backend_kv_bytes) {
+                budget.recordDenial(.workspace_kv, .{ .kind = .kv, .tier = .backend, .bytes = reservation_estimate.kv_bytes }, 0, reservation_estimate.kv_bytes, capacity.backend_kv_bytes);
                 return error.MemoryBudgetExceeded;
             }
-            if (estimate.scratch_tier == .backend and estimate.scratch_bytes > capacity.backend_scratch_bytes) {
-                budget.recordDenial(.workspace_scratch, .{ .kind = .scratch, .tier = .backend, .bytes = estimate.scratch_bytes }, 0, estimate.scratch_bytes, capacity.backend_scratch_bytes);
+            if (context_host_bytes > capacity.host_kv_bytes) {
+                budget.recordDenial(.workspace_kv, .{ .kind = .kv, .tier = .host, .bytes = context_host_bytes }, 0, context_host_bytes, capacity.host_kv_bytes);
+                return error.MemoryBudgetExceeded;
+            }
+            if (reservation_estimate.scratch_tier == .backend and reservation_estimate.scratch_bytes > capacity.backend_scratch_bytes) {
+                budget.recordDenial(.workspace_scratch, .{ .kind = .scratch, .tier = .backend, .bytes = reservation_estimate.scratch_bytes }, 0, reservation_estimate.scratch_bytes, capacity.backend_scratch_bytes);
                 return error.MemoryBudgetExceeded;
             }
         }
-        try budget.reserveEstimate(estimate);
+        try budget.tryReserve(.{ .kind = .kv, .tier = .host, .bytes = context_host_bytes });
+        errdefer budget.release(.{ .kind = .kv, .tier = .host, .bytes = context_host_bytes });
+        try budget.reserveEstimate(reservation_estimate);
     }
 };
 
@@ -2838,15 +2956,7 @@ pub fn reserveGptGenerationPrefill(
         var trial = budget.*;
         var failed = false;
         for (components) |component| {
-            component.reserveEstimate(&trial, try estimateGptGenerationForKvPolicy(
-                component.backend,
-                component.kv_dtype,
-                component.config,
-                prompt_tokens,
-                max_tokens,
-                chunk,
-                component.kv_capacity_policy,
-            )) catch |err| {
+            component.reserveEstimate(&trial, try component.estimate(prompt_tokens, max_tokens, chunk), chunk) catch |err| {
                 if (err != error.MemoryBudgetExceeded) return err;
                 failed = true;
                 break;
@@ -2860,7 +2970,13 @@ pub fn reserveGptGenerationPrefill(
                 .max_scratch_bytes = selected_scratch,
             };
         }
-        if (chunk <= 32) {
+        // A prepared compaction request binds its chunk geometry. Replanning
+        // requires new admission; silently shrinking it would reuse stale KV
+        // and replay reservations.
+        const fixed_context = for (components) |component| {
+            if (component.context_request != null and component.context_plan == null) break true;
+        } else false;
+        if (chunk <= 32 or fixed_context) {
             const denial_count = trial.denials;
             const last_denial = trial.last_denial;
             budget.denials = denial_count;
@@ -4503,4 +4619,203 @@ test "embeddinggemma2 live retained admission cannot credit a later kernel sampl
     const capacity = controller.live_capacity_bytes;
     lease.release();
     try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+}
+
+test "context resource admission charges generations capture and fitter before allocation" {
+    const config = gpt_mod.Config{ .family = .gemma, .num_hidden_layers = 1, .hidden_size = 64, .num_attention_heads = 2, .num_key_value_heads = 1, .attention_head_dim = 32, .vocab_size = 16, .max_position_embeddings = 2048 };
+    const component = GptGenerationBudgetComponent{ .backend = .metal, .kv_dtype = .f16, .config = config, .context_policy = .{ .mode = .attention_matching, .max_kv_tokens = 1024, .keep_prefix_tokens = 0, .keep_recent_tokens = 512 } };
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, component.estimate(1000, 24, 1));
+    var budget = RunBudget.init(.{});
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, reserveGptGenerationPrefill(&budget, &.{component}, 1000, 24, 1));
+    try std.testing.expectEqual(@as(usize, 0), budget.kvTotalBytes());
+    var unsupported = component;
+    unsupported.kv_dtype = .f32;
+    try std.testing.expectError(error.UnsupportedContextCombination, unsupported.estimate(1000, 24, 1));
+    var exact = component;
+    exact.context_policy = .{};
+    try std.testing.expectEqualDeep(try estimateGptGeneration(.metal, .f16, config, 1000, 24, 1), try exact.estimate(1000, 24, 1));
+}
+
+test "packed exact generation admission uses the session physical allocation" {
+    const policy = @import("../context_policy.zig");
+    const packed_session = @import("../../backends/packed_context_session.zig");
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 2,
+        .hidden_size = 1024,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 512,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .sliding_window_pattern = 2,
+        .vocab_size = 16,
+        .max_position_embeddings = 4096,
+    };
+    const prompt_tokens = 1025;
+    const max_tokens = 8;
+    const chunk = 64;
+    const component = GptGenerationBudgetComponent{
+        .backend = .metal,
+        .kv_dtype = .f16,
+        .config = config,
+        .context_policy = .{},
+        .packed_exact = .{ .optimize_decode = true, .optimize_prefill = true },
+    };
+    const plan = try (policy.Policy{}).admit(config.max_position_embeddings, null, prompt_tokens, max_tokens, 0);
+    const expected = try packed_session.allocation(.{
+        .plan = plan,
+        .layout = try policy.Layout.init(config),
+        .max_query_rows = chunk,
+        .physical_budget_bytes = 0,
+        .optimize_decode = true,
+        .optimize_prefill = true,
+    });
+    const estimate = try component.estimate(prompt_tokens, max_tokens, chunk);
+    try std.testing.expect(expected.physical_bytes > 0);
+    try std.testing.expectEqual(expected.physical_bytes, estimate.kv_bytes);
+    try std.testing.expectEqual(plan.retained_row_limit, estimate.retained_tokens);
+
+    const zero_output = try component.estimate(prompt_tokens, 0, chunk);
+    const one_output = try component.estimate(prompt_tokens, 1, chunk);
+    try std.testing.expectEqualDeep(one_output, zero_output);
+    const zero_chunk = try component.estimate(prompt_tokens, max_tokens, 0);
+    const one_chunk_sizes = try packed_session.allocation(.{
+        .plan = plan,
+        .layout = try policy.Layout.init(config),
+        .max_query_rows = 1,
+        .physical_budget_bytes = 0,
+        .optimize_decode = true,
+        .optimize_prefill = true,
+    });
+    try std.testing.expectEqual(one_chunk_sizes.physical_bytes, zero_chunk.kv_bytes);
+
+    var budget = RunBudget.init(.{});
+    const admitted = try reserveGptGenerationPrefill(&budget, &.{component}, prompt_tokens, max_tokens, chunk);
+    try std.testing.expectEqual(@as(usize, chunk), admitted.max_chunk_rows);
+    try std.testing.expectEqual(expected.physical_bytes, budget.backend_kv_bytes);
+
+    var constrained = component;
+    const smaller = try component.estimate(prompt_tokens, max_tokens, 32);
+    try std.testing.expect(smaller.kv_bytes < expected.physical_bytes);
+    constrained.workspace_capacity = .{
+        .backend_kv_bytes = smaller.kv_bytes,
+        .backend_scratch_bytes = std.math.maxInt(usize),
+    };
+    budget = RunBudget.init(.{});
+    const reduced = try reserveGptGenerationPrefill(&budget, &.{constrained}, prompt_tokens, max_tokens, chunk);
+    try std.testing.expectEqual(@as(usize, 32), reduced.max_chunk_rows);
+    try std.testing.expectEqual(smaller.kv_bytes, budget.backend_kv_bytes);
+
+    constrained.workspace_capacity.?.backend_kv_bytes -= 1;
+    budget = RunBudget.init(.{});
+    try std.testing.expectError(
+        error.MemoryBudgetExceeded,
+        reserveGptGenerationPrefill(&budget, &.{constrained}, prompt_tokens, max_tokens, chunk),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.kvTotalBytes());
+    try std.testing.expectEqual(DenialLimit.workspace_kv, budget.last_denial.?.limit);
+
+    var unsupported = component;
+    unsupported.backend = .native;
+    try std.testing.expectError(error.UnsupportedContextCombination, unsupported.estimate(prompt_tokens, max_tokens, chunk));
+    unsupported = component;
+    unsupported.kv_dtype = .f32;
+    try std.testing.expectError(error.UnsupportedContextCombination, unsupported.estimate(prompt_tokens, max_tokens, chunk));
+    unsupported = component;
+    unsupported.context_policy.mode = .rolling;
+    try std.testing.expectError(error.UnsupportedContextCombination, unsupported.estimate(prompt_tokens, max_tokens, chunk));
+}
+
+test "context admission selects a chunk before finalizing prepared compaction" {
+    const coordinator = @import("../../backends/compaction_coordinator.zig");
+    const query_protocol = @import("../../backends/context_query_protocol.zig");
+    const studies = @import("../../backends/context_study_templates.zig");
+    const policy = @import("../context_policy.zig");
+    const a = std.testing.allocator;
+    const config = gpt_mod.Config{ .family = .gemma, .num_hidden_layers = 1, .hidden_size = 1024, .num_attention_heads = 2, .num_key_value_heads = 1, .attention_head_dim = 512, .vocab_size = 16, .max_position_embeddings = 4096 };
+    const ids: [1025]i64 = @splat(7);
+    var labels: [1025]u32 = @splat(0);
+    @memset(labels[1..513], 1);
+    var blocks = [_]@import("../kv/reference_replay.zig").Range{.{ .start = 1, .end = 513 }};
+    const eligible = policy.payload.Eligible{ .allocator = a, .labels = &labels, .ranges = &blocks, .blocks = &blocks };
+    const identity: coordinator.profiles.Identity = .{ .artifact = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4), .runtime = @splat(5) };
+    const attention_policy = policy.Policy{ .mode = .attention_matching, .max_kv_tokens = 1000, .keep_prefix_tokens = 32, .keep_recent_tokens = 32 };
+    const prepared_config = @import("../../backends/packed_context_session.zig").Config{ .plan = try attention_policy.admit(4096, null, 1025, 3, 0), .layout = try policy.Layout.init(config), .max_query_rows = 64, .physical_budget_bytes = 0 };
+    var protocol = coordinator.profiles.QueryProtocolAuthority{
+        .schema_version = query_protocol.runtime_identity_version,
+        .layer = 0,
+        .sha256 = @splat(0),
+        .query_sampling = .source_uniform_partition_v3,
+        .accounting = .serial_physical_branch_upper_bound_v2,
+        .max_training_rows = query_protocol.max_training_rows,
+        .max_validation_rows = query_protocol.max_validation_rows,
+        .sources = .{
+            .{ .kind = .request_question_replay, .partition = .training, .physical_branch = 0 },
+            .{ .kind = .fixed_study_prefill, .partition = .training, .physical_branch = 1 },
+            .{ .kind = .fixed_study_generated_response, .partition = .training, .physical_branch = 1 },
+            .{ .kind = .fixed_study_prefill, .partition = .validation, .physical_branch = 2 },
+            .{ .kind = .fixed_study_generated_response, .partition = .validation, .physical_branch = 2 },
+        },
+        .owner_kv_heads = 1,
+        .owner_query_heads = 2,
+        .owner_head_dim = 512,
+        .strata = &.{
+            .{ .consumer_layer = 0, .query_head = 0, .kv_head = 0 },
+            .{ .consumer_layer = 0, .query_head = 1, .kv_head = 0 },
+        },
+        .fit = studies.authority(.fit),
+        .gate = studies.authority(.gate),
+    };
+    protocol.sha256 = try query_protocol.runtimeIdentity(protocol);
+    const profile = coordinator.profiles.Profile{ .identity = identity, .artifact_sha256 = @splat(9), .owners = &.{.{ .layer = 0, .retained = &.{256} }}, .query_protocols = &.{protocol}, .max_prompt_tokens = 2048, .max_output_tokens = 8, .minimum_saved_bytes = 16384 };
+    var prompt_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (ids) |id| {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &bytes, id, .little);
+        prompt_hash.update(&bytes);
+    }
+    var prompt_digest: [32]u8 = undefined;
+    prompt_hash.final(&prompt_digest);
+    const study_ids: [16]i64 = @splat(3);
+    const query_sources = coordinator.PreparedQuerySources{
+        .question = .{ .ids = ids[1000..1016], .source_start = 1000, .source_end = 1016, .prompt_tokens = @intCast(ids.len), .prompt_tokens_sha256 = prompt_digest },
+        .fit = .{ .ids = &study_ids, .template_bytes = studies.template(.fit), .generation_contract_bytes = studies.generation_contract, .prompt_tokens = @intCast(ids.len), .prompt_tokens_sha256 = prompt_digest, .response_tokens = studies.response_tokens },
+        .gate = .{ .ids = &study_ids, .template_bytes = studies.template(.gate), .generation_contract_bytes = studies.generation_contract, .prompt_tokens = @intCast(ids.len), .prompt_tokens_sha256 = prompt_digest, .response_tokens = studies.response_tokens },
+        .loaded_private_position_limit = 4096,
+    };
+    const selected = coordinator.SelectedCampaignAuthority{ .load_generation = 7, .loaded_position_limit = @intCast(config.max_position_embeddings), .identity = identity, .profile_artifact_sha256 = profile.artifact_sha256, .profile_semantic_sha256 = profile.semanticDigest() };
+    const Probe = struct {
+        fn run(allocator: std.mem.Allocator, packed_config: @import("../../backends/packed_context_session.zig").Config, token_ids: []const i64, payload_eligible: *const policy.payload.Eligible, sources: coordinator.PreparedQuerySources, chosen: coordinator.SelectedCampaignAuthority, frozen: coordinator.profiles.Profile) !void {
+            var plan = try coordinator.prepareCampaignPlan(allocator, packed_config, token_ids, payload_eligible, sources, chosen, frozen, frozen.identity, 1000);
+            defer plan.deinit();
+            _ = try plan.estimate(32);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{ prepared_config, &ids, &eligible, query_sources, selected, profile });
+    var prepared = try coordinator.prepareCampaignPlan(a, prepared_config, &ids, &eligible, query_sources, selected, profile, identity, 1000);
+    defer prepared.deinit();
+    try std.testing.expectEqual(policy.Mode.attention_matching, prepared.admission_plan.policy.mode);
+    try std.testing.expectEqual(policy.Mode.exact, prepared.config.plan.policy.mode);
+    const component = GptGenerationBudgetComponent{ .backend = .metal, .kv_dtype = .f16, .config = config, .context_plan = &prepared, .context_policy = attention_policy };
+    const large = try component.estimate(1025, 3, 64);
+    const small = try component.estimate(1025, 3, 32);
+    try std.testing.expect(large.scratch_bytes > small.scratch_bytes);
+    const small_context = try prepared.estimate(32);
+    try std.testing.expect(small_context.backend_peak_bytes > 0 and small_context.host_peak_bytes > 0);
+    try std.testing.expectError(error.ContextStagingBudgetExceeded, prepared.finalize(32, 0, small_context.host_peak_bytes));
+    try std.testing.expectError(error.ContextStagingBudgetExceeded, prepared.finalize(32, small_context.backend_peak_bytes, 0));
+    try std.testing.expectError(error.ContextStagingBudgetExceeded, prepared.finalize(32, small_context.backend_peak_bytes - 1, small_context.host_peak_bytes));
+    try std.testing.expectError(error.ContextStagingBudgetExceeded, prepared.finalize(32, small_context.backend_peak_bytes, small_context.host_peak_bytes - 1));
+    var admitted = RunBudget.init(.{ .kv_limit_bytes = small_context.combined_peak_bytes, .scratch_limit_bytes = small.scratch_bytes });
+    const reservation = try reserveGptGenerationPrefill(&admitted, &.{component}, 1025, 3, 64);
+    try std.testing.expectEqual(@as(usize, 32), reservation.max_chunk_rows);
+    try std.testing.expectEqual(small_context.combined_peak_bytes, admitted.kvTotalBytes());
+    var request = try prepared.finalize(reservation.max_chunk_rows, small_context.backend_peak_bytes, small_context.host_peak_bytes);
+    defer request.deinit();
+    try std.testing.expectEqual(@as(u32, 32), request.config.max_query_rows);
+    try std.testing.expectEqual(small_context.combined_peak_bytes, request.peak_bytes);
+    try std.testing.expectEqual(small_context.execution_peak_bytes, request.execution_peak_bytes);
+    try std.testing.expectError(error.InvalidContextTransaction, prepared.finalize(32, small_context.backend_peak_bytes, small_context.host_peak_bytes));
+    try std.testing.expectError(error.InvalidContextPolicy, component.estimate(1025, 4, 64));
 }

@@ -206,6 +206,14 @@ pub const WeightStore = struct {
     scalar_bounds: @import("../models/embedding_gemma2_weight_cache.zig").ScalarBoundsCache = .{},
     allocator: std.mem.Allocator,
     resident_weight_estimate_bytes: usize = 0,
+    /// Encoded model artifact bytes kept alive by this store's tensor mmap.
+    /// Managed Metal admission uses this to prove when borrowed no-copy views
+    /// are already covered by the retained backend model lease.
+    model_artifact_mmap_bytes: usize = 0,
+    /// False unless managed Metal admission has proved that the backend model
+    /// baseline covers `model_artifact_mmap_bytes`. Unmanaged stores and other
+    /// backends therefore retain the conservative charging behavior.
+    borrowed_mmap_raw_prepaid_by_backend_model: bool = false,
     prefix: []const u8,
     lazy_weights: std.StringHashMapUnmanaged(LazyWeightEntry),
     prefetch: PrefetchQueue = undefined,
@@ -242,6 +250,15 @@ pub const WeightStore = struct {
     boundary_resident: ?*@import("gliner_boundary_resident.zig").Owner = null,
     laya_resident: if (supports_native_metal_provider) ?*@import("laya_metal.zig").Owner else void = if (supports_native_metal_provider) null else {},
     jina_lora_adapter: ?*JinaLoraAdapter = null,
+
+    pub fn configureBorrowedMmapRawPrepayment(
+        self: *WeightStore,
+        backend_model_baseline_bytes: usize,
+    ) void {
+        self.borrowed_mmap_raw_prepaid_by_backend_model =
+            self.model_artifact_mmap_bytes != 0 and
+            backend_model_baseline_bytes >= self.model_artifact_mmap_bytes;
+    }
 };
 
 test "gpu hosted immutable F32 borrowing is disabled for ordinary stores" {
@@ -357,12 +374,58 @@ fn expectedDenseCacheBytes(
     return entry.tensor_ref.byte_len;
 }
 
-fn rawPackedMmapBytesAreBorrowed(
-    has_packed_expert_view: bool,
+fn rawMmapIsBorrowedModelSource(
+    raw_bytes: []const u8,
     raw_mmap_backed: bool,
     raw_owned: bool,
+    raw_mmap_source_bytes: ?[]const u8,
+    owns_mmap_region: bool,
 ) bool {
-    return has_packed_expert_view and raw_mmap_backed and !raw_owned;
+    if (!raw_mmap_backed or raw_owned or owns_mmap_region) return false;
+    const source = raw_mmap_source_bytes orelse return false;
+    const source_start = @intFromPtr(source.ptr);
+    const raw_start = @intFromPtr(raw_bytes.ptr);
+    if (raw_start < source_start or raw_bytes.len > source.len) return false;
+    return raw_start - source_start <= source.len - raw_bytes.len;
+}
+
+fn rawPackedMmapBytesAreBorrowed(
+    has_packed_expert_view: bool,
+    raw_bytes: []const u8,
+    raw_mmap_backed: bool,
+    raw_owned: bool,
+    raw_mmap_source_bytes: ?[]const u8,
+    owns_mmap_region: bool,
+) bool {
+    return has_packed_expert_view and rawMmapIsBorrowedModelSource(
+        raw_bytes,
+        raw_mmap_backed,
+        raw_owned,
+        raw_mmap_source_bytes,
+        owns_mmap_region,
+    );
+}
+
+fn rawModelMmapBytesArePrepaid(
+    prepaid_by_backend_model: bool,
+    raw_bytes: []const u8,
+    raw_mmap_backed: bool,
+    raw_owned: bool,
+    raw_mmap_source_bytes: ?[]const u8,
+    owns_mmap_region: bool,
+) bool {
+    return prepaid_by_backend_model and rawMmapIsBorrowedModelSource(
+        raw_bytes,
+        raw_mmap_backed,
+        raw_owned,
+        raw_mmap_source_bytes,
+        owns_mmap_region,
+    );
+}
+
+fn directQuantHostCharge(raw_bytes: usize, prepared_bytes: usize, raw_prepaid: bool) !usize {
+    return std.math.add(usize, if (raw_prepaid) 0 else raw_bytes, prepared_bytes) catch
+        error.MemoryBudgetExceeded;
 }
 
 pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEntry) !void {
@@ -396,20 +459,31 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
         if (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) |storage_value| {
             var loaded_storage = storage_value;
             errdefer loaded_storage.deinit();
-            // Packed expert entries borrow the same model mmap span. Charge
-            // owned preparation buffers here, not the full virtual tensor once
-            // per expert/projection alias. This is a storage property, not an
-            // A4B policy property; model/session admission accounts for the
-            // mmap-backed working set separately.
-            const mmap_borrowed_packed = rawPackedMmapBytesAreBorrowed(
+            // Packed experts are repeated views of one immutable model mmap;
+            // ordinary views are prepaid only when the managed Metal model
+            // lease covers the complete artifact. Charge owned preparation
+            // buffers in both cases, while independently owned mappings and
+            // copies remain independently charged.
+            const mmap_borrowed = rawPackedMmapBytesAreBorrowed(
                 loaded_storage.packed_expert != null,
+                loaded_storage.raw_bytes,
                 loaded_storage.raw_mmap_backed,
                 loaded_storage.raw_owned,
+                loaded_storage.raw_mmap_source_bytes,
+                loaded_storage.raw_mmap_region != null,
+            ) or rawModelMmapBytesArePrepaid(
+                data.borrowed_mmap_raw_prepaid_by_backend_model,
+                loaded_storage.raw_bytes,
+                loaded_storage.raw_mmap_backed,
+                loaded_storage.raw_owned,
+                loaded_storage.raw_mmap_source_bytes,
+                loaded_storage.raw_mmap_region != null,
             );
-            entry.loaded_bytes = if (mmap_borrowed_packed)
-                loaded_storage.prepared.ownedBytes()
-            else
-                loaded_storage.raw_bytes.len + loaded_storage.prepared.ownedBytes();
+            entry.loaded_bytes = try directQuantHostCharge(
+                loaded_storage.raw_bytes.len,
+                loaded_storage.prepared.ownedBytes(),
+                mmap_borrowed,
+            );
             if (entry.loaded_bytes != 0) {
                 if (data.tier_cache) |*tier_cache| {
                     tier_cache.reserve(.host, entry.loaded_bytes) catch |err| {
@@ -489,11 +563,47 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
     }
 }
 
-test "packed mmap admission is keyed to storage ownership rather than A4B policy" {
-    try std.testing.expect(rawPackedMmapBytesAreBorrowed(true, true, false));
-    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(false, true, false));
-    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(true, false, false));
-    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(true, true, true));
+test "context Metal ordinary mmap admission requires explicit model baseline coverage and borrowed source storage" {
+    var store = WeightStore{
+        .allocator = std.testing.allocator,
+        .model_artifact_mmap_bytes = 4096,
+        .prefix = "",
+        .lazy_weights = .empty,
+    };
+    try std.testing.expect(!store.borrowed_mmap_raw_prepaid_by_backend_model);
+    store.configureBorrowedMmapRawPrepayment(0);
+    try std.testing.expect(!store.borrowed_mmap_raw_prepaid_by_backend_model);
+    store.configureBorrowedMmapRawPrepayment(4095);
+    try std.testing.expect(!store.borrowed_mmap_raw_prepaid_by_backend_model);
+    store.configureBorrowedMmapRawPrepayment(4096);
+    try std.testing.expect(store.borrowed_mmap_raw_prepaid_by_backend_model);
+
+    const source: [64]u8 = @splat(0);
+    const raw = source[16..32];
+    try std.testing.expect(rawModelMmapBytesArePrepaid(true, raw, true, false, &source, false));
+    try std.testing.expect(!rawModelMmapBytesArePrepaid(false, raw, true, false, &source, false));
+    try std.testing.expect(!rawModelMmapBytesArePrepaid(true, raw, false, false, &source, false));
+    try std.testing.expect(!rawModelMmapBytesArePrepaid(true, raw, true, true, &source, false));
+    try std.testing.expect(!rawModelMmapBytesArePrepaid(true, raw, true, false, null, false));
+    try std.testing.expect(!rawModelMmapBytesArePrepaid(true, raw, true, false, &source, true));
+
+    const unrelated: [16]u8 = @splat(0);
+    try std.testing.expect(!rawModelMmapBytesArePrepaid(true, &unrelated, true, false, &source, false));
+
+    // A4B packed experts are aliases of one parent tensor/model mmap and do
+    // not require a full-artifact baseline. They still require exact borrowed
+    // source ownership; owned or unrelated mappings remain charged.
+    try std.testing.expect(rawPackedMmapBytesAreBorrowed(true, raw, true, false, &source, false));
+    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(false, raw, true, false, &source, false));
+    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(true, raw, true, false, &source, true));
+    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(true, &unrelated, true, false, &source, false));
+
+    try std.testing.expectEqual(@as(usize, 17), try directQuantHostCharge(4096, 17, true));
+    try std.testing.expectEqual(@as(usize, 4113), try directQuantHostCharge(4096, 17, false));
+    try std.testing.expectError(
+        error.MemoryBudgetExceeded,
+        directQuantHostCharge(std.math.maxInt(usize), 1, false),
+    );
 }
 
 test "jina adapter names map base weight to PEFT LoRA tensors" {

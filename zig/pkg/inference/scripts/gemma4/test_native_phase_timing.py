@@ -17,15 +17,23 @@ import unittest
 from native_phase_timing import generation_timing, prepare_timing
 
 GENERATION = "generate_timing_ms: prompt_format=0 tokenize=1 multimodal_prepare=0 runtime_prepare=1 prefill=10 decode=3 text_decode=1 total=16\n"
+GENERATION_WITH_MAINTENANCE = "generate_timing_ms: prompt_format=0 tokenize=1 multimodal_prepare=0 runtime_prepare=1 prefill=10 maintenance=4 decode=3 text_decode=1 total=20\n"
 PREPARE = "info: native_checkpoint_prepare_work source_tokens=8189 outcome=compacted query_ns=100 snapshot_ns=200 fit_ns=300 export_write_ns=400 export_clock_valid=1 checkpoint_bytes=201728532 retention_retries=2 terminal_complete=0\n"
 
 
 class PhaseTimingTests(unittest.TestCase):
     def test_generation_reports_exclusive_additive_phases(self):
         row = generation_timing("other logs\n" + GENERATION, 0.020)
+        self.assertEqual(row["maintenance"], 0)
         self.assertEqual(row["decode"], 3)
         self.assertEqual(row["text_decode"], 1)
         self.assertEqual(row["total"], 16)
+
+    def test_generation_keeps_current_maintenance_out_of_decode(self):
+        row = generation_timing(GENERATION_WITH_MAINTENANCE, 0.025)
+        self.assertEqual(row["maintenance"], 4)
+        self.assertEqual(row["decode"], 3)
+        self.assertEqual(row["total"], 20)
 
     def test_generation_rejects_ambiguous_or_missing_requests(self):
         for text in ["", GENERATION * 2]:
@@ -38,6 +46,8 @@ class PhaseTimingTests(unittest.TestCase):
             GENERATION.replace("decode=3", "decode=-3"),
             GENERATION.replace("total=16", "total=16 total=16"),
             GENERATION.replace("prefill=10 ", ""),
+            GENERATION_WITH_MAINTENANCE.replace("maintenance=4", "maintenance=-4"),
+            GENERATION_WITH_MAINTENANCE.replace("total=20", "total=16"),
         ]:
             with self.assertRaises(ValueError):
                 generation_timing(text, 1)

@@ -1,0 +1,63 @@
+{
+  "completed": true,
+  "design": {
+    "path": "/private/tmp/attention-matching-native-mass-cg-control-readiness-v1.json",
+    "sha256": "84a48621fa26fdbc3255ab6dd5a2209b64e4c52197f93e9fe509343077647003"
+  },
+  "diagnostic_only": true,
+  "embedded_tests": [
+    "exact 512-row half-open seed formula and violation comparator order",
+    "accepted fake solve ownership and stored materialization",
+    "one exact restricted-witness retry at 1e-10",
+    "solver time-limit terminal with no candidate",
+    "cancellation after callback allocation with testing-allocator leak detection",
+    "deadline crossing after callback allocation with terminal cleanup",
+    "duplicate warm-row and clock-regression rejection",
+    "full-scan violation selection and original-row deduplication"
+  ],
+  "execution_authorized": false,
+  "limitations": [
+    "solver callback is injected and no HiGHS or other optimizer is linked",
+    "scalar Zig full scans are not claimed numerically identical to NumPy BLAS near selection thresholds",
+    "support LP, value fitting, tangent fitting, transaction integration, full36 parity, resource qualification, and serving remain out of scope",
+    "the V4 domain module is a pinned external review artifact for testing and is not installed into canonical runtime sources"
+  ],
+  "named_test_module": {
+    "path": "/private/tmp/attention_mass_lp_v4.zig",
+    "sha256": "ff1d98cab21450271694ab524dd0733294ae0ff15793c57ed105f4d18d9354de"
+  },
+  "native_parity_claimed": false,
+  "native_solver_integrated": false,
+  "publication_authority": false,
+  "readme": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/README.md",
+    "sha256": "eb8264569a3c1adc0fd491443c8673031254aea37b731f4abaf07b579919aa86"
+  },
+  "schema": "antfly.attention-matching.native-mass-cg-controller-draft-handoff.v1",
+  "serving_authority": false,
+  "source": {
+    "path": "/Users/timkaye/Documents/af/antfly/.worktrees/codex-gemma4-compaction-production/docs/design/inference/native-port/attention_mass_constraint_generation.zig",
+    "sha256": "646a7d21add4f1189ad467277ea267c5ce915082fa1abe31bfaf65278f414853"
+  },
+  "test_command": [
+    "/opt/homebrew/Cellar/zig/0.17.0/bin/zig",
+    "test",
+    "-OReleaseSafe",
+    "--dep",
+    "attention_mass_lp",
+    "-Mroot=docs/design/inference/native-port/attention_mass_constraint_generation.zig",
+    "-Mattention_mass_lp=/private/tmp/attention_mass_lp_v4.zig",
+    "--cache-dir",
+    ".zig-cache",
+    "--global-cache-dir",
+    ".zig-cache/global"
+  ],
+  "unapplied": true,
+  "verification": {
+    "git_diff_check": "PASS",
+    "reason": "root coordinates guarded pinned-Zig testing",
+    "zig_compile": "NOT RUN",
+    "zig_fmt": "NOT RUN",
+    "zig_tests": "NOT RUN"
+  }
+}

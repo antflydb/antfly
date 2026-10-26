@@ -14,14 +14,17 @@
 // limitations under the License.
 
 const std = @import("std");
+const compaction_identity = @import("compaction_identity.zig");
 
 pub const Modules = struct {
     metal: ?*std.Build.Module,
     cuda: ?*std.Build.Module,
+    compaction: *std.Build.Module,
 
     pub fn addImports(self: Modules, module: *std.Build.Module) void {
         if (self.metal) |identity| module.addImport("metal_jit_identity", identity);
         if (self.cuda) |identity| module.addImport("cuda_jit_identity", identity);
+        module.addImport("compaction_identity", self.compaction);
     }
 };
 
@@ -29,18 +32,18 @@ pub const Modules = struct {
 /// arguments participate in Zig's cache and watch graph. No source is read
 /// while configuring the build, and disabled backends have no generator edge.
 pub fn create(b: *std.Build, root: std.Build.LazyPath, metal: bool, cuda: bool) Modules {
-    if (!metal and !cuda) return .{ .metal = null, .cuda = null };
-    const tool = b.addExecutable(.{
+    const tool = if (metal or cuda) b.addExecutable(.{
         .name = "jit-source-identity",
         .root_module = b.createModule(.{
             .root_source_file = root.path(b, "tools/jit_identity.zig"),
             .target = b.graph.host,
             .optimize = .safe,
         }),
-    });
+    }) else null;
     return .{
-        .metal = if (metal) add(b, tool, root, .metal) else null,
-        .cuda = if (cuda) add(b, tool, root, .cuda) else null,
+        .metal = if (metal) add(b, tool.?, root, .metal) else null,
+        .cuda = if (cuda) add(b, tool.?, root, .cuda) else null,
+        .compaction = compaction_identity.create(b, root),
     };
 }
 
