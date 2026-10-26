@@ -40,7 +40,10 @@ pytestmark = [
     "file_format",
     ["parquet", pytest.param("iceberg", marks=pytest.mark.iceberg_integration)],
 )
-def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format):
+@pytest.mark.parametrize("native_ordering", [False, True])
+def test_logical_identity_reuses_reordered_native_indexes(
+    tmp_path, file_format, native_ordering
+):
     if not os.environ.get("ANTFLY_E2E_FULL_LAKE"):
         pytest.importorskip("pyarrow")
         if file_format == "iceberg":
@@ -70,6 +73,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
             "e2e.logical",
             schema=Schema(
                 NestedField(1, "id", LongType(), required=False),
+                NestedField(7, "rank", LongType(), required=False),
                 *[
                     NestedField(i, name, StringType(), required=False)
                     for i, name in enumerate(
@@ -91,6 +95,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
         docs = [
             {
                 "id": base + i,
+                "rank": -1 if step in (3, 6) and i == 17 else i // 64,
                 "body": (
                     "changed word" if step in (3, 6) and i == 17 else "needle same text"
                 ),
@@ -111,6 +116,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
             docs = [
                 {
                     "id": base + count,
+                    "rank": count // 64,
                     "body": "needle same text",
                     "label": f"row-{count}",
                     "dense_native": json.dumps([1, 1]),
@@ -195,6 +201,16 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                         "storage_mode": "relational",
                         "base_source": source,
                         "default_type": "row",
+                        **(
+                            {
+                                "index_sort": [
+                                    {"field": "rank", "order": "asc"},
+                                    {"field": "_id", "order": "asc"},
+                                ]
+                            }
+                            if native_ordering
+                            else {}
+                        ),
                         "document_schemas": {
                             "row": {
                                 "schema": {
@@ -202,6 +218,13 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                                     "additionalProperties": False,
                                     "properties": {
                                         "id": {
+                                            "type": "integer",
+                                            "x-antfly-field": {
+                                                "type": "number",
+                                                "sortable": True,
+                                            },
+                                        },
+                                        "rank": {
                                             "type": "integer",
                                             "x-antfly-field": {
                                                 "type": "number",
@@ -344,6 +367,8 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
         first = states()
         assert first, "Logical identity state was not published"
         original = next(root for root in first if root.get("indexes") is None)
+        if native_ordering:
+            assert original.get("native_space") is not None, original
         assert original["values_format"] == 3
         assert original["current"]["compact"]
         assert original["current"]["by_location"] == original["current"]["by_file"]
@@ -375,6 +400,10 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 assert "text" in reused, current
                 # Value-only updates change cohort evidence; stable membership
                 # and coordinate maps remain reusable across those updates.
+                assert current.get("native_space") is not None, {
+                    "step": step,
+                    "root": current,
+                }
                 assert (
                     current["native_space"]["by_id"]
                     == original["native_space"]["by_id"]
@@ -395,6 +424,14 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     != original_spaces["all_text"]["navigation"]
                 ), current
                 assert "dense_native" in reused and "sparse_native" in reused, current
+                if native_ordering:
+                    # A rank mutation can move the shared native layout without
+                    # rebuilding unchanged vector inputs in their old space.
+                    for name in ("dense_native", "sparse_native"):
+                        assert (
+                            reused[name]["navigation"]
+                            == original_spaces[name]["navigation"]
+                        ), current
                 text_after_body_update = reused["text"]
             elif step == 6:
                 assert "text" in reused and "dense_native" in reused, current
@@ -425,6 +462,24 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
             attach(oracle, False)
             ready(oracle)
             requests_ = [
+                dict(
+                    text,
+                    full_text_index="all_text",
+                    order_by=[{"field": "rank"}],
+                    profile=True,
+                ),
+                dict(
+                    text,
+                    full_text_index="all_text",
+                    order_by=[{"field": "rank", "desc": True}],
+                    profile=True,
+                ),
+                dict(
+                    text,
+                    full_text_index="all_text",
+                    order_by=[{"field": "_id"}],
+                    profile=True,
+                ),
                 text,
                 dict(text, filter_query={"term": {"path": "/id", "value": base + 17}}),
                 dict(
@@ -498,38 +553,48 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     rel=1e-6,
                     abs=score_error,
                 )
-            pages = []
-            for name in ("logical", oracle):
-                ordered = dict(
-                    text,
-                    order_by=[
-                        {"field": "_score", "desc": True},
-                        {"field": "_id", "desc": False},
-                    ],
-                    limit=5,
-                )
-                first = call("POST", f"/tables/{name}/query", ordered)
-                second = call(
-                    "POST",
-                    f"/tables/{name}/query",
-                    dict(
-                        ordered,
-                        search_after=first["hits"]["hits"][-1]["_sort"],
-                        remote_snapshot=first["remote_snapshot"],
-                    ),
-                )
-                previous = call(
-                    "POST",
-                    f"/tables/{name}/query",
-                    dict(
-                        ordered,
-                        search_before=second["hits"]["hits"][0]["_sort"],
-                        remote_snapshot=first["remote_snapshot"],
-                    ),
-                )
-                assert normalize(previous) == normalize(first)
-                pages.append([normalize(first), normalize(second)])
-            assert pages[0] == pages[1]
+            page_orders = (
+                [
+                    [{"field": "rank"}],
+                    [{"field": "rank", "desc": True}],
+                    [{"field": "_id"}],
+                ]
+                if native_ordering
+                else [
+                    [{"field": "_score", "desc": True}, {"field": "_id", "desc": False}]
+                ]
+            )
+            for page_order in page_orders:
+                pages = []
+                for name in ("logical", oracle):
+                    ordered = dict(
+                        text,
+                        full_text_index="all_text" if native_ordering else "text",
+                        order_by=page_order,
+                        limit=5,
+                    )
+                    first = call("POST", f"/tables/{name}/query", ordered)
+                    second = call(
+                        "POST",
+                        f"/tables/{name}/query",
+                        dict(
+                            ordered,
+                            search_after=first["hits"]["hits"][-1]["_sort"],
+                            remote_snapshot=first["remote_snapshot"],
+                        ),
+                    )
+                    previous = call(
+                        "POST",
+                        f"/tables/{name}/query",
+                        dict(
+                            ordered,
+                            search_before=second["hits"]["hits"][0]["_sort"],
+                            remote_snapshot=first["remote_snapshot"],
+                        ),
+                    )
+                    assert normalize(previous) == normalize(first)
+                    pages.append([normalize(first), normalize(second)])
+                assert pages[0] == pages[1]
             for statement in (
                 "SELECT id, label FROM {table} WHERE id >= "
                 + str(base + 17)

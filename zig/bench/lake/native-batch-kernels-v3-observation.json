@@ -1,0 +1,163 @@
+{
+  "experiment": "native_batch_ordering_metadata_and_fused_merge_provenance_v3",
+  "scope": "Local Debug typed-kernel and operation-count comparisons; identical-source real-Parquet answer controls.",
+  "timing_attribution_qualified": false,
+  "remote_transport_qualified": false,
+  "archive_throughput_qualified": false,
+  "candidate_production_source": {
+    "source_commit": "b9e51ad91b75acceac39a74ca6d20ab718c6b811",
+    "source_tree": "f17133c1977d55677bf7b6032b702a944526daae",
+    "source_clean": true,
+    "binary_sha256": "ae4b81984b585cd9ed6a425dcf92af46d08fbc62a0d8b6f09aafca4844b62436",
+    "build_mode": "Debug",
+    "zig_version": "0.17.0"
+  },
+  "baseline_binary_source": {
+    "source_commit": "80fe9777a520813b36ae59ac630cba6943e1031c",
+    "source_tree": "12870dcb1c4e22653d2f3738c0299987f3e47a40",
+    "source_clean": true,
+    "binary_sha256": "7528116f6130751a411f1c7b44ceba37a086744ea03255afda7d2a362e986e05",
+    "build_mode": "Debug",
+    "zig_version": "0.17.0"
+  },
+  "merged_main": "0c753dc705",
+  "compiled_runtime_abi": 65,
+  "native_reader_protocol": 89,
+  "deterministic_work": {
+    "bound_ordering": {
+      "rows": 16384,
+      "keys": 8,
+      "source_columns": 32,
+      "row_adapter_ns": 262053000,
+      "bound_kernel_ns": 8169000,
+      "checksum": 1073676288,
+      "interpretation": "One local Debug observation; repeated mapping/column resolution is removed from the row loop. Not end-to-end publication throughput.",
+      "candidate_over_row_adapter": 0.031173083307575185
+    },
+    "metadata_batch": {
+      "candidates": 64,
+      "point_callbacks": 0,
+      "batch_callbacks": 1,
+      "maximum_program_tile": 64,
+      "ordered_collector_tile": 16,
+      "ordinary_term_collector_tile": 1,
+      "semantics": "Preserves arbitrary order, duplicates, minimum-should-match, exclusions, scalar fallback and surviving-candidate masks."
+    },
+    "merge_provenance": {
+      "rows": 8192,
+      "prior_point_callbacks": 8192,
+      "fused_range_callbacks": 32,
+      "extra_typed_ordered_plan_passes": 0,
+      "interpretation": "256-row contiguous runs alternating two inputs. Fully interleaved rows retain individual callbacks. Source-only merges retain the allocation-free fallback pass."
+    },
+    "capture_payload_reads": {
+      "rows": 8193,
+      "payload_blocks": 129,
+      "fragments": 16,
+      "ordering_payload_decodes": 0,
+      "interpretation": "Existing captured-ordering regression remains source-payload-free."
+    }
+  },
+  "controls": {
+    "rows": 16384,
+    "source_files": 8,
+    "cases": 6,
+    "samples_per_binary": 36,
+    "baseline_report_sha256": "bc37051c2908fd57f4f3677b7471dccdd710197f1e58ab0fb048efc3ac07c513",
+    "candidate_report_sha256": "a3fe01777efbb0f6c382f28af85de3d707c03dab7ac95382bb4a5ba340688c4d",
+    "comparison_sha256": "e3e44928f3ad99d9550b1dfebfe39504d9703478ba6f64922563fc1df95a8b7b",
+    "source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+    "complete_normalized_answers_and_expected_ids_match": true,
+    "decorated_candidates_per_sample": [
+      21
+    ],
+    "baseline_ordered_scanned": [
+      21,
+      22,
+      23
+    ],
+    "candidate_ordered_scanned": [
+      21,
+      22,
+      23,
+      33
+    ],
+    "prefetch_tradeoff": "Metadata plans scan a bounded 33 rows rather than 22 for this limit-20 control. Ordinary term plans keep 22. All controls decorate 21 candidates.",
+    "cache_contract": {
+      "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+      "warm": "same query immediately after its process-restarted sample",
+      "empty_cache_qualified": false
+    },
+    "initial_publication_ns": {
+      "baseline": 8759737666,
+      "candidate": 8771918375
+    },
+    "warm_candidate_over_baseline": [
+      {
+        "case": "complete_forward",
+        "candidate_over_baseline": 0.9917419483996897
+      },
+      {
+        "case": "complete_reverse",
+        "candidate_over_baseline": 0.9676097864945455
+      },
+      {
+        "case": "wide_forward",
+        "candidate_over_baseline": 0.9485532923960704
+      },
+      {
+        "case": "public_id_only",
+        "candidate_over_baseline": 0.9450388810827719
+      },
+      {
+        "case": "metadata_complete_forward",
+        "candidate_over_baseline": 0.9727721739489729
+      },
+      {
+        "case": "metadata_complete_reverse",
+        "candidate_over_baseline": 0.9676853068705926
+      }
+    ],
+    "timing_interpretation": "Sequential local runs are observational and include main changes; no causal latency or full-archive gain is claimed. Concurrent validation can affect the measurements."
+  },
+  "qualification": {
+    "native_batch_ordering_provenance_tests": {
+      "passed": 143,
+      "declared_skips": 1,
+      "leaks": 0
+    },
+    "compiled_error_identity_tests": {
+      "passed": 1
+    },
+    "archive_tooling_tests": {
+      "passed": 18
+    },
+    "frontier_logical_tests": {
+      "frontier_server": 90,
+      "navigation_embedded": 26,
+      "logical_field_queries": 83,
+      "declared_skips": 1,
+      "leaks": 0
+    },
+    "real_file_e2e": {
+      "passed": 29,
+      "skipped": 0,
+      "elapsed_seconds": 1150.7,
+      "binary_sha256": "ae4b81984b585cd9ed6a425dcf92af46d08fbc62a0d8b6f09aafca4844b62436",
+      "coverage": [
+        "archive qualification, NULL integer/timestamp cursors and compound membership",
+        "Parquet and Iceberg logical identity reuse through rewrites, updates, deletes, new projections and restart",
+        "real Iceberg snapshot/schema-ID/partition/delete lifecycle",
+        "70003-row indexed metadata conjunctions and cursor pages in Parquet and Iceberg",
+        "four real Parquet attachment/pgwire/restart variants"
+      ],
+      "log_sha256": "6f0f959ae225e4ea46ab5aea2ec2d9955271245c1aad8a83be9cc8930aaf7e4a"
+    },
+    "cleanup": {
+      "command": "make gc",
+      "exit_code": 0,
+      "active_worktree_cache_preserved": true,
+      "optional_uv_prune": "Idle task-owned prune child terminated; remaining cleanup completed."
+    }
+  }
+}

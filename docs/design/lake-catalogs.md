@@ -57,7 +57,7 @@ For REST, replace the catalog configuration:
 ```
 
 `hn_source` is a named storage connection. Managed writes require both
-`lake_read` and `lake_write`; a REST reader needs `lake_read`. `hn_catalog` is a
+`lake.read` and `lake.write`; a REST reader needs `lake.read`. `hn_catalog` is a
 named `external_io` HTTP connection with `lake_catalog_read` and, for mutations,
 `lake_catalog_write`. Its host policy must allow the configured catalog origin.
 Credentials come from connection headers and secret references, never the table

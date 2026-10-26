@@ -24,6 +24,8 @@ const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const CachedRead = struct {
+    /// Admission mode for field-sort windows; never changes artifact authority.
+    lazy_lineage: bool = false,
     metrics: ?*@import("lake_query_metrics.zig").Metrics = null,
     cache: *local.serverless_query_lake_serving_cache.Cache,
     scope: [32]u8,

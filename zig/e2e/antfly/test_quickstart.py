@@ -1252,6 +1252,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         cli_wait = subprocess.run(
             [
                 server.binary,
+                "--no-agent",
                 "index",
                 "wait",
                 "--table",
@@ -1725,19 +1726,33 @@ def test_live_index_activation_preempts_an_active_enrichment_quantum(
             },
         )
         assert_created_index(created, first_index, "embeddings")
-        backup_api.wait_index_ready(
-            table_name,
-            first_index,
-            timeout_s=30.0,
-            until="complete",
-        )
-        slow_inference_embedder.arm_delay()
-
         tiny_png = (
             "data:image/png;base64,"
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
             "AAAADUlEQVR42mNk+M/wHwAF/gL+X3GQAAAAAElFTkSuQmCC"
         )
+        # Protect a real searchable publication. An empty index can be queryable
+        # before its first write, then legitimately await its first artifact;
+        # that transition says nothing about sibling activation continuity.
+        assert (
+            backup_api.batch_write(
+                table_name,
+                inserts={
+                    "seed": {"title": "Published seed", "thumbnail_url": tiny_png}
+                },
+                sync_level="write",
+            )["inserted"]
+            == 1
+        )
+        seeded = backup_api.wait_index_ready(
+            table_name,
+            first_index,
+            timeout_s=30.0,
+            until="complete",
+        )
+        assert seeded["searchable_vectors"] >= 1
+        slow_inference_embedder.arm_delay()
+
         documents = {
             f"doc:{i:03d}": {
                 "title": f"Live activation {i}",

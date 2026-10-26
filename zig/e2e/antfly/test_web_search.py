@@ -407,12 +407,15 @@ def test_exa_mixed_database_and_step_level_configuration(web_runtime):
     }
 
 
-def test_exa_cli_supports_web_only_named_connection(web_runtime):
+@pytest.mark.parametrize("agent_mode", ["0", "1"])
+def test_exa_cli_supports_web_only_named_connection(web_runtime, agent_mode):
     url, _, state = web_runtime
     provider = state.get("provider_url")
     result = subprocess.run(
         [
             state["binary"],
+            "--output",
+            "json",
             "agents",
             "retrieval",
             "--web-search-connection",
@@ -430,10 +433,15 @@ def test_exa_cli_supports_web_only_named_connection(web_runtime):
                 }
             ),
         ],
-        env={**os.environ, "ANTFLY_URL": url.removesuffix("/db/v1")},
+        env={
+            **os.environ,
+            "ANTFLY_URL": url.removesuffix("/db/v1"),
+            "ANTFLY_AGENT_MODE": agent_mode,
+        },
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout)["status"] == "completed"

@@ -1124,3 +1124,622 @@ bytes and 768 versus 384 allocations. One local Debug run measured 41.1 ms versu
 allocation failure release their owners correctly. These are in-memory changes
 under reader protocol 81; wire artifacts, publication authority and GC closure
 are unchanged. Archive-scale throughput and cloud latency remain unmeasured.
+
+
+### Archive qualification after the locality refinements
+
+[Lake archive qualification](../../zig/bench/lake/README.md) provides a repeatable
+real-Parquet gate for source scans, metadata lookup/filtering, skewed joins,
+numeric text sorting and broad incremental publication. Deterministic generated
+fixtures use independent answer oracles and atomic manifest commits; user-supplied
+archives are copied into isolated fixtures without rewriting originals. Frozen
+remote plans retain their declared source identity and credential references.
+
+Reports distinguish process-restarted, warm and startup work. They do not treat
+retained persistent/OS caches as empty, sampled RSS as exact request allocation,
+serving-cache counters as complete transport traces, or newly retained artifacts
+as total disk writes. SQL runtime profiles preserve their own coverage and spill
+fields. Every sample and input/binary/collector fingerprint is retained; report
+comparison requires equal answers and compatible inputs, cache conditions and
+collector/environment before reporting a ratio.
+
+This establishes the measurement path for further implementation decisions.
+Native reader protocol 81, publication authority and GC closure are unchanged.
+The initial Debug filesystem run exposes all-candidate numeric text sorting and
+publication artifact volume as targets for deeper profiling, without making
+archive-scale or live-cloud performance claims.
+
+### Qualification integrity and native physical ordering
+
+Archive qualification version 3 binds the executable, effective configuration
+(including the generated default), collector, harness and runtime-environment
+digest before startup. It rejects changes around restarts and measurements and
+verifies content before completing a report. Comparison requires complete,
+matching provenance, including the generated refresh recipe, rewritten-source hash and changed-row count. Version-2 reports remain historical observations and are not comparable through the current collector. Environment values and configuration contents are not
+included in reports. Readiness includes embedded table indexes, additional index
+declarations and schema relational indexes. A declared identity field controls
+the exact ID oracle and answer normalization independently of physical source
+coordinates. Python tooling tests run in the regular CI unittest suite.
+
+For stable-key sources, logical fragments assign native coordinates in declared
+`schema.index_sort` order. The existing publication-bound by-ID and by-location
+maps authenticate both directions; the physical source space, logical identity and public IDs remain distinct. Sorting uses captured typed payloads and the shared
+native key comparator, with at most 8,192 rows per fragment and the existing
+scheduler, memory and spill admission. Only changed input fragments are sorted. Incremental verification can omit a
+complete payload capture; those fragments gather only ordering columns at their
+authenticated physical row coordinates instead of abandoning native layout.
+Sort inputs live in one internal authenticated input cohort, separate from text,
+vector, relational and aggregate consumer cohorts. Only membership and that
+ordering cohort invalidate physical layout. A payload-only edit no longer sorts
+unchanged keys, and a rank-only edit can retain a field-only text/vector generation
+in its original coordinate space. Ordering configuration is bound by navigation,
+not by consumer payload interpretation. Missing,
+null or unsupported keys retain canonical coordinates and the exact
+doc-values top-N fallback. Failed admission retains the physical-source fallback. Reversed or leading
+`_id` sort components retain the exact fallback; private coordinate IDs can close
+an otherwise ordered tuple ascending.
+
+A normalized ordering recipe and ordered-member digest travel in authenticated
+fragment navigation. The digest also binds native coordinate reuse: a changed
+sort key that moves rows forces a full run rebuild, while unchanged layouts
+retain the original coordinate pages and can retain row patches. The identity
+builder admits a provisional file reuse and switches to a rescan only after its
+ordering commitment changes; payload-only edits do not republish coordinate maps. Source recipes fence earlier producers that omitted ordering
+or ignored disabled detailed text mappings. Native encoders attest the observed
+physical order before writing ordinary sort metadata and endpoint bounds. They
+never silently rearrange documents after source ordinals have been assigned.
+
+Public-ID projection uses a bounded k-way merge of native primary sort tuples.
+Cursor seeks retain the complete primary boundary tie, then the existing exact
+collector applies public identities and final cursor comparisons. The stream
+uses authenticated endpoint bounds as lazy heap entries, opening sort-value streams
+only when their bound becomes competitive. Inclusive seeks retain complete primary
+ties. Publication-wide winners pass a trusted primary boundary to later routing
+windows; strictly worse runs need no sort-key probes, while exact matching bitmap
+totals and equal-key public-ID candidates remain intact. It shares the candidate-probe budget; skewed
+membership resumes the original compressed membership iterator after discarding
+the partial window. Metadata coverage alone is insufficient qualification:
+profiles must show positive ordered work and fewer decorated candidates.
+
+Append compaction preserves ordering only when all input metadata and bounds
+prove the concatenation monotone. Lake serving compaction also merges overlapping
+ordered runs using the native merge's output-order provenance stream, composing
+each emitted coordinate with original-file ranges. Adjacent coordinates coalesce
+into authenticated ranges. Existing eight-way, byte, workspace and source-range
+limits apply; highly fragmented mappings split into smaller packs instead of
+publishing unbounded row metadata. A pack admits at most 65,536 ranges and 4 MiB
+of authenticated source pages. A pack shares one source dictionary across its
+pages, followed by fixed-width native range records. Pending inputs retain shared
+source descriptors and 16-byte ranges instead of full Span structures. Pending-tier
+and open-tail decisions charge retained native data rather than a repeated JSON
+estimate; merge workspace admission additionally charges actual pending arena
+capacity. Ownership publication emits one mutation per distinct source file/pack,
+regardless of the number of interleaved ranges. Query admission
+includes a decoded-range floor
+independent of wire size. Inverse routes coalesce contiguous original-file ranks
+even when their serving positions interleave. Physical-generation changes and
+source-rank gaps retain separate routes; historical uncoalesced maps remain
+removable during refresh.
+Native text metadata v13 and reader protocol 83 fence the shared-dictionary writer;
+retained v9-v12 roots, historical JSON and page-local dictionary pages remain
+readable. Nested serving and
+checkpoint roots resolve their own authenticated versions. Existing publication
+certificates, reader leases and GC closure own every dictionary source reference;
+there is no additional artifact family.
+
+Detailed `x-antfly-field.index: false` suppresses that field's text postings.
+Stored source, explicitly enabled named subfields and independently requested
+typed doc values retain their own policies. This avoids generating dictionaries
+and statistics for large payload fields that the schema excluded from indexing.
+Named subfields are scoped to the selected document schema and honor its unindexed
+paths. The deployed logical ASCH lowering remains unchanged. Physical projection
+semantics have their own provenance revision: only an exact known prior witness
+admits a leader-owned shadow generation rebuild through the durable repair queue.
+Unknown provenance mismatches keep their existing manual policy. Active postings
+are never relabeled under new semantics. Schema binding also recognizes the exact,
+complete omitted-source encoding briefly emitted by this PR; unrelated changes,
+partial omissions and lost enabled fields remain invalid. Stored epoch bytes are
+preserved rather than rewritten under the same version, including owner descriptor
+rehydration. Read-only repair observation exposes verified startup debt even before
+an intent exists; the next leader-admitted turn discovers and advances that debt.
+A named repair never discovers unrelated startup failures.
+
+Qualification must compare projected answers on frozen Parquet bytes, including
+numeric/timestamp directions, nulls, ties, filtering, cursor continuation,
+deletions, rewrites and restarts. Reduced candidate work and repeated timing
+improvements must be weighed against bounded build memory and publication cost.
+The earlier configuration-only probe remains historical evidence, not evidence
+for the implementation above. Filesystem observations do not qualify live-cloud
+transport or retention behavior.
+
+The [version-3 native compaction observation](../../zig/bench/lake/native-compaction-v3-observation.json)
+retains equal-answer comparisons on frozen Parquet inputs, including the
+intermediate JSON metadata regression and the compact-page result. It records
+all sort-work/timing samples and refresh provenance, distinguishing the explicit
+native ordering plan from the generated fallback control. These local Debug
+observations establish reduced work and metadata growth; timing attribution and
+live-cloud qualification remain separate.
+
+
+### Shared pack navigation and admission before publication (reader protocol 83)
+
+The source dictionary is authenticated by the ordered page references in the pack
+manifest. Dictionary bytes can span 64 KiB pages, so one large valid file descriptor
+does not become an artificial page-size failure. Range pages carry four little-endian
+32-bit fields: source index, original rank, serving position and count. Readers
+verify dictionary and range offsets, reference domains, complete coverage and all
+coordinate extents. The 4 MiB total admission limit includes page headers and the
+dictionary. Collectors traverse every unique physical source reference; publication
+certificates and reader leases retain their existing authority.
+
+Encoding and full pack-manifest admission precede posting publication, statistics
+and ownership mutations. An admission decline releases the candidate's readers,
+workspace and staged segment, then retries smaller input groups. Provider failures
+abort the publication; they never replay partially applied reducer contributions.
+The regression forces eight-way splitting and checks exact term frequency and
+retained pack ownership. It also covers the formerly failing 65,536-range case:
+eight long source names need 1,070,237 bytes with the shared dictionary, versus
+6,523,136 bytes with page-local dictionaries.
+
+Query readers keep the dictionary and 16-byte range views rather than expanding
+one complete file descriptor per range. Public identity mappings own source paths
+once per file, with compact forward ranges and inverse intervals. A real ordered
+merge of 16,384 interleaved coordinates initializes identities within a 2 MiB
+allocation budget (observed peak below 1.2 MiB). Maintenance paths can expand the
+same view when they need ordinary spans. Streaming merge provenance removes the
+post-merge inverse lookup, row permutation allocation and permutation sort.
+
+Ordered top-K membership is deferred where an unmasked segment provides an exact
+header-only count: match-all, match-none and a single term without synonyms,
+including identity Boolean wrappers. Skipped runs contribute their exact totals
+without decoding their membership bitmaps. Proven match-all and match-none runs
+use implicit ranges for membership and enumeration. Partial single-term probes
+retain one leased segment, its scoped dictionary and one decoded postings chunk;
+arbitrary forward and backward probes seek through authenticated chunk metadata
+and never decode positions. Switching segments releases the previous lease before
+opening the next, bounding reader residency independently of segment count.
+Deletions, synonyms and compound predicates retain ordinary execution; fallback
+enumeration materializes partial runs when a complete bitmap is actually needed.
+Empty Boolean filters retain their zero-match semantics. Attachment and query
+options do not change.
+
+The [shared-navigation comparison](../../zig/bench/lake/native-shared-navigation-v3-observation.json)
+retains the final binary identity, all samples and the exact-answer comparison.
+On the frozen 16,384-row source, process-restarted median latency is 215 ms versus
+922 ms for the prior compact-page implementation; warm medians remain about
+32 ms, with the same 21 decorated candidates and 23 ordered probes. These local
+Debug observations supplement the deterministic metadata-size and allocation
+checks; they do not qualify cloud transport or controlled timing attribution.
+
+
+### Reusing physical leading prefixes
+
+The native primary candidate producer accepts a leading prefix of the declared
+physical order, with matching field directions. For physical `(id, revision, _id)`,
+a public query ordered by `(id, _id)` can stream the `id` prefix. The complete
+physical recipe and endpoint bounds must still authenticate against the schema.
+This proof is separate from full-order segment-seek eligibility: an unused
+physical suffix can permute public-ID ties, so it cannot authorize an executor
+that assumes the complete requested order is monotone.
+
+The primary producer removes only the final public `_id` key for traversal and
+inclusive cursor seeks. The collector resolves the whole primary boundary tie,
+projects public identities, and applies exact cursors and final tie directions.
+Competitive boundaries prune only strictly worse primary tuples. Allocation and
+candidate budgets keep the existing exhaustive fallback. Regressions compare
+both complete and prefix physical recipes through forward/backward cursors,
+deletions and public IDs that reverse private identities; real Parquet tests
+exercise both declared physical recipes after import and process restart.
+
+### Reverse traversal, public tie navigation and sparse tombstones
+
+Native primary prefixes can traverse in either physical direction when every
+primary field agrees on the same reversal. Mixed reversals retain exact fallback.
+Query direction and `search_before` combine to choose physical traversal; heap
+comparison still uses the requested order. The public `_id` tie-breaker retains
+its ascending API contract. Binary seeks and endpoint proofs compare in the
+physical domain, so reversing a query never reverses only part of its tuple.
+
+Candidate admission charges new native probes. Buffered heads and EOF can drain
+with no additional allowance. A bounded fallback retains its current top-K window
+and a compressed set of examined matching ordinals; membership enumeration skips
+those ordinals rather than decorating the same rows again. This also makes a
+poorly selective optional ordered producer safe to abandon without replaying its
+completed sort work.
+
+Large primary ties can reuse the publication's existing public-file navigation,
+current `by_order` row tree and the bound index space's `by_id` map. A query-owned
+cursor visits public file digests and physical row coordinates in public-ID order,
+then translates stable IDs into the pinned index's coordinates. This works after
+external rewrites and retained-generation reuse; private index coordinates never
+stand in for public tie order. Native binary seeks identify each primary group's
+intervals before opening the cursor. Small/sparse groups decline this path using
+a cardinality cost estimate. The ordinary primary stream remains authoritative
+when this capability is unavailable.
+
+The optional cursor has an independent decoder lane, bounded tiles, a 4,096-row
+allowance and 16 MiB read allowance while preserving 32 MiB for required reads.
+Skew, optional memory pressure or exhausted optional reads falls back to native
+intervals. Complete-order evidence belongs to each emitted group and is withdrawn
+when that group falls back; exact membership, tombstone and cursor checks still
+run in the collector. Scratch/cache storage is reclaimed independently of a result
+arena. The cursor borrows its query's publication/reader authority and closes before
+that owner. No additional persisted index, artifact family or metadata protocol is
+needed: all traversed trees already belong to the publication's retention/GC graph.
+
+Unmasked term headers retain raw document frequencies. Match-all and match-none
+can also derive exact live counts with any validated tombstone mask. For a partial
+term, at most 4,096 deleted ordinals, covering no more than one sixteenth of the
+segment, are tested with chunk-local point probes; subtracting their matches gives
+an exact live count without expanding the postings. Dense masks and unsupported
+filters keep ordinary bitmap execution. Point membership rejects tombstones before
+using implicit-all or term probes, and exhaustive enumeration remains complete.
+
+### Independent public-ID ordering and complete competitive bounds
+
+A query ordered only by `_id` can use the same publication-bound public-row
+navigation as a large primary tie. The exact membership collector streams public
+IDs, applies filters and tombstones, and decorates only the retained page plus its
+lookahead. Forward and backward cursors share the public identity ordering proof;
+private logical hashes never supply this order. Optional budget exhaustion
+withdraws the complete-order proof and resumes exact enumeration without replay.
+
+The coordinator's complete winning tuple also bounds public navigation. Primary
+groups strictly better than that tuple retain all IDs; only an equal primary group
+receives the inclusive public-ID endpoint. Independent ID ordering has no primary
+prefix and can apply that endpoint directly. Invalid, foreign-snapshot or
+unsupported cursor domains decline the optimization. The collector still checks
+the exact public cursor and complete comparison tuple.
+
+Each navigation tile translates at most 256 stable IDs with authenticated tree
+multi-get. Shared routing and leaf reads replace per-row tree seeks; filename
+resolution is batched too. Coalesced and parallel read lanes charge the same
+optional allowance under the owner's lock and preserve the required-read reserve.
+The cursor retains its existing row, byte, cache and scheduler bounds.
+
+### Repairing declared text projection exclusions
+
+Dynamic templates select undeclared runtime values using both path and value
+type. A declared text source instead takes physical `index:false` policy from
+its own exact source mapping. Applying the declaration-only resolver to a declared
+string could incorrectly suppress it when a numeric-only dynamic template matched
+the path. Logical schema epochs and their potential-source descriptions remain
+stable; the correction belongs to physical projection identity.
+
+Affected local generations receive a new projection witness. Only exact prior
+witnesses authorize the existing leader-owned private replacement; unknown drift
+continues to require manual repair. Unaffected witnesses remain stable. Native
+publication definition revision 11 and reader protocol 84 force revalidation;
+only affected whole-document text binding hashes change. Field-selected text and
+vector bindings retain their existing identity and artifact reuse proofs. This
+is a semantic migration, with no change to native text metadata encoding.
+
+
+## Incremental ordering-key state (reader protocol 85)
+
+Native fragment spaces optionally retain a copy-on-write page tree keyed by
+logical row ID. Each value contains primitive typed ordering keys and the exact
+ordering-input digest used to derive them. The root also binds the ordering
+cohort, including its schema, input interpretation and emitted field positions.
+The cache recipe is separate from the source-input cohort, which intentionally
+sorts and deduplicates column names. Permuting fields or selecting another alias
+cannot reinterpret a cached tuple; reversing directions can reuse the same keys.
+Keys retain signed
+nanosecond timestamps and integers beyond 2^53 without conversion to floating
+point. They contain ordering inputs, not source bodies or an independent row
+identity.
+
+When an input edit requires sorting a fragment again, the builder joins its
+current input-version cursor with the previous key cursor. Matching evidence
+supplies unchanged keys; only missing or changed rows gather ordering columns
+from the current Parquet/Iceberg locations. Deleted IDs remove their key records.
+A new cohort starts a fresh tree. Historical publications without keys remain
+readable and populate keys as fragments are processed. The bounded fragment sort,
+spill manager, shared scheduler and publication admission remain authoritative.
+
+The tree advances with the same catalog publication as the coordinate layout.
+Its pages belong to the ordinary identity dependency closure, including reader
+leases, durable cloud generation maps and GC traversal. Frozen per-index reuse
+spaces omit this builder-only cache, so they do not independently retain obsolete
+ordering state. A cache hit never substitutes for current input evidence or
+source-version validation during result hydration.
+
+## Early routing dominance and lineage read waves
+
+Native text metadata v14 attaches portable typed first/last bounds to each
+segment's authenticated routing record. A full field-order top-K can reject a
+strictly dominated primary range before descriptor, segment or lineage admission.
+The leading physical prefix must match with one uniform direction reversal;
+unknown mappings, unsupported directions, missing bounds and invalid bounds keep
+the pack eligible. Equal primary values remain eligible because private segment
+IDs cannot bound public-ID ties. Forward and backward pages use their respective
+competitive endpoint. Exact counts and full-match evaluation do not prune; a
+pruned result reports a lower-bound total. This streams compact routing metadata;
+it does not yet provide a best-first multi-field metadata tree. Prefetch owns a
+copy of the cutoff so concurrent winner movement cannot invalidate its values.
+
+Cold lineage loading admits all logical page bytes before issuing reads, then
+uses waves of at most eight shared scheduler I/O tasks. Authentication stays per
+artifact and decoding stays in publication order. Every submitted task is joined
+before failure or cancellation returns. Saturation uses caller execution;
+publication-owned execution stays serial to preserve its CPU/I/O phase ownership.
+The extra encoded residency is bounded by eight 64-KiB pages and scheduler
+workspace admission. This reduces serial provider round trips without widening
+query limits or creating another worker pool.
+
+## Ordered serving admission and demand-paged lineage (reader protocol 86)
+
+Field-sort admission uses the same competitive primary-tuple predicate for both
+full routing walks and term/predicate-selected segments. Equal primary keys stay
+eligible for the public-ID tie. Pruned searches report a lower-bound total;
+count-only and complete-match evaluation retain exhaustive admission.
+
+Native text metadata v15 adds an optional `directories.ordered` page-tree root.
+Each segment contributes its first and last endpoint, with a memcomparable typed
+key in physical sort order and its authenticated segment identity. The tree's
+reduction binds a common field/direction/value-domain layout. Queries require
+that proof and exactly two records per live segment before using the directory.
+Absent, partial, mixed-domain or unknown-order covers retain ordinary routing.
+The query walks first endpoints forward or last endpoints backward, accounting
+for request direction and backward pagination. Strict primary dominance proves
+that the rest of the ordered range cannot improve the winners, so the query can
+stop before reading subsequent routing records, descriptors or lineage. A broad
+selected segment set may intersect this stream; sparse sets retain direct seeks
+with the same cutoff predicate. Admission begins with a small window and grows
+when winners stop changing, preserving batching for wide equal-key groups. The
+endpoint record carries the same conservative byte estimate as ordinary routing;
+segment-count and byte limits still bound each window. The directory is publication-owned and belongs
+to existing reader leases, cloud closure certificates, navigation warming and GC.
+It does not introduce a separately mutable index or a new publication boundary.
+
+Unfiltered field-sort windows with a proven ordered endpoint cover may admit
+shared-dictionary lineage as a dictionary
+and authenticated range-page references, without decoding every range. Native
+ordinal lookup binary-searches page bounds and then fixed-width records inside
+one page. Current v3 lineage pages already carry the required positions; no
+second row-index format is needed. Legacy encodings and masked packs use complete
+views. Score-order queries, overlays, predicates, count-only queries and complete
+match evaluation retain their existing full mapping semantics.
+
+A public-ID tie traversal can require the inverse map. That operation explicitly
+materializes it through the existing bounded shared decoded cache. An operation
+holds a lease across its tiles; later queries can reuse the immutable inverse
+map without decoding it again. The cache key binds the full publication/layout,
+and each lease checks the current request authority. Query resolvers are attached
+after acquisition and are never retained in the shared value.
+Failure of this optional admission withdraws the complete tie-order proof and
+returns to native ranges. Cancellation, authority checks and read accounting use
+the current query capability, never a capability retained from cache admission.
+The shared corpus cache distinguishes complete and paged admission modes.
+Immutable descriptors, page references and complete inverse maps may be shared;
+mutable traversal state remains query-owned. Point reads retain
+no archive-sized permutation; sustained point work switches to the complete map
+before consuming the read allowance reserved for that fallback. Every range page remains an ordinary flat
+`source_pages` dependency, so reclamation and retention use the existing closure.
+
+Complete payload captures now use the same input-version-checked ordering-key
+cache as projected gathers. Missing keys are grouped by captured payload offset
+before extraction. Thus one changed key does not reread every payload in its
+fragment, and a fresh capture reads each missing block once per fragment rather
+than depending on random hash order fitting a small decode cache. Consumer
+coordinate generations, tuple recipes, schema epochs and public cursors retain
+their existing contracts.
+
+Admission storage can be released immediately after a native corpus is built.
+Deferred lineage therefore deeply owns its compact source descriptors, page
+references and segment counts. It retains neither expanded admission-root slices
+nor an acquired snapshot pointer. Complete inverse maps derive counts from these
+owned offsets and reattach the caller's partial-inventory semantics on every
+lease, just as they reattach the current row resolver. The interleaved-compaction
+regression explicitly frees admission storage before both point and inverse
+reads, including allocation-failure coverage of the ownership transfer.
+
+
+## Bounded lineage leases, term probes and binary refresh keys (reader protocol 87)
+
+Range pages use the existing verified immutable block-lease API. A synchronous
+query operation pins at most eight 64-KiB pages under scope, domain and exact
+content identity. Repeated probes reuse those bytes instead of allocating and
+copying each page. Every hit checks the current deadline, cancellation and lease
+hooks; the cache retains no request capability. Newly admitted pages consume the
+operation's read allowance, including re-admission after eviction. Result tiles
+visit native ordinals in order and restore caller order, preserving duplicates
+before batched current-coordinate translation. A separate 4,096-point CPU limit
+and the existing required-read reserve switch sustained work to the shared
+complete inverse map. Cached pages release before complete-map admission.
+
+Sorted text membership retains up to eight exact term probes under a 2-MiB
+query-owned budget. Interleaved sorted runs reuse each probe's dictionary and
+position-free posting chunk. Least-recently-used probes release segment leases
+and decoded buffers before replacement. A probe that cannot fit declines to the
+existing exact bitmap path; unsupported predicates retain their existing plans.
+Mutable probes remain local to the synchronous collector. No archive-wide probe
+array or process-global mutable cursor is introduced.
+
+Ordering-cache rows use the self-describing `AFOK001` binary codec: magic,
+32-byte input version, bounded tuple count, explicit scalar tags and exact
+little-endian values. Signed 128-bit timestamps, signed/unsigned integers,
+finite floating values, booleans and owned variable-width bytes preserve their
+native domains. Field positions remain bound by the existing tuple recipe.
+Malformed lengths/tags, nonfinite floats and trailing bytes fail closed. Empty
+or oversized tuples do not create optional per-row state. Readers also accept
+historical JSON rows, and old/new entries may share one copy-on-write tree;
+only newly remembered values are rewritten. Decode results own byte strings
+independently of cursor/input storage. Reader protocol 87 fences these writers;
+native text metadata remains v15 because serving artifacts are unchanged.
+Publication leases, cloud certificates and GC follow the same ordering-key root
+and flat range-page closure. No new public configuration or query semantics are
+required. Performance qualification records page acquisitions, probe openings,
+cache pressure and encoded tuple bytes separately from end-to-end latency.
+
+## Compound probes, nullable ordering and layout cohorts (reader protocol 88)
+
+Eligible native top-K searches compile term/all/none and nested Boolean
+membership into an immutable program of at most 128 nodes and 32 distinct terms.
+Each of the eight query-local probe slots owns its segment leases and position-free
+posting chunks under the same 2-MiB budget. AND, OR, exclusions, optional clauses
+and minimum-should-match retain the ordinary Boolean semantics. Unsupported
+leaves, synonyms, program overflow and local cursor/chunk pressure retain exact
+bitmap execution. No mutable cursor or request capability enters a shared cache.
+
+Named text consumers retain the selected query and index, and clear the
+coordinator's outer named-source list in both serial and parallel dispatch.
+This preserves score-source admission and gives explicit `full_text_index`
+queries the same native membership and ordering plans as implicit selection.
+Composed results own copies of profile strings before component cleanup; a
+window-owned profile cannot escape through a borrowed slice.
+
+Unknown compound cardinality is an admission estimate, never a reported exact
+count or lower bound. Ordered early termination reports only observed matches
+with `gte`; count-only, zero-limit and full-match evaluation retain exact counting.
+If the ordered walk loses, at most 1,024–65,536 probes (scaled to requested top-K)
+precede complete bitmap fallback. Existing seen ordinals and winners survive the
+switch. Cursor filtering and public-ID ties continue to determine the exact page.
+
+The field mapping opts in with `missing_null_policy: nulls_ordered`; the
+existing `missing_rejected` default continues to reject live missing/null values
+and null cursors. Structural request/response validators admit JSON null as a
+replayable scalar; mapped-field admission owns the null policy, including shared
+result merging and gateway cursor validation. NULL does not establish or conflict
+with the non-null scalar domain of a distributed sort column. Nullable public
+capability admission defers physical completeness to the owning native reader,
+rather than treating a sparse density summary as a completeness proof.
+
+Native ordering has an explicit null tag matching the existing comparator:
+ascending nulls first, with descending order reversing that placement. Tagged
+refresh tuples retain nulls without creating a fake typed scalar value. Sort
+metadata v2 carries a per-field completeness witness from a full producer walk.
+Only that authenticated witness permits missing typed values or an entirely
+missing typed section to represent null. Older metadata and sparse coverage
+without a witness retain the existing rejection/fallback. Sort-only admission uses
+the witness and typed header/domain without a whole-column coverage scan; general
+column-density summaries keep their existing validation. Malformed typed sections
+still fail closed. Streaming compaction, spill keys, bounds and binary refresh
+keys preserve the same null domain. A new layout recipe upgrades previously
+unordered nullable fragments while allowing unchanged consumer payloads and
+historical ordering-cache rows to remain reusable.
+
+Endpoint records are grouped by a physical recipe/domain prefix in one existing
+page tree. Its aggregate counts at most 32 cohorts; complete paired record counts
+bind the cover to the publication's segment count. Query-owned cursors process
+incompatible/unknown groups exactly and merge the best endpoints from compatible
+groups. Each compatible group can stop independently at strict primary dominance;
+equal primary groups retain every public-ID tie. A separate 8-MiB owner bounds
+retained cursor pages and group heads. Excess cohorts withdraw this optional plan
+and retain ordinary routing. No separate shadow index or new public setting is
+introduced.
+
+A first publication refresh migrates an old flat endpoint directory from final
+segment metadata, one descriptor at a time. This migration does not reopen source
+Parquet files or rebuild native payload generations. The existing directory root
+keeps the same publication lease, cloud-certificate and GC closure. Historical
+flat directories remain readable. Native text metadata v16 and reader protocol 88
+fence the new writer; readers retain v9–v15 publications and historical JSON/binary
+refresh entries.
+
+### Verified nullable keys and shared-scan ordering capture (protocol 89)
+
+A mapped sort projection now distinguishes semantic NULL from an unsupported
+scalar, a multivalued field, or a conflicted typed column. Virtual fields resolve
+their actual source path before producing a navigation tuple. Invalid tuples
+withdraw physical ordering and nullable completeness; ordinary text indexing
+continues, and an exact sort rejects missing coverage. Local projection provenance
+fences prior nullable sort witnesses, including those from selected-field indexes
+that omit the table sort columns, and uses the existing leader-owned private
+replacement workflow. Remote text recipe v2 likewise rebuilds affected sorted
+payloads instead of adopting a possibly false completeness witness.
+
+Complete verification captures compact typed ordering tuples in a private tree
+while each source column batch is live. It shares the payload capture's memory,
+spill quota, cancellation and I/O ownership. The tree grants no reader authority:
+only a complete identity census can supply tuples to logical fragments. Fragment
+ordering reads these narrow keys by logical ID and persists them with the actual
+ordering-input version. It no longer decodes payload blocks independently for
+each hash fragment. Missing or oversized tuples conservatively retain ordinary
+ordering fallback. Incremental refresh continues to verify retained key versions.
+
+The emitted typed projection owns scalar values and conflicts, including literal
+dotted field names. Raw source inspection only certifies genuine missing/null
+values; it cannot override an ambiguous or unsupported projection. Unsupported
+exact sorting keeps the public `422 unsupported_exact_sort` contract across the
+compiled runtime boundary. Shared-scan capture adds narrow temporary key writes
+under the existing quota in exchange for eliminating repeated wide payload
+reads; local qualification measures those operations separately from latency.
+
+### Batch-bound ordering and candidate membership
+
+Ordering extraction binds each emitted field to its actual source column once
+per typed batch. Exact column names take precedence over dotted JSON traversal;
+virtual mappings retain their declared source association. Numeric, Boolean and
+keyword columns use typed kernels, including dictionaries and validity masks.
+Datetime, encoded and nested values keep the canonical mapped conversion. Tuples
+own their byte keys and never retain source-batch storage beyond its lifetime.
+Verification capture, payload fallback and selective physical gathers share this
+binding, without changing ordering-input commitments or durable tuple formats.
+
+Native ordered collection uses tiles of at most 16 rows only when its compiled
+predicate includes a metadata batch producer. Boolean masks eliminate candidates
+before each expensive child; minimum-should-match and exclusions preserve the
+scalar evaluation semantics. Per-row public tie proofs travel with the tile.
+Ordinary term plans retain single-row admission. Metadata probes translate a
+bounded tile under the existing scratch, work and lineage budgets; any incomplete
+probe is discarded before complete compressed membership fallback. This internal
+callback addition advances the compiled runtime ABI, not the reader protocol.
+
+Sorted typed compaction emits contiguous provenance ranges from the existing
+statistics/source-span preparation walk. It avoids a second ordered-plan read
+and per-row lineage callbacks. Source-only merges retain their allocation-free
+fallback traversal. Observer failures abort the private publication attempt;
+provenance cannot authorize publication before the merged output is complete.
+
+Metadata candidate probes reuse original index coordinates when the existing
+coordinate-space admission rule proves both readers share the authenticated
+file dictionary and row map. Incoming source/snapshot labels must still match
+the originating index cut before rebinding them to the metadata reader's cut.
+Matching filenames, row counts or logical-ID recipes do not establish this
+equivalence. Different or absent relocation witnesses keep the ordinary
+text-index-to-source-to-metadata translation and complete membership fallback.
+
+Ordered predicate read-ahead follows remaining page demand and observed tile
+selectivity, bounded by the existing 16-row maximum. Dense small pages avoid
+reading a full tile merely to establish their boundary; sparse predicates and
+unresolved public tie groups retain larger batches. Capture binds its ordering
+columns once, fills a fixed typed tuple, and immediately encodes it using one
+reusable scratch arena. Flat byte keys may borrow the live source batch only
+until encoding copies them. Durable tuple bytes, quota ownership, nullable
+coverage and ordering-input commitments remain unchanged.
+
+Planning distinguishes an unloaded lazy inventory from a genuinely empty source.
+If the authoritative directory count differs from the eager file list, projected
+scan cost remains unknown rather than zero, and residual gather cost stays
+conservative. Planning does not enumerate that directory to estimate a scan.
+Reverse membership estimates charge per-candidate leaf work and amortize internal
+navigation across bounded tiles; authenticated I/O, scratch and cancellation
+budgets continue to govern execution. Exhaustion discards partial probe results
+before complete membership fallback. Opt-in benchmark diagnostics separate direct
+and translated probes from full materialization so work reductions cannot be
+mistaken for end-to-end query gains.
+
+
+Winner scoring retains an operation-owned proof binding the selected native IDs,
+original score expression and result to the same leased text snapshot. Metadata
+inclusion, exclusion and visibility already proved during selection are not
+re-evaluated during scoring. Explicit native document constraints retain their
+existing score contribution. Boolean boosts, corpus/distributed statistics,
+pattern context and cancellation still apply to the original expression. A
+constant producer assigns its boost only to these proven winners. This proof is
+private to synchronous execution and cannot be supplied through a request.
+
+Probe admission compares reverse-tree work against complete membership conversion,
+not just the predicate scan. The metadata predicate tree counts matching compressed
+block records under the same tuple bounds without decoding membership bitmaps.
+Shared authenticated coordinates charge conversion per block; translated or
+unknown layouts charge per matching row. A source scan alternative includes its
+row conversion too. Distinct-ID ranges therefore differ from compact categorical
+sets of equal row cardinality. Estimates saturate and only choose a path; existing
+read-byte, scratch, candidate-tile and cancellation limits still force an exact
+complete fallback when exhausted.
+
+Both initial eager membership admission and subsequent deferred probe admission
+use this conversion estimate. A small distinct-key range cannot enter the eager
+path merely because its scan-only estimate fits one reverse-tree probe.

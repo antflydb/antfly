@@ -197,6 +197,24 @@ pub fn storageName(handle: *h.Handle, name: []const u8) ![]const u8 {
     return handle.embedded_tables.get(name).?.namespace;
 }
 
+/// Read schema declarations at the captured Lite root without constructing
+/// index/provider runtimes. This is metadata, not a serving-capability proof;
+/// integrity reads still open and validate every owner they actually use.
+pub fn liteSchemaJson(handle: *h.Handle, alloc: std.mem.Allocator, id: u64) !?[]u8 {
+    const backend = if (handle.owned_lite_backend) |*value| value else return error.UnsupportedSqlExecution;
+    const namespace = try catalog.namespaceAlloc(alloc, id);
+    defer alloc.free(namespace);
+    var options: h.db_mod.OpenOptions = .{};
+    try backend.configureDbOpenOptionsForNamespace(&options, namespace);
+    var probe = try options.primary_runtime_store.?.beginProbe();
+    defer probe.abort();
+    const json = probe.get(@import("../storage/internal_keys.zig").public_schema_json_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try alloc.dupe(u8, json);
+}
+
 pub fn get(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
     try loadCatalog(handle);
     if (std.mem.eql(u8, name, "default")) return &handle.db;

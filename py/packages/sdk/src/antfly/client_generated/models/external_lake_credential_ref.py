@@ -14,7 +14,7 @@ T = TypeVar("T", bound="ExternalLakeCredentialRef")
 class ExternalLakeCredentialRef:
     """
     Attributes:
-        ref (str): Name of a configured external_io connection with lake_read capability.
+        ref (str): Name of a configured external_io connection with lake.read capability.
         scope (str | Unset): Allowed object prefix relative to the configured bucket or filesystem root.
     """
 

@@ -149,7 +149,7 @@ pub fn status(err: anyerror) u16 {
         error.MemoryInputTooLarge, error.MemoryWorkLimit, error.ResolverCurationLimitExceeded => 413,
         error.MemoryModelRequired, error.MemoryCapabilityUnavailable, error.MemoryExecutionIdentityRequired, error.MemoryModelRevisionUnavailable, error.MemoryModelRevisionMismatch, error.MemoryEmbeddingDimensionsRequired, error.MemoryEmbeddingDimensionsUnsupported => 422,
         error.MemoryRetryNotReady, error.MemoryRetryExhausted, error.MemoryOverloaded => 429,
-        error.MemoryCommitPending, error.NotLeader, error.Unavailable, error.StorageUnavailable, error.GroupLeaderUnavailable => 503,
+        error.MemoryCommitPending, error.NotLeader, error.Unavailable, error.StorageUnavailable, error.GroupLeaderUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable => 503,
         error.Canceled => 408,
         error.Timeout, error.DeadlineExceeded => 504,
         error.OutOfMemory, error.MemoryCorruptState => 500,

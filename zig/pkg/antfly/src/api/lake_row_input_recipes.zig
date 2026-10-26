@@ -30,10 +30,26 @@ pub const Recipe = struct {
         if (self.binding) |binding| try writer.write(.{ .name = self.name, .digest = self.digest, .columns = self.columns, .reusable = self.reusable, .binding = binding }) else try writer.write(.{ .name = self.name, .digest = self.digest, .columns = self.columns, .reusable = self.reusable });
     }
 };
+// Internal authenticated cohort, never a consumer declaration. Public names
+// cannot contain NUL; keep layout evidence separate from payload dependencies.
+pub const ordering_name = "\x00antfly:ordering:v1";
+pub fn isOrdering(recipe: Recipe) bool {
+    return std.mem.eql(u8, recipe.name, ordering_name);
+}
+pub fn consumers(a: A, recipes: []const Recipe) ![]const Recipe {
+    var result: std.ArrayList(Recipe) = .empty;
+    errdefer result.deinit(a);
+    for (recipes) |recipe| if (!isOrdering(recipe)) try result.append(a, recipe);
+    return result.toOwnedSlice(a);
+}
+pub fn orderingDigest(recipes: []const Recipe) ?[32]u8 {
+    for (recipes) |recipe| if (isOrdering(recipe)) return recipe.digest;
+    return null;
+}
 pub fn count(recipes: []const Recipe) usize {
     // Root admission caps declarations at 4096. Keep validation allocation-free
     // without repeatedly comparing every declaration to all its predecessors.
-    if (recipes.len > local.metadata_lake_index_catalog.max_directory_artifacts) return recipes.len;
+    if (recipes.len > local.metadata_lake_index_catalog.max_directory_artifacts + 1) return recipes.len;
     const absent = std.math.maxInt(u16);
     var slots: [8192]u16 = @splat(absent);
     var n: usize = 0;
@@ -120,6 +136,7 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
     const ca = arena.allocator();
     const input_schema = table.schema_json;
     const configs = try std.json.parseFromSliceLeaky(std.json.Value, ca, table.indexes_json, .{});
+    if (configs == .object and configs.object.contains(ordering_name)) return error.InvalidLogicalRowIdentity;
     var result: std.ArrayList(Recipe) = .empty;
     for (desired.artifacts) |artifact| {
         switch (artifact.kind) {
@@ -197,7 +214,24 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
         }
         try result.append(out, try make(out, input_schema, try @import("lake_index_native_rows.zig").logicalName(ca, index.name), try std.json.Stringify.valueAlloc(ca, index, .{}), columns.items, true));
     };
+    if (schema.index_sort.len != 0) {
+        var columns: std.ArrayList([]const u8) = .empty;
+        try appendOrderingInputs(ca, schema, &columns);
+        try result.append(out, try make(out, input_schema, ordering_name, try std.json.Stringify.valueAlloc(ca, schema.index_sort, .{}), columns.items, true));
+    }
     return result.toOwnedSlice(out);
+}
+// Ordering changes the shared native coordinate layout. Capture its source
+// values in a dedicated cohort independent of consumer payload fingerprints.
+fn appendOrderingInputs(a: A, schema: local.storage_schema.TableSchema, columns: *std.ArrayList([]const u8)) !void {
+    for (schema.index_sort) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse continue;
+        const source = for (schema.exact_fields) |mapped| {
+            if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+        } else field.field;
+        if (normalize(schema, source)) |path| try columns.append(a, path);
+    }
 }
 fn normalize(schema: local.storage_schema.TableSchema, name: []const u8) ?[]const u8 {
     for (schema.relational_columns) |column| if (std.mem.eql(u8, name, column.name) or std.mem.eql(u8, name, column.path)) return column.path;
@@ -217,7 +251,17 @@ fn make(a: A, schema: []const u8, name: []const u8, configuration: []const u8, i
         try columns.append(a, try a.dupe(u8, path));
     }
     const paths = try columns.toOwnedSlice(a);
-    const contract = try @import("lake_index_dependencies.zig").project(a, schema, if (reusable) paths else null);
+    var normalization = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer normalization.deinit();
+    const temporary = normalization.allocator();
+    var logical = try std.json.parseFromSliceLeaky(std.json.Value, temporary, schema, .{});
+    if (logical != .object) return error.InvalidLogicalRowIdentity;
+    // Ordering is bound by layout/navigation, not by payload interpretation.
+    // Consumer generations retain their own immutable coordinate spaces. Keep
+    // this full-schema temporary out of the durable recipe arena.
+    _ = logical.object.swapRemove("index_sort");
+    const input_schema = try std.json.Stringify.valueAlloc(temporary, logical, .{});
+    const contract = try @import("lake_index_dependencies.zig").project(a, input_schema, if (reusable) paths else null);
     defer a.free(contract);
     const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-input-cohort-v3", .schema = contract, .columns = paths }, .{});
     defer a.free(encoded);
@@ -282,4 +326,32 @@ test "external lake input recipes decline payload capture for enrichment and leg
         const config = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes_, .{});
         try std.testing.expectEqual(i < 2, nativeFragmentsEligible(config));
     }
+}
+
+test "external lake ordering inputs are independent of selected text" {
+    const a = std.testing.allocator;
+    const schema_json =
+        \\{"storage_mode":"relational","default_type":"row","index_sort":[{"field":"rank","order":"asc"},{"field":"_id","order":"asc"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"rank":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, schema_json);
+    defer parsed.deinit(a);
+    const schema = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+    defer local.storage_schema.freeSchema(a, schema);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var columns: std.ArrayList([]const u8) = .empty;
+    try appendOrderingInputs(ca, schema, &columns);
+    try std.testing.expectEqual(@as(usize, 1), columns.items.len);
+    try std.testing.expectEqualStrings("rank", columns.items[0]);
+    const before = try make(ca, schema_json, "text", "config", &.{"body"}, true);
+    var without_order = try std.json.parseFromSliceLeaky(std.json.Value, ca, schema_json, .{});
+    _ = without_order.object.swapRemove("index_sort");
+    const same_payload = try make(ca, try std.json.Stringify.valueAlloc(ca, without_order, .{}), "text", "config", &.{"body"}, true);
+    try std.testing.expectEqual(before.digest, same_payload.digest);
+    try std.testing.expectEqual(before.binding, same_payload.binding);
+    const after = try make(ca, schema_json, ordering_name, "config", columns.items, true);
+    try std.testing.expect(!std.mem.eql(u8, &before.digest, &after.digest));
+    try std.testing.expectEqual(@as(usize, 1), (try consumers(ca, &.{ before, after })).len);
+    try std.testing.expectEqual(after.digest, orderingDigest(&.{ before, after }).?);
 }

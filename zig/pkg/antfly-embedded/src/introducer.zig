@@ -514,7 +514,12 @@ pub const TypedFieldValue = struct {
 };
 
 /// A document with raw text fields that will be analyzed before indexing.
+pub const NamedSortValue = struct { field_name: []const u8, value: segment_mod.SegmentIndexSortBoundValue };
 pub const TextDocument = struct {
+    /// Native navigation tuples may include nulls without inventing typed column values.
+    index_sort_values: []const NamedSortValue = &.{},
+    /// A mapped projection may reject a non-null scalar or multivalued key.
+    index_sort_projection_valid: bool = true,
     id: []const u8,
     stored_data: []const u8,
     text_fields: []const TextField,
@@ -541,6 +546,9 @@ pub const BuildTextOptions = struct {
     infer_type_dynamic_paths: []const []const u8 = &.{},
     unindexed_paths: []const []const u8 = &.{},
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
+    /// Attest an existing physical order instead of reordering source rows.
+    /// A non-monotone or missing key keeps the segment unordered.
+    attest_index_sort_in_place: bool = false,
     profile: ?*BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     build_memory_target_bytes: usize = default_build_memory_target_bytes,
@@ -1015,15 +1023,28 @@ fn writeTextSegmentWithScratch(
     var scratch = TextBuildScratch{};
     defer scratch.deinit(alloc);
 
+    const attested = options.attest_index_sort_in_place and options.index_sort.len != 0 and
+        (textDocumentsAreIndexSorted(alloc, docs, text_analysis, options.index_sort) catch |err| switch (err) {
+            error.OutOfMemory => false,
+            else => return err,
+        });
+    var index_sort: []const segment_mod.SegmentIndexSortField = if (options.attest_index_sort_in_place and !attested) &.{} else options.index_sort;
+    const sort_docs: []const TextDocument = if (attested and docs.len > 1) &.{ docs[0], docs[docs.len - 1] } else docs;
     var empty_doc_order: [0]TextIndexSortEntry = .{};
-    const doc_order: []TextIndexSortEntry = if (options.index_sort.len > 0)
-        try buildTextDocumentOrderAlloc(alloc, docs, text_analysis, options.index_sort)
+    const doc_order: []TextIndexSortEntry = if (index_sort.len > 0)
+        buildTextDocumentOrderAlloc(alloc, sort_docs, text_analysis, index_sort) catch |err| switch (err) {
+            error.InvalidSegment, error.UnsupportedTypedDocValues => declined: {
+                index_sort = &.{};
+                break :declined empty_doc_order[0..];
+            },
+            else => return err,
+        }
     else
         empty_doc_order[0..];
     defer freeTextDocumentOrder(alloc, doc_order);
 
     for (0..docs.len) |doc_idx| {
-        const source_doc_idx = if (options.index_sort.len > 0) doc_order[doc_idx].doc_index else doc_idx;
+        const source_doc_idx = if (index_sort.len > 0 and !attested) doc_order[doc_idx].doc_index else doc_idx;
         const text_doc = docs[source_doc_idx];
         _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
         scratch.reset(alloc, options.doc_scratch_retained_bytes);
@@ -1209,13 +1230,16 @@ fn writeTextSegmentWithScratch(
     if (!options.store_documents) {
         try seg_writer.addDocKeyRange(min_doc_key orelse return error.InvalidSegment, max_doc_key orelse return error.InvalidSegment);
     }
-    if (options.index_sort.len > 0) {
+    if (index_sort.len > 0) {
+        const complete_fields = try alloc.dupe(segment_mod.SegmentIndexSortField, index_sort);
+        defer alloc.free(complete_fields);
+        for (complete_fields) |*field| field.nulls_complete = true;
         if (doc_order.len > 0) {
             var bounds = try textIndexSortBoundsAlloc(alloc, doc_order[0].keys, doc_order[doc_order.len - 1].keys);
             defer bounds.deinit(alloc);
-            try seg_writer.addIndexSortMetadataWithBounds(options.index_sort, bounds);
+            try seg_writer.addIndexSortMetadataWithBounds(complete_fields, bounds);
         } else {
-            try seg_writer.addIndexSortMetadata(options.index_sort);
+            try seg_writer.addIndexSortMetadata(complete_fields);
         }
     }
 
@@ -1351,6 +1375,7 @@ const TextIndexSortEntry = struct {
 };
 
 const TextIndexSortValue = union(enum) {
+    null_value,
     datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
@@ -1378,6 +1403,50 @@ fn textIndexSortEntryLessThan(index_sort: []const segment_mod.SegmentIndexSortFi
         return if (field.desc) order == .gt else order == .lt;
     }
     return a.doc_index < b.doc_index;
+}
+
+/// Prove existing physical order without changing document/source ordinals.
+/// Only two tuples are resident. Missing/null or incompatible scalar values
+/// conservatively leave the segment unordered; ordinary encoding still runs.
+pub fn textDocumentsAreIndexSorted(alloc: Allocator, docs: []const TextDocument, analysis: TextAnalysisConfig, fields: []const segment_mod.SegmentIndexSortField) !bool {
+    if (fields.len == 0 or docs.len == 0) return false;
+    var regions = [_]std.heap.ArenaAllocator{ .init(alloc), .init(alloc) };
+    defer for (&regions) |*region| region.deinit();
+    const domains = try alloc.alloc(?TextIndexSortValueTag, fields.len);
+    defer alloc.free(domains);
+    @memset(domains, null);
+    var previous: ?TextIndexSortEntry = null;
+    for (docs, 0..) |doc, index| {
+        const region = &regions[index % 2];
+        _ = region.reset(.retain_capacity);
+        const scratch = region.allocator();
+        const next: TextIndexSortEntry = .{ .doc_index = index, .keys = try scratch.alloc(TextIndexSortValue, fields.len) };
+        for (fields, next.keys) |field, *key| {
+            key.* = textDocumentSortValueAlloc(scratch, doc, field.field, analysis) catch |err| switch (err) {
+                error.InvalidSegment, error.UnsupportedTypedDocValues => {
+                    return false;
+                },
+                else => return err,
+            };
+        }
+        for (next.keys, domains) |key, *domain| {
+            if (key == .null_value) continue;
+            const tag = std.meta.activeTag(key);
+            if (domain.*) |held| {
+                if (held != tag) return false;
+            } else domain.* = tag;
+        }
+        if (previous) |entry| {
+            for (entry.keys, next.keys) |left, right| if (left != .null_value and right != .null_value and std.meta.activeTag(left) != std.meta.activeTag(right)) {
+                return false;
+            };
+            if (textIndexSortEntryLessThan(fields, next, entry)) {
+                return false;
+            }
+        }
+        previous = next;
+    }
+    return true;
 }
 
 fn buildTextDocumentOrderAlloc(
@@ -1409,10 +1478,10 @@ fn buildTextDocumentOrderAlloc(
             var key = try textDocumentSortValueAlloc(alloc, docs[i], field.field, text_analysis);
             errdefer key.deinit(alloc);
             const key_tag = std.meta.activeTag(key);
-            if (expected_key_tags[keys_initialized]) |expected| {
-                if (expected != key_tag) return error.InvalidSegment;
-            } else {
-                expected_key_tags[keys_initialized] = key_tag;
+            if (key != .null_value) {
+                if (expected_key_tags[keys_initialized]) |expected| {
+                    if (expected != key_tag) return error.InvalidSegment;
+                } else expected_key_tags[keys_initialized] = key_tag;
             }
             entry.keys[keys_initialized] = key;
             keys_initialized += 1;
@@ -1421,6 +1490,15 @@ fn buildTextDocumentOrderAlloc(
     }
     std.sort.pdq(TextIndexSortEntry, order, index_sort, textIndexSortEntryLessThan);
     return order;
+}
+
+/// Sort only bounded navigation keys; payloads retain their capture ownership.
+pub fn sortedTextDocumentIndicesAlloc(a: Allocator, docs: []const TextDocument, fields: []const segment_mod.SegmentIndexSortField) ![]u32 {
+    const order = try buildTextDocumentOrderAlloc(a, docs, .{}, fields);
+    defer freeTextDocumentOrder(a, order);
+    const indices = try a.alloc(u32, order.len);
+    for (order, indices) |entry, *index| index.* = @intCast(entry.doc_index);
+    return indices;
 }
 
 fn freeTextDocumentOrder(alloc: Allocator, order: []TextIndexSortEntry) void {
@@ -1464,6 +1542,7 @@ fn textIndexSortBoundValuesAlloc(
 
 fn textIndexSortBoundValueAlloc(alloc: Allocator, value: TextIndexSortValue) !segment_mod.SegmentIndexSortBoundValue {
     return switch (value) {
+        .null_value => .null_value,
         .datetime_ns => |v| .{ .datetime_ns = v },
         .u64_val => |v| .{ .u64_val = v },
         .i64_val => |v| .{ .i64_val = v },
@@ -1485,15 +1564,36 @@ fn textDocumentSortValueAlloc(
     field: []const u8,
     text_analysis: TextAnalysisConfig,
 ) !TextIndexSortValue {
+    if (!doc.index_sort_projection_valid) return error.UnsupportedTypedDocValues;
     if (std.mem.eql(u8, field, "_id")) return .{ .id = doc.id };
+    for (doc.index_sort_values) |key| if (std.mem.eql(u8, key.field_name, field)) return switch (key.value) {
+        .null_value => .null_value,
+        .bytes_val => |v| .{ .bytes_val = try alloc.dupe(u8, v) },
+        .id => |v| .{ .id = v },
+        inline .u64_val, .i64_val, .f64_val => |v, tag| .{ .numeric_val = @unionInit(typed_dv.NumericValue, @tagName(tag), v) },
+        inline else => |v, tag| @unionInit(TextIndexSortValue, @tagName(tag), v),
+    };
     if (doc.typed_fields) |typed_fields| {
         var found: ?typed_dv.TypedValue = null;
         for (typed_fields) |typed_field| {
             if (!std.mem.eql(u8, typed_field.field_name, field)) continue;
+            if (typed_field.conflicted) return error.UnsupportedTypedDocValues;
             if (found != null) return error.InvalidSegment;
             found = typed_field.value;
         }
         if (found) |value| return try textIndexSortValueFromTypedValueAlloc(alloc, value);
+        // Explicit projections must not attest omitted non-null source values
+        // as null coverage. The encoder consumes this same typed projection.
+        if (doc.typed_source) |source| {
+            if (jsonPathValue(source, field)) |value| if (value != .null) return error.UnsupportedTypedDocValues;
+            return .null_value;
+        }
+        if (doc.stored_data.len != 0) {
+            var source = try std.json.parseFromSlice(std.json.Value, alloc, doc.stored_data, .{});
+            defer source.deinit();
+            if (jsonPathValue(source.value, field)) |value| if (value != .null) return error.UnsupportedTypedDocValues;
+        }
+        return .null_value;
     }
     if (doc.typed_source) |source| {
         if (jsonPathValue(source, field)) |value| {
@@ -1502,7 +1602,7 @@ fn textDocumentSortValueAlloc(
     }
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc.stored_data, .{});
     defer parsed.deinit();
-    const value = jsonPathValue(parsed.value, field) orelse return error.InvalidSegment;
+    const value = jsonPathValue(parsed.value, field) orelse return .null_value;
     return try textIndexSortValueFromJsonAlloc(alloc, field, value, text_analysis);
 }
 
@@ -1512,6 +1612,7 @@ fn textIndexSortValueFromJsonAlloc(
     value: std.json.Value,
     text_analysis: TextAnalysisConfig,
 ) !TextIndexSortValue {
+    if (value == .null) return .null_value;
     const detected = detectTypedValue(field, value, text_analysis) orelse return error.InvalidSegment;
     return try textIndexSortValueFromTypedValueAlloc(alloc, detected.value);
 }
@@ -1540,7 +1641,9 @@ fn jsonPathValue(value: std.json.Value, path: []const u8) ?std.json.Value {
 }
 
 fn compareTextIndexSortValues(a: TextIndexSortValue, b: TextIndexSortValue) std.math.Order {
+    if (b == .null_value) return if (a == .null_value) .eq else .gt;
     return switch (a) {
+        .null_value => .lt,
         .datetime_ns => |av| if (b == .datetime_ns) std.math.order(av, b.datetime_ns) else .lt,
         .u64_val => |av| switch (b) {
             .u64_val => |bv| std.math.order(av, bv),
@@ -4958,4 +5061,58 @@ test "postings spill policy retains small-node bounds and adapts to live headroo
     defer held.release();
     try std.testing.expectEqual(@as(u64, 10 * MiB), postingsRunTarget(.{ .resource_manager = &large }, 8 * MiB));
     try std.testing.expectEqual(@as(u64, 1024), postingsRunTarget(.{ .resource_manager = &large, .postings_run_target_bytes = 1024 }, 8 * MiB));
+}
+
+test "observed physical ordering proves directions ties and native nulls" {
+    const a = std.testing.allocator;
+    const docs = [_]TextDocument{
+        .{ .id = "a", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "b", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "c", .stored_data = "{\"rank\":2}", .text_fields = &.{} },
+    };
+    const fields = [_]segment_mod.SegmentIndexSortField{ .{ .field = "rank" }, .{ .field = "_id" } };
+    try std.testing.expect(try textDocumentsAreIndexSorted(a, &docs, .{}, &fields));
+    try std.testing.expect(!try textDocumentsAreIndexSorted(a, &.{ docs[1], docs[0] }, .{}, &fields));
+    try std.testing.expect(!try textDocumentsAreIndexSorted(a, &.{ docs[2], docs[0] }, .{}, &fields));
+    try std.testing.expect(try textDocumentsAreIndexSorted(a, &.{ docs[2], docs[0], docs[1] }, .{}, &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } }));
+    try std.testing.expect(try textDocumentsAreIndexSorted(a, &.{ .{ .id = "z", .stored_data = "{\"rank\":null}", .text_fields = &.{} }, docs[0] }, .{}, &fields));
+}
+
+test "observed physical ordering encoder keeps all source ordinals and declines unsorted input" {
+    const a = std.testing.allocator;
+    const docs = [_]TextDocument{
+        .{ .id = "a", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "b", .stored_data = "{\"rank\":2}", .text_fields = &.{} },
+        .{ .id = "c", .stored_data = "{\"rank\":3}", .text_fields = &.{} },
+    };
+    for (0..2) |unordered| {
+        const input = if (unordered == 0) docs else [_]TextDocument{ docs[2], docs[0], docs[1] };
+        const bytes = try buildSegmentFromTextWithAnalysisOptions(a, &input, &analysis_mod.default_analyzer, .{}, .{ .index_sort = &.{ .{ .field = "rank" }, .{ .field = "_id" } }, .attest_index_sort_in_place = true });
+        defer a.free(bytes);
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(u32, 3), reader.doc_count);
+        for (input, 0..) |doc, i| try std.testing.expectEqualStrings(doc.id, (try reader.storedDoc(@intCast(i))).?.id);
+        const order = try reader.indexSortFieldsAlloc(a);
+        defer if (order) |fields| segment_mod.freeIndexSortFields(a, fields);
+        try std.testing.expectEqual(unordered == 0, order != null);
+    }
+}
+
+test "observed physical ordering uses signed timestamp keys and releases failed scratch" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            const values = [_]TypedFieldValue{
+                .{ .field_name = "at", .value_type = .datetime_ns, .value = .{ .datetime_ns = -1 } },
+                .{ .field_name = "at", .value_type = .datetime_ns, .value = .{ .datetime_ns = 1 } },
+            };
+            const docs = [_]TextDocument{
+                .{ .id = "a", .stored_data = "{}", .text_fields = &.{}, .typed_fields = values[0..1] },
+                .{ .id = "b", .stored_data = "{}", .text_fields = &.{}, .typed_fields = values[1..2] },
+            };
+            try std.testing.expect(try textDocumentsAreIndexSorted(a, &docs, .{}, &.{ .{ .field = "at" }, .{ .field = "_id" } }));
+            try std.testing.expect(!try textDocumentsAreIndexSorted(a, &docs, .{}, &.{ .{ .field = "at", .desc = true }, .{ .field = "_id" } }));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

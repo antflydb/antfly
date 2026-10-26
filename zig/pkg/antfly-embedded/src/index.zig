@@ -343,7 +343,7 @@ pub const CoverageValidation = struct {
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
 
-    fn checkActive(self: @This()) !void {
+    pub fn checkActive(self: @This()) !void {
         if (self.cancellation) |token| try token.check();
         if (self.execution_deadline_ns) |deadline_ns| {
             if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;

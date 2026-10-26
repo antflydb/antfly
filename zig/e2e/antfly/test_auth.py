@@ -1378,10 +1378,15 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
                 # Standalone advances memory in the background. Both mutation
                 # CAS and read-snapshot fences require a fresh bounded attempt.
                 response = error.response
-                if (
-                    response is None
-                    or response.status_code != 409
-                    or response.json().get("code") != "MemoryRevisionConflict"
+                payload = response.json() if response is not None else {}
+                if response is None or not (
+                    (
+                        response.status_code == 409
+                        and payload.get("code") == "MemoryRevisionConflict"
+                    )
+                    or (
+                        response.status_code == 503 and payload.get("retryable") is True
+                    )
                 ):
                     raise
                 assert time.monotonic() < deadline

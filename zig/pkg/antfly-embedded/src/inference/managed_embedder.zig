@@ -580,12 +580,20 @@ const max_embedding_request_timeout_ns: u64 = max_embedding_request_timeout_ms *
 const query_cache_secret_refresh_interval_ns: u64 = std.time.ns_per_s;
 const dimension_probe_text = "antfly embedding dimension probe";
 
+// Advance logical operation time in timeout regressions without sleeping
+// through production-sized budgets. Test artifacts run cases serially; the
+// atomic also lets a real HTTP listener advance time from its worker thread.
+const TestClock = if (builtin.is_test) struct {
+    var offset_ns: std.atomic.Value(u64) = .init(0);
+} else struct {};
+
 fn monotonicNowNs() u64 {
     var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
-        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
-        else => return 0,
-    }
+    const now: u64 = switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => 0,
+    };
+    return if (builtin.is_test) now +| TestClock.offset_ns.load(.monotonic) else now;
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -10915,6 +10923,8 @@ test "managed embedder cold activation precedes default probe and query inferenc
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    TestClock.offset_ns.store(0, .monotonic);
+    defer TestClock.offset_ns.store(0, .monotonic);
     const Service = struct {
         loaded: bool = false,
         delay: u64 = 31 * std.time.ns_per_s,
@@ -10928,8 +10938,9 @@ test "managed embedder cold activation precedes default probe and query inferenc
                 defer load.deinit();
                 try std.testing.expectEqualStrings("cold", load.value.model);
                 try std.testing.expectEqualStrings("embedder", load.value.task);
-                // Exceed the real inference-only default, not a test override.
-                try std.testing.io.sleep(.fromNanoseconds(@intCast(self.delay)), .awake);
+                // Cross the real inference-only default in logical time.
+                // Keep real HTTP framing and the unchanged production budget.
+                _ = TestClock.offset_ns.fetchAdd(self.delay, .monotonic);
                 self.loaded = true;
                 _ = self.activations.fetchAdd(1, .monotonic);
                 break :loading "{\"state\":\"loaded\"}";

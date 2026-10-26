@@ -51,6 +51,7 @@ pub const CatalogProjectionReader = struct {
                 metadata_group_id: u64,
                 deadline_ns: ?u64,
             ) anyerror!metadata_storage.CatalogProjectionSnapshot,
+            execution_indexes: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, u64) anyerror![]u8 = null,
         };
 
         fn ensureListenerRegistered(self: Source) !void {
@@ -493,6 +494,12 @@ pub const CatalogProjectionReader = struct {
         // full admin records) continued to pass.
         tables[0] = try metadata_table_manager.cloneTable(alloc, table);
         errdefer metadata_table_manager.freeTable(alloc, tables[0]);
+        if (std.mem.indexOf(u8, table.indexes_json, "\"projection_only\"") != null) {
+            const materialize = source.vtable.execution_indexes orelse return error.CatalogRoutingUnavailable;
+            const indexes = try materialize(source.ptr, alloc, metadata_group_id, table.name, snapshot.catalog_revision);
+            alloc.free(tables[0].indexes_json);
+            tables[0].indexes_json = indexes;
+        }
         const span = snapshot.table_range_spans.get(table.table_id) orelse Snapshot.RangeSpan{ .start = 0, .len = 0 };
         const table_ranges = snapshot.ranges[span.start..][0..span.len];
         const ranges = try alloc.alloc(metadata_table_manager.RangeRecord, table_ranges.len);
@@ -742,6 +749,49 @@ fn freeTables(alloc: std.mem.Allocator, records: []metadata_table_manager.TableR
 fn freeRanges(alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
     for (records) |record| metadata_table_manager.freeRange(alloc, record);
     if (records.len > 0) alloc.free(records);
+}
+
+test "catalog projection point reads materialize namespace execution at the routing revision" {
+    const Fixture = struct {
+        calls: usize = 0,
+        changed: bool = false,
+        fn listen(_: *anyopaque) !void {}
+        fn epoch(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn capture(_: *anyopaque, a: std.mem.Allocator, _: u64, _: ?u64) !metadata_storage.CatalogProjectionSnapshot {
+            const tables = try a.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer a.free(tables);
+            tables[0] = try metadata_table_manager.cloneTable(a, .{ .table_id = 7, .name = "docs", .indexes_json = "{\"projection_only\":true}" });
+            return .{ .metadata_incarnation = null, .catalog_revision = 9, .tables = tables, .ranges = &.{} };
+        }
+        fn execution(ptr: *anyopaque, a: std.mem.Allocator, group: u64, name: []const u8, revision: u64) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u64, 1), group);
+            try std.testing.expectEqualStrings("docs", name);
+            try std.testing.expectEqual(@as(u64, 9), revision);
+            if (self.changed) return error.CatalogGenerationChanged;
+            return a.dupe(u8, "{\"projection_only\":false}");
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{};
+    var reader: CatalogProjectionReader = .{};
+    defer reader.deinit(a);
+    const source: CatalogProjectionReader.Source = .{ .ptr = &fixture, .vtable = &.{ .ensure_listener_registered = Fixture.listen, .catalog_epoch = Fixture.epoch, .capture_projection = Fixture.capture, .execution_indexes = Fixture.execution } };
+    var point = try reader.tableRoutingSnapshot(a, 1, source, "docs", null);
+    defer reader.freeRoutingSnapshot(a, &point);
+    try std.testing.expectEqualStrings("{\"projection_only\":false}", point.tables[0].indexes_json);
+    fixture.changed = true;
+    try std.testing.expectError(error.CatalogGenerationChanged, reader.tableRoutingSnapshot(a, 1, source, "docs", null));
+    // The cached routing view stays compact. Hydration is a point-read cost,
+    // and a failed refresh must not mutate a previously returned definition.
+    var compact = try reader.routingSnapshot(a, 1, source, null);
+    defer reader.freeRoutingSnapshot(a, &compact);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqualStrings("", compact.tables[0].indexes_json);
+    try std.testing.expectEqualStrings("{\"projection_only\":false}", point.tables[0].indexes_json);
 }
 
 test "catalog projection point reads retain restore admission identity" {

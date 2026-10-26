@@ -43,7 +43,7 @@ pub fn compactRoutes(a: A, group: corpus.FileGroup) ![]const corpus.SegmentRouti
         const sources = if (group.parts.len != 0) group.parts[i] else group.sources;
         const live: []corpus.text_directory.Interval = if (group.parts.len != 0 or group.masked) try a.alloc(corpus.text_directory.Interval, sources.len) else &.{};
         for (live, sources[0..live.len]) |*interval, span| interval.* = .{ .lower = span.pack_lower, .count = span.count };
-        out.* = .{ .ref = ref, .summary = summary, .bytes = metadata.bytes, .doc_count = metadata.doc_count, .fields = fields, .live = live, .descriptor = if (group.descriptors.len == group.segments.len) group.descriptors[i] else null };
+        out.* = .{ .ref = ref, .summary = summary, .bytes = metadata.bytes, .doc_count = metadata.doc_count, .fields = fields, .live = live, .sort_bound = if (group.sort_bounds.len == group.segments.len) group.sort_bounds[i] else null, .descriptor = if (group.descriptors.len == group.segments.len) group.descriptors[i] else null };
     }
     return segments;
 }

@@ -1,0 +1,273 @@
+{
+  "experiment": "native_interval_pruning_metadata_points_shared_scan_keys_v3",
+  "scope": "Deterministic operation checks and identical-source local Debug real-Parquet controls during concurrent native/E2E validation.",
+  "timing_attribution_qualified": false,
+  "remote_transport_qualified": false,
+  "archive_throughput_qualified": false,
+  "candidate_production_source": {
+    "source_commit": "80fe9777a520813b36ae59ac630cba6943e1031c",
+    "source_tree": "12870dcb1c4e22653d2f3738c0299987f3e47a40",
+    "source_clean": true,
+    "binary_sha256": "7528116f6130751a411f1c7b44ceba37a086744ea03255afda7d2a362e986e05",
+    "build_mode": "Debug",
+    "zig_version": "0.17.0"
+  },
+  "baseline_binary_source": {
+    "source_commit": "f83dc3694c13077fc057ba8808cacde0454ad6c3",
+    "source_tree": "214a39e30a1a64833c18461551dc836050ae6465",
+    "source_clean": true,
+    "binary_sha256": "eabca4cecdd1e7276ea4889fd6321e24ed130cc223d2a9f3a16930a750f8d59f"
+  },
+  "collector_git_head_note": "Both collector checkout and frozen executable identify the clean source revision in candidate_production_source. Subsequent documentation-only updates do not reattribute the executable.",
+  "reader_protocol": 89,
+  "native_text_metadata_version": 17,
+  "ordered_directory_format": 2,
+  "rows": 16384,
+  "files": 8,
+  "limit": 20,
+  "conclusions": {
+    "answers": "All 48 baseline/candidate control samples preserve full normalized answers and independently expected IDs; each retains 21 decorated candidates.",
+    "timing": "Warm/restarted observations are retained below. Sequential local Debug runs overlap native/E2E work and include main changes, so no causal latency or archive-throughput gain is claimed.",
+    "capture": "The same documented 8,193-row, 129-block, 16-fragment scenario drops ordering payload decodes from 144 to zero by capturing compact keys during verified source scanning. This shifts work into quota-bound narrow private key writes.",
+    "compatibility": "Old nullable witnesses rebuild through existing owner reconciliation; historical directories retain conservative reading and metadata-only migration. Ordinary text indexing survives invalid exact-sort projections."
+  },
+  "deterministic_work": {
+    "layout_publication": {
+      "layouts": 40,
+      "endpoint_records": 80,
+      "root_aggregate_bytes": 52,
+      "aggregate_limit_bytes": 256,
+      "maximum_query_cohorts": 32,
+      "excess_query_cohorts": "optional fan-in declines to exact routing"
+    },
+    "cursor_pruning": {
+      "singleton_ranges": 512,
+      "excluded_records": [
+        255,
+        256
+      ],
+      "excluded_subtrees_per_direction": 3,
+      "overlapping_range": [
+        0,
+        1000
+      ],
+      "overlap_cursor": 600,
+      "overlapping_range_retained": true,
+      "equal_primary_public_ties_retained": true,
+      "zero_limit_and_count_only_not_pruned": true
+    },
+    "metadata_membership": {
+      "first_segment_point_probes": 5,
+      "additional_segment_base_probes": 2,
+      "segment_bitmap_materializations": 0,
+      "probe_setup": "uses caller-owned segment base, no prefix walk",
+      "fallback": "adaptive complete compressed bitmap with authenticated admitted-window lineage"
+    },
+    "capture_ordering": {
+      "rows": 8193,
+      "payload_blocks": 129,
+      "fragments": 16,
+      "previous_documented_payload_decodes": 144,
+      "previous_observation": "native-endpoint-lineage-v3-observation.json",
+      "ordering_payload_decodes": 0,
+      "ordering_rows_fetched": 0,
+      "captured_keys": 8193
+    },
+    "nullable_projection": {
+      "conflicted_keyword_arrays_reject_exact_sort": true,
+      "unsupported_virtual_scalars_not_null": true,
+      "literal_dotted_scalar_names_preserved": true,
+      "ambiguous_duplicate_projections_not_certified": true,
+      "public_error_status": 422,
+      "public_error": "unsupported_exact_sort",
+      "exact_historical_witness_rebuild": true,
+      "unaffected_projection_witness_unchanged": true,
+      "selected_source_free_columns_not_certified": true,
+      "selected_nullable_historical_witness_rebuild": true
+    },
+    "real_parquet_features": {
+      "domains": [
+        "signed integer",
+        "signed timestamp nanoseconds including pre-epoch"
+      ],
+      "rows_per_domain": 4096,
+      "verified_feature_samples": 48,
+      "broad_indexed_metadata_top_k": true,
+      "native_ordering_candidates_upper_bound": 127,
+      "exact_zero_limit_count": 4096,
+      "process_restart_and_cursor_replay": true,
+      "observed_native_ordering_candidates": [
+        21,
+        22
+      ],
+      "feature_reports": [
+        {
+          "kind": "integer",
+          "samples": 24,
+          "sha256": "eb9259d057114960fb5371f058c5f7322b747a15fffb24e4738a77574c32bb0f"
+        },
+        {
+          "kind": "datetime",
+          "samples": 24,
+          "sha256": "48a92b13b1cb8a1c7b8db9f6527788bf20642dd4b46cd817ab2e53638a21859e"
+        }
+      ]
+    }
+  },
+  "oracle": {
+    "plan_observation": "native-compound-null-cohorts-v3-observation.json",
+    "derivation": "Same imported plan and immutable Parquet bytes as the previous observation; independent expected application IDs plus full normalized-answer comparison. Restarted is not empty-cache.",
+    "source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+    "workload_sha256": "aa54cf3375f34270cfef94eccec477646926b9c33f4d6edcc13d31e3e8f1f204",
+    "collector_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
+    "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f"
+  },
+  "reports": {
+    "baseline_sha256": "df120b879ecbdd05f19346c149a59a72a13450a7385d1e84d1c2cfb1dca29cb9",
+    "candidate_sha256": "2b9de6b4dd4efa719cb99525141f66098d837c1119b2d8c2988b15d048322f93",
+    "comparison_sha256": "310f717ef77ae33a430c7ea2052c287502baf89fe5508f23f818fe132354c9ae"
+  },
+  "initial_publication_ns": {
+    "baseline": 7915665875,
+    "candidate": 7801519500,
+    "scope": "one local readiness interval per build; not causal publication-cost qualification"
+  },
+  "comparison": {
+    "version": 3,
+    "timing_qualified": true,
+    "environment_scope": "same declared platform and collector; sequential runs are observational, not randomized paired trials",
+    "comparisons": [
+      {
+        "case": "complete_forward",
+        "cache_mode": "process_restarted",
+        "baseline_median_ns": 146424333,
+        "candidate_median_ns": 142956875,
+        "candidate_over_baseline": 0.9763191135724688,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "complete_forward",
+        "cache_mode": "warm",
+        "baseline_median_ns": 27490334,
+        "candidate_median_ns": 26849084,
+        "candidate_over_baseline": 0.9766736191710148,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "complete_reverse",
+        "cache_mode": "process_restarted",
+        "baseline_median_ns": 145486875,
+        "candidate_median_ns": 130318834,
+        "candidate_over_baseline": 0.8957428908965156,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "complete_reverse",
+        "cache_mode": "warm",
+        "baseline_median_ns": 28174917,
+        "candidate_median_ns": 24117125,
+        "candidate_over_baseline": 0.8559785641959478,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "wide_forward",
+        "cache_mode": "process_restarted",
+        "baseline_median_ns": 204771583,
+        "candidate_median_ns": 190875125,
+        "candidate_over_baseline": 0.9321367848194053,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "wide_forward",
+        "cache_mode": "warm",
+        "baseline_median_ns": 28200875,
+        "candidate_median_ns": 26745583,
+        "candidate_over_baseline": 0.948395501912618,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "public_id_only",
+        "cache_mode": "process_restarted",
+        "baseline_median_ns": 202721083,
+        "candidate_median_ns": 188808541,
+        "candidate_over_baseline": 0.9313710158109209,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "public_id_only",
+        "cache_mode": "warm",
+        "baseline_median_ns": 26329542,
+        "candidate_median_ns": 24632417,
+        "candidate_over_baseline": 0.9355429350043385,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      }
+    ]
+  },
+  "validation": {
+    "full_lake_integration": {
+      "source_commit": "d5d13b944fefeaebf9dfd19008f660d85697dd75",
+      "server_passed": 516,
+      "embedded_passed": 237,
+      "failures": 0,
+      "leaks": 0
+    },
+    "deferred_lineage_frontier": {
+      "source_commit": "a71922e86a7fea0d251302b46917cc85683d43b5",
+      "server_passed": 90,
+      "embedded_passed": 26,
+      "failures": 0,
+      "leaks": 0
+    },
+    "final_projection_upgrade_and_membership": {
+      "source_commit": "80fe9777a520813b36ae59ac630cba6943e1031c",
+      "embedded_top_k_passed": 79,
+      "embedded_top_k_declared_skips": 1,
+      "server_top_k_passed": 32,
+      "logical_query_passed": 83,
+      "logical_query_declared_skips": 1,
+      "failures": 0,
+      "leaks": 0
+    },
+    "shared_query_contracts_passed": 171,
+    "reader_and_composed_contracts_passed": 67,
+    "stable_runtime_failure_contracts_passed": 8,
+    "collector_tooling_tests_passed": 18,
+    "embedded_boundary_sources": 1014,
+    "apache_boundary_sources": 2486,
+    "main_merged": "9d152a4c78311bcbcf1438d9ae1ac893ea1cde42",
+    "final_e2e": {
+      "source_commit": "80fe9777a520813b36ae59ac630cba6943e1031c",
+      "binary_sha256": "7528116f6130751a411f1c7b44ceba37a086744ea03255afda7d2a362e986e05",
+      "passed": 37,
+      "failed": 0,
+      "skipped": 0,
+      "duration_seconds": 849.51,
+      "full_lake_dependencies_required": true,
+      "log_sha256": "3a52023ba9b05fb33dc2857826d98737c60b453929834afc8438625caaf1382b",
+      "coverage": [
+        "archive qualification matrix",
+        "schema indexing and exact-sort rejection",
+        "nullable signed integer/timestamp metadata predicates and cursors",
+        "real Parquet snapshot refresh and cold navigation",
+        "real Iceberg snapshots, schema IDs, partition/delete evolution, restart",
+        "ordered logical identity reuse after Parquet/Iceberg rewrites, updates and deletes"
+      ]
+    }
+  }
+}

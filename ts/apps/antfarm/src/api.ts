@@ -46,7 +46,7 @@ export interface JSONSchemaProperty {
 
 export interface JSONSchema {
   type: "object";
-  properties: {
+  properties?: {
     [key: string]: JSONSchemaProperty;
   };
   required?: string[];

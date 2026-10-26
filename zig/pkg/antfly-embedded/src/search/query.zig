@@ -138,6 +138,331 @@ pub const Filter = union(enum) {
     }
 };
 
+/// Exact header-only counts for unmasked segments. Unsupported Boolean,
+/// synonym, positional and predicate cases retain ordinary bitmap execution.
+pub fn exactSegmentCardinality(a: Allocator, input: Filter, seg: *const index_mod.SegmentEntry) !?u32 {
+    var filter = input;
+    for (0..32) |_| {
+        if (filter != .bool_filter) break;
+        const boolean = filter.bool_filter;
+        try boolean.control.check();
+        if (boolean.should.len != 0 or boolean.must_not.len != 0) return null;
+        if (boolean.must.len == 0) return 0;
+        var child: ?Filter = null;
+        for (boolean.must) |required| {
+            if (required == .match_all) continue;
+            if (child != null) return null;
+            child = required;
+        }
+        filter = child orelse .{ .match_all = {} };
+    }
+    return switch (filter) {
+        .match_all => seg.reader.doc_count,
+        .match_none => 0,
+        .term => |term| blk: {
+            if (try seg.reader.getSection(term.field, .synonym) != null) break :blk null;
+            var inverted_reader = (try seg.reader.invertedIndexScoped(a, term.field)) orelse break :blk 0;
+            defer inverted_reader.deinit();
+            const found = (try inverted_reader.lookup(term.term)) orelse break :blk 0;
+            break :blk found.docFreq();
+        },
+        else => null,
+    };
+}
+
+/// Header-count-compatible term membership, retaining a single chunk rather
+/// than expanding all postings. The lease keeps borrowed segment bytes valid.
+pub const ExactTermProbe = struct {
+    lease: index_mod.IndexSnapshot.SegmentLease,
+    reader: inverted.ScopedInvertedIndexReader,
+    postings: inverted.PostingsIterator,
+    pub fn init(a: Allocator, input: Filter, snapshot: *const index_mod.IndexSnapshot, ordinal: usize) !?ExactTermProbe {
+        var filter = input;
+        for (0..32) |_| {
+            if (filter != .bool_filter) break;
+            const boolean = filter.bool_filter;
+            try boolean.control.check();
+            if (boolean.should.len != 0 or boolean.must_not.len != 0) return null;
+            var child: ?Filter = null;
+            for (boolean.must) |required| {
+                if (required == .match_all) continue;
+                if (child != null) return null;
+                child = required;
+            }
+            filter = child orelse return null;
+        }
+        if (filter != .term) return null;
+        var lease = try snapshot.leaseSegment(ordinal);
+        errdefer lease.deinit();
+        if (try lease.entry.reader.getSection(filter.term.field, .synonym) != null) {
+            lease.deinit();
+            return null;
+        }
+        var reader = (try lease.entry.reader.invertedIndexScoped(a, filter.term.field)) orelse {
+            lease.deinit();
+            return null;
+        };
+        errdefer reader.deinit();
+        const found = (try reader.lookup(filter.term.term)) orelse {
+            reader.deinit();
+            lease.deinit();
+            return null;
+        };
+        return .{ .lease = lease, .reader = reader, .postings = try found.iterator(a) };
+    }
+    pub fn contains(self: *@This(), doc: u32) !bool {
+        return self.postings.containsDoc(doc);
+    }
+    pub fn deinit(self: *@This()) void {
+        self.postings.deinit();
+        self.reader.deinit();
+        self.lease.deinit();
+    }
+};
+
+/// Immutable bounded Boolean program. Segment cursors are separate owners;
+/// missing terms are false and unsupported leaves decline before execution.
+pub const PredicateProbePlan = struct {
+    const Boolean = struct { start: u8, must: u8, should: u8, excluded: u8, minimum: u32, control: ExecutionControl };
+    const Node = union(enum) { constant: bool, term: u8, doc_num: DocNumFilter, boolean: Boolean };
+    nodes: [128]Node = undefined,
+    children: [128]u8 = undefined,
+    terms: [32]Filter = undefined,
+    node_count: usize = 0,
+    child_count: usize = 0,
+    term_count: usize = 0,
+    has_batch_producer: bool = false,
+    control: ExecutionControl = .{},
+    pub fn compile(filter: Filter) !?PredicateProbePlan {
+        var self: PredicateProbePlan = .{};
+        _ = self.append(filter, 0) catch |err| switch (err) {
+            error.UnsupportedPredicateProbe => return null,
+            else => return err,
+        };
+        return self;
+    }
+    fn append(self: *@This(), filter: Filter, depth: usize) anyerror!u8 {
+        if (depth == 32 or self.node_count == self.nodes.len) return error.UnsupportedPredicateProbe;
+        const index: u8 = @intCast(self.node_count);
+        self.node_count += 1;
+        self.nodes[index] = switch (filter) {
+            .match_all => .{ .constant = true },
+            .match_none => .{ .constant = false },
+            .term => |term| value: {
+                for (self.terms[0..self.term_count], 0..) |existing, i| {
+                    if (std.mem.eql(u8, existing.term.field, term.field) and std.mem.eql(u8, existing.term.term, term.term)) break :value .{ .term = @intCast(i) };
+                }
+                if (self.term_count == self.terms.len) return error.UnsupportedPredicateProbe;
+                const i: u8 = @intCast(self.term_count);
+                self.terms[i] = filter;
+                self.term_count += 1;
+                break :value .{ .term = i };
+            },
+            .doc_num => |filter_| value: {
+                if (filter_.producer) |producer| {
+                    self.has_batch_producer = self.has_batch_producer or producer.contains_many != null;
+                    if ((producer.contains == null and producer.contains_many == null) or filter_.bitmap != null or filter_.doc_nums.len != 0) return error.UnsupportedPredicateProbe;
+                }
+                if (filter_.bitmap == null and filter_.producer == null and filter_.doc_nums.len > 128) return error.UnsupportedPredicateProbe;
+                break :value .{ .doc_num = filter_ };
+            },
+            .bool_filter => |b| value: {
+                try b.control.check();
+                // Preserve the query control on every point evaluation.
+                self.control = b.control;
+                const count = b.must.len + b.should.len + b.must_not.len;
+                if (count > self.children.len - self.child_count) return error.UnsupportedPredicateProbe;
+                const start = self.child_count;
+                self.child_count += count;
+                var next = start;
+                for (b.must) |child| {
+                    self.children[next] = try self.append(child, depth + 1);
+                    next += 1;
+                }
+                for (b.should) |child| {
+                    self.children[next] = try self.append(child, depth + 1);
+                    next += 1;
+                }
+                for (b.must_not) |child| {
+                    self.children[next] = try self.append(child, depth + 1);
+                    next += 1;
+                }
+                break :value .{ .boolean = .{ .start = @intCast(start), .must = @intCast(b.must.len), .should = @intCast(b.should.len), .excluded = @intCast(b.must_not.len), .minimum = b.min_should_match, .control = b.control } };
+            },
+            else => return error.UnsupportedPredicateProbe,
+        };
+        return index;
+    }
+};
+/// All mutable posting chunks and segment leases belong to a bounded query LRU.
+pub const ExactPredicateProbe = struct {
+    a: Allocator,
+    plan: *const PredicateProbePlan,
+    terms: [32]?ExactTermProbe = @splat(null),
+    opened: [32]bool = @splat(false),
+    snapshot: *const index_mod.IndexSnapshot,
+    ordinal: usize,
+    offset: u32,
+    pub fn create(a: Allocator, plan: *const PredicateProbePlan, snapshot: *const index_mod.IndexSnapshot, ordinal: usize, offset: u32) !?*ExactPredicateProbe {
+        var lease = try snapshot.leaseSegment(ordinal);
+        defer lease.deinit();
+        for (plan.terms[0..plan.term_count]) |term| if (try lease.entry.reader.getSection(term.term.field, .synonym) != null) return null;
+        const self = try a.create(ExactPredicateProbe);
+        self.* = .{ .a = a, .plan = plan, .snapshot = snapshot, .ordinal = ordinal, .offset = offset };
+        return self;
+    }
+    pub fn destroy(self: *@This()) void {
+        for (&self.terms) |*term| if (term.*) |*probe| probe.deinit();
+        self.a.destroy(self);
+    }
+    pub fn contains(self: *@This(), doc: u32) !bool {
+        try self.plan.control.check();
+        return self.evaluate(0, doc);
+    }
+    /// Evaluate at most 64 candidates with masks through the Boolean program.
+    /// Only surviving candidates reach a producer; no partial result escapes.
+    pub fn containsMany(self: *@This(), docs: []const u32, allowed: []bool) !void {
+        if (docs.len != allowed.len or docs.len > 64) return error.InvalidQueryRequest;
+        try self.plan.control.check();
+        const active = @as(u64, std.math.maxInt(u64)) >> @as(u6, @intCast(64 - @max(1, docs.len)));
+        const result = if (docs.len == 0) 0 else try self.evaluateMany(0, docs, active);
+        for (allowed, 0..) |*keep, i| keep.* = result & (@as(u64, 1) << @as(u6, @intCast(i))) != 0;
+    }
+    fn evaluateMany(self: *@This(), index: u8, docs: []const u32, active: u64) anyerror!u64 {
+        if (active == 0) return 0;
+        try self.plan.control.check();
+        return switch (self.plan.nodes[index]) {
+            .constant => |value| if (value) active else 0,
+            .term => blk: {
+                var result: u64 = 0;
+                var remaining = active;
+                while (remaining != 0) {
+                    const i: u6 = @intCast(@ctz(remaining));
+                    remaining &= remaining - 1;
+                    if (try self.evaluate(index, docs[i])) result |= @as(u64, 1) << i;
+                }
+                break :blk result;
+            },
+            .doc_num => |filter_| blk: {
+                var globals: [64]u32 = undefined;
+                var positions: [64]u6 = undefined;
+                var allowed: [64]bool = undefined;
+                var count: usize = 0;
+                var remaining = active;
+                while (remaining != 0) {
+                    const i: u6 = @intCast(@ctz(remaining));
+                    remaining &= remaining - 1;
+                    globals[count] = try std.math.add(u32, self.offset, docs[i]);
+                    positions[count] = i;
+                    count += 1;
+                }
+                if (filter_.producer) |producer| {
+                    if (producer.contains_many) |check| {
+                        try check(producer.ptr, self.a, globals[0..count], allowed[0..count]);
+                    } else for (globals[0..count], allowed[0..count]) |doc, *keep| {
+                        keep.* = try producer.contains.?(producer.ptr, self.a, doc);
+                    }
+                } else for (globals[0..count], allowed[0..count]) |doc, *keep| {
+                    keep.* = if (filter_.bitmap) |bitmap| bitmap.contains(doc) else std.mem.indexOfScalar(u32, filter_.doc_nums, doc) != null;
+                }
+                var result: u64 = 0;
+                for (positions[0..count], allowed[0..count]) |i, keep| if (keep) {
+                    result |= @as(u64, 1) << i;
+                };
+                break :blk result;
+            },
+            .boolean => |b| blk: {
+                try b.control.check();
+                if (b.must == 0 and b.should == 0) break :blk 0;
+                var live = active;
+                var at: usize = b.start;
+                for (0..b.must) |_| {
+                    live &= try self.evaluateMany(self.plan.children[at], docs, live);
+                    at += 1;
+                    if (live == 0) break :blk 0;
+                }
+                const required = if (b.must == 0 and b.minimum == 0) 1 else b.minimum;
+                if (b.should != 0 and required != 0) {
+                    var counts: [64]u32 = @splat(0);
+                    var pending = live;
+                    var satisfied: u64 = 0;
+                    for (0..b.should) |child| {
+                        const matches = try self.evaluateMany(self.plan.children[at + child], docs, pending);
+                        var left = pending;
+                        while (left != 0) {
+                            const i: u6 = @intCast(@ctz(left));
+                            const bit = @as(u64, 1) << i;
+                            left &= left - 1;
+                            if (matches & bit != 0) counts[i] += 1;
+                            if (counts[i] >= required) {
+                                satisfied |= bit;
+                                pending &= ~bit;
+                            } else if (counts[i] + b.should - child - 1 < required) pending &= ~bit;
+                        }
+                        if (pending == 0) break;
+                    }
+                    live = satisfied;
+                }
+                at += b.should;
+                for (0..b.excluded) |_| {
+                    live &= ~try self.evaluateMany(self.plan.children[at], docs, live);
+                    at += 1;
+                    if (live == 0) break;
+                }
+                break :blk live;
+            },
+        };
+    }
+    fn evaluate(self: *@This(), index: u8, doc: u32) anyerror!bool {
+        return switch (self.plan.nodes[index]) {
+            .constant => |value| value,
+            .term => |i| value: {
+                if (!self.opened[i]) {
+                    self.terms[i] = try ExactTermProbe.init(self.a, self.plan.terms[i], self.snapshot, self.ordinal);
+                    self.opened[i] = true;
+                }
+                break :value if (self.terms[i]) |*term| try term.contains(doc) else false;
+            },
+            .doc_num => |filter_| value: {
+                const global = try std.math.add(u32, self.offset, doc);
+                if (filter_.producer) |producer| {
+                    if (producer.contains) |check| break :value try check(producer.ptr, self.a, global);
+                    var allowed: [1]bool = undefined;
+                    try producer.contains_many.?(producer.ptr, self.a, &.{global}, &allowed);
+                    break :value allowed[0];
+                }
+                if (filter_.bitmap) |bitmap| break :value bitmap.contains(global);
+                break :value std.mem.indexOfScalar(u32, filter_.doc_nums, global) != null;
+            },
+            .boolean => |b| value: {
+                try b.control.check();
+                if (b.must == 0 and b.should == 0) break :value false;
+                var at: usize = b.start;
+                for (0..b.must) |_| {
+                    if (!try self.evaluate(self.plan.children[at], doc)) break :value false;
+                    at += 1;
+                }
+                const required = if (b.must == 0 and b.minimum == 0) 1 else b.minimum;
+                var matched: u32 = 0;
+                if (b.should != 0 and required != 0) {
+                    for (0..b.should) |i| {
+                        if (try self.evaluate(self.plan.children[at + i], doc)) matched += 1;
+                        if (matched >= required) break;
+                        if (matched + b.should - i - 1 < required) break :value false;
+                    }
+                    if (matched < required) break :value false;
+                }
+                at += b.should;
+                for (0..b.excluded) |_| {
+                    if (try self.evaluate(self.plan.children[at], doc)) break :value false;
+                    at += 1;
+                }
+                break :value true;
+            },
+        };
+    }
+};
+
 /// Query-owned immutable programs. Only compilation runs under the lock;
 /// dictionary I/O and private DFA execution never hold it. Full/oversized
 /// caches decline reuse and preserve the ordinary per-consumer execution path.
@@ -2122,6 +2447,11 @@ pub const DocIdFilter = struct {
 /// matching local ordinals in an owned bitmap. Its owner outlives every
 /// synchronous filter pass.
 pub const DocNumProducer = struct {
+    /// Exact candidate-local membership, with the same bounded fallback owner
+    /// as produce(). Never advertises a partial bitmap as complete coverage.
+    contains: ?*const fn (*anyopaque, Allocator, u32) anyerror!bool = null,
+    /// Exact arbitrary-order candidate tile. Results preserve duplicates and order.
+    contains_many: ?*const fn (*anyopaque, Allocator, []const u32, []bool) anyerror!void = null,
     ptr: *anyopaque,
     produce: *const fn (*anyopaque, Allocator, u32, u32, ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap,
     /// Optional complete segment-local membership. The consumer releases its
@@ -4902,4 +5232,101 @@ test "logical value borrowed sparse complement counts exceptions and clips delet
     steps = 0;
     try testing.expectEqual(@as(usize, 123), try program.cardinality(127, &deleted));
     try testing.expectEqual(@as(usize, 0), steps);
+}
+
+test "producer top k probes exact metadata without materializing a segment" {
+    const a = testing.allocator;
+    const bytes = try buildTestSegmentWithTerms(a, &@as([127]TestTermDocument, @splat(.{ .terms = &.{.{ .term = "star", .freq = 1, .norm = 10 }} })));
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const State = struct {
+        points: usize = 0,
+        fn produce(_: *anyopaque, _: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+            return error.TestUnexpectedResult;
+        }
+        fn contains(raw: *anyopaque, _: Allocator, doc: u32) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.points += 1;
+            return doc % 3 == 0;
+        }
+    };
+    var state: State = .{};
+    const leaves = [_]Filter{ .{ .term = .{ .field = "body", .term = "star" } }, .{ .doc_num = .{ .doc_nums = &.{}, .producer = .{ .ptr = &state, .produce = State.produce, .contains = State.contains } } } };
+    const plan = (try PredicateProbePlan.compile(.{ .bool_filter = .{ .must = &leaves, .should = &.{}, .must_not = &.{} } })).?;
+    const probe = (try ExactPredicateProbe.create(a, &plan, writer.snapshot(), 0, 0)).?;
+    defer probe.destroy();
+    for ([_]u32{ 126, 0, 7, 6, 9 }) |doc| try testing.expectEqual(doc % 3 == 0, try probe.contains(doc));
+    try testing.expectEqual(@as(usize, 5), state.points);
+    // The caller already owns every segment base. Offset membership must use
+    // that base without reopening/walking earlier snapshot segments.
+    const shifted = (try ExactPredicateProbe.create(a, &plan, writer.snapshot(), 1, 127)).?;
+    defer shifted.destroy();
+    try testing.expect(!try shifted.contains(0));
+    try testing.expect(try shifted.contains(2));
+    try testing.expectEqual(@as(usize, 7), state.points);
+}
+
+test "producer top k batches metadata masks with Boolean short circuit and arbitrary order" {
+    const a = testing.allocator;
+    const bytes = try buildTestSegmentWithTerms(a, &@as([127]TestTermDocument, @splat(.{ .terms = &.{.{ .term = "star", .freq = 1, .norm = 10 }} })));
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const State = struct {
+        modulus: u32,
+        points: usize = 0,
+        batches: usize = 0,
+        candidates: usize = 0,
+        fn produce(_: *anyopaque, _: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+            return error.TestUnexpectedResult;
+        }
+        fn contains(raw: *anyopaque, _: Allocator, doc: u32) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.points += 1;
+            return doc % self.modulus == 0;
+        }
+        fn many(raw: *anyopaque, _: Allocator, docs: []const u32, out: []bool) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batches += 1;
+            self.candidates += docs.len;
+            for (docs, out) |doc, *keep| keep.* = doc % self.modulus == 0;
+        }
+        fn filter(self: *@This()) Filter {
+            return .{ .doc_num = .{ .doc_nums = &.{}, .producer = .{ .ptr = self, .produce = produce, .contains = contains, .contains_many = many } } };
+        }
+    };
+    var even: State = .{ .modulus = 2 };
+    var thirds: State = .{ .modulus = 3 };
+    var fifths: State = .{ .modulus = 5 };
+    var docs: [64]u32 = undefined;
+    for (&docs, 0..) |*doc, i| doc.* = @intCast((63 - i) * 3 % 127);
+    docs[63] = docs[0];
+    var allowed: [64]bool = undefined;
+    const must = [_]Filter{ .{ .term = .{ .field = "body", .term = "star" } }, even.filter() };
+    const simple = (try PredicateProbePlan.compile(.{ .bool_filter = .{ .must = &must, .should = &.{}, .must_not = &.{} } })).?;
+    const probe = (try ExactPredicateProbe.create(a, &simple, writer.snapshot(), 0, 0)).?;
+    defer probe.destroy();
+    try probe.containsMany(&docs, &allowed);
+    for (docs, allowed) |doc, keep| try testing.expectEqual(doc % 2 == 0, keep);
+    try testing.expectEqual(@as(usize, 0), even.points);
+    try testing.expectEqual(@as(usize, 1), even.batches);
+    try testing.expectEqual(@as(usize, 64), even.candidates);
+    std.debug.print("METADATA_BATCH candidates=64 point_calls=0 batch_calls={d}\n", .{even.batches});
+    for ([_]u32{ 0, 1, 2, 3 }) |minimum| {
+        const should = [_]Filter{ even.filter(), thirds.filter() };
+        const excluded = [_]Filter{fifths.filter()};
+        const plan = (try PredicateProbePlan.compile(.{ .bool_filter = .{ .must = must[0..1], .should = &should, .must_not = &excluded, .min_should_match = minimum } })).?;
+        const compound = (try ExactPredicateProbe.create(a, &plan, writer.snapshot(), 0, 0)).?;
+        defer compound.destroy();
+        var expected: [64]bool = undefined;
+        for (docs, &expected) |doc, *keep| keep.* = try compound.contains(doc);
+        try compound.containsMany(&docs, &allowed);
+        try testing.expectEqualDeep(expected, allowed);
+        try compound.containsMany(&.{}, &.{});
+    }
+    try testing.expectError(error.InvalidQueryRequest, probe.containsMany(&docs, allowed[0..1]));
 }

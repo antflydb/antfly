@@ -32,6 +32,7 @@ const audited_tests = [_][]const u8{
 };
 
 pub fn build(b: *std.Build) void {
+    const measured_memory = b.option(bool, "native-linux-ownership-memory", "Use the qualified Nix glibc stripped Debug audit envelope") orelse false;
     _ = project.create(b) orelse return;
     var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
     var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
@@ -55,5 +56,34 @@ pub fn build(b: *std.Build) void {
     }
     inline for (.{ "cli", "distributed", "storage_kernel", "enrichment_compute", "serverless", "inference", "api_kernel" }) |unit| {
         check.dependOn(&b.top_level_steps.get("runtime-unit-" ++ unit).?.step);
+    }
+    if (measured_memory) {
+        const host = b.graph.host.result;
+        if (host.os.tag != .linux or host.cpu.arch != .x86_64 or
+            !std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0"))
+            @panic("native Linux ownership memory profile requires the qualified host/compiler");
+        var audited_steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+        var audited_modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+        profiles.collectSteps(check, &audited_steps, &audited_modules);
+        var selected = audited_steps.keyIterator();
+        while (selected.next()) |entry| {
+            const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
+            const cap = profiles.native_linux_audit_compile_cap;
+            if (artifact.step.max_rss <= cap) {
+                std.debug.print("storage audit claim artifact={s} bytes={d} authored=true\n", .{ artifact.name, artifact.step.max_rss });
+                continue;
+            }
+            const module = artifact.root_module;
+            const target = module.resolved_target.?.result;
+            const baseline = std.Target.Cpu.baseline(target.cpu.arch, target.os);
+            if (target.os.tag != .linux or target.cpu.arch != .x86_64 or target.abi != .gnu or
+                target.cpu.model != baseline.model or !target.cpu.features.eql(baseline.features) or
+                module.optimize != .debug or module.strip != true)
+                @panic("native Linux ownership memory profile requires baseline GNU stripped Debug artifacts");
+            // Applies only to this audit's transitive graph. Keep smaller
+            // authored reservations and all production build profiles intact.
+            artifact.step.max_rss = cap;
+            std.debug.print("storage audit claim artifact={s} bytes={d} authored=false\n", .{ artifact.name, artifact.step.max_rss });
+        }
     }
 }

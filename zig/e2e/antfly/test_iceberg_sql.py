@@ -1217,6 +1217,10 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 "schema": {
                     "storage_mode": "relational",
                     "default_type": "row",
+                    "index_sort": [
+                        {"field": "id", "order": "asc"},
+                        {"field": "_id", "order": "asc"},
+                    ],
                     "document_schemas": {
                         "row": {
                             "schema": {
@@ -1260,9 +1264,10 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     },
                 },
                 "indexes": {
+                    # Whole-document projection carries the sortable id
+                    # alongside body text in both archive and recent rows.
                     "body_text": {
                         "type": "full_text",
-                        "field": "body",
                         "store_source": True,
                     },
                     **(
@@ -1620,6 +1625,27 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             assert [h["_source"] for h in recent_only["hits"]["hits"]] == [{"id": 1000}]
             counted = call("POST", "/tables/wal_windows/query", dict(pinned, limit=0))
             assert counted["hits"]["total"] == {"value": row_count, "relation": "exact"}
+            # The published ordered index covers archive rows, while this
+            # retained accepted cut also contains id=1000 from the WAL. Field
+            # ordering must include it before and after restart.
+            for descending in (False, True):
+                sorted_request = dict(
+                    pinned,
+                    fields=["id"],
+                    order_by=[{"field": "id", "desc": descending}],
+                    filter_query={"range": {"path": "/id", "gte": 0}},
+                    limit=10,
+                )
+                sorted_request.pop("highlight", None)
+                ordered = call("POST", "/tables/wal_windows/query", sorted_request)
+                expected = (
+                    [1000, *range(row_count - 1, row_count - 10, -1)]
+                    if descending
+                    else [0, *range(2, 11)]
+                )
+                assert [
+                    hit["_source"]["id"] for hit in ordered["hits"]["hits"]
+                ] == expected, ordered
         failed = False
     finally:
         if failed:

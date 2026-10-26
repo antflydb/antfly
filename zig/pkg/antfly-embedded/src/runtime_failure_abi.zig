@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 64;
+pub const abi_version: u32 = 66;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -858,6 +858,7 @@ pub const Status = enum(u32) {
     cypher_variable_type_conflict = 899,
     cypher_write_union_unsupported = 900,
     cypher_invalid_regex = 901,
+    unsupported_exact_sort = 902,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

@@ -3871,3 +3871,51 @@ admission requires observed offset reuse and remains bounded by the existing
 request budget. Matched flags stay fresh, saved matches retain coordinates, and
 borrowed pages keep independent ownership. Publication, reader protocol 81 and
 reclamation semantics remain unchanged.
+
+
+[Archive qualification](../../zig/bench/lake/README.md) now exercises broad refresh
+through immutable generated Parquet files and one atomic manifest-head commit.
+It separates fixture encoding/commit time from readiness/verification, checks
+new publication revisions and exact changed-row results, and reports sampled
+memory, scoped cache counters, and newly retained artifact volume. Retained-file
+ratios exclude temporary spills and reclaimed files; real provider write traces
+remain necessary for cloud amplification claims.
+
+Archive qualification now pins executable/configuration/collector identity across
+restarts and closes its managed server/session on initialization, interruption
+and finalization errors. Publication readiness covers the complete embedded,
+additional and schema-relational index set. Custom logical identity fields drive
+the exact result oracle without altering physical source coordinates. Declared
+native text ordering uses [authenticated coordinate layouts and native merge provenance](lake-row-identity.md#qualification-integrity-and-native-physical-ordering).
+Producer and compactor lineage, exact answers and bounded admission are qualified
+before accepting performance claims.
+
+### Bounded interval summaries and candidate-local metadata probes (protocol 89)
+
+Native text metadata v17 / ordered-directory format 2 replace inline cohort lists
+with interval witnesses bounded by the existing 256-byte page aggregate limit.
+Layout cohorts are discovered by prefix seeks in the authenticated endpoint tree.
+A bounded fan-in serves up to 32 cohorts; greater diversity preserves publication
+and uses ordinary exact routing. Historical directories remain readable and migrate
+from segment descriptors without rebuilding unrelated payloads.
+
+Homogeneous child pages retain the farthest opposite endpoint, with an exact
+compact typed tuple and normalized comparison key. Mixed layouts and oversized
+witnesses withdraw subtree pruning. Both cursor directions skip a child only when
+its entire primary interval is strictly outside the requested cursor. Equal
+primary groups and overlapping intervals stay eligible for public-ID ties. The
+cursor performs the same conservative check at leaves, before segment admission.
+
+Exact metadata predicate producers can expose candidate-local membership to the
+bounded Boolean probe program. Ordered Top-K checks metadata only for reached
+candidates and shares the producer's existing adaptive work budget. Once probing
+loses, the producer materializes complete compressed membership; exact counts,
+unsupported leaves and unproved visibility retain the existing bitmap executor.
+Candidate-local answers never become complete coverage metadata.
+
+Deferred lineage is a compact representation, not an empty row set. When the
+adaptive planner selects complete compressed membership, block translation and
+residual physical selections resolve the admitted window's authenticated inverse
+map through the existing bounded cache. Point probes retain their paged path.
+Segment membership receives its already computed document base, avoiding a prefix
+walk for every newly opened probe in a fragmented snapshot.

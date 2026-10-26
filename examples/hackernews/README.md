@@ -59,7 +59,7 @@ The checker obtains a short-lived token from the current gcloud identity and
 passes it only through the child environment. Configuration contains
 `${secret:HN_GCS_BEARER}` rather than a credential. This authentication is for the
 smoke check; a service needs its own credential flow. Source and artifact
-connections have separate prefix allowlists and capabilities (`lake_read` and
+connections have separate prefix allowlists and capabilities (`lake.read` and
 `storage.primary`). Existing human IAM grants are used. Index artifacts are in
 `<prefix>/indexes` by default; use `--artifact-prefix` to isolate another run
 without copying the source. Catalog state and the configured 1 GiB cache are local.

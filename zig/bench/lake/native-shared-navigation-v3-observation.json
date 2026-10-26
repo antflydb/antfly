@@ -1,0 +1,1082 @@
+{
+  "experiment": "shared_source_navigation_v3",
+  "scope": "Local Debug filesystem measurements on the same verified deterministic 16384-row, eight-file real Parquet source. Each run retains three samples per cache mode. Reference measurement overlapped native builds; candidate measurements preceded final E2Es. Sequential observations are not randomized paired trials.",
+  "report_excerpt_scope": "Preserves complete input/executable/configuration/collector provenance, all timing and sort-work samples, sampled memory and report digests; detailed Prometheus snapshots are omitted.",
+  "timing_attribution_qualified": false,
+  "remote_transport_qualified": false,
+  "total_disk_writes_qualified": false,
+  "conclusion": "Shared source dictionaries and compact query identities reduce source metadata and first-query-after-restart work. Exact answers and sort-work counts agree with the prior compact-page implementation; warm timings show no material change. Wall times and RSS remain observational.",
+  "rows": 16384,
+  "files": 8,
+  "limit": 20,
+  "baseline": {
+    "version": 3,
+    "refresh_workload": null,
+    "binary_sha256": "48f8f5a8e80d62f42a77f04aa367a267042d9b416c17e8cf510e95f85c724bd9",
+    "tool_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
+    "server_config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+    "server_config_origin": "generated",
+    "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f",
+    "runtime_environment_sha256": "f87bd45ed7dd12943a95767ac02aae0d4af6230a0d6a794847b0e28648dfa30c",
+    "input_identity_contract": "identity checked around launches/measurements and content verified before completion",
+    "git_head": "8acdf4315665b6b2498c7c7b28a0d42cd61dc9ea",
+    "platform": {
+      "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+      "machine": "arm64",
+      "cpu_count": 14,
+      "python": "3.13.14"
+    },
+    "cache_contract": {
+      "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+      "warm": "same query immediately after its process-restarted sample",
+      "empty_cache_qualified": false
+    },
+    "complete": true,
+    "answer_contract": {
+      "opaque_continuations": "presence only; token bytes include authority and expiry",
+      "cursor_replay_qualified": false
+    },
+    "started_at_utc": "2026-10-25T01:00:15Z",
+    "transport": {
+      "fixture_backend": "filesystem_object_store",
+      "remote_transport_qualified": false,
+      "cache_counter_scope": "lake serving-cache provider counters; not a complete transport trace or all SQL/provider I/O",
+      "sql_profile_coverage": "retain EXPLAIN ANALYZE coverage fields; unavailable values remain null"
+    },
+    "source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+    "source_identity_assurance": "verified_local_file_bytes",
+    "oracle_coverage": {
+      "ordered_text": "exact_expected_rows_or_ids"
+    },
+    "input": {
+      "manifest_uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-archive-qualification/.benchmark-results/lake/shared-source-baseline/fixture/snapshot.parquet-manifest.json",
+      "files": [
+        {
+          "file_id": "import-0.parquet",
+          "object_uri": "object://antfly/import-0.parquet",
+          "etag": "635b6bf2e60e6e7ee77f1134afac98a0cc5a2c60578f6ba52290fa655d886b29",
+          "row_count": 2048,
+          "byte_len": 31140
+        },
+        {
+          "file_id": "import-1.parquet",
+          "object_uri": "object://antfly/import-1.parquet",
+          "etag": "a53c52121fcba1030ae60b6859ed77e6c865251205210038282ef51080da90d5",
+          "row_count": 2048,
+          "byte_len": 31332
+        },
+        {
+          "file_id": "import-2.parquet",
+          "object_uri": "object://antfly/import-2.parquet",
+          "etag": "98126235211324d423ad96b4b1ad3bac2e7b56bda381f46de28d92d33945a0ed",
+          "row_count": 2048,
+          "byte_len": 31313
+        },
+        {
+          "file_id": "import-3.parquet",
+          "object_uri": "object://antfly/import-3.parquet",
+          "etag": "0409ab1095633fdfd2ec1f2565eee25e0e22e0454315c3853b54f84bf67e2b0b",
+          "row_count": 2048,
+          "byte_len": 31389
+        },
+        {
+          "file_id": "import-4.parquet",
+          "object_uri": "object://antfly/import-4.parquet",
+          "etag": "5ab7e54c091257cab552d5e3317c058478aabc91fb028ae726ed7886960bc692",
+          "row_count": 2048,
+          "byte_len": 31187
+        },
+        {
+          "file_id": "import-5.parquet",
+          "object_uri": "object://antfly/import-5.parquet",
+          "etag": "4d25f877847b26d32cc32b049fff2daf55980bc4cd2155e72512b62ebad13eb1",
+          "row_count": 2048,
+          "byte_len": 31293
+        },
+        {
+          "file_id": "import-6.parquet",
+          "object_uri": "object://antfly/import-6.parquet",
+          "etag": "83b12e657e28cab00ed31d0c2114a09fdadf0629a514188c687b9a4259704bb7",
+          "row_count": 2048,
+          "byte_len": 31381
+        },
+        {
+          "file_id": "import-7.parquet",
+          "object_uri": "object://antfly/import-7.parquet",
+          "etag": "3732d77672e2c7ca3b29e9d112dbf9408b2595e2a31783f1a1fed02621744632",
+          "row_count": 2048,
+          "byte_len": 31320
+        }
+      ],
+      "sha256": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+      "parquet_bytes": 250355
+    },
+    "plan_sha256": "585b6a699077a07a89a163f29cb0069b888c139260143b244eb930ee6ceb4c1f",
+    "workload_sha256": "5aa6d5e73999b3d639d92cbd71e1f008854039138882b0342739d250e74f8818",
+    "profile_scope": "EXPLAIN ANALYZE is a separate execution; its own coverage fields are authoritative",
+    "initial_publication_ns": 8971063875,
+    "initial_index_revisions": {
+      "text": 1,
+      "archive_id": 1
+    },
+    "summary": [
+      {
+        "case": "ordered_text",
+        "cache_mode": "process_restarted",
+        "samples": 3,
+        "median_ns": 922443250,
+        "cache_provider_reads_median": 0,
+        "cache_provider_bytes_median": 0,
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df"
+      },
+      {
+        "case": "ordered_text",
+        "cache_mode": "warm",
+        "samples": 3,
+        "median_ns": 32429750,
+        "cache_provider_reads_median": 0,
+        "cache_provider_bytes_median": 0,
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df"
+      }
+    ],
+    "full_report_sha256": "75195a544c85e31dd77c881844030c8c21b9ef50496beedf8c2350ead0443ffc",
+    "git_head_scope": "Collector checkout at run start; executable identity is binary_sha256, not inferred from the checkout.",
+    "samples": [
+      {
+        "elapsed_ns": 888980833,
+        "memory": {
+          "baseline_bytes": 440532992,
+          "peak_sampled_bytes": 492568576,
+          "samples": 12,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 0,
+        "cache_mode": "process_restarted",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 14219,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        "restart_ns": 947598166,
+        "startup_memory": {
+          "baseline_bytes": 237125632,
+          "peak_sampled_bytes": 439697408,
+          "samples": 4,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        }
+      },
+      {
+        "elapsed_ns": 31407541,
+        "memory": {
+          "baseline_bytes": 493076480,
+          "peak_sampled_bytes": 495960064,
+          "samples": 2,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 0,
+        "cache_mode": "warm",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 4073,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        }
+      },
+      {
+        "elapsed_ns": 1870161541,
+        "memory": {
+          "baseline_bytes": 419430400,
+          "peak_sampled_bytes": 491208704,
+          "samples": 13,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 1,
+        "cache_mode": "process_restarted",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 16242,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        "restart_ns": 745542166,
+        "startup_memory": {
+          "baseline_bytes": 66453504,
+          "peak_sampled_bytes": 419430400,
+          "samples": 6,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        }
+      },
+      {
+        "elapsed_ns": 32429750,
+        "memory": {
+          "baseline_bytes": 491732992,
+          "peak_sampled_bytes": 491913216,
+          "samples": 2,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 1,
+        "cache_mode": "warm",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 3984,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        }
+      },
+      {
+        "elapsed_ns": 922443250,
+        "memory": {
+          "baseline_bytes": 420036608,
+          "peak_sampled_bytes": 491667456,
+          "samples": 11,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 2,
+        "cache_mode": "process_restarted",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 14674,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        "restart_ns": 1030634125,
+        "startup_memory": {
+          "baseline_bytes": 61833216,
+          "peak_sampled_bytes": 419758080,
+          "samples": 7,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        }
+      },
+      {
+        "elapsed_ns": 34285500,
+        "memory": {
+          "baseline_bytes": 492371968,
+          "peak_sampled_bytes": 492617728,
+          "samples": 2,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 2,
+        "cache_mode": "warm",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 4183,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        }
+      }
+    ],
+    "binary_identity_evidence": "Same retained executable SHA256 as native-compaction-v3-observation.json ordering.candidate; the report git_head is the collector checkout."
+  },
+  "candidate": {
+    "version": 3,
+    "refresh_workload": null,
+    "binary_sha256": "8ff9d39f28769cc836fd546b523cd6b8904d991fa3ec017a4cabdbdd8fc8100e",
+    "tool_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
+    "server_config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+    "server_config_origin": "generated",
+    "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f",
+    "runtime_environment_sha256": "f87bd45ed7dd12943a95767ac02aae0d4af6230a0d6a794847b0e28648dfa30c",
+    "input_identity_contract": "identity checked around launches/measurements and content verified before completion",
+    "git_head": "ddd16f113d5de1582ad244f1464403eb4d4847ee",
+    "platform": {
+      "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+      "machine": "arm64",
+      "cpu_count": 14,
+      "python": "3.13.14"
+    },
+    "cache_contract": {
+      "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+      "warm": "same query immediately after its process-restarted sample",
+      "empty_cache_qualified": false
+    },
+    "complete": true,
+    "answer_contract": {
+      "opaque_continuations": "presence only; token bytes include authority and expiry",
+      "cursor_replay_qualified": false
+    },
+    "started_at_utc": "2026-10-25T01:13:42Z",
+    "transport": {
+      "fixture_backend": "filesystem_object_store",
+      "remote_transport_qualified": false,
+      "cache_counter_scope": "lake serving-cache provider counters; not a complete transport trace or all SQL/provider I/O",
+      "sql_profile_coverage": "retain EXPLAIN ANALYZE coverage fields; unavailable values remain null"
+    },
+    "source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+    "source_identity_assurance": "verified_local_file_bytes",
+    "oracle_coverage": {
+      "ordered_text": "exact_expected_rows_or_ids"
+    },
+    "input": {
+      "manifest_uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-archive-qualification/.benchmark-results/lake/shared-source-candidate/fixture/snapshot.parquet-manifest.json",
+      "files": [
+        {
+          "file_id": "import-0.parquet",
+          "object_uri": "object://antfly/import-0.parquet",
+          "etag": "635b6bf2e60e6e7ee77f1134afac98a0cc5a2c60578f6ba52290fa655d886b29",
+          "row_count": 2048,
+          "byte_len": 31140
+        },
+        {
+          "file_id": "import-1.parquet",
+          "object_uri": "object://antfly/import-1.parquet",
+          "etag": "a53c52121fcba1030ae60b6859ed77e6c865251205210038282ef51080da90d5",
+          "row_count": 2048,
+          "byte_len": 31332
+        },
+        {
+          "file_id": "import-2.parquet",
+          "object_uri": "object://antfly/import-2.parquet",
+          "etag": "98126235211324d423ad96b4b1ad3bac2e7b56bda381f46de28d92d33945a0ed",
+          "row_count": 2048,
+          "byte_len": 31313
+        },
+        {
+          "file_id": "import-3.parquet",
+          "object_uri": "object://antfly/import-3.parquet",
+          "etag": "0409ab1095633fdfd2ec1f2565eee25e0e22e0454315c3853b54f84bf67e2b0b",
+          "row_count": 2048,
+          "byte_len": 31389
+        },
+        {
+          "file_id": "import-4.parquet",
+          "object_uri": "object://antfly/import-4.parquet",
+          "etag": "5ab7e54c091257cab552d5e3317c058478aabc91fb028ae726ed7886960bc692",
+          "row_count": 2048,
+          "byte_len": 31187
+        },
+        {
+          "file_id": "import-5.parquet",
+          "object_uri": "object://antfly/import-5.parquet",
+          "etag": "4d25f877847b26d32cc32b049fff2daf55980bc4cd2155e72512b62ebad13eb1",
+          "row_count": 2048,
+          "byte_len": 31293
+        },
+        {
+          "file_id": "import-6.parquet",
+          "object_uri": "object://antfly/import-6.parquet",
+          "etag": "83b12e657e28cab00ed31d0c2114a09fdadf0629a514188c687b9a4259704bb7",
+          "row_count": 2048,
+          "byte_len": 31381
+        },
+        {
+          "file_id": "import-7.parquet",
+          "object_uri": "object://antfly/import-7.parquet",
+          "etag": "3732d77672e2c7ca3b29e9d112dbf9408b2595e2a31783f1a1fed02621744632",
+          "row_count": 2048,
+          "byte_len": 31320
+        }
+      ],
+      "sha256": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+      "parquet_bytes": 250355
+    },
+    "plan_sha256": "ddb8e6b0d0376802f253de0352f09b22728f927a2e491ea78ea85732f667db99",
+    "workload_sha256": "5aa6d5e73999b3d639d92cbd71e1f008854039138882b0342739d250e74f8818",
+    "profile_scope": "EXPLAIN ANALYZE is a separate execution; its own coverage fields are authoritative",
+    "initial_publication_ns": 8547226375,
+    "initial_index_revisions": {
+      "text": 1,
+      "archive_id": 1
+    },
+    "summary": [
+      {
+        "case": "ordered_text",
+        "cache_mode": "process_restarted",
+        "samples": 3,
+        "median_ns": 215119708,
+        "cache_provider_reads_median": 0,
+        "cache_provider_bytes_median": 0,
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df"
+      },
+      {
+        "case": "ordered_text",
+        "cache_mode": "warm",
+        "samples": 3,
+        "median_ns": 31947500,
+        "cache_provider_reads_median": 0,
+        "cache_provider_bytes_median": 0,
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df"
+      }
+    ],
+    "full_report_sha256": "21317496caad43145a9e23aee311d3ffbb3b41ceca634e6e36642dd3d14eaa8b",
+    "git_head_scope": "Collector checkout at run start; executable identity is binary_sha256, not inferred from the checkout.",
+    "samples": [
+      {
+        "elapsed_ns": 217186167,
+        "memory": {
+          "baseline_bytes": 444071936,
+          "peak_sampled_bytes": 453754880,
+          "samples": 3,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 0,
+        "cache_mode": "process_restarted",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 20126,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        "restart_ns": 742426542,
+        "startup_memory": {
+          "baseline_bytes": 68894720,
+          "peak_sampled_bytes": 443252736,
+          "samples": 7,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        }
+      },
+      {
+        "elapsed_ns": 31947500,
+        "memory": {
+          "baseline_bytes": 454410240,
+          "peak_sampled_bytes": 454574080,
+          "samples": 2,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 0,
+        "cache_mode": "warm",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 10149,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        }
+      },
+      {
+        "elapsed_ns": 215119708,
+        "memory": {
+          "baseline_bytes": 418594816,
+          "peak_sampled_bytes": 442843136,
+          "samples": 3,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 1,
+        "cache_mode": "process_restarted",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 19574,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        "restart_ns": 864722208,
+        "startup_memory": {
+          "baseline_bytes": 28164096,
+          "peak_sampled_bytes": 418594816,
+          "samples": 5,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        }
+      },
+      {
+        "elapsed_ns": 32147791,
+        "memory": {
+          "baseline_bytes": 442974208,
+          "peak_sampled_bytes": 443138048,
+          "samples": 2,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 1,
+        "cache_mode": "warm",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 10497,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        }
+      },
+      {
+        "elapsed_ns": 211544167,
+        "memory": {
+          "baseline_bytes": 424214528,
+          "peak_sampled_bytes": 447692800,
+          "samples": 4,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 2,
+        "cache_mode": "process_restarted",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 19595,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        "restart_ns": 691559542,
+        "startup_memory": {
+          "baseline_bytes": 62767104,
+          "peak_sampled_bytes": 424214528,
+          "samples": 5,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        }
+      },
+      {
+        "elapsed_ns": 30771500,
+        "memory": {
+          "baseline_bytes": 447823872,
+          "peak_sampled_bytes": 448102400,
+          "samples": 2,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "metric_scope": "isolated process interval; can include asynchronous background work",
+        "case": "ordered_text",
+        "sample": 2,
+        "cache_mode": "warm",
+        "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+        "profile": {
+          "shards": {
+            "total": 1,
+            "successful": 1,
+            "failed": 0
+          },
+          "sort": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "id",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "sorted_segment_membership",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "caller_selected_doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "accelerated",
+            "index_sort_coverage": "covered_with_bounds",
+            "candidate_count": 21,
+            "ordered_scanned_count": 23,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 10048,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        }
+      }
+    ]
+  },
+  "comparison": {
+    "version": 3,
+    "timing_qualified": true,
+    "environment_scope": "same declared platform and collector; sequential runs are observational, not randomized paired trials",
+    "comparisons": [
+      {
+        "case": "ordered_text",
+        "cache_mode": "process_restarted",
+        "baseline_median_ns": 922443250,
+        "candidate_median_ns": 215119708,
+        "candidate_over_baseline": 0.23320644169709084,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "ordered_text",
+        "cache_mode": "warm",
+        "baseline_median_ns": 32429750,
+        "candidate_median_ns": 31947500,
+        "candidate_over_baseline": 0.9851293950770512,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      }
+    ]
+  },
+  "maximum_interleaving_regression": {
+    "ranges": 65536,
+    "unique_sources": 8,
+    "source_name_bytes": 2048,
+    "historical_page_dictionary_bytes": 6523136,
+    "shared_dictionary_and_range_bytes": 1070237,
+    "shared_pages": 18,
+    "admission_cap_bytes": 4194304,
+    "round_trip_all_coordinates": true,
+    "malformed_source_index_rejected": true
+  },
+  "compact_query_identity_regression": {
+    "ranges": 16384,
+    "unique_sources": 2,
+    "resident_forward_range_bytes": 262144,
+    "allocation_budget_bytes": 2097152,
+    "peak_allocation_bytes": 1191134,
+    "all_original_coordinates_verified": true,
+    "allocation_failure_sweep_passed": true
+  },
+  "publication_admission_regression": {
+    "forced_source_budget_bytes": 1024,
+    "retained_packs": 8,
+    "exact_term_frequency": 8,
+    "rejected_merge_statistics_contributions": 0,
+    "staged_bytes_after_retry": 0
+  },
+  "deferred_membership_regression": {
+    "segments": 4,
+    "exact_matches": 32,
+    "materialized_before_probe": 0,
+    "materialized_after_first_probe": 1,
+    "deletions_and_empty_boolean_filters_verified": true
+  }
+}

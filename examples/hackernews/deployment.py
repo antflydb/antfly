@@ -54,8 +54,8 @@ def candidate(bucket, image, *, foundation_exists=False):
             },
         },
         "connections": {
-            "hn-history": connection(["lake_read"], "archive"),
-            "hn-current": connection(["lake_read", "lake_write"], "current"),
+            "hn-history": connection(["lake.read"], "archive"),
+            "hn-current": connection(["lake.read", "lake.write"], "current"),
             "hn-artifacts": connection(["storage.primary"], "indexes"),
         },
         "lake_cache": {"root": "/data/cache", "max_disk_bytes": 2 * 1024**3},

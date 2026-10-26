@@ -475,6 +475,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const decodeArtifactRepairIssueValueAlloc = materialization.decodeArtifactRepairIssueValueAlloc;
         pub const deferExternalBulkExecutorNotification = commit.deferExternalBulkExecutorNotification;
         pub const deleteDerivedCoverageForDocKeys = materialization.deleteDerivedCoverageForDocKeys;
+        pub const deleteDerivedCoverageForDocKeysWithPlan = materialization.deleteDerivedCoverageForDocKeysWithPlan;
         pub const denseApplyUsesLocalStreamingSession = materialization.denseApplyUsesLocalStreamingSession;
         pub const denseCatchUpBulkRebuildHbcLeafMinMembers = materialization.denseCatchUpBulkRebuildHbcLeafMinMembers;
         pub const denseCatchUpDeferredHbcLeafSplitMembersPerPublish = materialization.denseCatchUpDeferredHbcLeafSplitMembersPerPublish;

@@ -5194,6 +5194,51 @@ fn sqlSessionStatement(handle: ?*anyopaque, session_id: u64, statement: []const 
     try std.testing.expectEqual(capi.ErrorCode.ok, status);
 }
 
+test "capi SQL conflict owner probes leave unrelated namespaces unopened" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-conflict-point-catalog");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE target(id TEXT PRIMARY KEY)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE unrelated(id TEXT PRIMARY KEY)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE plain(body TEXT)");
+    try sqlFkRecoveryStatement(handle, "INSERT INTO target(id) VALUES ('existing')");
+    try sqlRefreshCleanGeneration(handle);
+    const guard = public.enterHandle(handle, .exclusive).?;
+    defer guard.leave();
+    const root = guard.handle;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sql = @import("antfly_local_sources").capi_sql;
+    var adapter = sql.Adapter(antfly){ .handle = root, .db = &root.db, .table_name = "default" };
+    const backend = adapter.backend();
+    const table = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "target" }, .write);
+    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), arena.allocator(), table, .{ .columns = &.{"id"} }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), owners.len);
+    try std.testing.expectEqual(@as(usize, 1), root.embedded_tables.count());
+    try std.testing.expect(root.embedded_tables.contains("target"));
+    try std.testing.expect(!root.embedded_tables_discovered);
+    var selected = sql.Adapter(antfly){ .handle = root, .db = &root.embedded_tables.get("target").?.db, .table_name = "target" };
+    const metadata = try selected.localCatalog(arena.allocator(), table.schema_version);
+    try std.testing.expectEqual(@as(usize, 3), metadata.table.len);
+    try std.testing.expectEqual(@as(usize, 1), root.embedded_tables.count());
+    try std.testing.expect(!root.embedded_tables_discovered);
+    _ = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "plain" }, .write);
+    var plain = sql.Adapter(antfly){ .handle = root, .db = &root.embedded_tables.get("plain").?.db, .table_name = "plain" };
+    try std.testing.expect(try plain.localRequiresCoordination());
+    try std.testing.expectEqual(@as(usize, 2), root.embedded_tables.count());
+    try std.testing.expect(!root.embedded_tables.contains("unrelated"));
+}
+
 test "capi SQL refreshed generations retain complete FK catalogs and unqualified indexes" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-refreshed-integrity");
@@ -5220,11 +5265,12 @@ test "capi SQL refreshed generations retain complete FK catalogs and unqualified
     try sqlSessionStatement(handle, session, "DELETE FROM child WHERE id IN (SELECT id FROM child WHERE parent_id='p' ORDER BY id DESC OFFSET 8)");
     try sqlRefreshCleanGeneration(handle);
     try sqlSessionStatement(handle, session, "COMMIT");
-    // Discovery is cached per generation, independently of durable recovery.
+    // Integrity uses the full schema catalog without constructing every
+    // namespace runtime merely to discover inbound constraints.
     {
         const guard = public.enterHandle(handle, .exclusive).?;
         defer guard.leave();
-        try std.testing.expect(guard.handle.embedded_tables_discovered);
+        try std.testing.expect(!guard.handle.embedded_tables_discovered);
         try std.testing.expectEqual(@as(usize, 2), guard.handle.embedded_tables.count());
         try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_ddl_recovery_scans);
     }
@@ -5256,13 +5302,20 @@ test "capi SQL refreshed generations retain complete FK catalogs and unqualified
             var failing = std.testing.FailingAllocator.init(original_alloc, .{ .fail_index = 0 });
             root.alloc = failing.allocator();
             defer root.alloc = original_alloc;
-            try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(arena.allocator(), view.version()));
+            // Metadata enumeration succeeds even when opening a provider is
+            // unavailable. Referencing that owner still fails closed.
+            const metadata = try adapter.localCatalog(arena.allocator(), view.version());
+            try std.testing.expectEqual(@as(usize, 2), metadata.table.len);
+            const backend = adapter.backend();
+            try std.testing.expectError(error.OutOfMemory, backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "parent" }, .read));
             try std.testing.expectEqual(@as(usize, 1), root.embedded_table_errors.count());
         }
+        const backend = adapter.backend();
+        _ = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "parent" }, .read);
         const recovered = try adapter.localCatalog(arena.allocator(), view.version());
         try std.testing.expectEqual(@as(usize, 2), recovered.table.len);
         try std.testing.expectEqual(@as(usize, 0), root.embedded_table_errors.count());
-        try std.testing.expect(root.embedded_tables_discovered);
+        try std.testing.expect(!root.embedded_tables_discovered);
         try std.testing.expectEqual(@as(u64, 0), root.sql_ddl_recovery_scans);
     }
     try sqlRefreshCleanGeneration(handle);
@@ -6100,6 +6153,11 @@ test "capi SQL missing namespace forces coordinated catalog validation" {
     try guard.handle.embedded_table_errors.put(guard.handle.alloc, "broken", "InvalidSchema");
     try std.testing.expect(try adapter.localRequiresCoordination());
     try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(alloc, 1));
+    // A named namespace with missing declarations is equally unavailable;
+    // metadata-only discovery must not silently discard possible constraints.
+    const name = try guard.handle.alloc.dupe(u8, "broken");
+    try guard.handle.embedded_table_records.putNoClobber(guard.handle.alloc, name, 2);
+    try std.testing.expect(try adapter.localRequiresCoordination());
 }
 
 test "capi SQL maintenance capture queues after bounded foreground contention" {

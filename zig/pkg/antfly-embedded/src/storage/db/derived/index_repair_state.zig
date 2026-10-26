@@ -115,6 +115,10 @@ pub const Trigger = enum(u8) {
     /// Build receiver-local historical projection evidence without claiming
     /// the currently serving index is corrupt or an operator requested it.
     artifact_baseline_adoption = 11,
+    /// An exact historical text-projection witness authorizes a private
+    /// replacement under current physical semantics. The logical schema stays
+    /// immutable and the old posting generation remains unavailable.
+    text_projection_upgrade = 12,
 };
 
 /// Durable scheduler work and its user-visible meaning are separate from the
@@ -1366,4 +1370,26 @@ test "index repair state rejects escaped candidates and corrupt checkpoints" {
     defer alloc.free(raw);
     raw[magic.len] ^= 0xff;
     try std.testing.expectError(error.InvalidIndexRepairState, decode(alloc, raw));
+}
+
+test "index repair state text projection upgrade survives durable reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const path = try checkpointPathAlloc(a, root);
+    defer a.free(path);
+    var initial = try loadOrCreate(a, path, 8);
+    const identity = initial.identity;
+    initial.deinit(a);
+    var detected = try testEntry(a, identity, .detected);
+    defer detected.deinit(a);
+    detected.intent.kind = .full_text;
+    detected.intent.trigger = .text_projection_upgrade;
+    try putEntry(a, path, identity, null, detected);
+    var reopened = try loadOrCreate(a, path, 8);
+    defer reopened.deinit(a);
+    try std.testing.expectEqual(Trigger.text_projection_upgrade, reopened.entries.items[0].intent.trigger);
+    try std.testing.expectEqual(types.IndexKind.full_text, reopened.entries.items[0].intent.kind);
 }

@@ -283,6 +283,9 @@ const Binding = struct {
         return self.owner.navigationFor(a, self.space);
     }
     fn close(_: *anyopaque) void {}
+    fn openPublicRows(raw: *anyopaque, a: A, range: Source.PublicRowsCursor.Range) !?Source.PublicRowsCursor {
+        return PublicRows.openRange(from(raw), a, range);
+    }
     fn capability(self: *Binding) Source.RowResolver {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("native-lake-coordinate-space-v1");
@@ -302,7 +305,7 @@ const Binding = struct {
         };
         var space: [32]u8 = undefined;
         hash.final(&space);
-        return .{ .ptr = self, .source = self.space.source, .snapshot = self.space.snapshot, .current_source = self.owner.reader.root.current.source, .current_snapshot = self.owner.reader.root.current.snapshot, .rows = self.owner.reader.root.current.rows, .relocated = self.relocated, .coordinate_space = space, .from_index = fromIndex, .to_index = toIndex, .file = file, .digest = digest, .tie_rank = tieRank, .tie_ranks = tieRanks, .translate_many = translateMany, .translate_many_bounded = translateManyBounded, .close = close };
+        return .{ .ptr = self, .source = self.space.source, .snapshot = self.space.snapshot, .current_source = self.owner.reader.root.current.source, .current_snapshot = self.owner.reader.root.current.snapshot, .rows = self.owner.reader.root.current.rows, .relocated = self.relocated, .open_public_rows = openPublicRows, .coordinate_space = space, .from_index = fromIndex, .to_index = toIndex, .file = file, .digest = digest, .tie_rank = tieRank, .tie_ranks = tieRanks, .translate_many = translateMany, .translate_many_bounded = translateManyBounded, .close = close };
     }
 };
 fn sameCut(space: identity.Space, ref: RowRef) bool {
@@ -387,6 +390,10 @@ const Owner = struct {
     fn tieRanks(raw: *anyopaque, a: A, refs: []const RowRef, ranks: []u64) !void {
         const self: *Owner = @ptrCast(@alignCast(raw));
         try Binding.tieRanks(&self.default_binding, a, refs, ranks);
+    }
+    fn openPublicRows(raw: *anyopaque, a: A, range: Source.PublicRowsCursor.Range) !?Source.PublicRowsCursor {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        return PublicRows.openRange(&self.default_binding, a, range);
     }
     fn bindIndex(raw: *anyopaque, name: []const u8) !Source.RowResolver {
         const self: *Owner = @ptrCast(@alignCast(raw));
@@ -482,6 +489,177 @@ const Owner = struct {
 
 /// Mutable cursor/cache state belongs to one synchronous operation, while
 /// authenticated decoded pages and publication authority remain shared.
+/// Reuse authenticated public-file and canonical row maps. No shadow row
+/// index, archive-sized permutation or publication-format change is required.
+const PublicRows = struct {
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    a: A,
+    binding: *Binding,
+    lane: ReadLane = undefined,
+    allowance: Source.TranslationAllowance = .{},
+    files: ?tree.Cursor = null,
+    rows: ?tree.Cursor = null,
+    reverse: bool,
+    exhausted: bool = false,
+    cursor: ?local.storage_rowsource_identity.Parts = null,
+    stop: ?local.storage_rowsource_identity.Parts = null,
+    cursor_digest: [32]u8 = @splat(0),
+    stop_digest: [32]u8 = @splat(0),
+    file_digest: [32]u8 = @splat(0),
+    bounds: [2][44]u8 = undefined,
+    file_bounds: [2][32]u8 = undefined,
+    fn open(binding: *Binding, a: A, reverse: bool, cursor: ?[]const u8) !?Source.PublicRowsCursor {
+        return openRange(binding, a, .{ .reverse = reverse, .cursor = cursor });
+    }
+    fn openRange(binding: *Binding, a: A, range: Source.PublicRowsCursor.Range) !?Source.PublicRowsCursor {
+        const owner = binding.owner;
+        if (owner.reader.root.current.by_order == null or owner.reader.root.current.navigation == null) return null;
+        const navigation_ = try owner.navigationFor(a, owner.reader.root.current);
+        // The bound logical reader emits lake3 IDs. Other public domains and
+        // arbitrary lexical cursors decline this optional seek optimization.
+        if (navigation_.root.public == null or navigation_.root.public_identity_version != 2 or owner.identity_version != 2) return null;
+        const parsed = if (range.cursor) |id| local.storage_rowsource_identity.parse(id) catch return null else null;
+        const stop = if (range.stop_at) |id| local.storage_rowsource_identity.parse(id) catch return null else null;
+        for ([_]?local.storage_rowsource_identity.Parts{ parsed, stop }) |value| if (value) |parts| {
+            if (parts.version != owner.identity_version) return null;
+            local.storage_rowsource_identity.validateSnapshot(parts, owner.reader.root.current.source, owner.reader.root.current.snapshot) catch return null;
+        };
+        const self = try a.create(@This());
+        self.* = .{ .a = a, .binding = binding, .reverse = range.reverse, .cursor = parsed, .stop = stop };
+        self.lane.init(owner, a, &self.allowance);
+        errdefer close(self);
+        if (parsed) |parts| _ = std.fmt.hexToBytes(&self.cursor_digest, parts.digest) catch return error.InvalidLogicalRowIdentity;
+        if (stop) |parts| _ = std.fmt.hexToBytes(&self.stop_digest, parts.digest) catch return error.InvalidLogicalRowIdentity;
+        if (range.cursor != null and range.stop_at != null) {
+            const order = std.mem.order(u8, range.cursor.?, range.stop_at.?);
+            self.exhausted = if (range.reverse) order != .gt else order != .lt;
+        }
+        if (!self.exhausted) {
+            var lower: []const u8 = "";
+            var upper: ?[]const u8 = null;
+            if (if (range.reverse) stop != null else parsed != null) {
+                self.file_bounds[0] = if (range.reverse) self.stop_digest else self.cursor_digest;
+                lower = &self.file_bounds[0];
+            }
+            if (if (range.reverse) parsed != null else stop != null) {
+                self.file_bounds[1] = if (range.reverse) self.cursor_digest else self.stop_digest;
+                upper = if (increment(&self.file_bounds[1])) &self.file_bounds[1] else null;
+            }
+            self.files = if (range.reverse) try tree.Cursor.initReverse(a, self.lane.cache.store(), navigation_.root.public, lower, upper) else try tree.Cursor.init(a, self.lane.cache.store(), navigation_.root.public, lower, upper);
+        }
+        return .{ .ptr = self, .next = next, .close = close };
+    }
+    fn increment(bytes: []u8) bool {
+        var i = bytes.len;
+        while (i != 0) {
+            i -= 1;
+            bytes[i] +%= 1;
+            if (bytes[i] != 0) return true;
+        }
+        return false;
+    }
+    fn next(raw: *anyopaque, a: A, limit: usize) !Source.PublicRowsCursor.Batch {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (limit > 256) return error.InvalidLogicalRowIdentity;
+        var result: std.ArrayList(RowRef) = .empty;
+        errdefer {
+            for (result.items) |ref| freeRef(a, ref);
+            result.deinit(a);
+        }
+        var ids: [256]identity.logical.Id = undefined;
+        var count: usize = 0;
+        var scanned: usize = 0;
+        if (!self.exhausted and self.allowance.remaining_rows == 0 and limit != 0) return error.QueryCandidateBudgetExceeded;
+        while (!self.exhausted and scanned < limit and self.allowance.remaining_rows != 0) {
+            try self.binding.owner.cached.context.ensureActive();
+            if (self.rows) |*cursor| {
+                if (try cursor.next()) |record| {
+                    scanned += 1;
+                    self.allowance.remaining_rows -= 1;
+                    if (record.key.len != 44 or record.value.len != 32) return error.InvalidLogicalRowIdentity;
+                    if (self.cursor) |bound| if (std.mem.eql(u8, &self.file_digest, &self.cursor_digest)) {
+                        const group = std.mem.readInt(u32, record.key[32..36], .big);
+                        const row = std.mem.readInt(u64, record.key[36..44], .big);
+                        if (!self.reverse and (group < bound.group or (group == bound.group and row <= bound.row))) continue;
+                    };
+                    ids[count] = record.value[0..32].*;
+                    count += 1;
+                    continue;
+                }
+                cursor.deinit();
+                self.rows = null;
+            }
+            const file = (try self.files.?.next()) orelse {
+                self.exhausted = true;
+                break;
+            };
+            if (file.key.len != 32 or file.value.len == 0) return error.InvalidLogicalRowIdentity;
+            self.file_digest = file.key[0..32].*;
+            self.bounds[0] = identity.orderKey(file.value, 0, 0);
+            self.bounds[1] = self.bounds[0];
+            const has_upper = increment(self.bounds[1][0..32]);
+            var upper: ?[]const u8 = if (has_upper) self.bounds[1][0..32] else null;
+            if (self.cursor) |bound| if (std.mem.eql(u8, &self.file_digest, &self.cursor_digest)) {
+                const key = identity.orderKey(file.value, bound.group, bound.row);
+                if (self.reverse) {
+                    self.bounds[1] = key;
+                    upper = &self.bounds[1];
+                } else self.bounds[0] = key;
+            };
+            if (self.stop) |bound| if (std.mem.eql(u8, &self.file_digest, &self.stop_digest)) {
+                const key = identity.orderKey(file.value, bound.group, bound.row);
+                if (self.reverse) self.bounds[0] = key else {
+                    self.bounds[1] = key;
+                    upper = if (increment(&self.bounds[1])) &self.bounds[1] else null;
+                }
+            };
+            const reader_ = self.binding.reader(&self.lane);
+            self.rows = if (self.reverse) try tree.Cursor.initReverse(self.a, self.lane.cache.store(), reader_.root.current.by_order, &self.bounds[0], upper) else try tree.Cursor.init(self.a, self.lane.cache.store(), reader_.root.current.by_order, &self.bounds[0], upper);
+        }
+        if (count != 0) {
+            var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            var reader_ = self.binding.reader(&self.lane);
+            const indexed = try reader_.byIdsMany(sa, self.binding.space, ids[0..count]);
+            const current = if (reader_.verify_values and !std.meta.eql(self.binding.space.by_id, reader_.root.current.by_id)) try reader_.byIdsMany(sa, reader_.root.current, ids[0..count]) else null;
+            var selected: [256]usize = undefined;
+            var slots: [256]u32 = undefined;
+            var live: usize = 0;
+            for (indexed, 0..) |possible, i| {
+                const index = possible orelse continue;
+                if (current) |values| {
+                    const row = values[i] orelse return error.InvalidLogicalRowIdentity;
+                    if (!index.state.unchanged(row.state)) continue;
+                }
+                selected[live] = i;
+                slots[live] = index.coordinate.file;
+                live += 1;
+            }
+            const names = try reader_.filesMany(sa, self.binding.space, slots[0..live]);
+            for (selected[0..live], names) |position, name| {
+                const coordinate = indexed[position].?.coordinate;
+                const ref = try ownRef(a, .{ .external = .{ .identity_version = self.binding.owner.index_identity_version, .source_id = self.binding.space.source, .snapshot_id = self.binding.space.snapshot, .file_id = name, .row_group_ordinal = coordinate.group, .row_ordinal = coordinate.row } });
+                errdefer freeRef(a, ref);
+                try result.append(a, ref);
+            }
+        }
+        return .{ .rows = try result.toOwnedSlice(a), .scanned = scanned, .exhausted = self.exhausted };
+    }
+    fn freeRef(a: A, ref: RowRef) void {
+        a.free(ref.external.source_id);
+        a.free(ref.external.snapshot_id);
+        a.free(ref.external.file_id);
+    }
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.rows) |*cursor| cursor.deinit();
+        if (self.files) |*cursor| cursor.deinit();
+        self.lane.deinit();
+        self.a.destroy(self);
+    }
+};
+
 const ReadLane = struct {
     owner: *Owner,
     allowance: ?*Source.TranslationAllowance,
@@ -495,7 +673,7 @@ const ReadLane = struct {
         self.pages = .{ .domain = owner_.reader.root.domain, .artifacts = &owner_.artifacts, .cancellation = owner_.pages.cancellation, .remaining_read_bytes = &self.unused_reads, .remaining_write_bytes = &self.unused_writes, .read_cache = .{ .ptr = self, .read = readPage } };
         var storage = self.pages.store();
         storage.decoded_page = .{ .ptr = self, .read = decodedPage };
-        if (allowance == null and owner_.cached.context.io != null) storage.read_many = .{ .ptr = self, .read = readMany };
+        if (owner_.cached.context.io != null) storage.read_many = .{ .ptr = self, .read = readMany };
         self.cache = .{ .alloc = a, .underlying = storage, .max_bytes = 256 * 1024 };
     }
     fn releaseDecoded(owner: *anyopaque, item: *anyopaque) void {
@@ -511,7 +689,7 @@ const ReadLane = struct {
     fn readMany(raw: *anyopaque, a: A, refs: []const @import("../serverless/graph_segment/page_tree.zig").Ref, output: []@import("../serverless/graph_segment/page_tree.zig").Page) !void {
         const self: *ReadLane = @ptrCast(@alignCast(raw));
         const tree = @import("../serverless/graph_segment/page_tree.zig");
-        if (self.allowance != null or refs.len != output.len or refs.len > tree.max_read_batch) return error.InvalidLogicalRowIdentity;
+        if (refs.len != output.len or refs.len > tree.max_read_batch) return error.InvalidLogicalRowIdentity;
         var ready: [tree.max_read_batch]?tree.Page = @splat(null);
         defer for (&ready) |*page| if (page.*) |*value| value.deinit(a);
         var missing: [tree.max_read_batch]tree.Ref = undefined;
@@ -537,10 +715,11 @@ const ReadLane = struct {
             var workspace: local.sql_memory_budget = .{ .backing = a, .limit = reservation };
             const Charge = struct {
                 fn charge(ptr: *anyopaque, bytes: u64) !void {
-                    try @as(*Owner, @ptrCast(@alignCast(ptr))).charge(bytes, null);
+                    const lane: *ReadLane = @ptrCast(@alignCast(ptr));
+                    try lane.owner.charge(bytes, lane.allowance);
                 }
             };
-            var encoded = if (retained) @import("lake_index_page_ranges.zig").load(workspace.allocator(), self.owner.artifacts, self.owner.reader.root.domain, missing[0..count], self.pages.cancellation, self.owner.cached, .{ .ptr = self.owner, .charge = Charge.charge }) catch |err| fallback: {
+            var encoded = if (retained) @import("lake_index_page_ranges.zig").load(workspace.allocator(), self.owner.artifacts, self.owner.reader.root.domain, missing[0..count], self.pages.cancellation, self.owner.cached, .{ .ptr = self, .charge = Charge.charge }) catch |err| fallback: {
                 if (err != error.OutOfMemory or !workspace.isExhausted()) return err;
                 break :fallback null;
             } else null;
@@ -548,7 +727,7 @@ const ReadLane = struct {
             var lanes: [tree.max_read_batch]ReadLane = undefined;
             var stores_: [tree.max_read_batch]tree.Store = undefined;
             for (stores_[0..count], lanes[0..count]) |*source, *lane| {
-                lane.init(self.owner, a, null);
+                lane.init(self.owner, a, self.allowance);
                 lane.preloaded = if (encoded) |*batch| batch else null;
                 source.* = lane.pages.store();
                 source.decoded_page = .{ .ptr = lane, .read = decodedPage };
@@ -715,6 +894,7 @@ pub fn install(table_id: u64, source: *Source, store: *Store, publication: local
     resolver.translate_many = Owner.translateMany;
     resolver.translate_many_bounded = Owner.translateManyBounded;
     resolver.bind_index = Owner.bindIndex;
+    resolver.open_public_rows = Owner.openPublicRows;
     resolver.close = Owner.close;
     source.row_resolver = resolver;
 }
@@ -896,4 +1076,165 @@ test "external lake compact coordinate identity binds file names as well as memb
     try std.testing.expect(!std.meta.eql(first.capability().coordinate_space, renamed.capability().coordinate_space));
     renamed.space.files = ref;
     try std.testing.expectEqual(first.capability().coordinate_space, renamed.capability().coordinate_space);
+}
+
+test "external lake public tie row cursors seek both directions and release failed tiles" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("public-tie-row-cursors");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var artifacts = fs.artifactStore();
+    artifacts.upload_scope = try @import("../serverless/artifacts/store.zig").UploadScope.forPublication(@splat(61), 1, std.testing.io);
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var cancel: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &cancel, .checkpoint = Check.call };
+    defer manager.deinit();
+    var reads: u64 = 64 * 1024 * 1024;
+    var writes: u64 = 64 * 1024 * 1024;
+    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = artifacts.upload_scope.?.domain, .attempt = artifacts.upload_scope.?.attempt, .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
+    const files = [_][]const u8{ "first", "second" };
+    const builder = try @import("lake_row_identity_delta.zig").Builder.createWithOptions(a, &manager, &pages, &files, null, null, &.{}, "source", "snapshot", true);
+    defer builder.deinit();
+    for (0..64) |i| {
+        var id: [32]u8 = @splat(1);
+        id[31] = @intCast(i);
+        try builder.add(.{ .id = id, .values = id }, .{ .file = @intCast(i / 32), .group = @intCast(i / 32), .row = i % 32 });
+    }
+    var root = try builder.finish(@splat(2), @splat(3), @splat(4));
+    root.current.navigation = .{ .kind = .doc_values, .artifact_id = "owned-current-navigation", .checksum = "fixture", .byte_len = 1 };
+    const Entry = struct { key: [32]u8, file: []const u8 };
+    var entries: [2]Entry = undefined;
+    for (&entries, files) |*entry, file| entry.* = .{ .key = local.storage_rowsource_identity.navigationDigest(2, "source", "snapshot", file), .file = file };
+    if (std.mem.order(u8, &entries[0].key, &entries[1].key) == .gt) std.mem.swap(Entry, &entries[0], &entries[1]);
+    const SourceEntries = struct {
+        entries: []const Entry,
+        position: usize = 0,
+        pub fn next(self: *@This()) !?@import("../serverless/graph_segment/page_tree.zig").Cursor.Record {
+            if (self.position == self.entries.len) return null;
+            const entry = &self.entries[self.position];
+            self.position += 1;
+            return .{ .key = &entry.key, .value = entry.file };
+        }
+    };
+    var source: SourceEntries = .{ .entries = &entries };
+    const public = try @import("../serverless/graph_segment/page_tree.zig").buildSorted(a, pages.store(), &source);
+    var serving_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer serving_cache.deinit();
+    var owner: Owner = .{ .a = a, .arena = .init(a), .store = undefined, .artifacts = artifacts, .lease = undefined, .reader = .{ .root = root, .pages = &pages }, .navigation = .{ .root = .{ .version = 4, .domain = pages.domain, .source = "source", .schema = "schema", .snapshot = "snapshot", .count = 2, .public = public, .public_identity_version = 2 }, .store = artifacts, .cached = .{ .cache = &serving_cache, .scope = @splat(0), .context = .{ .io = std.testing.io } }, .token = .none }, .pages = pages, .cached = .{ .cache = &serving_cache, .scope = @splat(0), .context = .{ .io = std.testing.io } }, .identity_version = 2, .index_identity_version = 2, .table_id = 1, .generation = 1, .publication_token = @splat(1), .repair_hint = null };
+    defer owner.arena.deinit();
+    var binding: Binding = .{ .owner = &owner, .space = root.current, .relocated = false };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var expected: [64][]const u8 = undefined;
+    for (&expected, 0..) |*id, i| id.* = try local.storage_rowsource_identity.allocId(out, .{ .external = .{ .identity_version = 2, .source_id = "source", .snapshot_id = "snapshot", .file_id = files[i / 32], .row_group_ordinal = @intCast(i / 32), .row_ordinal = i % 32 } });
+    std.mem.sort([]const u8, &expected, {}, struct {
+        fn less(_: void, l: []const u8, r: []const u8) bool {
+            return std.mem.order(u8, l, r) == .lt;
+        }
+    }.less);
+    for ([_]bool{ false, true }) |reverse| for ([_]bool{ false, true }) |seek| {
+        const cursor = (try PublicRows.open(&binding, a, reverse, if (seek) expected[32] else null)).?;
+        defer cursor.close(cursor.ptr);
+        var found: usize = 0;
+        while (true) {
+            const batch = try cursor.next(cursor.ptr, out, 7);
+            for (batch.rows) |ref| {
+                const id = try local.storage_rowsource_identity.allocId(out, ref);
+                const position = if (reverse) (if (seek) @as(usize, 32) else 64) - found - 1 else (if (seek) @as(usize, 33) else 0) + found;
+                try std.testing.expectEqualStrings(expected[position], id);
+                found += 1;
+            }
+            if (batch.exhausted) break;
+        }
+        try std.testing.expectEqual(@as(usize, if (seek) (if (reverse) 32 else 31) else 64), found);
+    };
+    for ([_]bool{ false, true }) |reverse| for ([_]bool{ false, true }) |seek| {
+        const stop = if (reverse) @as(usize, 16) else 47;
+        const cursor = (try PublicRows.openRange(&binding, a, .{ .reverse = reverse, .cursor = if (seek) expected[32] else null, .stop_at = expected[stop] })).?;
+        defer cursor.close(cursor.ptr);
+        var found: usize = 0;
+        while (true) {
+            const batch = try cursor.next(cursor.ptr, out, 7);
+            for (batch.rows) |ref| {
+                const position = if (reverse) (if (seek) @as(usize, 32) else 64) - found - 1 else (if (seek) @as(usize, 33) else 0) + found;
+                try std.testing.expectEqualStrings(expected[position], try local.storage_rowsource_identity.allocId(out, ref));
+                found += 1;
+            }
+            if (batch.exhausted) break;
+        }
+        try std.testing.expectEqual(@as(usize, if (seek) (if (reverse) 16 else 15) else 48), found);
+    };
+    {
+        const reads_before = owner.reads;
+        const empty = (try PublicRows.openRange(&binding, a, .{ .cursor = expected[32], .stop_at = expected[32] })).?;
+        defer empty.close(empty.ptr);
+        const batch = try empty.next(empty.ptr, out, 7);
+        try std.testing.expect(batch.exhausted and batch.rows.len == 0 and batch.scanned == 0);
+        try std.testing.expectEqual(reads_before, owner.reads);
+    }
+    {
+        const bounded = (try PublicRows.openRange(&binding, a, .{ .stop_at = expected[0] })).?;
+        defer bounded.close(bounded.ptr);
+        const batch = try bounded.next(bounded.ptr, out, 256);
+        try std.testing.expect(batch.exhausted);
+        try std.testing.expectEqual(@as(usize, 1), batch.scanned);
+        try std.testing.expectEqual(@as(usize, 1), batch.rows.len);
+        std.debug.print("PUBLIC_ID_CUTOFF scanned={d} unbounded_rows=64\n", .{batch.scanned});
+    }
+    try std.testing.expect(try PublicRows.openRange(&binding, a, .{ .stop_at = "arbitrary-string-boundary" }) == null);
+    {
+        var cold = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cold.deinit();
+        const previous_cache = owner.cached.cache;
+        owner.cached.cache = &cold;
+        defer owner.cached.cache = previous_cache;
+        var allowance: Source.TranslationAllowance = .{ .remaining_reads = 0 };
+        var lane: ReadLane = undefined;
+        lane.init(&owner, a, &allowance);
+        defer lane.deinit();
+        try std.testing.expect(lane.cache.underlying.read_many != null);
+        var output: [1]@import("../serverless/graph_segment/page_tree.zig").Page = undefined;
+        const before = owner.reads;
+        try std.testing.expectError(error.QueryCandidateBudgetExceeded, ReadLane.readMany(&lane, a, &.{root.current.by_id.?}, &output));
+        try std.testing.expectEqual(before, owner.reads);
+        allowance.remaining_reads = 16 * 1024 * 1024;
+        owner.reads = allowance.required_reserve;
+        defer owner.reads = before;
+        try std.testing.expectError(error.QueryCandidateBudgetExceeded, ReadLane.readMany(&lane, a, &.{root.current.by_id.?}, &output));
+        try std.testing.expectEqual(allowance.required_reserve, owner.reads);
+    }
+    try std.testing.expect(try PublicRows.open(&binding, a, false, "arbitrary-string-cursor") == null);
+    owner.identity_version = 1;
+    try std.testing.expect(try PublicRows.open(&binding, a, false, null) == null);
+    owner.identity_version = 2;
+    owner.navigation.root.public_identity_version = 1;
+    try std.testing.expect(try PublicRows.open(&binding, a, false, null) == null);
+    owner.navigation.root.public_identity_version = 2;
+    {
+        const limited = (try PublicRows.open(&binding, a, false, null)).?;
+        defer limited.close(limited.ptr);
+        const state: *PublicRows = @ptrCast(@alignCast(limited.ptr));
+        state.allowance.remaining_rows = 1;
+        const batch = try limited.next(limited.ptr, out, 8);
+        try std.testing.expectEqual(@as(usize, 1), batch.scanned);
+        try std.testing.expect(!batch.exhausted);
+        try std.testing.expectError(error.QueryCandidateBudgetExceeded, limited.next(limited.ptr, out, 8));
+    }
+
+    const Failure = struct {
+        fn run(allocator: A, bound: *Binding) !void {
+            const cursor = (try PublicRows.open(bound, allocator, false, null)).?;
+            defer cursor.close(cursor.ptr);
+            const batch = try cursor.next(cursor.ptr, allocator, 8);
+            defer allocator.free(batch.rows);
+            defer for (batch.rows) |ref| PublicRows.freeRef(allocator, ref);
+            try std.testing.expectEqual(@as(usize, 8), batch.rows.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failure.run, .{&binding});
 }

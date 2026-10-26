@@ -1,0 +1,4068 @@
+{
+  "experiment": "native_endpoint_directory_paged_lineage_capture_reuse_v3",
+  "scope": "Deterministic bounded-work contracts plus sequential local Debug real-Parquet controls during concurrent native/E2E validation. No measured end-to-end latency or real-cloud throughput improvement is established.",
+  "timing_attribution_qualified": false,
+  "remote_transport_qualified": false,
+  "archive_throughput_qualified": false,
+  "candidate_production_source": {
+    "source_commit": "e0bf3799deeb8bac184ca375376d1929ca29af17",
+    "source_tree": "8e2c1961b3f7ccf8f1297ac3550f4d61b7d79be6",
+    "source_clean": true,
+    "binary_sha256": "5e265ae425775442638318a778df441545f8d172306b4e1dc17d048b86073e67"
+  },
+  "baseline_binary_source": {
+    "binary_sha256": "5128abd173c2b860257e0bb344898050ce31c38543bd53cc83bdf5007947e97d",
+    "qualification": "previous tuple-recipe executable, before reader protocol 86",
+    "source_commit": "2adfcac70eaf2bd356f2ab314df0b8d61603fa11",
+    "source_tree": "7d1a773ab992380aa1c1d3d8c1ba19be4a0e101e",
+    "prior_report_sha256": "c55dd4cb5d93d60ecbf77f29cf789b3ccb1d8d34ea30cd4917345279c7f24158"
+  },
+  "rows": 16384,
+  "files": 8,
+  "limit": 20,
+  "conclusions": {
+    "answers": "All 48 samples match independently derived expected application IDs and the comparison also verifies normalized full answers, including totals and continuation presence. All cases retain 21 decorations.",
+    "timing": "Warm medians are 28\u201330 ms versus baseline 24\u201326 ms; restarted complete-tuple medians are 161\u2013171 ms versus 188\u2013189 ms, while wide/public-ID controls are 219\u2013222 ms versus 192\u2013198 ms. Concurrent load and sequential runs prevent attribution; no latency win is claimed.",
+    "ownership": "An initial candidate failed on a wide primary tie because deferred lineage borrowed temporary admission arrays. The final executable deeply owns compact descriptors, has no acquired snapshot pointer, and passes all four cases. Regression frees admission storage before point and inverse reads and covers allocation failures."
+  },
+  "deterministic_work": {
+    "endpoint_navigation": {
+      "segments": 128,
+      "admitted_before_dominance_stop": 1,
+      "directions": [
+        "forward",
+        "reverse",
+        "search_before_forward",
+        "search_before_reverse"
+      ],
+      "bounded_batch_counts": [
+        2,
+        1
+      ],
+      "unproven_cover_fallback": true
+    },
+    "paged_lineage": {
+      "ranges": 65536,
+      "sources": 8,
+      "point_logical_read_bytes": 349069,
+      "full_logical_read_bytes": 1070237,
+      "scope": "authenticated metadata read charges, not measured network transfer"
+    },
+    "capture_ordering": {
+      "rows": 8193,
+      "capture_payload_blocks": 129,
+      "fragments": 16,
+      "ordering_payload_decodes": 144,
+      "scope": "hashed identity plus ordered captured rows; each missing block decoded once per fragment; no measured old-executable decode ratio"
+    },
+    "key_reuse": {
+      "rows": 257,
+      "changed_row_fetches": 1,
+      "unchanged_keys_reused": 256,
+      "after_delete_fetches": 0,
+      "changed_cohort_fetches": 256,
+      "missing_cache_fetches": 256,
+      "paths": [
+        "complete capture",
+        "projected gather"
+      ]
+    }
+  },
+  "oracle": {
+    "derivation": "Same independently validated eight-file fixture and expected application-ID arrays as native-routing-refresh-v3-observation.json. This plan removes relational indexes and declares revision ASC, id ASC, _id ASC to exercise native segment admission. It does not derive expected answers from the candidate.",
+    "prior_observation": "native-routing-refresh-v3-observation.json",
+    "prior_source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83"
+  },
+  "plan": {
+    "version": 1,
+    "definition": {
+      "schema": {
+        "storage_mode": "relational",
+        "base_source": {
+          "kind": "external",
+          "table_id": "archive-qualification",
+          "format": "parquet",
+          "object_mutability": "immutable",
+          "uri": "file:///private/tmp/lake-refinements-v3-reference/fixture/snapshot.parquet-manifest.json",
+          "row_identity": {
+            "key_columns": [
+              "id"
+            ]
+          }
+        },
+        "default_type": "row",
+        "document_schemas": {
+          "row": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "integer",
+                  "x-antfly-field": {
+                    "type": "number",
+                    "sortable": true
+                  }
+                },
+                "uniform_key": {
+                  "type": "integer"
+                },
+                "skew_key": {
+                  "type": "integer"
+                },
+                "revision": {
+                  "type": "integer",
+                  "x-antfly-field": {
+                    "type": "number",
+                    "sortable": true
+                  }
+                },
+                "category": {
+                  "type": "string",
+                  "x-antfly-field": {
+                    "type": "text"
+                  }
+                },
+                "body": {
+                  "type": "string",
+                  "x-antfly-field": {
+                    "type": "text"
+                  }
+                },
+                "payload": {
+                  "type": "string",
+                  "x-antfly-field": {
+                    "type": "text",
+                    "index": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "index_sort": [
+          {
+            "field": "revision",
+            "order": "asc"
+          },
+          {
+            "field": "id",
+            "order": "asc"
+          },
+          {
+            "field": "_id",
+            "order": "asc"
+          }
+        ]
+      }
+    },
+    "indexes": {
+      "text": {
+        "type": "full_text",
+        "store_source": true
+      }
+    },
+    "cases": [
+      {
+        "name": "complete_forward",
+        "identity_field": "id",
+        "request": {
+          "full_text_search": {
+            "match": "quasar",
+            "field": "body"
+          },
+          "fields": [
+            "id",
+            "revision"
+          ],
+          "order_by": [
+            {
+              "field": "revision"
+            },
+            {
+              "field": "id"
+            }
+          ],
+          "limit": 20,
+          "profile": true
+        },
+        "expected_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ]
+      },
+      {
+        "name": "complete_reverse",
+        "identity_field": "id",
+        "request": {
+          "full_text_search": {
+            "match": "quasar",
+            "field": "body"
+          },
+          "fields": [
+            "id",
+            "revision"
+          ],
+          "order_by": [
+            {
+              "field": "revision",
+              "desc": true
+            },
+            {
+              "field": "id",
+              "desc": true
+            }
+          ],
+          "limit": 20,
+          "profile": true
+        },
+        "expected_ids": [
+          16383,
+          16382,
+          16381,
+          16380,
+          16379,
+          16378,
+          16377,
+          16376,
+          16375,
+          16374,
+          16373,
+          16372,
+          16371,
+          16370,
+          16369,
+          16368,
+          16367,
+          16366,
+          16365,
+          16364
+        ]
+      },
+      {
+        "name": "wide_forward",
+        "identity_field": "id",
+        "request": {
+          "full_text_search": {
+            "match": "quasar",
+            "field": "body"
+          },
+          "fields": [
+            "id",
+            "revision"
+          ],
+          "order_by": [
+            {
+              "field": "revision"
+            }
+          ],
+          "limit": 20,
+          "profile": true
+        },
+        "expected_ids": [
+          12288,
+          12289,
+          12290,
+          12291,
+          12292,
+          12293,
+          12294,
+          12295,
+          12296,
+          12297,
+          12298,
+          12299,
+          12300,
+          12301,
+          12302,
+          12303,
+          12304,
+          12305,
+          12306,
+          12307
+        ]
+      },
+      {
+        "name": "public_id_only",
+        "identity_field": "id",
+        "request": {
+          "full_text_search": {
+            "match": "quasar",
+            "field": "body"
+          },
+          "fields": [
+            "id",
+            "revision"
+          ],
+          "order_by": [
+            {
+              "field": "_id"
+            }
+          ],
+          "limit": 20,
+          "profile": true
+        },
+        "expected_ids": [
+          12288,
+          12289,
+          12290,
+          12291,
+          12292,
+          12293,
+          12294,
+          12295,
+          12296,
+          12297,
+          12298,
+          12299,
+          12300,
+          12301,
+          12302,
+          12303,
+          12304,
+          12305,
+          12306,
+          12307
+        ]
+      }
+    ]
+  },
+  "comparison": {
+    "version": 3,
+    "timing_qualified": true,
+    "environment_scope": "same declared platform and collector; sequential runs are observational, not randomized paired trials",
+    "comparisons": [
+      {
+        "case": "complete_forward",
+        "cache_mode": "process_restarted",
+        "baseline_median_ns": 189147125,
+        "candidate_median_ns": 170955667,
+        "candidate_over_baseline": 0.9038237668164398,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "complete_forward",
+        "cache_mode": "warm",
+        "baseline_median_ns": 25239625,
+        "candidate_median_ns": 28330667,
+        "candidate_over_baseline": 1.1224678258888554,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "complete_reverse",
+        "cache_mode": "process_restarted",
+        "baseline_median_ns": 188441500,
+        "candidate_median_ns": 161464833,
+        "candidate_over_baseline": 0.8568432802753109,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "complete_reverse",
+        "cache_mode": "warm",
+        "baseline_median_ns": 24446666,
+        "candidate_median_ns": 28590792,
+        "candidate_over_baseline": 1.1695170212576227,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "wide_forward",
+        "cache_mode": "process_restarted",
+        "baseline_median_ns": 197601042,
+        "candidate_median_ns": 221753125,
+        "candidate_over_baseline": 1.1222264961538007,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "wide_forward",
+        "cache_mode": "warm",
+        "baseline_median_ns": 25774666,
+        "candidate_median_ns": 30432417,
+        "candidate_over_baseline": 1.1807104309324512,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "public_id_only",
+        "cache_mode": "process_restarted",
+        "baseline_median_ns": 192142250,
+        "candidate_median_ns": 219024833,
+        "candidate_over_baseline": 1.1399097959974966,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      },
+      {
+        "case": "public_id_only",
+        "cache_mode": "warm",
+        "baseline_median_ns": 24018458,
+        "candidate_median_ns": 28364333,
+        "candidate_over_baseline": 1.1809389678554718,
+        "baseline_samples": 3,
+        "candidate_samples": 3,
+        "minimum_sample_count_met": true
+      }
+    ]
+  },
+  "reports": {
+    "baseline": {
+      "version": 3,
+      "refresh_workload": null,
+      "binary_sha256": "5128abd173c2b860257e0bb344898050ce31c38543bd53cc83bdf5007947e97d",
+      "tool_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
+      "server_config_sha256": "5e16acb5c3f661f4eee93f1025add1060ba49d6b8443621884fcf121b60c3840",
+      "server_config_origin": "supplied",
+      "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f",
+      "runtime_environment_sha256": "f87bd45ed7dd12943a95767ac02aae0d4af6230a0d6a794847b0e28648dfa30c",
+      "input_identity_contract": "identity checked around launches/measurements and content verified before completion",
+      "git_head": "dfd0d3d6741037ebdb0aeeeb25636159674b8135",
+      "platform": {
+        "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "cpu_count": 14,
+        "python": "3.13.14"
+      },
+      "cache_contract": {
+        "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+        "warm": "same query immediately after its process-restarted sample",
+        "empty_cache_qualified": false
+      },
+      "complete": true,
+      "answer_contract": {
+        "opaque_continuations": "presence only; token bytes include authority and expiry",
+        "cursor_replay_qualified": false
+      },
+      "started_at_utc": "2026-10-25T18:34:08Z",
+      "transport": {
+        "fixture_backend": "filesystem_object_store",
+        "remote_transport_qualified": false,
+        "cache_counter_scope": "lake serving-cache provider counters; not a complete transport trace or all SQL/provider I/O",
+        "sql_profile_coverage": "retain EXPLAIN ANALYZE coverage fields; unavailable values remain null"
+      },
+      "source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+      "source_identity_assurance": "verified_local_file_bytes",
+      "oracle_coverage": {
+        "complete_forward": "exact_expected_rows_or_ids",
+        "complete_reverse": "exact_expected_rows_or_ids",
+        "wide_forward": "exact_expected_rows_or_ids",
+        "public_id_only": "exact_expected_rows_or_ids"
+      },
+      "input": {
+        "manifest_uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-archive-qualification/.benchmark-results/lake/range-lineage/baseline-run/fixture/snapshot.parquet-manifest.json",
+        "files": [
+          {
+            "file_id": "import-0.parquet",
+            "object_uri": "object://antfly/import-0.parquet",
+            "etag": "635b6bf2e60e6e7ee77f1134afac98a0cc5a2c60578f6ba52290fa655d886b29",
+            "row_count": 2048,
+            "byte_len": 31140
+          },
+          {
+            "file_id": "import-1.parquet",
+            "object_uri": "object://antfly/import-1.parquet",
+            "etag": "a53c52121fcba1030ae60b6859ed77e6c865251205210038282ef51080da90d5",
+            "row_count": 2048,
+            "byte_len": 31332
+          },
+          {
+            "file_id": "import-2.parquet",
+            "object_uri": "object://antfly/import-2.parquet",
+            "etag": "98126235211324d423ad96b4b1ad3bac2e7b56bda381f46de28d92d33945a0ed",
+            "row_count": 2048,
+            "byte_len": 31313
+          },
+          {
+            "file_id": "import-3.parquet",
+            "object_uri": "object://antfly/import-3.parquet",
+            "etag": "0409ab1095633fdfd2ec1f2565eee25e0e22e0454315c3853b54f84bf67e2b0b",
+            "row_count": 2048,
+            "byte_len": 31389
+          },
+          {
+            "file_id": "import-4.parquet",
+            "object_uri": "object://antfly/import-4.parquet",
+            "etag": "5ab7e54c091257cab552d5e3317c058478aabc91fb028ae726ed7886960bc692",
+            "row_count": 2048,
+            "byte_len": 31187
+          },
+          {
+            "file_id": "import-5.parquet",
+            "object_uri": "object://antfly/import-5.parquet",
+            "etag": "4d25f877847b26d32cc32b049fff2daf55980bc4cd2155e72512b62ebad13eb1",
+            "row_count": 2048,
+            "byte_len": 31293
+          },
+          {
+            "file_id": "import-6.parquet",
+            "object_uri": "object://antfly/import-6.parquet",
+            "etag": "83b12e657e28cab00ed31d0c2114a09fdadf0629a514188c687b9a4259704bb7",
+            "row_count": 2048,
+            "byte_len": 31381
+          },
+          {
+            "file_id": "import-7.parquet",
+            "object_uri": "object://antfly/import-7.parquet",
+            "etag": "3732d77672e2c7ca3b29e9d112dbf9408b2595e2a31783f1a1fed02621744632",
+            "row_count": 2048,
+            "byte_len": 31320
+          }
+        ],
+        "sha256": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+        "parquet_bytes": 250355
+      },
+      "plan_sha256": "d9bc6dddefb2e85b3b94ce200044b0d2b47717d9c90a3903f060ba068f7c6dbb",
+      "workload_sha256": "aa54cf3375f34270cfef94eccec477646926b9c33f4d6edcc13d31e3e8f1f204",
+      "profile_scope": "EXPLAIN ANALYZE is a separate execution; its own coverage fields are authoritative",
+      "initial_publication_ns": 7676992833,
+      "initial_index_revisions": {
+        "text": 1
+      },
+      "samples": [
+        {
+          "elapsed_ns": 204368875,
+          "memory": {
+            "baseline_bytes": 436846592,
+            "peak_sampled_bytes": 452329472,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 12893,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 839492042,
+          "startup_memory": {
+            "baseline_bytes": 48922624,
+            "peak_sampled_bytes": 436649984,
+            "samples": 7,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 25696084,
+          "memory": {
+            "baseline_bytes": 452427776,
+            "peak_sampled_bytes": 453509120,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 0,
+          "cache_mode": "warm",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3377,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 186698500,
+          "memory": {
+            "baseline_bytes": 425771008,
+            "peak_sampled_bytes": 455131136,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 11513,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 813291084,
+          "startup_memory": {
+            "baseline_bytes": 224018432,
+            "peak_sampled_bytes": 425771008,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 25239625,
+          "memory": {
+            "baseline_bytes": 455229440,
+            "peak_sampled_bytes": 455589888,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 1,
+          "cache_mode": "warm",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3255,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 189147125,
+          "memory": {
+            "baseline_bytes": 420724736,
+            "peak_sampled_bytes": 450347008,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 11678,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 845938417,
+          "startup_memory": {
+            "baseline_bytes": 59097088,
+            "peak_sampled_bytes": 420724736,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 24768500,
+          "memory": {
+            "baseline_bytes": 450412544,
+            "peak_sampled_bytes": 450887680,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 2,
+          "cache_mode": "warm",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3133,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 185868042,
+          "memory": {
+            "baseline_bytes": 426328064,
+            "peak_sampled_bytes": 455376896,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 12755,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 849699500,
+          "startup_memory": {
+            "baseline_bytes": 38174720,
+            "peak_sampled_bytes": 426328064,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 23808917,
+          "memory": {
+            "baseline_bytes": 455655424,
+            "peak_sampled_bytes": 455770112,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 0,
+          "cache_mode": "warm",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 2994,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 234845959,
+          "memory": {
+            "baseline_bytes": 420937728,
+            "peak_sampled_bytes": 449626112,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 12606,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 766016583,
+          "startup_memory": {
+            "baseline_bytes": 180453376,
+            "peak_sampled_bytes": 420937728,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 31028291,
+          "memory": {
+            "baseline_bytes": 450461696,
+            "peak_sampled_bytes": 450641920,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 1,
+          "cache_mode": "warm",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3216,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 188441500,
+          "memory": {
+            "baseline_bytes": 432275456,
+            "peak_sampled_bytes": 461193216,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 12685,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 776312459,
+          "startup_memory": {
+            "baseline_bytes": 66732032,
+            "peak_sampled_bytes": 432275456,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 24446666,
+          "memory": {
+            "baseline_bytes": 461471744,
+            "peak_sampled_bytes": 461602816,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 2,
+          "cache_mode": "warm",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3077,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 198497750,
+          "memory": {
+            "baseline_bytes": 424280064,
+            "peak_sampled_bytes": 465649664,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 19845,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 765828958,
+          "startup_memory": {
+            "baseline_bytes": 61177856,
+            "peak_sampled_bytes": 424411136,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 25959708,
+          "memory": {
+            "baseline_bytes": 465879040,
+            "peak_sampled_bytes": 467025920,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 0,
+          "cache_mode": "warm",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4305,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 197059625,
+          "memory": {
+            "baseline_bytes": 420691968,
+            "peak_sampled_bytes": 461717504,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 18754,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 811162709,
+          "startup_memory": {
+            "baseline_bytes": 42680320,
+            "peak_sampled_bytes": 420691968,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 25345542,
+          "memory": {
+            "baseline_bytes": 461750272,
+            "peak_sampled_bytes": 463011840,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 1,
+          "cache_mode": "warm",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4153,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 197601042,
+          "memory": {
+            "baseline_bytes": 424165376,
+            "peak_sampled_bytes": 465321984,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 18811,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 933577125,
+          "startup_memory": {
+            "baseline_bytes": 196132864,
+            "peak_sampled_bytes": 424165376,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 25774666,
+          "memory": {
+            "baseline_bytes": 465534976,
+            "peak_sampled_bytes": 466681856,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 2,
+          "cache_mode": "warm",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4197,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 192142250,
+          "memory": {
+            "baseline_bytes": 424787968,
+            "peak_sampled_bytes": 465141760,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 18192,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 784684417,
+          "startup_memory": {
+            "baseline_bytes": 46120960,
+            "peak_sampled_bytes": 424787968,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 23931958,
+          "memory": {
+            "baseline_bytes": 465174528,
+            "peak_sampled_bytes": 466403328,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 0,
+          "cache_mode": "warm",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3635,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 193932208,
+          "memory": {
+            "baseline_bytes": 421396480,
+            "peak_sampled_bytes": 461766656,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 19019,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 864703167,
+          "startup_memory": {
+            "baseline_bytes": 24903680,
+            "peak_sampled_bytes": 421396480,
+            "samples": 7,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 24018458,
+          "memory": {
+            "baseline_bytes": 461848576,
+            "peak_sampled_bytes": 462864384,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 1,
+          "cache_mode": "warm",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3550,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 187616542,
+          "memory": {
+            "baseline_bytes": 424378368,
+            "peak_sampled_bytes": 464994304,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 18984,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 919510917,
+          "startup_memory": {
+            "baseline_bytes": 45170688,
+            "peak_sampled_bytes": 424378368,
+            "samples": 7,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 24110542,
+          "memory": {
+            "baseline_bytes": 465027072,
+            "peak_sampled_bytes": 466223104,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 2,
+          "cache_mode": "warm",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3474,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        }
+      ],
+      "summary": [
+        {
+          "case": "complete_forward",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 189147125,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299"
+        },
+        {
+          "case": "complete_forward",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 25239625,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299"
+        },
+        {
+          "case": "complete_reverse",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 188441500,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc"
+        },
+        {
+          "case": "complete_reverse",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 24446666,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc"
+        },
+        {
+          "case": "wide_forward",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 197601042,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9"
+        },
+        {
+          "case": "wide_forward",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 25774666,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9"
+        },
+        {
+          "case": "public_id_only",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 192142250,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257"
+        },
+        {
+          "case": "public_id_only",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 24018458,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257"
+        }
+      ],
+      "report_sha256": "73f6189340a27d33bc69ff9056f90d473e0a353ea9ec70511585e16c2b847353"
+    },
+    "candidate": {
+      "version": 3,
+      "refresh_workload": null,
+      "binary_sha256": "5e265ae425775442638318a778df441545f8d172306b4e1dc17d048b86073e67",
+      "tool_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
+      "server_config_sha256": "5e16acb5c3f661f4eee93f1025add1060ba49d6b8443621884fcf121b60c3840",
+      "server_config_origin": "supplied",
+      "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f",
+      "runtime_environment_sha256": "f87bd45ed7dd12943a95767ac02aae0d4af6230a0d6a794847b0e28648dfa30c",
+      "input_identity_contract": "identity checked around launches/measurements and content verified before completion",
+      "git_head": "e0bf3799deeb8bac184ca375376d1929ca29af17",
+      "platform": {
+        "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "cpu_count": 14,
+        "python": "3.13.14"
+      },
+      "cache_contract": {
+        "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+        "warm": "same query immediately after its process-restarted sample",
+        "empty_cache_qualified": false
+      },
+      "complete": true,
+      "answer_contract": {
+        "opaque_continuations": "presence only; token bytes include authority and expiry",
+        "cursor_replay_qualified": false
+      },
+      "started_at_utc": "2026-10-25T19:04:50Z",
+      "transport": {
+        "fixture_backend": "filesystem_object_store",
+        "remote_transport_qualified": false,
+        "cache_counter_scope": "lake serving-cache provider counters; not a complete transport trace or all SQL/provider I/O",
+        "sql_profile_coverage": "retain EXPLAIN ANALYZE coverage fields; unavailable values remain null"
+      },
+      "source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+      "source_identity_assurance": "verified_local_file_bytes",
+      "oracle_coverage": {
+        "complete_forward": "exact_expected_rows_or_ids",
+        "complete_reverse": "exact_expected_rows_or_ids",
+        "wide_forward": "exact_expected_rows_or_ids",
+        "public_id_only": "exact_expected_rows_or_ids"
+      },
+      "input": {
+        "manifest_uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-archive-qualification/.benchmark-results/lake/range-lineage/candidate-owned/fixture/snapshot.parquet-manifest.json",
+        "files": [
+          {
+            "file_id": "import-0.parquet",
+            "object_uri": "object://antfly/import-0.parquet",
+            "etag": "635b6bf2e60e6e7ee77f1134afac98a0cc5a2c60578f6ba52290fa655d886b29",
+            "row_count": 2048,
+            "byte_len": 31140
+          },
+          {
+            "file_id": "import-1.parquet",
+            "object_uri": "object://antfly/import-1.parquet",
+            "etag": "a53c52121fcba1030ae60b6859ed77e6c865251205210038282ef51080da90d5",
+            "row_count": 2048,
+            "byte_len": 31332
+          },
+          {
+            "file_id": "import-2.parquet",
+            "object_uri": "object://antfly/import-2.parquet",
+            "etag": "98126235211324d423ad96b4b1ad3bac2e7b56bda381f46de28d92d33945a0ed",
+            "row_count": 2048,
+            "byte_len": 31313
+          },
+          {
+            "file_id": "import-3.parquet",
+            "object_uri": "object://antfly/import-3.parquet",
+            "etag": "0409ab1095633fdfd2ec1f2565eee25e0e22e0454315c3853b54f84bf67e2b0b",
+            "row_count": 2048,
+            "byte_len": 31389
+          },
+          {
+            "file_id": "import-4.parquet",
+            "object_uri": "object://antfly/import-4.parquet",
+            "etag": "5ab7e54c091257cab552d5e3317c058478aabc91fb028ae726ed7886960bc692",
+            "row_count": 2048,
+            "byte_len": 31187
+          },
+          {
+            "file_id": "import-5.parquet",
+            "object_uri": "object://antfly/import-5.parquet",
+            "etag": "4d25f877847b26d32cc32b049fff2daf55980bc4cd2155e72512b62ebad13eb1",
+            "row_count": 2048,
+            "byte_len": 31293
+          },
+          {
+            "file_id": "import-6.parquet",
+            "object_uri": "object://antfly/import-6.parquet",
+            "etag": "83b12e657e28cab00ed31d0c2114a09fdadf0629a514188c687b9a4259704bb7",
+            "row_count": 2048,
+            "byte_len": 31381
+          },
+          {
+            "file_id": "import-7.parquet",
+            "object_uri": "object://antfly/import-7.parquet",
+            "etag": "3732d77672e2c7ca3b29e9d112dbf9408b2595e2a31783f1a1fed02621744632",
+            "row_count": 2048,
+            "byte_len": 31320
+          }
+        ],
+        "sha256": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+        "parquet_bytes": 250355
+      },
+      "plan_sha256": "de4899adaf0693f1b4ab3488e0dc7cbbd85676ebc75e447fb0e3432442daaf14",
+      "workload_sha256": "aa54cf3375f34270cfef94eccec477646926b9c33f4d6edcc13d31e3e8f1f204",
+      "profile_scope": "EXPLAIN ANALYZE is a separate execution; its own coverage fields are authoritative",
+      "initial_publication_ns": 8596001084,
+      "initial_index_revisions": {
+        "text": 1
+      },
+      "samples": [
+        {
+          "elapsed_ns": 170955667,
+          "memory": {
+            "baseline_bytes": 432128000,
+            "peak_sampled_bytes": 468615168,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 12803,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 735502708,
+          "startup_memory": {
+            "baseline_bytes": 62095360,
+            "peak_sampled_bytes": 432128000,
+            "samples": 8,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 26594250,
+          "memory": {
+            "baseline_bytes": 469172224,
+            "peak_sampled_bytes": 470171648,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 0,
+          "cache_mode": "warm",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3230,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 168803208,
+          "memory": {
+            "baseline_bytes": 425410560,
+            "peak_sampled_bytes": 453656576,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 13106,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 852570417,
+          "startup_memory": {
+            "baseline_bytes": 70057984,
+            "peak_sampled_bytes": 424886272,
+            "samples": 5,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 29237333,
+          "memory": {
+            "baseline_bytes": 453722112,
+            "peak_sampled_bytes": 454393856,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 1,
+          "cache_mode": "warm",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3319,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 171363166,
+          "memory": {
+            "baseline_bytes": 425197568,
+            "peak_sampled_bytes": 453558272,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 13111,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 954347209,
+          "startup_memory": {
+            "baseline_bytes": 24412160,
+            "peak_sampled_bytes": 424968192,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 28330667,
+          "memory": {
+            "baseline_bytes": 453656576,
+            "peak_sampled_bytes": 454311936,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_forward",
+          "sample": 2,
+          "cache_mode": "warm",
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3330,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 157864791,
+          "memory": {
+            "baseline_bytes": 421527552,
+            "peak_sampled_bytes": 449527808,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 13657,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 982072250,
+          "startup_memory": {
+            "baseline_bytes": 47054848,
+            "peak_sampled_bytes": 421298176,
+            "samples": 8,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 28590792,
+          "memory": {
+            "baseline_bytes": 449527808,
+            "peak_sampled_bytes": 449691648,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 0,
+          "cache_mode": "warm",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3289,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 162655959,
+          "memory": {
+            "baseline_bytes": 425394176,
+            "peak_sampled_bytes": 453689344,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 13781,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 910566541,
+          "startup_memory": {
+            "baseline_bytes": 32227328,
+            "peak_sampled_bytes": 424525824,
+            "samples": 5,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 27632666,
+          "memory": {
+            "baseline_bytes": 454443008,
+            "peak_sampled_bytes": 454803456,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 1,
+          "cache_mode": "warm",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3297,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 161464833,
+          "memory": {
+            "baseline_bytes": 425394176,
+            "peak_sampled_bytes": 452886528,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 13540,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 684920667,
+          "startup_memory": {
+            "baseline_bytes": 66945024,
+            "peak_sampled_bytes": 425394176,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 29158125,
+          "memory": {
+            "baseline_bytes": 453263360,
+            "peak_sampled_bytes": 453492736,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "complete_reverse",
+          "sample": 2,
+          "cache_mode": "warm",
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3525,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 221753125,
+          "memory": {
+            "baseline_bytes": 429064192,
+            "peak_sampled_bytes": 470614016,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 74357,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 832203417,
+          "startup_memory": {
+            "baseline_bytes": 45514752,
+            "peak_sampled_bytes": 428736512,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 26978542,
+          "memory": {
+            "baseline_bytes": 470892544,
+            "peak_sampled_bytes": 472760320,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 0,
+          "cache_mode": "warm",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4364,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 228748208,
+          "memory": {
+            "baseline_bytes": 421576704,
+            "peak_sampled_bytes": 462733312,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 77389,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 833742666,
+          "startup_memory": {
+            "baseline_bytes": 61390848,
+            "peak_sampled_bytes": 421117952,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 31267709,
+          "memory": {
+            "baseline_bytes": 462782464,
+            "peak_sampled_bytes": 464502784,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 1,
+          "cache_mode": "warm",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4756,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 220433625,
+          "memory": {
+            "baseline_bytes": 426033152,
+            "peak_sampled_bytes": 467288064,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 74898,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 883029334,
+          "startup_memory": {
+            "baseline_bytes": 63356928,
+            "peak_sampled_bytes": 426278912,
+            "samples": 7,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 30432417,
+          "memory": {
+            "baseline_bytes": 467337216,
+            "peak_sampled_bytes": 467910656,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "wide_forward",
+          "sample": 2,
+          "cache_mode": "warm",
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_best_first_sort",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4166,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 218211750,
+          "memory": {
+            "baseline_bytes": 425345024,
+            "peak_sampled_bytes": 465633280,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 20509,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 867843250,
+          "startup_memory": {
+            "baseline_bytes": 175308800,
+            "peak_sampled_bytes": 425148416,
+            "samples": 8,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 27929166,
+          "memory": {
+            "baseline_bytes": 465633280,
+            "peak_sampled_bytes": 466780160,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 0,
+          "cache_mode": "warm",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3513,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 219731625,
+          "memory": {
+            "baseline_bytes": 425213952,
+            "peak_sampled_bytes": 465534976,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 20823,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 706295084,
+          "startup_memory": {
+            "baseline_bytes": 63127552,
+            "peak_sampled_bytes": 425213952,
+            "samples": 7,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 28364333,
+          "memory": {
+            "baseline_bytes": 466010112,
+            "peak_sampled_bytes": 467189760,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 1,
+          "cache_mode": "warm",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3490,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "elapsed_ns": 219024833,
+          "memory": {
+            "baseline_bytes": 420626432,
+            "peak_sampled_bytes": 461209600,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 21845,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 748284458,
+          "startup_memory": {
+            "baseline_bytes": 211025920,
+            "peak_sampled_bytes": 420626432,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "elapsed_ns": 29456084,
+          "memory": {
+            "baseline_bytes": 461438976,
+            "peak_sampled_bytes": 462520320,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0
+          },
+          "metric_scope": "isolated process interval; can include asynchronous background work",
+          "case": "public_id_only",
+          "sample": 2,
+          "cache_mode": "warm",
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3844,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        }
+      ],
+      "summary": [
+        {
+          "case": "complete_forward",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 170955667,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299"
+        },
+        {
+          "case": "complete_forward",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 28330667,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299"
+        },
+        {
+          "case": "complete_reverse",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 161464833,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc"
+        },
+        {
+          "case": "complete_reverse",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 28590792,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc"
+        },
+        {
+          "case": "wide_forward",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 221753125,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9"
+        },
+        {
+          "case": "wide_forward",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 30432417,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9"
+        },
+        {
+          "case": "public_id_only",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 219024833,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257"
+        },
+        {
+          "case": "public_id_only",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 28364333,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257"
+        }
+      ],
+      "report_sha256": "c8515aa1541bed65e71246369e54ee5a71d8de728eb32b976121dca38e681dc1"
+    }
+  },
+  "sample_retention": "All 48 timings, result hashes, profiles, sampled memory, restart/startup timing and scoped provider read/byte deltas are retained. Other raw metrics remain in the full report bound by report_sha256; serving-cache counters do not cover all I/O.",
+  "validation": {
+    "complete_integration_before_final_ownership_fix": {
+      "source_commit": "67fd97abe4168a5d00307f0a2ac0d9c823ccea68",
+      "server": 512,
+      "embedded": 237,
+      "failures": 0,
+      "leaks": 0
+    },
+    "final_ownership_and_fragment_contracts": {
+      "server_frontier": 88,
+      "embedded_frontier": 26,
+      "fragments": 13,
+      "admission_release_and_allocation_failures": true,
+      "failures": 0,
+      "leaks": 0
+    },
+    "frozen_candidate_e2e": {
+      "passed": 34,
+      "failed": 0,
+      "seconds": 913.25,
+      "coverage": [
+        "18 archive cases",
+        "12 schema/indexing cases",
+        "full Parquet lifecycle",
+        "real Iceberg lifecycle",
+        "ordered Parquet logical-identity rewrite/refresh",
+        "ordered Iceberg logical-identity rewrite/refresh"
+      ]
+    },
+    "archive_tooling_tests": 18,
+    "main_merged": "4eedf9add77fc54cdba27ec32e88deb9ebb1e547"
+  },
+  "post_merge_validation": {
+    "origin_main": "71aa19359aebfb7220f58f06a3a12c17d0d5defb",
+    "executable": {
+      "source_commit": "26622434b8d8a9ae5f07b440e480c75d21d30f34",
+      "source_tree": "6bd0ee9439126906af4f7a4f73a1139df36f9399",
+      "source_clean": true,
+      "binary_sha256": "c5935ff9743fa433f7922da41fea22d8114b4a18031eaae7e93f59766bc21fbc"
+    },
+    "cli_build": "passed",
+    "google_embedding_catalog_contracts_passed": 5,
+    "generated_error_check": "passed",
+    "embedded_boundary": {
+      "sources": 1013,
+      "server_coordination_imports": 0
+    },
+    "e2e": {
+      "passed": 3,
+      "failed": 0,
+      "seconds": 24.65,
+      "coverage": [
+        "bounded native sort from shuffled real Parquet",
+        "full Parquet lifecycle",
+        "real Iceberg lifecycle"
+      ]
+    },
+    "benchmark_repeated_after_merge": false
+  }
+}

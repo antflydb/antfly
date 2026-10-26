@@ -357,7 +357,7 @@ def test_native_catalog_file_commit_read_and_restart(
     authority.submissions = 0
     storage_connection = {
         "kind": "external_io",
-        "capabilities": ["lake_read", "lake_write", "storage.primary"],
+        "capabilities": ["lake.read", "lake.write", "storage.primary"],
         "external_io": {
             "protocol": "s3",
             "endpoint": origin,
