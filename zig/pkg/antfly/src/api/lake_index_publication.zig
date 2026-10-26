@@ -437,7 +437,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
         // Legacy sidecars/enrichment dependencies retain the physical builder.
         const configs = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{});
         const reusable_inputs = @import("lake_row_input_recipes.zig").nativeFragmentsEligible(configs);
-        if (reusable_inputs) fragments = try @import("lake_row_fragments.zig").prepare(a, &scoped, table, source, &provider, identity, previous_identity);
+        if (reusable_inputs) fragments = try @import("lake_row_fragments.zig").prepareWithCapture(a, &scoped, table, source, &provider, identity, previous_identity, captured_rows);
     };
     var fragment_replay: ?replay_api.Replay = null;
     defer if (fragment_replay) |*value| value.deinit();
@@ -663,12 +663,13 @@ fn completeNativeReuse(a: A, configs_json: []const u8, desired: []const @import(
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const configs = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), configs_json, .{});
-    if (!@import("lake_row_input_recipes.zig").nativeFragmentsEligible(configs) or desired.len != retained.len) return false;
+    const consumers = try @import("lake_row_input_recipes.zig").consumers(arena.allocator(), desired);
+    if (!@import("lake_row_input_recipes.zig").nativeFragmentsEligible(configs) or consumers.len != retained.len) return false;
     var names: std.StringHashMapUnmanaged(void) = .empty;
     defer names.deinit(a);
     for (retained) |declaration| try names.put(a, declaration.name, {});
-    for (desired) |recipe| if (!names.contains(recipe.name)) return false;
-    return names.count() == desired.len;
+    for (consumers) |recipe| if (!names.contains(recipe.name)) return false;
+    return names.count() == consumers.len;
 }
 
 /// Relocation cannot keep a root whose serving/build format has advanced.

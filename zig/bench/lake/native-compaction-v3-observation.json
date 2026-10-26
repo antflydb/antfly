@@ -1,0 +1,2507 @@
+{
+  "experiment": "native_ordering_compact_lineage_v3",
+  "scope": "Local Debug filesystem measurements on verified deterministic real Parquet files. Exact answers agree in all cache modes. Other machine builds and some lifecycle work overlapped portions of this series. Sequential observations are not randomized paired trials.",
+  "report_excerpt_scope": "Preserves qualification provenance, every timing/sort-work sample and sampled memory. Full reports are represented by SHA256; metrics detail is omitted.",
+  "timing_attribution_qualified": false,
+  "remote_transport_qualified": false,
+  "total_disk_writes_qualified": false,
+  "sort_counter_scope": "Decorated sort candidates and native ordered probes; excludes membership construction, planning and other query I/O.",
+  "conclusion": "Declared-order top-20 decorates 21 candidates and probes 23 rows instead of decorating 16384. Compact lineage improves work counts and avoids the observed intermediate JSON-map restart regression. Refresh retains fewer new immutable artifact bytes with identical rewritten source hashes and changed-row count. Wall times are observational.",
+  "ordering": {
+    "rows": 16384,
+    "files": 8,
+    "limit": 20,
+    "schema_index_sort": [
+      {
+        "field": "id",
+        "order": "asc"
+      },
+      {
+        "field": "_id",
+        "order": "asc"
+      }
+    ],
+    "baseline": {
+      "version": 3,
+      "complete": true,
+      "refresh_workload": null,
+      "binary_sha256": "028906d943243622c70268c4282a5621f40f14007622af5002e87f29fbcad242",
+      "tool_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
+      "server_config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "server_config_origin": "generated",
+      "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f",
+      "runtime_environment_sha256": "f87bd45ed7dd12943a95767ac02aae0d4af6230a0d6a794847b0e28648dfa30c",
+      "git_head": "956cc879a76da7ba72911791f69038498798b5c1",
+      "platform": {
+        "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "cpu_count": 14,
+        "python": "3.13.14"
+      },
+      "cache_contract": {
+        "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+        "warm": "same query immediately after its process-restarted sample",
+        "empty_cache_qualified": false
+      },
+      "source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+      "source_identity_assurance": "verified_local_file_bytes",
+      "workload_sha256": "5aa6d5e73999b3d639d92cbd71e1f008854039138882b0342739d250e74f8818",
+      "oracle_coverage": {
+        "ordered_text": "exact_expected_rows_or_ids"
+      },
+      "initial_publication_ns": 8496651500,
+      "input": {
+        "manifest_uri": "file:///private/tmp/lake-refinements-declared-reference2/fixture/snapshot.parquet-manifest.json",
+        "files": [
+          {
+            "file_id": "import-0.parquet",
+            "object_uri": "object://antfly/import-0.parquet",
+            "etag": "635b6bf2e60e6e7ee77f1134afac98a0cc5a2c60578f6ba52290fa655d886b29",
+            "row_count": 2048,
+            "byte_len": 31140
+          },
+          {
+            "file_id": "import-1.parquet",
+            "object_uri": "object://antfly/import-1.parquet",
+            "etag": "a53c52121fcba1030ae60b6859ed77e6c865251205210038282ef51080da90d5",
+            "row_count": 2048,
+            "byte_len": 31332
+          },
+          {
+            "file_id": "import-2.parquet",
+            "object_uri": "object://antfly/import-2.parquet",
+            "etag": "98126235211324d423ad96b4b1ad3bac2e7b56bda381f46de28d92d33945a0ed",
+            "row_count": 2048,
+            "byte_len": 31313
+          },
+          {
+            "file_id": "import-3.parquet",
+            "object_uri": "object://antfly/import-3.parquet",
+            "etag": "0409ab1095633fdfd2ec1f2565eee25e0e22e0454315c3853b54f84bf67e2b0b",
+            "row_count": 2048,
+            "byte_len": 31389
+          },
+          {
+            "file_id": "import-4.parquet",
+            "object_uri": "object://antfly/import-4.parquet",
+            "etag": "5ab7e54c091257cab552d5e3317c058478aabc91fb028ae726ed7886960bc692",
+            "row_count": 2048,
+            "byte_len": 31187
+          },
+          {
+            "file_id": "import-5.parquet",
+            "object_uri": "object://antfly/import-5.parquet",
+            "etag": "4d25f877847b26d32cc32b049fff2daf55980bc4cd2155e72512b62ebad13eb1",
+            "row_count": 2048,
+            "byte_len": 31293
+          },
+          {
+            "file_id": "import-6.parquet",
+            "object_uri": "object://antfly/import-6.parquet",
+            "etag": "83b12e657e28cab00ed31d0c2114a09fdadf0629a514188c687b9a4259704bb7",
+            "row_count": 2048,
+            "byte_len": 31381
+          },
+          {
+            "file_id": "import-7.parquet",
+            "object_uri": "object://antfly/import-7.parquet",
+            "etag": "3732d77672e2c7ca3b29e9d112dbf9408b2595e2a31783f1a1fed02621744632",
+            "row_count": 2048,
+            "byte_len": 31320
+          }
+        ],
+        "sha256": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+        "parquet_bytes": 250355
+      },
+      "transport": {
+        "fixture_backend": "filesystem_object_store",
+        "remote_transport_qualified": false,
+        "cache_counter_scope": "lake serving-cache provider counters; not a complete transport trace or all SQL/provider I/O",
+        "sql_profile_coverage": "retain EXPLAIN ANALYZE coverage fields; unavailable values remain null"
+      },
+      "answer_contract": {
+        "opaque_continuations": "presence only; token bytes include authority and expiry",
+        "cursor_replay_qualified": false
+      },
+      "started_at_utc": "2026-10-24T23:16:50Z",
+      "summary": [
+        {
+          "case": "ordered_text",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 1015136208,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df"
+        },
+        {
+          "case": "ordered_text",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 966074917,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df"
+        }
+      ],
+      "full_report_sha256": "1bbc811367c453e5804345510b921a6771a1cd7cdcc422ae5379f8d4308f2681",
+      "git_head_scope": "Checkout revision observed by collector; actual executable identified independently by binary_sha256.",
+      "samples": [
+        {
+          "case": "ordered_text",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1015136208,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 431177728,
+            "peak_sampled_bytes": 450052096,
+            "samples": 12,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 647555625,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "index_sort_unavailable_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "missing_segment_index_sort",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 956125,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 966074917,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 448888832,
+            "peak_sampled_bytes": 450609152,
+            "samples": 12,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "index_sort_unavailable_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "missing_segment_index_sort",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 936069,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 981847167,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 418480128,
+            "peak_sampled_bytes": 443400192,
+            "samples": 9,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 734968542,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "index_sort_unavailable_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "missing_segment_index_sort",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 927319,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 944060041,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 443777024,
+            "peak_sampled_bytes": 446414848,
+            "samples": 9,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "index_sort_unavailable_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "missing_segment_index_sort",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 913605,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1350397708,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 420200448,
+            "peak_sampled_bytes": 444252160,
+            "samples": 15,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 803309500,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "index_sort_unavailable_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "missing_segment_index_sort",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 1277533,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 1062964209,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 444432384,
+            "peak_sampled_bytes": 444645376,
+            "samples": 15,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "index_sort_unavailable_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "missing_segment_index_sort",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 1019321,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        }
+      ]
+    },
+    "intermediate_json_ranges": {
+      "version": 3,
+      "complete": true,
+      "refresh_workload": null,
+      "binary_sha256": "eac547814ce92f97dde26be3a331ab8fab27f608e5aa07a3da1559645312cb70",
+      "tool_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
+      "server_config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "server_config_origin": "generated",
+      "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f",
+      "runtime_environment_sha256": "f87bd45ed7dd12943a95767ac02aae0d4af6230a0d6a794847b0e28648dfa30c",
+      "git_head": "956cc879a76da7ba72911791f69038498798b5c1",
+      "platform": {
+        "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "cpu_count": 14,
+        "python": "3.13.14"
+      },
+      "cache_contract": {
+        "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+        "warm": "same query immediately after its process-restarted sample",
+        "empty_cache_qualified": false
+      },
+      "source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+      "source_identity_assurance": "verified_local_file_bytes",
+      "workload_sha256": "5aa6d5e73999b3d639d92cbd71e1f008854039138882b0342739d250e74f8818",
+      "oracle_coverage": {
+        "ordered_text": "exact_expected_rows_or_ids"
+      },
+      "initial_publication_ns": 11865401250,
+      "input": {
+        "manifest_uri": "file:///private/tmp/lake-refinements-declared-candidate/fixture/snapshot.parquet-manifest.json",
+        "files": [
+          {
+            "file_id": "import-0.parquet",
+            "object_uri": "object://antfly/import-0.parquet",
+            "etag": "635b6bf2e60e6e7ee77f1134afac98a0cc5a2c60578f6ba52290fa655d886b29",
+            "row_count": 2048,
+            "byte_len": 31140
+          },
+          {
+            "file_id": "import-1.parquet",
+            "object_uri": "object://antfly/import-1.parquet",
+            "etag": "a53c52121fcba1030ae60b6859ed77e6c865251205210038282ef51080da90d5",
+            "row_count": 2048,
+            "byte_len": 31332
+          },
+          {
+            "file_id": "import-2.parquet",
+            "object_uri": "object://antfly/import-2.parquet",
+            "etag": "98126235211324d423ad96b4b1ad3bac2e7b56bda381f46de28d92d33945a0ed",
+            "row_count": 2048,
+            "byte_len": 31313
+          },
+          {
+            "file_id": "import-3.parquet",
+            "object_uri": "object://antfly/import-3.parquet",
+            "etag": "0409ab1095633fdfd2ec1f2565eee25e0e22e0454315c3853b54f84bf67e2b0b",
+            "row_count": 2048,
+            "byte_len": 31389
+          },
+          {
+            "file_id": "import-4.parquet",
+            "object_uri": "object://antfly/import-4.parquet",
+            "etag": "5ab7e54c091257cab552d5e3317c058478aabc91fb028ae726ed7886960bc692",
+            "row_count": 2048,
+            "byte_len": 31187
+          },
+          {
+            "file_id": "import-5.parquet",
+            "object_uri": "object://antfly/import-5.parquet",
+            "etag": "4d25f877847b26d32cc32b049fff2daf55980bc4cd2155e72512b62ebad13eb1",
+            "row_count": 2048,
+            "byte_len": 31293
+          },
+          {
+            "file_id": "import-6.parquet",
+            "object_uri": "object://antfly/import-6.parquet",
+            "etag": "83b12e657e28cab00ed31d0c2114a09fdadf0629a514188c687b9a4259704bb7",
+            "row_count": 2048,
+            "byte_len": 31381
+          },
+          {
+            "file_id": "import-7.parquet",
+            "object_uri": "object://antfly/import-7.parquet",
+            "etag": "3732d77672e2c7ca3b29e9d112dbf9408b2595e2a31783f1a1fed02621744632",
+            "row_count": 2048,
+            "byte_len": 31320
+          }
+        ],
+        "sha256": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+        "parquet_bytes": 250355
+      },
+      "transport": {
+        "fixture_backend": "filesystem_object_store",
+        "remote_transport_qualified": false,
+        "cache_counter_scope": "lake serving-cache provider counters; not a complete transport trace or all SQL/provider I/O",
+        "sql_profile_coverage": "retain EXPLAIN ANALYZE coverage fields; unavailable values remain null"
+      },
+      "answer_contract": {
+        "opaque_continuations": "presence only; token bytes include authority and expiry",
+        "cursor_replay_qualified": false
+      },
+      "started_at_utc": "2026-10-24T23:19:37Z",
+      "summary": [
+        {
+          "case": "ordered_text",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 1218973167,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df"
+        },
+        {
+          "case": "ordered_text",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 44670834,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df"
+        }
+      ],
+      "full_report_sha256": "4e3f9ab4ae52de9973baeab21e48315f818e2f74fdd6c982632d16aca8f114c2",
+      "git_head_scope": "Checkout revision observed by collector; actual executable identified independently by binary_sha256.",
+      "samples": [
+        {
+          "case": "ordered_text",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1232323708,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 440614912,
+            "peak_sampled_bytes": 517947392,
+            "samples": 13,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 942636416,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 28,
+              "ordered_scanned_count": 32,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 15702,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 44670834,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 518127616,
+            "peak_sampled_bytes": 518946816,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 28,
+              "ordered_scanned_count": 32,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 5527,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1218973167,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 422559744,
+            "peak_sampled_bytes": 514342912,
+            "samples": 14,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 876804583,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 28,
+              "ordered_scanned_count": 32,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 14871,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 42716917,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 514342912,
+            "peak_sampled_bytes": 515391488,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 28,
+              "ordered_scanned_count": 32,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 5347,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1206328042,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 424394752,
+            "peak_sampled_bytes": 516800512,
+            "samples": 13,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 908214500,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 28,
+              "ordered_scanned_count": 32,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 15551,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 45279917,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 516997120,
+            "peak_sampled_bytes": 518144000,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "bounded_text_routing_windows",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 28,
+              "ordered_scanned_count": 32,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 5572,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        }
+      ]
+    },
+    "candidate": {
+      "version": 3,
+      "complete": true,
+      "refresh_workload": null,
+      "binary_sha256": "48f8f5a8e80d62f42a77f04aa367a267042d9b416c17e8cf510e95f85c724bd9",
+      "tool_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
+      "server_config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "server_config_origin": "generated",
+      "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f",
+      "runtime_environment_sha256": "f87bd45ed7dd12943a95767ac02aae0d4af6230a0d6a794847b0e28648dfa30c",
+      "git_head": "b7bd7674d13847b306f3d1e90b0fae3f9562c4be",
+      "platform": {
+        "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "cpu_count": 14,
+        "python": "3.13.14"
+      },
+      "cache_contract": {
+        "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+        "warm": "same query immediately after its process-restarted sample",
+        "empty_cache_qualified": false
+      },
+      "source_identity": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+      "source_identity_assurance": "verified_local_file_bytes",
+      "workload_sha256": "5aa6d5e73999b3d639d92cbd71e1f008854039138882b0342739d250e74f8818",
+      "oracle_coverage": {
+        "ordered_text": "exact_expected_rows_or_ids"
+      },
+      "initial_publication_ns": 9694663084,
+      "input": {
+        "manifest_uri": "file:///private/tmp/lake-native-final-declared/fixture/snapshot.parquet-manifest.json",
+        "files": [
+          {
+            "file_id": "import-0.parquet",
+            "object_uri": "object://antfly/import-0.parquet",
+            "etag": "635b6bf2e60e6e7ee77f1134afac98a0cc5a2c60578f6ba52290fa655d886b29",
+            "row_count": 2048,
+            "byte_len": 31140
+          },
+          {
+            "file_id": "import-1.parquet",
+            "object_uri": "object://antfly/import-1.parquet",
+            "etag": "a53c52121fcba1030ae60b6859ed77e6c865251205210038282ef51080da90d5",
+            "row_count": 2048,
+            "byte_len": 31332
+          },
+          {
+            "file_id": "import-2.parquet",
+            "object_uri": "object://antfly/import-2.parquet",
+            "etag": "98126235211324d423ad96b4b1ad3bac2e7b56bda381f46de28d92d33945a0ed",
+            "row_count": 2048,
+            "byte_len": 31313
+          },
+          {
+            "file_id": "import-3.parquet",
+            "object_uri": "object://antfly/import-3.parquet",
+            "etag": "0409ab1095633fdfd2ec1f2565eee25e0e22e0454315c3853b54f84bf67e2b0b",
+            "row_count": 2048,
+            "byte_len": 31389
+          },
+          {
+            "file_id": "import-4.parquet",
+            "object_uri": "object://antfly/import-4.parquet",
+            "etag": "5ab7e54c091257cab552d5e3317c058478aabc91fb028ae726ed7886960bc692",
+            "row_count": 2048,
+            "byte_len": 31187
+          },
+          {
+            "file_id": "import-5.parquet",
+            "object_uri": "object://antfly/import-5.parquet",
+            "etag": "4d25f877847b26d32cc32b049fff2daf55980bc4cd2155e72512b62ebad13eb1",
+            "row_count": 2048,
+            "byte_len": 31293
+          },
+          {
+            "file_id": "import-6.parquet",
+            "object_uri": "object://antfly/import-6.parquet",
+            "etag": "83b12e657e28cab00ed31d0c2114a09fdadf0629a514188c687b9a4259704bb7",
+            "row_count": 2048,
+            "byte_len": 31381
+          },
+          {
+            "file_id": "import-7.parquet",
+            "object_uri": "object://antfly/import-7.parquet",
+            "etag": "3732d77672e2c7ca3b29e9d112dbf9408b2595e2a31783f1a1fed02621744632",
+            "row_count": 2048,
+            "byte_len": 31320
+          }
+        ],
+        "sha256": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
+        "parquet_bytes": 250355
+      },
+      "transport": {
+        "fixture_backend": "filesystem_object_store",
+        "remote_transport_qualified": false,
+        "cache_counter_scope": "lake serving-cache provider counters; not a complete transport trace or all SQL/provider I/O",
+        "sql_profile_coverage": "retain EXPLAIN ANALYZE coverage fields; unavailable values remain null"
+      },
+      "answer_contract": {
+        "opaque_continuations": "presence only; token bytes include authority and expiry",
+        "cursor_replay_qualified": false
+      },
+      "started_at_utc": "2026-10-24T23:57:44Z",
+      "summary": [
+        {
+          "case": "ordered_text",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 934638250,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df"
+        },
+        {
+          "case": "ordered_text",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 32967625,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df"
+        }
+      ],
+      "full_report_sha256": "e01a884b741294cbec9f18f0f0611dc3bee2d4591f1873f3f6f6c024aabd725e",
+      "git_head_scope": "Checkout revision observed by collector; actual executable identified independently by binary_sha256.",
+      "samples": [
+        {
+          "case": "ordered_text",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 938283792,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 429817856,
+            "peak_sampled_bytes": 493158400,
+            "samples": 10,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 848550416,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "caller_selected_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 14802,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 32967625,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 493404160,
+            "peak_sampled_bytes": 493551616,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "caller_selected_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4509,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 934638250,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 418906112,
+            "peak_sampled_bytes": 486965248,
+            "samples": 13,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 838082750,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "caller_selected_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 15484,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 34680708,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 488079360,
+            "peak_sampled_bytes": 490848256,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "caller_selected_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4470,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 920277792,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 423788544,
+            "peak_sampled_bytes": 491438080,
+            "samples": 12,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 839569375,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "caller_selected_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 14464,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 32914792,
+          "result_sha256": "447e03a021c91f30a3abf4c3a3d86a1f4e514af735b77a8b85f7fbe510be54df",
+          "memory": {
+            "baseline_bytes": 491683840,
+            "peak_sampled_bytes": 491814912,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "caller_selected_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4139,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        }
+      ]
+    },
+    "versus_baseline": {
+      "version": 3,
+      "timing_qualified": true,
+      "environment_scope": "same declared platform and collector; sequential runs are observational, not randomized paired trials",
+      "comparisons": [
+        {
+          "case": "ordered_text",
+          "cache_mode": "process_restarted",
+          "baseline_median_ns": 1015136208,
+          "candidate_median_ns": 934638250,
+          "candidate_over_baseline": 0.9207023083546637,
+          "baseline_samples": 3,
+          "candidate_samples": 3,
+          "minimum_sample_count_met": true
+        },
+        {
+          "case": "ordered_text",
+          "cache_mode": "warm",
+          "baseline_median_ns": 966074917,
+          "candidate_median_ns": 32967625,
+          "candidate_over_baseline": 0.03412532964045479,
+          "baseline_samples": 3,
+          "candidate_samples": 3,
+          "minimum_sample_count_met": true
+        }
+      ]
+    },
+    "versus_json_ranges": {
+      "version": 3,
+      "timing_qualified": true,
+      "environment_scope": "same declared platform and collector; sequential runs are observational, not randomized paired trials",
+      "comparisons": [
+        {
+          "case": "ordered_text",
+          "cache_mode": "process_restarted",
+          "baseline_median_ns": 1218973167,
+          "candidate_median_ns": 934638250,
+          "candidate_over_baseline": 0.7667422674284347,
+          "baseline_samples": 3,
+          "candidate_samples": 3,
+          "minimum_sample_count_met": true
+        },
+        {
+          "case": "ordered_text",
+          "cache_mode": "warm",
+          "baseline_median_ns": 44670834,
+          "candidate_median_ns": 32967625,
+          "candidate_over_baseline": 0.7380123012702203,
+          "baseline_samples": 3,
+          "candidate_samples": 3,
+          "minimum_sample_count_met": true
+        }
+      ]
+    }
+  },
+  "publication": {
+    "rows": 16384,
+    "files": 8,
+    "row_group": 2048,
+    "payload_bytes": 32,
+    "refresh_every": 10,
+    "schema_index_sort": [],
+    "scope": "Generated numeric-sort fallback control; no native ordering speedup is claimed for this case. Artifact growth excludes temporary writes and reclaimed objects.",
+    "baseline": {
+      "version": 3,
+      "complete": true,
+      "refresh_workload": {
+        "kind": "generated_parquet_v1",
+        "rows": 16384,
+        "files": 8,
+        "row_group": 2048,
+        "payload_bytes": 32,
+        "refresh_every": 10,
+        "generation": 1
+      },
+      "binary_sha256": "028906d943243622c70268c4282a5621f40f14007622af5002e87f29fbcad242",
+      "tool_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
+      "server_config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "server_config_origin": "generated",
+      "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f",
+      "runtime_environment_sha256": "f87bd45ed7dd12943a95767ac02aae0d4af6230a0d6a794847b0e28648dfa30c",
+      "git_head": "cdd16c54b6ee75965c112407c8b291daa32d1ec0",
+      "platform": {
+        "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "cpu_count": 14,
+        "python": "3.13.14"
+      },
+      "cache_contract": {
+        "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+        "warm": "same query immediately after its process-restarted sample",
+        "empty_cache_qualified": false
+      },
+      "source_identity": "517fe4c0282902490aa11ee8beecb9fa64fae1273a21257b5d3c7b1906d0bc31",
+      "source_identity_assurance": "verified_local_file_bytes",
+      "workload_sha256": "fc398e8c505558d609abe30d911c238a3e6b0d29df37b6bacc61bbef1d40ce86",
+      "oracle_coverage": {
+        "ordered_text": "exact_expected_rows_or_ids"
+      },
+      "initial_publication_ns": 8923311709,
+      "input": {
+        "manifest_uri": "file:///private/tmp/lake-refinements-v3-reference/fixture/snapshot.parquet-manifest.json",
+        "files": [
+          {
+            "file_id": "part-0-0.parquet",
+            "object_uri": "object://antfly/part-0-0.parquet",
+            "etag": "635b6bf2e60e6e7ee77f1134afac98a0cc5a2c60578f6ba52290fa655d886b29",
+            "row_count": 2048,
+            "byte_len": 31140
+          },
+          {
+            "file_id": "part-0-1.parquet",
+            "object_uri": "object://antfly/part-0-1.parquet",
+            "etag": "a53c52121fcba1030ae60b6859ed77e6c865251205210038282ef51080da90d5",
+            "row_count": 2048,
+            "byte_len": 31332
+          },
+          {
+            "file_id": "part-0-2.parquet",
+            "object_uri": "object://antfly/part-0-2.parquet",
+            "etag": "98126235211324d423ad96b4b1ad3bac2e7b56bda381f46de28d92d33945a0ed",
+            "row_count": 2048,
+            "byte_len": 31313
+          },
+          {
+            "file_id": "part-0-3.parquet",
+            "object_uri": "object://antfly/part-0-3.parquet",
+            "etag": "0409ab1095633fdfd2ec1f2565eee25e0e22e0454315c3853b54f84bf67e2b0b",
+            "row_count": 2048,
+            "byte_len": 31389
+          },
+          {
+            "file_id": "part-0-4.parquet",
+            "object_uri": "object://antfly/part-0-4.parquet",
+            "etag": "5ab7e54c091257cab552d5e3317c058478aabc91fb028ae726ed7886960bc692",
+            "row_count": 2048,
+            "byte_len": 31187
+          },
+          {
+            "file_id": "part-0-5.parquet",
+            "object_uri": "object://antfly/part-0-5.parquet",
+            "etag": "4d25f877847b26d32cc32b049fff2daf55980bc4cd2155e72512b62ebad13eb1",
+            "row_count": 2048,
+            "byte_len": 31293
+          },
+          {
+            "file_id": "part-0-6.parquet",
+            "object_uri": "object://antfly/part-0-6.parquet",
+            "etag": "83b12e657e28cab00ed31d0c2114a09fdadf0629a514188c687b9a4259704bb7",
+            "row_count": 2048,
+            "byte_len": 31381
+          },
+          {
+            "file_id": "part-0-7.parquet",
+            "object_uri": "object://antfly/part-0-7.parquet",
+            "etag": "3732d77672e2c7ca3b29e9d112dbf9408b2595e2a31783f1a1fed02621744632",
+            "row_count": 2048,
+            "byte_len": 31320
+          }
+        ],
+        "sha256": "517fe4c0282902490aa11ee8beecb9fa64fae1273a21257b5d3c7b1906d0bc31",
+        "parquet_bytes": 250355
+      },
+      "transport": {
+        "fixture_backend": "filesystem_object_store",
+        "remote_transport_qualified": false,
+        "cache_counter_scope": "lake serving-cache provider counters; not a complete transport trace or all SQL/provider I/O",
+        "sql_profile_coverage": "retain EXPLAIN ANALYZE coverage fields; unavailable values remain null"
+      },
+      "answer_contract": {
+        "opaque_continuations": "presence only; token bytes include authority and expiry",
+        "cursor_replay_qualified": false
+      },
+      "started_at_utc": "2026-10-24T22:48:33Z",
+      "summary": [
+        {
+          "case": "ordered_text",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 1025103291,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c"
+        },
+        {
+          "case": "ordered_text",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 978359583,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c"
+        }
+      ],
+      "full_report_sha256": "ab9037acd663cd5bbb5546fb24a20d05d3598f624979cae99b8f8115906ab82f",
+      "git_head_scope": "Checkout revision observed by collector; actual executable identified independently by binary_sha256.",
+      "samples": [
+        {
+          "case": "ordered_text",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1025103291,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 429883392,
+            "peak_sampled_bytes": 448380928,
+            "samples": 12,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 735540542,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 964496,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 984436250,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 447840256,
+            "peak_sampled_bytes": 449626112,
+            "samples": 11,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 949547,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1025750625,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 419446784,
+            "peak_sampled_bytes": 443613184,
+            "samples": 12,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 817571667,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 967585,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 978359583,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 443744256,
+            "peak_sampled_bytes": 446087168,
+            "samples": 12,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 947170,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1020647292,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 415547392,
+            "peak_sampled_bytes": 441466880,
+            "samples": 12,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 813291833,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 961835,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 968999916,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 442007552,
+            "peak_sampled_bytes": 443138048,
+            "samples": 12,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 938399,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        }
+      ],
+      "refresh": {
+        "elapsed_ns": 19427561875,
+        "memory": {
+          "baseline_bytes": 443138048,
+          "peak_sampled_bytes": 521519104,
+          "samples": 196,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "input": {
+          "manifest_uri": "file:///private/tmp/lake-refinements-v3-reference/fixture/snapshot.parquet-manifest.json",
+          "files": [
+            {
+              "file_id": "part-1-0.parquet",
+              "object_uri": "object://antfly/part-1-0.parquet",
+              "etag": "bc0228274241badce00986bd52464a936c0a37165a57a60627acb0c95a4ea1b5",
+              "row_count": 2048,
+              "byte_len": 32244
+            },
+            {
+              "file_id": "part-1-1.parquet",
+              "object_uri": "object://antfly/part-1-1.parquet",
+              "etag": "fc20112c5cb28b5d0facfea4dbd82139dc7a0657a66ae1016c426d46fdfed692",
+              "row_count": 2048,
+              "byte_len": 32440
+            },
+            {
+              "file_id": "part-1-2.parquet",
+              "object_uri": "object://antfly/part-1-2.parquet",
+              "etag": "3274fc3f5b4a49a02ec739df3ec07ade29ca3bf78a1e4f8f321025c2e81e3608",
+              "row_count": 2048,
+              "byte_len": 32425
+            },
+            {
+              "file_id": "part-1-3.parquet",
+              "object_uri": "object://antfly/part-1-3.parquet",
+              "etag": "691de823dc80a7b29923c2d7938ad25d4709c00107d327576d8ff1c8d78d3a69",
+              "row_count": 2048,
+              "byte_len": 32480
+            },
+            {
+              "file_id": "part-1-4.parquet",
+              "object_uri": "object://antfly/part-1-4.parquet",
+              "etag": "7f883525aae75a700e30c87f6625f3f143e99bcde2c04e37a219fdd643318cb1",
+              "row_count": 2048,
+              "byte_len": 32289
+            },
+            {
+              "file_id": "part-1-5.parquet",
+              "object_uri": "object://antfly/part-1-5.parquet",
+              "etag": "879b9b0764ce4cda5db7bad072f722c2eb2aaa73a5fc43099b9a483b3311ae50",
+              "row_count": 2048,
+              "byte_len": 32402
+            },
+            {
+              "file_id": "part-1-6.parquet",
+              "object_uri": "object://antfly/part-1-6.parquet",
+              "etag": "9a7cd4ffd5e88a652108c0318a3b72ea11c1bfff2d26d92540690ca106c6680c",
+              "row_count": 2048,
+              "byte_len": 32485
+            },
+            {
+              "file_id": "part-1-7.parquet",
+              "object_uri": "object://antfly/part-1-7.parquet",
+              "etag": "ac42222522521bff053bc81665249e2304cc40d9c30c8232498710b3fdb2de51",
+              "row_count": 2048,
+              "byte_len": 32422
+            }
+          ],
+          "sha256": "55a6877a80b57893c802791b6906eb5d78efdbe67be50bf8db72879fbd06da91",
+          "parquet_bytes": 259187
+        },
+        "changed_rows": 1639,
+        "revisions": {
+          "text": 2,
+          "archive_id": 2
+        },
+        "fixture_and_commit_ns": 14691625,
+        "publication_and_verify_ns": 19412854292,
+        "artifacts": {
+          "new_retained_files": 1136,
+          "new_retained_bytes": 114465543,
+          "retained_bytes_before": 68809258,
+          "retained_bytes_after": 183274801,
+          "coverage": "immutable files still present at observation; excludes reclaimed files and temporary spill writes"
+        },
+        "retained_artifact_over_rewritten_parquet": 441.6330410090012,
+        "includes_fixture_encoding_and_commit": true
+      }
+    },
+    "candidate": {
+      "version": 3,
+      "complete": true,
+      "refresh_workload": {
+        "kind": "generated_parquet_v1",
+        "rows": 16384,
+        "files": 8,
+        "row_group": 2048,
+        "payload_bytes": 32,
+        "refresh_every": 10,
+        "generation": 1
+      },
+      "binary_sha256": "48f8f5a8e80d62f42a77f04aa367a267042d9b416c17e8cf510e95f85c724bd9",
+      "tool_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
+      "server_config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "server_config_origin": "generated",
+      "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f",
+      "runtime_environment_sha256": "f87bd45ed7dd12943a95767ac02aae0d4af6230a0d6a794847b0e28648dfa30c",
+      "git_head": "b7bd7674d13847b306f3d1e90b0fae3f9562c4be",
+      "platform": {
+        "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "cpu_count": 14,
+        "python": "3.13.14"
+      },
+      "cache_contract": {
+        "process_restarted": "restart with retained data, persistent cache and OS page cache; startup navigation may warm before readiness",
+        "warm": "same query immediately after its process-restarted sample",
+        "empty_cache_qualified": false
+      },
+      "source_identity": "517fe4c0282902490aa11ee8beecb9fa64fae1273a21257b5d3c7b1906d0bc31",
+      "source_identity_assurance": "verified_local_file_bytes",
+      "workload_sha256": "fc398e8c505558d609abe30d911c238a3e6b0d29df37b6bacc61bbef1d40ce86",
+      "oracle_coverage": {
+        "ordered_text": "exact_expected_rows_or_ids"
+      },
+      "initial_publication_ns": 7266412208,
+      "input": {
+        "manifest_uri": "file:///private/tmp/lake-native-final-refresh/fixture/snapshot.parquet-manifest.json",
+        "files": [
+          {
+            "file_id": "part-0-0.parquet",
+            "object_uri": "object://antfly/part-0-0.parquet",
+            "etag": "635b6bf2e60e6e7ee77f1134afac98a0cc5a2c60578f6ba52290fa655d886b29",
+            "row_count": 2048,
+            "byte_len": 31140
+          },
+          {
+            "file_id": "part-0-1.parquet",
+            "object_uri": "object://antfly/part-0-1.parquet",
+            "etag": "a53c52121fcba1030ae60b6859ed77e6c865251205210038282ef51080da90d5",
+            "row_count": 2048,
+            "byte_len": 31332
+          },
+          {
+            "file_id": "part-0-2.parquet",
+            "object_uri": "object://antfly/part-0-2.parquet",
+            "etag": "98126235211324d423ad96b4b1ad3bac2e7b56bda381f46de28d92d33945a0ed",
+            "row_count": 2048,
+            "byte_len": 31313
+          },
+          {
+            "file_id": "part-0-3.parquet",
+            "object_uri": "object://antfly/part-0-3.parquet",
+            "etag": "0409ab1095633fdfd2ec1f2565eee25e0e22e0454315c3853b54f84bf67e2b0b",
+            "row_count": 2048,
+            "byte_len": 31389
+          },
+          {
+            "file_id": "part-0-4.parquet",
+            "object_uri": "object://antfly/part-0-4.parquet",
+            "etag": "5ab7e54c091257cab552d5e3317c058478aabc91fb028ae726ed7886960bc692",
+            "row_count": 2048,
+            "byte_len": 31187
+          },
+          {
+            "file_id": "part-0-5.parquet",
+            "object_uri": "object://antfly/part-0-5.parquet",
+            "etag": "4d25f877847b26d32cc32b049fff2daf55980bc4cd2155e72512b62ebad13eb1",
+            "row_count": 2048,
+            "byte_len": 31293
+          },
+          {
+            "file_id": "part-0-6.parquet",
+            "object_uri": "object://antfly/part-0-6.parquet",
+            "etag": "83b12e657e28cab00ed31d0c2114a09fdadf0629a514188c687b9a4259704bb7",
+            "row_count": 2048,
+            "byte_len": 31381
+          },
+          {
+            "file_id": "part-0-7.parquet",
+            "object_uri": "object://antfly/part-0-7.parquet",
+            "etag": "3732d77672e2c7ca3b29e9d112dbf9408b2595e2a31783f1a1fed02621744632",
+            "row_count": 2048,
+            "byte_len": 31320
+          }
+        ],
+        "sha256": "517fe4c0282902490aa11ee8beecb9fa64fae1273a21257b5d3c7b1906d0bc31",
+        "parquet_bytes": 250355
+      },
+      "transport": {
+        "fixture_backend": "filesystem_object_store",
+        "remote_transport_qualified": false,
+        "cache_counter_scope": "lake serving-cache provider counters; not a complete transport trace or all SQL/provider I/O",
+        "sql_profile_coverage": "retain EXPLAIN ANALYZE coverage fields; unavailable values remain null"
+      },
+      "answer_contract": {
+        "opaque_continuations": "presence only; token bytes include authority and expiry",
+        "cursor_replay_qualified": false
+      },
+      "started_at_utc": "2026-10-24T23:58:26Z",
+      "summary": [
+        {
+          "case": "ordered_text",
+          "cache_mode": "process_restarted",
+          "samples": 3,
+          "median_ns": 1076076916,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c"
+        },
+        {
+          "case": "ordered_text",
+          "cache_mode": "warm",
+          "samples": 3,
+          "median_ns": 1012555042,
+          "cache_provider_reads_median": 0,
+          "cache_provider_bytes_median": 0,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c"
+        }
+      ],
+      "full_report_sha256": "a6c12c920371aa72d88aabb9eeaf596e590c20674a2ded842d7f2ac355de1363",
+      "git_head_scope": "Checkout revision observed by collector; actual executable identified independently by binary_sha256.",
+      "samples": [
+        {
+          "case": "ordered_text",
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1076076916,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 440107008,
+            "peak_sampled_bytes": 451166208,
+            "samples": 11,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 810201084,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 1019466,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 1028350292,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 451313664,
+            "peak_sampled_bytes": 453738496,
+            "samples": 11,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 995184,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1089554500,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 424558592,
+            "peak_sampled_bytes": 448610304,
+            "samples": 8,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 851822375,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 1035400,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 1012555042,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 449200128,
+            "peak_sampled_bytes": 449380352,
+            "samples": 11,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 981347,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 1026591791,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 424198144,
+            "peak_sampled_bytes": 447987712,
+            "samples": 9,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "restart_ns": 911695458,
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 972381,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "ordered_text",
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 981735708,
+          "result_sha256": "4ce6d6e77a12ac625c7f9b73dd7f6a28c9ee9b95fd222415ee87c79ef3b7577c",
+          "memory": {
+            "baseline_bytes": 448495616,
+            "peak_sampled_bytes": 449675264,
+            "samples": 9,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "profile": {
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "text_postings",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "request_mismatch",
+              "candidate_count": 16384,
+              "ordered_scanned_count": 0,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 949822,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        }
+      ],
+      "refresh": {
+        "elapsed_ns": 17979507084,
+        "memory": {
+          "baseline_bytes": 449609728,
+          "peak_sampled_bytes": 514506752,
+          "samples": 151,
+          "interval_ms": 50,
+          "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+          "sampling_errors": []
+        },
+        "input": {
+          "manifest_uri": "file:///private/tmp/lake-native-final-refresh/fixture/snapshot.parquet-manifest.json",
+          "files": [
+            {
+              "file_id": "part-1-0.parquet",
+              "object_uri": "object://antfly/part-1-0.parquet",
+              "etag": "bc0228274241badce00986bd52464a936c0a37165a57a60627acb0c95a4ea1b5",
+              "row_count": 2048,
+              "byte_len": 32244
+            },
+            {
+              "file_id": "part-1-1.parquet",
+              "object_uri": "object://antfly/part-1-1.parquet",
+              "etag": "fc20112c5cb28b5d0facfea4dbd82139dc7a0657a66ae1016c426d46fdfed692",
+              "row_count": 2048,
+              "byte_len": 32440
+            },
+            {
+              "file_id": "part-1-2.parquet",
+              "object_uri": "object://antfly/part-1-2.parquet",
+              "etag": "3274fc3f5b4a49a02ec739df3ec07ade29ca3bf78a1e4f8f321025c2e81e3608",
+              "row_count": 2048,
+              "byte_len": 32425
+            },
+            {
+              "file_id": "part-1-3.parquet",
+              "object_uri": "object://antfly/part-1-3.parquet",
+              "etag": "691de823dc80a7b29923c2d7938ad25d4709c00107d327576d8ff1c8d78d3a69",
+              "row_count": 2048,
+              "byte_len": 32480
+            },
+            {
+              "file_id": "part-1-4.parquet",
+              "object_uri": "object://antfly/part-1-4.parquet",
+              "etag": "7f883525aae75a700e30c87f6625f3f143e99bcde2c04e37a219fdd643318cb1",
+              "row_count": 2048,
+              "byte_len": 32289
+            },
+            {
+              "file_id": "part-1-5.parquet",
+              "object_uri": "object://antfly/part-1-5.parquet",
+              "etag": "879b9b0764ce4cda5db7bad072f722c2eb2aaa73a5fc43099b9a483b3311ae50",
+              "row_count": 2048,
+              "byte_len": 32402
+            },
+            {
+              "file_id": "part-1-6.parquet",
+              "object_uri": "object://antfly/part-1-6.parquet",
+              "etag": "9a7cd4ffd5e88a652108c0318a3b72ea11c1bfff2d26d92540690ca106c6680c",
+              "row_count": 2048,
+              "byte_len": 32485
+            },
+            {
+              "file_id": "part-1-7.parquet",
+              "object_uri": "object://antfly/part-1-7.parquet",
+              "etag": "ac42222522521bff053bc81665249e2304cc40d9c30c8232498710b3fdb2de51",
+              "row_count": 2048,
+              "byte_len": 32422
+            }
+          ],
+          "sha256": "55a6877a80b57893c802791b6906eb5d78efdbe67be50bf8db72879fbd06da91",
+          "parquet_bytes": 259187
+        },
+        "changed_rows": 1639,
+        "revisions": {
+          "text": 2,
+          "archive_id": 2
+        },
+        "fixture_and_commit_ns": 13832875,
+        "publication_and_verify_ns": 17965660375,
+        "artifacts": {
+          "new_retained_files": 872,
+          "new_retained_bytes": 70811934,
+          "retained_bytes_before": 37819939,
+          "retained_bytes_after": 108631873,
+          "coverage": "immutable files still present at observation; excludes reclaimed files and temporary spill writes"
+        },
+        "retained_artifact_over_rewritten_parquet": 273.20789237114514,
+        "includes_fixture_encoding_and_commit": true
+      }
+    },
+    "comparison": {
+      "version": 3,
+      "timing_qualified": true,
+      "environment_scope": "same declared platform and collector; sequential runs are observational, not randomized paired trials",
+      "comparisons": [
+        {
+          "case": "ordered_text",
+          "cache_mode": "process_restarted",
+          "baseline_median_ns": 1025103291,
+          "candidate_median_ns": 1076076916,
+          "candidate_over_baseline": 1.0497253549447438,
+          "baseline_samples": 3,
+          "candidate_samples": 3,
+          "minimum_sample_count_met": true
+        },
+        {
+          "case": "ordered_text",
+          "cache_mode": "warm",
+          "baseline_median_ns": 978359583,
+          "candidate_median_ns": 1012555042,
+          "candidate_over_baseline": 1.0349518312021277,
+          "baseline_samples": 3,
+          "candidate_samples": 3,
+          "minimum_sample_count_met": true
+        }
+      ]
+    }
+  },
+  "compact_page_unit": {
+    "ranges": 64,
+    "legacy_json_bytes": 34009,
+    "compact_dictionary_bytes": 2020,
+    "same_decoded_coordinates": true
+  },
+  "inverse_route_unit": {
+    "interleaved_ranges": 1024,
+    "coalesced_routes": 2,
+    "splits_physical_generations": true
+  }
+}
