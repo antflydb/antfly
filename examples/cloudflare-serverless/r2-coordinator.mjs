@@ -74,7 +74,7 @@ export class R2CommitCoordinator extends DurableObject {
   finishPublication(id,watermark){return this.publication.finish(id,watermark);}
   openReadView(options={}) {
     this.readAdmissions??=new FreshReadAdmissions({delayMs:Number(this.env.READ_VIEW_BATCH_MS??2)});
-    return this.readAdmissions.run(options.immutable===false?JSON.stringify(["metadata",options.version??"latest"]):options.version??"latest",async traceIds=>{
+    return this.readAdmissions.run(options.immutable===false?JSON.stringify(["metadata",options.version??"latest"]):options.version??"latest",async(traceIds,close)=>{
       await this.ensureAuthority();
       const capture=async tx=>{
         const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
@@ -82,11 +82,12 @@ export class R2CommitCoordinator extends DurableObject {
         if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||this.authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
         return captureReadView(tx,keys,options);
       };
-      return(this.env.READ_ONLY_SNAPSHOTS==="false"?Promise.reject(Error("ReadSnapshotNeedsAdmission")):this.store.readOnly(capture,{traceId:options.trace_id,traceIds})).catch(error=>{
-        if(!/ReadSnapshotNeeds(?:Admission|Pin)/.test(String(error)))throw error;
+      if(this.env.READ_ONLY_SNAPSHOTS==="false")close();
+      return(this.env.READ_ONLY_SNAPSHOTS==="false"?Promise.reject(Error("ReadSnapshotNeedsAdmission")):this.store.readOnly(capture,{traceId:options.trace_id,traceIds,onAdmission:close,priority:options.immutable===false?"commit":"interactive"})).catch(error=>{
+        close();if(!/ReadSnapshotNeeds(?:Admission|Pin)/.test(String(error)))throw error;
         return this.transaction(capture,{traceId:options.trace_id});
       }).then(view=>options.immutable!==false&&!view.immutable&&this.store.readHints?.version===view.version?{...view,immutable:structuredClone(this.store.readHints.records)}:view);
-    },options.trace_id);
+    },options.trace_id,{untilAdmission:true,admissionClass:options.immutable===false?"commit":"read"});
   }
   async nativePublication(tx,op,lease,owner=lease?.owner){
     const keys=await metadataKeys(this.env.ANTFLY_INCARNATION),names=[keys.head,keys.progress+"HEAD_FENCE"],values=await tx.getMany(names),records=new Map(names.map((key,i)=>[key,values[i]]));

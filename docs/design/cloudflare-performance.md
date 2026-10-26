@@ -906,3 +906,18 @@ as with the existing shared-kernel limitation. The local integration additionall
 restarts all isolates, erases platform storage and disables edge caching before
 checking tenant data and replaying receipts from R2. It uses a reader actor that
 throws on execution, proving that HTTP queries use the app path.
+
+
+Read-view cohorts now remain eligible for joining while their native observation
+is queued. They close at kernel admission, with an additional close hook before
+transport I/O for hosts without pool-stage callbacks. Thus every member arrived
+before the fresh observation began; a completed view is never reused for a later
+request. Failure and writer-transaction fallback close the cohort first. An old
+completion cannot remove a newer cohort with the same version key.
+
+Across an isolate, at most 64 read callers and 16 mutation-metadata callers may
+wait for these views, with at most 64 members per cohort. The valid view's
+32 KiB reservation bounds caller copies to 2.5 MiB. Mutation metadata uses a
+separate admission allowance and commit priority in the observation pool, so
+read demand cannot consume its caller allowance. Kernel reservations and native
+working budgets remain unchanged.

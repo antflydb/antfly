@@ -13,18 +13,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// A cohort closes BEFORE observation starts. No frontier or failed promise is
-// retained for callers arriving after that boundary.
+// Cohorts close before native observation. Queued callers may share a pending
+// admission only when its owner closes it before the first freshness-bearing
+// I/O. Separate limits preserve mutation-metadata admission under read load.
+const waiters={read:0,commit:0},limits={read:64,commit:16};
 export class FreshReadAdmissions {
- constructor({delayMs=2,maxGroups=64}={}){if(!Number.isInteger(delayMs)||delayMs<0||delayMs>10)throw Error('InvalidReadAdmissionDelay');this.delayMs=delayMs;this.maxGroups=maxGroups;this.pending=new Map();}
- run(key,read,traceId){
+ constructor({delayMs=2,maxGroups=64,maxMembers=64}={}){if(!Number.isInteger(delayMs)||delayMs<0||delayMs>10)throw Error("InvalidReadAdmissionDelay");if(!Number.isInteger(maxMembers)||maxMembers<1||maxMembers>64)throw Error("InvalidReadAdmissionLimit");this.delayMs=delayMs;this.maxGroups=maxGroups;this.maxMembers=maxMembers;this.pending=new Map();}
+ run(key,read,traceId,{untilAdmission=false,admissionClass="read"}={}){
+  if(!Object.hasOwn(limits,admissionClass)||waiters[admissionClass]>=limits[admissionClass])return Promise.reject(Error("CoordinatorCommitBusy"));
   let group=this.pending.get(key);
+  if(group&&group.members>=this.maxMembers||!group&&this.pending.size>=this.maxGroups)return Promise.reject(Error("CoordinatorCommitBusy"));
   if(!group){
-   if(this.pending.size>=this.maxGroups)return Promise.reject(Error('CoordinatorCommitBusy'));
-   group={traceIds:new Set()};this.pending.set(key,group);
-   group.promise=new Promise((resolve,reject)=>setTimeout(()=>{this.pending.delete(key);Promise.resolve().then(()=>read([...group.traceIds])).then(resolve,reject);},this.delayMs));
+   group={traceIds:new Set(),ids:[],members:0};this.pending.set(key,group);
+   const close=()=>{if(this.pending.get(key)===group)this.pending.delete(key);};
+   group.promise=new Promise((resolve,reject)=>setTimeout(()=>{
+    if(!untilAdmission)close();
+    Promise.resolve().then(()=>read(group.ids,close)).then(view=>{close();resolve(view);},error=>{close();reject(error);});
+   },this.delayMs));
   }
-  if(traceId)group.traceIds.add(traceId);
-  return group.promise.then(view=>structuredClone(view));
+  group.members++;waiters[admissionClass]++;
+  if(traceId&&!group.traceIds.has(traceId)){group.traceIds.add(traceId);group.ids.push(traceId);}
+  return group.promise.then(view=>structuredClone(view)).finally(()=>{waiters[admissionClass]--;});
  }
 }

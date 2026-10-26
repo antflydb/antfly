@@ -29,6 +29,27 @@ const module=await WebAssembly.compile(await readFile(new URL("../dist/antfly-se
 const utf8=new TextEncoder();
 const record=body=>({etag:crypto.randomUUID(),body:utf8.encode(body),contentType:null});
 const fixture=()=>{const bucket=new Bucket();return{bucket,store:new R2CoordinatorStore(module,bucket,"performance")};};
+test('queued read cohorts close at native admission and an old completion cannot erase a newer cohort',async()=>{
+ const{FreshReadAdmissions}=await import('../fresh-read-admissions.mjs'),admissions=new FreshReadAdmissions({delayMs:0});let entered,admit,observed,finish,nextEntered,nextAdmit,reads=0;
+ const queued=new Promise(resolve=>entered=resolve),admitted=new Promise(resolve=>admit=resolve),started=new Promise(resolve=>observed=resolve),done=new Promise(resolve=>finish=resolve),nextQueued=new Promise(resolve=>nextEntered=resolve),nextReady=new Promise(resolve=>nextAdmit=resolve);
+ const read=async(ids,close)=>{const ordinal=++reads;if(ordinal===1){entered();await admitted;close();observed();await done;}else{nextEntered();await nextReady;close();}return{ordinal,ids:[...ids]};};
+ const a=admissions.run('latest',read,'a',{untilAdmission:true});await queued;const b=admissions.run('latest',read,'b',{untilAdmission:true});admit();await started;
+ const c=admissions.run('latest',read,'c',{untilAdmission:true});await nextQueued;finish();assert.deepEqual((await a).ids,['a','b']);assert.equal((await b).ordinal,1);
+ const d=admissions.run('latest',read,'d',{untilAdmission:true});nextAdmit();assert.deepEqual((await c).ids,['c','d']);assert.equal((await d).ordinal,2);assert.equal(reads,2);
+});
+test('read cohort capacity preserves separate mutation metadata admission and releases every waiter',async()=>{
+ const{FreshReadAdmissions}=await import('../fresh-read-admissions.mjs'),admissions=new FreshReadAdmissions({delayMs:0});let release;const held=new Promise(resolve=>release=resolve),read=async(_,close)=>{await held;close();return{ok:true};};
+ const readers=Array.from({length:64},()=>admissions.run('read',read,undefined,{untilAdmission:true}));await assert.rejects(admissions.run('overflow-read',read),/CoordinatorCommitBusy/);
+ const commits=Array.from({length:16},()=>admissions.run('metadata',read,undefined,{untilAdmission:true,admissionClass:'commit'}));await assert.rejects(admissions.run('overflow-commit',read,undefined,{admissionClass:'commit'}),/CoordinatorCommitBusy/);
+ release();assert.equal((await Promise.all([...readers,...commits])).length,80);assert.deepEqual(await admissions.run('recovered',async()=>({ok:true})),{ok:true});
+ await assert.rejects(admissions.run('failed',async()=>{throw Error('failed observation');},undefined,{untilAdmission:true}),/failed observation/);assert.deepEqual(await admissions.run('failed',async()=>({recovered:true})),{recovered:true});
+});
+test('native observations close admission before transport I/O even without pool stage callbacks',async()=>{
+ const{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs'),bucket=new Bucket(),namespace='admission-hook',seed=new R2CoordinatorStore(module,bucket,namespace);await seed.transaction(tx=>tx.put('one',1));
+ const host=await instantiateHost(module,null),raw=createR2Transport({database:bucket});let closed=false,priority;
+ const store=new R2CoordinatorStore(module,bucket,namespace,{transport:async(...args)=>{assert.equal(closed,true);return raw(...args);},readKernel:{request(input,{onStage,...options}){priority=options.priority;return host.request(input,options);}}});
+ assert.equal(await store.readOnly(tx=>tx.get('one'),{onAdmission:()=>{closed=true;},priority:'commit'}),1);assert.equal(priority,'commit');
+});
 function edgeFixture(){
  const entries=new Map(),storage={async open(){return{async match(key){return entries.get(key.url)?.clone();},async put(key,response){entries.set(key.url,new Response(await response.arrayBuffer(),{headers:response.headers}));}};}};
  const key='antfly/artifacts/sha256/aa/'+'b'.repeat(62),request={op:'get',bucket:'database',key},physical={},transport=instrumentTransport(async req=>({json:{bucket:req.bucket,key:req.key,etag:'confirmed',content_length:3},body:utf8.encode('abc')}),physical);

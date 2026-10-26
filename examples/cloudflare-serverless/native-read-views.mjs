@@ -30,7 +30,7 @@ export class NativeReadViews {
   this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readKernel:observation,cache,onMetrics,remoteCache:edgeCacheForEnv(env,{background})});
  }
  open(options={}){
-  return this.cohorts.run(options.version??"latest",async traceIds=>{
+  return this.cohorts.run(options.version??"latest",async(traceIds,close)=>{
    const authority=await this.authorityAdmission.get();
    if(authority.descriptor.mode!=="r2"){this.authorityAdmission.value=null;throw Error("CoordinatorMigrationRequired");}
    const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
@@ -38,7 +38,7 @@ export class NativeReadViews {
     const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
     if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
     return captureReadView(tx,keys,options,this.clock);
-   },{traceId:options.trace_id,traceIds});
-  },options.trace_id);
+   },{traceId:options.trace_id,traceIds,onAdmission:close});
+  },options.trace_id,{untilAdmission:true});
  }
 }

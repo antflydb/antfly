@@ -111,12 +111,13 @@ export class R2CoordinatorStore {
     while(this.rows.size>=256||this.rowBytes+this.hintBytes+bytes>512*1024){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
     this.rows.set(key,{value:structuredClone(value),bytes});this.rowBytes+=bytes;
   }
-  async readOnly(run,{traceId,traceIds=[]}={}){
+  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive"}={}){
     if(this.ownerReady)await this.ownerReady;
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
     const owned=this.acquired,captured=structuredClone(owned?this.state:(this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=this.clock()+5000,started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false;
     const reserve=(operations,bytes)=>{if(usedOperations+operations>=254||usedBytes+bytes>=8*1024*1024){admissionBudgetExceeded=true;throw Error("ReadSnapshotNeedsAdmission");}usedOperations+=operations;usedBytes+=bytes;};
-    const raw=this.cache.wrap(this.remoteCache(instrumentTransport(this.rawTransport,physical),{budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}}),`coordinator/${this.namespace}`);
+    const cached=this.cache.wrap(this.remoteCache(instrumentTransport(this.rawTransport,physical),{budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}}),`coordinator/${this.namespace}`);
+    const raw=(request,body)=>{onAdmission?.();return cached(request,body);};
     const guarded=async(request,body)=>{if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");return raw(request,body);};
     let transport;
     if(owned&&captured&&this.base){
@@ -131,7 +132,7 @@ export class R2CoordinatorStore {
     }else transport=recoveryReadAhead(guarded,{window:this.recoveryWindow||1,initialWindow:1,reserve,cursor:captured,followSeals:!owned});
     const native=(state,coordinate)=>{
       if(usedOperations>=254||usedBytes>=8*1024*1024)throw Error("ReadSnapshotNeedsAdmission");
-      return this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,fairKey:this.namespace,priority:"interactive",deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,...sample});}catch{}}});
+      return this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,fairKey:this.namespace,priority,onStage:sample=>{if(sample.name==="kernel_queue")onAdmission?.();},deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,...sample});}catch{}}});
     };
     this.snapshotReaders++;
     try{

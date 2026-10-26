@@ -394,3 +394,8 @@ in the sealed profile. The reserved physical epochs exercise coordinator
 recovery; complete app Worker isolate eviction remains an explicit limitation.
 The local restart fixture separately verifies recovery with platform storage
 erased and the optional edge cache disabled.
+
+Queued callers may share a read cohort only until native kernel admission (and
+always before transport observation). Completed snapshots remain request-bound.
+Read and mutation-metadata caller allowances are separate and bounded; native
+fencing, visibility, deadlines and acceptance limits are unchanged.

@@ -1433,3 +1433,25 @@ fencing and the 32 MiB app budget without invoking a reader actor. It then
 restarts every isolate, erases platform storage, disables the edge cache and
 verifies data and receipts again. Native module hashes and frozen ANN evidence
 remain unchanged; live direct-reader performance is not yet qualified.
+
+
+The first direct-app diagnostic (`direct-app-smoke-2.json`, revision
+`e7008b3fca`) completed the offered five minutes with 120 reads and 40 writes
+per side, no HTTP/resource errors and zero DLQ messages in the final Queue
+samples. Candidate read/write p95 was 1,314 / 3,011 ms versus 5,672 / 6,747 ms
+for the frozen control. Both absolute limits are still missed. The completed
+report verified 80 bodies and eight receipts overall. No reserved cold epoch was used.
+
+Queued observation cohorts now close at native kernel admission rather than
+when their short batching timer expires. This coalesces callers waiting for the
+same fresh observation without admitting any member after observation starts.
+Transport I/O provides a second boundary hook when a host omits pool stages.
+New regressions cover that hook, the close boundary, independent view copies,
+old completion/new cohort races, separate read/mutation capacity and recovery
+after failures. All 203 Node checks and all ten persisted Worker checks pass
+(the latter in 279.3 seconds). New live qualification remains required.
+
+The frozen control's DLQ was subsequently observed empty through its pull API,
+and its temporary HTTP pull consumer was removed. Recovery proofs retain both
+original task hashes and accepted replays; this operational recovery does not
+turn the earlier failed runs into passing evidence.
