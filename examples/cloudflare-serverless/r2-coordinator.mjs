@@ -193,13 +193,17 @@ export class R2CommitCoordinator extends DurableObject {
   async commitMutations(inputs,deadline=Date.now()+30000) {
     const trace=new CriticalPath({id:inputs[0]?.__trace_id,scope:"wal"}),started=performance.now(),keys=await metadataKeys(this.env.ANTFLY_INCARNATION),physical={};
     let usedOperations=0,usedBytes=0;
+    // Point mutations touch bounded WAL/operation-index paths. Larger groups
+    // retain the full native variant and its exclusive 32 MiB reservation.
+    const compactWal=inputs.length===1&&inputs[0].mutations?.length===1&&new TextEncoder().encode(JSON.stringify(inputs[0])).byteLength<=16384;
+    const walWorkingBytes=compactWal?Math.min(8*1024*1024,Number(this.env.WORKING_SET_BYTES??20*1024*1024)):Number(this.env.WORKING_SET_BYTES??20*1024*1024);
     for(let attempt=0;attempt<3;attempt++){
       // The shared durable generation pin protects the manifest read during
       // preparation. New publication can only make admission more conservative.
       const view=await trace.span("prepare_snapshot",()=>this.openReadView({trace_id:trace.id})),prepared=new PreparedWal(keys.wal,view.entries);
       const transport=this.store.cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical),prepared),this.env.ANTFLY_INCARNATION);
 
-      const result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:Number(this.env.WORKING_SET_BYTES??20*1024*1024),mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));
+      const result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:walWorkingBytes,mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));
       let maximum=0n;for(const item of result.results)maximum=BigInt("0x"+item.visibility.slice(-16))>maximum?BigInt("0x"+item.visibility.slice(-16)):maximum;
       let committed;
       if(prepared.head&&this.env.NATIVE_WAL_COMMIT!=="false"){

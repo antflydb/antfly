@@ -1020,3 +1020,13 @@ read-only observations, retaining its 64 MiB total pool ceiling. All 155 Node
 checks pass, including a suspended-mutation-kernel observation regression. The
 latest grouped Worker attempt on write-through alone again timed out in the
 split-runtime fixture and is not passing evidence.
+
+
+The reserved-observation revision passed all six persisted Worker checks in
+228.9 seconds; the split-runtime fixture completed within its unchanged
+120-second timeout. Its diagnostics confirm exact counts before eviction,
+disposal, and the same receipt after reopening. This is the completed passing
+run; earlier timeouts remain recorded separately. A subsequent weighted WAL pool
+passed all 157 Node checks, including cancellation and starvation prevention
+under a fixed memory reservation ceiling, plus actual compact-writer/reader
+compatibility. Its own persisted Worker and live checks remain required.

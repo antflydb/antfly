@@ -325,3 +325,23 @@ test('queued read preparation preserves pinned identity and fails closed on tran
  const fenced=Error('ImmutableLogFenced');stub.openReadView=async()=>{throw fenced;};await assert.rejects(prepareReadAdmission(env,{op:'lookup'},trace),error=>error===fenced);
  stub.openReadView=async()=>{throw Error('openReadView does not implement this RPC');};assert.equal((await prepareReadAdmission(env,{op:'lookup'},trace)).legacy,true);
 });
+
+
+test("weighted kernel reservations bound retained memory and let a large waiting variant drain",async()=>{
+ const{RequestPool}=await import('../request-pool.mjs');let now=0,releaseFirst,releaseSecond,firstEntered,secondEntered;const firstStarted=new Promise(r=>firstEntered=r),secondStarted=new Promise(r=>secondEntered=r),firstGate=new Promise(r=>releaseFirst=r),secondGate=new Promise(r=>releaseSecond=r),order=[];
+ const pool=new RequestPool(async job=>({usable:()=>true,memoryBytes:()=>job.reservationBytes}),2,{clock:()=>now,maxReservedBytes:32,reservationBytes:32,recycleBytes:100});
+ const compact={memoryReservationBytes:16,kernelVariant:'compact'};
+ const first=pool.withHost(async()=>{firstEntered();await firstGate;},compact),second=pool.withHost(async()=>{secondEntered();await secondGate;},compact);await Promise.all([firstStarted,secondStarted]);assert.equal(pool.reservedBytes,32);assert.equal(pool.memoryBytes(),32);
+ const large=pool.withHost(()=>{order.push('large');assert.equal(pool.reservedBytes,32);assert.ok(pool.memoryBytes()<=32);},{kernelVariant:'full'});now=6000;
+ releaseFirst();await first;const small=pool.withHost(()=>{order.push('small');assert.ok(pool.memoryBytes()<=32);},compact);await new Promise(r=>setTimeout(r,0));assert.deepEqual(order,[],'aged large reservation must drain running smaller work');
+ releaseSecond();await Promise.all([second,large,small]);assert.deepEqual(order,['large','small']);assert.equal(pool.reservedBytes,0);assert.ok(pool.memoryBytes()<=32);
+ await assert.rejects(pool.withHost(()=>{}, {memoryReservationBytes:33}),/InvalidKernelMemoryReservation/);
+});
+
+test("cancelled weighted reservations release waiting work without opening another host",async()=>{
+ const{RequestPool}=await import('../request-pool.mjs');let release,entered;const started=new Promise(r=>entered=r),gate=new Promise(r=>release=r),controller=new AbortController();let now=0;
+ const pool=new RequestPool(async job=>({usable:()=>true,memoryBytes:()=>job.reservationBytes}),2,{clock:()=>now,maxReservedBytes:32,reservationBytes:16});
+ const held=pool.withHost(async()=>{entered();await gate;});await started;
+ const blocked=assert.rejects(pool.withHost(()=>assert.fail('cancelled reservation ran'),{memoryReservationBytes:32,signal:controller.signal}),/DeadlineExceeded/);now=6000;
+ const available=pool.withHost(()=>42);controller.abort();assert.equal(await available,42);await blocked;release();await held;assert.equal(pool.reservedBytes,0);
+});

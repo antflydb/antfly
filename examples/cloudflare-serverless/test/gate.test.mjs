@@ -21,6 +21,7 @@ test('WAL format activation probes the actual full writer and compact reader',as
  const{verifyWalTailReaders}=await import('../qualification/wal-compatibility.mjs'),{readFile}=await import('node:fs/promises');
  const modules=await Promise.all(['antfly-serverless.wasm','antfly-serverless-compact.wasm'].map(async name=>WebAssembly.compile(await readFile(new URL('../dist/'+name,import.meta.url)))));
  assert.deepEqual(await verifyWalTailReaders(...modules),{writer_format:3,reader_count:'1'});
+ assert.deepEqual(await verifyWalTailReaders(modules[1],modules[1]),{writer_format:3,reader_count:'1'});
 });
 test('setup replay requires a completely acknowledged corpus and no offered workload',()=>{
  const baseline={id:'baseline',wasm_sha256:'a'.repeat(64),reader_wasm_sha256:'b'.repeat(64)},candidate={...baseline,id:'candidate'},execution_id=crypto.randomUUID();

@@ -23,9 +23,9 @@ export const readerKernel=new RequestPool(()=>instantiateHost(compact,null),2);
 export const metadataKernel=new RequestPool(()=>instantiateHost(compact,null),1);
 const snapshotKernel=new RequestPool(()=>instantiateHost(compact,null),0);
 export function readObservationKernel(){return snapshotKernel.slots.length?snapshotKernel:metadataKernel;}
-export const buildKernel=new RequestPool(()=>instantiateHost(full,null),1,{recycleBytes:24*1024*1024});
+export const buildKernel=new RequestPool(job=>instantiateHost(job.options.kernelVariant==="compact"?compact:full,null),1,{recycleBytes:24*1024*1024,maxReservedBytes:32*1024*1024,reservationBytes:32*1024*1024});
 let runtimeRole="shared";
-const roles={shared:[2,1,1,0,80],writer:[0,1,1,1,64],reader:[2,0,0,0,32],builder:[0,0,1,0,32],app:[0,0,0,0,0]};
+const roles={shared:[2,1,1,0,80],writer:[0,1,2,1,64],reader:[2,0,0,0,32],builder:[0,0,1,0,32],app:[0,0,0,0,0]};
 export function configureKernels(role){
  const layout=roles[role];if(!layout)throw new Error("InvalidRuntimeRole");if(runtimeRole!=="shared"&&runtimeRole!==role)throw new Error("RuntimeRoleMismatch");
  for(const[pool,index]of[[readerKernel,0],[metadataKernel,1],[buildKernel,2],[snapshotKernel,3]]){if(pool.pending.length||pool.slots.some(slot=>slot.host||slot.busy))throw new Error("RuntimeAlreadyStarted");pool.slots=Array.from({length:layout[index]},()=>({host:null,busy:false}));}

@@ -275,3 +275,16 @@ WAL-preparation slot, the writer retains the 64 MiB pool ceiling. The shared
 single-script mode keeps its original layout. The observation lane cannot write,
 repair, checkpoint or acquire an epoch. This isolates fresh reads from a
 suspended metadata mutation without changing authority or fencing semantics.
+
+
+The WAL-preparation pool uses weighted reservations within its existing 32 MiB
+ceiling. A single mutation envelope of at most 16 KiB can use the compact native
+binary, an 8 MiB working budget and a 16 MiB linear reservation. Two such prepares
+can overlap. Larger groups retain the full binary, the existing working budget
+and an exclusive 32 MiB reservation. Metadata mutation and observation each keep
+a separate compact slot, so total writer pool memory remains bounded by 64 MiB.
+Idle retained hosts count toward reservations and are evicted before changing to
+a larger variant. An aged large request drains smaller work, and cancellation
+removes its reservation before allowing other waiting jobs to proceed. Every
+prepare still writes private pages first; authoritative commit and receipt
+fencing remain unchanged.
