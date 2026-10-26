@@ -6172,3 +6172,26 @@ integer/timestamp feature samples retain 21–22 ordered candidates out of 4,096
 rows. Eighteen archive tooling tests, stable control/error catalog checks, format
 checks and embedded/Apache boundary audits (1,014 / 2,486 sources) pass. Main
 `9d152a4c78` is merged; repeated final fetch/merge checks report up to date.
+
+
+The [batch-kernel qualification](bench/lake/native-batch-kernels-v3-observation.json)
+pins clean source `b9e51ad91b` and measures ordering extraction, metadata masks and
+fused compaction provenance. Per-batch binding preserves canonical datetime,
+encoded and nested conversion while flat numeric, Boolean and keyword columns
+use typed kernels. Only plans with a metadata batch producer prefetch 16 ordered
+rows; each buffered row retains its own public tie proof. Boolean masks retain
+minimum-should-match, exclusions, duplicate positions and exact bitmap fallback.
+Typed compaction emits contiguous provenance during existing preparation;
+observer failures still abort the private publication attempt.
+
+All 36 baseline and 36 candidate samples preserve complete answers and expected
+IDs. Local Debug warm medians are about 1–5% lower; metadata prefetch scans 33
+rather than 22 rows in these limit-20 controls while still decorating 21. The
+ordering kernel measures 262 ms versus 8.2 ms with the same checksum. Metadata
+callback count falls from 64 points to one batch; the alternating-run merge
+emits 32 ranges instead of 8,192 point callbacks and avoids an extra plan pass.
+These operations do not qualify cloud or full-archive throughput. Qualification
+passes 343 native test executions (two declared skips), 18 tooling tests, and
+29 real Parquet/Iceberg E2Es covering NULL/date cursors, broad metadata filters,
+identity reuse, schema changes, deletes, pgwire and restart. Main `0c753dc705`
+is merged; compiled runtime ABI 65 covers the added internal batch callback.

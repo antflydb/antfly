@@ -450,3 +450,31 @@ integer/timestamp feature samples retain 21–22 ordered candidates out of 4,096
 rows. Eighteen archive tooling tests, stable control/error catalog checks, format
 checks and embedded/Apache boundary audits (1,014 / 2,486 sources) pass. Main
 `9d152a4c78` is merged; repeated final fetch/merge checks report up to date.
+
+
+### Ordering batches and merge provenance
+
+[`native-batch-kernels-v3-observation.json`](native-batch-kernels-v3-observation.json)
+pins clean production source `b9e51ad91b`, the frozen executable and reports.
+The same eight Parquet files / 16,384 rows pass 36 samples per binary, preserving
+complete normalized answers and independently expected IDs across six cases.
+All samples decorate 21 candidates. Ordinary term plans scan 22 rows; metadata
+plans prefetch at most 16 candidates and scan 33 rather than 22 in these controls.
+Warm median ratios range from 0.945 to 0.992. Sequential local Debug runs and
+concurrent validation do not establish causal latency or archive throughput.
+
+A 16,384-row / eight-key / 32-column comparison retains identical checksums:
+repeated row adaptation takes 262,053,000 ns, versus 8,169,000 ns with one batch
+binding and typed kernels. This is a kernel observation, not publication speed.
+A 64-candidate metadata mask uses one batch callback and no point callbacks.
+The 8,192-row alternating 256-row-run merge emits 32 provenance ranges instead
+of 8,192 point callbacks and removes the extra typed ordered-plan pass. Fully
+interleaved inputs still need individual ranges; source-only merges retain the
+allocation-free fallback traversal. Captured ordering still decodes zero payload
+blocks in the existing 8,193-row / 129-block / 16-fragment regression.
+
+Qualification passes 343 native test executions with two declared skips,
+18 archive tooling tests, compiled error identity and control/error catalog
+checks, and 29 real Parquet/Iceberg E2Es without skips. The native count includes
+the compiled error-identity test. Main `0c753dc705` is merged. Reader protocol 89
+and existing durable key formats remain; the internal compiled runtime ABI is 65.
