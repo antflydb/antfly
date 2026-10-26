@@ -4261,12 +4261,8 @@ test "artifact text replay deletes only keys owned by its source projection" {
 test "db artifact dense target prefers current incarnation outcomes over stale name counter" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -4275,7 +4271,8 @@ test "db artifact dense target prefers current incarnation outcomes over stale n
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const config: types.IndexConfig = .{
         .name = "dense_idx",

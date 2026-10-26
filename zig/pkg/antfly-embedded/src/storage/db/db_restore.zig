@@ -5810,19 +5810,17 @@ test "db portable restore rebuilds multi-source graph contender provenance" {
 test "db native snapshot exports self-contained generation" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
         .filesystem_io = std.testing.io,
     });
     defer runtime.deinit();
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .backend_runtime = runtime.ptr(),
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
+    const path = t.path().ptr;
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:snap", .value = "{\"title\":\"snap\"}" }},
@@ -5874,17 +5872,14 @@ test "db native snapshot rejects storage without atomic host generation publicat
     antfly_test_error_logs.expectErrorLogs(1);
 
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var memory_storage = lsm_backend_mod.MemoryStorage.init(alloc);
     defer memory_storage.deinit();
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .storage = memory_storage.storage(),
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.batch(.{ .writes = &.{.{ .key = "doc:one", .value = "{\"title\":\"one\"}" }} });
     try std.testing.expectError(
         error.NativeBackupStorageBackendUnsupported,

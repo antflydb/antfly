@@ -38786,14 +38786,12 @@ test "generated document embeddings batch across rows and memoize retry work" {
         }
     };
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
     var probe = BatchProbe{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{ .owner_id = "batch-probe", .dense_embedder = probe.interface() },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     var consumers_a = [_][]u8{@constCast("dense_v1")};
     var consumers_b = [_][]u8{@constCast("dense_v1")};
@@ -38833,13 +38831,13 @@ test "generated document embeddings batch across rows and memoize retry work" {
     var memo = GeneratedEmbeddingMemo.init(alloc);
     defer memo.deinit();
     const request = types.BatchRequest{ .writes = &writes };
-    try prewarmGeneratedDenseMemo(&db, request, &extracted, .all, &plan, &memo);
+    try prewarmGeneratedDenseMemo(db, request, &extracted, .all, &plan, &memo);
     try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
     try std.testing.expectEqual(@as(usize, 2), probe.items);
     try std.testing.expectEqual(@as(usize, 2), memo.dense.count());
 
     // The same semantic request on an optimistic retry performs no provider IO.
-    try prewarmGeneratedDenseMemo(&db, request, &extracted, .all, &plan, &memo);
+    try prewarmGeneratedDenseMemo(db, request, &extracted, .all, &plan, &memo);
     try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
 }
 
@@ -40736,10 +40734,6 @@ test "background maintenance services lifecycle runs on borrowed VoprIo" {
 
 test "db inherits the resource manager capacity source" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const CapacityContext = struct {
         fn observe(_: *anyopaque) anyerror!resource_manager_mod.CapacityObservation {
             return .{ .available_bytes = 1234, .capacity_bytes = 5678 };
@@ -40754,8 +40748,9 @@ test "db inherits the resource manager capacity source" {
         .observe = CapacityContext.observe,
     });
 
-    var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &manager });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .resource_manager = &manager });
+    defer t.deinit();
+    const db = &t.db;
     const source = db.capacity_source orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u128, 91), source.domain_id);
     const observed = try source.current();
@@ -41346,16 +41341,14 @@ pub fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
     var options = db_config.primary_lsm_options_default;
     options.tombstone_gc_min_percent = gc_min_percent;
     // Exercise real persisted files; make only the obsolete-file grace period
     // deterministic. Pinned readers must still prevent premature reclamation.
     options.obsolete_retention_ns = 0;
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = options } });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = options } });
+    defer t.deinit();
+    const db = &t.db;
     const columns = [_]schema_mod.RelationalColumn{
         .{ .name = "n", .path = "n", .column_type = .integer },
         .{ .name = "payload", .path = "payload", .column_type = .string },
@@ -41372,7 +41365,7 @@ pub fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
         write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = try std.fmt.allocPrint(scratch, "{{\"n\":{d},\"payload\":\"{s}\"}}", .{ i, payload }) };
     }
     try db.batch(.{ .writes = &writes });
-    try drainTestRelationalMaintenance(&db);
+    try drainTestRelationalMaintenance(db);
     const backend = db.core.primary_store_owner.lsmBackend().?;
     try backend.sync(true);
     var pinned = try db.core.store.beginReadTxn();
@@ -41395,7 +41388,7 @@ pub fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
         const started = platform_time.monotonicNs();
         try db.batch(.{ .writes = &updates });
         ns.* = platform_time.monotonicNs() - started;
-        try drainTestRelationalMaintenance(&db);
+        try drainTestRelationalMaintenance(db);
         // Checkpoint at measurement boundaries, not once per individual write.
         try backend.sync(true);
         peak_physical = @max(peak_physical, try (try backend.measurePhysicalUsage()).totalBytes());
@@ -41406,9 +41399,9 @@ pub fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     var deletes: [128][]const u8 = undefined;
     for (&deletes, 0..) |*key, i| key.* = writes[i * 2].key;
     try db.batch(.{ .deletes = &deletes });
-    try drainTestRelationalMaintenance(&db);
+    try drainTestRelationalMaintenance(db);
     try backend.sync(true);
-    try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+    try relational_columns.validatePayloadOwnershipForTest(db, alloc);
     var stats: types.ColumnarScanStats = .{};
     var result = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .columnar_stats = &stats });
     defer result.deinit(alloc);
@@ -41424,7 +41417,7 @@ pub fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
         try (try backend.measurePhysicalUsage()).totalBytes(),
         mutation_ns[8],
         mutation_ns[15],
-        try relational_columns.payloadStorageBytesForTest(&db, alloc),
+        try relational_columns.payloadStorageBytesForTest(db, alloc),
         stats.payload_bytes_read,
     });
 }
@@ -42040,17 +42033,14 @@ test "db preferred identity namespace seeds new stores but preserves existing na
 test "db can reassign identity namespace for rebuild" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const old_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 801, .range_id = 8001 };
     const new_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 802, .range_id = 8002 };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .identity_namespace = old_namespace,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
@@ -42796,15 +42786,12 @@ test "db lsm primary compaction preserves doc identity ordinals" {
 test "db validates internal resolved doc filter wire namespace and generation" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const namespace = doc_identity.Namespace{ .table_id = 1, .shard_id = 2, .range_id = 3 };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .identity_namespace = namespace,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -44758,19 +44745,16 @@ test "db lsm primary reopens explicit dense replay stream state" {
 test "db lsm generated chunked enrichment publishes replay stream state" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = db_config.primary_lsm_options_default },
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dense_idx",
@@ -44943,16 +44927,13 @@ test "db starts resolver replay workers only while resolver catalog is configure
 test "db backfills a mention name embedding so ann/cosine resolution links end-to-end" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var embedder = FixedVectorEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .resolution_embedder = embedder.interface(),
         .start_index_workers = false,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -45015,7 +44996,7 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
     try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 
-    const edges = try waitForGraphEdges(alloc, &db, "relations_graph", "doc:a", "mentions", .out, 1);
+    const edges = try waitForGraphEdges(alloc, db, "relations_graph", "doc:a", "mentions", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
@@ -45485,15 +45466,12 @@ pub const FakePromotionSink = struct {
 test "db promotes resolved entities into entity-document upserts end-to-end" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var sink = FakePromotionSink{ .alloc = alloc };
     defer sink.deinit();
 
-    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .entity_sink = sink.sink() });
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.relations_graph);
     try db.addResolver(.{
@@ -45747,18 +45725,15 @@ test "db member-mode chunk hits apply query.bool.filter/must_not doc_id against 
 test "db member-mode chunk hits apply query.bool.filter/must_not against the parent row on the dense arm" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var embedder = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = embedder.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_chunked_named);
 
@@ -45816,18 +45791,15 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
 test "db member-mode chunk hits apply query.bool.filter/must_not doc_id against the resolved parent id on the dense arm (PR #957)" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var embedder = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = embedder.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_chunked_named);
 
@@ -45994,18 +45966,15 @@ test "db member-mode chunk hits apply filter_query/exclusion_query against the p
 test "db member-mode chunk hits apply filter_prefix against the parent row on the sparse arm (issue #931/#957)" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var embedder = embedder_mod.DeterministicSparseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .sparse_embedder = embedder.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "sp_v1",
@@ -46051,18 +46020,15 @@ test "db member-mode chunk hits apply filter_prefix against the parent row on th
 test "db composed full_text+dense (rrf) member-mode fusion scopes filter_query/exclusion_query to the parent row without collapsing distinct chunks (issue #931)" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var embedder = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = embedder.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     // The dense index's inline generator registers the "body_chunks_v1"
     // chunk enrichment as a side effect; the full-text index then sources
@@ -46744,19 +46710,16 @@ test "db canonicalizes positional extractor endpoints once resolution lands" {
 test "db resolver removal retires resolution artifacts and mention graph state" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var sink = FakePromotionSink{ .alloc = alloc };
     defer sink.deinit();
 
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .executor = .{ .backend = .manual },
         .start_index_workers = false,
         .entity_sink = sink.sink(),
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.prov_graph);
     try db.addResolver(.{
@@ -46824,7 +46787,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"_artifact_kind\":\"resolution_mention\"") != null);
     }
     {
-        const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
+        const out = try waitForGraphEdges(alloc, db, "prov_graph", "doc:a", "mentions", .out, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 1), out.len);
         var parsed_metadata = try std.json.parseFromSlice(std.json.Value, alloc, out[0].metadata, .{});
@@ -46837,7 +46800,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         try std.testing.expectEqualStrings(second_mention_artifact_key, mention_artifact_keys[1].string);
     }
     {
-        const inbound = try waitForGraphEdges(alloc, &db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
+        const inbound = try waitForGraphEdges(alloc, db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
     }
@@ -46874,14 +46837,11 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
 test "db does not materialize review-band resolution as canonical mention edges" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     // Keep production workers enabled: this is the regression for the original
     // race between background resolver catch-up and the runUntilIdle fence.
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.prov_graph);
     try db.addResolver(.{
@@ -46934,7 +46894,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
     // Only the cleanly resolved mention has a canonical edge; the reviewed
     // one is withheld.
     {
-        const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
+        const out = try waitForGraphEdges(alloc, db, "prov_graph", "doc:a", "mentions", .out, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 1), out.len);
         try std.testing.expectEqualStrings("person/charles_babbage", out[0].target);
@@ -46968,7 +46928,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
 
     // runUntilIdle is the lifecycle fence: a blocked promotion sink must not
     // prevent the independent graph consumer from publishing this edge.
-    const curated_edges = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 2);
+    const curated_edges = try waitForGraphEdges(alloc, db, "prov_graph", "doc:a", "mentions", .out, 2);
     defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
     try std.testing.expectEqual(@as(usize, 2), curated_edges.len);
     var saw_ada = false;
@@ -46979,7 +46939,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
 
     // Approval also releases the withheld relation, entity-sourced from the
     // canonical endpoint.
-    const curated_knows = try waitForGraphEdges(alloc, &db, "prov_graph", "person/charles_babbage", "knows", .out, 1);
+    const curated_knows = try waitForGraphEdges(alloc, db, "prov_graph", "person/charles_babbage", "knows", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, curated_knows);
     try std.testing.expectEqual(@as(usize, 1), curated_knows.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_knows[0].target);
@@ -47900,18 +47860,15 @@ test "producer readiness cached graph relations survive metadata overwrite and r
 test "db async asset producer graph source materializes through replay" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -47946,24 +47903,21 @@ test "db async asset producer graph source materializes through replay" {
 test "db async asset producer mention edges come from resolution artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{
         .extractor_output =
         \\{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}],"relations":[]}
         ,
     };
     var embedder = FixedVectorEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
         },
         .resolution_embedder = embedder.interface(),
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "prov_graph",
@@ -48077,13 +48031,9 @@ test "db full_index precomputes generated enrichments into the committed batch" 
     var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
     defer manager.deinit(alloc);
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .resource_manager = &manager,
         .enrichment = .{
             .owner_id = "worker-a",
@@ -48091,7 +48041,8 @@ test "db full_index precomputes generated enrichments into the committed batch" 
             .sparse_embedder = deterministic_sparse.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_dims3_generated);
     try db.addIndex(.{
@@ -48173,12 +48124,8 @@ test "db full_text sync level does not wait for dense hbc visibility" {
 test "db replicated apply decouples client enrichment sync from raft apply execution" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         // Inspect only the replicated apply record. An independent enrichment
         // worker may legitimately append a second record immediately afterward.
@@ -48188,7 +48135,8 @@ test "db replicated apply decouples client enrichment sync from raft apply execu
             .dense_embedder = deterministic_dense.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_dims3_generated);
 
@@ -48293,18 +48241,15 @@ pub fn jsonTestNumber(value: std.json.Value) f64 {
 test "db asset producer enrichments execute fake providers and skip unchanged state" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "generated_title_v1",
@@ -48474,18 +48419,15 @@ test "db asset producer enrichments batch compatible generated assets" {
         }
     };
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = BatchProducer{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "summary_v1",
@@ -48559,18 +48501,15 @@ test "db asset producer sync precompute fails closed on permanent item failure" 
         }
     };
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = FallbackProducer{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "summary_v1",
@@ -48782,18 +48721,15 @@ test "db hierarchy navigation seeks only the descriptor blocks needed by the pag
 test "db hierarchy cursor binds every unit artifact revision under its source" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     for ([_][]const u8{ "a/units_v1", "z_units_v1" }) |name| {
         try db.addEnrichment(.{
@@ -48871,19 +48807,16 @@ test "db hierarchy cursor binds every unit artifact revision under its source" {
 test "db async document extraction accounts resource manager working set" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .resource_manager = &resource_manager,
         .enrichment = .{
             .owner_id = "worker-a",
             .enable_without_producers = true,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(test_enrichment.document_units_v1);
 
@@ -48987,19 +48920,16 @@ test "db async document extraction deletes artifacts with corrupt previous extra
 test "db async document extraction reuses generated OCR text across streaming passes" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -49641,13 +49571,9 @@ test "db public extraction budget rejection publishes a failure manifest" {
 
 test "db public artifact reprocess accepts durable work despite unrelated provider retries" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = GateDenseEmbedder{};
     gated.allowed_successes.store(100, .release);
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
@@ -49656,7 +49582,8 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
             .worker_retry_max_attempts = 10,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addIndex(.{
         .name = "semantic",
@@ -49883,19 +49810,16 @@ test "db successful embedding publication retires covered provider failure debt"
 test "db shared repair completion reprocesses consumer with terminal coverage" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "semantic",
         .kind = .dense_vector,
@@ -50154,13 +50078,9 @@ fn testMaterializedEmbeddingWriteGrowth(comptime mode: enum { dense, derived_den
     const is_sparse = mode == .sparse;
     const embedding_name = if (is_sparse) "document_sparse" else "document_dense";
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{
@@ -50169,7 +50089,8 @@ fn testMaterializedEmbeddingWriteGrowth(comptime mode: enum { dense, derived_den
             .sparse_embedder = deterministic_sparse.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -50273,10 +50194,10 @@ fn testMaterializedEmbeddingWriteGrowth(comptime mode: enum { dense, derived_den
         .sparse => computeSparseRequestDerived,
     };
     if (mode == .dense) {
-        try compute(alloc, &db, "{}", request, &artifact_writes, &embeddings, &chunk_cache);
+        try compute(alloc, db, "{}", request, &artifact_writes, &embeddings, &chunk_cache);
     } else {
         const no_deletes = std.StringHashMapUnmanaged(void).empty;
-        try compute(alloc, &db, "{}", request, &artifact_writes, &no_deletes, &embeddings, &chunk_cache, null, null, true);
+        try compute(alloc, db, "{}", request, &artifact_writes, &no_deletes, &embeddings, &chunk_cache, null, null, true);
     }
 
     // Guard the test's relocation precondition, not just the successful no-growth path.
@@ -50396,12 +50317,8 @@ test "db sync_level enrichments returns without waiting on an unrelated enrichme
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var slow_asset = SlowGatedAssetProducer{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = slow_asset.interface(),
@@ -50409,7 +50326,8 @@ test "db sync_level enrichments returns without waiting on an unrelated enrichme
         },
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     defer slow_asset.allow();
 
     try db.addEnrichment(test_enrichment.summary_v1);
@@ -50576,18 +50494,15 @@ test "db extractEnrichments rejects unsupported legacy summaries field" {
 test "db computeEnrichments synchronously builds chunk and embedding outputs" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_chunked_named);
     try db.addIndex(test_index.ft_chunks);
@@ -50633,24 +50548,21 @@ test "db computeEnrichments synchronously builds chunk and embedding outputs" {
             try std.testing.expect(computed.dense_embeddings.len != 0);
         }
     };
-    try platform.allocator.checkAllAllocationFailures(alloc, AllocationSweep.run, .{&db});
+    try platform.allocator.checkAllAllocationFailures(alloc, AllocationSweep.run, .{db});
 }
 
 test "db leased enrichment worker generates dense embeddings" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1);
 
@@ -50736,12 +50648,8 @@ test "db leased enrichment worker renews text replay tenure across provider wait
 test "db leased enrichment worker backs off while a stale owner holds the lease" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-b",
@@ -50749,7 +50657,8 @@ test "db leased enrichment worker backs off while a stale owner holds the lease"
         },
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     var stale_lease = try enrichment_lease.EnrichmentLease.init(
         alloc,
@@ -50789,19 +50698,16 @@ test "db leased enrichment worker backs off while a stale owner holds the lease"
 test "db leased enrichment worker generates dense embeddings with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1);
 
@@ -50872,14 +50778,10 @@ fn independentDensePublicationVisibleForTest(db: *DB, alloc: Allocator) !bool {
 test "db retryable chunked producer does not block independent dense publication" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = SelectiveGateDenseEmbedder{
         .blocked_embedding_name = "body_chunk_dense",
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = gated.interface(),
@@ -50887,7 +50789,8 @@ test "db retryable chunked producer does not block independent dense publication
         },
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     // Register the throttled chunked producer first. Request ordering must not
     // be the mechanism that lets the direct title producer make progress.
@@ -50922,7 +50825,7 @@ test "db retryable chunked producer does not block independent dense publication
             }
         }
         if (sibling_published)
-            sibling_published = try independentDensePublicationVisibleForTest(&db, alloc);
+            sibling_published = try independentDensePublicationVisibleForTest(db, alloc);
         if (sibling_published) break;
         sleepPollInterval();
     }
@@ -50948,13 +50851,9 @@ test "db retryable chunked producer does not block independent dense publication
 test "db retryable asset producer batches do not block independent dense publication" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated_asset = GateAssetProducer{};
     var dense = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = gated_asset.interface(),
@@ -50963,7 +50862,8 @@ test "db retryable asset producer batches do not block independent dense publica
         },
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     // Register the unavailable asset producer first so request ordering cannot
     // be the mechanism that lets the dense producer make progress.
@@ -51002,7 +50902,7 @@ test "db retryable asset producer batches do not block independent dense publica
             }
         }
         if (sibling_published)
-            sibling_published = try independentDensePublicationVisibleForTest(&db, alloc);
+            sibling_published = try independentDensePublicationVisibleForTest(db, alloc);
         if (sibling_published) break;
         sleepPollInterval();
     }
@@ -51028,15 +50928,11 @@ test "db retryable asset producer batches do not block independent dense publica
 test "db blocked dense embedding lane does not force the independent asset lane to redo checkpointed work" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated_dense = GateDenseEmbedder{};
     gated_dense.allowed_successes.store(0, .release);
     var gated_asset = GateAssetProducer{};
     gated_asset.allowAll();
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = gated_asset.interface(),
@@ -51045,7 +50941,8 @@ test "db blocked dense embedding lane does not force the independent asset lane 
         },
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(test_enrichment.summary_v1);
     try db.addIndex(test_index.title_dense);
@@ -52127,19 +52024,16 @@ test "source vector table rejects delayed enrichment after source update deletio
 pub fn testDenseSourceHashReuse(settings: table_storage_mod.Settings) !void {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .table_storage = settings,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -52159,7 +52053,7 @@ pub fn testDenseSourceHashReuse(settings: table_storage_mod.Settings) !void {
         const before = source.stats.resolved_payloads;
         try std.testing.expectEqual(
             @as(?u64, enrichment_artifact_codec.hashSource("same source")),
-            try storedOrPendingEmbeddingSourceHash(&db, null, key),
+            try storedOrPendingEmbeddingSourceHash(db, null, key),
         );
         try std.testing.expectEqual(before, source.stats.resolved_payloads);
     }
@@ -52204,19 +52098,16 @@ test "source vector migration captures enrichment updates and stale chunk deleti
 pub fn testDenseChunkArtifactLifecycle(settings: table_storage_mod.Settings, migrate: bool) !void {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .table_storage = settings,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -52316,18 +52207,15 @@ pub fn resetDenseIndexForArtifactRebuildForTest(db: *DB, index_name: []const u8)
 test "db recreated managed dense index converges replay and irrelevant resolver stages" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const config: types.IndexConfig = .{
         .name = "dv_v1",
@@ -52421,18 +52309,15 @@ test "db reopened chunked dense HBC deletes stale vectors through artifact loade
 
 test "db synchronous chunk replacement retires stale embeddings in the same commit" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(test_index.dv_v1_chunked_named);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
@@ -52469,18 +52354,15 @@ test "db synchronous chunk replacement retires stale embeddings in the same comm
 
 test "db asynchronous empty inline chunks retire old embeddings" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(test_index.dv_v1_chunked_named);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
@@ -52504,21 +52386,18 @@ test "db asynchronous empty inline chunks retire old embeddings" {
 
 test "db cached chunk cleanup survives another failed shared batch request" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = GateDenseEmbedder{
         .allowed_successes = .init(3),
         .blocked_error = error.UnsupportedEmbeddingProvider,
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = gated.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(test_index.dv_v1_chunked_named);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"abcdefghijklmno\"}" }},
@@ -52553,19 +52432,16 @@ test "db cached chunk cleanup survives another failed shared batch request" {
 test "db sparse enrichment skips unchanged source hash" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingSparseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .sparse_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "sp_v1",
@@ -52612,18 +52488,15 @@ test "db sparse enrichment skips unchanged source hash" {
 test "db runUntilIdle drains enrichment and derived indexing" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "embedded-worker",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1);
 
@@ -52958,18 +52831,15 @@ test "db cooperative dense posting drain crosses more than one maintenance page"
 test "db leased enrichment worker materializes chunk artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_chunked);
 
@@ -52981,7 +52851,7 @@ test "db leased enrichment worker materializes chunk artifacts" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -53013,18 +52883,15 @@ test "db leased enrichment worker materializes chunk artifacts" {
 test "db leased enrichment worker keeps chunk storage ephemeral when store_chunks is false" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -53040,7 +52907,7 @@ test "db leased enrichment worker keeps chunk storage ephemeral when store_chunk
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -53071,7 +52938,7 @@ test "db leased enrichment worker keeps chunk storage ephemeral when store_chunk
         .sync_level = .write,
     });
     try db.enrichment_runtime.?.waitForApplied(2);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
 
     const replayed_artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, replayed_artifacts);
@@ -53092,19 +52959,16 @@ test "db leased enrichment worker keeps chunk storage ephemeral when store_chunk
 test "db leased enrichment worker persists chunk storage when full text consumes chunked text" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
         .start_index_workers = false,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -53204,19 +53068,16 @@ test "db deferred generated coverage remains pending until the enrichment worker
 test "db leased enrichment worker persists chunk storage when chunker enables full text indexing" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
         .start_index_workers = false,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -53485,12 +53346,8 @@ test "db primary parent match_all eligibility preserves transformed populations 
 test "db full_text sync level does not precompute template chunk full text routing" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         // Keep the asynchronous enrichment worker from racing the assertion
         // that .full_text returns before template-derived chunks are routed.
         // Drain the same work explicitly below once that boundary is proven.
@@ -53500,7 +53357,8 @@ test "db full_text sync level does not precompute template chunk full text routi
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.full_text_index_v0);
     try db.addIndex(test_index.semantic_template_chunked_idx);
@@ -53609,18 +53467,15 @@ test "visibility targets include graph replay blocked by a missing dependency" {
 test "db full_index supports dense parent search for template chunked embeddings" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.semantic_template_chunked_idx);
 
@@ -53648,18 +53503,15 @@ test "db full_index supports dense parent search for template chunked embeddings
 test "db full_index supports dense parent search when chunk artifacts are ephemeral" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "semantic_template_chunked_idx",
@@ -53768,19 +53620,16 @@ test "db reopened full_index supports dense parent search when chunk artifacts a
 test "db leased enrichment worker materializes chunk artifacts with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_chunked);
 
@@ -53792,7 +53641,7 @@ test "db leased enrichment worker materializes chunk artifacts with durable lsm 
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -53824,18 +53673,15 @@ test "db leased enrichment worker materializes chunk artifacts with durable lsm 
 test "db shared embedding enrichment feeds multiple dense indexes" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"shared_dense_v1\"}}";
     try db.addIndex(.{
@@ -53857,7 +53703,7 @@ test "db shared embedding enrichment feeds multiple dense indexes" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
 
     const shared_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "shared_dense_v1");
     defer alloc.free(shared_artifact_key);
@@ -53888,13 +53734,9 @@ test "db shared embedding enrichment feeds multiple dense indexes" {
 test "db shared enrichment failure parks repair debt for every consumer" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = GateDenseEmbedder{};
     gated.allowed_successes.store(0, .release);
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
@@ -53903,7 +53745,8 @@ test "db shared enrichment failure parks repair debt for every consumer" {
             .worker_retry_max_attempts = 2,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"shared_dense_v1\"}}";
     try db.addIndex(.{ .name = "dv_a", .kind = .dense_vector, .config_json = shared_cfg });
@@ -53992,13 +53835,9 @@ test "db upstream asset failure dominates downstream coverage in one replay sequ
         }
     };
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var failing = FailingProducer{};
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
@@ -54008,7 +53847,8 @@ test "db upstream asset failure dominates downstream coverage in one replay sequ
             .worker_retry_max_attempts = 1,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(test_enrichment.summary_v1);
     try db.addEnrichment(.{
@@ -54195,19 +54035,16 @@ test "db foreign inference provider failure releases enrichment waiter as termin
 
 test "db terminal enrichment sequence index survives coalescing and retires with repair debt" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
     defer alloc.free(artifact_key);
 
@@ -54299,19 +54136,16 @@ test "db terminal enrichment sequence index survives coalescing and retires with
 
 test "db terminal enrichment marker cleanup isolates corrupt cross issue reverse entries" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     var issue_a = types.ArtifactRepairIssue{
         .artifact_kind = .asset,
@@ -54387,19 +54221,16 @@ test "db terminal enrichment marker cleanup isolates corrupt cross issue reverse
 
 test "db terminal enrichment marker retirement is bounded and fences stale generations" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     var issue = types.ArtifactRepairIssue{
         .artifact_kind = .asset,
@@ -54468,19 +54299,16 @@ test "db terminal enrichment marker retirement is bounded and fences stale gener
 
 test "db terminal enrichment markers do not resurrect across rollback recreation" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     var issue = types.ArtifactRepairIssue{
         .artifact_kind = .asset,
         .index_name = try alloc.dupe(u8, "relations_graph"),
@@ -54534,13 +54362,9 @@ test "db terminal enrichment markers do not resurrect across rollback recreation
 test "db shared enrichment repair regenerates one physical artifact once" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = GateDenseEmbedder{};
     gated.allowed_successes.store(0, .release);
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
@@ -54549,7 +54373,8 @@ test "db shared enrichment repair regenerates one physical artifact once" {
             .worker_retry_max_attempts = 2,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"shared_dense_v1\"}}";
     try db.addIndex(.{ .name = "dv_a", .kind = .dense_vector, .config_json = shared_cfg });
@@ -54663,19 +54488,16 @@ test "db asset repair reports a missing source document precisely" {
 test "db shared embedding enrichment feeds multiple dense indexes with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"shared_dense_v1\"}}";
     try db.addIndex(.{
@@ -54697,7 +54519,7 @@ test "db shared embedding enrichment feeds multiple dense indexes with durable l
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
 
     const shared_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "shared_dense_v1");
     defer alloc.free(shared_artifact_key);
@@ -54728,18 +54550,15 @@ test "db shared embedding enrichment feeds multiple dense indexes with durable l
 test "db addEnrichment supports explicit shared definitions" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var validating = ValidatingChunkDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = validating.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(test_enrichment.body_chunks_v1);
     try db.addEnrichment(.{
@@ -54764,7 +54583,7 @@ test "db addEnrichment supports explicit shared definitions" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
 
     const query_vec = try validating.deterministic.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
     defer alloc.free(query_vec);
@@ -54774,10 +54593,10 @@ test "db addEnrichment supports explicit shared definitions" {
         .dense = .{ .vector = query_vec, .k = 3 },
         .return_mode = .chunk,
     };
-    var dense_result = try waitForDenseSearchResult(alloc, &db, req, 1);
+    var dense_result = try waitForDenseSearchResult(alloc, db, req, 1);
     dense_result.deinit();
 
-    var result = try waitForSearchResult(alloc, &db, req, 1);
+    var result = try waitForSearchResult(alloc, db, req, 1);
     defer result.deinit();
     var chunk_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, result.hits[0].id)) orelse return error.TestUnexpectedResult;
     defer chunk_ref.deinit(alloc);
@@ -55822,19 +55641,16 @@ test "db listEnrichments returns explicit definitions across reopen with durable
 test "db full-text chunk consumer returns parent and chunk modes" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
         .start_index_workers = false,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.ft_chunks);
     try db.addIndex(test_index.dv_v1_chunked);
@@ -55853,7 +55669,7 @@ test "db full-text chunk consumer returns parent and chunk modes" {
     try std.testing.expect(chunk_records.len > 0);
     try std.testing.expect(db.core.index_manager.textIndex("ft_chunks").?.snapshot().liveDocCount() > 0);
 
-    var chunk_result = try waitForSearchResult(alloc, &db, .{
+    var chunk_result = try waitForSearchResult(alloc, db, .{
         .index_name = "ft_chunks",
         .full_text = .{ .match = .{ .field = "body", .text = "abcdefgh" } },
         .return_mode = .chunk,
@@ -55886,19 +55702,16 @@ test "db full-text chunk consumer returns parent and chunk modes" {
 test "db full-text chunk consumer filters expired parents under ttl" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
         .start_index_workers = false,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
     try db.setSchema(.{
@@ -55923,9 +55736,9 @@ test "db full-text chunk consumer filters expired parents under ttl" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(2);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
 
-    var chunk_result = try waitForSearchResult(alloc, &db, .{
+    var chunk_result = try waitForSearchResult(alloc, db, .{
         .index_name = "ft_chunks",
         .full_text = .{ .match = .{ .field = "body", .text = "abcdefgh" } },
         .return_mode = .chunk,
@@ -56195,19 +56008,16 @@ test "canonical grouped match requests isolate nested pagination and work" {
 test "db full-text chunk parent paging applies after grouping" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
         .start_index_workers = false,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.ft_chunks);
     try db.addIndex(.{
@@ -56224,7 +56034,7 @@ test "db full-text chunk parent paging applies after grouping" {
         .sync_level = .full_index,
     });
 
-    var result = try waitForSearchResult(alloc, &db, .{
+    var result = try waitForSearchResult(alloc, db, .{
         .index_name = "ft_chunks",
         .full_text = .{ .term = .{ .field = "body", .term = "alpha" } },
         .return_mode = .parent,
@@ -56413,21 +56223,18 @@ test "db restart after provider failure resumes enrichment from retained async r
 test "db async replay truncation retains journal behind generated enrichment" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var provider_failed: std.Io.Event = .unset;
     var gated = GateDenseEmbedder{ .blocked_event = &provider_failed };
     gated.allowed_successes.store(0, .release);
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .executor = .{ .backend = .io_threaded },
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = gated.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.ft_v1);
     try db.addIndex(test_index.semantic_idx);
@@ -57331,13 +57138,10 @@ test "db stats report projection checkpoint replay tail per index hint" {
 test "db catch-up hands dense coverage debt to resumable maintenance" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const target_sequence: u64 = 7;
-    var db = try DB.open(alloc, std.mem.span(path), no_replay_no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_replay_no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -57353,7 +57157,7 @@ test "db catch-up hands dense coverage debt to resumable maintenance" {
 
     const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(artifact_key);
-    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+    try putDenseEmbeddingArtifactWithCounterForTest(db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
     try std.testing.expectEqual(
         @as(?u64, 1),
         try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dv_v1"),
@@ -57485,13 +57289,10 @@ test "idle generated coverage gap becomes durable paged recovery debt" {
 test "db catch-up defers artifact dense target advance without durable counter" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const target_sequence: u64 = 7;
-    var db = try DB.open(alloc, std.mem.span(path), no_replay_no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_replay_no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -57510,7 +57311,7 @@ test "db catch-up defers artifact dense target advance without durable counter" 
 
     const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(artifact_key);
-    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+    try putDenseEmbeddingArtifactForTest(db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
 
     try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
     var latest_raw: [8]u8 = undefined;
@@ -57583,11 +57384,8 @@ test "managed dense physical migration is online and uses durable repair intent"
         }
     };
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
     var gate = Gate{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .index_backends = .{ .dense_native_migration_policy_source = .{
@@ -57595,7 +57393,8 @@ test "managed dense physical migration is online and uses durable repair intent"
             .authority_permitted = Gate.read,
         } },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(test_index.dense_idx_dims2_external);
 
     try std.testing.expect(!(try db.indexGenerationRepairRequired(alloc, "dense_idx")));
@@ -57913,10 +57712,6 @@ test "db writer open resumes generated enrichment replay from journal" {
 test "enrichment worker bounds retries against a durable foreign lease" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const lease_ttl_ms: u64 = 5_000;
     var backend = mem_backend_mod.Backend.init(alloc, .{});
     defer backend.close();
@@ -57934,7 +57729,7 @@ test "enrichment worker bounds retries against a durable foreign lease" {
         ));
     }
 
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .mem = .{} },
         .primary_runtime_store = &runtime_store,
         .physical_root_mode = .external_backend,
@@ -57944,7 +57739,8 @@ test "enrichment worker bounds retries against a durable foreign lease" {
             .enable_without_producers = true,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
     runtime.notifySequence(1);
@@ -59544,15 +59340,12 @@ test "db sparse vector index routes knn search with durable lsm primary backend"
 test "db delete artifact cleanup isolates binary document id prefixes" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const first_doc = "doc\x00a";
     const second_doc = "doc\x00a:child";
 
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -59565,8 +59358,8 @@ test "db delete artifact cleanup isolates binary document id prefixes" {
     defer alloc.free(first_artifact);
     const second_artifact = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, second_doc, "dense\x00idx");
     defer alloc.free(second_artifact);
-    try putDenseEmbeddingArtifactForTest(&db, alloc, first_artifact, null, &.{ 1.0, 0.0 });
-    try putDenseEmbeddingArtifactForTest(&db, alloc, second_artifact, null, &.{ 0.0, 1.0 });
+    try putDenseEmbeddingArtifactForTest(db, alloc, first_artifact, null, &.{ 1.0, 0.0 });
+    try putDenseEmbeddingArtifactForTest(db, alloc, second_artifact, null, &.{ 0.0, 1.0 });
 
     try db.batch(.{ .deletes = &.{first_doc} });
 
@@ -60163,13 +59956,10 @@ test "runtime status never regresses below durable projection checkpoint" {
 
 test "runtime status overlay hydrates cached derived coverage identity" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}";
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "external_v1",
         .kind = .dense_vector,
@@ -62310,18 +62100,15 @@ test "db coverage recovery admits a published generation after its admission mar
 
 pub fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, replay_handoff, late_completion, coverage_recovery, coverage_lag }) !void {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
         .sync_level = .write,
@@ -62335,8 +62122,8 @@ pub fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_hand
         .coverage_generation = 42,
     };
     const admission_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-    try drainManagedAdmissionSourceReplayForTest(&db, alloc, admission_id);
-    try awaitManagedAdmissionPublicationForTest(&db, alloc, admission_id);
+    try drainManagedAdmissionSourceReplayForTest(db, alloc, admission_id);
+    try awaitManagedAdmissionPublicationForTest(db, alloc, admission_id);
     try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
 
     if (mode == .coverage_lag) {
@@ -62587,17 +62374,15 @@ test "producer readiness local receipt migration retires only after source and c
 
 test "db empty managed index does not invent generated coverage recovery debt" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try std.testing.expectEqual(@as(?u64, null), try range_cardinality.load(alloc, db.core.store));
     _ = try db.admitManagedIndex(.{
         .name = "semantic_idx",
@@ -62624,18 +62409,15 @@ test "db empty managed index does not invent generated coverage recovery debt" {
 
 test "db completed partial managed admission serves and retires redundant repair" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.addEnrichment(.{
         .name = "thumbnail",
         .kind = .embedding,
@@ -62659,7 +62441,7 @@ test "db completed partial managed admission serves and retires redundant repair
         .coverage_generation = 42,
     };
     const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-    try drainManagedAdmissionSourceReplayForTest(&db, alloc, repair_id);
+    try drainManagedAdmissionSourceReplayForTest(db, alloc, repair_id);
 
     const active = db.core.index_manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 1), active.index.stats().active_count);
@@ -62699,17 +62481,15 @@ test "db completed partial managed admission serves and retires redundant repair
 
 test "db completed generated recovery retires an inactive candidate without an admission marker" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.addEnrichment(.{ .name = "thumbnail", .kind = .embedding, .field = "body", .expected_dims = 3 });
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }}, .sync_level = .write });
     const cfg: types.IndexConfig = .{
@@ -62721,7 +62501,7 @@ test "db completed generated recovery retires an inactive candidate without an a
         .coverage_generation = 42,
     };
     const admission = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-    try drainManagedAdmissionSourceReplayForTest(&db, alloc, admission);
+    try drainManagedAdmissionSourceReplayForTest(db, alloc, admission);
     var admitted = try db.loadIndexRepairEntryById(alloc, admission);
     defer admitted.deinit(alloc);
     const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
@@ -62803,17 +62583,14 @@ test "db completed generated recovery retires an inactive candidate without an a
 
 test "db completed chunked managed admission uses physical artifact count" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{ .dense_embedder = counting.interface() },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     const doc_count = 50;
     const writes = try alloc.alloc(types.BatchWrite, doc_count);
     defer {
@@ -62840,8 +62617,8 @@ test "db completed chunked managed admission uses physical artifact count" {
         .coverage_generation = 43,
     };
     const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-    try drainManagedAdmissionSourceReplayForTest(&db, alloc, repair_id);
-    try awaitManagedAdmissionPublicationForTest(&db, alloc, repair_id);
+    try drainManagedAdmissionSourceReplayForTest(db, alloc, repair_id);
+    try awaitManagedAdmissionPublicationForTest(db, alloc, repair_id);
 
     const active = db.core.index_manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
     const physical_count = active.index.stats().active_count;
@@ -63656,10 +63433,6 @@ test "db forced repair preserves missing-counter fail-closed classification" {
 
 test "db rejects derived backlog exhaustion before primary commit" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = 1,
@@ -63667,12 +63440,13 @@ test "db rejects derived backlog exhaustion before primary commit" {
     };
     var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer resources.deinit(alloc);
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .resource_manager = &resources,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try std.testing.expectError(error.ResourceBudgetExceeded, db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -63686,22 +63460,19 @@ test "db rejects derived backlog exhaustion before primary commit" {
 
 test "write sync never drains sequence-only derived backlog inline" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var resources = resource_manager_mod.ResourceManager.init(.{
         .derived_backlog_high_sequences = 1,
         .derived_backlog_resume_sequences = 0,
         .derived_backlog_throttle_window_sequences = 1,
     });
     defer resources.deinit(alloc);
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .resource_manager = &resources,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -66565,16 +66336,13 @@ test "db close stops text admission before joining derived publishers" {
 test "db text merge backpressure drains sustained segment debt to low watermark" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     // Build the backlog without an automatic merge worker so the admission
     // boundary and producer assistance are deterministic.
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.ft_v1);
 
@@ -69030,10 +68798,6 @@ test "db explicit field analyzer override drives match queries" {
     const alloc = std.testing.allocator;
     const table_schema_api = public_table_schema;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const schema_json =
         \\{
         \\  "default_type": "doc",
@@ -69054,8 +68818,9 @@ test "db explicit field analyzer override drives match queries" {
         \\}
     ;
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -69170,10 +68935,6 @@ test "db dynamic template precedence beats open additionalProperties fallback" {
     const alloc = std.testing.allocator;
     const table_schema_api = public_table_schema;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const schema_json =
         \\{
         \\  "default_type": "doc",
@@ -69203,8 +68964,9 @@ test "db dynamic template precedence beats open additionalProperties fallback" {
         \\}
     ;
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -69390,10 +69152,6 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
     const alloc = std.testing.allocator;
     const table_schema_api = public_table_schema;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const schema_json =
         \\{
         \\  "default_type": "doc",
@@ -69457,8 +69215,9 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
         \\}
     ;
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -70914,22 +70673,19 @@ test "db ttl delete callback atomically removes dense artifacts and updates repa
 test "db stats expose ttl cleanup activity" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const ttl_cfg: ttl_runtime_mod.Config = .{
         .enabled = true,
         .interval_ms = 10,
         .batch_size = 8,
         .grace_period_ns = 0,
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtimes = false,
         .ttl_cleanup = ttl_cfg,
     });
-    defer db.close();
-    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
+    defer t.deinit();
+    const db = &t.db;
+    try initStoppedTtlRuntimeForTest(db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -70956,10 +70712,6 @@ test "db stats expose ttl cleanup activity" {
 test "db ttl cleanup can run under lease ownership" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const ttl_cfg: ttl_runtime_mod.Config = .{
         .enabled = true,
         .lease_owned = true,
@@ -70969,12 +70721,13 @@ test "db ttl cleanup can run under lease ownership" {
         .batch_size = 8,
         .grace_period_ns = 0,
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtimes = false,
         .ttl_cleanup = ttl_cfg,
     });
-    defer db.close();
-    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
+    defer t.deinit();
+    const db = &t.db;
+    try initStoppedTtlRuntimeForTest(db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -71001,10 +70754,6 @@ test "db ttl cleanup can run under lease ownership" {
 test "db ttl cleanup can run under lease ownership with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
     const ttl_cfg: ttl_runtime_mod.Config = .{
@@ -71016,13 +70765,14 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
         .batch_size = 8,
         .grace_period_ns = 0,
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = primary_backend,
         .start_optional_runtimes = false,
         .ttl_cleanup = ttl_cfg,
     });
-    defer db.close();
-    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
+    defer t.deinit();
+    const db = &t.db;
+    try initStoppedTtlRuntimeForTest(db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -71049,10 +70799,6 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
 test "db ttl cleanup can run with manual clock" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var clock = platform_clock.ManualClock{
         .now_realtime_ns = 10 * std.time.ns_per_s,
     };
@@ -71064,12 +70810,13 @@ test "db ttl cleanup can run with manual clock" {
         .grace_period_ns = 0,
         .clock = clock.clock(),
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtimes = false,
         .ttl_cleanup = ttl_cfg,
     });
-    defer db.close();
-    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
+    defer t.deinit();
+    const db = &t.db;
+    try initStoppedTtlRuntimeForTest(db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -71095,10 +70842,6 @@ test "db ttl cleanup can run with manual clock" {
 test "db ttl cleanup background worker starts and deletes with manual clock" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var clock = platform_clock.ManualClock{
         .now_realtime_ns = 10 * std.time.ns_per_s,
     };
@@ -71110,10 +70853,11 @@ test "db ttl cleanup background worker starts and deletes with manual clock" {
         .grace_period_ns = 0,
         .clock = clock.clock(),
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .ttl_cleanup = ttl_cfg,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try std.testing.expect(db.ttl_runtime != null);
 
     try db.setSchema(.{
@@ -71128,7 +70872,7 @@ test "db ttl cleanup background worker starts and deletes with manual clock" {
         .timestamp_ns = now_ns - 2 * std.time.ns_per_s,
     });
 
-    try waitForRawDelete(alloc, &db, "doc:expired_worker", 200);
+    try waitForRawDelete(alloc, db, "doc:expired_worker", 200);
 
     var stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
@@ -72314,20 +72058,17 @@ test "db staged raft snapshot chunks atomically replace the live generation" {
 test "db replicated split bootstrap requires and preserves begin barrier" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const identity_namespace: DocIdentityNamespace = .{
         .table_id = 71,
         .shard_id = 72,
         .range_id = 73,
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .identity_namespace = identity_namespace,
         .start_index_workers = false,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const base_replication: types.SplitReplicationContext = .{
         .transition_id = 7001,

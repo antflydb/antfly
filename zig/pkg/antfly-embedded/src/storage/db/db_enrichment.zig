@@ -1243,17 +1243,14 @@ test "db enrichment reconfigure preserves active runtime when replacement cannot
 
 test "db enrichment reconfigure inherits resident execution and security capabilities" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var remote_content = scraping.RemoteContentConfig{
         .security = .{ .block_private_ips = false },
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .remote_content = &remote_content,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     var replacement_embedder = embedder_mod.DeterministicDenseEmbedder{};
     try db.reconfigureEnrichmentRuntime(.{
@@ -1268,16 +1265,13 @@ test "db enrichment reconfigure inherits resident execution and security capabil
 
 test "db enrichment reconfigure refreshes durable state after old worker joins" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var original_embedder = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{ .dense_embedder = original_embedder.interface() },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "semantic",
         .kind = .dense_vector,
@@ -1423,17 +1417,14 @@ test "db embeddings index remoteMedia accepts bmp via shared image decode" {
     });
     defer template_remote.setHostRenderer(null);
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var image_embedder = ImageDecodingPartsEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{ .dense_embedder = image_embedder.interface() },
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "visual_idx",
@@ -1470,17 +1461,14 @@ test "db embeddings index remoteMedia accepts webp via shared image decode" {
     });
     defer template_remote.setHostRenderer(null);
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var image_embedder = ImageDecodingPartsEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{ .dense_embedder = image_embedder.interface() },
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "visual_idx",
@@ -1521,19 +1509,16 @@ test "db embeddings index remoteMedia accepts webp via shared image decode" {
 test "db enrichment status changes notify query visibility hook" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{ .dense_embedder = deterministic.interface() },
         // Assert the explicit status edge without racing startup/replay
         // notifications from independently scheduled workers.
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const HookCtx = struct {
         status_calls: u64 = 0,
@@ -1745,14 +1730,11 @@ test "db managed resolver changes fence in-flight replay and reset durable curso
     for ([_]bool{ false, true }) |follower| {
         const alloc = std.testing.allocator;
 
-        var path_tmp = try TestDirectory.init("db");
-        defer path_tmp.cleanup();
-        const path = path_tmp.path().ptr;
-
         var sink = FakePromotionSink{ .alloc = alloc };
         defer sink.deinit();
-        var db = try DB.open(alloc, std.mem.span(path), .{ .start_resolver_workers = false, .entity_sink = sink.sink() });
-        defer db.close();
+        const t = try TestDb.open(alloc, .{ .start_resolver_workers = false, .entity_sink = sink.sink() });
+        defer t.deinit();
+        const db = &t.db;
 
         try db.addIndex(test_index.relations_graph);
 
@@ -1830,20 +1812,17 @@ test "db managed resolver changes fence in-flight replay and reset durable curso
 test "db enrichments precomputes generated enrichments into the committed batch" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),
             .sparse_embedder = deterministic_sparse.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_dims3_generated);
     try db.addIndex(.{
@@ -1883,21 +1862,18 @@ test "db enrichments precomputes generated enrichments into the committed batch"
 test "db enrichments precomputed watermark advances across replay entries without enrichment debt" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     // This probes foreground precomputed advancement; a concurrent replay
     // worker could consume the inert entry before the initial observation.
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const inert_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
@@ -2037,22 +2013,19 @@ test "db managed dense enrichment remains searchable after transient rate limits
 test "db managed dense enrichment retries temporary model capacity without terminal coverage" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = GateDenseEmbedder{
         .allowed_successes = .init(0),
         .blocked_error = error.ResourceTemporarilyUnavailable,
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = gated.interface(),
             .inline_retry_max_attempts = 1,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.semantic_idx);
     try db.batch(.{
@@ -2116,19 +2089,16 @@ test "db managed dense enrichment retries temporary model capacity without termi
 test "db managed sparse enrichment retries temporary model capacity without terminal coverage" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = GateSparseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .sparse_embedder = gated.interface(),
             .inline_retry_max_attempts = 1,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "sp_v1",
@@ -2195,22 +2165,19 @@ test "db managed sparse enrichment retries temporary model capacity without term
 test "db chunked dense enrichment retries temporary model capacity without terminal coverage" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = GateDenseEmbedder{
         .allowed_successes = .init(0),
         .blocked_error = error.ResourceTemporarilyUnavailable,
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = gated.interface(),
             .inline_retry_max_attempts = 1,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_chunked_named);
     try db.batch(.{
@@ -2265,18 +2232,15 @@ test "db chunked dense enrichment retries temporary model capacity without termi
 test "db managed dense delete quiesces rate-limited enrichment and recreates cleanly" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = GateDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = gated.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const cfg: types.IndexConfig = .{
         .name = "semantic_idx",
@@ -2363,18 +2327,15 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
 test "db managed dense enrichment delete recreate recovers after corrupt artifact" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const cfg: types.IndexConfig = .{
         .name = "semantic_idx",
@@ -2511,18 +2472,15 @@ test "db chunked dense enrichment skips unchanged chunks and deletes stale chunk
 test "db chunked dense enrichment replays cached artifacts after dense reset without re-embedding" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_chunked_named);
 
@@ -2536,7 +2494,7 @@ test "db chunked dense enrichment replays cached artifacts after dense reset wit
     try std.testing.expect(first_calls > 0);
     try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
-    try resetDenseIndexForArtifactRebuildForTest(&db, "dv_v1");
+    try resetDenseIndexForArtifactRebuildForTest(db, "dv_v1");
     try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
     try db.batch(.{
@@ -2618,20 +2576,17 @@ test "db chunked dense retry preserves published vectors until replacements succ
 test "db chunked generated dense and sparse embeddings search as parent results" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),
             .sparse_embedder = deterministic_sparse.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_dims3_generated);
     try db.addIndex(.{
@@ -2756,19 +2711,16 @@ test "db chunked generated dense and sparse embeddings search as parent results"
 test "db chunked sparse enrichment skips unchanged chunks and deletes stale sparse artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingSparseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .sparse_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "sp_v1",
@@ -2840,18 +2792,15 @@ test "db chunked sparse enrichment skips unchanged chunks and deletes stale spar
 test "db generated enrichment empty backfill advances enrichment checkpoint" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "embedded-worker",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1);
 
@@ -2863,18 +2812,15 @@ test "db generated enrichment empty backfill advances enrichment checkpoint" {
 test "db generated enrichment backfill drains stored docs beyond first replay chunk" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "embedded-worker",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const total_docs: usize = 129;
     const writes = try alloc.alloc(types.BatchWrite, total_docs);
@@ -3043,13 +2989,9 @@ test "db managed conditional embeddings persist exact mixed corpus coverage acro
 test "db enrichment retry makes monotonic progress across provider batches" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = GateDenseEmbedder{};
     gated.allowed_successes.store(0, .release);
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
@@ -3058,7 +3000,8 @@ test "db enrichment retry makes monotonic progress across provider batches" {
             .worker_retry_max_attempts = 2,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "semantic",
@@ -3096,13 +3039,9 @@ test "db enrichment retry makes monotonic progress across provider batches" {
 test "db chunked enrichment failure repair completes from request coverage" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var gated = GateDenseEmbedder{};
     gated.allowed_successes.store(0, .release);
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
@@ -3111,7 +3050,8 @@ test "db chunked enrichment failure repair completes from request coverage" {
             .worker_retry_max_attempts = 2,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "chunked_dense",
@@ -3502,17 +3442,14 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
 
 test "db managed vector admission captures writes while durable repair is pending" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const cfg = types.IndexConfig{
         .name = "semantic_idx",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
     };
-    var db = try DB.open(alloc, std.mem.span(path), no_replay_no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_replay_no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.batch(.{
         .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"before admission\"}" }},
         .sync_level = .write,
@@ -3546,17 +3483,14 @@ test "db managed vector admission captures writes while durable repair is pendin
 
 test "db managed external dense admission ignores unrelated source rows" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const cfg = types.IndexConfig{
         .name = "semantic_idx",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
     };
-    var db = try DB.open(alloc, std.mem.span(path), no_replay_no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_replay_no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.batch(.{
         .writes = &.{.{ .key = "readiness", .value = "{\"ready\":true}" }},
         .sync_level = .write,
@@ -3596,18 +3530,15 @@ test "db managed external dense admission ignores unrelated source rows" {
 
 test "db managed full text admission replays transitive artifact producers" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     // Model the catalog-to-resident handoff: the source write commits through
     // the old schema immediately before the new generated index is admitted.
@@ -3679,21 +3610,18 @@ test "db managed full text admission replays transitive artifact producers" {
 
 test "db managed vector admission discovers artifacts committed before resident activation" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const cfg = types.IndexConfig{
         .name = "late_external",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     // Model a catalog create whose resident activation is queued while the
     // write path accepts the newly committed external artifact.
@@ -3871,17 +3799,14 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
 
 test "db managed repair scheduler defers canonical worker until shadow activation" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
         .sync_level = .write,
@@ -3902,7 +3827,7 @@ test "db managed repair scheduler defers canonical worker until shadow activatio
     db.local_execution.optional_runtime_workers_enabled = false;
 
     try std.testing.expect(db.executor.appliedSequence(cfg.name) == null);
-    try drainManagedAdmissionSourceReplayForTest(&db, alloc, repair_id);
+    try drainManagedAdmissionSourceReplayForTest(db, alloc, repair_id);
     try std.testing.expect(db.executor.appliedSequence(cfg.name) == null);
     try std.testing.expectEqual(
         @as(u64, 1),
@@ -3939,8 +3864,8 @@ test "db managed repair scheduler defers canonical worker until shadow activatio
     try db.core.store.put(stored_key, "{\"body\":\"beta\"}");
     const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:b", cfg.name);
     defer alloc.free(artifact_key);
-    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 0, 1, 0 });
-    const later_sequence = try appendDerivedBatchRecord(&db, .{
+    try putDenseEmbeddingArtifactForTest(db, alloc, artifact_key, null, &[_]f32{ 0, 1, 0 });
+    const later_sequence = try appendDerivedBatchRecord(db, .{
         .dense_embeddings = &.{.{
             .index_name = cfg.name,
             .doc_key = "doc:b",
@@ -4242,13 +4167,11 @@ test "db managed index deletion commits catalog absence with marker removal" {
 
 test "db managed index deletion remains successful after post-commit cleanup failure" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
     const index_name = "full_text_index_v1";
 
-    var db = try DB.open(alloc, std.mem.span(path), no_replay_no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_replay_no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
         .sync_level = .write,
@@ -4297,17 +4220,15 @@ test "db managed index deletion remains successful after post-commit cleanup fai
 
 test "db generated artifact cleanup retries beyond the transient burst" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
     const cfg: types.IndexConfig = .{
         .name = "full_text_index_v1",
         .kind = .full_text,
         .config_json = "{}",
     };
 
-    var db = try DB.open(alloc, std.mem.span(path), no_replay_no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_replay_no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(cfg);
     const old_provenance = (try db.core.textIndexEntry(cfg.name).?.persistent.readGenerationMetadataAlloc(
         alloc,
@@ -4335,9 +4256,6 @@ test "db generated artifact cleanup retries beyond the transient burst" {
 
 test "db generated artifact finalization releases page arbitration and preserves admission fence" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
     const first: types.IndexConfig = .{
         .name = "a_full_text",
         .kind = .full_text,
@@ -4349,8 +4267,9 @@ test "db generated artifact finalization releases page arbitration and preserves
         .config_json = "{}",
     };
 
-    var db = try DB.open(alloc, std.mem.span(path), no_replay_no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_replay_no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(first);
     try db.addIndex(second);
 

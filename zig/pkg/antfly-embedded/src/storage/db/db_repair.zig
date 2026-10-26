@@ -3258,18 +3258,15 @@ test "db index repair shadow roots are allocated uniquely" {
 test "db index repair shadow swap preserves post snapshot mutations" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const text_cfg: types.IndexConfig = .{
         .name = "ft_v1",
         .kind = .full_text,
         .config_json = "{}",
     };
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(text_cfg);
     try db.batch(.{
@@ -4180,22 +4177,19 @@ test "db repair capacity converts materialized shadow bytes into consumed reserv
 
 test "db repair replay pin applies hard-pressure write backpressure" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.lsm_wal_retention)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };
     var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .resource_manager = &resources,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     var tracked: u64 = 0;
     resources.observeUsage(.lsm_wal_retention, &tracked, 2);

@@ -3565,12 +3565,8 @@ test "db dense checkpoint persistence serializes with index apply" {
 test "db dense repair reprocesses corrupt managed source before rebuilding" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -3579,7 +3575,8 @@ test "db dense repair reprocesses corrupt managed source before rebuilding" {
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const cfg: types.IndexConfig = .{
         .name = "semantic_idx",
@@ -3662,18 +3659,15 @@ test "db dense enrichment skips unchanged source hash" {
 test "db dense enrichment republishes unchanged source hash from cached artifact after index reset" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1);
 
@@ -3685,7 +3679,7 @@ test "db dense enrichment republishes unchanged source hash from cached artifact
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
     try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
-    try resetDenseIndexForArtifactRebuildForTest(&db, "dv_v1");
+    try resetDenseIndexForArtifactRebuildForTest(db, "dv_v1");
     try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
     try db.batch(.{
@@ -3715,18 +3709,15 @@ test "db dense enrichment republishes unchanged source hash from cached artifact
 test "db dense index can reference existing whole-doc embedding enrichment" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_gen",
@@ -3747,7 +3738,7 @@ test "db dense index can reference existing whole-doc embedding enrichment" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
 
     const query_vec = try deterministic.interface().embedDense(alloc, "", "reference embedding text", 3);
     defer alloc.free(query_vec);
@@ -3764,18 +3755,15 @@ test "db dense index can reference existing whole-doc embedding enrichment" {
 test "db dense index can reference existing chunk embedding enrichment" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_gen",
@@ -3796,8 +3784,8 @@ test "db dense index can reference existing chunk embedding enrichment" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
-    _ = try waitForAppliedSequenceAdvance(alloc, &db, "dv_ref", 0);
+    try waitForDerivedReplayTarget(db);
+    _ = try waitForAppliedSequenceAdvance(alloc, db, "dv_ref", 0);
 
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
@@ -3824,18 +3812,15 @@ test "db dense index can reference existing chunk embedding enrichment" {
 test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_chunked);
 
@@ -3847,7 +3832,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
     const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
@@ -3858,7 +3843,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
 
-    var chunk_result = try waitForSearchResult(alloc, &db, .{
+    var chunk_result = try waitForSearchResult(alloc, db, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 3 },
         .return_mode = .chunk,
@@ -3914,7 +3899,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     try std.testing.expectEqual(@as(u32, 1), parent_result.total_hits);
     try std.testing.expectEqualStrings("doc:a", parent_result.hits[0].id);
 
-    var parent_with_chunks = try waitForSearchResult(alloc, &db, .{
+    var parent_with_chunks = try waitForSearchResult(alloc, db, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 3 },
         .return_mode = .parent_with_chunks,
@@ -3926,7 +3911,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
     try std.testing.expectEqualStrings(top_chunk_id, parent_with_chunks.hits[0].chunk_hits[0].id);
 
-    var canonical_grouped = try waitForSearchResult(alloc, &db, .{
+    var canonical_grouped = try waitForSearchResult(alloc, db, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 3 },
         .return_mode = .parent_with_chunks,
@@ -3983,19 +3968,16 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
 test "db dense chunk consumer supports parent and parent_with_chunks modes with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_chunked);
 
@@ -4007,7 +3989,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try waitForDerivedReplayTarget(db);
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
     const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
@@ -4018,7 +4000,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
 
-    var chunk_result = try waitForSearchResult(alloc, &db, .{
+    var chunk_result = try waitForSearchResult(alloc, db, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 3 },
         .return_mode = .chunk,
@@ -4042,7 +4024,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
     try std.testing.expectEqual(@as(u32, 1), parent_result.total_hits);
     try std.testing.expectEqualStrings("doc:a", parent_result.hits[0].id);
 
-    var parent_with_chunks = try waitForSearchResult(alloc, &db, .{
+    var parent_with_chunks = try waitForSearchResult(alloc, db, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 3 },
         .return_mode = .parent_with_chunks,
@@ -4058,18 +4040,15 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
 test "db dense parent paging fetches enough chunk hits before grouping" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(test_index.dv_v1_chunked);
 
@@ -4084,7 +4063,7 @@ test "db dense parent paging fetches enough chunk hits before grouping" {
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
 
-    var first_parent = try waitForSearchResult(alloc, &db, .{
+    var first_parent = try waitForSearchResult(alloc, db, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 1 },
         .return_mode = .parent,
@@ -4095,7 +4074,7 @@ test "db dense parent paging fetches enough chunk hits before grouping" {
     try std.testing.expectEqual(@as(usize, 1), first_parent.hits.len);
     try std.testing.expectEqualStrings("doc:a", first_parent.hits[0].id);
 
-    var second_parent = try waitForSearchResult(alloc, &db, .{
+    var second_parent = try waitForSearchResult(alloc, db, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 1 },
         .return_mode = .parent,
@@ -7182,18 +7161,15 @@ test "db dense lsm cache profile benchmark" {
     if (!profileBenchTestsEnabled()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var lsm_cache = lsm_backend_mod.Cache.init(alloc, 64 * 1024 * 1024);
     defer lsm_cache.deinit();
 
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .lsm_cache = &lsm_cache,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -7375,7 +7351,7 @@ test "db dense lsm cache profile benchmark" {
             const stored_data = if (req.include_stored and !(chunk_backed and group_chunk_parents)) blk: {
                 const load_start = monotonicTimeNs();
                 const loaded = try projectOwnedStoredBytesForSearch(
-                    &db,
+                    db,
                     alloc,
                     req,
                     doc_key,
@@ -7395,7 +7371,7 @@ test "db dense lsm cache profile benchmark" {
 
         const postprocess_start = monotonicTimeNs();
         var profiled_result = try DB.postprocessVectorSearchResultCallback(
-            @ptrCast(&db),
+            @ptrCast(db),
             alloc,
             req,
             .{

@@ -979,18 +979,15 @@ test "document extraction inline source size uses remote content limit" {
 test "document extraction templated inline source size is rejected before persistence" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     const security = scraping.ContentSecurityConfig{ .max_download_size_bytes = 4 };
     var remote_content = scraping.RemoteContentConfig{ .security = security };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .remote_content = &remote_content,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -1193,18 +1190,15 @@ test "db document unit payload marks scanned pdf pages as pending OCR" {
 test "db document extraction asset materializes unit artifacts from data url" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(test_enrichment.document_units_v1);
     // A source may have multiple asset enrichments. Opaque non-document
@@ -1301,7 +1295,7 @@ test "db document extraction asset materializes unit artifacts from data url" {
     }
     try appendDocumentExtractionNavigationBackfill(
         alloc,
-        &db,
+        db,
         "doc:a",
         "document_units_v1",
         "6c1146dc037bb3ca77d4248754322b14697b236ddaddf5203b13ab97f133fb78",
@@ -1770,12 +1764,8 @@ test "db document extraction stores image pending OCR unit" {
 test "db document extraction completes image OCR with reader producer" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{
@@ -1783,7 +1773,8 @@ test "db document extraction completes image OCR with reader producer" {
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -1822,12 +1813,8 @@ test "db document extraction attempts forced OCR for a scanned PDF" {
 
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{ .reader_output = "[{\"text\":\"scanned PDF transcription with enough text to remain selected\"}]" };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{
@@ -1835,7 +1822,8 @@ test "db document extraction attempts forced OCR for a scanned PDF" {
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -1890,14 +1878,10 @@ test "db document extraction attempts forced OCR for a scanned PDF" {
 test "db document extraction stores structured OCR confidence and coordinates" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{
         .reader_output = "[{\"text\":\"invoice total\",\"confidence\":0.92,\"bbox\":[1,2,101,42],\"warning\":\"low contrast\"}]",
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{
@@ -1905,7 +1889,8 @@ test "db document extraction stores structured OCR confidence and coordinates" {
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -1946,14 +1931,10 @@ test "db document extraction stores structured OCR confidence and coordinates" {
 test "db document extraction completes audio transcription with transcriber producer" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{
         .transcriber_output = "{\"text\":\"spoken words\",\"confidence\":0.81}",
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{
@@ -1961,7 +1942,8 @@ test "db document extraction completes audio transcription with transcriber prod
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -2002,21 +1984,18 @@ test "db document extraction completes audio transcription with transcriber prod
 test "db document extraction transcript segments time chunk artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var fake = TestAssetProducer{
         .transcriber_output = "{\"text\":\"first phrase here. second phrase there.\",\"confidence\":0.9,\"duration_ms\":2500,\"segments\":[{\"text\":\"first phrase here.\",\"start_ms\":0,\"end_ms\":1200},{\"text\":\"second phrase there.\",\"start_ms\":1300,\"end_ms\":2500}]}",
     };
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -2386,18 +2365,15 @@ test "db document extraction manifest classifies unit fingerprint keeps" {
 test "db document extraction skips stable unit local rewrites without text consumers" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addEnrichment(test_enrichment.document_chunks_v1);
@@ -2584,18 +2560,15 @@ test "document child range partition preserves single ownership on allocation fa
 test "db document extraction manifest inspection and reprocess API" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addEnrichment(test_enrichment.document_chunks_v1);
@@ -2863,18 +2836,15 @@ test "db document extraction failure preserves last-known-good children and reco
 test "db document extraction skips stable unit local rewrites while replaying full text from stored artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addEnrichment(test_enrichment.document_chunks_v1);
@@ -2932,7 +2902,7 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     const second_value = "{\"url\":\"data:text/plain,alpha%20beta%20gamma\"}";
     var extracted = [_]mapper.ExtractedWrite{try mapper.extractWrite(alloc, "doc:a", second_value)};
     defer extracted[0].deinit(alloc);
-    var precomputed = try prepareGeneratedEnrichments(&db, alloc, .{
+    var precomputed = try prepareGeneratedEnrichments(db, alloc, .{
         .writes = &.{.{ .key = "doc:a", .value = second_value }},
     }, &extracted, .all, &.{}, null, null);
     defer precomputed.deinit(alloc);
@@ -3038,20 +3008,17 @@ test "db document extraction skips stable unit local rewrites while replaying fu
 test "db document extraction chunks units through source artifact enrichment" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),
             .sparse_embedder = deterministic_sparse.interface(),
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addEnrichment(test_enrichment.document_chunks_v1);
@@ -3680,14 +3647,12 @@ test "db document extraction unit chunks embed in provider batches, not per chun
     try std.testing.expectEqual(@as(c_int, 0), c.setenv(batch_items_env, "3", 1));
     defer _ = c.unsetenv(batch_items_env);
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
     var probe = BatchProbe{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{ .owner_id = "worker-a", .dense_embedder = probe.interface() },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addEnrichment(test_enrichment.document_chunks_v1);
