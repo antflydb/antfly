@@ -200,6 +200,7 @@ const RegionTask = struct {
     failure: ?anyerror = null,
     fn execute(self: *RegionTask) std.Io.Cancelable!void {
         defer self.permit.deinit();
+        defer self.run.abandonPixels();
         self.process() catch |err| {
             self.failure = err;
         };
@@ -942,4 +943,114 @@ test "document native crossing run cannot authorize amount loss through regional
     try std.testing.expect(!page.regions[0].validated);
     try std.testing.expectEqualStrings("Total 12.50 12.50", page.text);
     try std.testing.expectEqual(c.Status.unresolved, page.status);
+}
+
+test "document pixel ownership ends when a region worker fails before the group join" {
+    const readers = @import("antfly_readers");
+    const runs = readers.document_runs;
+    const a = std.testing.allocator;
+    var memory = readers.testing.Store{ .a = a };
+    defer memory.deinit();
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const store = memory.interface();
+    const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "worker", .owner = "alice", .identity = identity, .limits = .{ .pixels = 3 }, .inputs = &.{} });
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+        fn unexpectedWait(_: ?*anyopaque) !void {
+            return error.UnexpectedAdmissionWait;
+        }
+        fn unused(_: void, _: A) !runs.Session.Output {
+            return error.UnexpectedCall;
+        }
+    };
+    const lease = try store.claim(work, "worker", "alice", identity, 1, 100);
+    var session = try runs.Session.init(a, store, lease, identity, .{ .now_fn = Clock.now }, 16, 32768);
+    defer session.deinit();
+    session.io = io;
+    session.check_fn = Clock.unexpectedWait;
+    var ledger = c.SharedAccounting{ .limits = .{}, .usage = .{}, .event_count = 0 };
+    var parent = c.Run{ .limits = .{}, .shared = &ledger };
+    const DriverState = struct {
+        run: *c.Run = undefined,
+        fn fork(raw: *anyopaque, _: A) !Driver {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.run.pixels(1);
+            // Fail before the normal per-region flush, outside the crop helper.
+            return error.DocumentSourceLimitExceeded;
+        }
+        fn prepare(_: *anyopaque, _: *c.Run) !bool {
+            return true;
+        }
+        fn unused(_: *anyopaque, _: A, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            return error.UnexpectedCall;
+        }
+    };
+    var driver_state = DriverState{};
+    var task = RegionTask{
+        .arena = .init(a),
+        .definition = .{ .models = &.{}, .read = .{} },
+        .driver = .{ .ptr = &driver_state, .read_fn = DriverState.unused, .parallel = .{ .io = io, .fork_fn = DriverState.fork, .prepare_fn = DriverState.prepare } },
+        .page_index = 0,
+        .supplied = .{ .source_id = "source", .number = 1, .kind = .image },
+        .region = .{ .id = 1, .text = "" },
+        .run = .{ .durable = &session, .limits = .{}, .shared = &ledger },
+        .permit = try parent.acquire(io, true),
+    };
+    defer task.arena.deinit();
+    defer task.run.deinit();
+    driver_state.run = &task.run;
+    var finished: std.Io.Event = .unset;
+    const Worker = struct {
+        task: *RegionTask,
+        io: std.Io,
+        finished: *std.Io.Event,
+        fn execute(self: *@This()) void {
+            defer self.finished.set(self.io);
+            self.task.execute() catch |err| {
+                self.task.failure = err;
+            };
+        }
+    };
+    const Sibling = struct {
+        session: *runs.Session,
+        io: std.Io,
+        finished: *std.Io.Event,
+        failure: ?anyerror = null,
+        fn execute(self: *@This()) void {
+            self.finished.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            _ = self.session.execute(scratch.allocator(), @splat(9), .{ .pixels = 1 }, 0, {}, Clock.unused) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.failure = error.TestUnexpectedResult;
+        }
+    };
+    var worker = Worker{ .task = &task, .io = io, .finished = &finished };
+    var sibling = Sibling{ .session = &session, .io = io, .finished = &finished };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, Worker.execute, .{&worker});
+    try group.concurrent(io, Sibling.execute, .{&sibling});
+    try group.await(io);
+    try std.testing.expectEqual(error.DocumentSourceLimitExceeded, task.failure.?);
+    try std.testing.expectEqual(error.DocumentBudgetExhausted, sibling.failure.?);
+    try std.testing.expectEqual(@as(u64, 0), task.run.pixel_meter.upper);
+    try std.testing.expectEqual(@as(usize, 0), ledger.active_regions);
+    const record = try store.load(work, "worker", "alice");
+    try std.testing.expectEqual(@as(usize, 0), record.pending.len);
+    try std.testing.expectEqual(@as(u64, 3), record.used.pixels);
+    try std.testing.expectEqual(@as(u64, 3), record.uncertain.pixels);
 }

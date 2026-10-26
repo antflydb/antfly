@@ -776,8 +776,11 @@ cannot acknowledge that transition, local liveness still excludes the failed
 intent and ownership handoff recovers its charges. Admission waits only for this
 attempt's known non-failed workers, which can still reconcile their upper bounds;
 untracked reservations remain spent capacity. Pixel credit planning uses the same
-distinction, and failed rendering and scope teardown abandon grant liveness.
-Exhaustion caused by failed work returns immediately; successful live work can
+distinction. Whole-view and crop failures abandon grant liveness at the error
+boundary. Page and region workers also close any remaining grants before their
+completion is observed, rather than waiting for group joins and arena teardown.
+Physical charges remain consumed, including when a crop exceeds its encoding
+ceiling. Exhaustion caused by failed work returns immediately; successful live work can
 still release capacity and admit a waiting page or crop.
 
 Duplex upload and response processing share a synchronized invocation allocator.

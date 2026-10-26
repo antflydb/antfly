@@ -630,6 +630,7 @@ pub fn Service(comptime Node: type) type {
                 self.arena.deinit();
             }
             fn execute(self: *PageTask) std.Io.Cancelable!void {
+                defer self.run.abandonPixels();
                 self.process() catch |err| {
                     self.failure = err;
                 };
@@ -778,6 +779,7 @@ pub fn Service(comptime Node: type) type {
             return decoded.candidate;
         }
         fn readImpl(raw: *anyopaque, a: A, binding: c.Binding, _: usize, bbox: ?[4]f64, run: *c.Run) !executor.Candidate {
+            errdefer run.abandonPixels();
             try run.requireOutput();
             const self: *Self = @ptrCast(@alignCast(raw));
             // Run source ceilings are absolute aggregate counters. The current
@@ -3065,4 +3067,115 @@ fn testDurableReading(comptime Node: type, node: *Node) !void {
     defer response.deinit();
     try std.testing.expectEqual(@as(i64, 0), response.value.object.get("usage").?.object.get("physical_model_calls").?.integer);
     try std.testing.expectEqual(@as(i64, 2), response.value.object.get("usage").?.object.get("model_calls").?.integer);
+}
+
+test "document pixel ownership settles failed crop encoding before a sibling admission joins" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
+            return .{ .binding = binding, .path = binding.model, .identity = @splat(0) };
+        }
+        fn readEncodedImagesReportedDirectWithContext(self: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            self.calls += 1;
+            return error.UnexpectedCall;
+        }
+        fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) !V {
+            return error.UnexpectedCall;
+        }
+        fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: Control) ![]u8 {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    const runs = readers.document_runs;
+    var memory = readers.testing.Store{ .a = a };
+    defer memory.deinit();
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const store = memory.interface();
+    const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "crop", .owner = "alice", .identity = identity, .limits = .{ .pixels = 131072, .output_bytes = 1048576 }, .inputs = &.{} });
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+        fn unexpectedWait(_: ?*anyopaque) !void {
+            return error.UnexpectedAdmissionWait;
+        }
+        fn unused(_: void, _: A) !runs.Session.Output {
+            return error.UnexpectedCall;
+        }
+    };
+    const lease = try store.claim(work, "crop", "alice", identity, 1, 100);
+    var session = try runs.Session.init(a, store, lease, identity, .{ .now_fn = Clock.now }, 32, 32768);
+    defer session.deinit();
+    session.io = io;
+    session.check_fn = Clock.unexpectedWait;
+    var crop_arena = std.heap.ArenaAllocator.init(a);
+    defer crop_arena.deinit();
+    const crop_alloc = crop_arena.allocator();
+    var run = c.Run{ .durable = &session, .limits = .{ .max_source_bytes = 88 }, .work_allocator = crop_alloc };
+    defer run.deinit();
+    var source = try sources.Source.init(work, .{ .id = "photo", .url = "", .media_type = "image/png" }, @import("antfly_documents").fixtures.get("crop-byte-limit.png"), .{}, .{});
+    defer source.deinit();
+    var node = Fake{};
+    const S = Service(Fake);
+    const graph = S.Graph{};
+    var service = S{ .node = &node, .definition = .{ .models = &.{}, .budget = .{ .max_source_bytes = 88 } }, .work_allocator = crop_alloc, .graph = &graph, .source = &source, .number = 1, .control = .{}, .prompt = null, .max_tokens = null };
+    var finished: std.Io.Event = .unset;
+    const Crop = struct {
+        service: *S,
+        run: *c.Run,
+        alloc: A,
+        io: std.Io,
+        finished: *std.Io.Event,
+        failure: ?anyerror = null,
+        fn execute(self: *@This()) void {
+            defer self.finished.set(self.io);
+            _ = S.readImpl(self.service, self.alloc, .{ .name = "crop", .model = "accurate", .operation = .read }, 0, .{ 0, 0, 256, 256 }, self.run) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.failure = error.TestUnexpectedResult;
+        }
+    };
+    const Sibling = struct {
+        session: *runs.Session,
+        io: std.Io,
+        finished: *std.Io.Event,
+        failure: ?anyerror = null,
+        fn execute(self: *@This()) void {
+            self.finished.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            _ = self.session.execute(scratch.allocator(), @splat(9), .{ .pixels = 1 }, 0, {}, Clock.unused) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.failure = error.TestUnexpectedResult;
+        }
+    };
+    var crop = Crop{ .service = &service, .run = &run, .alloc = crop_alloc, .io = io, .finished = &finished };
+    var sibling = Sibling{ .session = &session, .io = io, .finished = &finished };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, Crop.execute, .{&crop});
+    try group.concurrent(io, Sibling.execute, .{&sibling});
+    try group.await(io);
+    try std.testing.expectEqual(error.DocumentSourceLimitExceeded, crop.failure.?);
+    try std.testing.expectEqual(error.DocumentBudgetExhausted, sibling.failure.?);
+    try std.testing.expectEqual(@as(usize, 0), node.calls);
+    // Check before Run.deinit: the group join must not be needed for cleanup.
+    try std.testing.expectEqual(@as(u64, 0), run.pixel_meter.upper);
+    const record = try store.load(work, "crop", "alice");
+    try std.testing.expectEqual(@as(usize, 0), record.pending.len);
+    try std.testing.expectEqual(@as(u64, 131072), record.used.pixels);
+    try std.testing.expectEqual(@as(u64, 65536), record.uncertain.pixels);
 }
