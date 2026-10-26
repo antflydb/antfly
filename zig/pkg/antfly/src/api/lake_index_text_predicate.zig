@@ -648,6 +648,9 @@ pub const Identities = struct {
         return cache.load(a, store, cached, block);
     }
     fn addBlock(self: Identities, a: A, temporary: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, selected: @import("lake_index_predicate_blocks.zig").Block, result: *Bitmap) !void {
+        // Compressed fallback needs the admitted window's complete inverse
+        // mapping. Deferred descriptors are not evidence of an empty window.
+        if (self.deferred != null) return (try self.eager(a, cache, store, cached)).addBlock(a, temporary, cache, store, cached, selected, result);
         if (self.row_resolver != null) {
             // An ordered index may be freshly rebuilt while this text index
             // is retained. Its compressed blocks still describe current rows.
@@ -907,6 +910,11 @@ pub const Identities = struct {
     /// Invert only selected ordinal blocks. Contiguous extents stay compressed;
     /// delete holes are resolved within their authenticated physical block.
     fn physicalSelection(self: Identities, a: A, selected: *const Bitmap, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !PhysicalSet {
+        if (self.deferred != null) {
+            var cache: LiveRowsCache = .{ .backing = a };
+            defer cache.deinit(a);
+            return (try self.eager(a, &cache, store, cached)).physicalSelection(a, selected, store, cached);
+        }
         var result = PhysicalSet.init(a);
         errdefer result.deinit();
         var cache: LiveRowsCache = .{ .backing = a };
@@ -2407,4 +2415,26 @@ test "external lake text candidate tiles batch shuffled duplicate relocation wit
         try std.testing.expectEqual(row, ref.external.row_ordinal);
         try std.testing.expectEqualStrings("new", ref.external.snapshot_id);
     }
+}
+
+test "external lake global frontier deferred predicate block fallback preserves compressed ranks" {
+    const a = std.testing.allocator;
+    const high: u64 = 1 << 40;
+    const span: Identities.Span = .{ .lower = 0, .upper = 4, .rows = &.{.{ .group = 2, .high = high >> corpus.physical.shift, .base = 0, .count = 6, .lower = 10 }}, .intervals = &.{ .{ .file_lower = 0, .lower = 0, .upper = 1 }, .{ .file_lower = 3, .lower = 1, .upper = 4 } } };
+    var loaded: Identities = .{ .offsets = &.{ 0, 1, 4 }, .partial_inventory = true, .spans = &.{.{ .file = "part", .span = span }} };
+    defer loaded.files.deinit(a);
+    try loaded.files.put(a, "part", span);
+    const deferred: Identities.Deferred = .{ .groups = &.{}, .domain = @splat(1), .key = @splat(2) };
+    const identities: Identities = .{ .offsets = loaded.offsets, .partial_inventory = true, .deferred = &deferred };
+    // A previous point lookup can already own the authenticated window map.
+    // Reuse it without reopening lineage or interpreting absent eager fields.
+    var cache: LiveRowsCache = .{ .backing = a, .eager_identity = loaded, .identity_owner = deferred.key };
+    defer cache.deinit(a);
+    const store: @import("../serverless/artifacts/store.zig").ArtifactStore = undefined;
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = undefined, .scope = @splat(1), .context = .{} };
+    var result = Bitmap.init(a);
+    defer result.deinit();
+    try identities.addBlock(a, a, &cache, store, cached, .{ .file = "part", .group = 2, .base = high, .selection = .{ .interval = .{ .lower = 13, .count = 3 } } }, &result);
+    try std.testing.expectEqual(@as(u64, 3), result.cardinality());
+    try std.testing.expect(result.contains(1) and result.contains(2) and result.contains(3));
 }
