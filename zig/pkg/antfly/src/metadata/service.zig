@@ -6125,12 +6125,19 @@ pub const MetadataService = struct {
             .ensure_listener_registered = catalogProjectionEnsureListener,
             .catalog_epoch = catalogProjectionEpoch,
             .capture_projection = catalogProjectionCapture,
+            .execution_indexes = catalogProjectionExecutionIndexes,
         } };
     }
 
     fn catalogProjectionEnsureListener(ptr: *anyopaque) !void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
         try self.ensureLifecycleListenerRegistered();
+    }
+
+    fn catalogProjectionExecutionIndexes(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, name: []const u8, revision: u64) ![]u8 {
+        const self: *MetadataService = @ptrCast(@alignCast(ptr));
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return @import("resolver_catalog_read.zig").executionIndexesAlloc(store, alloc, group, name, revision, false);
     }
 
     fn catalogProjectionEpoch(ptr: *anyopaque) u64 {
@@ -8795,12 +8802,19 @@ pub const MetadataHttpService = struct {
             .ensure_listener_registered = catalogProjectionEnsureListener,
             .catalog_epoch = catalogProjectionEpoch,
             .capture_projection = catalogProjectionCapture,
+            .execution_indexes = catalogProjectionExecutionIndexes,
         } };
     }
 
     fn catalogProjectionEnsureListener(ptr: *anyopaque) !void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         try self.ensureLifecycleListenerRegistered();
+    }
+
+    fn catalogProjectionExecutionIndexes(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, name: []const u8, revision: u64) ![]u8 {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return @import("resolver_catalog_read.zig").executionIndexesAlloc(store, alloc, group, name, revision, false);
     }
 
     fn catalogProjectionEpoch(ptr: *anyopaque) u64 {

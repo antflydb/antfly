@@ -3353,6 +3353,31 @@ pub const IndexManager = struct {
         };
     }
 
+    pub const ManagedIndexApplyPlan = struct {
+        guard: ManagedIndexApplyGuard,
+        snapshot: WritePlanSnapshotView,
+        pub fn unlock(self: *@This()) void {
+            self.guard.unlock();
+            self.snapshot.release();
+        }
+    };
+
+    /// Build/pin before entering catalog admission. A cold snapshot needs a
+    /// catalog reader and cannot be acquired recursively behind a writer.
+    pub fn lockManagedIndexApplyWithPlan(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyPlan {
+        while (true) {
+            var snapshot = try self.acquireWritePlanSnapshot();
+            var guard = self.lockManagedIndexApply(index_ref) catch |err| {
+                snapshot.release();
+                return err;
+            };
+            if (snapshot.generation() == self.writePlanGeneration())
+                return .{ .guard = guard, .snapshot = snapshot };
+            guard.unlock();
+            snapshot.release();
+        }
+    }
+
     pub fn lockVectorIndexApply(self: *IndexManager, index_name: []const u8) !ManagedIndexApplyGuard {
         self.catalog_mutex.lockShared();
         errdefer self.catalog_mutex.unlockShared();

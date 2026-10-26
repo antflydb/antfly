@@ -429,7 +429,7 @@ const RowPolicyOutputCheckpoint = struct {
     }
 };
 const default_visibility_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
-const public_schema_json_key = "\x00\x00__metadata__:schema_json";
+const public_schema_json_key = @import("../internal_keys.zig").public_schema_json_key;
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 // Legacy singleton keys remain readable for crash recovery across upgrades.
 const replication_batch_outbox_key = durable_outbox.replication_batch_outbox_key;
@@ -81206,6 +81206,10 @@ test "db enrichments precomputes generated enrichments into the committed batch"
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
+        // Inspect the foreground transaction and its exact first watermark.
+        // Independent replay may legitimately publish another observation.
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),
@@ -109604,6 +109608,81 @@ test "db completed managed admission emits an initial build clear edge" {
     try std.testing.expectEqual(IndexRepairAdmission.serviceable, hook.admission.?);
 }
 
+test "db managed admission cannot deadlock replay coverage deletion" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("coverage-catalog-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copied\"}]}" });
+    const manager = db.core.index_manager;
+    // Retain the current plan without filling the single-flight cache. Replay
+    // must use this plan even when a new admission makes the cache cold.
+    manager.invalidateWritePlanSnapshot();
+    var plan = try manager.writePlanSnapshotAlloc(a);
+    defer plan.deinit();
+    var guard = try manager.lockManagedIndexApply(.{ .name = "text", .kind = .full_text });
+    defer guard.unlock();
+    const State = struct {
+        db: *DB,
+        plan: *const index_manager_mod.IndexManager.WritePlanSnapshot,
+        cancel: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        deletion_error: ?anyerror = null,
+        writer_error: ?anyerror = null,
+        fn write(self: *@This()) void {
+            self.db.core.index_manager.catalog_mutex.lockExclusiveIo(std.testing.io, @as(?types.CancellationToken, types.CancellationToken.fromAtomic(&self.cancel))) catch |err| {
+                self.writer_error = err;
+                return;
+            };
+            self.db.core.index_manager.catalog_mutex.unlockExclusive();
+        }
+        fn erase(self: *@This()) void {
+            defer self.done.store(true, .release);
+            local_mutation.deleteDerivedCoverageForDocKeysWithPlan(std.testing.allocator, self.db.core.store, self.db.core.index_manager, "text", &.{"doc"}, self.plan) catch |err| {
+                self.deletion_error = err;
+            };
+        }
+    };
+    var state = State{ .db = &db, .plan = &plan };
+    const writer = try std.Thread.spawn(.{}, State.write, .{&state});
+    var writer_joined = false;
+    defer if (!writer_joined) {
+        state.cancel.store(true, .release);
+        writer.join();
+    };
+    const catalog = &manager.catalog_mutex;
+    const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (catalog.exclusive_waiters.load(.acquire) == 0 and monotonicTimeNs() < deadline)
+        @import("antfly_platform").time.yieldNow();
+    try std.testing.expect(catalog.exclusive_waiters.load(.acquire) != 0);
+    const deletion = try std.Thread.spawn(.{}, State.erase, .{&state});
+    var deletion_joined = false;
+    defer if (!deletion_joined) {
+        state.cancel.store(true, .release);
+        deletion.join();
+    };
+    while (!state.done.load(.acquire) and catalog.shared_waiters.load(.acquire) == 0 and monotonicTimeNs() < deadline)
+        @import("antfly_platform").time.yieldNow();
+    const nested = catalog.shared_waiters.load(.acquire) != 0;
+    const completed_without_canceling_writer = state.done.load(.acquire);
+    // Rescue the old nested-acquisition path so a regression fails promptly
+    // and joins both threads instead of hanging the unit process.
+    state.cancel.store(true, .release);
+    writer.join();
+    writer_joined = true;
+    deletion.join();
+    deletion_joined = true;
+    try std.testing.expect(!nested and completed_without_canceling_writer);
+    try std.testing.expectEqual(@as(?anyerror, null), state.deletion_error);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), state.writer_error);
+}
+
 test "db managed admission rejects regressed identity evidence" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -118367,6 +118446,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     // boundary and producer assistance are deterministic.
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
+        .start_optional_runtime_workers = false,
     });
     defer db.close();
 
@@ -118393,6 +118473,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         _ = try db.indexTextKernelDocuments("ft_v1", &docs);
     }
 
+    // Disabling derived workers alone does not stop optional merge workers.
+    // This fixture owns the scheduler directly until its explicit runtimes start.
+    if (db.text_merge_runtime) |automatic| try std.testing.expect(!automatic.isStarted());
     const before = db.core.index_manager.textMergeStatsSnapshot();
     try std.testing.expect(before.pending_segments > 8);
 
@@ -118400,7 +118483,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var held_task = (try resources.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
     var held_task_active = true;
     defer if (held_task_active) {
+        resources.apply_mutex.lockExclusive();
         resources.index_manager.cancelTextMergeTask(&held_task);
+        resources.apply_mutex.unlockExclusive();
         held_task.deinit(resources.index_manager.alloc);
     };
 
@@ -118447,7 +118532,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     byte_permit.release();
     byte_only_runtime.deinit();
 
+    resources.apply_mutex.lockExclusive();
     resources.index_manager.cancelTextMergeTask(&held_task);
+    resources.apply_mutex.unlockExclusive();
     held_task.deinit(resources.index_manager.alloc);
     held_task_active = false;
 
@@ -118468,6 +118555,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
 
     const outcome = runtime.applyBackpressure();
     try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.drained, outcome);
+    // Retire the worker before comparing two separately acquired snapshots;
+    // crossing the low watermark does not promise the scheduler stays idle.
+    _ = runtime.stop();
 
     const after = runtime.stats();
     try std.testing.expect(after.pending_segments <= 4);
@@ -118614,7 +118704,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     // process-wide byte dimension. A younger request for another index must
     // not consume the remaining bytes merely because the older waiter is also
     // blocked on its index-local segment ceiling.
-    const mixed_byte_limit = resources.index_manager.textMergeStatsSnapshot().pending_bytes +| 100;
+    const mixed_byte_limit = runtime.stats().pending_bytes +| 100;
     var mixed_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
         alloc,
         resources.index_manager,

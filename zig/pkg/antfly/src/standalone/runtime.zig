@@ -1978,6 +1978,12 @@ const LocalStandaloneMetadata = struct {
             if (table) |value| {
                 tables[0] = try antfly.metadata.table_manager.cloneTable(self.alloc, value.*);
                 copied_table = true;
+                if (std.mem.indexOf(u8, value.indexes_json, "\"projection_only\"") != null) {
+                    const store = self.lifecycle_store orelse return error.MissingMetadataStore;
+                    const indexes = try @import("../metadata/resolver_catalog_read.zig").executionIndexesAlloc(store, self.alloc, group_ids.main_metadata_group_id, value.name, self.durable_revision, true);
+                    self.alloc.free(tables[0].indexes_json);
+                    tables[0].indexes_json = indexes;
+                }
             }
             const refs = if (table) |value| generation.indexed.table_range_refs.get(value.table_id) orelse &.{} else &.{};
             const ranges = try self.alloc.alloc(antfly.metadata.RangeRecord, refs.len);
