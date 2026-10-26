@@ -8644,8 +8644,11 @@ test "sparse locator refresh stops after a generation retires between bounded ba
     var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
     defer index.close();
     const vector: SparseVector = .{ .indices = &.{1}, .values = &.{2} };
-    var ids: [512][16]u8 = undefined;
-    var writes: [512]SparseWrite = undefined;
+    // One complete 256-record refresh quantum plus one record is enough to
+    // prove retirement between batches. A second full quantum only repeats
+    // corpus construction and locator verification without another boundary.
+    var ids: [257][16]u8 = undefined;
+    var writes: [257]SparseWrite = undefined;
     for (&writes, &ids, 0..) |*write, *id, i| write.* = .{ .doc_id = try std.fmt.bufPrint(id, "doc-{d:0>4}", .{i}), .vec = vector };
     const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
     try index.batchWithOptions(writes[0..256], &.{}, bulk);
