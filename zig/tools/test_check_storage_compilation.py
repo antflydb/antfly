@@ -323,10 +323,30 @@ class BuildFailureEvidence(unittest.TestCase):
             self.assertFalse(first_global.exists())
             self.assertEqual(len(json.loads(report.read_text())), len(expected))
 
+    def test_active_process_diagnostics_exclude_other_builds(self):
+        snapshot = """100 1 20 30:00 0:00 S python measure.py
+101 100 30 29:59 0:01 S maker build
+102 101 7000 28:00 27:40 R zig build-lib --name antfly-storage-kernel -Mroot=storage.zig
+200 1 90000 40:00 39:50 R zig build-lib --name unrelated
+"""
+        rows = measurement.process_diagnostics(snapshot, 100)
+        self.assertEqual([row["pid"] for row in rows], [100, 101, 102])
+        compiler = rows[-1]
+        self.assertEqual(compiler["artifact"], "antfly-storage-kernel")
+        self.assertEqual(compiler["cpu_time"], "27:40")
+        self.assertEqual(compiler["rss_bytes"], 7000 * 1024)
+        self.assertNotIn("command", compiler)
+        self.assertEqual(measurement.process_diagnostics("", 100), [])
+
     def test_timeout_preserves_output_and_measurements(self):
         with (
             tempfile.TemporaryDirectory() as directory,
             mock.patch.object(measurement.subprocess, "check_output", return_value=""),
+            mock.patch.object(
+                measurement,
+                "active_build_processes",
+                return_value=[{"artifact": "storage", "cpu_time": "29:59"}],
+            ) as diagnostics,
         ):
             code, output, measured = measurement.measured_build(
                 [
@@ -342,6 +362,8 @@ class BuildFailureEvidence(unittest.TestCase):
         self.assertIn("compiler diagnostic", output)
         self.assertTrue(measured["timed_out"])
         self.assertFalse(measured["cpu_accounting_complete"])
+        diagnostics.assert_called_once()
+        self.assertEqual(measured["active_processes"][0]["cpu_time"], "29:59")
         self.assertGreater(measured["wall_seconds"], 0)
 
     def test_report_replaces_previous_running_snapshot(self):

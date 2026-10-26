@@ -166,6 +166,61 @@ def tree_rss(snapshot: str, root_pid: int) -> tuple[int, int]:
     return sum(sizes), max(sizes, default=0)
 
 
+def process_diagnostics(snapshot: str, root_pid: int) -> list[dict]:
+    """Attribute stalled work without retaining enormous compiler command lines."""
+    processes = {}
+    for line in snapshot.splitlines():
+        fields = line.split(None, 6)
+        if len(fields) != 7:
+            continue
+        pid, parent, rss, elapsed, cpu, state, command = fields
+        try:
+            processes[int(pid)] = (
+                int(parent),
+                int(rss) * 1024,
+                elapsed,
+                cpu,
+                state,
+                command,
+            )
+        except ValueError:
+            continue
+    descendants = {root_pid}
+    while True:
+        added = {pid for pid, row in processes.items() if row[0] in descendants}
+        if added <= descendants:
+            break
+        descendants |= added
+    result = []
+    for pid in sorted(descendants & processes.keys()):
+        parent, rss, elapsed, cpu, state, command = processes[pid]
+        artifact = re.search(r"(?:^|\s)--name\s+(\S+)", command)
+        result.append(
+            {
+                "pid": pid,
+                "parent_pid": parent,
+                "rss_bytes": rss,
+                "elapsed": elapsed,
+                "cpu_time": cpu,
+                "state": state,
+                "executable": Path(command.split()[0]).name,
+                "artifact": artifact[1] if artifact else None,
+            }
+        )
+    return result
+
+
+def active_build_processes(root_pid: int) -> list[dict]:
+    try:
+        snapshot = subprocess.check_output(
+            ["ps", "-axo", "pid=,ppid=,rss=,etime=,time=,state=,args="],
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return process_diagnostics(snapshot, root_pid)
+
+
 def bounded_build_command(zig: str, arguments: list[str]) -> list[str]:
     return [
         sys.executable,
@@ -196,6 +251,7 @@ def measured_build(
     peak_tree = peak_process = samples = 0
     min_disk_free = shutil.disk_usage(cwd).free
     timed_out = False
+    active_processes = []
     last_report = started
     with tempfile.TemporaryFile(mode="w+") as output:
         process = subprocess.Popen(
@@ -216,6 +272,9 @@ def measured_build(
                 now = time.monotonic()
                 if not timed_out and now - started > timeout_seconds:
                     timed_out = True
+                    # Capture before killing: wait4 cannot recover compiler CPU
+                    # clocks or the active artifact after its parent is killed.
+                    active_processes = active_build_processes(process.pid)
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -230,7 +289,10 @@ def measured_build(
                 min_disk_free = min(min_disk_free, shutil.disk_usage(cwd).free)
                 samples += 1
                 if now - last_report >= 30:
+                    if not timed_out:
+                        active_processes = active_build_processes(process.pid)
                     current = {
+                        "active_processes": active_processes,
                         "wall_seconds": round(now - started, 3),
                         "peak_build_tree_rss_bytes": peak_tree,
                         "peak_process_rss_bytes": peak_process,
@@ -257,6 +319,7 @@ def measured_build(
                 "wall_seconds": round(time.monotonic() - started, 3),
                 "cpu_seconds": round(usage.ru_utime + usage.ru_stime, 3),
                 "cpu_accounting_complete": not timed_out,
+                "active_processes": active_processes,
                 "peak_build_tree_rss_bytes": peak_tree,
                 "peak_process_rss_bytes": peak_process,
                 "rss_samples": samples,
