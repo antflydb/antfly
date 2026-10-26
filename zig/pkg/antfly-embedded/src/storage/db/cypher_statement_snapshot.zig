@@ -25,6 +25,7 @@ pub fn Snapshot(comptime DB: type) type {
         arena: std.heap.ArenaAllocator,
         source: *DB,
         db: DB,
+        population_upper_bound: ?u64,
         input: port.Input,
         graph: cypher.catalog.Graph,
         graphs: []const cypher.catalog.Graph,
@@ -76,9 +77,15 @@ pub fn Snapshot(comptime DB: type) type {
             stage = "open";
             var readonly = try db.openQueryCut(cut, cancellation);
             errdefer readonly.close();
-            self.* = .{ .a = a, .arena = arena, .source = db, .db = readonly, .input = copied, .graph = graph, .graphs = graphs, .policy = authority, .tables = undefined, .adapter = undefined };
+            const population: ?u64 = population: {
+                var primary_read = try readonly.core.store.beginReadTxn();
+                defer primary_read.abort();
+                const summary = (try @import("doc_identity.zig").readVisibilitySummaryTxn(&primary_read)) orelse break :population null;
+                break :population summary.live_ordinals;
+            };
+            self.* = .{ .a = a, .arena = arena, .source = db, .db = readonly, .population_upper_bound = population, .input = copied, .graph = graph, .graphs = graphs, .policy = authority, .tables = undefined, .adapter = undefined };
             self.tables = .{.{ .name = self.input.table, .db = &self.db }};
-            self.adapter = .{ .tables = &self.tables, .ttl_now_ns = copied.ttl_now_ns, .partitioned = true, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship, .read_authorization = readAuthorization, .search = search, .storage_projection = true, .ordered_projection = true } };
+            self.adapter = .{ .tables = &self.tables, .ttl_now_ns = copied.ttl_now_ns, .partitioned = true, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship, .read_authorization = readAuthorization, .population_upper_bound = populationUpperBound, .search = search, .storage_projection = true, .ordered_projection = true } };
             const backend = self.adapter.backend();
             stage = "bind";
             try backend.vtable.bind(backend.ptr, owned, graph);
@@ -110,6 +117,12 @@ pub fn Snapshot(comptime DB: type) type {
                     if (actual.incarnation != expected.incarnation or actual.config_hash != expected.config_hash) return error.CatalogGenerationChanged;
                 }
             }
+        }
+        fn populationUpperBound(ptr: *anyopaque, table: []const u8) !?u64 {
+            const self = cast(ptr);
+            if (!std.mem.eql(u8, table, self.input.table)) return error.Forbidden;
+            try checkpoint(ptr);
+            return self.population_upper_bound;
         }
         fn readAuthorization(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8) !DB.CypherBackend.ReadAuthorization {
             const self = cast(ptr);

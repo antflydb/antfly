@@ -104,6 +104,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             project_relationship: *const fn (*anyopaque, A, *const v.Relationship) anyerror!?*const v.Relationship,
             search: ?*const fn (*anyopaque, A, []const u8, b.SearchInput) anyerror!b.SearchPage = null,
             read_authorization: ?*const fn (*anyopaque, A, []const u8) anyerror!ReadAuthorization = null,
+            /// Physical owners can supply metadata captured with a retained cut
+            /// even when their DB adapter has no population method.
+            population_upper_bound: ?*const fn (*anyopaque, []const u8) anyerror!?u64 = null,
             /// The native reader enforces full-record policies, and project
             /// independently checks authority by identity rather than requiring
             /// unrequested node properties. Label predicates are still retained.
@@ -123,7 +126,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         read_fields: ?[]const []const u8 = null,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
         }
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
@@ -576,15 +579,18 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             if (cursor != null) return error.CatalogGenerationChanged;
             return null;
         }
+        fn populationUpperBound(ptr: *anyopaque, _: A, table: []const u8) !?u64 {
+            const self = cast(ptr);
+            if (comptime !@hasDecl(DB, "cypherPopulationUpperBound")) if (self.authority.population_upper_bound == null) return null;
+            try checkpoint(ptr);
+            if (self.work) |work| try work.charge(work.ptr, 1);
+            const count = if (self.authority.population_upper_bound) |read| try read(self.authority.ptr, table) else if (comptime @hasDecl(DB, "cypherPopulationUpperBound")) try (try self.selected(table)).cypherPopulationUpperBound() else null;
+            try checkpoint(ptr);
+            return count;
+        }
         fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?usize {
             if (limit == 0) return null;
-            if (filters.len == 0) if (comptime @hasDecl(DB, "cypherPopulationUpperBound")) {
-                try checkpoint(ptr);
-                const self = cast(ptr);
-                if (self.work) |work| try work.charge(work.ptr, 1);
-                const count = (try (try self.selected(table)).cypherPopulationUpperBound()) orelse return null;
-                return @intCast(@min(count, limit));
-            };
+            if (filters.len == 0) return if (try populationUpperBound(ptr, a, table)) |count| @intCast(@min(count, limit)) else null;
             // Costing can ask about a much larger population than one native
             // owner page. A partial page is unknown, never an exact count.
             const maximum = @min(limit, 4096);

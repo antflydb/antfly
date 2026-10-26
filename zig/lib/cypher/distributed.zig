@@ -157,7 +157,7 @@ pub const ReadSet = struct {
         self.* = undefined;
     }
     pub fn backend(self: *ReadSet) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         for (cast(ptr).snapshots) |snapshot| if (snapshot.backend.vtable.set_read_fields) |configure| configure(snapshot.backend.ptr, fields);
@@ -423,6 +423,21 @@ pub const ReadSet = struct {
         if (cursors.items.len != 0) cursors.items[cursors.items.len - 1] = continuation;
         return .{ .exact_keys = exact_keys, .stable_ties = stable_ties, .encounter_owners = if (!stable_ties) encounter_owners.items else null, .items = try output.toOwnedSlice(a), .cursors = if (self.ordered_item_cursors) cursors.items else null, .examined = merge.examined, .next = continuation };
     }
+    fn populationUpperBound(ptr: *anyopaque, a: A, table: []const u8) !?u64 {
+        const self = cast(ptr);
+        var total: u64 = 0;
+        var found = false;
+        for (self.targets, self.snapshots) |target, snapshot| {
+            if (!std.mem.eql(u8, target.table, table)) continue;
+            found = true;
+            try checkpoint(ptr);
+            const read = snapshot.backend.vtable.population_upper_bound orelse return null;
+            const count = (try read(snapshot.backend.ptr, a, table)) orelse return null;
+            total = std.math.add(u64, total, count) catch return null;
+        }
+        try checkpoint(ptr);
+        return if (found) total else null;
+    }
     fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?usize {
         const self = cast(ptr);
         var total: usize = 0;
@@ -508,6 +523,80 @@ pub const ReadSet = struct {
         try checkpoint(ptr);
         return .{ .items = page.items, .examined = page.examined, .next = try self.next(a, table, position, page.next) };
     }
+    const SearchMerge = struct {
+        read: *ReadSet,
+        a: A,
+        limit: usize,
+        steps: usize = 0,
+        best: std.ArrayList(b.Seed) = .empty,
+        // Backward-shift index deletion avoids tombstone accumulation during
+        // continuous top-k eviction; cached hashes also avoid rehashing keys.
+        identities: std.ArrayHashMapUnmanaged(v.Identity, void, IdentityContext, true) = .empty,
+        const IdentityContext = struct {
+            pub fn hash(_: @This(), identity: v.Identity) u32 {
+                return @truncate((v.Identity.Context{}).hash(identity));
+            }
+            pub fn eql(_: @This(), left: v.Identity, right: v.Identity, _: usize) bool {
+                return left.eql(right);
+            }
+        };
+        fn charge(self: *@This(), amount: usize) !void {
+            if (self.read.work) |work| try work.charge(work.ptr, amount);
+            const before = self.steps;
+            self.steps +|= amount;
+            if (before / 64 != self.steps / 64) try checkpoint(self.read);
+        }
+        fn better(self: *@This(), left: b.Seed, right: b.Seed) !bool {
+            try self.charge(1);
+            if (left.score == right.score) try self.charge((left.node.identity.key.len +| right.node.identity.key.len) / 64 +| 1);
+            return less({}, left, right);
+        }
+        fn sift(self: *@This(), length: usize) !void {
+            var parent: usize = 0;
+            while (parent * 2 + 1 < length) {
+                var child = parent * 2 + 1;
+                if (child + 1 < length and try self.better(self.best.items[child], self.best.items[child + 1])) child += 1;
+                if (!try self.better(self.best.items[parent], self.best.items[child])) break;
+                std.mem.swap(b.Seed, &self.best.items[parent], &self.best.items[child]);
+                parent = child;
+            }
+        }
+        fn add(self: *@This(), seed: b.Seed) !void {
+            const identity = seed.node.identity;
+            // Hashing and key comparisons are physical coordinator work too.
+            try self.charge(1 +| 3 *| ((identity.table.len +| identity.key.len) / 64 +| 1));
+            if (self.identities.contains(identity)) return error.CypherOverlappingOwners;
+            if (self.best.items.len < self.limit) {
+                try self.identities.put(self.a, identity, {});
+                try self.best.append(self.a, seed);
+                var child = self.best.items.len - 1;
+                while (child != 0) {
+                    const parent = (child - 1) / 2;
+                    if (!try self.better(self.best.items[parent], self.best.items[child])) break;
+                    std.mem.swap(b.Seed, &self.best.items[parent], &self.best.items[child]);
+                    child = parent;
+                }
+            } else if (try self.better(seed, self.best.items[0])) {
+                const old = self.best.items[0].node.identity;
+                try self.charge((old.table.len +| old.key.len) / 64 +| 1);
+                _ = self.identities.swapRemove(old);
+                try self.identities.put(self.a, identity, {});
+                self.best.items[0] = seed;
+                try self.sift(self.best.items.len);
+            }
+        }
+        fn finish(self: *@This()) ![]const b.Seed {
+            // Fallible heap sort preserves score/key order while metering every
+            // comparison. The retained identity set never exceeds top-k size.
+            var length = self.best.items.len;
+            while (length > 1) {
+                length -= 1;
+                std.mem.swap(b.Seed, &self.best.items[0], &self.best.items[length]);
+                try self.sift(length);
+            }
+            return self.best.toOwnedSlice(self.a);
+        }
+    };
     fn search(ptr: *anyopaque, a: A, table: []const u8, input: b.SearchInput) !b.SearchPage {
         const self = cast(ptr);
         try checkpoint(ptr);
@@ -515,7 +604,9 @@ pub const ReadSet = struct {
         if (parameters != .map) return error.CypherTypeMismatch;
         const requested = parameters.property("limit");
         const limit: usize = if (requested == .null) 10 else if (requested == .integer and requested.integer > 0 and requested.integer <= 1024) @intCast(requested.integer) else return error.CypherInvalidSearchLimit;
-        var best: std.ArrayList(b.Seed) = .empty;
+        var merge: SearchMerge = .{ .read = self, .a = a, .limit = limit };
+        defer merge.identities.deinit(a);
+        errdefer merge.best.deinit(a);
         var found = false;
         var examined: usize = 0;
         var approximate = false;
@@ -536,20 +627,14 @@ pub const ReadSet = struct {
             if (seeds.len > limit) return error.CypherInvalidSearchResult;
             for (seeds) |seed| {
                 if (!std.math.isFinite(seed.score) or !std.mem.eql(u8, seed.node.identity.table, table)) return error.CypherInvalidSearchResult;
-                for (best.items) |other| if (other.node.identity.eql(seed.node.identity)) return error.CypherOverlappingOwners;
-                var index: usize = 0;
-                while (index < best.items.len and less({}, best.items[index], seed)) : (index += 1) {}
-                if (index < limit) {
-                    try best.insert(a, index, seed);
-                    if (best.items.len > limit) best.items.len = limit;
-                }
+                try merge.add(seed);
             }
         }
         if (!found) return error.UndefinedGraphTable;
         try checkpoint(ptr);
         // Text and hybrid scores currently use owner-local corpus statistics.
         // Report this explicitly until a global-statistics scorer is available.
-        return .{ .seeds = try best.toOwnedSlice(a), .examined = examined, .approximate = approximate or searched_owners > 1 };
+        return .{ .seeds = try merge.finish(), .examined = examined, .approximate = approximate or searched_owners > 1 };
     }
     fn less(_: void, left: b.Seed, right: b.Seed) bool {
         if (left.score != right.score) return left.score > right.score;
@@ -929,4 +1014,77 @@ test "ordered RPC buffers keep calls bounded and resume every unconsumed item" {
         after = page.next orelse break;
     }
     try std.testing.expectEqual(@as(usize, 1024), ordinal);
+}
+
+test "distributed search heap meters ranking hashes sorting and revocation" {
+    const Fixture = struct {
+        units: usize = 0,
+        limit: usize = std.math.maxInt(usize),
+        revoked: bool = false,
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.revoked) return error.Forbidden;
+        }
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.units += amount;
+            if (self.units > self.limit) return error.CypherStateBudgetExceeded;
+        }
+        fn value(_: *anyopaque, _: v.Value) !void {}
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    var read: ReadSet = .{ .a = a, .targets = &.{}, .snapshots = &.{}, .independent_validations = &.{}, .source = .{ .ptr = &fixture, .checkpoint = Fixture.checkpoint, .admit = undefined, .capture = undefined }, .work = .{ .ptr = &fixture, .charge = Fixture.charge, .value = Fixture.value } };
+    var merge: ReadSet.SearchMerge = .{ .read = &read, .a = a, .limit = 17 };
+    defer merge.identities.deinit(a);
+    var reference: std.ArrayList(b.Seed) = .empty;
+    for (0..1024) |ordinal| {
+        const index = ordinal * 359 % 1024;
+        const node = try a.create(v.Node);
+        node.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "n{d:0>4}", .{index}) } };
+        const seed: b.Seed = .{ .node = node, .score = @floatFromInt(index % 5) };
+        try merge.add(seed);
+        try reference.append(a, seed);
+        try std.testing.expect(merge.identities.count() <= 17);
+    }
+    std.mem.sort(b.Seed, reference.items, {}, ReadSet.less);
+    const result = try merge.finish();
+    for (result, reference.items[0..17]) |actual, expected| try std.testing.expect(actual.node.identity.eql(expected.node.identity));
+    try std.testing.expect(fixture.units > 1024);
+    try std.testing.expect(fixture.units < 100000);
+    var duplicate: ReadSet.SearchMerge = .{ .read = &read, .a = a, .limit = 1 };
+    try duplicate.add(result[0]);
+    try std.testing.expectError(error.CypherOverlappingOwners, duplicate.add(result[0]));
+    fixture.limit = fixture.units;
+    try std.testing.expectError(error.CypherStateBudgetExceeded, duplicate.add(result[1]));
+    fixture.limit = std.math.maxInt(usize);
+    fixture.revoked = true;
+    try std.testing.expectError(error.Forbidden, duplicate.charge(64));
+}
+
+test "distributed population bounds sum only matching retained owners and reject overflow" {
+    const Owner = struct {
+        count: ?u64,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn population(ptr: *anyopaque, _: A, _: []const u8) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.count;
+        }
+    };
+    var owners = [_]Owner{ .{ .count = 5000 }, .{ .count = 7000 }, .{ .count = 99 } };
+    const targets = [_]Target{ .{ .table = "docs", .table_id = 1, .group_id = 1 }, .{ .table = "docs", .table_id = 1, .group_id = 2 }, .{ .table = "other", .table_id = 2, .group_id = 3 } };
+    var snapshots: [3]Snapshot = undefined;
+    for (&owners, &snapshots) |*owner, *snapshot| snapshot.* = .{ .ptr = owner, .validate = Owner.checkpoint, .close = undefined, .backend = .{ .ptr = owner, .vtable = &.{ .bind = undefined, .checkpoint = Owner.checkpoint, .scan = undefined, .get = undefined, .expand = undefined, .population_upper_bound = Owner.population } } };
+    var read: ReadSet = .{ .a = std.testing.allocator, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &owners, .checkpoint = Owner.checkpoint, .admit = undefined, .capture = undefined } };
+    const backend = read.backend();
+    const population = backend.vtable.population_upper_bound.?;
+    try std.testing.expectEqual(@as(?u64, 12000), try population(backend.ptr, std.testing.allocator, "docs"));
+    try std.testing.expectEqual(@as(?u64, 99), try population(backend.ptr, std.testing.allocator, "other"));
+    try std.testing.expectEqual(@as(?u64, null), try population(backend.ptr, std.testing.allocator, "missing"));
+    owners[1].count = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(?u64, null), try population(backend.ptr, std.testing.allocator, "docs"));
+    owners[1].count = null;
+    try std.testing.expectEqual(@as(?u64, null), try population(backend.ptr, std.testing.allocator, "docs"));
 }

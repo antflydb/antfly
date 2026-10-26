@@ -169,6 +169,9 @@ pub const Backend = struct {
         /// serve advisory costing only. Unknown populations return null;
         /// planning consumes work quota without binding query anchors.
         estimate_where: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, usize) anyerror!?usize = null,
+        /// Maintained physical population at the retained cut. No row sampling;
+        /// TTL, membership and policies can only reduce this advisory bound.
+        population_upper_bound: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?u64 = null,
         /// Authorized document lookup also serves nonvertex producers. The runtime
         /// applies graph membership before admitting traversal endpoints.
         get: *const fn (*anyopaque, std.mem.Allocator, v.Identity) anyerror!?*const v.Node,

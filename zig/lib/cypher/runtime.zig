@@ -649,7 +649,7 @@ pub const NodeCursor = struct {
     pub fn preferScalarGroupScan(self: *NodeCursor, maximum: u64, prefix_skip: u64, memory_bytes: usize, group_count: usize, reducer_count: usize, predicate: ?*const ast.Expr) !bool {
         if (maximum <= 1 or memory_bytes == 0) return false;
         const e = self.engine;
-        const estimate = e.backend.vtable.estimate_where orelse return false;
+        const estimate = e.backend.vtable.estimate_where;
         const node = self.original_match.paths[0].nodes[0];
         if (node.labels.len != 1) return false;
         const label = e.graph.label(node.labels[0]) orelse return false;
@@ -661,7 +661,12 @@ pub const NodeCursor = struct {
         try backend.vtable.checkpoint(backend.ptr);
         if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
         defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
-        const rows = (try estimate(backend.ptr, e.a, label.table, filters, cap)) orelse return false;
+        const candidate = if (estimate) |read| try read(backend.ptr, e.a, label.table, filters, cap) else null;
+        const rows = candidate orelse population: {
+            const read = backend.vtable.population_upper_bound orelse return false;
+            const bound = (try read(backend.ptr, e.a, label.table)) orelse return false;
+            break :population @as(usize, @intCast(@min(bound, cap)));
+        };
         try backend.vtable.checkpoint(backend.ptr);
         if (rows >= cap) return false;
         const skipped = @min(prefix_skip, maximum);

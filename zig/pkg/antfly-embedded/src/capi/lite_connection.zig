@@ -651,6 +651,7 @@ pub const Owner = struct {
     maintenance_schedules: std.AutoHashMapUnmanaged(MaintenanceKey, MaintenanceSchedule) = .empty,
     maintenance_root_incarnation: ?u128 = null,
     wake: std.Io.Event = .unset,
+    maintenance_activity: @import("maintenance_activity.zig").Activity = .{},
     current: ?*h.Handle = null,
     retired: std.ArrayList(*h.Handle) = .empty,
     maintenance_snapshot: ?*h.Handle = null,
@@ -1282,6 +1283,7 @@ pub const Owner = struct {
         defer if (root_catalog_read) |*read| read.abort();
         var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (run_database) try catalogStamp(database) else @splat(0), .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .root_catalog_read = if (root_catalog_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
+        self.maintenance_activity.begin();
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
         const store = root.owned_lite_backend.?.native_docstore.?;
@@ -1355,6 +1357,7 @@ pub const Owner = struct {
         store.writer_admission = null;
         root.maintenance_owner = null;
         root.maintenance_references -= 1;
+        self.maintenance_activity.finish(io);
         if (independent) inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
         if (!independent and self.current != root) {
             store.read_only = true;
@@ -1407,6 +1410,7 @@ pub const Owner = struct {
         const root = try self.refreshMaintenanceSnapshot(foreground, false);
         const store = root.owned_lite_backend.?.native_docstore.?;
         root.maintenance_references += 1;
+        self.maintenance_activity.begin();
         root.maintenance_owner = self;
         root.maintenance_publication = null;
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
@@ -1420,6 +1424,7 @@ pub const Owner = struct {
         store.writer_admission = null;
         root.maintenance_owner = null;
         root.maintenance_references -= 1;
+        self.maintenance_activity.finish(io);
         inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
         try self.adoptIdleMaintenanceCheckpoint(foreground, entry_header, store);
         try result;
@@ -1530,9 +1535,18 @@ pub const Connection = struct {
     readable_lease_hook: ?h.ReadableLeaseHook = null,
 
     pub fn acquire(self: *Connection) !native.PathWriterLock {
+        return self.acquireWithMaintenance(false);
+    }
+
+    pub fn acquireForMaintenance(self: *Connection) !native.PathWriterLock {
+        return self.acquireWithMaintenance(true);
+    }
+
+    fn acquireWithMaintenance(self: *Connection, manual_maintenance: bool) !native.PathWriterLock {
         const io = h.handleLockIo();
         self.gate.mutex.lockUncancelable(io);
         errdefer self.gate.mutex.unlock(io);
+        if (manual_maintenance) self.owner.maintenance_activity.wait(io, &self.gate.mutex);
         const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms;
         var backoff: i96 = std.time.ns_per_ms;
         while (true) {

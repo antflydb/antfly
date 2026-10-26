@@ -3705,3 +3705,76 @@ tests, 624 local Lite tests and 12 companion tests, with five skips and no
 failures or leaks; 81 affected Python SDK tests also pass. The full public,
 SQL and authenticated server campaigns above were run before this final Lite
 merge, rather than being claimed as repeated on the merge commit.
+
+Distributed search now retains top-k candidates in a worst-first heap, with a
+dense identity index that avoids tombstone accumulation under eviction. Ranking,
+key hashing and final ordering consume statement work; coordinator checkpoints
+remain bounded during merging. Result order remains descending score then
+ascending document key, and retained duplicate identities still reject overlap.
+The isolated 64-owner merge probe takes approximately 4 ms at k=512 and 8 ms at
+k=1024, versus 37 ms and 153 ms before; these measure merge CPU rather than
+network or owner search time.
+
+Cardinality costing has a separate retained-cut population capability across
+native, distributed and RPC backends. Embedded pinned reads retain the summary
+with their primary transaction; hosted statement snapshots capture it from the
+opened query-cut database and provide it through the native authority adapter.
+It reads maintained metadata without sampling rows and sums owner bounds with
+overflow/unknown handling. Unfiltered
+costing uses it directly. Filtered estimates retain their existing bounded page
+limits, falling back to the conservative physical population when sampling is
+incomplete. Active write overlays decline the capability. Population evidence
+never supplies an aggregate or licenses pruning; missing or excessive bounds
+retain bounded traversal.
+
+Hosted graph admission resolves unique database/namespace/table targets in one
+catalog epoch, then reuses those bindings for label aliases. Every label still
+validates its captured immutable table identity, and each unique target retains
+its logical permission checks, schema binding and row-policy proof. The shared
+SQL resolver supports batched definition reads; graph execution also reuses the
+logical names preserved by graphForExecution instead of parsing the definition
+a second time. A focused regression admits 64 aliases over two physical tables
+through one metadata resolution and rejects a stale identity on the last alias.
+
+Native Lite manual maintenance also coordinates with already-detached work before
+taking its path-writer lease. Waiting releases the owner gate so a publisher can
+finish and release its retained cut; the manual drain reacquires the gate before
+refreshing and draining. This avoids retaining a competing reader frontier while
+a large synchronous drain exhausts retirement admission. Ordinary reads/writes
+keep concurrent admission, and external writer contention retains the existing
+busy contract. A focused concurrency test covers waiting for multiple detached
+publishers and reuse of the idle notification; it runs in the C API unit gate.
+
+After merging `origin/main` at `b0b39178d6`, focused qualification passes 476
+native Cypher tests, nine transport/admission tests and the manual-maintenance
+concurrency test. Native SQL passes 1,082 local, 227 server and 57 supporting
+tests. The corrected library passes all 50 optimized build steps and the
+137-function export boundary. All 1,154 public Cypher/performance tests pass
+(468 seconds), including the three Lite drains which exposed detached-cohort
+contention in the initial run. That run also reproduced the earlier 32-AVG
+memory-quota signal; both isolated cases and the final full run pass without
+memory-code or quota changes. The admission fix addresses the FileBusy drain
+failure, rather than being claimed as a memory-quota fix.
+
+The final hosted-capability qualification repeats all 476 native Cypher tests
+and both real-owner/retained-cut tests. The latter captures two documents, adds
+a third live document, and proves that the RPC population remains two and
+rejects another table. The final production build passes all 88 steps; the
+library passes 50 steps and its 137-function export boundary. All 1,154 public
+Cypher/performance tests pass again (777 seconds on the shared host), and both
+authenticated standalone and replicated-owner campaigns pass (235 seconds,
+including setup/teardown).
+
+An authenticated 4,000-document SQL GRAPH_TABLE probe verifies index readiness
+with a one-anchor read and compares equal results over five warmed samples.
+At offset 2,999, count(DISTINCT score), min(score), max(score) with ORDER BY id
+now takes a median 671 ms versus 644 ms for the expression-forced full-pass
+control. Before the fix, the corresponding medians were 1,189 ms and 559 ms:
+the seek penalty relative to its control falls from roughly 2.1x to 1.04x.
+These are shared-host observations, not a controlled absolute speedup claim.
+The one-/64-label admission probe is too noisy for a reliable timing claim
+(59/94 ms medians, with individual samples up to 276 ms); the focused admission
+regression instead proves the constant metadata-call count and per-label stale
+identity rejection. Search-merge CPU results above exclude network and owner
+search time; their benchmark removes the work cap to measure the complete
+merge, while production enforces the newly accounted coordinator work budget.

@@ -424,7 +424,7 @@ test "external lake Cypher execution reads immutable native document and graph c
     defer if (read_open) read.deinit();
     statement_fence.release();
     try std.testing.expectError(error.CypherSnapshotRequired, cypher.snapshot.Materialized.create(a, capture.backend(), graph, .{}));
-    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"id\":\"b\",\"title\":\"After graph capture\"}" }}, .sync_level = .full_index });
+    try db.batch(.{ .writes = &.{ .{ .key = "b", .value = "{\"id\":\"b\",\"title\":\"After graph capture\"}" }, .{ .key = "later", .value = "{\"id\":\"later\"}" } }, .sync_level = .full_index });
     const Channel = struct {
         fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8) ![]u8 {
             const port: *local.storage_statement_read_fence.GraphRead = @ptrCast(@alignCast(ptr));
@@ -434,6 +434,12 @@ test "external lake Cypher execution reads immutable native document and graph c
     var client: cypher.rpc.Client = .{ .channel = .{ .ptr = &read, .call = Channel.invoke }, .incarnation = 1, .revision = 1 };
     var wire_arena = std.heap.ArenaAllocator.init(a);
     defer wire_arena.deinit();
+    // The real owner uses DB.CypherBackend, not the embedded pinned adapter.
+    // Population metadata must survive that adapter and remain on this cut
+    // after a new live document is committed.
+    try std.testing.expectEqual(@as(?u64, 2), try client.backend().vtable.population_upper_bound.?(&client, wire_arena.allocator(), "docs"));
+    try std.testing.expectEqual(@as(?usize, 2), try client.backend().vtable.estimate_where.?(&client, wire_arena.allocator(), "docs", &.{}, 15000));
+    try std.testing.expectError(error.Forbidden, client.backend().vtable.population_upper_bound.?(&client, wire_arena.allocator(), "other"));
     const node = (try client.backend().vtable.get(&client, wire_arena.allocator(), .{ .table = "docs", .key = "b" })).?;
     try std.testing.expectEqualStrings("Changed", node.properties[1].value.string);
     try std.testing.expectError(error.Forbidden, client.backend().vtable.get(&client, wire_arena.allocator(), .{ .table = "other", .key = "b" }));

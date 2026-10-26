@@ -643,6 +643,16 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")
         .dependOn(&run_capi_models.step);
+    const maintenance_activity_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/capi/maintenance_activity.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const run_maintenance_activity = b.addRunArtifact(maintenance_activity_tests);
+    run_capi_tests.step.dependOn(&run_maintenance_activity.step);
+    b.step("capi-maintenance-activity-test", "Verify manual drains yield admission to detached publishers")
+        .dependOn(&run_maintenance_activity.step);
     const cypher_capi_tests = b.addTest(.{
         .root_module = capi_root_mod,
         .filters = &.{ "capi embedded graph catalog and query", "capi Cypher authority" },

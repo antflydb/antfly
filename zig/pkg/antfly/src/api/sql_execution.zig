@@ -723,25 +723,38 @@ pub const Adapter = struct {
 
     fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        const target: system_catalog.Target = .{ .database = name.database orelse self.database, .namespace = name.namespace orelse self.namespace, .table = name.table };
-        try target.validate();
-        const logical = try target.resourceNameAlloc(alloc);
-        const permission: @import("../usermgr/mod.zig").PermissionType = switch (action) {
-            .read => .read,
-            .write, .read_write => .write,
-            .admin => .admin,
-        };
-        if (self.identity.*) |identity| {
-            if (!http_server.permissionsAllow(identity.permissions, .table, logical, permission)) return error.Forbidden;
-            if (action == .read_write and !http_server.permissionsAllow(identity.permissions, .table, logical, .read)) return error.Forbidden;
+        const targets = [_]system_catalog.Target{.{ .database = name.database orelse self.database, .namespace = name.namespace orelse self.namespace, .table = name.table }};
+        return (try self.resolveMany(alloc, &targets, action))[0];
+    }
+
+    /// Bind unique targets in one metadata epoch. Admission checks every logical
+    /// target before projecting its physical permission alias.
+    pub fn resolveMany(self: *Adapter, alloc: std.mem.Allocator, targets: []const system_catalog.Target, action: catalog.Action) ![]catalog.Table {
+        for (targets) |target| {
+            try target.validate();
+            const logical = try target.resourceNameAlloc(alloc);
+            const permission: @import("../usermgr/mod.zig").PermissionType = switch (action) {
+                .read => .read,
+                .write, .read_write => .write,
+                .admin => .admin,
+            };
+            if (self.identity.*) |identity| {
+                if (!http_server.permissionsAllow(identity.permissions, .table, logical, permission)) return error.Forbidden;
+                if (action == .read_write and !http_server.permissionsAllow(identity.permissions, .table, logical, .read)) return error.Forbidden;
+            }
         }
-        // A narrow definition read pins schema and physical identity in one
-        // catalog epoch; never enumerate/clone every table on a SQL request.
         if (!self.server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
-        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true, .expected_revision = self.revision } });
+        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = targets, .include_query_definitions = true, .expected_revision = self.revision } });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
-        if (snapshot.tables.len != 1) return error.InvalidSqlBackendResponse;
-        const table = snapshot.tables[0] orelse return error.TableNotFound;
+        if (snapshot.tables.len != targets.len) return error.InvalidSqlBackendResponse;
+        const bindings = try alloc.alloc(catalog.Table, targets.len);
+        for (targets, snapshot.tables, bindings) |target, resolved, *binding| binding.* = try self.bindResolved(alloc, target, resolved, snapshot.revision, action);
+        return bindings;
+    }
+
+    fn bindResolved(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, resolved: ?system_catalog.ResolvedTable, revision: u64, action: catalog.Action) !catalog.Table {
+        const logical = try target.resourceNameAlloc(alloc);
+        const table = resolved orelse return error.TableNotFound;
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
@@ -759,8 +772,8 @@ pub const Adapter = struct {
                 .indexes_json = definition.indexes_json,
             }),
         };
-        binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = snapshot.revision };
-        self.revision = snapshot.revision;
+        binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = revision };
+        self.revision = revision;
         self.target = target;
         try self.recordPreparedBinding(alloc, binding);
         if (self.identity.*) |*identity| try http_server.projectCatalogIdentity(self.server.alloc, identity, logical, table.name);

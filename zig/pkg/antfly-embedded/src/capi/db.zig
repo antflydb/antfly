@@ -931,7 +931,7 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
         connection.mutex.lockUncancelable(handleLockIo());
         var guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = access, .connection = connection };
         if (!pinned) {
-            guard.path_lease = connection.acquire() catch |err| {
+            guard.path_lease = (if (access == .maintain) connection.acquireForMaintenance() else connection.acquire()) catch |err| {
                 guard.entry_error = capi.mapError(err);
                 return guard;
             };

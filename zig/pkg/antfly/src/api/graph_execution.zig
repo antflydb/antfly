@@ -50,17 +50,32 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     const state = try std.json.parseFromSliceLeaky(domain.State, scratch, bytes, .{ .allocate = .alloc_always });
     const record = state.find(.graph, 0, name) orelse return error.CatalogNotFound;
     const graph = try domain.graphForExecution(scratch, record);
-    const logical = try cypher.catalog.parseDefinition(scratch, name, graph.incarnation, graph.revision, record.source_json);
     var sql: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = identity, .context = context };
-    const resolver = sql.backend();
     var tables: std.ArrayList(port.GraphTable) = .empty;
-    for (logical.labels, @constCast(graph.labels), 0..) |label, *physical, label_index| {
-        const target = try domain.graphLabelTarget(state, record.graph_tables[label_index], label);
+    var targets: std.ArrayList(domain.Target) = .empty;
+    const positions = try scratch.alloc(usize, graph.labels.len);
+    for (graph.labels, positions, 0..) |label, *position, label_index| {
+        var logical = label;
+        logical.table = label.logical_table;
+        const target = try domain.graphLabelTarget(state, record.graph_tables[label_index], logical);
+        position.* = for (targets.items, 0..) |existing, index| {
+            if (std.mem.eql(u8, existing.database, target.database) and std.mem.eql(u8, existing.namespace, target.namespace) and std.mem.eql(u8, existing.table, target.table)) break index;
+        } else append: {
+            const index = targets.items.len;
+            try targets.append(scratch, target);
+            break :append index;
+        };
+    }
+    const resolved = try sql.resolveMany(scratch, targets.items, if (writes and !compiled.query.explain) .read_write else .read);
+    for (@constCast(graph.labels), positions) |*physical, position| {
+        const target = targets.items[position];
+        const table = resolved[position];
         physical.logical_table = target.table;
         physical.database = target.database;
         physical.namespace = target.namespace;
-        const table = try resolver.vtable.resolve(resolver.ptr, scratch, .{ .database = target.database, .namespace = target.namespace, .table = target.table }, if (writes and !compiled.query.explain) .read_write else .read);
         if (table.id != physical.table_id or !std.mem.eql(u8, table.physical_name, physical.table)) return error.CatalogGenerationChanged;
+    }
+    for (resolved, targets.items) |table, target| {
         var duplicate = false;
         for (tables.items) |existing| if (existing.table_id == table.id) {
             duplicate = true;
@@ -304,4 +319,55 @@ test "Cypher write releases retained owner reads before commit and cleanup is id
     try std.testing.expect(read == null);
     try std.testing.expect(channel.read == null);
     try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+}
+
+test "graph admission batches distinct tables before resolving label aliases" {
+    const Fake = struct {
+        state: domain.State,
+        resolutions: usize = 0,
+        fn call(ptr: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, request: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return switch (request) {
+                .read => std.json.Stringify.valueAlloc(a, self.state, .{}),
+                .policy_publication_status => a.dupe(u8, "null"),
+                .resolve_many => |input| resolve: {
+                    self.resolutions += 1;
+                    try std.testing.expectEqual(@as(usize, 2), input.targets.len);
+                    try std.testing.expect(input.include_query_definitions);
+                    const tables = try a.alloc(?domain.ResolvedTable, input.targets.len);
+                    for (input.targets, tables, 0..) |target, *out, index| {
+                        try std.testing.expectEqualStrings(if (index == 0) "docs" else "other", target.table);
+                        out.* = .{ .table_id = index + 7, .name = target.table, .query_definition = .{ .table_id = index + 7, .schema_json = "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"Document\",\"document_schemas\":{\"Document\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}}}}}}", .read_schema_json = "", .indexes_json = "{}" } };
+                    }
+                    break :resolve std.json.Stringify.valueAlloc(a, domain.ResolvedMany{ .revision = 1, .tables = tables }, .{});
+                },
+                else => error.TestUnexpectedResult,
+            };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Label = @typeInfo(@FieldType(cypher.catalog.Definition, "labels")).pointer.child;
+    const labels = try a.alloc(Label, 64);
+    const bindings = try a.alloc(domain.GraphTableBinding, labels.len);
+    for (labels, bindings, 0..) |*label, *binding, index| {
+        const table = if (index % 2 == 0) "docs" else "other";
+        label.* = .{ .name = try std.fmt.allocPrint(a, "D{d}", .{index}), .table = .{ .string = table } };
+        binding.* = .{ .label_index = @intCast(index), .table_id = index % 2 + 7, .storage_name = table };
+    }
+    const resources = try a.alloc(domain.Resource, 1);
+    resources[0] = .{ .kind = .graph, .id = 1, .name = "g", .source_json = try std.json.Stringify.valueAlloc(a, cypher.catalog.Definition{ .labels = labels }, .{}), .graph_tables = bindings };
+    var fake: Fake = .{ .state = .{ .revision = 1, .resources = resources } };
+    var server = server_mod.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.call, .supports_query_definitions = true } }, null, null);
+    defer server.deinit();
+    var identity: ?server_mod.AuthenticatedIdentity = null;
+    var diagnostic: cypher.compiler.Diagnostic = .{};
+    var outcome: WriteOutcome = .not_started;
+    const result = try execute(std.testing.allocator, &server, &identity, .{}, "g", "{\"query\":\"RETURN 1\"}", &diagnostic, &outcome);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 1), fake.resolutions);
+    // Every alias still checks its captured immutable table identity.
+    bindings[63].table_id = 99;
+    try std.testing.expectError(error.CatalogGenerationChanged, execute(std.testing.allocator, &server, &identity, .{}, "g", "{\"query\":\"RETURN 1\"}", &diagnostic, &outcome));
 }

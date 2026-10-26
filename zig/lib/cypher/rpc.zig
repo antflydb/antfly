@@ -23,7 +23,7 @@ const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
 const A = std.mem.Allocator;
 pub const Request = struct {
-    operation: enum { validate, scan, scan_ordered, estimate, get, get_many, expand, search, observe, observe_ranges, normalize, project },
+    operation: enum { validate, scan, scan_ordered, estimate, population, get, get_many, expand, search, observe, observe_ranges, normalize, project },
     graph_incarnation: u64,
     graph_revision: u64,
     table: []const u8 = "",
@@ -47,7 +47,7 @@ pub const Request = struct {
     include_relationships: bool = false,
 };
 pub const Projection = struct { node: ?*const v.Node, relationships: []const *const v.Relationship = &.{} };
-const Reply = struct { exact_keys: bool = false, stable_ties: bool = true, encounter_owners: ?[]const usize = null, cursors: ?[]const ?[]const u8 = null, ordered: bool = false, estimate: ?usize = null, unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
+const Reply = struct { exact_keys: bool = false, stable_ties: bool = true, encounter_owners: ?[]const usize = null, cursors: ?[]const ?[]const u8 = null, ordered: bool = false, estimate: ?usize = null, population: ?u64 = null, unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
 pub const Channel = struct { ptr: *anyopaque, call: *const fn (*anyopaque, A, []const u8) anyerror![]u8, checkpoint: ?*const fn (*anyopaque) anyerror!void = null };
 pub const Version = struct { incarnation: u64, revision: u64 };
 pub const Client = struct {
@@ -58,7 +58,7 @@ pub const Client = struct {
     work: ?b.Work = null,
     read_fields: ?[]const []const u8 = null,
     pub fn backend(self: *Client) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         cast(ptr).read_fields = fields;
@@ -149,7 +149,15 @@ pub const Client = struct {
     fn scan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         return scanWhere(ptr, a, table, &.{}, after, limit);
     }
+    fn populationUpperBound(ptr: *anyopaque, a: A, table: []const u8) !?u64 {
+        const self = cast(ptr);
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        return (try self.invoke(scratch.allocator(), .{ .operation = .population, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table })).population;
+    }
     fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?usize {
+        if (limit == 0) return null;
+        if (filters.len == 0) if (try populationUpperBound(ptr, a, table)) |count| return @intCast(@min(count, limit));
         const self = cast(ptr);
         var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer scratch.deinit();
@@ -322,6 +330,12 @@ pub const Owner = struct {
                 const normalized = try (self.backend.vtable.normalize_node orelse return error.CypherInvalidDocument)(self.backend.ptr, scratch, &node, request.apply_defaults);
                 try values.append(scratch, .{ .value = .{ .node = normalized } });
             },
+            .population => {
+                if (!self.permitsTable(request.table)) return error.Forbidden;
+                const count = if (self.backend.vtable.population_upper_bound) |read| try read(self.backend.ptr, scratch, request.table) else null;
+                try self.backend.vtable.checkpoint(self.backend.ptr);
+                return std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .population = count }, .{});
+            },
             .estimate => {
                 if (!self.permitsTable(request.table) or request.limit > 128) return error.Forbidden;
                 const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
@@ -415,6 +429,11 @@ test "bounded owner estimates retain authority and propagate planning work" {
         charged: usize = 0,
         invalid: bool = false,
         saturated: bool = false,
+        fn population(ptr: *anyopaque, _: A, _: []const u8) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.work) |work| try work.charge(work.ptr, 2);
+            return 50000;
+        }
         const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
         fn checkpoint(_: *anyopaque) !void {}
         fn setWork(ptr: *anyopaque, work: ?b.Work) void {
@@ -432,21 +451,25 @@ test "bounded owner estimates retain authority and propagate planning work" {
         }
         fn value(_: *anyopaque, _: v.Value) !void {}
         fn call(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
-            const owner: Owner = .{ .backend = .{ .ptr = ptr, .vtable = &.{ .bind = undefined, .checkpoint = checkpoint, .scan = undefined, .get = undefined, .expand = undefined, .estimate_where = estimate, .set_work = setWork } }, .graph = graph, .table = "docs" };
+            const owner: Owner = .{ .backend = .{ .ptr = ptr, .vtable = &.{ .bind = undefined, .checkpoint = checkpoint, .scan = undefined, .get = undefined, .expand = undefined, .estimate_where = estimate, .population_upper_bound = population, .set_work = setWork } }, .graph = graph, .table = "docs" };
             return owner.execute(a, body);
         }
     };
     var fixture: Fixture = .{};
     var client: Client = .{ .channel = .{ .ptr = &fixture, .call = Fixture.call }, .incarnation = 1, .revision = 1, .work = .{ .ptr = &fixture, .charge = Fixture.charge, .value = Fixture.value } };
     const backend = client.backend();
-    try std.testing.expectEqual(@as(?usize, 2), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 32));
+    const filters = &[_]b.PropertyFilter{.{ .property = "score", .value = .{ .integer = 1 } }};
+    try std.testing.expectEqual(@as(?usize, 2), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", filters, 32));
     try std.testing.expectEqual(@as(usize, 7), fixture.charged);
-    try std.testing.expectEqual(@as(?usize, 2), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 15000));
-    try std.testing.expectEqual(@as(?usize, null), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 1));
-    try std.testing.expectError(error.Forbidden, backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "hidden", &.{}, 32));
+    try std.testing.expectEqual(@as(?usize, 2), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", filters, 15000));
+    try std.testing.expectEqual(@as(?usize, null), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", filters, 1));
+    try std.testing.expectError(error.Forbidden, backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "hidden", filters, 32));
+    try std.testing.expectEqual(@as(?usize, 50000), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 60000));
+    try std.testing.expectEqual(@as(?u64, 50000), try backend.vtable.population_upper_bound.?(backend.ptr, std.testing.allocator, "docs"));
+    try std.testing.expectError(error.Forbidden, backend.vtable.population_upper_bound.?(backend.ptr, std.testing.allocator, "hidden"));
     fixture.saturated = true;
-    try std.testing.expectEqual(@as(?usize, null), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 15000));
-    try std.testing.expectEqual(@as(?usize, 128), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 128));
+    try std.testing.expectEqual(@as(?usize, null), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", filters, 15000));
+    try std.testing.expectEqual(@as(?usize, 128), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", filters, 128));
     fixture.invalid = true;
-    try std.testing.expectError(error.CypherInvalidBackendPage, backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 32));
+    try std.testing.expectError(error.CypherInvalidBackendPage, backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", filters, 32));
 }
