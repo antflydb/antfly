@@ -1150,3 +1150,175 @@ test "relational index system document generated portable LSM round trip preserv
     try std.testing.expectEqualStrings("cold", parsed.value.object.get("g").?.string);
     try std.testing.expect(parsed.value.object.get("unknown").?.bool);
 }
+
+test "relational index system document schema integrity rejects batches before intents and recovers prepared rows" {
+    const a = std.testing.allocator;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("document-schema-integrity");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    var db = try db_mod.DB.open(a, directory.path(), options);
+    var live = true;
+    defer if (live) db.close();
+    try db.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"}},"additionalProperties":true}}}}
+    );
+    const first = "{\"amount\":1,\"untouched\":{\"n\":9007199254740993.1250}}";
+    const second = "{\"amount\":2}";
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = first }, .{ .key = "b", .value = second } }, .timestamp_ns = 42 });
+    try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"amount\":10}" }, .{ .key = "b", .value = "{\"amount\":\"bad\"}" } } }));
+    const rejected = try db.beginTransaction(100);
+    try std.testing.expectError(error.InvalidBatchRequest, db.writeIntents(rejected, &.{.{ .key = "a", .value = null, .json_null_fields = &.{"amount"} }}, &.{}));
+    try std.testing.expectError(error.InvalidBatchRequest, db.writeIntents(rejected, &.{ .{ .key = "a", .value = "{\"amount\":10}" }, .{ .key = "b", .value = "{\"amount\":\"bad\"}" } }, &.{}));
+    // A failed prepare has no durable write intents and must release every
+    // attempted key. Independent valid writes can still acquire both keys.
+    var rejected_rows = try db.core.collectTransactionIntentBatch(a, rejected);
+    defer rejected_rows.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), rejected_rows.writes.len);
+    try db.abortTransaction(rejected, 101);
+    const pending = try db.beginTransaction(200);
+    try db.writeIntents(pending, &.{.{ .key = "c", .value = "{\"amount\":3,\"cold\":[1,null]}" }}, &.{});
+    for ([_][]const u8{ "a", "b" }, [_][]const u8{ first, second }) |key, expected| {
+        const bytes = (try db.get(a, key)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(expected, bytes);
+    }
+    db.close();
+    live = false;
+    db = try db_mod.DB.open(a, directory.path(), options);
+    live = true;
+    try db.commitTransaction(pending, 201);
+    const recovered = (try db.get(a, "c")).?;
+    defer a.free(recovered);
+    try std.testing.expectEqualStrings("{\"amount\":3,\"cold\":[1,null]}", recovered);
+    try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{ .key = "c", .value = "{\"amount\":\"bad after reopen\"}" }} }));
+    const retained = (try db.get(a, "c")).?;
+    defer a.free(retained);
+    try std.testing.expectEqualStrings(recovered, retained);
+}
+
+test "relational index system document schema integrity releases partial preparation allocations" {
+    const a = std.testing.allocator;
+    var validator = try @import("../../schema/mod.zig").CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"}},"additionalProperties":true}}}}
+    );
+    defer validator.deinit(a);
+    try std.testing.expectError(error.InvalidBatchRequest, mapper.PreparedDocumentBatch.init(a, &.{.{ .key = "\x00internal", .value = "opaque", .json_null_fields = &.{"amount"} }}, validator, false));
+    const Run = struct {
+        fn run(fault: std.mem.Allocator, compiled: @import("../../schema/mod.zig").CompiledTableValidator) !void {
+            var prepared = try mapper.PreparedDocumentBatch.init(fault, &.{ .{ .key = "a", .value = "{\"amount\":1}" }, .{ .key = "b", .value = "{\"amount\":2,\"cold\":[1,null]}" } }, compiled, false);
+            defer prepared.deinit();
+            try std.testing.expectEqual(@as(usize, 2), prepared.writes.len);
+            try std.testing.expect(prepared.roots[0] != null and prepared.roots[1] != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{validator});
+}
+
+test "relational index system document schema integrity retains unconstrained streaming values and cold intents" {
+    const a = std.testing.allocator;
+    var validator = try @import("../../schema/mod.zig").CompiledTableValidator.init(a, "{}");
+    defer validator.deinit(a);
+    try std.testing.expect(!validator.requiresDocumentPreparation());
+    const wide = try a.alloc(u8, 8193);
+    defer a.free(wide);
+    wide[0] = '[';
+    for (0..4096) |i| {
+        wide[1 + 2 * i] = '0';
+        wide[2 + 2 * i] = if (i == 4095) ']' else ',';
+    }
+    var fixed: std.heap.FixedBufferAllocator = .init(&.{});
+    try mapper.validateJsonDocumentNoAlloc(fixed.allocator(), wide);
+    const deep = try a.alloc(u8, 8193);
+    defer a.free(deep);
+    @memset(deep[0..4096], '[');
+    deep[4096] = '0';
+    @memset(deep[4097..], ']');
+    try mapper.validateJsonDocumentNoAlloc(a, deep);
+    try std.testing.expectError(error.OutOfMemory, mapper.validateJsonDocumentNoAlloc(fixed.allocator(), deep));
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("document-unconstrained-integrity");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    var db = try db_mod.DB.open(a, directory.path(), options);
+    var live = true;
+    defer if (live) db.close();
+    try db.setSchemaJson(a, "{}");
+    try db.batch(.{ .writes = &.{ .{ .key = "array", .value = wide }, .{ .key = "scalar", .value = "\"literal JSON string\"" }, .{ .key = "null", .value = "null" } } });
+    const rejected = try db.beginTransaction(100);
+    for ([_][]const u8{ "", "]", "}", "[", "{}{}", "true false", "\"\xff\"" }) |invalid| {
+        try std.testing.expectError(error.InvalidBatchRequest, db.writeIntents(rejected, &.{ .{ .key = "valid", .value = "true" }, .{ .key = "invalid", .value = invalid } }, &.{}));
+    }
+    var rejected_rows = try db.core.collectTransactionIntentBatch(a, rejected);
+    defer rejected_rows.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), rejected_rows.writes.len);
+    try db.abortTransaction(rejected, 101);
+    const pending = try db.beginTransaction(200);
+    try db.writeIntents(pending, &.{.{ .key = "prepared", .value = "\"prepared scalar\"" }}, &.{});
+    db.close();
+    live = false;
+    db = try db_mod.DB.open(a, directory.path(), options);
+    live = true;
+    try db.commitTransaction(pending, 201);
+    for ([_][]const u8{ "array", "scalar", "null", "prepared" }, [_][]const u8{ wide, "\"literal JSON string\"", "null", "\"prepared scalar\"" }) |key, expected| {
+        const bytes = (try db.get(a, key)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(expected, bytes);
+    }
+}
+
+test "relational index system document schema integrity fences speculative epochs and retains durable decisions" {
+    const a = std.testing.allocator;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("document-schema-epochs");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    var db = try db_mod.DB.open(a, directory.path(), options);
+    var live = true;
+    defer if (live) db.close();
+    {
+        try db.lockApplyForPortableRuntime();
+        defer db.core.unlockApply();
+        try db.validatePreparedSchemaViewLocked(null);
+    }
+    try db.setSchemaJson(a, "{\"version\":1}");
+    const pending = try db.beginTransaction(100);
+    try db.writeIntents(pending, &.{.{ .key = "prepared", .value = "\"retained v1 scalar\"" }}, &.{});
+    const replay: db_mod.types.BatchRequest = .{
+        .schema_version = 1,
+        .writes = &.{.{ .key = "ordered", .value = "\"ordered v1 scalar\"" }},
+    };
+    {
+        var pinned = db.core.acquireSchemaView().?;
+        defer pinned.release();
+        try std.testing.expect(!pinned.validator().?.requiresDocumentPreparation());
+        try db.setSchemaJson(a,
+            \\{"version":2,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"}},"additionalProperties":true}}}}
+        );
+        {
+            try db.lockApplyForPortableRuntime();
+            defer db.core.unlockApply();
+            try std.testing.expectError(error.PreparedGenerationChanged, db.validatePreparedSchemaViewLocked(null));
+            try std.testing.expectError(error.PreparedGenerationChanged, db.validatePreparedSchemaViewLocked(pinned));
+            var current = db.core.acquireSchemaView().?;
+            defer current.release();
+            try db.validatePreparedSchemaViewLocked(current);
+        }
+        // An ordinary stale request cannot claim the historical epoch; a
+        // committed Raft entry and prepared participant must use it instead.
+        try std.testing.expectError(error.PreparedGenerationChanged, db.batch(replay));
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{ .key = "new", .value = "\"invalid v2 scalar\"" }} }));
+        try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, replay, .{ .index = 1, .term = 1 });
+    }
+    db.close();
+    live = false;
+    db = try db_mod.DB.open(a, directory.path(), options);
+    live = true;
+    try db.commitTransaction(pending, 101);
+    try db.commitTransaction(pending, 101);
+    try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, replay, .{ .index = 1, .term = 1 });
+    for ([_][]const u8{ "prepared", "ordered" }, [_][]const u8{ "\"retained v1 scalar\"", "\"ordered v1 scalar\"" }) |key, expected| {
+        const bytes = (try db.get(a, key)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(expected, bytes);
+    }
+    try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
+    try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{ .key = "new", .value = "\"invalid after reopen\"" }} }));
+}

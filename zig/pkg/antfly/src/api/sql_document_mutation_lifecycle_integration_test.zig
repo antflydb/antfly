@@ -759,6 +759,120 @@ const Campaign = struct {
     }
 };
 
+test "mounted SQL original document integrity rejects invalid images and assignment indirection across cold owners" {
+    // sql-0909 and sql-0941: original SQL and source-owned property domains.
+    const ids = [_][]const u8{ "sql-0909", "sql-0941" };
+    const Integrity = struct {
+        pub const native_sessions = true;
+        pub const native_auth = true;
+        pub const cold_catalog = true;
+        pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+            const users = @import("../usermgr/mod.zig");
+            inline for (.{ users.ResourceType.database, users.ResourceType.namespace }) |kind| {
+                var permission = try users.Permission.initOwned(manager.alloc, kind, "*", .admin);
+                defer permission.deinit(manager.alloc);
+                try manager.addPermissionToUser("pk-rewriter", permission);
+            }
+        }
+        state: *State,
+        campaign: Campaign,
+
+        fn rejected(ctx: *fixture.Context, sql: []const u8, code: []const u8) !void {
+            var response = try client.execute(ctx, sql, .never);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 400) std.debug.print("document integrity sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 400), response.status);
+            var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+            defer diagnostic.deinit();
+            try std.testing.expectEqualStrings(code, diagnostic.value.code);
+        }
+
+        fn atomicity(self: *@This(), ctx: *fixture.Context) !void {
+            if (!std.mem.eql(u8, self.state.entry.id, "sql-0909")) return;
+            // A valid first candidate followed by an invalid image must never
+            // leak the first candidate's bytes, timestamp or content digest.
+            try rejected(ctx, "UPDATE docs SET _doc=CASE WHEN _id='doc:a' THEN jsonb_set(_doc,'{amount}','10') ELSE jsonb_set(_doc,'{amount}','\"not numeric\"') END WHERE _id IN ('doc:a','doc:b')", "22023");
+            try self.campaign.verify(ctx, true);
+            var batch = try fixture.batch(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "docs",
+                \\{"inserts":{"doc:a":{"amount":10},"doc:b":{"amount":"not numeric"}},"sync_level":"write"}
+            );
+            defer batch.deinit(ctx.alloc);
+            if (batch.status != 400) std.debug.print("document integrity REST status={d} body={s}\n", .{ batch.status, batch.body });
+            try self.campaign.verify(ctx, true);
+            try std.testing.expectEqual(@as(u16, 400), batch.status);
+        }
+
+        fn targets(self: *@This(), ctx: *fixture.Context, seed: bool) !void {
+            if (!std.mem.eql(u8, self.state.entry.id, "sql-0941")) return;
+            if (seed) {
+                var created = try client.execute(ctx, "CREATE TABLE assignments(id text PRIMARY KEY,metadata jsonb,profile text,\"metadata.profile\" text)", .write_admission);
+                defer created.deinit(ctx.alloc);
+                try std.testing.expect(created.status == 200 or created.status == 202);
+                const serving = try fixture.waitServingSchema(ctx, "assignments", 0);
+                try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+                try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "assignments");
+            } else _ = try fixture.waitServingSchema(ctx, "assignments", 0);
+            try rejected(ctx, "INSERT INTO assignments(id,metadata.profile) VALUES('bad','shadowed')", "42804");
+            try rejected(ctx, "INSERT INTO assignments(id,assignments.profile) VALUES('bad','qualified')", "42703");
+            try rejected(ctx, "INSERT INTO assignments(id,missing.profile) SELECT id,profile FROM assignments", "42703");
+            try rejected(ctx, "UPDATE assignments SET metadata.profile='bad' WHERE false", "42804");
+            try rejected(ctx, "UPDATE assignments SET metadata.a.b.c.d.e='bad' WHERE false", "42804");
+            try rejected(ctx, "UPDATE assignments SET (metadata.profile,profile)=('bad','shadowed') WHERE false", "42804");
+            try rejected(ctx, "UPDATE assignments SET assignments.profile='bad' WHERE false", "42703");
+            try rejected(ctx, "UPDATE assignments AS metadata SET metadata.profile='bad' WHERE false", "42804");
+            try rejected(ctx, "INSERT INTO assignments(id) VALUES('x') ON CONFLICT(id) DO UPDATE SET metadata.profile='bad'", "42804");
+            try rejected(ctx, "MERGE INTO assignments AS a USING(VALUES('x')) AS v(id) ON a.id=v.id WHEN MATCHED THEN UPDATE SET a.profile='bad'", "42703");
+            try rejected(ctx, "MERGE INTO assignments AS a USING(VALUES('x')) AS v(id) ON a.id=v.id WHEN MATCHED THEN UPDATE SET metadata.profile='bad'", "42804");
+            try rejected(ctx, "MERGE INTO assignments AS a USING(VALUES('x')) AS v(id) ON a.id=v.id WHEN NOT MATCHED THEN INSERT(metadata.profile) VALUES('bad')", "42804");
+            if (seed) {
+                var inserted = try client.execute(ctx, "INSERT INTO assignments(id,\"metadata.profile\") VALUES('x','literal dot')", .write_admission);
+                defer inserted.deinit(ctx.alloc);
+                try std.testing.expectEqual(@as(u16, 200), inserted.status);
+            }
+            var response = try client.execute(ctx, "SELECT id,profile,\"metadata.profile\" FROM assignments ORDER BY id", .read);
+            defer response.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer result.deinit();
+            try expectSourceResult(ctx.alloc, result.value, .{ .columns = &.{ "id", "profile", "metadata.profile" }, .column_oids = &.{ 25, 25, 25 }, .rows = &.{&.{ .{ .string = "x" }, .null, .{ .string = "literal dot" } }} }, true);
+        }
+
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.campaign.beforeRestart(ctx);
+            try self.atomicity(ctx);
+            try self.targets(ctx, true);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.campaign.afterRestart(ctx);
+            var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+            defer corpus.deinit();
+            try rejected(ctx, (try corpus.get(self.state.entry.id)).sql, self.state.entry.sqlstate.?);
+            var reader = ctx.*;
+            reader.headers = ctx.reader_headers;
+            var denied = try client.execute(&reader, (try corpus.get(self.state.entry.id)).sql, .never);
+            defer denied.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 403), denied.status);
+            var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, denied.body, .{});
+            defer diagnostic.deinit();
+            try std.testing.expectEqualStrings("42501", diagnostic.value.code);
+            try self.campaign.verify(ctx, true);
+            try self.atomicity(ctx);
+            try self.targets(ctx, false);
+        }
+    };
+    const a = std.testing.allocator;
+    var golden = try std.json.parseFromSlice(Golden, a, local.sql_parity_fixtures.document_integrity_reference, .{ .ignore_unknown_fields = true });
+    defer golden.deinit();
+    try std.testing.expectEqual(ids.len, golden.value.entries.len);
+    for (golden.value.entries, ids) |entry, id| {
+        try std.testing.expectEqualStrings(id, entry.id);
+        var state: State = .{ .golden = golden.value, .entry = entry };
+        defer state.versions.deinit(a);
+        defer state.digests.deinit(a);
+        try fixture.runWithState(Integrity, .{ .state = &state, .campaign = .{ .state = &state } });
+    }
+}
+
 test "mounted SQL original document identities enforce create only conflicts returning versions and cold postimages" {
     const ids = [_][]const u8{ "sql-0883", "sql-0927", "sql-0935" };
     const a = std.testing.allocator;
@@ -1234,4 +1348,43 @@ test "mounted SQL original temporal keys enforce intervals and retain all cold o
             .tables = parsed.value.tables,
         } },
     });
+}
+
+test "SQL assignment target domains distinguish composites qualifiers and quoted dots" {
+    for ([_][]const u8{
+        "INSERT INTO assignments(metadata.profile) VALUES('bad')",
+        "UPDATE assignments SET metadata.profile='bad'",
+        "INSERT INTO assignments(id) VALUES('x') ON CONFLICT(id) DO UPDATE SET metadata.profile='bad'",
+        "MERGE INTO assignments AS a USING(VALUES('x')) AS v(id) ON a.id=v.id WHEN MATCHED THEN UPDATE SET metadata.profile='bad'",
+        "MERGE INTO assignments AS a USING(VALUES('x')) AS v(id) ON a.id=v.id WHEN NOT MATCHED THEN INSERT(metadata.profile) VALUES('bad')",
+    }) |sql| {
+        var compiled = try local.sql_compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        const field = switch (compiled.statement) {
+            .insert => |insert| if (insert.conflict) |conflict| conflict.assignments[0].field else insert.columns[0],
+            .update => |update| update.assignments[0].field,
+            .merge => |merge| switch (merge.arms[0].action) {
+                .update => |assignments| assignments[0].field,
+                .insert => |insert| insert.columns[0],
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+        try std.testing.expectEqualStrings("metadata\x00profile", field);
+    }
+    try std.testing.expectError(error.SqlLimitExceeded, local.sql_compiler.compile(std.testing.allocator, "UPDATE assignments SET metadata.a.b.c='bad'", .{ .max_depth = 2 }));
+    const table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "assignments", .schema_version = 1, .columns = &.{
+        .{ .name = "metadata", .path = "metadata", .type = .json },
+        .{ .name = "profile", .path = "profile", .type = .string },
+        .{ .name = "metadata.profile", .path = "metadata.profile", .type = .string },
+    }, .scope = .{ .database = "default", .namespace = "public", .name = "assignments", .revision = 1 } };
+    try std.testing.expectEqualStrings("profile", (try table.column("assignments\x00profile")).name);
+    try std.testing.expectError(error.UndefinedColumn, table.assignmentColumn("assignments\x00profile"));
+    try std.testing.expectError(error.UndefinedColumn, table.assignmentColumn("missing\x00profile"));
+    try std.testing.expectError(error.SqlAssignmentTypeMismatch, table.assignmentColumn("metadata\x00profile"));
+    try std.testing.expectError(error.SqlAssignmentTypeMismatch, table.updateTarget("metadata\x00profile"));
+    try std.testing.expectEqualStrings("metadata.profile", (try table.assignmentColumn("metadata.profile")).name);
+    try std.testing.expectEqualStrings("metadata.profile", (try table.updateTarget("metadata.profile")).name);
+    try table.validateInsertTargets(&.{ "profile", "metadata.profile" });
+    try std.testing.expectError(error.SqlAssignmentTypeMismatch, table.validateInsertTargets(&.{"metadata\x00profile"}));
 }

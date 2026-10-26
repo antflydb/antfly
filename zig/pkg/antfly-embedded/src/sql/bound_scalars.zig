@@ -402,7 +402,7 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
             for (update.assignments) |assignment| {
                 if (assignment.expression != null) break :blk true;
                 if (table) |definition| {
-                    const column = try definition.column(assignment.field);
+                    const column = try definition.assignmentColumn(assignment.field);
                     if (needsAssignmentProgram(column, assignment.value, assignment.expression, false) or (column.type == .array and assignment.value == .parameter)) break :blk true;
                 }
             }
@@ -483,7 +483,7 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
                 };
             },
             .update => |update| for (update.assignments) |assignment| {
-                const column = try (table orelse return error.UndefinedColumn).column(assignment.field);
+                const column = try (table orelse return error.UndefinedColumn).assignmentColumn(assignment.field);
                 if (!needsAssignmentProgram(column, assignment.value, assignment.expression, true)) continue;
                 const expression = try builder.assignmentNode(assignment.expression, assignment.value, column);
                 changed = try builder.inferAssignment(expression, column) or changed;
@@ -520,7 +520,7 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
             const programs = try alloc.alloc(?scalar.Program, update.assignments.len);
             @memset(programs, null);
             for (update.assignments, programs) |assignment, *program| {
-                const column = try (table orelse return error.UndefinedColumn).column(assignment.field);
+                const column = try (table orelse return error.UndefinedColumn).assignmentColumn(assignment.field);
                 if (!needsAssignmentProgram(column, assignment.value, assignment.expression, typed_parameters)) continue;
                 const expression = try builder.assignmentNode(assignment.expression, assignment.value, column);
                 program.* = try builder.assignmentProgram(expression, column);

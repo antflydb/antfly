@@ -888,6 +888,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const indexed_document_run = addFilteredTestRunArtifact(b, indexed_document_tests);
     indexed_document_run.addArg("--require-no-skips");
     b.step("antfly-indexed-document-read-test", "Verify exact retained document text predicates through native LSM reads").dependOn(&indexed_document_run.step);
+    const document_integrity_storage_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system document schema integrity"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const document_integrity_storage_run = addFilteredTestRunArtifact(b, document_integrity_storage_tests);
+    document_integrity_storage_run.addArg("--require-no-skips");
+    b.step("antfly-document-integrity-storage-test", "Verify plain document schema admission, atomic invalid batches, failed prepares, cold intents and allocation cleanup")
+        .dependOn(&document_integrity_storage_run.step);
     const document_generated_storage_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{"relational index system document generated portable LSM round trip preserves historical values"},

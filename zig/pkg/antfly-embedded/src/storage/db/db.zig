@@ -26448,7 +26448,8 @@ pub const DB = struct {
             if (hasCoordinatedConstraints(view) and !isMetadataKey(intent.key)) return error.ForeignKeyCoordinationRequired;
         }
         for (predicates) |predicate| if (isProtectedIntegrityKey(predicate.key)) return error.InvalidIntegrityOperation;
-        try self.prepareTransactionRows(preparation_alloc, prepared_intents, view);
+        var prepared_documents = try self.prepareTransactionRows(preparation_alloc, prepared_intents, view);
+        defer if (prepared_documents) |*documents| documents.deinit();
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -26734,7 +26735,8 @@ pub const DB = struct {
             try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &control_key);
         }
         defer freePreparedIntentRows(preparation_alloc, intents.items);
-        try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
+        var prepared_documents = try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
+        defer if (prepared_documents) |*documents| documents.deinit();
 
         const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
         var integrity_catalog: ?integrity_catalog_mod.Catalog = null;
@@ -27150,19 +27152,61 @@ pub const DB = struct {
         return try spans.toOwnedSlice(alloc);
     }
 
+    fn validateUnconstrainedTransactionRows(alloc: Allocator, intents: []const transactions_mod.WriteIntent) !void {
+        for (intents) |intent| {
+            if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+            if (isMetadataKey(intent.key)) continue;
+            if (intent.value) |value| mapper.validateJsonDocumentNoAlloc(alloc, value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidBatchRequest,
+            };
+        }
+    }
+
     fn prepareTransactionRows(
         self: *DB,
         alloc: Allocator,
         intents: []transactions_mod.WriteIntent,
         schema_view: ?schema_registry_mod.SchemaView,
-    ) !void {
+    ) !?mapper.PreparedDocumentBatch {
         const view = schema_view orelse {
-            for (intents) |intent| if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
-            return;
+            try validateUnconstrainedTransactionRows(alloc, intents);
+            return null;
         };
-        if (view.storageMode() != .relational) {
-            for (intents) |intent| if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
-            return;
+        if (view.storageMode() == .document) {
+            const compiled = view.validator() orelse {
+                try validateUnconstrainedTransactionRows(alloc, intents);
+                return null;
+            };
+            if (!compiled.requiresDocumentPreparation()) {
+                try validateUnconstrainedTransactionRows(alloc, intents);
+                return null;
+            }
+            // Own the normalized logical documents until the intent journal has
+            // copied them. Validation of every row finishes before any intent
+            // is changed or a participant can vote prepared. The owner also
+            // unwinds partial allocation/normalization failures as one arena.
+            var writes: std.ArrayList(types.BatchWrite) = .empty;
+            defer writes.deinit(alloc);
+            for (intents) |intent| {
+                if (isMetadataKey(intent.key) or intent.value == null) {
+                    if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+                    continue;
+                }
+                try writes.append(alloc, .{ .key = intent.key, .value = intent.value.?, .json_null_fields = intent.json_null_fields });
+            }
+            if (writes.items.len == 0) return null;
+            const io = self.backend_runtime.io();
+            const validator = if (io) |provided| compiled.forPreparation(try (@import("../../schema/relational_expression.zig").PreparationRuntime{ .io = provided }).withClock(view.tableSchema().requires_clock_defaults)) else compiled;
+            const prepared = try mapper.PreparedDocumentBatch.init(alloc, writes.items, validator, false);
+            var ordinal: usize = 0;
+            for (intents) |*intent| {
+                if (isMetadataKey(intent.key) or intent.value == null) continue;
+                intent.value = prepared.writes[ordinal].value;
+                intent.json_null_fields = &.{};
+                ordinal += 1;
+            }
+            return prepared;
         }
         const Context = struct {
             alloc: Allocator,
@@ -27221,6 +27265,7 @@ pub const DB = struct {
             try group.await(io.?);
         } else ctx.run();
         if (ctx.failure) |err| return err;
+        return null;
     }
 
     // resolveTransactionTransforms, removePendingTransactionWrite, and freeTransactionWritesOwned

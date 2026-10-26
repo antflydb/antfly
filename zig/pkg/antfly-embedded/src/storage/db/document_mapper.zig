@@ -362,7 +362,10 @@ pub const PreparedDocumentBatch = struct {
         for (input, writes, roots) |write, *out, *root| {
             out.* = write;
             root.* = null;
-            if (write.key.len != 0 and (write.key[0] == 0 or write.key[0] == 1)) continue;
+            if (write.key.len != 0 and (write.key[0] == 0 or write.key[0] == 1)) {
+                if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
+                continue;
+            }
             _ = scratch.reset(.retain_capacity);
             var value = try std.json.parseFromSliceLeaky(std.json.Value, owned, write.value, .{ .parse_numbers = false });
             if (preserve) {
@@ -2750,9 +2753,27 @@ fn canUseOpaqueJsonFastPath(data: []const u8) bool {
     return true;
 }
 
-fn validateJsonDocumentNoAlloc(alloc: Allocator, data: []const u8) !void {
+/// Streaming structural validation for unconstrained native JSON rows.
+/// Ordinary nesting uses stack storage independent of document width. Deep
+/// values retain the caller's bounded allocator and existing accepted domain.
+pub fn validateJsonDocumentNoAlloc(alloc: Allocator, data: []const u8) !void {
+    var nesting: [2 * std.atomic.cache_line]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&nesting);
+    validateJsonDocumentStreaming(fixed.allocator(), data) catch |err| switch (err) {
+        error.OutOfMemory => return validateJsonDocumentStreaming(alloc, data),
+        else => return err,
+    };
+}
+
+fn validateJsonDocumentStreaming(alloc: Allocator, data: []const u8) !void {
     var scanner = std.json.Scanner.initCompleteInput(alloc, data);
     defer scanner.deinit();
+    // skipValue requires a value token; closing delimiters and an empty
+    // payload are ordinary malformed input rather than unreachable states.
+    switch (try scanner.peekNextTokenType()) {
+        .object_end, .array_end, .end_of_document => return error.SyntaxError,
+        else => {},
+    }
     try scanner.skipValue();
     if (try scanner.next() != .end_of_document) return error.SyntaxError;
 }

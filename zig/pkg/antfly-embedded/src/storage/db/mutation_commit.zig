@@ -424,8 +424,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // schema or its durable catalog.
             const request_schema_binding: ?transactions_mod.SchemaBinding = if (opts.transaction_resolution) |resolution|
                 resolution.schema_binding
-            else if (opts.ordered_apply_receipt != null and req.relational_schema_version != null)
-                .{ .version = req.relational_schema_version }
+            else if (opts.ordered_apply_receipt != null and (req.relational_schema_version != null or req.schema_version != null))
+                .{ .version = req.relational_schema_version orelse req.schema_version }
             else
                 null;
             var request_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, request_schema_binding);
@@ -452,7 +452,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             var prepared_document: ?mapper.PreparedDocumentBatch = null;
             defer if (prepared_document) |*prepared| prepared.deinit();
-            if (request_schema_view) |view| if (view.tableSchema().requires_document_expressions and effective_req.writes.len != 0) {
+            if (request_schema_view) |view| if (view.storageMode() == .document and (if (view.validator()) |validator| validator.requiresDocumentPreparation() else false) and effective_req.writes.len != 0) {
                 const validator = preparationValidator(view.validator(), opts.restore_staging != null) orelse return error.InvalidSchemaUpdateRequest;
                 prepared_document = try mapper.PreparedDocumentBatch.init(preparation_alloc, effective_req.writes, validator, opts.restore_staging != null or opts.preserve_logical_values or opts.replication_applied_lsn_marker != null or req.split_replication != null or req.merge_replication != null);
                 effective_req.writes = prepared_document.?.writes;
@@ -886,7 +886,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return error.InitialChildNotPublished;
             // Durable intents already retain a historical schema identity.
             // Ordinary requests must still prove their speculative epoch current.
-            if (req.schema_version != null or (prepared_document != null and request_schema_binding == null)) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            if (request_schema_binding == null) try self.validatePreparedSchemaViewLocked(request_schema_view);
             if (prepared_document != null and S.ownerField(self, "core").*.index_manager.writePlanGeneration() != document_generated_write_plan_generation.?) return error.PreparedGenerationChanged;
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (live_replication_apply) {
@@ -1162,8 +1162,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // preflight remains useful for early UX feedback, but every embedded,
             // replicated, recovery, and direct DB caller gets the same contract.
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-            // Coalescer draining above can release/reacquire apply. An index-only
-            // publication need not change the schema or managed-index generation.
+            // Coalescer draining above can release/reacquire apply. Even a
+            // schemaless or unconstrained document write must not bypass a newly
+            // published schema. Durable decisions retain their admitted epoch.
+            if (request_schema_binding == null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            // An index-only publication need not change the schema generation.
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (write_plan_snapshot) |pinned| if (pinned.plan().group_sources) |group_plan| {
                 if (group_plan.entries.len > 0 and pinned.generation() != S.ownerField(self, "core").*.index_manager.writePlanGeneration()) return error.PreparedGenerationChanged;

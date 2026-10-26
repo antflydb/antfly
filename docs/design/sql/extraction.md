@@ -269,6 +269,24 @@ allocation-free path through predicate extraction.
   Document UPDATE preserves undeclared fields from the full raw preimage;
   exact-byte row digests prevent stale writes even when custom TTL timestamps
   are unchanged.
+- Mutation targets use assignment-domain binding, separate from read-column
+  qualification. Unquoted `metadata.profile` denotes a composite-field target;
+  JSONB, arrays and scalar columns are not composites (`42804`), and an absent
+  root receives `42703`. A quoted `"metadata.profile"` remains one column name.
+  INSERT source binding, UPDATE, ON CONFLICT and MERGE share this boundary before
+  source execution. It allocates no memory; ordinary INSERT columns retain their
+  existing single schema lookup.
+- A constant-time check on the immutable validator selects document preparation.
+  Unconstrained native JSON tables retain their streaming validation fast path
+  and scalar/array values; malformed transaction rows fail before intent
+  admission. Declared document schemas use owned typed preparation.
+- Whole-document patches still pass through the native pinned-schema preparation
+  boundary. An invalid late candidate rejects the entire SQL mutation or REST
+  batch without changing primary bytes, versions or content digests. The
+  document-integrity campaign exercises those outcomes before and after both
+  metadata and data-owner recovery. Its PostgreSQL oracle declares Antfly's
+  patch/schema-validation extensions explicitly; ordinary assignment-indirection
+  diagnostics come directly from PostgreSQL.
 - Multi-row `INSERT ... VALUES` uses a flat VALUES source with ordered arms;
   adjacent literal-only arms share a typed row block, and only one nonliteral arm
   iterator is active. Scalar subqueries in VALUES use the bounded INSERT-source

@@ -203,6 +203,14 @@ pub const CompiledTableValidator = struct {
         return borrowed;
     }
 
+    /// Constant-time admission requirement from this immutable declaration.
+    /// Unconstrained native JSON rows retain streaming structural validation.
+    pub fn requiresDocumentPreparation(self: CompiledTableValidator) bool {
+        return self.schema.document_schemas.len != 0 or self.schema.enforce_types or
+            self.schema.ttl_duration_ns != 0 or self.schema.dynamic_templates.len != 0 or
+            self.physical_fields.len != 0 or self.uuid_columns.len != 0 or self.execution.expressions != null;
+    }
+
     pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
         var schema = try parseValidatedTableSchema(alloc, schema_json);
         errdefer schema.deinit(alloc);

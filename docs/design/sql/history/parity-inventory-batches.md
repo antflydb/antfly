@@ -1720,3 +1720,47 @@ The ledger records 799 implemented, 137 rejected, 443 superseded and
 rejection change disposition. Four opt-in component benchmarks remain skipped
 in the broad Debug suite; the EXPLAIN memory benchmark and both mounted lifecycle
 campaigns execute without skips.
+
+### Document admission and assignment-domain integrity
+
+This cohort closes sql-0909 and sql-0941 against their unchanged originals.
+The former is an invalid numeric-property patch; the latter assigns a subfield
+of a JSONB column, which PostgreSQL does not treat as a composite. Both receive
+specific data/type errors rather than generic unsupported-shape waivers.
+The ledger moves from 816 implemented, 137 rejected, 443 superseded and 190
+unresolved to 816 implemented, 138 rejected, 444 superseded and 188 unresolved.
+No source SQL, parameter, schema domain or inventory expectation changes.
+
+The mounted regression exposed a broader native defect: an ordinary document
+schema could bypass preparation when REST trusted the owner's atomic-preparation
+capability. All declared document schemas now use the existing pinned preparation
+pipeline, with their parsed roots reused by extraction. Transaction preparation
+owns normalized logical documents until the journal copies them; every row
+validates before intent admission. LSM regressions verify atomic invalid-batch
+rejection, absence of intents after a failed prepare, cold prepared-row commit,
+and allocation-failure cleanup. Unconstrained native JSON tables retain their
+streaming fast path, including scalar/array values and cold intent recovery;
+malformed unconstrained values reject before durable intent admission. A streaming
+work witness validates 4,096 array elements (8,193 bytes) with no available heap
+allocator; deep nesting retains its bounded allocator fallback. Empty and closing
+delimiter inputs reject safely. Speculative requests recheck their pinned schema
+at admission and after coalescer work, including schemaless/unconstrained epochs.
+Durable ordered writes and prepared participants retain their admitted historical
+schema through publication and restart; ordinary stale requests cannot select it.
+Historical generated-document portable restore retains its existing semantics.
+
+Mutation target binding is separate from read-column qualification. INSERT,
+UPDATE (including tuples), ON CONFLICT, and both MERGE assignment forms retain
+field selectors through bounded linear parsing. A missing root receives 42703;
+a present non-composite root receives 42804. A target alias cannot be stripped
+into a writable leaf column. Quoted literal-dot columns and ordinary qualified
+reads remain valid. Binding allocates no memory and ordinary INSERT targets
+avoid a second schema lookup.
+
+The independent PostgreSQL oracle executes both originals, verifies complete
+unchanged postimages and native PostgreSQL indirection diagnostics, and names
+Antfly's patch and document-schema validation extensions explicitly. Authenticated
+native owners verify physical versions and digests, failed SQL/REST batches,
+read-only denial before schema details leak, and metadata/data-owner restart.
+These closures do not claim user-defined composite types or obsolete private
+view-mapping activation.

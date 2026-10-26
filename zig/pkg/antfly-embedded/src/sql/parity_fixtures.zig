@@ -36,6 +36,7 @@ pub const correlated_mutation_postgres_reference = @embedFile("fixtures/sql_corr
 pub const conditional_subquery_reference = @embedFile("fixtures/sql_conditional_subquery_reference.json");
 pub const document_campaign = @embedFile("fixtures/sql_document_campaign.json");
 pub const document_patch_reference = @embedFile("fixtures/sql_document_patch_reference.json");
+pub const document_integrity_reference = @embedFile("fixtures/sql_document_integrity_reference.json");
 pub const document_envelope_reference = @embedFile("fixtures/sql_document_envelope_reference.json");
 pub const document_truncate_reference = @embedFile("fixtures/sql_document_truncate_reference.json");
 pub const document_identity_reference = @embedFile("fixtures/sql_document_identity_reference.json");

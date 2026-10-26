@@ -670,6 +670,25 @@ const Parser = struct {
         return result;
     }
 
+    /// Assignment indirection is a column root plus field selectors, not a
+    /// relation-qualified read reference. Retain every selector for typed
+    /// binding; concatenate once and charge each selector to the parser budget.
+    fn assignmentField(self: *Parser) Error![]const u8 {
+        const first = try self.identifier();
+        if (!self.peek(.dot)) return first;
+        var bytes: std.ArrayList(u8) = .empty;
+        try bytes.appendSlice(self.alloc, first);
+        var depth: usize = 1;
+        while (self.take(.dot)) {
+            try self.node();
+            if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "assignment field nesting exceeds configured bound");
+            try bytes.append(self.alloc, 0);
+            try bytes.appendSlice(self.alloc, try self.identifier());
+            depth += 1;
+        }
+        return bytes.toOwnedSlice(self.alloc);
+    }
+
     fn value(self: *Parser) Error!ast.Value {
         try self.node();
         if (self.keyword(.null)) return .null;
@@ -1822,7 +1841,7 @@ const Parser = struct {
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         while (true) {
             try self.node();
-            const column = try self.field();
+            const column = try self.assignmentField();
             const entry = try seen.getOrPut(self.alloc, column);
             if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate INSERT column");
             try columns.append(self.alloc, column);
@@ -1975,14 +1994,14 @@ const Parser = struct {
         while (true) {
             const tuple = self.take(.lparen);
             try self.node();
-            const first = try self.identifier();
+            const first = try self.assignmentField();
             if ((try seen.getOrPut(self.alloc, first)).found_existing) return self.fail(error.DuplicateSqlAssignment, "duplicate conflict assignment");
             const targets: []const []const u8 = if (tuple) columns: {
                 var names: std.ArrayList([]const u8) = .empty;
                 try names.append(self.alloc, first);
                 while (self.take(.comma)) {
                     try self.node();
-                    const column = try self.identifier();
+                    const column = try self.assignmentField();
                     if ((try seen.getOrPut(self.alloc, column)).found_existing) return self.fail(error.DuplicateSqlAssignment, "duplicate conflict assignment");
                     try names.append(self.alloc, column);
                 }
@@ -2041,11 +2060,7 @@ const Parser = struct {
             var targets: std.ArrayList([]const u8) = .empty;
             while (true) {
                 try self.node();
-                const field_name = try self.field();
-                const column = if (std.mem.indexOfScalar(u8, field_name, 0)) |separator| blk: {
-                    if (!std.mem.eql(u8, field_name[0..separator], alias orelse table.table)) return self.fail(error.InvalidSqlSyntax, "assignment must name the mutation target");
-                    break :blk field_name[separator + 1 ..];
-                } else field_name;
+                const column = try self.assignmentField();
                 const entry = try seen.getOrPut(self.alloc, column);
                 if (entry.found_existing) return self.fail(error.DuplicateSqlAssignment, "duplicate UPDATE assignment");
                 try targets.append(self.alloc, column);
@@ -2102,11 +2117,7 @@ const Parser = struct {
                 while (true) {
                     if (assignments.items.len >= 256) return self.fail(error.SqlLimitExceeded, "MERGE assignment limit exceeded");
                     try self.node();
-                    const field_name = try self.field();
-                    const column = if (std.mem.indexOfScalar(u8, field_name, 0)) |separator| blk: {
-                        if (!std.mem.eql(u8, field_name[0..separator], alias orelse table.table)) return self.fail(error.InvalidSqlSyntax, "assignment must name MERGE target");
-                        break :blk field_name[separator + 1 ..];
-                    } else field_name;
+                    const column = try self.assignmentField();
                     const entry = try seen.getOrPut(self.alloc, column);
                     if (entry.found_existing) return self.fail(error.DuplicateSqlAssignment, "duplicate MERGE assignment");
                     try self.expect(.eq);
@@ -2131,7 +2142,7 @@ const Parser = struct {
                 var seen: std.StringHashMapUnmanaged(void) = .empty;
                 while (true) {
                     if (columns.items.len >= 256) return self.fail(error.SqlLimitExceeded, "MERGE insert column limit exceeded");
-                    const column_name = try self.identifier();
+                    const column_name = try self.assignmentField();
                     const entry = try seen.getOrPut(self.alloc, column_name);
                     if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate MERGE insert column");
                     try columns.append(self.alloc, column_name);

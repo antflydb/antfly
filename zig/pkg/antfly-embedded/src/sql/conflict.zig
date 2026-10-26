@@ -115,7 +115,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
         if (pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
         var changed = false;
         for (clause.assignments) |assignment| {
-            const column = try table.column(assignment.field);
+            const column = try table.assignmentColumn(assignment.field);
             if (assignment.use_default) continue;
             const expression = assignment.expression orelse return error.InvalidSqlBackendResponse;
             if (assignment.deferred_scalar) continue;
@@ -152,7 +152,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
             const binding = try alloc.create(@import("describe.zig").BoundStatement);
             binding.* = try @import("describe.zig").bind(alloc, backend, &compiled, parameters);
             if (binding.columns.len != 1) return error.InvalidSqlParameters;
-            const target = try table.column(assignment.field);
+            const target = try table.assignmentColumn(assignment.field);
             if (binding.columns[0].type != target.type and !@import("builtin_cast.zig").numericAssignmentAllowed(binding.columns[0].type, target.type)) return error.SqlTypeMismatch;
             later.* = .{ .query = query, .binding = binding };
             continue;
@@ -160,7 +160,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
         if (assignment.capture_ordinal != null and assignment.capture_expression == null) {
             program.* = null;
         } else {
-            const column = try table.column(assignment.field);
+            const column = try table.assignmentColumn(assignment.field);
             const expected: scalar.Type = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
             const root = try scalar.assignmentExpression(alloc, assignment.capture_expression orelse assignment.expression.?, expected);
             program.* = if (backend.parameter_invocation) |owner|

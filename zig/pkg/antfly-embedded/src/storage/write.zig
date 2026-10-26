@@ -1585,7 +1585,9 @@ pub fn validateTableBatchAgainstLocalSchema(
     {
         var view = db.core.acquireSchemaView();
         defer if (view) |*pinned| pinned.release();
-        if (view) |pinned| if (pinned.tableSchema().requires_document_expressions) return;
+        // The pinned native document pipeline now validates ordinary schemas
+        // as well as generated expressions, after final transform coalescing.
+        if (view) |pinned| if (pinned.validator() != null) return;
     }
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);

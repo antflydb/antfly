@@ -489,9 +489,29 @@ pub const Table = struct {
     /// envelope or assign its observed version. All mutation planners share
     /// this binding check before capturing source rows or proposing writes.
     pub fn updateTarget(self: Table, name: []const u8) !Column {
-        const selected = try self.column(name);
+        const selected = try self.assignmentColumn(name);
         if (std.mem.eql(u8, selected.name, "_id") or self.isDocumentVersion(selected.name)) return error.SqlSystemColumnWrite;
         return selected;
+    }
+
+    /// Assignment dots denote composite-field indirection, never relation
+    /// qualifiers. JSON and SQL arrays are not composite types. A quoted
+    /// identifier containing a literal dot remains one ordinary column name.
+    /// No allocation or source-row access belongs at this binding boundary.
+    pub fn assignmentColumn(self: Table, name: []const u8) !Column {
+        if (std.mem.indexOfScalar(u8, name, 0)) |separator| {
+            _ = try self.column(name[0..separator]);
+            return error.SqlAssignmentTypeMismatch;
+        }
+        return self.column(name);
+    }
+
+    pub fn validateInsertTargets(self: Table, names: []const []const u8) !void {
+        // Plain targets are resolved by the existing binding pass. Avoid a
+        // duplicate schema lookup on the ordinary INSERT fast path.
+        for (names) |name| if (std.mem.indexOfScalar(u8, name, 0) != null) {
+            _ = try self.assignmentColumn(name);
+        };
     }
 
     pub fn validateDocumentWriteColumns(self: Table, names: []const []const u8) !void {

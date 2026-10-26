@@ -3320,6 +3320,35 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-qualified-document-integrity-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-document-integrity-test",
+        "antfly-document-integrity-storage-test",
+        "antfly-document-generated-storage-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-document-integrity-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_document_integrity_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_integrity_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -17327,8 +17356,25 @@
     },
     {
       "id": "sql-0909",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The historical compile-only write classification is superseded by schema-enforced native execution. The unchanged original Antfly JSON patch attempts to store a string in a declared numeric property and receives 22023. The mounted authenticated SQL/REST campaign verifies complete unchanged documents, physical versions and content digests before and after metadata/data-owner restart, including a valid first candidate followed by an invalid row. Native document preparation now validates ordinary schemas as well as expression-bearing documents before atomic application, and owns normalized logical rows through transaction intent admission. LSM tests verify no partial writes or durable intents, cold prepared-row recovery and allocation-failure cleanup; generated-document portable restore remains qualified. The independent PostgreSQL oracle declares Antfly patch/schema-validation extensions explicitly and verifies the exact original SQL and complete unchanged postimages; it does not claim those extensions are PostgreSQL builtins.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original document integrity rejects invalid images and assignment indirection across cold owners",
+          "gate": "sql-qualified-document-integrity-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_expression_system_test.zig",
+          "test": "relational index system document schema integrity rejects batches before intents and recovers prepared rows",
+          "gate": "sql-qualified-document-integrity-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original document integrity rejects invalid images and assignment indirection across cold owners",
+          "gate": "sql-qualified-document-integrity-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0910",
@@ -17924,8 +17970,25 @@
     },
     {
       "id": "sql-0941",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The unchanged original INSERT addresses metadata.profile as a composite-field assignment, but its declared metadata domain is JSONB, so PostgreSQL and the mounted native endpoint return 42804 with complete unchanged documents, versions and digests through cold metadata/data-owner recovery. INSERT, UPDATE, tuple assignments, ON CONFLICT and MERGE retain root/field intent through bounded linear parsing and use one allocation-free typed assignment boundary. Missing roots receive 42703; target/relation aliases are never stripped into another writable column, and quoted literal-dot identifiers still insert and read correctly. Native read-only credentials are denied before assignment details leak. The separate PostgreSQL oracle verifies the original and all supplemental indirection diagnostics. This qualifies rejection of non-composite targets, not user-defined composite type support.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original document integrity rejects invalid images and assignment indirection across cold owners",
+          "gate": "sql-qualified-document-integrity-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "SQL assignment target domains distinguish composites qualifiers and quoted dots",
+          "gate": "sql-qualified-document-integrity-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original document integrity rejects invalid images and assignment indirection across cold owners",
+          "gate": "sql-qualified-document-integrity-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0942",

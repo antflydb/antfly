@@ -478,6 +478,10 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     };
     try backend.vtable.checkpoint(backend.ptr);
     var table = try backend.vtable.resolve(backend.ptr, allocator, target.name, target.action);
+    // Analyze assignment indirection before source binding/evaluation. The
+    // read resolver intentionally accepts qualified names; INSERT cannot use
+    // that interpretation for metadata.profile or table.column targets.
+    if (compiled.statement == .insert) try table.validateInsertTargets(compiled.statement.insert.columns);
     table.row_policy_purpose = @import("mutation_policy.zig").scanPurpose(compiled.statement);
     table.sql_select_required = @import("mutation_policy.zig").selectRequired(compiled.statement);
     const parameters = try allocator.alloc(?ast.ColumnType, compiled.parameter_count);
@@ -625,7 +629,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         }
         if (capture_count != 0) for (insertion.conflict.?.assignments) |assignment| if (assignment.capture_ordinal) |ordinal| {
             for (ordinal..ordinal + assignment.capture_span) |capture_index| {
-                const column = try table.column(assignment.field);
+                const column = try table.assignmentColumn(assignment.field);
                 expected[insertion.columns.len + capture_index] = column.type;
                 expected_types[insertion.columns.len + capture_index] = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
             }

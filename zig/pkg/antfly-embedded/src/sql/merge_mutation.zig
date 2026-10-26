@@ -612,7 +612,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
             .insert => |insert| blk: {
                 const values = try alloc.alloc(Expression, insert.values.len);
                 for (insert.columns, insert.values, values) |name, expression, *value| {
-                    const field = try target.column(name);
+                    const field = try target.assignmentColumn(name);
                     value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier }) else null };
                 }
                 break :blk .{ .insert = values };
@@ -1032,7 +1032,7 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
             .insert => |insert| {
                 if (insert.columns.len != insert.values.len) return error.InvalidSqlParameters;
                 for (insert.columns, insert.values, 0..) |name, value, index| {
-                    const field = try target.column(name);
+                    const field = try target.assignmentColumn(name);
                     if (field.generated) return error.UnsupportedSqlShape;
                     if (field.sequence_default) |binding| if (binding.generation == .always and value != null) return error.SqlGeneratedColumnWrite;
                     for (insert.columns[0..index]) |prior| if (std.mem.eql(u8, prior, field.name)) return error.DuplicateSqlColumn;
