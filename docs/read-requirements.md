@@ -70,8 +70,10 @@ They preserve an explicit zero wait budget.
 
 HTTP search `lake_read` and HTTP SQL `lake_visibility` are rejected fields; use
 `read_requirements.visibility`. PostgreSQL `antfly.lake_visibility` remains a
-compatibility setting. External-I/O `lake_read`/`lake_write` capabilities are
-separate permissions and are unchanged. MCP exposes
+compatibility setting. External-I/O `lake.read`/`lake.write` capabilities authorize
+connection use separately from user/API permissions. Configuration loading
+normalizes the legacy `lake_read`/`lake_write` spellings; new configurations should
+use dotted names. MCP exposes
 `read_requirements` in its compact query schema. Composed query lookups and graph
 reads forward the requirements to their leaf reads; existing snapshot tokens
 continue to pin those reads.

@@ -6215,3 +6215,22 @@ timings are mixed under concurrent validation, and these observations establish
 neither cloud nor full-archive throughput. Final checks pass 146 focused native
 tests (one declared skip), 18 tooling tests, and 29 real Parquet/Iceberg E2Es without
 skips. Main `0c753dc705` remains merged after the final fetch.
+
+### Proven winner scoring and representation-aware membership conversion
+
+Sorted page selection binds its native winner IDs, original score expression and
+result to one leased text snapshot. Rescoring reuses that proof instead of
+reopening metadata inclusion/exclusion or live-visibility producers. Explicit
+native document constraints keep their score contribution; Boolean boosts,
+pattern execution, corpus statistics, distributed statistics and cancellation
+still govern scoring. The proof is private to the operation and never enters
+public requests or persisted formats.
+
+Metadata probe admission now includes complete membership conversion in the
+alternative's cost. Matching predicate blocks are counted from authenticated
+tree cardinalities under the same tuple bounds, without decoding their bitmaps.
+Shared coordinate spaces charge per compressed block; translated or unknown
+layouts charge per row. This distinguishes a distinct-ID range from a compact
+categorical selection with the same cardinality. A source scan alternative
+charges row conversion too. Read bytes, scratch, tile size and cancellation stay
+independent hard execution limits, and exhaustion retains the exact fallback.

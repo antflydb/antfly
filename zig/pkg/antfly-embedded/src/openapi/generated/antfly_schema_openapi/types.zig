@@ -312,7 +312,7 @@ pub const DynamicTemplate = struct {
 };
 
 pub const ExternalLakeCredentialRef = struct {
-    /// Name of a configured external_io connection with lake_read capability.
+    /// Name of a configured external_io connection with lake.read capability.
     ref: []const u8,
     /// Allowed object prefix relative to the configured bucket or filesystem root.
     scope: ?[]const u8 = null,

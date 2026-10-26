@@ -41,6 +41,7 @@ const Owner = struct {
     predicate_lower: []const u8 = "",
     predicate_upper: ?[]const u8 = null,
     predicate_count: u64 = 0,
+    predicate_blocks: ?u64 = null,
     metadata: ?@import("lake_index_decoded_metadata.zig").Owned(ordered.VerifiedRoot) = null,
     table: catalog.Table,
     request: catalog.Scan,
@@ -555,6 +556,18 @@ pub const Predicate = struct {
         const reverse = owner.reader.root.reverse orelse return std.math.maxInt(u64);
         const tiles = 1 + (candidates - 1) / 128;
         return candidates *| (64 + tree.target_page_bytes / 1024) +| tiles *| reverse.height *| (tree.target_page_bytes / 1024);
+    }
+    /// Full membership has a conversion cost as well as a predicate scan.
+    /// Exact shared maps consume compressed predicate blocks; incompatible
+    /// coordinates must also map matching rows into the text ordinal space.
+    pub fn materializationWork(self: Predicate, target: ?local.serverless_query_lake_serving.ServingSource.RowResolver) u64 {
+        if (self.scan) return std.math.maxInt(u64);
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        const conversions = if (self.sharesCoordinates(target)) owner.predicate_blocks orelse owner.predicate_count else owner.predicate_count;
+        return self.work +| conversions *| 64;
+    }
+    pub fn scanMaterializationWork(self: Predicate, scan_work: u64) u64 {
+        return scan_work +| self.estimatedRows() *| 64;
     }
     pub fn hasMembership(self: Predicate) bool {
         if (self.scan) return false;
@@ -1833,6 +1846,10 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
         owner.predicate_lower = lower;
         owner.predicate_upper = upper;
         owner.predicate_count = if (empty_range) 0 else try owner.reader.countRange(ca, lower, upper);
+        // Same tuple bounds as the row index; count block records without
+        // decoding or materializing their bitmaps. Key cardinality matters:
+        // 16K distinct IDs have 16K blocks, unlike one categorical value.
+        owner.predicate_blocks = if (root.predicates) |blocks| if (empty_range) 0 else try tree.countRange(ca, owner.reader.pages.store(), blocks, lower, upper) else null;
     }
     if (estimated_cost) |cost| {
         if (identities_only) {
@@ -2533,4 +2550,24 @@ test "external lake direct metadata probes require exact maps and validate sourc
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fault.run, .{ predicate, source, &refs });
+}
+
+test "external lake metadata materialization costs count blocks and coordinate conversion" {
+    var owner: Owner = undefined;
+    owner.row_resolver = null;
+    owner.predicate_count = 16384;
+    owner.predicate_blocks = 16384;
+    const value: Predicate = .{ .work = 2312, .cursor = .{ .ptr = &owner, .next = undefined, .close = undefined } };
+    try std.testing.expect(value.materializationWork(null) > 64 * 128);
+    const distinct = value.materializationWork(null);
+    owner.predicate_blocks = 4;
+    try std.testing.expectEqual(@as(u64, 2312 + 4 * 64), value.materializationWork(null));
+    try std.testing.expect(value.materializationWork(null) < distinct);
+    owner.predicate_blocks = null;
+    try std.testing.expectEqual(distinct, value.materializationWork(null));
+    try std.testing.expect(value.scanMaterializationWork(1000) > 1000);
+    owner.predicate_count = 0;
+    owner.predicate_blocks = 0;
+    try std.testing.expectEqual(@as(u64, 2312), value.materializationWork(null));
+    try std.testing.expectEqual(std.math.maxInt(u64), value.scanMaterializationWork(std.math.maxInt(u64)));
 }

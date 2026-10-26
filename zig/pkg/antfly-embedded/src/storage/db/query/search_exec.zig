@@ -12960,6 +12960,41 @@ const TextConjunctionProducer = struct {
     }
 };
 
+/// Operation-owned proof minted only after exact native membership and page
+/// selection. The query expression, selected IDs and result borrow the same
+/// pinned snapshot lifetime. This capability is never accepted from the wire.
+const ProvenTextPage = struct {
+    snapshot: *const index_mod.IndexSnapshot,
+    score_query: search_mod.SearchQuery,
+    docs: []const u32,
+    result: *types.SearchResult,
+    fn init(a: Allocator, snapshot: *const index_mod.IndexSnapshot, score_query: search_mod.SearchQuery, result: *types.SearchResult) !@This() {
+        const docs = try a.alloc(u32, result.hits.len);
+        for (result.hits, docs) |hit, *doc| {
+            doc.* = hit.native_text_doc_id orelse return error.InvalidData;
+        }
+        std.mem.sort(u32, docs, {}, std.sort.asc(u32));
+        for (docs, 0..) |doc, i| if (i != 0 and docs[i - 1] == doc) return error.InvalidData;
+        return .{ .snapshot = snapshot, .score_query = score_query, .docs = docs, .result = result };
+    }
+    fn score(self: @This(), a: Allocator, scratch: Allocator, req: types.SearchRequest) !void {
+        try checkSearchRequestDeadline(req);
+        // Constant producers need no second membership pass either. The
+        // selected IDs already prove their query and all attached constraints.
+        if (self.score_query == .doc_num) {
+            for (self.result.hits) |*hit| hit.score = self.score_query.doc_num.boost;
+            return;
+        }
+        var scored = try search_mod.execute(a, self.snapshot, .{ .query = self.score_query, .control = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns, .pattern_programs = req.text_pattern_programs, .pattern_cache = req.text_pattern_membership }, .k = @intCast(self.docs.len), .include_stored = false, .filter_doc_nums = self.docs, .filter_doc_nums_positive = true, .distributed_text_stats = req.distributed_text_stats });
+        defer scored.deinit();
+        var scores: std.AutoHashMapUnmanaged(u32, f32) = .empty;
+        defer scores.deinit(scratch);
+        for (scored.hits) |hit| try scores.put(scratch, hit.doc_id, hit.score);
+        for (self.result.hits) |*hit| hit.score = scores.get(hit.native_text_doc_id.?) orelse return error.StoredDocMissing;
+        try checkSearchRequestDeadline(req);
+    }
+};
+
 pub fn searchTextQuery(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -13034,6 +13069,10 @@ pub fn searchTextQuery(
     // snapshot can otherwise reach refcount zero while a concurrent write is
     // still scoring it (observed as allocator corruption in termDocFreq()).
     const snapshot = text_source.snapshot;
+    // Freeze the score expression before adding zero-score eligibility and
+    // visibility constraints. A proven page may score this expression only on
+    // its selected native IDs in this same leased snapshot.
+    const score_query = base_search_query;
     const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
     var apply_broad_live_all_docs = can_apply_live_all_docs;
     var live_visibility: ?TextLiveVisibilityProducer = null;
@@ -13379,22 +13418,10 @@ pub fn searchTextQuery(
                 field_sort_plan,
             );
             errdefer out.deinit();
-            if (executor.project_key != null and out.hits.len != 0 and search_query == .doc_num) {
-                // This exact producer has one constant score. Recover it
-                // directly; rescoring cannot distinguish selected documents.
-                for (out.hits) |*hit| hit.score = search_query.doc_num.boost;
-            } else if (executor.project_key != null and out.hits.len != 0) {
-                // Membership/top-N is scoreless, but public _score still comes
-                // from the original query and the complete corpus statistics.
-                const selected = try arena_alloc.alloc(u32, out.hits.len);
-                for (out.hits, selected) |hit, *doc| doc.* = hit.native_text_doc_id orelse return error.InvalidData;
-                std.mem.sort(u32, selected, {}, std.sort.asc(u32));
-                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership }, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
-                defer scored.deinit();
-                var scores: std.AutoHashMapUnmanaged(u32, f32) = .empty;
-                defer scores.deinit(alloc);
-                for (scored.hits) |hit| try scores.put(alloc, hit.doc_id, hit.score);
-                for (out.hits) |*hit| hit.score = scores.get(hit.native_text_doc_id.?) orelse return error.StoredDocMissing;
+            if (executor.project_key != null and out.hits.len != 0) {
+                const selected_score_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, score_query, native_constraints, effective_req.count_only);
+                const selected = try ProvenTextPage.init(arena_alloc, snapshot, selected_score_query, &out);
+                try selected.score(alloc, arena_alloc, effective_req);
             }
             return out;
         }
@@ -37173,4 +37200,76 @@ test "producer top k demand sizing caps dense pages and batches sparse boundary 
     try std.testing.expectEqual(@as(usize, 16), demand.width(16, 1));
     try std.testing.expectEqual(@as(usize, 1), demand.width(1, 20));
     std.debug.print("DEMAND_PREFETCH limit=1 initial_tile=2 dense_remaining=5 sparse_tile=16\n", .{});
+}
+
+test "producer top k proven page scores Boolean winners without probing metadata twice" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const intro = @import("../../../introducer.zig");
+    const docs = try scratch.alloc(intro.TextDocument, 128);
+    const fields = try scratch.alloc(intro.TextField, docs.len);
+    for (docs, fields, 0..) |*doc, *field, i| {
+        field.* = .{ .field_name = "body", .text = if (i % 2 == 0) "quasar quasar pulsar" else "quasar" };
+        doc.* = .{ .id = try std.fmt.allocPrint(scratch, "native-{d:0>4}", .{i}), .stored_data = try std.fmt.allocPrint(scratch, "{{\"price\":{d}}}", .{i}), .text_fields = fields[i..][0..1] };
+    }
+    const bytes = try intro.buildSegmentFromTextWithAnalysisOptions(a, docs, &@import("../../../search/analysis.zig").default_analyzer, .{}, .{ .index_sort = &.{ .{ .field = "price" }, .{ .field = "_id" } }, .attest_index_sort_in_place = true });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const State = struct {
+        probed: usize = 0,
+        fn many(raw: *anyopaque, _: Allocator, ids: []const u32, keep: []bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.probed += ids.len;
+            for (ids, keep) |id, *allowed| allowed.* = id % 3 == 0;
+        }
+        fn produce(_: *anyopaque, _: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            return error.UnexpectedMetadataMaterialization;
+        }
+        fn project(_: ?*anyopaque, alloc: Allocator, id: []const u8) ![]u8 {
+            return std.fmt.allocPrint(alloc, "public:{s}", .{id});
+        }
+    };
+    var state: State = .{};
+    const producer: query_mod.DocNumProducer = .{ .ptr = &state, .contains_many = State.many, .produce = State.produce };
+    const filter: query_mod.Filter = .{ .bool_filter = .{ .must = &.{ .{ .term = .{ .field = "body", .term = "quasar" } }, .{ .doc_num = .{ .doc_nums = &.{}, .producer = producer } } }, .should = &.{}, .must_not = &.{} } };
+    const executor: SearchTextQueryExecutor = .{ .ctx = null, .text_index_entry = undefined, .text_index_is_chunk_backed = undefined, .search_match_all = undefined, .project_stored_search = undefined, .load_stored = testUnexpectedLoadStoredCallback, .postprocess = undefined, .native_count_visibility_exact = true, .project_key = State.project };
+    const req: types.SearchRequest = .{ .include_stored = false, .profile = true, .limit = 12, .order_by = &.{ .{ .field = "price" }, .{ .field = "_id" } } };
+    const plan = try planTextNativeSortFields(req, writer.snapshot(), testSortedPriceSchema());
+    var page = try sortAndPageTextDocValueFilterAlloc(a, req, writer.snapshot(), filter, executor, plan);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 12), page.hits.len);
+    const probes = state.probed;
+    try std.testing.expect(probes > 0 and probes < docs.len);
+    const score_query: search_mod.SearchQuery = .{ .bool_query = .{ .must = &.{.{ .term = .{ .field = "body", .term = "quasar", .boost = 2 } }}, .should = &.{.{ .term = .{ .field = "body", .term = "pulsar", .boost = 3 } }}, .boost = 1.5 } };
+    const selected = try ProvenTextPage.init(scratch, writer.snapshot(), score_query, &page);
+    try selected.score(a, scratch, req);
+    try std.testing.expectEqual(probes, state.probed);
+    var bitmap = roaring.RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    for (0..docs.len) |i| if (i % 3 == 0) {
+        try bitmap.add(@intCast(i));
+    };
+    var reference = try search_mod.execute(a, writer.snapshot(), .{ .query = .{ .bool_query = .{ .must = &.{ score_query, .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap, .boost = 0 } } } } }, .k = @intCast(page.hits.len), .include_stored = false, .filter_doc_nums = selected.docs, .filter_doc_nums_positive = true });
+    defer reference.deinit();
+    try std.testing.expectEqual(page.hits.len, reference.hits.len);
+    for (page.hits) |hit| {
+        const id = hit.native_text_doc_id.?;
+        try std.testing.expect(id % 3 == 0);
+        var found = false;
+        for (reference.hits) |expected| if (expected.doc_id == id) {
+            try std.testing.expectApproxEqAbs(expected.score, hit.score.?, 0.00001);
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+    try std.testing.expect(page.hits[0].score != page.hits[1].score);
+    const constant = try ProvenTextPage.init(scratch, writer.snapshot(), .{ .doc_num = .{ .ids = selected.docs, .boost = 3.25 } }, &page);
+    try constant.score(a, scratch, req);
+    for (page.hits) |hit| try std.testing.expectEqual(@as(f32, 3.25), hit.score.?);
+    try std.testing.expectEqual(probes, state.probed);
+    try std.testing.expectError(error.Timeout, selected.score(a, scratch, .{ .execution_deadline_ns = 0 }));
 }

@@ -1719,3 +1719,23 @@ budgets continue to govern execution. Exhaustion discards partial probe results
 before complete membership fallback. Opt-in benchmark diagnostics separate direct
 and translated probes from full materialization so work reductions cannot be
 mistaken for end-to-end query gains.
+
+
+Winner scoring retains an operation-owned proof binding the selected native IDs,
+original score expression and result to the same leased text snapshot. Metadata
+inclusion, exclusion and visibility already proved during selection are not
+re-evaluated during scoring. Explicit native document constraints retain their
+existing score contribution. Boolean boosts, corpus/distributed statistics,
+pattern context and cancellation still apply to the original expression. A
+constant producer assigns its boost only to these proven winners. This proof is
+private to synchronous execution and cannot be supplied through a request.
+
+Probe admission compares reverse-tree work against complete membership conversion,
+not just the predicate scan. The metadata predicate tree counts matching compressed
+block records under the same tuple bounds without decoding membership bitmaps.
+Shared authenticated coordinates charge conversion per block; translated or
+unknown layouts charge per matching row. A source scan alternative includes its
+row conversion too. Distinct-ID ranges therefore differ from compact categorical
+sets of equal row cardinality. Estimates saturate and only choose a path; existing
+read-byte, scratch, candidate-tile and cancellation limits still force an exact
+complete fallback when exhausted.

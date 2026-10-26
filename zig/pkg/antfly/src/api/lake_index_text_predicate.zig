@@ -1488,7 +1488,9 @@ fn PredicateResolver(comptime Set: type) type {
                 out.value = try std.json.parseFromSliceLeaky(std.json.Value, ca, bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
                 if (condition.value == .integer or condition.value == .float) out.value = condition.value;
             }
-            const work_budget = @min(predicate.work, rows.predicateScanWork(self.source, copied) orelse std.math.maxInt(u64));
+            const indexed_work = predicate.materializationWork(self.identities.row_resolver);
+            const scan_work = if (rows.predicateScanWork(self.source, copied)) |work| predicate.scanMaterializationWork(work) else std.math.maxInt(u64);
+            const work_budget = @min(indexed_work, scan_work);
             const owner = try a.create(ProducerOwner);
             owner.* = .{ .a = a, .resolver = self, .predicate = predicate, .arena = owned, .conditions = copied, .work_budget = work_budget, .cache = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a) }, .bench_profile = @import("antfly_platform").env.getenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY") != null };
             return .{ .bitmap = Bitmap.init(a), .producer = .{ .ptr = owner, .produce = ProducerOwner.produce, .contains = ProducerOwner.contains, .contains_many = ProducerOwner.containsMany, .materialized = ProducerOwner.completeMembership }, .owner = owner, .close = ProducerOwner.close };

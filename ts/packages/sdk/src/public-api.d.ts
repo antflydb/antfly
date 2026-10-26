@@ -17435,7 +17435,7 @@ export interface components {
          */
         TableStorageMode: "document" | "relational";
         ExternalLakeCredentialRef: {
-            /** @description Name of a configured external_io connection with lake_read capability. */
+            /** @description Name of a configured external_io connection with lake.read capability. */
             ref: string;
             /** @description Allowed object prefix relative to the configured bucket or filesystem root. */
             scope?: string;
