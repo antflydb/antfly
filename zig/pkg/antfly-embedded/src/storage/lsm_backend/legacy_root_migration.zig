@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Startup-only copy/install bridge for legacy file roots. The caller prepays
-//! this stable frame and excludes ALL Backend access (including accounting)
+//! Startup-only copy/install bridge for legacy file and memory roots. The caller
+//! prepays this stable frame and excludes ALL Backend access (including accounting)
 //! between capture and joined deinit. Legacy physical destruction is explicitly
 //! joined, not claimed to be an admitted bounded maintenance operation.
 const std = @import("std");
@@ -117,7 +117,7 @@ pub fn Migration(comptime Backend: type) type {
             }
             for (b.pending_admissions) |pending| if (pending != null) return error.ResourceBudgetExceeded;
             const d = b.run_directory orelse return error.ExecutionWaitUnsupported;
-            if (b.run_directory_dirty or d.memory_run_count != 0 or d.count() != b.runs.count()) return error.ExecutionWaitUnsupported;
+            if (b.run_directory_dirty or d.count() != b.runs.count()) return error.ExecutionWaitUnsupported;
             if (d.registered_owner != null or d.registered_account != null or b.runs.registered_owner != null or b.runs.registered_account != null or b.obsolete_paths.registered_owner != null or b.manifest_journal.obsolete.registered_owner != null) return error.ExecutionWaitUnsupported;
             if (b.manifest_directory) |durable| {
                 if (durable == d or durable.registered_owner != null or durable.registered_account != null) return error.ExecutionWaitUnsupported;
@@ -162,7 +162,10 @@ pub fn Migration(comptime Backend: type) type {
                             self.phase = .obsolete;
                             continue;
                         };
-                        if (self.snapshot == null) self.snapshot = try self.scope.?.beginFileSnapshotWithAdmission(self.source.?, original);
+                        if (self.snapshot == null) self.snapshot = if (self.source.?.path == null)
+                            try self.scope.?.beginMemorySnapshotWithAdmission(self.source.?, original)
+                        else
+                            try self.scope.?.beginFileSnapshotWithAdmission(self.source.?, original);
                         try self.snapshot.?.resumeWithAdmission(original);
                         self.phase = .entry;
                     },
@@ -171,7 +174,7 @@ pub fn Migration(comptime Backend: type) type {
                             // Preparation borrows only the old directory's real
                             // account. Successful take replaces it with the
                             // entry owner's independently funded account.
-                            try self.scope.?.beginEntryFromFileSnapshotWithAdmission(b, b.run_directory.?, self.snapshot.?, original);
+                            try self.scope.?.beginEntryFromSnapshotWithAdmission(b, b.run_directory.?, self.snapshot.?, original);
                         }
                         self.entry = try self.scope.?.takeEntryWithAdmission(original);
                         self.snapshot.?.requestRetirement();

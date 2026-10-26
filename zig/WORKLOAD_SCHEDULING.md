@@ -1734,3 +1734,17 @@ are 146/206. The startup exclusion/join contract remains; production opening,
 legacy global funding, memory-run import, normal maintenance integration and
 overload qualification remain open. The full goal stays active; full Linux
 qualification remains waived.
+
+
+### Independently owned legacy memory roots (2026-10-26)
+
+Quiesced migration now accepts mixed file and memory roots. Its registered memory
+snapshot funds and copies shared entry bytes under original admission; old roots
+and producer accounts can exit while the new roots preserve reads. Saved cursors
+own partial copy and retirement through refusal or joined abort. ABI versions are
+147/207; durable formats are unchanged. Registered checkpoints still reject any
+memory-containing directory, preserving descriptor lineage and WAL debt until
+those runs become durable outputs. Startup exclusion remains mandatory. Funded
+opening, memory-run materialization, normal admission forwarding, concurrent
+production adoption and overload qualification remain required. The full goal
+stays active; full Linux qualification remains waived.

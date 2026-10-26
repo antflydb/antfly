@@ -29454,3 +29454,54 @@ four publication cases pass. The 4/45/1/8 boundary companions and five native AB
 cases also pass. No final case fails, skips or leaks. The complete displaced
 root set can now retire under original admission; startup quiescence/join remains
 required. Production/default integration and the full goal remain incomplete.
+
+
+## Independently funded memory-run migration (2026-10-26)
+
+The startup migration bridge now imports mixed legacy file and memory roots.
+Memory snapshots use an explicit independent State.Clone mode: shared entries
+are copied in 16 KiB quanta rather than retained against the old producer's
+account. Planning includes every namespace/key/value byte and vector slot before
+variable allocation. Metadata, state and filters retain their registered header,
+allocator-host and variable reservation through final physical retirement.
+Original refusal preserves partial planning/copy/cleanup; abort stops all input
+borrows before producer exit. A completed copy clears its old source descriptor.
+Existing State.Clone callers retain their prior sharing behavior.
+
+PublicationResources exposes a common Snapshot and entry handoff, preserving its
+existing file API. The migration selects the memory constructor for pathless
+runs, installs the same coupled writer/directory/obsolete tuple, and retires the
+old shared-memory roots with its existing saved cursors. Caller-paid stable frame
+and complete startup exclusion remain mandatory through joined deinit. This is
+still a migration primitive, not the concurrent production driver.
+
+A memory root is not a durability receipt. The existing registered checkpoint
+constructor rejects any prepared directory containing memory runs before durable
+permission or WAL acknowledgment. Mixed-root tests retain the exact descriptor,
+journal sequence and unpublished WAL debt after rejection. Converting registered
+memory runs to durable outputs remains required before checkpointing such roots.
+Native/storage-owner ABIs are 147/207; public API ABI and durable formats do not
+change. File metadata/filter retirement now uses rawFree after its credited wipe,
+avoiding a second whole-buffer allocator poison pass.
+
+Four standalone cases cover shared tree and shared Run producer exit, original
+refusal/retry and abort at every recorded checkpoint, each owned allocation
+failure, and every admitted cleanup rejection. They verify the copied entries
+have independent buffers, retain tombstones, namespaces and long values, and
+have a variable reservation covering their complete resident payload. Three
+mixed migration cases cover post-retirement reads, checkpoint refusal, selected
+copy/handoff rejection and allocation-failure boundaries with retry/joined abort.
+
+Funded/admitted opening and legacy global-registry accounting, memory-run durable
+materialization, normal original-admission forwarding, concurrent maintenance
+adoption and overload/fairness qualification remain open. The original complete
+default/session/remote design remains required; full Linux qualification remains
+waived. No full-design completion or default activation is claimed.
+
+Final registered-memory-root-import-v3-fast and -debug receipts each pass all
+five commands and 82/82 build steps against identical current 5,763-input
+maps. The 38 storage cases (4 memory snapshots, 7 file snapshots, 9 migration,
+6 writer retirement, 4 directory/ledger retirement, 4 immutable retirement and
+4 durable checkpoints), 4/45/1/8 companions and five native ABI cases pass with
+no skips, failures or leaks. Earlier v1/v2 runs are diagnostic; the frozen v3
+receipts and final source archive are the qualification evidence.

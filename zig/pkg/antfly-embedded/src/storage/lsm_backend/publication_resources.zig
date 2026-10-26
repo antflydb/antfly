@@ -159,15 +159,24 @@ pub const Owner = struct {
         self.entry = try backend.beginOwnedDirectoryEntryFromRegisteredOutput(directory, source, metadata, owner, &host, original);
     }
 
-    pub const FileSnapshot = @import("registered_file_snapshot.zig");
+    pub const Snapshot = @import("registered_file_snapshot.zig");
+    pub const FileSnapshot = Snapshot;
     pub fn beginFileSnapshotWithAdmission(self: *Owner, source: Run, original: admission.Port) !*FileSnapshot.Owner {
         try original.checkpoint();
         if (self.closing) return error.InvalidArgument;
         return FileSnapshot.Owner.start(self.allocator, self.manager, source, original);
     }
+    pub fn beginMemorySnapshotWithAdmission(self: *Owner, source: Run, original: admission.Port) !*Snapshot.Owner {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return Snapshot.Owner.startMemory(self.allocator, self.manager, source, original);
+    }
     /// The in/out source capability is acquired from the actual registered
     /// snapshot, never synthesized from a caller's placeholder lifetime.
     pub fn beginEntryFromFileSnapshotWithAdmission(self: *Owner, backend: anytype, directory: *Directory, source: *FileSnapshot.Owner, original: admission.Port) !void {
+        return self.beginEntryFromSnapshotWithAdmission(backend, directory, source, original);
+    }
+    pub fn beginEntryFromSnapshotWithAdmission(self: *Owner, backend: anytype, directory: *Directory, source: *Snapshot.Owner, original: admission.Port) !void {
         try original.checkpoint();
         if (self.closing or self.entry != null) return error.InvalidArgument;
         if (source.manager != self.manager or source.allocator.ptr != self.allocator.ptr or source.allocator.vtable != self.allocator.vtable) return error.ResourceAccountingMismatch;

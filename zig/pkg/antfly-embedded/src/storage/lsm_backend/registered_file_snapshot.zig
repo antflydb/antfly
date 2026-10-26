@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Independently funded metadata for an existing SST. The controller retains
-//! the immutable source and file-existence authority until copying completes or
+//! Independently funded metadata and state for an existing SST or memory run.
+//! The controller retains the immutable source and file-existence authority until copying completes or
 //! requestRetirement stops input reads. This owner never deletes an SST, claims
 //! a durability receipt, or retains Backend, Storage or an execution port.
 const std = @import("std");
@@ -22,6 +22,7 @@ const resource = @import("../resource_manager.zig");
 const admission = @import("../../common/read_admission.zig");
 const Run = @import("repository.zig").Run;
 const Metadata = @import("run_metadata_clone.zig").Clone;
+const State = @import("state.zig").State;
 const Retirement = @import("run_snapshot_clone.zig").Retirement;
 const Lifetime = @import("directory_entry_owner.zig").Lifetime;
 const Filter = @typeInfo(@FieldType(Run, "bloom_filter")).optional.child;
@@ -53,6 +54,7 @@ pub const Owner = struct {
     variable_credit: ?resource.Reservation = null,
     refs: std.atomic.Value(usize) = .init(1),
     metadata: Metadata,
+    state: ?State.Clone = null,
     input_filter: ?Filter,
     filter: ?Filter = null,
     filter_offset: usize = 0,
@@ -67,7 +69,18 @@ pub const Owner = struct {
     /// live-root controller supplies file-existence authority separately.
     pub fn start(a: std.mem.Allocator, manager: *resource.ResourceManager, source: Run, original: admission.Port) !*Owner {
         try original.checkpoint();
-        if (source.path == null or source.output_ticket != null) return error.InvalidArgument;
+        if (source.path == null) return error.InvalidArgument;
+        return startSource(a, manager, source, false, original);
+    }
+    /// Copies every state byte, including shared entry storage. The registered
+    /// lifetime owns its complete charge independently of the old memory root.
+    pub fn startMemory(a: std.mem.Allocator, manager: *resource.ResourceManager, source: Run, original: admission.Port) !*Owner {
+        try original.checkpoint();
+        if (source.path != null or source.state == null) return error.InvalidArgument;
+        return startSource(a, manager, source, true, original);
+    }
+    fn startSource(a: std.mem.Allocator, manager: *resource.ResourceManager, source: Run, memory: bool, original: admission.Port) !*Owner {
+        if (source.output_ticket != null) return error.InvalidArgument;
         var host: ?resource.AllocatorHost = try manager.acquireAllocatorHostWithAdmission(a, original);
         defer if (host) |held| held.release();
         var construction = try manager.reserveConstructionWithAdmission(slice, @sizeOf(Owner), original);
@@ -75,7 +88,7 @@ pub const Owner = struct {
         const self = try a.create(Owner);
         var registered = false;
         errdefer if (!registered) a.destroy(self);
-        self.* = .{ .allocator = a, .manager = manager, .host = host.?, .metadata = .init(source), .input_filter = source.bloom_filter };
+        self.* = .{ .allocator = a, .manager = manager, .host = host.?, .metadata = .init(source), .input_filter = source.bloom_filter, .state = if (memory) .initIndependent(&source.state.?) else null };
         try manager.registerResumablePayloadRetirementWithAdmission(&self.registration, &self.credit, &construction, self, .{ .advance = advance }, destroy, original);
         registered = true;
         host = null;
@@ -86,10 +99,12 @@ pub const Owner = struct {
         if (self.closing) return error.InvalidArgument;
         if (self.ready) return;
         if (self.variable_credit == null) {
-            const bound = std.math.add(u64, try self.metadata.memoryBound(), if (self.input_filter) |filter| filter.bytes.len else 0) catch return error.ResourceBudgetExceeded;
+            var bound = std.math.add(u64, try self.metadata.memoryBound(), if (self.input_filter) |filter| filter.bytes.len else 0) catch return error.ResourceBudgetExceeded;
+            if (self.state) |*state| bound = std.math.add(u64, bound, try state.memoryBoundWithAdmission(original)) catch return error.ResourceBudgetExceeded;
             self.variable_credit = try self.manager.reserveWithoutReclaimWithAdmission(slice, bound, original);
         }
         try self.metadata.resumeWithAdmission(self.allocator, original);
+        if (self.state) |*state| try state.resumeWithAdmission(self.allocator, original);
         if (self.input_filter) |input| {
             if (self.filter == null) {
                 try original.checkpoint();
@@ -105,6 +120,10 @@ pub const Owner = struct {
         }
         try original.checkpoint();
         var run = self.metadata.take() catch unreachable;
+        if (self.state) |*state| {
+            run.state = state.takeWithAdmission(null) catch unreachable;
+            state.source = undefined;
+        }
         run.bloom_filter = self.filter;
         run.owns_bloom_filter = self.filter != null;
         self.run = run;
@@ -142,6 +161,7 @@ pub const Owner = struct {
         self.closing = true;
         self.input_filter = null;
         self.metadata.source = undefined;
+        if (self.state) |*state| state.source = undefined;
         self.registration.publish();
     }
     fn advance(raw: *anyopaque, original: ?admission.Port) !bool {
@@ -156,13 +176,17 @@ pub const Owner = struct {
             if (!try retirement.step(self.allocator, original)) return false;
             self.retirement = null;
         }
+        if (self.state) |*state| {
+            try state.retireWithAdmission(self.allocator, original);
+            self.state = null;
+        }
         if (!try self.metadata.retireStep(self.allocator, original)) return false;
         if (self.filter) |filter| {
             const end = @min(filter.bytes.len, self.retire_filter_offset + Metadata.quantum);
             @memset(filter.bytes[self.retire_filter_offset..end], undefined);
             self.retire_filter_offset = end;
             if (end != filter.bytes.len) return false;
-            self.allocator.free(filter.bytes);
+            if (filter.bytes.len != 0) self.allocator.rawFree(filter.bytes, .of(u8), @returnAddress());
             self.filter = null;
             return false;
         }

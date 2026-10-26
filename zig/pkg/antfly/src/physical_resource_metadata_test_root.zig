@@ -4549,6 +4549,9 @@ const FileSnapshotFixture = struct {
         return runPhase(target, oom, abort_on_error, false);
     }
     fn runPhase(target: ?usize, oom: bool, abort_on_error: bool, retire_refusal: bool) !Stats {
+        return runKind(target, oom, abort_on_error, retire_refusal, false);
+    }
+    fn runKind(target: ?usize, oom: bool, abort_on_error: bool, retire_refusal: bool, memory: bool) !Stats {
         const a = std.testing.allocator;
         var failing = std.testing.FailingAllocator.init(a, .{});
         const owned = failing.allocator();
@@ -4579,6 +4582,20 @@ const FileSnapshotFixture = struct {
         };
         @memset(source.smallest_key, 'k');
         @memset(source.bloom_filter.?.bytes, 0xa5);
+        if (memory) {
+            a.free(source.path.?);
+            source.path = null;
+            const State = @import("antfly_local_sources").storage_lsm_backend_state;
+            var active: State.ActiveMemTable = .{};
+            defer active.deinit(a);
+            const value = try a.alloc(u8, 48 * 1024 + 3);
+            defer a.free(value);
+            @memset(value, 0x73);
+            try active.upsert(a, .{ .name = "docs" }, "row", value, false);
+            try active.upsert(a, .{ .name = "docs" }, "tombstone", "", true);
+            source.state = try active.snapshot(a);
+            try source.shareMemory(a);
+        }
         var source_live = true;
         defer if (source_live) source.deinit(a);
         var owner: ?*Owner = null;
@@ -4604,7 +4621,10 @@ const FileSnapshotFixture = struct {
         if (oom) failing.fail_index = start + target.?;
         var retry: FlushPublicationFixture.Retry = .{ .failing = &failing, .control = &control, .oom = oom, .abort_on_error = abort_on_error };
         const result: anyerror!void = work: {
-            owner = retry.call(Owner.start, .{ owned, &resources.resource_manager, source, original }) catch |cause| break :work cause;
+            owner = (if (memory)
+                retry.call(Owner.startMemory, .{ owned, &resources.resource_manager, source, original })
+            else
+                retry.call(Owner.start, .{ owned, &resources.resource_manager, source, original })) catch |cause| break :work cause;
             retry.call(Owner.resumeWithAdmission, .{ owner.?, original }) catch |cause| break :work cause;
             source.deinit(a);
             source_live = false;
@@ -4615,7 +4635,19 @@ const FileSnapshotFixture = struct {
         control.live = false;
         if (result) |_| {
             const copied = lease.?.run;
-            try std.testing.expectEqualStrings("/legacy/runs/77.tbl", copied.path.?);
+            if (memory) {
+                try std.testing.expect(copied.path == null and copied.shared_memory == null);
+                const state = &copied.state.?;
+                try std.testing.expectEqual(@as(usize, 2), state.entryCount());
+                try std.testing.expect(state.entryAt(0).shared == null and state.entryAt(1).shared == null);
+                try std.testing.expectEqualStrings("docs", state.entryAt(0).namespace_name.?);
+                try std.testing.expectEqualStrings("row", state.entryAt(0).key);
+                try std.testing.expectEqual(@as(usize, 48 * 1024 + 3), state.entryAt(0).value.len);
+                try std.testing.expect(std.mem.allEqual(u8, state.entryAt(0).value, 0x73));
+                try std.testing.expect(state.entryAt(1).tombstone);
+                const resident = state.estimatedMemoryBytes() + copied.smallest_key.len + copied.largest_key.len + copied.largest_namespace_name.?.len + copied.bloom_filter.?.bytes.len;
+                try std.testing.expect(owner.?.variable_credit.?.bytes >= resident);
+            } else try std.testing.expectEqualStrings("/legacy/runs/77.tbl", copied.path.?);
             try std.testing.expect(copied.smallest_namespace_name == null and copied.largest_namespace_name != null);
             try std.testing.expectEqualStrings("", copied.largest_namespace_name.?);
             try std.testing.expectEqual(@as(usize, 32777), copied.smallest_key.len);
@@ -4715,6 +4747,34 @@ test "physical cache metadata registered file snapshot preserves entry lifetime 
     }
 }
 
+test "physical cache metadata registered memory snapshot owns shared tree bytes after producer exit" {
+    _ = try FileSnapshotFixture.runKind(null, false, false, false, true);
+}
+
+test "physical cache metadata registered memory snapshot preserves every original refusal and abort" {
+    const checks = (try FileSnapshotFixture.runKind(null, false, false, false, true)).checks;
+    for (0..checks) |at| {
+        _ = try FileSnapshotFixture.runKind(at, false, false, false, true);
+        _ = try FileSnapshotFixture.runKind(at, false, true, false, true);
+    }
+}
+
+test "physical cache metadata registered memory snapshot funds every copy allocation and partial abort" {
+    const count = (try FileSnapshotFixture.runKind(null, false, false, false, true)).allocations;
+    for (0..count) |at| {
+        _ = try FileSnapshotFixture.runKind(at, true, false, false, true);
+        _ = try FileSnapshotFixture.runKind(at, true, true, false, true);
+    }
+}
+
+test "physical cache metadata registered memory snapshot retains cleanup across every original refusal" {
+    const checks = (try FileSnapshotFixture.runKind(null, false, false, true, true)).checks;
+    for (0..checks) |at| {
+        _ = try FileSnapshotFixture.runKind(at, false, false, true, true);
+        _ = try FileSnapshotFixture.runKind(at, false, true, true, true);
+    }
+}
+
 const LegacyMigrationFixture = struct {
     const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
     const io_mod = @import("antfly_local_sources").storage_lsm_backend_storage_io;
@@ -4723,6 +4783,9 @@ const LegacyMigrationFixture = struct {
     const Mode = enum { install, abort, stale, receipt, lineage, checkpoint, account, install_refusal, retire_dirs, retire_abort, retire_all, retire_all_abort };
 
     fn run(mode: Mode, target: ?usize, oom: bool) !Stats {
+        return runKind(mode, target, oom, false);
+    }
+    fn runKind(mode: Mode, target: ?usize, oom: bool, memory: bool) !Stats {
         const a = std.testing.allocator;
         var failing = std.testing.FailingAllocator.init(a, .{});
         const owned = failing.allocator();
@@ -4769,6 +4832,35 @@ const LegacyMigrationFixture = struct {
         backend.obsolete_paths.appendAssumeCapacity(.{ .path = long_path, .delete_after_ns = std.math.maxInt(u64) - 1000 });
         backend.obsolete_paths.appendAssumeCapacity(.{ .path = try owned.dupe(u8, "/legacy-orphan"), .delete_after_ns = std.math.maxInt(u64) - 2000 });
         try backend.persistManifest();
+        if (memory) {
+            const State = @import("antfly_local_sources").storage_lsm_backend_state;
+            var active: State.ActiveMemTable = .{};
+            defer active.deinit(owned);
+            try active.upsert(owned, .{ .name = "docs" }, "key-memory", "retained-memory", false);
+            var memory_run: lsm.repository.Run = .{
+                .id = backend.next_run_id,
+                .level = 0,
+                .size_bytes = 0,
+                .path = null,
+                .smallest_namespace_name = try owned.dupe(u8, "docs"),
+                .smallest_key = try owned.dupe(u8, "key-memory"),
+                .largest_namespace_name = try owned.dupe(u8, "docs"),
+                .largest_key = try owned.dupe(u8, "key-memory"),
+                .entry_count = 1,
+                .bloom_filter = null,
+                .state = try active.snapshot(owned),
+            };
+            var memory_live = true;
+            defer if (memory_live) memory_run.deinit(owned);
+            try memory_run.shareMemory(owned);
+            try backend.run_directory.?.put(&backend, memory_run);
+            try backend.runs.append(owned, memory_run);
+            memory_live = false;
+            backend.next_run_id += 1;
+            backend.run_directory_generation += 1;
+            backend.syncTrackedInMemoryStateUsageCurrentLocked();
+            try std.testing.expectEqual(@as(usize, 1), backend.run_directory.?.memory_run_count);
+        }
         const old_directory = backend.run_directory.?;
         const old_writer = backend.runs.tree.root;
         const old_obsolete = backend.obsolete_paths.tree.root;
@@ -4925,12 +5017,31 @@ const LegacyMigrationFixture = struct {
             try std.testing.expectEqual(@as(u64, 0), backend.unpublished_wal_logical_bytes);
             try std.testing.expectEqual(@as(usize, 2), backend.manifest_journal.obsolete.count());
         }
+        if (memory and mode != .abort) {
+            try std.testing.expectEqual(@as(usize, 1), backend.run_directory.?.memory_run_count);
+            try std.testing.expectEqual(@as(usize, 3), backend.runs.count());
+            const scope = try backend.beginPublicationResourcesWithAdmission(original);
+            defer scope.requestRetirement();
+            try scope.resumeWithAdmission(original);
+            var reservation = try backend.reserveRegisteredCheckpointWithAdmission(original);
+            defer reservation.deinit();
+            const candidate = try scope.preparePublicationWithAdmission(original);
+            defer candidate.requestRetirement();
+            try backend.capturePreparedPublicationWithAdmission(candidate, &backend.registered_publication, backend.run_directory_generation, original);
+            try candidate.prepareUnchangedWithAdmission(original);
+            var lineage = lsm.repository.ManifestJournal.CheckpointFence.capture(&backend);
+            try std.testing.expectError(error.InvalidArgument, scope.beginRegisteredCheckpointWithAdmission(backend.options.unpublished_outputs.?, candidate, root, reservation.id, reservation.next_run_id, &lineage, original));
+            try std.testing.expectEqualDeep(descriptor, backend.manifest_journal.descriptor);
+            try std.testing.expectEqual(sequence, backend.manifest_journal.sequence);
+            try std.testing.expectEqual(@as(u64, 37), backend.unpublished_wal_logical_bytes);
+        }
         try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
         {
             var reader = try backend.beginReadWithAdmission(original);
             defer reader.abort();
             try std.testing.expectEqualStrings("key-000", try reader.getWithAdmission(.{ .name = "docs" }, "key-000", original));
             try std.testing.expectEqualStrings("key-001", try reader.getWithAdmission(.{ .name = "docs" }, "key-001", original));
+            if (memory) try std.testing.expectEqualStrings("retained-memory", try reader.getWithAdmission(.{ .name = "docs" }, "key-memory", original));
         }
         backend.abandonAfterCrash();
         backend_live = false;
@@ -5059,6 +5170,28 @@ test "physical cache metadata bounded legacy retirement limits long path cleanup
     for (0..checks) |at| {
         _ = try LegacyLedgerRetirementFixture.run(at, false);
         _ = try LegacyLedgerRetirementFixture.run(at, true);
+    }
+}
+
+test "physical cache metadata legacy root migration imports mixed file and shared memory roots" {
+    _ = try LegacyMigrationFixture.runKind(.retire_all, null, false, true);
+}
+
+test "physical cache metadata legacy root migration preserves mixed root copy refusals and abort" {
+    const checks = (try LegacyMigrationFixture.runKind(.install, null, false, true)).checks;
+    // Include the state-copy and handoff boundaries, while the standalone
+    // snapshot suite exhausts every internal copy and retirement checkpoint.
+    for ([_]usize{ 0, checks / 4, checks / 2, checks * 3 / 4, checks - 1 }) |at| {
+        _ = try LegacyMigrationFixture.runKind(.install, at, false, true);
+        _ = try LegacyMigrationFixture.runKind(.abort, at, false, true);
+    }
+}
+
+test "physical cache metadata legacy root migration preserves mixed root allocation refusals" {
+    const count = (try LegacyMigrationFixture.runKind(.install, null, false, true)).allocations;
+    for ([_]usize{ 0, count / 4, count / 2, count * 3 / 4, count - 1 }) |at| {
+        _ = try LegacyMigrationFixture.runKind(.install, at, true, true);
+        _ = try LegacyMigrationFixture.runKind(.abort, at, true, true);
     }
 }
 

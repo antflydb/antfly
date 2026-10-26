@@ -541,6 +541,7 @@ pub const State = struct {
         const Port = @import("../../common/read_admission.zig").Port;
         pub const quantum = 16 * 1024;
         source: State,
+        independent: bool = false,
         output: State = .{},
         planned: usize = 0,
         planned_bytes: u64 = 0,
@@ -564,6 +565,11 @@ pub const State = struct {
         pub fn init(source: *const State) @This() {
             return .{ .source = source.* };
         }
+        /// Independent owners cannot borrow a producer's entry allocation or
+        /// its accounting lifetime, even when the source is a shared tree.
+        pub fn initIndependent(source: *const State) @This() {
+            return .{ .source = source.*, .independent = true };
+        }
         fn check(original: ?Port) !void {
             if (original) |port| try port.checkpoint();
         }
@@ -574,7 +580,7 @@ pub const State = struct {
             while (self.planned < self.source.entryCount()) {
                 try check(original);
                 const entry = self.planning_cursor.at(&self.source, self.planned);
-                if (entry.shared == null) {
+                if (self.independent or entry.shared == null) {
                     var bytes = try std.math.add(u64, entry.key.len, entry.value.len);
                     if (entry.namespace_name) |name| bytes = try std.math.add(u64, bytes, name.len);
                     self.planned_bytes = try std.math.add(u64, self.planned_bytes, bytes);
@@ -607,7 +613,7 @@ pub const State = struct {
             while (self.index < self.source.entryCount()) {
                 try check(original);
                 const entry = self.cursor.at(&self.source, self.index);
-                if (entry.shared != null) {
+                if (!self.independent and entry.shared != null) {
                     self.output.entries.appendAssumeCapacity(entry.retainShared());
                     self.index += 1;
                     continue;
