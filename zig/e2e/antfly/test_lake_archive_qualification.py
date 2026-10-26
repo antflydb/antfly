@@ -965,6 +965,10 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
                                                            remote_snapshot=after["remote_snapshot"])})
                     for response, wanted in ((first, expected[:20]), (after, expected[20:40]), (before, expected[:20])):
                         assert [h["_id"] for h in response["hits"]["hits"]] == [h["_id"] for h in wanted]
+                        for actual, reference in zip(response["hits"]["hits"], wanted):
+                            assert actual["_source"] == reference["_source"]
+                            assert actual["_sort"] == [reference["_source"]["bucket"], reference["_id"]]
+                            assert actual["_score"] == pytest.approx(reference["_score"], rel=1e-6, abs=1e-7)
                         profile = response["profile"]["sort"]
                         assert profile["selection_reason"] == "bounded_ordered_lake_index", profile
                         assert profile["ordered_scanned_count"] <= 88, profile

@@ -591,3 +591,43 @@ the frozen binary. Coverage includes limits 1/12/64, exact counts, residual
 filters, NULL/date ordering, forced tiny windows with 64-row public-ID ties and
 forward/backward cursors, snapshots, schema IDs, partitions, deletes, accepted
 writes and restart. Main `d8344ac981` is merged.
+
+### Ordered demand and primary boundary proofs
+
+The [ordered-demand observation](native-ordered-demand-v1-observation.json) records
+three samples per cache mode on one independently written 8,192-row Parquet file.
+Only the first or last 64 rows match the respective text query, and each group
+shares one metadata sort value. The merged baseline cannot prove a primary
+boundary from a later text match and falls back. The candidate uses the last
+authenticated key in each processed page and stops after 84 ordered references.
+It also attempts global ordered top-k before enumerating metadata selections,
+bounds optional pack selection, and retains abandoned attempt work in profiles.
+Required finite row selections carry conservative ceilings through lazy Boolean
+membership, preventing tiny child pages from walking unrelated ordered rows.
+
+| Limit-20 case | Baseline warm | Candidate warm |
+|---|---:|---:|
+| Correlated matches, forward | 318.23 ms | 50.44 ms |
+| Correlated matches, reverse | 324.57 ms | 54.30 ms |
+| Native-compatible ordering control | 48.02 ms | 40.09 ms |
+
+All 18 compared pages preserve public IDs, projected sources and sort tuples
+exactly. Correlated-path scores differ by one f32 ULP; native-control scores match
+exactly. Explicit exact counts are tested separately from early top-k lower-bound
+totals. The observation pins executable/input/configuration/runner hashes and
+individual samples. These sequential local Debug runs do not establish causal
+latency, empty-cache behavior, cloud performance or full-archive throughput.
+Restarted processes retain persistent/OS caches and readiness warming.
+
+The correlated fixture, residual filtering, exact count, forward/backward
+pagination, restart and exhausted-tie fallback are reproduced by
+`test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback`
+in `test_lake_archive_qualification.py`. Baseline fallback profiles omit attempted
+ordered work; the candidate's child and reference counters must not be compared
+to those default zeroes as if both had equal coverage.
+
+Validation passes 241 focused native tests (one declared benchmark skip; no
+failures or leaks), 18 benchmark-tooling tests, and all 29 selected real
+Parquet/Iceberg E2Es without skips. Main `9d553bc925` is merged; its integrated
+production build and three real-file rechecks pass, including the strengthened
+source/score/sort-tuple assertions, Parquet pagination and Iceberg pagination.
