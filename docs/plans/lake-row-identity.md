@@ -1708,3 +1708,14 @@ columns once, fills a fixed typed tuple, and immediately encodes it using one
 reusable scratch arena. Flat byte keys may borrow the live source batch only
 until encoding copies them. Durable tuple bytes, quota ownership, nullable
 coverage and ordering-input commitments remain unchanged.
+
+Planning distinguishes an unloaded lazy inventory from a genuinely empty source.
+If the authoritative directory count differs from the eager file list, projected
+scan cost remains unknown rather than zero, and residual gather cost stays
+conservative. Planning does not enumerate that directory to estimate a scan.
+Reverse membership estimates charge per-candidate leaf work and amortize internal
+navigation across bounded tiles; authenticated I/O, scratch and cancellation
+budgets continue to govern execution. Exhaustion discards partial probe results
+before complete membership fallback. Opt-in benchmark diagnostics separate direct
+and translated probes from full materialization so work reductions cannot be
+mistaken for end-to-end query gains.

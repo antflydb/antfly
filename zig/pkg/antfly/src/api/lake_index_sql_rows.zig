@@ -544,7 +544,8 @@ pub const Predicate = struct {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         return owner.predicate_count;
     }
-    /// Estimate complete reverse paths, including remote request overhead.
+    /// Estimate reverse leaves and shared internal paths, including remote
+    /// request overhead. Each bounded tile shares its internal navigation.
     /// This influences path choice only; authenticated read budgets remain the
     /// execution authority and exact predicates are always rechecked.
     pub fn membershipWork(self: Predicate, candidates: u64) u64 {
@@ -552,7 +553,8 @@ pub const Predicate = struct {
         if (self.scan) return std.math.maxInt(u64);
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         const reverse = owner.reader.root.reverse orelse return std.math.maxInt(u64);
-        return candidates *| (@as(u64, reverse.height) + 1) *| (64 + tree.target_page_bytes / 1024);
+        const tiles = 1 + (candidates - 1) / 128;
+        return candidates *| (64 + tree.target_page_bytes / 1024) +| tiles *| reverse.height *| (tree.target_page_bytes / 1024);
     }
     pub fn hasMembership(self: Predicate) bool {
         if (self.scan) return false;
@@ -963,6 +965,9 @@ fn generatedCoveringField(table: catalog.Table, field: []const u8) bool {
 /// and rows are upper estimates: no guessed selectivity or LIMIT credit.
 /// Null means the inventory has not established a row-count estimate.
 pub fn predicateScanWork(source: *local.serverless_query_lake_serving.ServingSource, conditions: []const catalog.Condition) ?u64 {
+    // A lazy directory retains its authoritative file count while the eager
+    // file list is unloaded. Missing projected statistics cannot mean free I/O.
+    if (source.fileCount() != source.inventory.files.len) return null;
     var count: u64 = 0;
     for (conditions, 0..) |condition, i| {
         var duplicate = false;
@@ -991,6 +996,7 @@ pub fn predicateScanWork(source: *local.serverless_query_lake_serving.ServingSou
 
 pub fn predicateResidualWork(source: *local.serverless_query_lake_serving.ServingSource, conditions: []const catalog.Condition, candidates: u64) u64 {
     if (candidates == 0) return 0;
+    if (source.fileCount() != source.inventory.files.len) return std.math.maxInt(u64);
     var bytes: u64 = 0;
     var groups: u64 = 0;
     var requests: u64 = 0;
@@ -1939,6 +1945,9 @@ test "external lake predicate costs prefer selective seeks and broad projected s
     var groups = [_]external.RowGroup{.{ .ordinal = 0, .row_count = 10000, .column_chunks = &chunks }};
     var files = [_]external.FileEntry{.{ .file_id = @constCast("file"), .object_uri = @constCast("file://file"), .byte_len = 100016384, .row_count = 10000, .row_groups = &groups }};
     var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    source.selected_catalog_view = false;
+    source.file_navigation = null;
+    source.plan_lease = null;
     source.inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file://source"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &files };
     const lower: catalog.Condition = .{ .column = "amount", .op = .gte, .value = .{ .integer = 0 } };
     const upper: catalog.Condition = .{ .column = "amount", .op = .lt, .value = .{ .integer = 10000 } };
@@ -1976,6 +1985,28 @@ test "external lake predicate costs prefer selective seeks and broad projected s
     // An inventory with no files is genuinely empty, unlike an unread footer.
     source.inventory.files = &.{};
     try std.testing.expectEqual(@as(?u64, 0), predicateScanWork(&source, &.{lower}));
+    // An unloaded list behind a nonempty directory is unknown, not empty.
+    var navigation: local.serverless_query_lake_serving.ServingSource.FileNavigation = undefined;
+    navigation.count = 8;
+    source.file_navigation = navigation;
+    try std.testing.expectEqual(@as(?u64, null), predicateScanWork(&source, &.{lower}));
+    try std.testing.expectEqual(std.math.maxInt(u64), predicateResidualWork(&source, &.{lower}, 1));
+    try std.testing.expectEqual(@as(u64, 0), predicateResidualWork(&source, &.{lower}, 0));
+    navigation.count = 0;
+    source.file_navigation = navigation;
+    try std.testing.expectEqual(@as(?u64, 0), predicateScanWork(&source, &.{lower}));
+}
+
+test "external lake metadata probe costs amortize internal paths and retain broad fallback" {
+    var owner: Owner = undefined;
+    owner.reader.root.reverse = .{ .digest = @splat(1), .bytes = 256, .height = 1, .records = 16384 };
+    const predicate: Predicate = .{ .cursor = .{ .ptr = &owner, .next = undefined, .close = undefined } };
+    const complete = predicateIndexWork(16384, 1024, true);
+    try std.testing.expectEqual(@as(u64, 0), predicate.membershipWork(0));
+    try std.testing.expect(predicate.membershipWork(16) + predicate.membershipWork(5) < complete);
+    try std.testing.expect(predicate.membershipWork(16384) > complete);
+    try std.testing.expect(predicate.membershipWork(128) < 128 * predicate.membershipWork(1));
+    try std.testing.expect(predicate.membershipWork(std.math.maxInt(u64)) >= complete);
 }
 
 test "external lake ordered access plans equality prefixes ranges directions and exact order proofs" {

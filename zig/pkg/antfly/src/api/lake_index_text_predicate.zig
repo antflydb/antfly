@@ -1315,8 +1315,14 @@ fn PredicateResolver(comptime Set: type) type {
             cache: LiveRowsCache = .{},
             materialized: ?Bitmap = null,
             spent_work: u64 = 0,
+            bench_profile: bool = false,
+            direct_probe_rows: u64 = 0,
+            translated_probe_rows: u64 = 0,
+            probe_ns: u64 = 0,
+            materialize_ns: u64 = 0,
             fn close(raw: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.bench_profile) std.debug.print("antfly_bench_metadata_membership direct_rows={d} translated_rows={d} probe_ns={d} materialize_ns={d} materialized={any} spent_work={d} work_budget={d}\n", .{ self.direct_probe_rows, self.translated_probe_rows, self.probe_ns, self.materialize_ns, self.materialized != null, self.spent_work, self.work_budget });
                 if (self.materialized) |*bitmap| bitmap.deinit();
                 self.cache.deinit(self.a);
                 self.predicate.deinit();
@@ -1324,6 +1330,10 @@ fn PredicateResolver(comptime Set: type) type {
                 self.a.destroy(self);
             }
             fn materialize(self: *@This()) !void {
+                const started = if (self.bench_profile) @import("antfly_platform").time.monotonicNs() else 0;
+                defer if (self.bench_profile) {
+                    self.materialize_ns +|= @import("antfly_platform").time.monotonicNs() - started;
+                };
                 // Preserve the whole-condition planner's scan/intersection
                 // alternatives instead of forcing an expensive index walk.
                 var exact = self.resolver;
@@ -1343,9 +1353,16 @@ fn PredicateResolver(comptime Set: type) type {
                 return if (self.materialized) |*bitmap| bitmap else null;
             }
             fn probe(self: *@This(), a: A, ordinals: []const u32, allowed: []bool, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !void {
+                const started = if (self.bench_profile) @import("antfly_platform").time.monotonicNs() else 0;
+                defer if (self.bench_profile) {
+                    self.probe_ns +|= @import("antfly_platform").time.monotonicNs() - started;
+                };
                 var identities = self.resolver.identities;
                 const binding = identities.row_resolver;
                 const direct = self.predicate.sharesCoordinates(binding);
+                if (self.bench_profile) {
+                    if (direct) self.direct_probe_rows +|= ordinals.len else self.translated_probe_rows +|= ordinals.len;
+                }
                 if (direct) identities.row_resolver = null;
                 const refs = try identities.physicalRows(a, &self.cache, self.resolver.store, cached, ordinals, if (binding) |bound| bound.source else self.resolver.source.inventory.source_id, if (binding) |bound| bound.snapshot else self.resolver.source.inventory.snapshot_id);
                 if (direct) {
@@ -1473,7 +1490,7 @@ fn PredicateResolver(comptime Set: type) type {
             }
             const work_budget = @min(predicate.work, rows.predicateScanWork(self.source, copied) orelse std.math.maxInt(u64));
             const owner = try a.create(ProducerOwner);
-            owner.* = .{ .a = a, .resolver = self, .predicate = predicate, .arena = owned, .conditions = copied, .work_budget = work_budget, .cache = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a) } };
+            owner.* = .{ .a = a, .resolver = self, .predicate = predicate, .arena = owned, .conditions = copied, .work_budget = work_budget, .cache = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a) }, .bench_profile = @import("antfly_platform").env.getenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY") != null };
             return .{ .bitmap = Bitmap.init(a), .producer = .{ .ptr = owner, .produce = ProducerOwner.produce, .contains = ProducerOwner.contains, .contains_many = ProducerOwner.containsMany, .materialized = ProducerOwner.completeMembership }, .owner = owner, .close = ProducerOwner.close };
         }
         fn value(self: Self, a: A, pa: A, input: Compiled, depth: usize, allow_scan: bool) anyerror!?PredicateResult {
