@@ -730,9 +730,14 @@ pub const Resolver = struct {
         var effective: std.ArrayList(KeyAlias) = .empty;
         for (starts.items) |start| {
             var key = start;
+            var path_nodes: usize = 0;
             while (true) {
                 if ((try seen.getOrPut(a, key)).found_existing) break;
-                if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+                // Native pages bound discovery independently. Their union may
+                // contain arbitrarily many short, disjoint paths; keep the
+                // safety bound on each traversal rather than the whole query.
+                path_nodes += 1;
+                if (path_nodes > 16384) return error.ResolverCurationLimitExceeded;
                 const target = native.get(key) orelse if (!index.removed_aliases.contains(key)) configured.target(key) else null;
                 const next = target orelse break;
                 const edge: KeyAlias = .{ .key = try a.dupe(u8, key), .target = try a.dupe(u8, next) };
@@ -4024,6 +4029,31 @@ test "query policy attachment reuses configured indexes and compiles only incide
     std.debug.print("QUERY ATTACHMENT configured_aliases=10000 phases=10 arena_bytes={d} compiled_edges=0\n", .{bytes});
     try target.installQueryPolicy(a, "attachment-regression", declared, suppress, &.{}, "{\"removed_aliases\":[\"entity/b\"]}", &.{"entity/a"});
     try std.testing.expectEqualStrings("entity/b", try target.canonicalKey("entity/a"));
+}
+
+test "query policy attachment accepts wide page unions and bounds individual paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const edges = try a.alloc(KeyAlias, 9000);
+    const seeds = try a.alloc([]const u8, edges.len);
+    for (edges, seeds, 0..) |*edge, *seed, i| {
+        edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/a-{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/b-{d}", .{i}) };
+        seed.* = edge.key;
+    }
+    var target = try Resolver.initFromParts(a, "entities", "entity/{{_entity.text}}", .{}, false, "");
+    defer target.deinit();
+    try target.installQueryPolicy(a, null, &.{}, "", edges, "", seeds);
+    for (edges) |edge| try std.testing.expectEqualStrings(edge.target, try target.canonicalKey(edge.key));
+    try std.testing.expectEqual(edges.len, target.aliases.len);
+    // Shared suffixes are visited once, and cycles still fail closed.
+    try std.testing.expectError(error.InvalidResolverAliasCycle, target.installQueryPolicy(a, null, &.{}, "", &.{ .{ .key = "a", .target = "b" }, .{ .key = "b", .target = "a" } }, "", &.{"a"}));
+    const chain = try a.alloc(KeyAlias, 16384);
+    for (chain, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(a, "chain/{d}", .{i}), .target = try std.fmt.allocPrint(a, "chain/{d}", .{i + 1}) };
+    try std.testing.expectError(error.ResolverCurationLimitExceeded, target.installQueryPolicy(a, null, &.{}, "", chain, "", &.{"chain/0"}));
+    // A failed attachment preserves the last valid policy and its lease.
+    try std.testing.expectEqualStrings(edges[8999].target, try target.canonicalKey(edges[8999].key));
+    std.debug.print("QUERY ATTACHMENT seeds=9000 disjoint_nodes=18000 canonical_results=9000 path_limit=16384\n", .{});
 }
 
 test "query policy attachment preserves its prior lease on allocation failure" {

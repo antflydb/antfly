@@ -7401,7 +7401,7 @@ pub fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     const handle = guard.handle;
-    const configs = handle.database().core.index_manager.listResolverRoutingDescriptors(handle.alloc) catch |err| return capi.mapError(err);
+    const configs = handle.database().core.index_manager.resolverQueryRoutingDescriptors(handle.alloc, resolver_name.bytes(), false) catch |err| return capi.mapError(err);
     defer {
         for (configs) |*cfg| cfg.deinit(handle.alloc);
         handle.alloc.free(configs);
@@ -7462,7 +7462,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
     if (extraction) |value| {
         if (value != .object or value.object.get("entities") == null or value.object.get("entities").? != .array) return capi.mapErrorContext(error.InvalidArgument, "extraction must contain an entities array");
     }
-    const configs = handle.database().core.index_manager.listPublicResolverRoutingDescriptors(alloc) catch |err| return capi.mapError(err);
+    const configs = handle.database().core.index_manager.resolverQueryRoutingDescriptors(alloc, resolver_name.bytes(), true) catch |err| return capi.mapError(err);
     defer {
         for (configs) |*cfg| cfg.deinit(alloc);
         alloc.free(configs);

@@ -2005,8 +2005,10 @@ Native query attachment leases the immutable configured alias/negative-policy
 index by its admission-qualified profile identity. It composes only the rendered
 mention paths and incident distinct endpoints against current native redirects
 and tombstones, then builds a request-local canonical index for those paths.
-Configured key/text negatives are borrowed under that lease; live negatives,
-pins and removals remain request-local. The two resolution phases replace and
+The 16,384-node safety bound applies to each traversal, not the union of native
+pages: 9,000 independent aliases (18,000 nodes) remain a valid query, with each
+shared suffix traversed once. Configured key/text negatives are borrowed under
+that lease; live negatives, pins and removals remain request-local. The two resolution phases replace and
 release their leases explicitly, and stage restoration releases the final query
 lease before restoring the caller's policy. Rendering uses the same attachment.
 Legacy source-owned policy retains its full cached index and its existing limits;
@@ -2015,6 +2017,17 @@ the configured baseline. The private policy wire contract and its complete head
 fences are unchanged.
 Ten warm attachments against 10,000 configured aliases allocate 4,640 bytes of
 request arenas instead of at least 35,984,100 bytes of copied/rebuilt indexes.
+
+Lite initial query and key-render admission use a catalog-owned directory keyed
+by resolver name and source artifact/routing domain. A warm read clones only the
+selected declaration and overlapping active siblings in catalog order, preserving
+catch-all label exclusions and declaration fingerprints. Private replacements stay
+in their own routing domain; public queries cannot select them or retired names.
+The directory is invalidated with structural catalog publication and warm reads
+use the shared catalog lock. A one-resolver admission uses 2,232 bytes of request
+arena capacity at both 100 and 1,000 declarations, copying zero unrelated aliases;
+the previous 1,000-declaration path copied 999,000 aliases into 59,848,688 bytes.
+The sibling-routing regression admits two relevant declarations within 16 KiB.
 
 Lite final declaration verification reads a scalar scoped fingerprint from the
 owner's namespace lookup. The scope includes the selected resolver and overlapping

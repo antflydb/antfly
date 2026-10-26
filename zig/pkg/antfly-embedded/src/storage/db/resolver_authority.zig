@@ -2719,6 +2719,46 @@ test "resolver curation query policy unions bounded batches with a head lineage 
     try std.testing.expectError(error.ResolverCurationConflict, unionQueryPolicies(a, &.{ part, divergent }));
 }
 
+test "resolver curation query policy wide native page union attaches without a query wide node cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "wide-attachment/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_entity.text}}";
+    const aliases = try a.alloc(resolver.KeyAlias, 9000);
+    const seeds = try a.alloc([]const u8, aliases.len);
+    for (aliases, seeds, 0..) |*edge, *seed, i| {
+        edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/a-{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/b-{d}", .{i}) };
+        seed.* = edge.key;
+    }
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1 });
+    var loader: Store.InlineQueryProfile = .{ .aliases = aliases };
+    const id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a);
+    const prepared = (try store.prepareQuery(template, .{ .id = id, .ptr = &loader, .load = Store.InlineQueryProfile.load, .estimated_bytes = loader.estimate() }, false)).?;
+    defer prepared.release();
+    var joined: QueryPolicyUnion = .{};
+    var offset: usize = 0;
+    var pages: usize = 0;
+    while (offset < seeds.len) {
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        var page_store = store;
+        page_store.a = scratch.allocator();
+        const end = @min(offset + 1024, seeds.len);
+        try joined.add(a, scratch.allocator(), try page_store.queryPrepared(prepared, seeds[offset..end], &.{}, false));
+        offset = end;
+        pages += 1;
+    }
+    const snapshot = try joined.finish();
+    var target = try resolver.Resolver.initFromParts(a, "entities", template, .{}, false, "");
+    defer target.deinit();
+    try target.installQueryPolicy(a, id, aliases, "", snapshot.namespace.merges, try encode(a, snapshot.namespace.state), seeds);
+    for (aliases) |edge| try std.testing.expectEqualStrings(edge.target, target.alias_index.?.canonical(edge.key));
+    try std.testing.expectEqual(@as(usize, 9), pages);
+    std.debug.print("NATIVE PAGE ATTACHMENT seeds=9000 pages=9 canonical_results=9000\n", .{});
+}
+
 test "resolver curation query policy unrelated pins never expand a large reverse component" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

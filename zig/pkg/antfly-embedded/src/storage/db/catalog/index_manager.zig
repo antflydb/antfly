@@ -12912,7 +12912,7 @@ pub const IndexManager = struct {
     /// Import immutable policy once into this owner's allocator. Transient
     /// metadata arenas never lend their lifetime to persistent catalog slots.
     const ResolverSlot = struct { retired: bool, index: usize };
-    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)), names: std.StringHashMapUnmanaged(ResolverSlot), profiles: std.StringHashMapUnmanaged([]const u8) = .empty, query_proofs: std.AutoHashMapUnmanaged([32]u8, [32]u8) = .empty, query_proof_generation: u64 = 0, reserved: std.StringHashMapUnmanaged(void) };
+    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)), names: std.StringHashMapUnmanaged(ResolverSlot), routing: std.StringHashMapUnmanaged(std.ArrayList(usize)), profiles: std.StringHashMapUnmanaged([]const u8) = .empty, query_proofs: std.AutoHashMapUnmanaged([32]u8, [32]u8) = .empty, query_proof_generation: u64 = 0, reserved: std.StringHashMapUnmanaged(void) };
     fn invalidateResolverNamespaceLookup(self: *IndexManager) void {
         if (self.resolver_namespace_lookup) |*lookup| lookup.arena.deinit();
         self.resolver_namespace_lookup = null;
@@ -12925,10 +12925,15 @@ pub const IndexManager = struct {
             const a = arena.allocator();
             var slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)) = .empty;
             var names: std.StringHashMapUnmanaged(ResolverSlot) = .empty;
+            var routing: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty;
             var reserved: std.StringHashMapUnmanaged(void) = .empty;
             for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }, 0..) |definitions, retired| for (definitions, 0..) |cfg, index| {
                 try names.put(a, try a.dupe(u8, cfg.name), .{ .retired = retired != 0, .index = index });
                 if (retired == 0) {
+                    const route = try std.json.Stringify.valueAlloc(a, .{ cfg.source_artifact, cfg.replacement_index }, .{});
+                    const group = try routing.getOrPut(a, route);
+                    if (!group.found_existing) group.value_ptr.* = .empty;
+                    try group.value_ptr.append(a, index);
                     if (cfg.replacement_resolver.len > 0) try reserved.put(a, try a.dupe(u8, cfg.replacement_resolver), {});
                     if (cfg.replacement_index.len > 0) try reserved.put(a, try a.dupe(u8, cfg.name), {});
                 }
@@ -12938,7 +12943,7 @@ pub const IndexManager = struct {
                 if (!entry.found_existing) entry.value_ptr.* = .empty;
                 try entry.value_ptr.append(a, .{ .retired = retired != 0, .index = index });
             };
-            self.resolver_namespace_lookup = .{ .arena = arena, .slots = slots, .names = names, .reserved = reserved };
+            self.resolver_namespace_lookup = .{ .arena = arena, .slots = slots, .names = names, .routing = routing, .reserved = reserved };
         }
     }
     fn resolverNamespaceSlots(self: *IndexManager, table: []const u8, template: []const u8) ![]const ResolverSlot {
@@ -13415,19 +13420,39 @@ pub const IndexManager = struct {
         return result;
     }
 
-    /// Match listResolvers' active/staged routing selection without copying
-    /// destination-owned projected policy for unrelated resolver siblings.
-    pub fn listPublicResolverRoutingDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+    /// Initial query/render admission owns only the requested declaration and
+    /// overlapping routing siblings. The immutable directory indexes names and
+    /// artifact/domain groups; unrelated aliases and producer bodies are never
+    /// cloned. Keep catalog order so declaration fingerprints match final fences.
+    pub fn resolverQueryRoutingDescriptors(self: *IndexManager, alloc: Allocator, name: []const u8, public_only: bool) ![]ResolverConfig {
         self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
+        if (self.resolver_namespace_lookup != null) {
+            defer self.catalog_mutex.unlockShared();
+            return self.cloneResolverQueryRoutingDescriptors(alloc, name, public_only);
+        }
+        self.catalog_mutex.unlockShared();
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        return self.cloneResolverQueryRoutingDescriptors(alloc, name, public_only);
+    }
+    fn cloneResolverQueryRoutingDescriptors(self: *IndexManager, alloc: Allocator, name: []const u8, public_only: bool) ![]ResolverConfig {
+        const lookup = &self.resolver_namespace_lookup.?;
+        const slot = lookup.names.get(name) orelse return alloc.alloc(ResolverConfig, 0);
+        if (slot.retired) return alloc.alloc(ResolverConfig, 0);
+        const selected = self.resolvers.items[slot.index];
+        if (public_only and selected.replacement_index.len != 0) return alloc.alloc(ResolverConfig, 0);
+        const route = try std.json.Stringify.valueAlloc(alloc, .{ selected.source_artifact, selected.replacement_index }, .{});
+        defer alloc.free(route);
+        const group = lookup.routing.get(route) orelse unreachable;
         var result: std.ArrayList(ResolverConfig) = .empty;
         errdefer {
             for (result.items) |*cfg| cfg.deinit(alloc);
             result.deinit(alloc);
         }
-        for (self.resolvers.items) |definition| {
-            if (definition.replacement_index.len != 0) continue;
-            var cfg = definition;
+        for (group.items) |index| {
+            var cfg = self.resolvers.items[index];
+            if (index != slot.index and (!selected.sharesRoutingDomain(cfg) or !cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) continue;
             cfg.merges = &.{};
             cfg.curation_json = "{}";
             var owned = try ResolverConfig.clone(alloc, cfg);
@@ -13435,24 +13460,6 @@ pub const IndexManager = struct {
             try result.append(alloc, owned);
         }
         return result.toOwnedSlice(alloc);
-    }
-    pub fn listResolverRoutingDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        const result = try alloc.alloc(ResolverConfig, self.resolvers.items.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (result[0..initialized]) |*cfg| cfg.deinit(alloc);
-            alloc.free(result);
-        }
-        for (self.resolvers.items, result) |definition, *output| {
-            var cfg = definition;
-            cfg.merges = &.{};
-            cfg.curation_json = "{}";
-            output.* = try ResolverConfig.clone(alloc, cfg);
-            initialized += 1;
-        }
-        return result;
     }
 
     /// Caller-owned snapshot of one identity. Lookup is shared with namespace

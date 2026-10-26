@@ -1519,7 +1519,7 @@ test "capi resolver curation query uses persisted profile nodes under leased cac
     var unused: u8 = 0;
     const pressure = try native.query_context.acquire(@splat(210), true, .{ .ptr = &unused, .load = Pressure.load });
     defer pressure.release();
-    const installed = try root.db.core.index_manager.listPublicResolverRoutingDescriptors(a);
+    const installed = try root.db.core.index_manager.resolverQueryRoutingDescriptors(a, cfg.name, true);
     const query_cfg = installed[0];
     var session = try QuerySession.init(a, root, query_cfg, installed);
     var target = try resolver.Resolver.initFromParts(a, cfg.table, cfg.key_template, .{}, false, "");
@@ -1569,4 +1569,72 @@ test "capi resolver curation final declaration fence excludes unrelated profiles
     manager.invalidateWritePlanSnapshot();
     try std.testing.expectEqualSlices(u8, &sibling, &try manager.resolverQueryDeclarationsFingerprint(selected));
     std.debug.print("FINAL DECLARATION FENCE resolvers=1000 unrelated_aliases=999000 warm_checks=1000 proof_builds=1 descriptor_copies=0\n", .{});
+}
+
+test "capi resolver curation initial routing admission excludes unrelated policy and preserves sibling fences" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Manager = @import("../storage/db/catalog/index_manager.zig").IndexManager;
+    var manager: Manager = undefined;
+    manager.alloc = a;
+    manager.catalog_mutex = .{};
+    manager.resolvers = .empty;
+    manager.retired_resolvers = .empty;
+    manager.resolver_namespace_lookup = null;
+    manager.test_resolver_lookup_builds = 0;
+    manager.test_resolver_query_proof_builds = 0;
+    manager.write_plan_generation = .init(1);
+    defer if (manager.resolver_namespace_lookup) |*lookup| lookup.arena.deinit();
+    const selected: h.db_mod.ResolverConfig = .{ .name = "selected", .table = "entities", .key_template = "entity/{{_entity.text}}", .source_artifact = "selected-kg", .resolution_artifact = "out" };
+    try manager.resolvers.append(a, selected);
+    var sibling = selected;
+    sibling.name = "sibling";
+    sibling.labels = &.{"person"};
+    sibling.aliases = &.{.{ .key = "person/ada", .target = "person/lovelace" }};
+    try manager.resolvers.append(a, sibling);
+    var chunk = selected;
+    chunk.name = "chunk";
+    chunk.source_artifact_kind = .chunk;
+    try manager.resolvers.append(a, chunk);
+    var staged = selected;
+    staged.name = "staged";
+    staged.replacement_index = "graph-v2";
+    try manager.resolvers.append(a, staged);
+    var retired = selected;
+    retired.name = "retired";
+    retired.retired = true;
+    try manager.retired_resolvers.append(a, retired);
+    const declared = try a.alloc(@import("antfly_resolver").KeyAlias, 1000);
+    for (declared, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(a, "other/alias-{d}", .{i}), .target = "other/root" };
+    for (0..999) |i| try manager.resolvers.append(a, .{ .name = try std.fmt.allocPrint(a, "unrelated-{d}", .{i}), .table = "other-entities", .key_template = "other/{{_entity.text}}", .source_artifact = "other-kg", .resolution_artifact = "other-out", .aliases = declared });
+    for (0..10) |_| {
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        const configs = try manager.resolverQueryRoutingDescriptors(scratch.allocator(), selected.name, true);
+        try std.testing.expectEqual(@as(usize, 2), configs.len);
+        try std.testing.expectEqualStrings("selected", configs[0].name);
+        try std.testing.expectEqualStrings("sibling", configs[1].name);
+        try std.testing.expectEqualStrings("person/lovelace", configs[1].aliases[0].target);
+        const labels = try QuerySession.runtime.siblingClaimedLabelsAlloc(scratch.allocator(), configs, &configs[0]);
+        try std.testing.expectEqualStrings("person", labels[0]);
+        const expected = try QuerySession.declarations(a, manager.resolvers.items, selected);
+        try std.testing.expectEqualSlices(u8, &expected, &try QuerySession.declarations(a, configs, selected));
+        try std.testing.expectEqualSlices(u8, &expected, &try manager.resolverQueryDeclarationsFingerprint(selected));
+        try std.testing.expect(scratch.queryCapacity() < 16 * 1024);
+    }
+    try std.testing.expectEqual(@as(usize, 1), manager.test_resolver_lookup_builds);
+    for ([_][]const u8{ "missing", "retired", "staged" }) |name| try std.testing.expectEqual(@as(usize, 0), (try manager.resolverQueryRoutingDescriptors(a, name, true)).len);
+    const private_configs = try manager.resolverQueryRoutingDescriptors(a, "staged", false);
+    try std.testing.expectEqual(@as(usize, 1), private_configs.len);
+    try std.testing.expectEqualStrings("staged", private_configs[0].name);
+    // Snapshots own the declarations they admitted; a later sibling edit must
+    // change the final proof without changing an already captured snapshot.
+    const snapshot = try manager.resolverQueryRoutingDescriptors(a, selected.name, true);
+    const before = try QuerySession.declarations(a, snapshot, selected);
+    manager.resolvers.items[1].min_confidence = 0.8;
+    manager.invalidateWritePlanSnapshot();
+    try std.testing.expect(!std.mem.eql(u8, &before, &try manager.resolverQueryDeclarationsFingerprint(selected)));
+    try std.testing.expect(snapshot[1].min_confidence == null);
+    std.debug.print("INITIAL ROUTING ADMISSION unrelated_aliases=999000 returned=2 warm_requests=10 arena_bytes_per_request<16384 lookup_builds=1\n", .{});
 }
