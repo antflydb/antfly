@@ -61,9 +61,11 @@
   "patch_sha256": "9b01c29c9e74136fe94443b0099e3c0ca0ea9f713151ccce250ed70e9155f313",
   "native_artifacts_unchanged": true,
   "live_control_changed": false,
-  "replacement_approved": false,
+  "replacement_approved": true,
   "native_sha256": {
     "antfly-serverless.wasm": "563936db3958bdab50c404db4a6ccef15e095e798e49198ab2304d87322dac97",
     "antfly-serverless-compact.wasm": "789469d743cf69bb9cdcc3e3c59caa4f05663fe4e73958908800d780b1d85f77"
-  }
+  },
+  "approval": "User: use the corrected control",
+  "combined_original_control_patch_sha256": "f65f5a8deaa1bba82076bbd39a8cd6d9fd99764d36e31856800e5b41ed3569b6"
 }
