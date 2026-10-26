@@ -254,6 +254,7 @@ fn hash(a: A, value: []const u8) ![]const u8 {
     @import("antfly_hash").Sha256.hash(value, &digest, .{});
     return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
+pub var test_query_base_loads: std.atomic.Value(usize) = .init(0);
 pub var test_proposal_key_scans: std.atomic.Value(usize) = .init(0);
 pub var test_head_enumerations: std.atomic.Value(usize) = .init(0);
 pub const Store = struct {
@@ -596,6 +597,7 @@ pub const Store = struct {
         pin_discovery: bool = true,
         profile_id: []const u8 = "",
         routing_id: [32]u8 = @splat(0),
+        graph_id: [32]u8 = @splat(0),
         stamp: Stamp,
         template: []const u8,
         distinct: bool,
@@ -615,7 +617,7 @@ pub const Store = struct {
         const graph_state = try self.queryGraph(h);
         const static_estimate = profile.estimated_bytes *| 4;
         const indexed = (composed and std.mem.allEqual(u8, &h.fingerprint, 0)) or static_estimate > query_context.Cache.max_bytes or (composed and graph_state.bytes *| 128 > query_context.Cache.max_bytes / 2);
-        var result: PreparedQuery = .{ .lease = null, .indexed = indexed, .pin_discovery = composed, .profile_id = profile.id, .routing_id = try self.routingFingerprint(h), .stamp = .{ .revision = h.revision, .fingerprint = h.fingerprint }, .template = template, .distinct = distinct };
+        var result: PreparedQuery = .{ .lease = null, .indexed = indexed, .pin_discovery = composed, .profile_id = profile.id, .routing_id = try self.routingFingerprint(h), .graph_id = graph_state.fingerprint, .stamp = .{ .revision = h.revision, .fingerprint = h.fingerprint }, .template = template, .distinct = distinct };
         if (indexed and profile.lookup != null and profile.lookup.?.seek_node != null) {
             result.lookup = profile.lookup;
             return result;
@@ -624,13 +626,23 @@ pub const Store = struct {
             profile: QueryProfile,
             fn load(ptr: *anyopaque, a: A) !query_context.Graph {
                 const loader: *@This() = @ptrCast(@alignCast(ptr));
+                if (comptime @import("builtin").is_test) _ = test_query_base_loads.fetchAdd(1, .monotonic);
                 return .{ .aliases = try loader.profile.load(loader.profile.ptr, a), .shared_profile = true };
             }
         };
         var base_loader: BaseLoader = .{ .profile = profile };
         var key: [32]u8 = undefined;
         @import("antfly_hash").Sha256.hash(try encode(self.a, .{ template, profile.id, @as(?[32]u8, null) }), &key, .{});
-        const base = try query_context.acquire(key, true, .{ .ptr = &base_loader, .load = BaseLoader.load });
+        const base = (try query_context.tryAcquire(key, true, .{ .ptr = &base_loader, .load = BaseLoader.load, .estimated_bytes = static_estimate +| 4096 })) orelse legacy: {
+            if (profile.lookup != null and profile.lookup.?.seek_node != null) {
+                result.indexed = true;
+                result.lookup = profile.lookup;
+                return result;
+            }
+            // Legacy inline profiles lack a persistent node projection. They
+            // still need their immutable static index to answer exactly.
+            break :legacy try query_context.acquire(key, true, .{ .ptr = &base_loader, .load = BaseLoader.load });
+        };
         errdefer base.release();
         result.lease = base;
         if (!composed or indexed) return result;
@@ -747,14 +759,20 @@ pub const Store = struct {
         lookup: AliasLookup,
         static_only: bool,
         memo: std.StringHashMapUnmanaged([]const u8) = .empty,
+        memo_allocator: ?A = null,
+        frame: ?*std.heap.FixedBufferAllocator = null,
+        fn remember(self: *@This(), id: []const u8, root: []const u8) !void {
+            const a = self.memo_allocator orelse self.store.a;
+            try self.memo.put(a, if (self.memo_allocator != null) try a.dupe(u8, id) else id, if (self.memo_allocator != null) try a.dupe(u8, root) else root);
+        }
         fn canonical(self: *@This(), seed: []const u8) ![]const u8 {
             if (self.memo.get(seed)) |known| return known;
             const a = self.store.a;
             if (self.static_only) {
                 const node = try self.lookup.node.?(self.lookup.ptr, a, seed);
                 const root = if (node) |value| value.canonical else seed;
-                try self.memo.put(a, seed, root);
-                return root;
+                try self.remember(seed, root);
+                return self.memo.get(seed).?;
             }
             var path: std.ArrayList([]const u8) = .empty;
             var visiting: std.StringHashMapUnmanaged(void) = .empty;
@@ -781,32 +799,36 @@ pub const Store = struct {
             };
             // Discovery paths are not result paths: unrelated pin endpoints
             // must never consume the query's returned-forward-path allowance.
-            for (path.items) |node| try self.memo.put(a, node, terminal);
-            return terminal;
+            for (path.items) |node| try self.remember(node, terminal);
+            return self.memo.get(seed).?;
         }
     };
-    fn queryPinNodes(self: Store, template: []const u8, component_scope: ?[]const u8, canonical: *QueryCanonical, roots: std.StringHashMapUnmanaged(void), starts: *std.StringHashMapUnmanaged(void)) !void {
+    fn queryPinNodes(self: Store, template: []const u8, component_scope: ?[]const u8, canonical: *QueryCanonical, roots: std.StringHashMapUnmanaged(void), starts: *std.StringHashMapUnmanaged(void), membership: ?*RoutingBuild) !void {
         const prefix = try self.keyPath(try std.fmt.allocPrint(self.a, "pin-count/{s}/", .{try hash(self.a, template)}));
-        var node = (try canonical.lookup.seek_node.?(canonical.lookup.ptr, self.a, &@as([64]u8, @splat('0')), component_scope)) orelse return;
+        var digest: [64]u8 = @splat('0');
         while (true) {
-            const before = try std.mem.concat(self.a, u8, &.{ prefix, &node.digest });
+            // Projection builds retain only owned memo/membership entries.
+            // Cursor and path scratch are reused for every posting.
+            if (canonical.frame) |frame| frame.reset();
+            const a = canonical.store.a;
+            const node = (try canonical.lookup.seek_node.?(canonical.lookup.ptr, a, &digest, component_scope)) orelse return;
+            const before = try std.mem.concat(a, u8, &.{ prefix, &node.digest });
             before[before.len - 1] -= 1;
-            const page = try self.backend.scan(self.backend.ptr, self.a, prefix, before, 1);
+            const page = try self.backend.scan(self.backend.ptr, a, prefix, before, 1);
             if (page.rows.len == 0) return;
             const row = page.rows[0];
             if (!std.mem.startsWith(u8, row.key, prefix) or row.key.len != prefix.len + 64) return error.InvalidCatalogRecord;
-            const digest = row.key[prefix.len..];
-            if (!std.mem.eql(u8, digest, &node.digest)) {
-                node = (try canonical.lookup.seek_node.?(canonical.lookup.ptr, self.a, digest, component_scope)) orelse return;
+            const posting_digest = row.key[prefix.len..];
+            if (!std.mem.eql(u8, posting_digest, &node.digest)) {
+                @memcpy(&digest, posting_digest);
                 continue;
             }
-            const posting = try parse(PinCount, self.a, row.value);
+            const posting = try parse(PinCount, a, row.value);
             if (posting.count == 0 or !std.mem.eql(u8, posting.key, node.key)) return error.InvalidCatalogRecord;
             const root = if (canonical.static_only) node.canonical else try canonical.canonical(node.key);
-            if (roots.contains(root)) try starts.put(self.a, node.key, {});
-            var next = node.digest;
-            next[next.len - 1] += 1;
-            node = (try canonical.lookup.seek_node.?(canonical.lookup.ptr, self.a, &next, component_scope)) orelse return;
+            if (membership) |builder| try builder.add(root, node.key) else if (roots.contains(root)) try starts.put(self.a, node.key, {});
+            digest = node.digest;
+            digest[digest.len - 1] += 1;
         }
     }
     const RoutingBuild = struct {
@@ -818,7 +840,7 @@ pub const Store = struct {
             if ((try self.seen.getOrPut(self.a, try encode(self.a, .{ root, component_scope }))).found_existing) return;
             self.bytes +|= @sizeOf(query_context.Route) +| root.len +| component_scope.len;
             if (self.bytes > 1024 * 1024) return error.OutOfMemory;
-            try self.routes.append(self.a, .{ .root = root, .component = component_scope });
+            try self.routes.append(self.a, .{ .root = try self.a.dupe(u8, root), .component = try self.a.dupe(u8, component_scope) });
         }
     };
     fn queryOverrideScopes(self: Store, template: []const u8, kind: Kind, canonical: *QueryCanonical, roots: std.StringHashMapUnmanaged(void), scopes: *std.StringHashMapUnmanaged(void), routing: ?*RoutingBuild) !void {
@@ -845,6 +867,49 @@ pub const Store = struct {
             node = (try canonical.lookup.seek_node.?(canonical.lookup.ptr, self.a, &next, null)) orelse return;
         }
     }
+    fn freezeRoutes(a: A, builder: RoutingBuild) !query_context.Graph {
+        const items = try a.alloc(query_context.Route, builder.routes.items.len);
+        for (items, builder.routes.items) |*route, value| route.* = .{ .root = try a.dupe(u8, value.root), .component = try a.dupe(u8, value.component) };
+        std.mem.sort(query_context.Route, items, {}, struct {
+            fn less(_: void, left: query_context.Route, right: query_context.Route) bool {
+                const order = std.mem.order(u8, left.root, right.root);
+                return if (order == .eq) std.mem.lessThan(u8, left.component, right.component) else order == .lt;
+            }
+        }.less);
+        return .{ .routes = items };
+    }
+    fn queryPinMembership(self: Store, prepared: PreparedQuery, lookup: AliasLookup, scope: []const u8) !?query_context.Lease {
+        if (prepared.profile_id.len == 0 or std.mem.allEqual(u8, &prepared.stamp.fingerprint, 0)) return null;
+        var key: [32]u8 = undefined;
+        @import("antfly_hash").Sha256.hash(try encode(self.a, .{ "pin-membership-v1", prepared.template, prepared.profile_id, prepared.graph_id, scope }), &key, .{});
+        const Loader = struct {
+            store: Store,
+            template: []const u8,
+            lookup: AliasLookup,
+            scope: []const u8,
+            fn load(ptr: *anyopaque, a: A) !query_context.Graph {
+                const loader: *@This() = @ptrCast(@alignCast(ptr));
+                const scratch = try query_context.RoutingScratch.init();
+                defer scratch.deinit();
+                var bounded: std.heap.FixedBufferAllocator = .init(scratch.bytes[0 .. 6 * 1024 * 1024]);
+                var frame: std.heap.FixedBufferAllocator = .init(scratch.bytes[6 * 1024 * 1024 ..]);
+                var store = loader.store;
+                store.a = bounded.allocator();
+                var temporary = store;
+                temporary.a = frame.allocator();
+                var canonical: QueryCanonical = .{ .store = temporary, .template = loader.template, .lookup = loader.lookup, .static_only = false, .memo_allocator = store.a, .frame = &frame };
+                var builder: RoutingBuild = .{ .a = store.a };
+                var ignored: std.StringHashMapUnmanaged(void) = .empty;
+                try store.queryPinNodes(loader.template, loader.scope, &canonical, .empty, &ignored, &builder);
+                return freezeRoutes(a, builder);
+            }
+        };
+        var loader: Loader = .{ .store = self, .template = prepared.template, .lookup = lookup, .scope = scope };
+        return query_context.tryRouting(key, .{ .ptr = &loader, .load = Loader.load }) catch |err| switch (err) {
+            error.OutOfMemory => null,
+            else => return err,
+        };
+    }
     fn queryRouting(self: Store, prepared: PreparedQuery, lookup: AliasLookup) !?query_context.Lease {
         if (prepared.profile_id.len == 0 or std.mem.allEqual(u8, &prepared.stamp.fingerprint, 0)) return null;
         var key: [32]u8 = undefined;
@@ -865,15 +930,7 @@ pub const Store = struct {
                 var ignored: std.StringHashMapUnmanaged(void) = .empty;
                 try store.queryOverrideScopes(loader.template, .redirect, &canonical, .empty, &ignored, &builder);
                 try store.queryOverrideScopes(loader.template, .removed_alias, &canonical, .empty, &ignored, &builder);
-                const route_items = try a.alloc(query_context.Route, builder.routes.items.len);
-                for (route_items, builder.routes.items) |*route, value| route.* = .{ .root = try a.dupe(u8, value.root), .component = try a.dupe(u8, value.component) };
-                std.mem.sort(query_context.Route, route_items, {}, struct {
-                    fn less(_: void, left: query_context.Route, right: query_context.Route) bool {
-                        const order = std.mem.order(u8, left.root, right.root);
-                        return if (order == .eq) std.mem.lessThan(u8, left.component, right.component) else order == .lt;
-                    }
-                }.less);
-                return .{ .routes = route_items };
+                return freezeRoutes(a, builder);
             }
         };
         var loader: Loader = .{ .store = self, .template = prepared.template, .lookup = lookup };
@@ -918,7 +975,13 @@ pub const Store = struct {
                 }
             }
             var scope_nodes = scopes.keyIterator();
-            while (scope_nodes.next()) |scope| try self.queryPinNodes(template, scope.*, &canonical, roots, &starts);
+            while (scope_nodes.next()) |scope| {
+                if (try self.queryPinMembership(prepared, lookup, scope.*)) |membership| {
+                    defer membership.release();
+                    var iterator = roots.keyIterator();
+                    while (iterator.next()) |root| for (membership.context.routesFor(root.*)) |member| try starts.put(self.a, try self.a.dupe(u8, member.component), {});
+                } else try self.queryPinNodes(template, scope.*, &canonical, roots, &starts, null);
+            }
             const selected = try self.a.alloc([]const u8, starts.count());
             var iterator = starts.keyIterator();
             for (selected) |*id| id.* = iterator.next().?.*;
@@ -3171,5 +3234,98 @@ test "native resolver authority root directed fallback and reusable routing fenc
         defer stale.release();
         try std.testing.expectEqualSlices(u8, &stale.stamp.fingerprint, &stale.routing_id);
         try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(stale, &.{"entity/moved-root"}, &.{}, true)).namespace.state.distinct.len);
+    }
+}
+
+test "native resolver authority indexed admission avoids profile loads under leased base pressure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Pressure = struct {
+        fn load(_: *anyopaque, alloc: A) !query_context.Graph {
+            const bytes = try alloc.alloc(u8, 28 * 1024 * 1024);
+            @memset(bytes, 'x');
+            return .{ .shared_profile = true, .routes = try alloc.dupe(query_context.Route, &.{.{ .root = bytes, .component = "pressure" }}) };
+        }
+        fn noLoad(ptr: *anyopaque, _: A) ![]const resolver.KeyAlias {
+            const calls: *usize = @ptrCast(@alignCast(ptr));
+            calls.* += 1;
+            return error.OutOfMemory;
+        }
+    };
+    var calls: usize = 0;
+    const pressure = try query_context.acquire(@splat(210), true, .{ .ptr = &calls, .load = Pressure.load });
+    defer pressure.release();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "base-admission/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1, .state = .{ .distinct = &.{.{ .from = "entity/pin", .to = "entity/other" }} } });
+    var reader: static_profiles.QueryReader = .{ .backend = store.backend, .root = "unused-projection/", .profile = "unloaded", .indexed = true };
+    for (0..3) |_| {
+        const prepared = (try store.prepareQuery(template, .{ .id = "admission-unloaded", .ptr = &calls, .load = Pressure.noLoad, .estimated_bytes = 8 * 1024 * 1024, .lookup = reader.lookup() }, true)).?;
+        defer prepared.release();
+        try std.testing.expect(prepared.indexed and prepared.lease == null);
+        try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(prepared, &.{"entity/pin"}, &.{}, true)).namespace.state.distinct.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), calls);
+    std.debug.print("BASE ADMISSION pages=3 profile_loads=0 leased_bytes={d}\n", .{pressure.context.arena.queryCapacity()});
+}
+
+test "native resolver authority effective root pin membership skips dense split components and fences edits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]usize{ 100, 1000 }) |count| {
+        var memory: TestMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = try std.fmt.allocPrint(a, "dense-split-{d}/", .{count}), .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+        const template = "entity/{{_key}}";
+        const aliases = try a.alloc(resolver.KeyAlias, count);
+        const pairs = try a.alloc(c.Pair, count);
+        for (aliases, pairs, 0..) |*alias, *pair, i| {
+            alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/pin-branch-{d}", .{i}), .target = "entity/static-root" };
+            pair.* = .{ .from = alias.key, .to = try std.fmt.allocPrint(a, "entity/other-{d}", .{i}) };
+        }
+        var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{.{ .key = aliases[0].key, .target = "entity/moved-root" }}, .state = .{ .distinct = pairs } };
+        try store.adoptNamespace(namespace);
+        var inline_profile: Store.InlineQueryProfile = .{ .aliases = aliases };
+        const profile: Store.QueryProfile = .{ .id = try (static_profiles.Definition{ .key_template = template, .aliases = aliases }).identity(a), .ptr = &inline_profile, .load = Store.InlineQueryProfile.load, .estimated_bytes = std.math.maxInt(usize) };
+        const prepared = (try store.prepareQuery(template, profile, true)).?;
+        defer prepared.release();
+        _ = try store.queryPrepared(prepared, &.{"entity/moved-root"}, &.{}, true);
+        memory.reads = 0;
+        memory.scans = 0;
+        const warm = try store.queryPrepared(prepared, &.{"entity/moved-root"}, &.{}, true);
+        try std.testing.expectEqual(@as(usize, 1), warm.namespace.state.distinct.len);
+        try std.testing.expect(memory.reads < 64 and memory.scans < 16);
+        std.debug.print("DENSE PIN MEMBERSHIP pins={d} gets={d} seeks={d} pairs=1\n", .{ count, memory.reads, memory.scans });
+        var next = namespace;
+        next.revision += 1;
+        next.state.suppress.texts = &.{"unrelated text"};
+        try store.apply(try difference(a, namespace, next));
+        namespace = next;
+        const text_edit = (try store.prepareQuery(template, profile, true)).?;
+        defer text_edit.release();
+        try std.testing.expectEqualSlices(u8, &prepared.graph_id, &text_edit.graph_id);
+        memory.reads = 0;
+        _ = try store.queryPrepared(text_edit, &.{"entity/moved-root"}, &.{}, true);
+        try std.testing.expect(memory.reads < 64);
+        next = namespace;
+        next.revision += 1;
+        next.state.distinct = pairs[1..];
+        try store.apply(try difference(a, namespace, next));
+        namespace = next;
+        const removed = (try store.prepareQuery(template, profile, true)).?;
+        defer removed.release();
+        try std.testing.expect(!std.mem.eql(u8, &prepared.graph_id, &removed.graph_id));
+        try std.testing.expectEqualSlices(u8, &prepared.routing_id, &removed.routing_id);
+        try std.testing.expectEqual(@as(usize, 0), (try store.queryPrepared(removed, &.{"entity/moved-root"}, &.{}, true)).namespace.state.distinct.len);
+        next = namespace;
+        next.revision += 1;
+        next.merges = &.{.{ .key = aliases[1].key, .target = "entity/moved-root" }};
+        try store.apply(try difference(a, namespace, next));
+        const redirected = (try store.prepareQuery(template, profile, true)).?;
+        defer redirected.release();
+        try std.testing.expectEqual(@as(usize, 1), (try store.queryPrepared(redirected, &.{"entity/moved-root"}, &.{}, true)).namespace.state.distinct.len);
+        try std.testing.expectError(error.ResolverCurationConflict, store.queryPrepared(prepared, &.{"entity/moved-root"}, &.{}, true));
     }
 }

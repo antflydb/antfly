@@ -2447,11 +2447,15 @@ pins and the affected static predecessor frontier. Unchanged components resolve
 through the base; no profile-sized map is copied for a new graph generation.
 
 The shared cache has 48 MiB for profile bases and graph overlays plus 16 MiB
-for component routing, including charged entry overhead, with
+for component routing and effective-root pin membership, including charged entry
+overhead, with
 byte-budgeted access-based eviction rather than a fixed entry count. Sixty-four
 yielding build-lock stripes coalesce identical cold misses; directory locks cover
 only lookup/publication and eviction reclamation runs outside them. Conservative
-compilation reservations account for concurrent builds before graph I/O. Admission
+compilation reservations account for concurrent builds before profile or graph I/O.
+A base miss reserves its conservative static estimate before invoking the loader.
+When that reservation is denied, an available persistent node adapter serves the
+query without decoding or indexing the profile. Admission
 reclaims idle LRU entries before denying a reservation. Retention and live payload
 charges are separate: evicted contexts remain charged until their final lease
 releases them, and their accounting object survives cache teardown. Payload
@@ -2489,7 +2493,15 @@ missing records use full lineage. Routing compilation reserves 12 MiB, uses
 8 MiB bounded scratch, and caps raw frozen route data at 1 MiB. Admission or
 scratch exhaustion selects the exact indexed join instead of partial routing.
 Ordered seeks intersect only those component nodes with propagated native
-pin counts; native pin-child postings then discover incident distinct pairs.
+pin counts. A separate bounded per-static-component projection groups pin-bearing
+nodes by their effective roots. Its key includes the profile and qualified graph
+fingerprint (redirects, removals and pins); the direction-only routing signature
+is insufficient for membership. Warm pages read only their roots' membership,
+then use native pin-child postings to discover incident distinct pairs. Projection
+builds reuse a 2 MiB cursor/path frame and retain owned canonical memo/membership
+entries in the remaining 6 MiB of scratch; frozen data uses the same 1 MiB cap.
+Text/provenance edits preserve membership; pin or direction changes invalidate
+it. Unavailable capacity uses the exact ordered join, never partial membership.
 Unpinned reverse alias branches never become query seeds. Effective forward
 qualification preserves native override/removal precedence and handles edges
 crossing static components. Only requested and incident forward paths consume the
@@ -2499,13 +2511,22 @@ Regression qualification retains 5,000 aliases across ten graph versions with
 one profile load and 60,584 bytes of combined overlay arenas (the earlier full
 context builds used 78,581,860 bytes). A root with its own pin and no incoming
 identity takes 31 reads and four seeks at both 100 and 1,000 unrelated edits.
-Warm routing takes 12 reads and six/seven seeks respectively. Redirect changes
+Warm routing takes 12 reads and two seeks at both sizes. Redirect changes
 invalidate routing immediately, pin-only changes reuse it, and stale optional
 stamps fall back to the complete head. Two hundred randomized valid forests
 with 800 compiled/indexed comparisons return identical pin facts.
 
+A dense static component split by a native redirect returns one pair with 42
+reads and six seeks at 100, 1,000 and 10,000 pins (the 10k probe uses an
+ordered in-memory adapter); the previous warm path used
+243/2,043 reads and 107/1,007 seeks. Three pages under 44,040,230 bytes of leased
+base pressure load a new 5,000-alias profile zero times instead of three times.
+
 Both adapters share this operation. Routed queries use persistent profile-node
-postings; embedded phases use their immutable in-memory node index. Older
+postings. Lite phases capture their active immutable profile-node directory in
+a physical read snapshot, retain it only through the phase, and independently
+recheck native heads on every page plus source/schema fences before returning.
+Older
 profiles without the new optional projection use the same in-memory index until
 enrollment publishes it. Alias loading verifies the canonical stored definition
 hash while skipping unrelated policy fields. A released namespace without a

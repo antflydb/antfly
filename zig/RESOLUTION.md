@@ -2362,10 +2362,12 @@ reads follow only requested/incident paths; unrelated pinned aliases do not
 trigger forward qualification. An immutable static profile base is loaded once; graph overlays retain its maps
 and node postings and compile only native records plus affected static
 predecessors. Cold overlays read native graph pages outside writer ownership.
-The shared cache assigns 48 MiB to bases/overlays and 16 MiB to routing
+The shared cache assigns 48 MiB to bases/overlays and 16 MiB to routing/pin membership
 with access-based byte-budgeted eviction and reference-counted leases across
 pages. Identical concurrent misses share a build; conservative build reservations
-prevent graph compilation under cache pressure. Idle LRU entries are reclaimed
+prevent profile and graph compilation under cache pressure. Base admission
+precedes profile loading; denied modern profiles use persisted node postings
+without materializing a static index. Idle LRU entries are reclaimed
 before denying admission; active payloads remain charged through their last
 lease even after retention eviction. Dependencies keep bases discoverable and
 charge shared payload once; reclaiming idle overlays releases their bases.
@@ -2382,7 +2384,11 @@ intersection across pages and pin edits. Its SHA-256 key includes profile identi
 and a redirect/removal signature; the optional head-qualified `query-routing`
 stamp falls back to full lineage after legacy writes or restore. Compilation
 reserves 12 MiB, bounds scratch at 8 MiB and raw route data at 1 MiB; budget or
-scratch exhaustion retains the exact indexed join. Only matched pin-bearing
+scratch exhaustion retains the exact indexed join. A per-component pin-membership
+projection groups pinned nodes by effective root and uses the qualified graph
+fingerprint, including pin edits. It shares the bounded routing lane and keeps
+only owned memo/membership data across reusable 2 MiB cursor/path frames. Warm
+split-component pages avoid requalifying other roots' pinned nodes. Only matched pin-bearing
 nodes need effective forward qualification and native pin-child traversal;
 unpinned reverse alias branches are never visited. Returned facts and forward
 path limits match the compiled query path. Embedded and routed adapters share
@@ -2399,8 +2405,10 @@ its alias universe. Each page revalidates enrollment, logical target and native
 head; full declarations load only on cache misses. The source query fence still
 revalidates schema, binding, incarnation and authorization before returning.
 Protocol 54 qualifies references against the existing v10 directory; missing
-readiness retains inline compatibility. Embedded phases reuse one prepared
-lease. Text-only pages skip identity preparation, aliases and distinct discovery.
+readiness retains inline compatibility. Lite phases retain a physical snapshot of the active immutable node projection
+and reuse one prepared lease; each native page and the final source/schema fence
+still revalidate independently. Legacy profiles keep inline compatibility until
+enrollment publishes the node index. Text-only pages skip identity preparation, aliases and distinct discovery.
 
 Metadata stores ordinary destination query fingerprints atomically with table
 DDL, independently of native curation admission. Initial query admission and

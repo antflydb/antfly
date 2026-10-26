@@ -990,6 +990,27 @@ pub const QuerySession = struct {
         };
         var current = cfg.*;
         if (captured.stamp) |expected| {
+            const LiteTxn = @import("../storage/lite/docstore.zig").Txn;
+            var profile_txn: ?LiteTxn = null;
+            defer if (profile_txn) |*txn| txn.abort();
+            var directory: native.static_profiles.ReadTransaction(LiteTxn) = undefined;
+            var indexed_profile: native.static_profiles.QueryReader = undefined;
+            var profile_lookup: ?native.AliasLookup = null;
+            if (cfg.aliases.len != 0 and seeds.count() != 0) {
+                const physical = if (self.root.owned_lite_backend) |*backend| backend.native_docstore else null;
+                if (physical) |file| {
+                    profile_txn = try file.beginRead();
+                    directory = .{ .txn = &profile_txn.? };
+                    const profile_id = self.profiles.get(cfg.name) orelse return error.Busy;
+                    const profile_root = try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, cfg.table, cfg.key_template);
+                    if (try native.static_profiles.queryReferenceActive(a, &profile_txn.?, profile_root, profile_id, cfg.key_template) and try native.static_profiles.queryNodesReady(a, &profile_txn.?, profile_root, profile_id)) {
+                        indexed_profile = .{ .backend = directory.backend(), .root = profile_root, .profile = profile_id, .indexed = true };
+                        profile_lookup = indexed_profile.lookup();
+                    }
+                }
+            }
+            // The immutable profile snapshot lives for this entire phase.
+            // Native heads are independently rechecked at every query page.
             var prepared: ?native.Store.PreparedQuery = null;
             defer if (prepared) |query| query.release();
             if (cfg.aliases.len != 0 and seeds.count() != 0) {
@@ -997,7 +1018,7 @@ pub const QuerySession = struct {
                 defer txn.abort();
                 var bridge: Bridge = .{ .txn = &txn };
                 var inline_profile: native.Store.InlineQueryProfile = .{ .aliases = cfg.aliases };
-                prepared = (try bridge.store(a, prefix).prepareQuery(cfg.key_template, .{ .id = self.profiles.get(cfg.name) orelse return error.Busy, .ptr = &inline_profile, .load = native.Store.InlineQueryProfile.load, .estimated_bytes = inline_profile.estimate() }, candidates != null)) orelse return error.Busy;
+                prepared = (try bridge.store(a, prefix).prepareQuery(cfg.key_template, .{ .id = self.profiles.get(cfg.name) orelse return error.Busy, .ptr = &inline_profile, .load = native.Store.InlineQueryProfile.load, .estimated_bytes = inline_profile.estimate(), .lookup = profile_lookup }, candidates != null)) orelse return error.Busy;
                 if (prepared.?.stamp.revision != expected.revision or !std.mem.eql(u8, &prepared.?.stamp.fingerprint, &expected.fingerprint)) return error.Busy;
             }
             var joined: native.QueryPolicyUnion = .{};
@@ -1468,4 +1489,47 @@ test "capi resolver curation owner maintenance backfills historical ownership in
     try std.testing.expect(try owns(db, a, "legacy/2{{_key}}"));
     try std.testing.expect(!try owns(db, a, "unrelated/{{_key}}"));
     std.debug.print("OWNERSHIP LITE historical_keys=300 turns={d} reopen=indexed\n", .{turns});
+}
+
+test "capi resolver curation query uses persisted profile nodes under leased cache pressure" {
+    const resolver = @import("antfly_resolver");
+    const api = @import("db.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-query-admission");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    const root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    try tables.create(root, "entities", "{}", false);
+    const profile_aliases = try a.alloc(resolver.KeyAlias, 5000);
+    for (profile_aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "concept/query-admission-{d}", .{i}), .target = "concept/query-root" };
+    const cfg: h.db_mod.ResolverConfig = .{ .name = "query-admission", .table = "entities", .source_artifact = "kg", .resolution_artifact = "out", .key_template = "concept/{{_key}}", .aliases = profile_aliases, .promote = false };
+    _ = try root.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/native"), .fromSlice("{\"into\":\"concept/native-root\"}"), &out));
+    const Pressure = struct {
+        fn load(_: *anyopaque, alloc: A) !native.query_context.Graph {
+            const bytes = try alloc.alloc(u8, 28 * 1024 * 1024);
+            @memset(bytes, 'x');
+            return .{ .shared_profile = true, .routes = try alloc.dupe(native.query_context.Route, &.{.{ .root = bytes, .component = "pressure" }}) };
+        }
+    };
+    var unused: u8 = 0;
+    const pressure = try native.query_context.acquire(@splat(210), true, .{ .ptr = &unused, .load = Pressure.load });
+    defer pressure.release();
+    const installed = try root.db.core.index_manager.listPublicResolverRoutingDescriptors(a);
+    const query_cfg = installed[0];
+    var session = try QuerySession.init(a, root, query_cfg, installed);
+    var target = try resolver.Resolver.initFromParts(a, cfg.table, cfg.key_template, .{}, false, "");
+    defer target.deinit();
+    const mentions: []const resolver.ExtractedEntity = &.{.{ .local_id = "query-admission-0", .label = "concept", .text = "query-admission-0" }};
+    const builds = native.test_query_base_loads.load(.monotonic);
+    try QuerySession.prepare(&session, &query_cfg, a, &target, mentions, null);
+    try std.testing.expectEqual(builds, native.test_query_base_loads.load(.monotonic));
+    try std.testing.expectEqualStrings("concept/query-root", target.alias_index.?.canonical(profile_aliases[0].key));
+    try session.verify(root);
 }
