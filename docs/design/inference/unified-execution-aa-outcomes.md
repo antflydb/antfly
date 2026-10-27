@@ -206,3 +206,18 @@ queue uses its own worktree, caches, immutable source/helper pins and private
 cuDNN links; it waits behind the earlier X/OCR/Z controllers and other branch
 work. It stops only its own process group if contention resumes. Static native
 qualification and transferred SM89 evidence do not stand in for this run.
+
+## Committed snapshot and cleanup
+
+Implementation commit: `9e97b7ef72c17bebd60b29751dea8deb8b40b5dc`.
+Glowworm's isolated import is `b55d25644234e07115d00b3bc316e3100c16dd83`:
+8,014 verified source files, 40 pinned helper/runtime inputs, source manifest
+`ca3005a634c7c4f88e0034383ef52a2f6413f98f56c1b655cad91f6be8129c74`.
+The controller was verified alive and waiting on earlier work after sync.
+CUDA device timing is pending; no other branch job was stopped.
+
+The task-owned CPU baseline worktree was audited to contain only the exact
+known test overlay, its patch and binaries were retained, and the worktree
+was removed. Task-scoped cache GC audited the active worktree's 5.3 GiB cache
+and 0.1 GiB output directory; policy kept them within budget. No other worktree
+or user cache was considered. No branch was pushed.
