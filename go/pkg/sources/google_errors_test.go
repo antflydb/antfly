@@ -296,3 +296,22 @@ func TestDriveRefreshFailureBeforeDownloadRetainsCooldown(t *testing.T) {
 		})
 	}
 }
+
+func TestGoogleJWTRefreshResponseUsesBoundedCodeOnly(t *testing.T) {
+	for _, tc := range []struct {
+		body  string
+		retry bool
+	}{
+		{`{"error":"temporarily_unavailable","error_description":"provider-secret"}`, true},
+		{`{"error":"invalid_grant","error_description":"provider-secret"}`, false},
+		{`{"error":"provider-secret"}`, false},
+		{`{"error":"temporarily_unavailable","error_description":"` + strings.Repeat("x", maxGoogleErrorBytes) + `"}`, false},
+	} {
+		raw := &oauth2.RetrieveError{Response: &http.Response{StatusCode: 400}, Body: []byte(tc.body)}
+		err := googleRequestError(raw)
+		var api *GoogleHTTPError
+		require.ErrorAs(t, err, &api)
+		require.Equal(t, tc.retry, api.Retryable())
+		require.NotContains(t, err.Error(), "provider-secret")
+	}
+}

@@ -63,9 +63,20 @@ func googleRequestError(err error) error {
 		api.Status = token.Response.StatusCode
 		api.RetryAt = providerRetryAt(token.Response.Header.Get("Retry-After"), time.Now())
 	}
-	switch token.ErrorCode {
+	code := token.ErrorCode
+	// The JWT service-account transport supplies Body but does not populate
+	// RetrieveError.ErrorCode. Decode only the same bounded, safe code field.
+	if code == "" && len(token.Body) <= maxGoogleErrorBytes {
+		var body struct {
+			Code string `json:"error"`
+		}
+		if json.Unmarshal(token.Body, &body) == nil {
+			code = body.Code
+		}
+	}
+	switch code {
 	case "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope", "access_denied", "server_error", "temporarily_unavailable":
-		api.Reason = token.ErrorCode
+		api.Reason = code
 	}
 	return api
 }
