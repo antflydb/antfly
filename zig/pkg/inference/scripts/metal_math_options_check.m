@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#include "../src/backends/metal_math_options.h"
+#include "../src/backends/metal_compile_options.h"
 
 // This checks the framework's actual compatibility behavior without a GPU.
 // Keep the deprecated setter only in the independent reference.
@@ -15,7 +15,7 @@ int main(void) {
             legacy.fastMathEnabled = NO;
 #pragma clang diagnostic pop
             MTLCompileOptions *candidate = [MTLCompileOptions new];
-            termite_metal_disable_fast_math(candidate);
+            termite_metal_set_precise_math(candidate);
             if (legacy.mathMode != candidate.mathMode ||
                 legacy.mathFloatingPointFunctions != candidate.mathFloatingPointFunctions) {
                 fprintf(stderr, "Metal precise math options differ from the legacy contract\n");

@@ -1,6 +1,6 @@
 # Integrating the OCR kernel families
 
-Main through `a69c0b582e`, including LightOnOCR3 (PR #1250) and the later
+Main through `9ace47d363`, including LightOnOCR3 (PR #1250) and the later
 document-inference APIs, is integrated with the
 unified execution branch. The integration retains upstream's device/model
 rollout gates and specialized schedules. It does not promote unqualified
@@ -70,7 +70,7 @@ negative control confirms that the prior Safe-only policy fails that regression.
 
 Receipts are under `.benchmark-assets/1166/ocr-generic/`.
 
-The scoped consolidation removes **8,937 maintained production bytes**, counting
+At snapshot `a816834cb9`, the scoped consolidation removes **8,937 maintained production bytes**, counting
 the complete replacement owners, 829 added build-identity bytes and 902 bytes
 of precision-check build integration. The final count also charges 1,456 bytes
 for disabled-target admission and document-control portability reconciliation. CUDA module
@@ -151,3 +151,19 @@ WASM64, all three x86 portable profiles, generated-source freshness and all
 14 GiB scheduler reservation at 17,557,094,400 bytes, despite Zig returning
 success. The strict log guard rejected that run. A measured 20 GiB single-Metal
 compiler reservation passes the rerun; inference memory limits are unchanged.
+
+The later macOS SDK/precision merge (`9ace47d363`) supplies the same safe and
+precise Metal options. The duplicate local helper is removed; the native
+precision regression now checks the upstream owner. Both operation programs
+and native precision settings are retained. CUDA qualification uses an
+isolated source-pinned Glowworm worktree and waits behind existing workloads.
+
+The final SDK merge passes the upstream precision regression, the native
+precision hook, 54 Metal compiler checks, 154 runtime cases, generated-source
+freshness and the both-backend build. The cache regression now independently
+checks the complete 19-input Metal and 65-input CUDA qualification bundles
+and eight-input CUDA dispatch bundle. Its warm-cache mutation checks pass,
+including a precision-header edit that leaves the baseline program identity
+unchanged and invalidates the qualification identity. Expanded host/Metal
+tokens match the pre-merge snapshot after normalizing the equivalent precision
+helper spelling and literal diagnostic source-line tags.

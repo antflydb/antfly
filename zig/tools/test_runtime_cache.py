@@ -1703,6 +1703,11 @@ class RuntimeCacheTest(unittest.TestCase):
                 # Establish the owned input before warming the cache: replacing
                 # a symlink with a copy is itself an input change in Zig 0.17.
                 path = self.own(source)
+                metal_options = (
+                    self.own("zig/pkg/inference/src/backends/metal_compile_options.h")
+                    if backend == "metal"
+                    else None
+                )
                 first = self.build(
                     "cache-identity", "runtime-unit-cli", backend=backend
                 )
@@ -1729,17 +1734,92 @@ class RuntimeCacheTest(unittest.TestCase):
                 self.assertRegex(output, r"run exe jit-source-identity .* success")
                 # Check the preserved bundle domain, count, length, and order
                 # independently of the Zig hashing implementation.
-                qualifier = (
-                    ["src/backends/metal_runtime.zig"]
-                    if backend == "metal"
-                    else ["src/ops/cuda/kernels.zig"]
-                ) + ["src/graph/kernel_jit.zig", "src/graph/quant_kernel_compiler.zig"]
-                if backend == "cuda":
-                    qualifier.append("src/graph/quant_kernel_cuda_renderer.zig")
-                qualifier += [
+                qualifier = [
+                    "src/backends/metal_runtime.zig",
+                    "src/graph/quant_kernel_metal_renderer.zig",
+                    "src/graph/quant_kernel_metal_attention_phases.zig",
+                    "src/graph/quant_kernel_metal_param_abi.zig",
+                    "src/graph/templates/metal_paged_prefill_compat.metal",
+                    "src/backends/metal_compile_options.h",
+                    "src/graph/kernel_jit.zig",
+                    "src/graph/quant_kernel_compiler.zig",
                     "src/graph/quant_matmul.zig",
                     "src/gguf/quant_codec.zig",
                     "src/gguf/tensor_types.zig",
+                    "src/ops/kernel_descriptor.zig",
+                    "src/ops/kernel_geometry.zig",
+                    "src/ops/kernel_math.zig",
+                    "src/ops/kernel_reduction.zig",
+                    "src/backends/metal_param_abi.h",
+                    "src/backends/metal_buffer_observation.h",
+                    "src/backends/metal_mtp_head.h",
+                    "src/backends/metal_mtp_head_impl.h",
+                ] if backend == "metal" else [
+                    "src/ops/cuda/kernels.zig",
+                    "src/graph/kernel_jit.zig",
+                    "src/graph/quant_kernel_compiler.zig",
+                    "src/graph/quant_kernel_cuda_renderer.zig",
+                    "src/graph/quant_matmul.zig",
+                    "src/gguf/quant_codec.zig",
+                    "src/gguf/tensor_types.zig",
+                    "src/ops/kernel_descriptor.zig",
+                    "src/ops/kernel_geometry.zig",
+                    "src/ops/kernel_math.zig",
+                    "src/ops/kernel_reduction.zig",
+                    "src/ops/cuda/embedded_module.zig",
+                    "src/ops/cuda/gated_delta.zig",
+                    "src/ops/cuda/paged_attention_bf16.zig",
+                    "src/ops/cuda/bf16_fusions.zig",
+                    "src/ops/cuda/vision_fusions.zig",
+                    "src/ops/cuda/encoder_decoder_fusions.zig",
+                    "src/ops/cuda/lighton_recurrent.ptx",
+                    "src/ops/cuda/lighton_attention.ptx",
+                    "src/ops/cuda/lighton_activation.ptx",
+                    "src/ops/cuda/lighton_vision.ptx",
+                    "src/ops/cuda/florence_fused.ptx",
+                    "src/ops/cuda/prototypes/lighton_qwen35_recurrent.cu",
+                    "src/ops/cuda/prototypes/lighton_batched_attention.cu",
+                    "src/ops/cuda/prototypes/lighton_activation.cu",
+                    "src/ops/cuda/prototypes/lighton_vision.cu",
+                    "src/ops/cuda/prototypes/florence_fused.cu",
+                    "src/ops/cuda/launch_abi.zig",
+                    "src/ops/cuda/driver.zig",
+                    "src/graph/templates/cuda_q4_0_bf16_staged.cuh",
+                    "src/graph/templates/cuda_gqa_repeat_prefill_f16.cuh",
+                    "src/graph/templates/cuda_gqa_repeat_split_f16.cuh",
+                    "src/ops/cuda/kernels/kernel_abi.cuh",
+                    "src/ops/cuda/kernels/embedding_gemma2.cuh",
+                    "src/ops/cuda/kernels/embedding_gemma2_training_rope.cuh",
+                    "src/ops/cuda/kernels/embedding_gemma2_optimized.cuh",
+                    "src/ops/cuda/kernels/gliner25_boundary.cuh",
+                    "src/ops/cuda/kernels/gliner_boundary_m64.cuh",
+                    "src/ops/cuda/kernels/deberta_tc_tiles.cuh",
+                    "src/ops/cuda/kernels/q8_projection_tile4.cuh",
+                    "src/ops/cuda/kernels/projection_rows_cols_init.cuh",
+                    "src/ops/cuda/kernels/projection_rows_cols_tree.cuh",
+                    "src/ops/cuda/kernels/quant_projection_epilogue.cuh",
+                    "src/ops/cuda/kernels/q4_k_tiled_dot.cuh",
+                    "src/ops/cuda/kernels/dense_qkv_tiled.cuh",
+                    "src/ops/cuda/kernels/quant_tile4_publish.cuh",
+                    "src/ops/cuda/kernels/quant_k_tile4_partials.cuh",
+                    "src/ops/cuda/kernels/scalar_argmax_fold.cuh",
+                    "src/ops/cuda/kernels/q8_1_zero_sum_store.cuh",
+                    "src/ops/cuda/kernels/q4_a4b_q8_acquire.cuh",
+                    "src/ops/cuda/kernels/tq_mma_visible_range.cuh",
+                    "src/ops/cuda/kernels/tq_mma_stage_kv.cuh",
+                    "src/ops/cuda/kernels/tq_mma_prefill.cuh",
+                    "src/ops/cuda/kernels/tq_scalar_online.cuh",
+                    "src/ops/cuda/kernels/vision_bf16_attention_m32n16.cuh",
+                    "src/ops/cuda/kernels/q6_e4b_tile8_partials.cuh",
+                    "src/ops/cuda/kernels/quant_argmax_publish.cuh",
+                    "src/ops/cuda/kernels/block_local_attention.cuh",
+                    "src/ops/cuda/kernels/primitive_gather.cuh",
+                    "src/ops/cuda/kernels/primitive_scatter.cuh",
+                    "src/ops/cuda/kernels/dense_fast_attention_online.cuh",
+                    "src/ops/cuda/kernels/training_validation.cuh",
+                    "src/ops/cuda/kernels/gliner25_layer_norm.cuh",
+                    "src/ops/cuda/kernels/gliner25_softmax.cuh",
+                    "src/ops/cuda/kernels/gliner25_attention.cuh",
                 ]
                 self.assertEqual(after[1], self.bundle_digest(qualifier))
                 if backend == "cuda":
@@ -1748,6 +1828,10 @@ class RuntimeCacheTest(unittest.TestCase):
                         self.bundle_digest(
                             [
                                 "src/ops/cuda/cuda_compute.zig",
+                                "src/ops/cuda/launch_abi.zig",
+                                "src/ops/cuda/kernels/kernel_abi.cuh",
+                                "src/ops/kernel_descriptor.zig",
+                                "src/ops/kernel_geometry.zig",
                                 "src/graph/quant_kernel_compiler.zig",
                                 "src/graph/quant_matmul.zig",
                                 "src/gguf/tensor_types.zig",
@@ -1766,6 +1850,19 @@ class RuntimeCacheTest(unittest.TestCase):
                 )
                 self.assertNotEqual(self.probe(output, label).split()[1], after[1])
                 self.assert_compile(output, "cli", "cached")
+                if metal_options is not None:
+                    before_options = self.probe(output, label).split()
+                    metal_options.write_bytes(
+                        metal_options.read_bytes() + b"\n// precision policy edit\n"
+                    )
+                    output = self.build(
+                        "cache-identity", "runtime-unit-cli", backend=backend
+                    )
+                    after_options = self.probe(output, label).split()
+                    self.assertEqual(after_options[0], before_options[0])
+                    self.assertNotEqual(after_options[1], before_options[1])
+                    self.assertEqual(after_options[1], self.bundle_digest(qualifier))
+                    self.assert_compile(output, "cli", "cached")
 
     def bundle_digest(self, paths):
         digest = hashlib.sha256(b"antfly-runtime-jit-source-bundle/v1")
