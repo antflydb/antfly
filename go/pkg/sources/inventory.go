@@ -25,7 +25,17 @@ import (
 // ValidateInventory rechecks acquisition authority on cached or empty manifests.
 // A persisted manifest or staged payload never grants current provider access.
 func (c *GoogleConnector) ValidateInventory(ctx context.Context, r Request, s Inventory) error {
-	return c.ValidateCachedSnapshot(ctx, r, s)
+	if err := c.ValidateCachedSnapshot(ctx, r, s); err != nil {
+		return err
+	}
+	if c.ProviderName == ProviderGoogleDrive {
+		for _, item := range s.Objects {
+			if err := c.ValidateStagedSource(ctx, r, item); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 func (c *GitHubClient) CheckRepositoryAccess(ctx context.Context, token, repository string) error {
 	owner, repo, err := ParseRepository(repository)
