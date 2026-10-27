@@ -4003,8 +4003,8 @@ $L__BB3_19:
 	.param .u32 lighton_graph_advance_param_2
 )
 {
-	.reg .pred 	%p<6>;
-	.reg .b32 	%r<9>;
+	.reg .pred 	%p<8>;
+	.reg .b32 	%r<10>;
 	.reg .b64 	%rd<7>;
 
 
@@ -4014,29 +4014,32 @@ $L__BB3_19:
 	mov.u32 	%r3, %ctaid.x;
 	setp.ne.s32 	%p1, %r3, 0;
 	mov.u32 	%r4, %ntid.x;
-	setp.ne.s32 	%p2, %r4, 256;
+	setp.ne.s32 	%p2, %r4, 512;
 	or.pred  	%p3, %p2, %p1;
-	@%p3 bra 	$L__BB4_5;
+	add.s32 	%r5, %r2, -1;
+	setp.gt.u32 	%p4, %r5, 383;
+	or.pred  	%p5, %p3, %p4;
+	@%p5 bra 	$L__BB4_5;
 
 	mov.u32 	%r1, %tid.x;
-	setp.ge.u32 	%p4, %r1, %r2;
-	@%p4 bra 	$L__BB4_3;
+	setp.ge.u32 	%p6, %r1, %r2;
+	@%p6 bra 	$L__BB4_3;
 
 	cvta.to.global.u64 	%rd3, %rd1;
 	mul.wide.u32 	%rd4, %r1, 4;
 	add.s64 	%rd5, %rd3, %rd4;
-	ld.global.u32 	%r5, [%rd5];
-	add.s32 	%r6, %r5, 1;
-	st.global.u32 	[%rd5], %r6;
+	ld.global.u32 	%r6, [%rd5];
+	add.s32 	%r7, %r6, 1;
+	st.global.u32 	[%rd5], %r7;
 
 $L__BB4_3:
-	setp.ne.s32 	%p5, %r1, 0;
-	@%p5 bra 	$L__BB4_5;
+	setp.ne.s32 	%p7, %r1, 0;
+	@%p7 bra 	$L__BB4_5;
 
 	cvta.to.global.u64 	%rd6, %rd2;
-	ld.global.u32 	%r7, [%rd6];
-	add.s32 	%r8, %r7, 1;
-	st.global.u32 	[%rd6], %r8;
+	ld.global.u32 	%r8, [%rd6];
+	add.s32 	%r9, %r8, 1;
+	st.global.u32 	[%rd6], %r9;
 
 $L__BB4_5:
 	ret;

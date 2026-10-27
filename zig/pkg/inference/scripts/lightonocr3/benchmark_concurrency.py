@@ -629,6 +629,24 @@ def run(args, model, label, mode, concurrency, output):
                 prior_snapshots = re.findall(snapshot_pattern, pieces[0])
                 previous_snapshots = int(prior_snapshots[-1]) if prior_snapshots else 0
                 for sample, section in zip(result["policy_rounds"], sections):
+                    replay_rows = [
+                        int(v)
+                        for v in re.findall(
+                            r"LIGHTONOCR3 cuda_model_graph_first_replay_rows=(\d+)",
+                            section,
+                        )
+                    ]
+                    sample["model_graph_replay_cohort_rows"] = sorted(set(replay_rows))
+                    sample["model_graph_first_replay_events"] = len(replay_rows)
+                    sample["model_graph_max_replay_rows"] = max(replay_rows, default=0)
+                    if args.require_lighton_model_graph and not replay_rows:
+                        result["status"] = "missing_timed_model_graph_replay"
+                    if (
+                        args.require_lighton_model_graph
+                        and args.physical128
+                        and max(replay_rows, default=0) <= 64
+                    ):
+                        result["status"] = "missing_timed_wide_model_graph_replay"
                     sample["vision_batch_sizes"] = sorted(
                         {
                             int(v)
@@ -698,7 +716,11 @@ def run(args, model, label, mode, concurrency, output):
                         or sample["packed_max_query_rows"] > 4096
                     ):
                         result["status"] = "missing_timed_wide_packed_prefill"
-                    if args.require_physical128 and sample["packed_max_items"] <= 64:
+                    sample["physical_max_items"] = max(
+                        sample["packed_max_items"],
+                        sample["model_graph_max_replay_rows"],
+                    )
+                    if args.require_physical128 and sample["physical_max_items"] <= 64:
                         result["status"] = "missing_timed_physical128_steps"
                     sample["packed_input_frames"] = sum(
                         int(value)
@@ -1416,6 +1438,16 @@ def run(args, model, label, mode, concurrency, output):
                 int(groups) * ((int(prefill) + int(decode) + 63) // 64)
                 for (prefill, decode, _), (groups, _) in zip(claims, callbacks)
             )
+            # Graph replay skips host recording counters. Warm/learn/capture
+            # records carry their independently checked two-step packet count.
+            graph_recorded_packets = sum(
+                int(v)
+                for v in re.findall(
+                    r"LIGHTONOCR3 cuda_model_graph_recorded_ragged_packets=(\d+)", text
+                )
+            )
+            expected_packets += graph_recorded_packets
+            result["cuda_graph_recorded_ragged_packets"] = graph_recorded_packets
             actual_packets = result["lighton_ragged_recurrent_calls"]
             result["cuda_ragged_expected_packets"] = expected_packets
             result["cuda_ragged_observed_packets"] = actual_packets

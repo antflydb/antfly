@@ -22,7 +22,7 @@ const driver = @import("driver.zig");
 const buffer = @import("buffer.zig");
 const memory = @import("../../runtime/tier/memory.zig");
 const plan_mod = @import("execution_arena.zig");
-pub const max_rows = 64;
+pub const max_rows = 128;
 
 /// The scheduler may rotate the same cohort between claims. Capture uses a
 /// stable sequence order, while publication retains the original claim order.
@@ -79,8 +79,14 @@ pub const Module = struct {
     graph: driver.CUgraphExec = null,
     rows: usize = 0,
     hidden: usize = 0,
+    vocab: usize = 0,
+    // Wide logits live outside the bounded temporary arena. Both dependent
+    // steps reuse this independently admitted output after their argmax.
+    head: buffer.DeviceBuffer = .{},
+    head_admission: ?memory.AdmissionLease = null,
     future_tokens: usize = 0,
     expected_attention_calls: usize = 0,
+    expected_ragged_packets: usize = 0,
     bank_offset: usize = 0,
     positions_offset: usize = 0,
     progress_offset: usize = 0,
@@ -91,6 +97,8 @@ pub const Module = struct {
     active: bool = false,
     captures: u64 = 0,
     replays: u64 = 0,
+    wide_replays: u64 = 0,
+    max_replay_rows: usize = 0,
     invalidations: u64 = 0,
     admission_denials: u64 = 0,
     weight_declines_logged: usize = 0,
@@ -102,22 +110,26 @@ pub const Module = struct {
         // graph whose inputs are about to retire through a page callback.
         self.phase = .disabled;
         self.active = false;
-        if (self.metadata.ptr != 0 or self.arena.ptr != 0 or self.graph != null)
+        if (self.head.ptr != 0 or self.metadata.ptr != 0 or self.arena.ptr != 0 or self.graph != null)
             try ctx.synchronize();
         if (self.graph != null) ctx.destroyGraphExec(self.graph);
         self.graph = null;
+        self.head.free(ctx);
         self.arena.free(ctx);
         self.metadata.free(ctx);
         if (self.plan) |plan| std.heap.c_allocator.destroy(plan);
         self.plan = null;
         if (self.key.len != 0) std.heap.c_allocator.free(self.key);
         self.key = &.{};
+        if (self.head_admission) |*lease| lease.release();
+        self.head_admission = null;
         if (self.arena_admission) |*lease| lease.release();
         self.arena_admission = null;
         if (self.metadata_admission) |*lease| lease.release();
         self.metadata_admission = null;
         self.rows = 0;
         self.hidden = 0;
+        self.vocab = 0;
         self.progress = 0;
         self.invalidations += 1;
     }
@@ -131,13 +143,13 @@ pub const Module = struct {
             host_positions.len == 3 * self.rows and
             std.mem.eql(u32, self.next_positions[0..host_positions.len], host_positions);
     }
-    pub fn reset(self: *Module, ctx: *context.CudaContext, key: []const u64, host_positions: []const u32, rows: usize, hidden: usize) !void {
+    pub fn reset(self: *Module, ctx: *context.CudaContext, key: []const u64, host_positions: []const u32, rows: usize, hidden: usize, vocab: usize) !void {
         try self.clear(ctx);
-        if (rows < 2 or rows > max_rows or host_positions.len != rows * 3 or key.len == 0)
+        if (rows < 2 or rows > max_rows or host_positions.len != rows * 3 or key.len == 0 or vocab == 0)
             return error.InvalidShape;
         const input_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), 4);
         const bank_offset = std.mem.alignForward(usize, input_bytes, 256);
-        const positions_offset = bank_offset + 256 * 2;
+        const positions_offset = bank_offset + std.mem.alignForward(usize, rows * 2 * 4, 256);
         const progress_offset = std.mem.alignForward(usize, positions_offset + host_positions.len * 4, 256);
         const bytes = progress_offset + 256;
         var lease: ?memory.AdmissionLease = null;
@@ -152,13 +164,29 @@ pub const Module = struct {
         const plan = try std.heap.c_allocator.create(plan_mod.Plan);
         errdefer std.heap.c_allocator.destroy(plan);
         plan.* = .{};
-        const device = try buffer.DeviceBuffer.alloc(ctx, bytes);
+        var device = try buffer.DeviceBuffer.alloc(ctx, bytes);
+        errdefer device.free(ctx);
+        var head_lease: ?memory.AdmissionLease = null;
+        errdefer if (head_lease) |*value| value.release();
+        var head = buffer.DeviceBuffer{};
+        if (rows > 64) {
+            const head_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, vocab), 4);
+            if (head_bytes > plan_mod.limit) return error.InvalidShape;
+            if (ctx.video_cache_budget.admission) |policy|
+                head_lease = try policy.controller.tryAcquire(.gpu, policy.limits, .{
+                    .backend_scratch_bytes = head_bytes,
+                }, policy.check_live_memory);
+            head = try buffer.DeviceBuffer.alloc(ctx, head_bytes);
+        }
+        self.head = head;
+        self.head_admission = head_lease;
         self.key = owned_key;
         self.plan = plan;
         self.metadata = device;
         self.metadata_admission = lease;
         self.rows = rows;
         self.hidden = hidden;
+        self.vocab = vocab;
         self.bank_offset = bank_offset;
         self.positions_offset = positions_offset;
         self.progress_offset = progress_offset;

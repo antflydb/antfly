@@ -345,7 +345,7 @@ lighton_attention_combine(const __grid_constant__ LightOnAttentionParams p) {
 // One ordered stream operation advances both graph steps and all M-RoPE axes.
 extern "C" __global__ void
 lighton_graph_advance(uint32_t *positions, uint32_t *progress, uint32_t count) {
-  if (blockIdx.x != 0 || blockDim.x != 256)
+  if (blockIdx.x != 0 || blockDim.x != 512 || count == 0 || count > 384)
     return;
   if (threadIdx.x < count)
     positions[threadIdx.x] += 1;

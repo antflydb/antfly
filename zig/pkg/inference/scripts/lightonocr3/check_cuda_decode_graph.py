@@ -74,11 +74,11 @@ graph = None
 try:
     torch.set_num_threads(4)
     for heads, kh in [(8, 2), (16, 4)]:
-        for batch in [2, 16, 64]:
+        for batch in [2, 16, 64, 66, 128]:
             for chunk in [32, 128]:
                 torch.manual_seed(152)
                 page_size = 16
-                lengths = ([31, 32, 63, 127, 255, 432, 554, 662] * 8)[:batch]
+                lengths = ([31, 32, 63, 127, 255, 432, 554, 662] * 16)[:batch]
                 replays = 5
                 counts = [math.ceil((n + replays * 2) / page_size) for n in lengths]
                 blocks = sum(counts)
@@ -99,19 +99,6 @@ try:
                 grouped = (heads == 8 and chunk == 32 and batch >= 8) or (
                     heads == 16 and chunk == 128 and batch >= 16
                 )
-                chunk_name = (
-                    (
-                        "lighton_attention_grouped_chunks128"
-                        if chunk == 128
-                        else "lighton_attention_grouped_chunks32"
-                    )
-                    if grouped
-                    else (
-                        "lighton_attention_chunks128"
-                        if chunk == 128
-                        else "lighton_attention_chunks"
-                    )
-                )
                 packets, outputs, partials, statistics = [], [], [], []
                 order = torch.randperm(blocks).tolist()
                 tables = []
@@ -129,33 +116,40 @@ try:
                     stats = torch.full(
                         (batch * heads * chunks * 2 + 16,), 123456.0, device="cuda"
                     )
-                    p = Params(
-                        q=qg.data_ptr(),
-                        k=kg.data_ptr(),
-                        v=vg.data_ptr(),
-                        out=output.data_ptr(),
-                        partials=partial.data_ptr(),
-                        statistics=stats.data_ptr(),
-                        new_k=nk.data_ptr(),
-                        new_v=nv.data_ptr(),
-                        items=batch,
-                        heads=heads,
-                        kv_heads=kh,
-                        chunks=chunks,
-                        page_size=page_size,
-                        row_values=kh * 256,
-                        capacity=capacity,
-                        graph_progress=progress.data_ptr(),
-                        graph_step=step,
-                    )
-                    for i, n in enumerate(lengths):
-                        p.pages[i] = oracle.Page(
-                            n + step,
-                            n + step - 1,
-                            counts[i],
-                            (c.c_uint32 * 64)(*tables[i]),
+                    step_packets = []
+                    for offset in range(0, batch, 64):
+                        items = min(64, batch - offset)
+                        p = Params(
+                            q=qg.data_ptr() + offset * heads * 256 * 4,
+                            k=kg.data_ptr(),
+                            v=vg.data_ptr(),
+                            out=output.data_ptr() + offset * heads * 256 * 4,
+                            partials=partial.data_ptr()
+                            + offset * heads * chunks * 256 * 4,
+                            statistics=stats.data_ptr()
+                            + offset * heads * chunks * 2 * 4,
+                            new_k=nk.data_ptr() + offset * kh * 256 * 4,
+                            new_v=nv.data_ptr() + offset * kh * 256 * 4,
+                            items=items,
+                            heads=heads,
+                            kv_heads=kh,
+                            chunks=chunks,
+                            page_size=page_size,
+                            row_values=kh * 256,
+                            capacity=capacity,
+                            graph_progress=progress.data_ptr(),
+                            graph_step=step,
                         )
-                    packets.append(p)
+                        for row in range(items):
+                            i = offset + row
+                            p.pages[row] = oracle.Page(
+                                lengths[i] + step,
+                                lengths[i] + step - 1,
+                                counts[i],
+                                (c.c_uint32 * 64)(*tables[i]),
+                            )
+                        step_packets.append(p)
+                    packets.append(step_packets)
                     outputs.append(output)
                     partials.append(partial)
                     statistics.append(stats)
@@ -163,26 +157,43 @@ try:
                 stream = torch.cuda.Stream()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream):
-                    for p in packets:
-                        args = (c.c_void_p * 1)(c.addressof(p))
-                        launch(
-                            "lighton_attention_write_suffix",
-                            (math.ceil(kh * 256 / 128), batch),
-                            args,
-                            stream,
-                        )
-                        launch(
-                            chunk_name,
-                            (kh if grouped else heads, batch * chunks),
-                            args,
-                            stream,
-                        )
-                        launch(
-                            "lighton_attention_combine",
-                            (batch * heads, 1),
-                            args,
-                            stream,
-                        )
+                    for step_packets in packets:
+                        for p in step_packets:
+                            grouped_packet = (
+                                heads == 8 and chunk == 32 and p.items >= 8
+                            ) or (heads == 16 and chunk == 128 and p.items >= 16)
+                            packet_chunk_name = (
+                                (
+                                    "lighton_attention_grouped_chunks128"
+                                    if chunk == 128
+                                    else "lighton_attention_grouped_chunks32"
+                                )
+                                if grouped_packet
+                                else (
+                                    "lighton_attention_chunks128"
+                                    if chunk == 128
+                                    else "lighton_attention_chunks"
+                                )
+                            )
+                            args = (c.c_void_p * 1)(c.addressof(p))
+                            launch(
+                                "lighton_attention_write_suffix",
+                                (math.ceil(kh * 256 / 128), p.items),
+                                args,
+                                stream,
+                            )
+                            launch(
+                                packet_chunk_name,
+                                (kh if grouped_packet else heads, p.items * chunks),
+                                args,
+                                stream,
+                            )
+                            launch(
+                                "lighton_attention_combine",
+                                (p.items * heads, 1),
+                                args,
+                                stream,
+                            )
                         pos, counter, count = (
                             c.c_uint64(positions.data_ptr()),
                             c.c_uint64(progress.data_ptr()),
@@ -192,7 +203,7 @@ try:
                             c.addressof(pos), c.addressof(counter), c.addressof(count)
                         )
                         launch(
-                            "lighton_graph_advance", (1, 1), advance_args, stream, 256
+                            "lighton_graph_advance", (1, 1), advance_args, stream, 512
                         )
                 max_error = 0.0
                 for index in range(replays + 1):
@@ -261,6 +272,7 @@ try:
                 result = dict(
                     heads=heads,
                     items=batch,
+                    packets_per_step=math.ceil(batch / 64),
                     grouped=grouped,
                     chunk=chunk,
                     replayed_steps=(replays + 1) * 2,

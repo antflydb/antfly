@@ -89,6 +89,13 @@ pub const Scope = struct {
     base: usize = 0,
     cursor: usize = 0,
     valid: bool = true,
+    // A caller-owned output can outlive individual arena allocations without
+    // joining the ordinary temporary cache. Only its explicit producer may
+    // borrow it; release remains valid through this complete stream scope.
+    output_ptr: usize = 0,
+    output_bytes: usize = 0,
+    output_active: bool = false,
+    output_taken: bool = false,
     pub fn owns(self: *const Scope, pointer: usize) bool {
         return self.base != 0 and pointer >= self.base and pointer - self.base < self.plan.peak;
     }

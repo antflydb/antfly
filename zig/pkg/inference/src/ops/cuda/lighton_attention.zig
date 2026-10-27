@@ -77,12 +77,12 @@ pub const Module = struct {
         self.functions = functions;
     }
     pub fn advanceGraph(self: *Module, ctx: *context.CudaContext, positions: driver.CUdeviceptr, progress: driver.CUdeviceptr, count: u32) !void {
-        if (count == 0 or count > 192) return error.InvalidShape;
+        if (count == 0 or count > 384) return error.InvalidShape;
         var p = positions;
         var c = progress;
         var n = count;
         var args = [_]?*anyopaque{ &p, &c, &n };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[4], 1, 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[4], 1, 1, 1, 512, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
     }
     pub fn writeSuffix(self: *Module, ctx: *context.CudaContext, params: *Params) !void {

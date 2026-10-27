@@ -265,6 +265,7 @@ pub const CublasLt = struct {
     plan_cache_hits: usize = 0,
     plan_cache_misses: usize = 0,
     uncached_plans: usize = 0,
+    plan_cache_refreshes: usize = 0,
     // Bias pointers are invocation data in a cached descriptor. Serialize
     // biased submissions through the API call that consumes that descriptor;
     // ordinary serving plans never share this descriptor kind.
@@ -284,6 +285,27 @@ pub const CublasLt = struct {
         defer self.tensor_core_plans_mutex.unlock();
         if (capacity < self.tensor_core_plans.count()) return error.CublasLtUnsupported;
         self.plan_cache_capacity = capacity;
+    }
+
+    /// Caller owns the complete backend execution lane and has retired every
+    /// graph that could reference these plans. Refresh only at that boundary,
+    /// never by evicting a descriptor borrowed by an asynchronous invocation.
+    /// The configured capacity and retained hash-map allocation stay unchanged.
+    pub fn reserveTensorCorePlanSlots(self: *CublasLt, ctx: *context_mod.CudaContext, slots: usize) Error!bool {
+        if (slots == 0 or slots > self.plan_cache_capacity or self.allocator == null) return false;
+        spinLock(&self.tensor_core_plans_mutex);
+        const refresh = self.tensor_core_plans.count() > self.plan_cache_capacity - slots;
+        self.tensor_core_plans_mutex.unlock();
+        if (!refresh) return false;
+        if (ctx.streamCaptureActive() catch return error.CublasLtError) return error.CublasLtUnsupported;
+        ctx.synchronize() catch return error.CublasLtError;
+        spinLock(&self.tensor_core_plans_mutex);
+        defer self.tensor_core_plans_mutex.unlock();
+        var plans = self.tensor_core_plans.valueIterator();
+        while (plans.next()) |plan| self.destroyTensorCorePlan(plan.*);
+        self.tensor_core_plans.clearRetainingCapacity();
+        self.plan_cache_refreshes += 1;
+        return true;
     }
 
     const Table = struct {

@@ -2371,10 +2371,20 @@ pub const CudaCompute = struct {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         return self.lighton_decode_graph_enabled and self.capability_profile == .lightonocr3 and
             self.lighton_attention_enabled and self.lighton_batched_kv_write_enabled and self.lighton_recurrent_batch_enabled and
-            self.lighton_ffn_block_enabled and self.lighton_ffn_bf16_inputs and
+            self.lighton_ffn_block_enabled and self.lighton_ffn_bf16_inputs and !self.lighton_gemm_bucket_rows and
+            self.cublaslt != null and self.cublaslt.?.allocator != null and self.cublaslt.?.plan_cache_capacity >= 64 and
             self.lighton_state_pool_enabled and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and !self.resident_training_cache and self.lazy_host_store == null and
             self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1;
     }
+    /// The epoch caller owns execution and has retired its decoder graph.
+    pub fn prepareLightOnMatmulFrame(cb: *const ops.ComputeBackend) !void {
+        if (cb.kind() != .cuda) return;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.capability_profile != .lightonocr3 or self.ctx.debug_graph_capture_active or self.debug_cuda_graph_capture_active) return;
+        if (self.lighton_decode_graph.graph != null) return error.InvalidExecutionPlan;
+        if (self.cublaslt) |*blas| _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
+    }
+
     pub fn endLightOnDecodeGraphEpoch(cb: *const ops.ComputeBackend, epoch: u64) void {
         if (cb.kind() != .cuda or epoch == 0) return;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -2450,11 +2460,30 @@ pub const CudaCompute = struct {
         }
         pub fn burst(self: *@This(), embedding: CT, vocab: usize) !LightOnTokenBurst {
             const owner = &self.compute.lighton_decode_graph;
+            if (vocab != owner.vocab) return error.InvalidShape;
             const shape = try allocShape2(self.compute.allocator, 2, owner.rows);
             errdefer self.compute.allocator.free(shape);
             const bank = try createTensorWithDType(self.compute, owner.bank(), shape, 2 * owner.rows, .i32);
             tensorFromCt(bank).owns_buffer = false;
             return .{ .owner = self.compute, .bank = bank, .embedding_weight = embedding, .suppress = .{}, .suppress_count = 0, .rows = owner.rows, .steps = 2, .hidden = owner.hidden, .vocab = vocab };
+        }
+        pub fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT) !CT {
+            const owner = &self.compute.lighton_decode_graph;
+            std.debug.assert(cb.ptr == @as(*anyopaque, @ptrCast(self.compute)));
+            if (owner.head.ptr == 0 or self.compute.execution_scope == null)
+                return cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
+            const scope = self.compute.execution_scope.?;
+            scope.output_ptr = owner.head.ptr;
+            scope.output_bytes = owner.head.len;
+            scope.output_active = true;
+            scope.output_taken = false;
+            defer scope.output_active = false;
+            const output = try cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
+            if (!scope.output_taken) {
+                cb.free(output);
+                return error.InvalidExecutionPlan;
+            }
+            return output;
         }
         pub fn setInput(self: *@This(), input_ct: CT) !void {
             const owner = &self.compute.lighton_decode_graph;
@@ -2484,6 +2513,10 @@ pub const CudaCompute = struct {
             if (owner.phase == .replay) {
                 try compute.ctx.launchGraph(owner.graph);
                 owner.replays += 1;
+                owner.wide_replays += @intFromBool(owner.rows > 64);
+                owner.max_replay_rows = @max(owner.max_replay_rows, owner.rows);
+                if (owner.progress == 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                    std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d}\n", .{ owner.rows, owner.captures });
                 return;
             }
             const phase = owner.phase;
@@ -2508,6 +2541,7 @@ pub const CudaCompute = struct {
             const h2d = compute.stats.h2d_bytes;
             const d2h = compute.stats.d2h_bytes;
             const attention_calls = compute.lighton_attention.calls;
+            const ragged_calls = compute.lighton_recurrent.ragged_batch_calls;
             if (phase == .learn or capture) compute.execution_scope = &scope;
             owner.active = true;
             callback(context, self) catch |failure| {
@@ -2516,6 +2550,10 @@ pub const CudaCompute = struct {
             };
             owner.active = false;
             compute.execution_scope = null;
+            if (compute.lighton_recurrent.ragged_batch_calls - ragged_calls != owner.expected_ragged_packets)
+                return error.InvalidExecutionPlan;
+            if (owner.expected_ragged_packets != 0 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                std.debug.print("LIGHTONOCR3 cuda_model_graph_recorded_ragged_packets={d} rows={d}\n", .{ owner.expected_ragged_packets, owner.rows });
             if (phase == .learn) {
                 if (!owner.plan.?.finishNoOutput() or compute.stats.h2d_bytes != h2d or compute.stats.d2h_bytes != d2h or compute.lighton_attention.calls - attention_calls != owner.expected_attention_calls) {
                     std.log.warn("LightOn decoder graph plan declined: allocations={d} events={d} peak={d} h2d={d} d2h={d}", .{ owner.plan.?.count, owner.plan.?.event_count, owner.plan.?.peak, compute.stats.h2d_bytes - h2d, compute.stats.d2h_bytes - d2h });
@@ -2537,7 +2575,7 @@ pub const CudaCompute = struct {
         pub fn read(self: *@This(), burst_value: *LightOnTokenBurst, tokens: []u32) !void {
             const owner = &self.compute.lighton_decode_graph;
             if (tokens.len != 2 * owner.rows) return error.InvalidShape;
-            var host: [384]u32 = undefined;
+            var host: [768]u32 = undefined;
             const bytes = owner.progress_offset + 4 - owner.bank_offset;
             const source = buffer_mod.DeviceBuffer{ .ptr = owner.bank().ptr, .len = bytes, .borrowed = true };
             try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(host[0 .. bytes / 4]));
@@ -2559,9 +2597,11 @@ pub const CudaCompute = struct {
             while (it.next()) |entry| entry.value_ptr.token_count = @max(entry.value_ptr.token_count, max_tokens);
         }
     };
-    pub fn beginLightOnDecodeGraph(cb: *const ops.ComputeBackend, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, future_tokens: usize, attention_layers: usize) !?LightOnGraphClaim {
-        if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > 64 or future_tokens == 0 or future_tokens > 1024 or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
+    pub fn beginLightOnDecodeGraph(cb: *const ops.ComputeBackend, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, vocab: usize, future_tokens: usize, attention_layers: usize, recurrent_layers: usize) !?LightOnGraphClaim {
+        if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or vocab == 0 or future_tokens == 0 or future_tokens > 1024 or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
+        if (rows > 64 and rows % 64 == 1) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (rows > 64 and !self.lighton_ragged_recurrent_enabled) return null;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
         const owner = &self.lighton_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -2578,7 +2618,7 @@ pub const CudaCompute = struct {
                 });
                 owner.resets_logged += 1;
             }
-            owner.reset(&self.ctx, key, positions, rows, hidden) catch |err| switch (err) {
+            owner.reset(&self.ctx, key, positions, rows, hidden, vocab) catch |err| switch (err) {
                 error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
                     owner.admission_denials += 1;
                     return null;
@@ -2605,8 +2645,14 @@ pub const CudaCompute = struct {
             const zero = [_]u32{0};
             try copyFromHostTracked(self, owner.counter(), std.mem.sliceAsBytes(&zero));
         }
+        // Ensure the owned cohort can retain its warmed plans. Prefill shape
+        // diversity may exhaust the cache between otherwise valid epochs.
+        if (owner.phase == .warm) if (self.cublaslt) |*blas| {
+            _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
+        };
         owner.future_tokens = future_tokens;
-        owner.expected_attention_calls = try checkedMul(2, attention_layers);
+        owner.expected_attention_calls = try checkedMul(try checkedMul(2, attention_layers), (rows + 63) / 64);
+        owner.expected_ragged_packets = if (rows > 64) try checkedMul(try checkedMul(2, recurrent_layers), (rows + 63) / 64) else 0;
         claimed = true;
         return .{ .compute = self, .future_tokens = future_tokens };
     }
@@ -4737,7 +4783,7 @@ pub const CudaCompute = struct {
             std.debug.print("OCR_CUDA temp_scan_diagnostic_interval=1024 alloc_ops={d} alloc_samples={d} alloc_cpu_samples={d} alloc_cpu_ns={d} alloc_wall_ns={d} alloc_entries={d} release_ops={d} release_samples={d} release_cpu_samples={d} release_cpu_ns={d} release_wall_ns={d} release_entries={d}\n", .{ search.operations, search.samples, search.cpu_samples, search.cpu_ns, search.wall_ns, search.entries, release.operations, release.samples, release.cpu_samples, release.cpu_ns, release.wall_ns, release.entries });
         }
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
-            std.debug.print("LIGHTONOCR3 cuda_model_graph_captures={d} cuda_model_graph_replays={d} cuda_model_graph_admission_denials={d}\n", .{ self.lighton_decode_graph.captures, self.lighton_decode_graph.replays, self.lighton_decode_graph.admission_denials });
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_captures={d} cuda_model_graph_replays={d} cuda_model_graph_admission_denials={d} cuda_model_graph_wide_replays={d} cuda_model_graph_max_replay_rows={d}\n", .{ self.lighton_decode_graph.captures, self.lighton_decode_graph.replays, self.lighton_decode_graph.admission_denials, self.lighton_decode_graph.wide_replays, self.lighton_decode_graph.max_replay_rows });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_model_graph_enabled={d} state_pool={d} lazy={d} training={d}\n", .{ @intFromBool(self.lighton_decode_graph_enabled), @intFromBool(self.lighton_state_pool_enabled), @intFromBool(self.lazy_host_store != null), @intFromBool(self.resident_training_cache) });
         self.lighton_decode_graph.invalidate(&self.ctx);
@@ -4789,10 +4835,10 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_bf16_decode_output_calls={d}\n", .{self.stats.bf16_decode_output_calls});
             std.debug.print("LIGHTONOCR3 cuda_bf16_prefill_ffn_calls={d}\n", .{self.lighton_bf16_prefill_ffn_calls});
             std.debug.print("LIGHTONOCR3 cuda_fused_ffn_calls={d} paired_weights={d}\n", .{ self.lighton_fused_ffn_calls, self.lighton_gate_up_cache.count() });
-            if (self.cublaslt) |*blas| std.debug.print("LIGHTONOCR3 cuda_gemm_plans={d} capacity={d} hits={d} misses={d} uncached={d} tuning_declines={d} scalar_calls={d}\n", .{
-                blas.tensor_core_plans.count(),      blas.plan_cache_capacity, blas.plan_cache_hits,
-                blas.plan_cache_misses,              blas.uncached_plans,      self.stats.bf16_cublaslt_tuning_api_fallbacks,
-                self.stats.bf16_scalar_linear_calls,
+            if (self.cublaslt) |*blas| std.debug.print("LIGHTONOCR3 cuda_gemm_plans={d} capacity={d} hits={d} misses={d} uncached={d} tuning_declines={d} scalar_calls={d} refreshes={d}\n", .{
+                blas.tensor_core_plans.count(),      blas.plan_cache_capacity,  blas.plan_cache_hits,
+                blas.plan_cache_misses,              blas.uncached_plans,       self.stats.bf16_cublaslt_tuning_api_fallbacks,
+                self.stats.bf16_scalar_linear_calls, blas.plan_cache_refreshes,
             });
         }
         if (self.capability_profile == .florence2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
@@ -11088,7 +11134,10 @@ fn tryCublasLtBf16Linear(
         break :pad scratch;
     } else (try stageBf16ActivationForCublasLt(self, input, rows, in_dim)) orelse return false;
     const workspace = cublasLtWorkspace(self);
-    if (!runCublasLtBf16Matmul(self, dst, input_bf16, weight, workspace, physical_rows, in_dim, out_dim)) return false;
+    if (!runCublasLtBf16Matmul(self, dst, input_bf16, weight, workspace, physical_rows, in_dim, out_dim)) {
+        if (lightOnOwnedDecodeCapture(self)) return error.CudaGraphCaptureUnsafeMatmulPlan;
+        return false;
+    }
     if (physical_rows != rows) self.stats.bf16_bucketed_linear_calls += 1;
     self.stats.bf16_cublaslt_linear_calls += 1;
     return true;
@@ -12485,7 +12534,14 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
 
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
-    if (self.execution_scope) |scope| if (scope.base != 0) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
+    if (self.execution_scope) |scope| {
+        if (scope.output_active and scope.output_ptr != 0 and len == scope.output_bytes) {
+            if (scope.output_taken) return error.InvalidExecutionPlan;
+            scope.output_taken = true;
+            return .{ .ptr = scope.output_ptr, .len = len, .borrowed = true };
+        }
+        if (scope.base != 0) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
+    }
     var result = try allocDeviceBufferOrdinary(self, len);
     if (self.execution_scope) |scope| {
         result.len = len;
@@ -12637,6 +12693,10 @@ fn recycleLightOnStateBuffer(context: *anyopaque, buffer: *buffer_mod.DeviceBuff
 fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
     if (self.execution_scope) |scope| {
+        if (buffer.borrowed and buffer.ptr == scope.output_ptr) {
+            buffer.* = .{};
+            return;
+        }
         if (scope.base == 0) scope.release(buffer.ptr) else if (scope.owns(buffer.ptr)) {
             scope.release(buffer.ptr);
             buffer.* = .{};
@@ -34578,19 +34638,19 @@ test "LightOnOCR3 CUDA decoder graph arena admission rejects partial allocations
     defer owner.clear(&compute.ctx) catch {};
     const positions = [_]u32{ 10, 20, 30, 40, 50, 60 };
     const key = [_]u64{ 1, 2, 3 };
-    const bytes = 9216;
+    const bytes = 8960;
     compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
         .backend_limit_bytes = bytes - 1,
         .host_limit_bytes = 16 * 1024 * 1024,
         .scratch_limit_bytes = 16 * 1024 * 1024,
     }, .check_live_memory = false };
     const baseline = compute.ctx.device_allocations.snapshot().live;
-    try std.testing.expectError(error.ResourceLimitExceeded, owner.reset(&compute.ctx, &key, &positions, 2, 1024));
+    try std.testing.expectError(error.ResourceLimitExceeded, owner.reset(&compute.ctx, &key, &positions, 2, 1024, 8));
     try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes;
-    try owner.reset(&compute.ctx, &key, &positions, 2, 1024);
+    try owner.reset(&compute.ctx, &key, &positions, 2, 1024, 8);
     try std.testing.expectEqual(@as(usize, bytes), controller.snapshot().backend_scratch_bytes);
     try std.testing.expect(owner.matches(&key, &positions));
     owner.plan.?.allocate(1024, 0x1000);
@@ -34615,4 +34675,104 @@ test "LightOnOCR3 CUDA decoder graph arena admission rejects partial allocations
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), owner.key.len);
+}
+
+test "LightOnOCR3 CUDA wide graph head has independent admission and never enters the temporary cache" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const memory = @import("../../runtime/tier/memory.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    var controller = memory.AdmissionController{};
+    var owner = @import("lighton_decode_graph.zig").Module{};
+    defer owner.clear(&compute.ctx) catch {};
+    const positions: [384]u32 = @splat(10);
+    const key = [_]u64{ 1, 2, 3 };
+    const metadata_bytes = 527104;
+    const head_bytes = 128 * 8 * 4;
+    const total = metadata_bytes + head_bytes;
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
+        .backend_limit_bytes = total - 1,
+        .host_limit_bytes = 16 * 1024 * 1024,
+        .scratch_limit_bytes = 16 * 1024 * 1024,
+    }, .check_live_memory = false };
+    const baseline = compute.ctx.device_allocations.snapshot().live;
+    // The second lease is denied; the preceding metadata allocation and both
+    // host reservations must be rolled back before conservative execution.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, owner.reset(&compute.ctx, &key, &positions, 128, 1024, 8));
+    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.head.ptr);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = total;
+    try owner.reset(&compute.ctx, &key, &positions, 128, 1024, 8);
+    try std.testing.expectEqual(@as(usize, head_bytes), owner.head.len);
+    try std.testing.expectEqual(@as(usize, metadata_bytes), owner.metadata.len);
+    try std.testing.expectEqual(@as(usize, total), controller.snapshot().backend_scratch_bytes);
+    const head_pointer = owner.head.ptr;
+    const cached = compute.temp_buffers.items.len;
+    for ([_]usize{ 0, 0x1000 }) |base| {
+        var scope = @import("execution_arena.zig").Scope{
+            .plan = owner.plan.?,
+            .base = base,
+            .output_ptr = owner.head.ptr,
+            .output_bytes = owner.head.len,
+            .output_active = true,
+        };
+        compute.execution_scope = &scope;
+        defer compute.execution_scope = null;
+        var output = try allocDeviceBuffer(&compute, head_bytes);
+        try std.testing.expect(output.borrowed and scope.output_taken);
+        try std.testing.expectEqual(head_pointer, output.ptr);
+        try std.testing.expectError(error.InvalidExecutionPlan, allocDeviceBuffer(&compute, head_bytes));
+        scope.output_active = false;
+        releaseDeviceBuffer(&compute, &output);
+        try std.testing.expectEqual(@as(usize, 0), output.ptr);
+        try std.testing.expectEqual(head_pointer, owner.head.ptr);
+        try std.testing.expectEqual(cached, compute.temp_buffers.items.len);
+        try std.testing.expectEqual(@as(usize, 0), owner.plan.?.event_count);
+        try std.testing.expectEqual(baseline + total, compute.ctx.device_allocations.snapshot().live);
+    }
+    try owner.clear(&compute.ctx);
+    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "LightOnOCR3 CUDA bounded GEMM refresh drains at an exclusive boundary and refuses capture" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const blas = if (compute.cublaslt) |*b| b else return error.CublasLtUnavailable;
+    try blas.setPlanCacheCapacity(4);
+    const width = 32;
+    var input = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4 * width * 2);
+    defer input.free(&compute.ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, width * width * 2);
+    defer weight.free(&compute.ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4 * width * 4);
+    defer output.free(&compute.ctx);
+    const inputs: [4 * width]u16 = @splat(0x3f80);
+    var weights: [width * width]u16 = @splat(0);
+    for (0..width) |i| weights[i * width + i] = 0x3f80;
+    try input.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&inputs));
+    try weight.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&weights));
+    for (1..5) |rows| try blas.matmulBf16WeightF32Out(&compute.ctx, output, input, weight, .{}, rows, width, width);
+    try std.testing.expectEqual(@as(usize, 4), blas.tensor_core_plans.count());
+    try std.testing.expect(!try blas.reserveTensorCorePlanSlots(&compute.ctx, 5));
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+    try std.testing.expectError(error.CublasLtUnsupported, blas.reserveTensorCorePlanSlots(&compute.ctx, 1));
+    const graph = try compute.ctx.endStreamCapture();
+    compute.ctx.destroyGraph(graph);
+    try std.testing.expectEqual(@as(usize, 4), blas.tensor_core_plans.count());
+    try std.testing.expect(try blas.reserveTensorCorePlanSlots(&compute.ctx, 2));
+    try std.testing.expectEqual(@as(usize, 4), blas.plan_cache_capacity);
+    try std.testing.expectEqual(@as(usize, 0), blas.tensor_core_plans.count());
+    try std.testing.expectEqual(@as(usize, 1), blas.plan_cache_refreshes);
+    try blas.matmulBf16WeightF32Out(&compute.ctx, output, input, weight, .{}, 4, width, width);
+    try blas.matmulBf16WeightF32Out(&compute.ctx, output, input, weight, .{}, 4, width, width);
+    try std.testing.expectEqual(@as(usize, 1), blas.tensor_core_plans.count());
+    var actual: [4 * width]f32 = undefined;
+    try output.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try compute.ctx.synchronize();
+    for (actual) |value| try std.testing.expectEqual(@as(f32, 1), value);
 }
