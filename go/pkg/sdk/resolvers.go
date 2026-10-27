@@ -714,3 +714,18 @@ type NamespaceUnmergeResolverKeyJSONRequestBody = oapi.NamespaceUnmergeResolverK
 type NamespaceUnmergeResolverKeyParams = oapi.NamespaceUnmergeResolverKeyParams
 type NamespaceUnsuppressEntityJSONRequestBody = oapi.NamespaceUnsuppressEntityJSONRequestBody
 type NamespaceUnsuppressResolverKeyJSONRequestBody = oapi.NamespaceUnsuppressResolverKeyJSONRequestBody
+
+// ListEntityResolverProgress reads one catalog-fenced page of native consumer replay proofs.
+func (c *AntflyClient) ListEntityResolverProgress(ctx context.Context, tableName string, key string, params *oapi.ListEntityResolverProgressParams) (*oapi.EntityConsumerProgressPage, error) {
+	return decodeCurationResponse[oapi.EntityConsumerProgressPage](c.client.ListEntityResolverProgress(ctx, tableName, key, params))
+}
+
+// NamespaceListEntityResolverProgress reads a bounded page in an explicit namespace.
+func (c *AntflyClient) NamespaceListEntityResolverProgress(ctx context.Context, databaseName string, namespaceName string, tableName string, key string, params *oapi.NamespaceListEntityResolverProgressParams) (*oapi.EntityConsumerProgressPage, error) {
+	return decodeCurationResponse[oapi.EntityConsumerProgressPage](c.client.NamespaceListEntityResolverProgress(ctx, databaseName, namespaceName, tableName, key, params))
+}
+
+type EntityConsumerProgressPage = oapi.EntityConsumerProgressPage
+type EntityNamespaceOutcome = oapi.EntityNamespaceOutcome
+type ListEntityResolverProgressParams = oapi.ListEntityResolverProgressParams
+type NamespaceListEntityResolverProgressParams = oapi.NamespaceListEntityResolverProgressParams

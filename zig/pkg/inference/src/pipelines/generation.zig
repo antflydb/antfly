@@ -2451,7 +2451,7 @@ fn metalCompiledSampledDecodeDefaultEligible(cfg: gpt_mod.Config) bool {
 }
 
 fn metalCompiledSampledDecodeEnabled(cfg: gpt_mod.Config) bool {
-    return metal_runtime.qualifiedM4FeatureEnabled(
+    return metal_runtime.appleSimdgroupFeatureEnabled(
         "ANTFLY_INFERENCE_METAL_RESIDENT_NUCLEUS",
         metalCompiledSampledDecodeDefaultEligible(cfg),
     );

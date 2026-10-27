@@ -95,7 +95,7 @@ pub const Archive = struct {
                 },
                 else => return error.UnsupportedDocumentCompression,
             };
-            if (data.len != entry.size or std.hash.Crc32.hash(data) != entry.crc) return error.InvalidDocumentArchive;
+            if (data.len != entry.size or @import("antfly_hash").Crc32.hash(data) != entry.crc) return error.InvalidDocumentArchive;
             return data;
         }
         return error.MissingDocumentPart;

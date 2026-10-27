@@ -16,7 +16,7 @@
 //! Bounded transport for a host-authorized document run. Control metadata is
 //! JSON; source/checkpoint bytes stay raw across native and worker boundaries.
 const std = @import("std");
-const runs = @import("document_runs.zig");
+const runs = @import("antfly_document_runs");
 const runtime = @import("antfly_runtime_abi");
 const abi = runtime.document_abi;
 const Bytes = runtime.http_abi.Bytes;

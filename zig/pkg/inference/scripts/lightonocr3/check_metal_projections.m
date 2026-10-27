@@ -19,6 +19,55 @@
 //   check_metal_projections.m -o /tmp/check-lighton-projections
 #include "../../src/backends/metal_kernels.m"
 
+// A marketing name must never participate in hardware eligibility. Report
+// inherited GPU-family support, including families newer than this SDK knows.
+@interface AppleCapabilityFixture : NSObject
+@property(nonatomic) uint16_t family;
+@end
+@implementation AppleCapabilityFixture
+- (BOOL)supportsFamily:(MTLGPUFamily)family {
+    return family >= 1001 && family <= 1000 + self.family;
+}
+- (NSString *)name {
+    @throw [NSException exceptionWithName:@"DeviceNamePolicyRegression"
+                                 reason:@"GPU policy queried a marketing name" userInfo:nil];
+}
+@end
+
+static int device_policy_check(void) {
+    const uint16_t families[] = {0, 6, 7, 8, 9, 10, 20};
+    for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); i++) {
+        AppleCapabilityFixture *fixture = [AppleCapabilityFixture new];
+        fixture.family = families[i];
+        id<MTLDevice> device = (id<MTLDevice>)fixture;
+        const bool eligible = families[i] >= 7;
+        if (termite_metal_apple_simdgroup_device(device) != eligible) return 201;
+        unsetenv("TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME");
+        if (termite_metal_fast_prepared_frame_enabled_for_device(device, families[i]) != eligible) return 202;
+        setenv("TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME", "1", 1);
+        if (termite_metal_fast_prepared_frame_enabled_for_device(device, families[i])) return 203;
+        unsetenv("TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME");
+        // Policy opt-in must be independent of the device name. Pipeline
+        // initialization/availability is tested separately by the GPU oracle.
+        termite_metal_decode_runtime runtime = {0};
+        runtime.device = device;
+        runtime.lightonocr3_local_initialization_attempted = YES;
+        runtime.lightonocr3_recurrent_initialization_attempted = YES;
+        runtime.lightonocr3_mpp_initialization_attempted = YES;
+        termite_metal_decode_runtime_set_lightonocr3_projections(&runtime, 1);
+        termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(&runtime, 1);
+        if (!runtime.lightonocr3_projections_enabled || !runtime.qwen35_ocr_vector_loads_enabled) return 204;
+        if (termite_metal_decode_runtime_lightonocr3_batch_projection_available(&runtime, 8, 2560)) return 205;
+        if (termite_metal_lightonocr3_local_pipeline_valid(&runtime, nil, 128, 0)) return 206;
+        termite_metal_decode_runtime_set_lightonocr3_projections(&runtime, 0);
+        termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(&runtime, 0);
+        if (runtime.lightonocr3_projections_enabled || runtime.qwen35_ocr_vector_loads_enabled) return 207;
+    }
+    if (termite_metal_apple_simdgroup_device(nil)) return 208;
+    fprintf(stderr, "DEVICE_POLICY_OK Apple7+ inherited capabilities, rollback, model scope, absent-pipeline fallback\n");
+    return 0;
+}
+
 static uint16_t round_bf16(float value) {
     uint32_t bits;
     memcpy(&bits, &value, 4);
@@ -2944,7 +2993,7 @@ static int ocr_attention_batch_check(termite_metal_decode_runtime *r,
       for (size_t row = 0; row < rows; row++) {
         const size_t tokens = 432 + row * 13;
         if (termite_metal_decode_runtime_encode_paged_attention_slot_ex(
-                r, r, r->active_frame_cb, 0, 3, q, row * width * 4, blocks, 6,
+                r, r, r->active_frame_cb, 0, 3, q, row * width * 4, blocks, 6, NULL, 0,
                 page, 1, tokens, heads, kv_heads, dim, kv_heads * dim * 2,
                 kv_heads * dim * 2, tokens - 1, 0, 0, 0, NULL, 0, result[mode],
                 16 + row * width * 4))
@@ -4250,13 +4299,14 @@ static int frame_staging_lifetime_check(void) {
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
+        if (argc == 2 && strcmp(argv[1], "--check-device-policy") == 0) return device_policy_check();
         if (argc == 2 && strcmp(argv[1], "--check-frame-staging-lifetime") == 0) return frame_staging_lifetime_check();
         termite_metal_decode_runtime *r = termite_metal_decode_runtime_create();
         if (!r)
             return 1;
         termite_metal_decode_runtime_set_lightonocr3_projections(r, 1);
         if (!r->lightonocr3_projections_enabled) {
-            fprintf(stderr, "SKIP: dispatch qualification is M4 Max\n");
+            fprintf(stderr, "LightOn projection policy was not enabled\n");
             return 77;
         }
         if (!r->lightonocr3_mpp_f32_pipeline || !r->lightonocr3_mpp_bf16_pipeline || !r->lightonocr3_gemv_pipeline) {

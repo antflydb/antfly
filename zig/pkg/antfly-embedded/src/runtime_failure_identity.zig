@@ -1196,9 +1196,9 @@ test "logical value exact sort rejection survives both compiled query boundaries
 }
 
 test "document job failures retain distinct semantic identities at the compiled boundary" {
-    try std.testing.expectEqual(@as(u32, 67), abi.abi_version);
-    try std.testing.expectEqual(@as(u32, 903), @backingInt(statusFromError(error.InvalidDocumentCheckpoint)));
-    try std.testing.expectEqual(@as(u32, 904), @backingInt(statusFromError(error.TooManyActiveJobs)));
+    try std.testing.expectEqual(@as(u32, 68), abi.abi_version);
+    try std.testing.expectEqual(@as(u32, 839), @backingInt(statusFromError(error.InvalidDocumentCheckpoint)));
+    try std.testing.expectEqual(@as(u32, 840), @backingInt(statusFromError(error.TooManyActiveJobs)));
     try std.testing.expectError(error.InvalidDocumentCheckpoint, statusToError(.invalid_document_checkpoint));
     try std.testing.expectError(error.TooManyActiveJobs, statusToError(.too_many_active_jobs));
 }

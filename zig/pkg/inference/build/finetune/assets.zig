@@ -28,6 +28,7 @@ pub fn create(options: struct {
     jinja: *std.Build.Module,
     platform: *std.Build.Module,
     runtime_abi: *std.Build.Module,
+    document_runs: *std.Build.Module,
 }) *std.Build.Module {
     const b = options.b;
     const module = b.createModule(.{
@@ -50,5 +51,6 @@ pub fn create(options: struct {
     }
     module.addImport("antfly_platform", options.platform);
     module.addImport("antfly_runtime_abi", options.runtime_abi);
+    module.addImport("antfly_document_runs", options.document_runs);
     return module;
 }

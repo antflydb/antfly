@@ -521,6 +521,9 @@ antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_sl
  * approximately 100 ms. Retry the identical request with bounded backoff.
  * replaces registers a hidden resumable shadow and returns; the old graph
  * serves until background activation. Identical requests are idempotent.
+ * This preserves the old generation's indexed contents; it does not turn an
+ * earlier write-only batch receipt into an index-visibility guarantee. Use
+ * sync_level:"full_index" when a subsequent graph read must see that batch.
  * Acts as add when the old index is absent. Optional wait:{timeout_ms:N}
  * waits for activation; deadline BUSY leaves the accepted shadow running.
  * Waiting releases admission between work quanta and remains bound to the

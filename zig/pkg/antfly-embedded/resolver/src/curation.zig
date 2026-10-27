@@ -677,6 +677,78 @@ pub fn supersede(a: std.mem.Allocator, current: []const Proposal, request: Reque
     }
     return proposals;
 }
+/// One request owns one queue overlay. Only open lifecycle headers are indexed;
+/// each incidence is consumed at most once across all namespace decisions.
+/// Closed history is borrowed and never recopied when nothing changes.
+pub const SupersessionBatch = struct {
+    a: std.mem.Allocator,
+    original: []const Proposal,
+    edited: ?[]Proposal = null,
+    by_id: std.StringHashMapUnmanaged(usize) = .empty,
+    by_key: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty,
+    by_pair: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty,
+    test_visits: usize = 0,
+    fn append(a: std.mem.Allocator, index: *std.StringHashMapUnmanaged(std.ArrayList(usize)), key: []const u8, position: usize) !void {
+        const entry = try index.getOrPut(a, key);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(a, position);
+    }
+    fn batchPairKey(a: std.mem.Allocator, from: []const u8, to: []const u8) ![]const u8 {
+        return std.json.Stringify.valueAlloc(a, if (std.mem.lessThan(u8, from, to)) .{ from, to } else .{ to, from }, .{});
+    }
+    pub fn init(a: std.mem.Allocator, proposals: []const Proposal) !SupersessionBatch {
+        var result: SupersessionBatch = .{ .a = a, .original = proposals };
+        for (proposals, 0..) |proposal, i| {
+            if ((try result.by_id.getOrPut(a, proposal.id)).found_existing) return error.InvalidResolverCurationRequest;
+            result.by_id.getPtr(proposal.id).?.* = i;
+            if (proposal.state != .open) continue;
+            try append(a, &result.by_key, proposal.key, i);
+            if (proposal.into) |target| {
+                if (!std.mem.eql(u8, target, proposal.key)) try append(a, &result.by_key, target, i);
+                if (proposal.action == .merge or proposal.action == .distinct) try append(a, &result.by_pair, try batchPairKey(a, proposal.key, target), i);
+            }
+        }
+        return result;
+    }
+    fn consume(self: *SupersessionBatch, positions: *std.ArrayList(usize), origin: Origin) !void {
+        for (positions.items) |i| {
+            if (comptime @import("builtin").is_test) self.test_visits += 1;
+            if (self.values()[i].state != .open) continue;
+            if (self.edited == null) self.edited = try self.a.dupe(Proposal, self.original);
+            self.edited.?[i].state = .superseded;
+            self.edited.?[i].decided = origin;
+        }
+        positions.clearRetainingCapacity();
+    }
+    pub fn apply(self: *SupersessionBatch, request: Request, absorbed: []const AbsorbedResult, origin: Origin) !void {
+        try validateProposalOrigin(origin);
+        const key = request.from orelse request.key;
+        if (request.action == .distinct) {
+            const other = request.to orelse request.target;
+            if (key != null and other != null) if (self.by_pair.getPtr(try batchPairKey(self.a, key.?, other.?))) |positions| try self.consume(positions, origin);
+            return;
+        }
+        var affected: std.StringHashMapUnmanaged(void) = .empty;
+        if (key) |value| try affected.put(self.a, value, {});
+        for (request.keys) |value| try affected.put(self.a, value, {});
+        if (request.add) |selection| for (selection.keys) |value| try affected.put(self.a, value, {});
+        if (request.remove) |selection| for (selection.keys) |value| try affected.put(self.a, value, {});
+        for (absorbed) |value| try affected.put(self.a, value.key, {});
+        var keys = affected.keyIterator();
+        while (keys.next()) |value| if (self.by_key.getPtr(value.*)) |positions| try self.consume(positions, origin);
+    }
+    pub fn values(self: SupersessionBatch) []const Proposal {
+        return self.edited orelse self.original;
+    }
+    /// An explicit reviewed decision overrides its own supersession without
+    /// copying terminal history again. Other queue records retain first cause.
+    pub fn decide(self: *SupersessionBatch, proposal: Proposal) !void {
+        const i = self.by_id.get(proposal.id) orelse return error.NotFound;
+        if (self.edited == null) self.edited = try self.a.dupe(Proposal, self.original);
+        self.edited.?[i].state = proposal.state;
+        self.edited.?[i].decided = proposal.decided;
+    }
+};
 /// Persist only terminal supersession receipts with a resolver mutation. The
 /// table queue keeps evidence; receipts retain just its stable identity.
 pub fn recordSupersessions(a: std.mem.Allocator, edit: *Plan, queue: []const Proposal, request: Request, origin: Origin) ![]const Proposal {
@@ -780,6 +852,8 @@ fn editSet(a: std.mem.Allocator, current: []const []const u8, changes: []const [
     return result;
 }
 pub const Index = struct {
+    configured_keys: std.StringHashMapUnmanaged(void) = .empty,
+    configured_texts: std.StringHashMapUnmanaged(void) = .empty,
     keys: std.StringHashMapUnmanaged(void) = .empty,
     texts: std.StringHashMapUnmanaged(void) = .empty,
     distinct: std.StringHashMapUnmanaged(void) = .empty,
@@ -833,15 +907,25 @@ pub const Index = struct {
             try self.distinct.put(a, try pairKey(a, redirects.canonical(key[0..split]), redirects.canonical(key[split + 1 ..])), {});
         }
     }
+    /// Borrow only immutable configured negatives; the owning resolver retains
+    /// their lease. Namespace facts and removed aliases remain request-local.
+    pub fn bindConfigured(self: *Index, configured: Index) void {
+        self.configured_keys = configured.keys;
+        self.configured_texts = configured.texts;
+        self.min_text_chars = @max(self.min_text_chars, configured.min_text_chars);
+    }
     pub fn textReason(self: Index, a: std.mem.Allocator, text: []const u8) !?Reason {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         const chars = std.unicode.utf8CountCodepoints(trimmed) catch return error.InvalidResolverSuppression;
         if (chars < self.min_text_chars) return .min_text_chars;
-        if (self.texts.count() > 0 and self.texts.contains(try normalize(a, text))) return .text;
+        if (self.texts.count() + self.configured_texts.count() > 0) {
+            const normalized = try normalize(a, text);
+            if (self.texts.contains(normalized) or self.configured_texts.contains(normalized)) return .text;
+        }
         return null;
     }
     pub fn keySuppressed(self: Index, key: []const u8) bool {
-        return self.keys.contains(key);
+        return self.keys.contains(key) or self.configured_keys.contains(key);
     }
     pub fn pinnedDistinct(self: Index, a: std.mem.Allocator, from: []const u8, to: []const u8) !bool {
         if (self.distinct.count() == 0) return false;
@@ -1249,4 +1333,51 @@ test "curation refresh replaces only open proposals and preserves queue identity
     }
     request.options.absorbed = .release;
     try std.testing.expectError(error.InvalidResolverCurationRequest, refreshProposal(a, next.state, &.{}, request, .{ .revision = 3 }));
+}
+
+test "curation supersession batch preserves sequential decisions and consumes each incidence once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const proposals = try a.alloc(Proposal, 128);
+    for (proposals, 0..) |*proposal, i| {
+        const target = try std.fmt.allocPrint(a, "target-{d}", .{i});
+        const action: EntityAction = if (i % 2 == 0) .merge else .distinct;
+        proposal.* = .{ .id = try proposalId(a, .{ .action = action, .key = "seed", .into = target }), .action = action, .key = "seed", .into = target, .origin = .{} };
+    }
+    var expected: []const Proposal = proposals;
+    var batch = try SupersessionBatch.init(a, proposals);
+    for (0..1000) |i| {
+        const request: Request = if (i == 0) .{ .action = .distinct, .key = "target-0", .to = "seed" } else .{ .action = .merge, .key = "seed", .to = "canonical" };
+        const origin: Origin = .{ .revision = @intCast(i + 1) };
+        expected = try supersede(a, expected, request, &.{}, origin);
+        try batch.apply(request, &.{}, origin);
+    }
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected, .{}), try std.json.Stringify.valueAlloc(a, batch.values(), .{}));
+    try std.testing.expect(batch.test_visits <= 2 * proposals.len);
+    try std.testing.expectEqual(@as(u64, 1), batch.values()[0].decided.?.revision);
+    var explicit = batch.values()[0];
+    explicit.state = .accepted;
+    try batch.decide(explicit);
+    try std.testing.expectEqual(ProposalState.accepted, batch.values()[0].state);
+}
+
+test "curation supersession batch does not copy terminal history across namespaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const proposals = try a.alloc(Proposal, 1024);
+    for (proposals, 0..) |*proposal, i| {
+        const target = try std.fmt.allocPrint(a, "target-{d}", .{i});
+        proposal.* = .{ .id = try proposalId(a, .{ .action = .merge, .key = "seed", .into = target }), .action = .merge, .key = "seed", .into = target, .origin = .{}, .state = .rejected, .decided = .{} };
+    }
+    try validateProposalQueue(.{ .proposals = proposals });
+    var batch = try SupersessionBatch.init(a, proposals);
+    const before = arena.queryCapacity();
+    for (0..1000) |_| try batch.apply(.{ .action = .merge, .key = "seed", .to = "canonical" }, &.{}, .{});
+    try std.testing.expect(batch.edited == null);
+    try std.testing.expect(batch.values().ptr == proposals.ptr);
+    try std.testing.expectEqual(@as(usize, 0), batch.test_visits);
+    try std.testing.expect(arena.queryCapacity() - before < 2 * 1024 * 1024);
+    std.debug.print("QUEUE BATCH namespaces=1000 history=1024 arena_added={d}\n", .{arena.queryCapacity() - before});
 }

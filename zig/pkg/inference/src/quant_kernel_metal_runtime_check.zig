@@ -1715,20 +1715,12 @@ fn splitGqaVariantEnvValue(variant: SplitGqaVariant) [*:0]const u8 {
     };
 }
 
-fn independentlyQualifiedM4Device() !bool {
+fn independentlyEligibleAppleDevice() !bool {
     var info: metal_runtime.MetalDeviceInfo = .{};
     if (metal_runtime.termite_metal_device_info_get(&info) != 0) {
         return error.MetalRuntimeUnavailable;
     }
-    var name_buffer: [4096]u8 = undefined;
-    const name_len = termite_metal_copy_device_name(null, 0);
-    if (name_len == 0 or name_len > name_buffer.len or
-        termite_metal_copy_device_name(name_buffer[0..].ptr, name_buffer.len) != name_len)
-    {
-        return error.MetalRuntimeUnavailable;
-    }
-    return info.apple_gpu_family == 9 and
-        std.mem.startsWith(u8, name_buffer[0..name_len], "Apple M4");
+    return info.apple_gpu_family >= 7;
 }
 
 fn runSplitGqaPolicyProbeChecks() !void {
@@ -2414,18 +2406,18 @@ fn runSplitGqaChecks(allocator: std.mem.Allocator) !void {
     const production_runtime = termite_metal_decode_runtime_create() orelse return error.MetalRuntimeUnavailable;
     defer termite_metal_decode_runtime_destroy(production_runtime);
     if (termite_metal_decode_runtime_ready(production_runtime) == 0) return error.MetalRuntimeUnavailable;
-    const independent_m4_qualification = try independentlyQualifiedM4Device();
+    const independent_apple_eligibility = try independentlyEligibleAppleDevice();
     const reported_device_default = termite_metal_pipelined_decode_frame_device_default() != 0;
-    if (reported_device_default != independent_m4_qualification) {
+    if (reported_device_default != independent_apple_eligibility) {
         std.debug.print(
-            "split GQA A4B device-default mismatch reported={} independent_m4={}\n",
-            .{ reported_device_default, independent_m4_qualification },
+            "split GQA A4B device-default mismatch reported={} independent_apple={}\n",
+            .{ reported_device_default, independent_apple_eligibility },
         );
         return error.GeneratedMetalKernelMismatch;
     }
     for (split_gqa_production_selection_checks) |selection| {
         const device_qualified = selection.check.shape.num_heads != 16 or
-            independent_m4_qualification;
+            independent_apple_eligibility;
         const expected_route = selection.expect_route and device_qualified;
         const expected_variant: ?SplitGqaVariant = if (expected_route) .s32_k32_r256 else null;
         const result = try runSplitGqaCheck(allocator, production_runtime, selection.check, expected_variant);

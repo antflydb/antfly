@@ -73,6 +73,7 @@ pub fn create(ctx: Context) Suite {
             .target = ctx.target,
             .optimize = ctx.optimize,
         });
+        standalone_readers_mod.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
         standalone_readers_mod.addImport("httpx", ctx.graph.httpx_mod);
         standalone_readers_mod.addImport("inference_api", ctx.graph.inference_api_mod);
         standalone_readers_mod.addImport("antfly_google", ctx.graph.google_mod);
@@ -82,6 +83,7 @@ pub fn create(ctx: Context) Suite {
         break :blk standalone_readers_mod;
     };
     tests.root_module.addImport("antfly_readers", readers_mod);
+    tests.root_module.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);

@@ -124,6 +124,13 @@ jobs:
     name: Build Zig archive (${{ matrix.artifact_name }})
     needs: release-plan
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Preparation and both product builds must use the same package cache.
+      ANTFLY_ZIG_CACHE_ROOT: ${{ github.workspace }}/.zig-cache/release-dependencies
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/release-dependencies/global
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.release-plan.outputs.matrix) }}
@@ -132,6 +139,18 @@ jobs:
         with:
           ref: ${{ inputs.source_commit }}
           submodules: true
+
+      - name: Check out pinned dependency preparation tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.build_controller_commit }}
+          path: release-controller
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
 
       - name: Install Linux build dependencies
         if: ${{ matrix.os == 'linux' }}
@@ -181,6 +200,11 @@ jobs:
 
       - name: Test reproducible archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
+
+      - name: Prepare verified release dependencies
+        uses: ./release-controller/.github/actions/prepare-zig-dependencies
+        with:
+          mirror-only: 'true'
 
       - name: Build source-declared runtime archives
         env:

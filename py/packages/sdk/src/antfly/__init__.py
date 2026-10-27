@@ -297,8 +297,10 @@ __all__ = [
 
 from .cypher import GraphOperations, decode_graph_value, encode_graph_parameter
 from .client_generated.models import (
+    EntityConsumerProgressPage,
     EntityCurationResult,
     EntityMergeRequest,
+    EntityNamespaceOutcome,
     GraphResolverSuppressionConfig,
     ResolverCurationState,
     ResolverList,
@@ -322,6 +324,8 @@ from .resolvers import CurationProposalOperations, EntityOperations, ResolverOpe
 
 __all__ += [
     "EntityCurationResult",
+    "EntityConsumerProgressPage",
+    "EntityNamespaceOutcome",
     "EntityMergeRequest",
     "GraphResolverSuppressionConfig",
     "ResolverCurationState",

@@ -13,6 +13,7 @@ from .client_generated.models import (
     CurationProposalDecisionResult,
     CurationProposalPage,
     CurationProposalRequest,
+    EntityConsumerProgressPage,
     EntityCurationResult,
     EntityDistinctRequest,
     EntityMergeRequest,
@@ -172,6 +173,17 @@ class EntityOperations:
 
     def in_namespace(self, database: str, namespace: str) -> EntityOperations:
         return EntityOperations(self._client, database, namespace)
+
+    def progress(
+        self, table: str, key: str, *, cursor: str | None = None, limit: int = 64
+    ) -> EntityConsumerProgressPage:
+        params = {"limit": limit, **({"cursor": cursor} if cursor is not None else {})}
+        value = self._client._request(
+            "GET",
+            self._prefix + f"/tables/{quote(table, safe='')}/entities/{quote(key, safe='')}/progress",
+            params=params,
+        )
+        return EntityConsumerProgressPage.from_dict(value)
 
     def state(self, table: str, key: str) -> EntityCurationResult:
         value = self._client._request(

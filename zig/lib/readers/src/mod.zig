@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
-pub const document_runs = @import("document_runs.zig");
+pub const document_runs = @import("antfly_document_runs");
 pub const document_failure = @import("document_failure.zig");
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
@@ -1868,6 +1868,6 @@ test "Vertex OCR preserves legacy defaults and respects pinned modern profiles" 
 
 pub const document_rpc = @import("document_rpc.zig");
 
-pub const testing = @import("document_test_store.zig");
+pub const testing = document_runs.testing;
 
 pub const document_stream = @import("document_stream.zig");

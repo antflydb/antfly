@@ -1421,6 +1421,10 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
         ));
         binding.written_tokens = rows;
 
+        // This fixture writes the physical prefix directly, bypassing the
+        // normal writer that establishes its logical row mapping.
+        binding.logical_contiguous = true;
+
         var decoded_keys: [rows * width]f32 = undefined;
         var decoded_values: [rows * width]f32 = undefined;
         try MetalKvStorage.gatherLayerKv(@ptrCast(owned), .{
@@ -1442,6 +1446,7 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .head_dim = head_dim,
             .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
             .scores_out = &gpu_scores,
+            .check_ctx = null,
             .check_fn = selectionTestNotCancelled,
         });
         const oracle = try selection.scoreConsumerNormalizedAttention(allocator, .{
@@ -1482,6 +1487,7 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .head_dim = head_dim,
             .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
             .scores_out = &compact_scores,
+            .check_ctx = null,
             .check_fn = selectionTestNotCancelled,
         });
         var compact_keys: [3 * width]f32 = undefined;

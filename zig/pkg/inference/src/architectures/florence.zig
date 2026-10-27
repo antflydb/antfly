@@ -791,7 +791,7 @@ fn encoderForwardTensorWhole(
     // Large encoder matrices benefit from the backend's bounded F16 mirrors
     // of quantized weights. Keep incremental decoding on its original path.
     const eager_mirrors = if (comptime build_options.enable_metal)
-        cb.kind() == .metal and @import("../backends/metal_runtime.zig").qualifiedM4FeatureEnabled("TERMITE_METAL_FLORENCE2_ENCODER_MIRRORS", true)
+        cb.kind() == .metal and @import("../backends/metal_runtime.zig").appleSimdgroupFeatureEnabled("TERMITE_METAL_FLORENCE2_ENCODER_MIRRORS", true)
     else
         false;
     if (eager_mirrors) cb.preferEagerQuantMirrors(true);

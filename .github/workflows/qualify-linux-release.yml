@@ -40,6 +40,9 @@ jobs:
       suite: linux-release
 
   archives:
+    permissions:
+      contents: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&

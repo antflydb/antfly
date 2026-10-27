@@ -27,6 +27,7 @@ fn createCpuComputeModule(ctx: Context, source: []const u8) *std.Build.Module {
         .link_libc = true,
         .imports = &.{
             .{ .name = "antfly_runtime_abi", .module = ctx.graph.runtime_abi_mod },
+            .{ .name = "antfly_document_runs", .module = ctx.graph.document_runs_mod },
             .{ .name = "ml", .module = ctx.graph.ml_mod },
             .{ .name = "antfly_platform", .module = ctx.graph.platform_mod },
             .{ .name = "inference_linalg", .module = ctx.graph.inference_linalg_mod },

@@ -5162,15 +5162,13 @@ fn cloneResolverReplayDiagnostics(alloc: std.mem.Allocator, stats: db_mod.types.
         errdefer alloc.free(source_artifact);
         const resolution_artifact = try alloc.dupe(u8, resolver.resolution_artifact);
         errdefer alloc.free(resolution_artifact);
-        resolvers[i] = .{
-            .name = name,
-            .config_generation = resolver.config_generation,
-            .effective_generation = resolver.effective_generation,
-            .curation_revision = resolver.curation_revision,
-            .table = table,
-            .source_artifact = source_artifact,
-            .resolution_artifact = resolution_artifact,
-        };
+        // Copy every scalar fence before replacing borrowed identity strings.
+        // New publication clocks must survive every cache/snapshot round trip.
+        resolvers[i] = resolver;
+        resolvers[i].name = name;
+        resolvers[i].table = table;
+        resolvers[i].source_artifact = source_artifact;
+        resolvers[i].resolution_artifact = resolution_artifact;
         initialized += 1;
     }
 
@@ -12305,4 +12303,30 @@ test "system catalog runtime status clones retain status names after JSON is rel
     try std.testing.expectEqualStrings("repair_required", cloned.enrichment.projection_checkpoint_status);
     try std.testing.expectEqualStrings("publishing_overdue", cloned.enrichment.stall_reason);
     try std.testing.expectEqualStrings("publishing", cloned.enrichment.active_phase);
+}
+
+test "resolver curation status cloning preserves every namespace publication fence" {
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    var source_live = true;
+    defer if (source_live) source.deinit();
+    const scratch = source.allocator();
+    const rows = try scratch.alloc(db_mod.types.ResolverReplayDiagnostic, 1);
+    rows[0] = .{ .name = try scratch.dupe(u8, "selected"), .table = try scratch.dupe(u8, "entities"), .source_artifact = try scratch.dupe(u8, "source"), .resolution_artifact = try scratch.dupe(u8, "resolved"), .config_generation = 7, .effective_generation = 9, .curation_revision = 11, .namespace_curation_generation = 13, .namespace_curation_table_id = 42, .namespace_curation_missing = true };
+    const snapshot: LocalTableRuntimeStatus = .{ .group_id = 5, .stats = .{ .resolver_replay = .{ .resolvers = rows } } };
+    var cloned = try snapshot.clone(a);
+    defer cloned.deinit(a);
+    source.deinit();
+    source_live = false;
+    const actual = cloned.stats.resolver_replay.resolvers[0];
+    try std.testing.expectEqualStrings("selected", actual.name);
+    try std.testing.expectEqual(@as(u64, 7), actual.config_generation);
+    try std.testing.expectEqual(@as(u64, 9), actual.effective_generation);
+    try std.testing.expectEqual(@as(u64, 11), actual.curation_revision);
+    try std.testing.expectEqual(@as(u64, 13), actual.namespace_curation_generation);
+    try std.testing.expectEqual(@as(u64, 42), actual.namespace_curation_table_id);
+    try std.testing.expect(actual.namespace_curation_missing);
+    var again = try cloned.clone(a);
+    defer again.deinit(a);
+    try std.testing.expectEqual(@as(u64, 13), again.stats.resolver_replay.resolvers[0].namespace_curation_generation);
 }

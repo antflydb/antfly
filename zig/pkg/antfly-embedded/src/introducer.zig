@@ -3675,7 +3675,7 @@ test "buildSegmentFromText omits multi-valued typed doc values" {
     try std.testing.expect((try reader.getSection("scores", .typed_doc_values)) == null);
 }
 
-test "buildSegmentFromText rejects multi-valued projected index sort field" {
+test "buildSegmentFromText declines sort metadata for multi-valued projected fields" {
     const alloc = std.testing.allocator;
 
     const typed_fields = [_]TypedFieldValue{
@@ -3695,7 +3695,7 @@ test "buildSegmentFromText rejects multi-valued projected index sort field" {
         .{ .field = "_id" },
     };
 
-    try std.testing.expectError(error.InvalidSegment, buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+    const bytes = try buildSegmentFromTextWithAnalysisOptions(alloc, &.{
         .{
             .id = "doc1",
             .stored_data = "{\"price\":10}",
@@ -3704,10 +3704,18 @@ test "buildSegmentFromText rejects multi-valued projected index sort field" {
         },
     }, &analysis_mod.default_analyzer, .{}, .{
         .index_sort = &index_sort,
-    }));
+    });
+    defer alloc.free(bytes);
+    var reader = try segment_mod.SegmentReader.init(alloc, bytes);
+    defer reader.deinit();
+    const sort_fields = try reader.indexSortFieldsAlloc(alloc);
+    defer if (sort_fields) |fields| segment_mod.freeIndexSortFields(alloc, fields);
+    try std.testing.expect(sort_fields == null);
+    try std.testing.expect((try reader.getSection("price", .typed_doc_values)) == null);
+    try std.testing.expectEqualStrings("doc1", (try reader.storedDoc(0)).?.id);
 }
 
-test "buildSegmentFromText rejects non-finite projected index sort field" {
+test "buildSegmentFromText rejects non-finite projected typed values" {
     const alloc = std.testing.allocator;
 
     const typed_fields = [_]TypedFieldValue{.{
@@ -3720,7 +3728,7 @@ test "buildSegmentFromText rejects non-finite projected index sort field" {
         .{ .field = "_id" },
     };
 
-    try std.testing.expectError(error.InvalidSegment, buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+    try std.testing.expectError(error.InvalidData, buildSegmentFromTextWithAnalysisOptions(alloc, &.{
         .{
             .id = "doc1",
             .stored_data = "{\"price\":10}",
