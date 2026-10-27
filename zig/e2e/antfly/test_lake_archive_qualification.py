@@ -1599,3 +1599,129 @@ def test_ordered_native_delivery_spans_packs_without_parquet_payloads(
                 unavailable.rename(parquet_object)
         finally:
             client.session.close()
+
+
+def test_native_source_column_batches_preserve_wide_projections_and_hidden_highlights(
+    tmp_path,
+):
+    """Cross batch/chunk boundaries without physical source or hidden-field leaks."""
+    import importlib.util
+
+    import conftest as harness
+
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
+    if not binary.is_file():
+        pytest.skip("Build the Antfly binary first")
+    spec = importlib.util.spec_from_file_location(
+        "column_batch_e2e",
+        Path(__file__).resolve().parents[2] / "tools" / "benchmark_lake_archive.py",
+    )
+    bench = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bench
+    spec.loader.exec_module(bench)
+    count = 128
+    data = {
+        "id": list(range(count)),
+        "bucket": [i // 16 for i in range(count)],
+        "body": ["common needle"] * count,
+        "note": [f"unrelated {i} " + "n" * 4096 for i in range(count)],
+        "counter": [None if i % 7 == 0 else 9007199254740993 + i for i in range(count)],
+        "payload": ["p" * 8192] * count,
+    }
+    archive = tmp_path / "archive.parquet"
+    pq.write_table(pa.table(data), archive, row_group_size=16, use_dictionary=False)
+    fixture_root = tmp_path / "fixture"
+    fixture = bench.import_fixture(fixture_root, [archive], "column-batch-e2e")
+    properties = {
+        name: {
+            "type": "integer",
+            "x-antfly-field": {"type": "number", "sortable": True},
+        }
+        for name in ("id", "bucket", "counter")
+    }
+    properties.update(
+        body={"type": "string", "x-antfly-field": {"type": "text"}},
+        note={"type": "string", "x-antfly-field": {"type": "text"}},
+        payload={"type": "string", "x-antfly-field": {"type": "text", "index": False}},
+    )
+    definition = {
+        "schema": {
+            "storage_mode": "relational",
+            "default_type": "row",
+            "base_source": {
+                "kind": "external",
+                "format": "parquet",
+                "table_id": "column-batch-e2e",
+                "object_mutability": "immutable",
+                "uri": fixture["manifest_uri"],
+                "row_identity": {"key_columns": ["id"]},
+            },
+            "document_schemas": {
+                "row": {"schema": {"type": "object", "properties": properties}}
+            },
+            "index_sort": [{"field": name, "order": "asc"} for name in ("id", "_id")],
+        },
+        "indexes": {"text": {"type": "full_text", "store_source": True}},
+    }
+    config = _write_remote_content_e2e_config(tmp_path)
+    with bench.managed_server(
+        harness.StandaloneAntflyServer,
+        binary,
+        config,
+        tmp_path,
+        api_root=harness.ANTFLY_PUBLIC_API_ROOT,
+    ) as server:
+        client = bench.Client(server, 120)
+        try:
+            client.call("POST", f"/tables/{bench.TABLE}", definition)
+            client.ready(bench.readiness_indexes({"definition": definition}))
+            original = (
+                fixture_root / "buckets" / "antfly" / "objects" / "import-0.parquet"
+            )
+            unavailable = original.with_suffix(".unavailable")
+            original.rename(unavailable)
+            try:
+                for restarted in (False, True):
+                    if restarted:
+                        server.restart()
+                    for descending in (False, True):
+                        ids = (
+                            list(reversed(range(count)))
+                            if descending
+                            else list(range(count))
+                        )
+                        request = {
+                            "full_text_search": {"match": "needle", "field": "body"},
+                            "fields": ["id", "bucket", "body", "note", "counter"],
+                            "order_by": [{"field": "id", "desc": descending}],
+                            "limit": 96,
+                        }
+                        first = client.query({"request": request})["hits"]["hits"]
+                        second = client.query(
+                            {"request": dict(request, search_after=first[-1]["_sort"])}
+                        )["hits"]["hits"]
+                        hits = first + second
+                        assert [hit["_source"]["id"] for hit in hits] == ids
+                        for hit in hits:
+                            row = hit["_source"]
+                            assert set(row) == set(request["fields"])
+                            for name in request["fields"]:
+                                assert row[name] == data[name][row["id"]]
+                        hidden = client.query(
+                            {
+                                "request": dict(
+                                    request,
+                                    fields=["id"],
+                                    highlight={"fields": ["body"]},
+                                )
+                            }
+                        )["hits"]["hits"]
+                        for hit in hidden:
+                            assert set(hit["_source"]) == {"id"}
+                            assert hit["_highlights"]["body"]
+            finally:
+                unavailable.rename(original)
+        finally:
+            client.session.close()

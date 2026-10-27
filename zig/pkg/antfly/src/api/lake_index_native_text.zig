@@ -73,10 +73,10 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     }
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
-    // v3 stores the complete declared row in independent typed source columns,
-    // including fields excluded from text indexing. Old monolithic recipes
-    // cannot attest this projection capability and are rebuilt.
-    hash.update("native-lake-text-stored-source-v3");
+    // v4 adds authenticated chunk row ranges to independent typed source columns.
+    // Its producer attests direct projection and sequential merge navigation,
+    // including fields excluded from text indexing.
+    hash.update("native-lake-text-stored-source-v4");
     hash.update(&original);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
@@ -1262,7 +1262,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer local.introducer.freeTextAnalysisConfig(a, analysis);
         var batch_arena = std.heap.ArenaAllocator.init(a);
         defer batch_arena.deinit();
-        var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+        var builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
         var file_arena = std.heap.ArenaAllocator.init(a);
         defer file_arena.deinit();
         var patch_serving: ?Root = null;
@@ -1440,7 +1440,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
                         leases.clear();
                         _ = batch_arena.reset(.free_all);
-                        builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                        builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                     const batch = (rows.next(a) catch |err| return buildFailure(err, "read_rows", file_ordinal, segments.items.len)) orelse break;
@@ -1460,7 +1460,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
                         leases.clear();
                         _ = batch_arena.reset(.free_all);
-                        builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                        builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     };
                     for (0..batch.rowCount()) |row| {
@@ -1485,7 +1485,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                             if (retained) try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source) else try flush(&compactor, builder.batch(), analysis, store_source);
                             leases.clear();
                             _ = batch_arena.reset(.free_all);
-                            builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                            builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
                             input_bytes = 0;
                         }
                     }
@@ -1518,7 +1518,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         ordinals = physical.Builder.init(a, fa, store, cancellation);
                         leases.clear();
                         _ = batch_arena.reset(.free_all);
-                        builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                        builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                         previous_id = null;
                         continue;
@@ -1552,7 +1552,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             group.admissions = admissions.items;
             group.sort_bounds = if (sort_bounds.items.len == segments.items.len) sort_bounds.items else &.{};
             _ = batch_arena.reset(.free_all);
-            builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+            builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
             if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
             try group.validate(store.upload_scope.?.domain);

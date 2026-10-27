@@ -4247,7 +4247,7 @@ fn writeMergedSourceColumn(a: Allocator, sink: *SegmentSink, inputs: []const Mer
         any = true;
     };
     if (!any) return false;
-    var writer = dv.StreamingWriter.init(a, sink, 1024);
+    var writer = dv.StreamingWriter.initIndexed(a, sink, 1024);
     defer writer.deinit();
     var ordinal: u32 = 0;
     if (order) |records| {

@@ -1115,14 +1115,30 @@ const Execution = struct {
             a.free(items);
         };
         if (self.use_stored_highlights) {
-            if (self.highlight_locations.count() != 0) {
-                var prepared = try search.PreparedHighlights.init(a, options, self.highlight_queries.?);
-                defer prepared.deinit();
-                try self.attachLocatedHighlights(a, &prepared, result.hits);
-            } else {
-                var prepared = try search.PreparedHighlights.init(a, options, self.highlight_queries.?);
-                defer prepared.deinit();
-                try self.attachPinnedHighlights(a, &prepared, result.hits);
+            var prepared = try search.PreparedHighlights.init(a, options, self.highlight_queries.?);
+            defer prepared.deinit();
+            const fields = try self.highlightHydrationFields(a, &prepared);
+            defer a.free(fields);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            var all_covered = true;
+            for (result.hits) |*hit| {
+                const value = hit.source_value orelse {
+                    all_covered = false;
+                    continue;
+                };
+                const covered = for (fields) |field| {
+                    if (local.api_json_helpers.extractJsonPathValue(value, field) == null) break false;
+                } else true;
+                if (!covered) {
+                    all_covered = false;
+                    continue;
+                }
+                _ = scratch.reset(.retain_capacity);
+                try prepared.attachValue(a, scratch.allocator(), hit, value);
+            }
+            if (!all_covered) {
+                if (self.highlight_locations.count() != 0) try self.attachLocatedHighlights(a, &prepared, result.hits) else try self.attachPinnedHighlights(a, &prepared, result.hits);
             }
             try self.context.ensureActive();
             return;
@@ -1136,6 +1152,8 @@ const Execution = struct {
         try self.context.ensureActive();
     }
     fn attachPinnedHighlights(self: *Execution, a: A, prepared: *const search.PreparedHighlights, hits: []types.SearchHit) !void {
+        const fields = try self.highlightHydrationFields(a, prepared);
+        defer a.free(fields);
         if (self.highlight_pins.items.len == 0) {
             var pin = if (self.delivery_pin) |*ranked| try ranked.clone() else (try self.acquireForText(self.highlight_index, self.highlight_queries.?[0].query)) orelse return error.InvalidNativeLakeTextCorpus;
             errdefer pin.deinit();
@@ -1170,27 +1188,32 @@ const Execution = struct {
         var hydrator = @import("lake_index_source_projection.zig").Hydrator.init(a);
         defer hydrator.deinit();
         for (winners) |winner| {
+            if (hits[winner.index].highlights.len != 0) continue;
             try self.context.ensureActive();
             _ = input.reset(.retain_capacity);
-            try self.attachStoredSnippet(a, input.allocator(), prepared, &hydrator, pin.snapshot, winner.ordinal, &hits[winner.index]);
+            try self.attachStoredSnippet(a, input.allocator(), prepared, &hydrator, pin.snapshot, winner.ordinal, &hits[winner.index], fields);
         }
     }
-    fn attachStoredSnippet(self: *Execution, a: A, scratch: A, prepared: *const search.PreparedHighlights, hydrator: *@import("lake_index_source_projection.zig").Hydrator, snapshot: *const local.index.IndexSnapshot, ordinal: u32, hit: *types.SearchHit) !void {
-        const expected = try nativeKey(self, scratch, hit.id);
+    fn highlightHydrationFields(self: *Execution, a: A, prepared: *const search.PreparedHighlights) ![]const []const u8 {
         var fields: std.ArrayList([]const u8) = .empty;
-        try appendHydrationPath(scratch, self.table, &fields, "_type");
-        for (prepared.options.fields) |field| try appendHydrationPath(scratch, self.table, &fields, field);
-        for (prepared.indexed_queries) |query| if (!try appendIndexHydration(scratch, self.table, &fields, query)) {
-            for (self.table.columns) |column| try appendHydrationPath(scratch, self.table, &fields, column.path);
-            break;
-        };
+        errdefer fields.deinit(a);
+        try appendHydrationPath(a, self.table, &fields, "_type");
+        if (prepared.source_fields) |paths| {
+            for (paths) |path| try appendHydrationPath(a, self.table, &fields, path);
+        } else for (self.table.columns) |column| try appendHydrationPath(a, self.table, &fields, column.path);
+        return fields.toOwnedSlice(a);
+    }
+    fn attachStoredSnippet(self: *Execution, a: A, scratch: A, prepared: *const search.PreparedHighlights, hydrator: *@import("lake_index_source_projection.zig").Hydrator, snapshot: *const local.index.IndexSnapshot, ordinal: u32, hit: *types.SearchHit, fields: []const []const u8) !void {
+        const expected = try nativeKey(self, scratch, hit.id);
         var value: std.json.Value = .{ .object = .empty };
-        try hydrator.append(scratch, snapshot, ordinal, expected, fields.items, &value);
+        try hydrator.append(scratch, snapshot, ordinal, expected, fields, &value);
         try prepared.attachValue(a, scratch, hit, value);
     }
     /// Sort a compact permutation, retaining result order and only one reader
     /// and decoded stored block. Hidden source is released after each snippet.
     fn attachLocatedHighlights(self: *Execution, a: A, prepared: *const search.PreparedHighlights, hits: []types.SearchHit) !void {
+        const fields = try self.highlightHydrationFields(a, prepared);
+        defer a.free(fields);
         const Winner = struct { index: usize, location: StoredTextLocation };
         const winners = try a.alloc(Winner, hits.len);
         defer a.free(winners);
@@ -1224,12 +1247,13 @@ const Execution = struct {
             var hydrator = @import("lake_index_source_projection.zig").Hydrator.init(a);
             defer hydrator.deinit();
             for (winners[begin..end], begin..) |winner, position| {
+                if (hits[winner.index].highlights.len != 0) continue;
                 for (winners[position..@min(end, position + 4)]) |upcoming| try pin.snapshot.prefetchStoredDoc(upcoming.location.document);
                 try self.context.ensureActive();
                 _ = input.reset(.retain_capacity);
                 const ia = input.allocator();
                 const page = hits[winner.index .. winner.index + 1];
-                try self.attachStoredSnippet(a, ia, prepared, &hydrator, pin.snapshot, winner.location.document, &page[0]);
+                try self.attachStoredSnippet(a, ia, prepared, &hydrator, pin.snapshot, winner.location.document, &page[0], fields);
             }
             begin = end;
         }
@@ -1378,15 +1402,21 @@ const Execution = struct {
         if (stored_fields.len != 0) {
             const started = @import("antfly_platform").time.monotonicNs();
             defer self.server.lake_query_metrics.record(.hydration_native, started);
-            for (values, 0..) |*value, position| {
-                const hit = hits.at(position);
+            var offset: usize = 0;
+            while (offset < values.len) {
                 try self.context.ensureActive();
-                // Keep a small lookahead through the current snapshot's bounded
-                // source queue. Required reads still authenticate and report errors.
-                for (position..@min(hits.len(), position + 4)) |upcoming| try pin.?.snapshot.prefetchStoredDoc(hits.at(upcoming).native_text_doc_id.?);
-                const key = try nativeKey(self, a, hit.id);
-                defer a.free(key);
-                if (value.*) |*row| try hydrator.append(a, pin.?.snapshot, hit.native_text_doc_id.?, key, stored_fields, row) else return error.StoredDocMissing;
+                const end = @min(values.len, offset + projection.Hydrator.batch_limit);
+                var docs: [projection.Hydrator.batch_limit]u32 = undefined;
+                var native_keys: [projection.Hydrator.batch_limit][]const u8 = undefined;
+                var scratch = std.heap.ArenaAllocator.init(a);
+                defer scratch.deinit();
+                for (offset..end, 0..) |position, i| {
+                    const hit = hits.at(position);
+                    docs[i] = hit.native_text_doc_id.?;
+                    native_keys[i] = try nativeKey(self, scratch.allocator(), hit.id);
+                }
+                try hydrator.appendBatch(a, pin.?.snapshot, docs[0 .. end - offset], native_keys[0 .. end - offset], stored_fields, values[offset..end]);
+                offset = end;
             }
         }
         for (values, 0..) |*value, index| {

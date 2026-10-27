@@ -532,6 +532,8 @@ pub const TextDocument = struct {
     typed_fields: ?[]const TypedFieldValue = null,
     typed_source: ?std.json.Value = null,
     stored_source: ?std.json.Value = null,
+    /// Exact typed source size for columnar builders without a JSON body.
+    stored_source_bytes: u64 = 0,
 };
 
 pub const TextField = struct {
@@ -713,6 +715,7 @@ fn estimateTypedSourceBytes(doc: TextDocument, value: std.json.Value, include_al
 
 fn estimateTextDocumentInputBytes(doc: TextDocument) u64 {
     var total: u64 = @intCast(doc.id.len + doc.stored_data.len);
+    if (doc.stored_source_bytes != 0) total +|= estimateTypedSourceBytes(doc, doc.stored_source.?, false);
     total +|= @as(u64, @intCast(doc.text_fields.len)) * (@sizeOf(TextField) + 16);
     for (doc.text_fields) |field| {
         total +|= @intCast(field.field_name.len + field.text.len);
@@ -723,12 +726,14 @@ fn estimateTextDocumentInputBytes(doc: TextDocument) u64 {
             total +|= @intCast(field.field_name.len);
             if (field.value == .bytes_val and !aliasesInput(doc, field.value.bytes_val)) total +|= @intCast(field.value.bytes_val.len);
         }
-    } else if (doc.typed_source) |source| total +|= estimateTypedSourceBytes(doc, source, false);
+    } else if (doc.stored_source_bytes == 0) {
+        if (doc.typed_source) |source| total +|= estimateTypedSourceBytes(doc, source, false);
+    }
     return total;
 }
 
 pub fn estimateTextDocumentSegmentBytes(doc: TextDocument) u64 {
-    var total: u64 = 64 + @as(u64, @intCast(doc.id.len + doc.stored_data.len));
+    var total: u64 = 64 + @as(u64, @intCast(doc.id.len)) + @max(doc.stored_data.len, doc.stored_source_bytes);
     for (doc.text_fields) |field| {
         total +|= 16 + @as(u64, @intCast(field.field_name.len + field.text.len));
     }
@@ -831,7 +836,7 @@ pub fn splitTextDocumentsForBuildBudget(
 fn estimateStoredDocBytes(docs: []const TextDocument) u64 {
     var total: u64 = 0;
     for (docs) |doc| {
-        total +|= @intCast(doc.id.len + doc.stored_data.len);
+        total +|= @as(u64, @intCast(doc.id.len)) + @max(doc.stored_data.len, doc.stored_source_bytes);
         total +|= 32;
     }
     return total;
@@ -1608,7 +1613,7 @@ fn textDocumentSortValueAlloc(
         if (found) |value| return try textIndexSortValueFromTypedValueAlloc(alloc, value);
         // Explicit projections must not attest omitted non-null source values
         // as null coverage. The encoder consumes this same typed projection.
-        if (doc.typed_source) |source| {
+        if (doc.typed_source orelse doc.stored_source) |source| {
             if (jsonPathValue(source, field)) |value| if (value != .null) return error.UnsupportedTypedDocValues;
             return .null_value;
         }
@@ -1943,14 +1948,14 @@ const SourceColumnProducer = struct {
     field: []const u8,
     fn write(a: Allocator, raw: *anyopaque, sink: *segment_mod.SegmentSink) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        var writer = @import("section/doc_values.zig").StreamingWriter.init(a, sink, 1024);
+        var writer = @import("section/doc_values.zig").StreamingWriter.initIndexed(a, sink, 1024);
         defer writer.deinit();
         for (0..self.docs.len) |i| {
             const doc = self.docs[if (self.order.len != 0) self.order[i].doc_index else i];
             const value = doc.stored_source.?.object.get(self.field) orelse continue;
             // Input rows remain leased; one encoded value and one raw/compressed
             // field chunk coexist. Reserve that scratch under the build owner.
-            try self.state.adjust(3 *| (@as(u64, @intCast(doc.stored_data.len)) +| 64 * 1024));
+            try self.state.adjust(3 *| (@max(@as(u64, @intCast(doc.stored_data.len)), doc.stored_source_bytes) +| 64 * 1024));
             const bytes = try @import("storage/typed_json.zig").encodeBinary(a, value);
             defer a.free(bytes);
             try writer.add(@intCast(i), bytes);

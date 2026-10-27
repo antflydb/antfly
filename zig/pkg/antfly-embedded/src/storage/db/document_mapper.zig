@@ -964,6 +964,7 @@ pub const TextProjectionBatchBuilder = struct {
     schema: ?runtime_schema.TableSchema,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
     selected_field: ?[]const u8 = null,
+    store_source_columns: bool = false,
     text_docs: std.ArrayListUnmanaged(introducer_mod.TextDocument) = .empty,
 
     pub fn init(
@@ -989,6 +990,12 @@ pub const TextProjectionBatchBuilder = struct {
     ) TextProjectionBatchBuilder {
         var builder = init(arena, text_analysis, schema, observed_field_analyzers);
         builder.selected_field = selected_field;
+        return builder;
+    }
+
+    pub fn initWithSourceColumns(arena: Allocator, text_analysis: introducer_mod.TextAnalysisConfig, schema: ?runtime_schema.TableSchema, observed: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer), selected: ?[]const u8) TextProjectionBatchBuilder {
+        var builder = initWithSelectedField(arena, text_analysis, schema, observed, selected);
+        builder.store_source_columns = true;
         return builder;
     }
 
@@ -1036,8 +1043,9 @@ pub const TextProjectionBatchBuilder = struct {
             .index_sort_values = order.values,
             .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
-            .stored_data = doc.stored_data,
+            .stored_data = if (self.store_source_columns) "" else doc.stored_data,
             .stored_source = doc.typed_source,
+            .stored_source_bytes = if (self.store_source_columns and doc.typed_source != null) try @import("../typed_json.zig").encodedSize(doc.typed_source.?) else 0,
             .doc_ordinal = doc.doc_ordinal,
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
@@ -1079,8 +1087,8 @@ pub const TextProjectionBatchBuilder = struct {
             try putTextProjectionPath(self.arena, &root, path, value);
             if (value == .string) input_bytes +|= value.string.len;
         }
-        const stored = if (store_source) try std.json.Stringify.valueAlloc(self.arena, root, .{}) else "";
-        input_bytes +|= stored.len;
+        const stored = if (store_source and !self.store_source_columns) try std.json.Stringify.valueAlloc(self.arena, root, .{}) else "";
+        input_bytes +|= if (store_source and self.store_source_columns) @as(usize, @intCast(try @import("../typed_json.zig").encodedSize(root))) else stored.len;
         try self.appendSourceDoc(.{ .key = key, .root = root, .stored_data = stored, .typed_source = if (store_source) root else null });
         return input_bytes;
     }
@@ -1519,7 +1527,7 @@ pub fn splitProjectionDocsEnd(docs: []const introducer_mod.TextDocument, start: 
 }
 
 fn estimateProjectedTextDocBytes(doc: introducer_mod.TextDocument) usize {
-    var total: usize = 64 + doc.id.len + doc.stored_data.len;
+    var total: usize = 64 + doc.id.len + @max(doc.stored_data.len, @as(usize, @intCast(doc.stored_source_bytes)));
     for (doc.text_fields) |field| {
         total +|= 16 + field.field_name.len + field.text.len;
     }
@@ -7365,4 +7373,28 @@ test "observed physical ordering preserves literal dotted typed fields and rejec
         try std.testing.expectEqual(i != 2, doc.index_sort_projection_valid);
         if (i < 2) try std.testing.expectEqualStrings(if (i == 0) "z" else "a", doc.index_sort_values[0].value.bytes_val);
     }
+}
+
+test "external lake bounded window profiles native source column inputs keep typed values and byte admission without JSON" {
+    const a = std.testing.allocator;
+    const columns = @import("../rowsource/types.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    const payload = try sa.alloc(u8, 256 * 1024);
+    @memset(payload, 'x');
+    const batch_: columns.ColumnBatch = .{
+        .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
+        .row_refs = &.{.{ .relational_key = "a" }},
+        .columns = &.{ .{ .name = "body", .values = .{ .bytes = &.{"needle"} } }, .{ .name = "payload", .values = .{ .bytes = &.{payload} } } },
+    };
+    var builder = TextProjectionBatchBuilder.initWithSourceColumns(sa, .{}, null, null, "body");
+    defer builder.deinit();
+    const bytes = try builder.appendColumnRow(try TextColumnProjection.bind(sa, batch_, &.{ "body", "payload" }), 0, "a", true, true);
+    const doc = builder.batch().docs[0];
+    try std.testing.expectEqual(@as(usize, 0), doc.stored_data.len);
+    try std.testing.expectEqualStrings(payload, doc.stored_source.?.object.get("payload").?.string);
+    try std.testing.expect(doc.stored_source_bytes > payload.len and bytes >= payload.len);
+    try std.testing.expect(introducer_mod.estimateTextDocumentSegmentBytes(doc) >= payload.len);
+    try std.testing.expect(introducer_mod.estimateTextDocumentBuildMemoryBytes(doc) >= payload.len);
 }

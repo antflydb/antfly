@@ -22033,6 +22033,8 @@ pub const PreparedHighlights = struct {
     entries: []const HighlightMatcherEntry,
     indexed_queries: []const HighlightQuery,
     options: types.HighlightRequest,
+    /// Null conservatively requires complete source for dynamic mappings.
+    source_fields: ?[]const []const u8,
     pub fn init(alloc: Allocator, options: types.HighlightRequest, indexed_queries: []const HighlightQuery) !PreparedHighlights {
         const owner = try alloc.create(std.heap.ArenaAllocator);
         owner.* = .init(alloc);
@@ -22048,7 +22050,38 @@ pub const PreparedHighlights = struct {
             try collectHighlightMatchers(arena, lowered, indexed, &entries);
             for (entries.items[start..]) |*entry| entry.query_index = index;
         }
-        return .{ .arena = owner, .entries = entries.items, .indexed_queries = indexed_queries, .options = options };
+        return .{ .arena = owner, .entries = entries.items, .indexed_queries = indexed_queries, .options = options, .source_fields = try sourceFields(arena, options, indexed_queries, entries.items) };
+    }
+    fn sourceFields(a: Allocator, options: types.HighlightRequest, queries: []const HighlightQuery, entries: []const HighlightMatcherEntry) !?[]const []const u8 {
+        if (options.fields.len != 0) return options.fields;
+        var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (entries) |entry| {
+            const query = queries[entry.query_index];
+            if (query.selected_field) |selected| {
+                try appendPath(a, &paths, selected);
+                continue;
+            }
+            const schema = query.runtime_schema orelse return null;
+            if (schema.dynamic_templates.len != 0 or schema.full_text_documents.len == 0) return null;
+            var mapped = false;
+            for (schema.exact_fields) |field| if (std.mem.eql(u8, field.field, entry.indexed_field)) {
+                try appendPath(a, &paths, field.source_field);
+                mapped = true;
+            };
+            for (schema.full_text_documents) |document| {
+                if (document.dynamic_rules.len != 0 or document.open_dynamic_paths.len != 0 or document.infer_type_dynamic_paths.len != 0) return null;
+                for (document.fields) |field| if (std.mem.eql(u8, field.emitted_name, entry.indexed_field) or (field.include_in_all and std.mem.eql(u8, entry.indexed_field, "_all"))) {
+                    try appendPath(a, &paths, field.path);
+                    mapped = true;
+                };
+            }
+            if (!mapped) return null;
+        }
+        return paths.items;
+    }
+    fn appendPath(a: Allocator, paths: *std.ArrayListUnmanaged([]const u8), path: []const u8) !void {
+        for (paths.items) |prior| if (std.mem.eql(u8, prior, path)) return;
+        try paths.append(a, path);
     }
     pub fn deinit(self: *PreparedHighlights) void {
         const a = self.arena.child_allocator;
@@ -37741,4 +37774,33 @@ test "producer top k proven empty segment skips optional posting materialization
     var allowed: [2]bool = undefined;
     try segment.containsMany(&.{ 12, 17 }, &allowed);
     try std.testing.expectEqualSlices(bool, &.{ false, false }, &allowed);
+}
+
+test "external lake bounded window profiles prepared highlight dependencies preserve aliases and explicit source projection" {
+    const a = std.testing.allocator;
+    const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{
+        .{ .path = "body", .emitted_name = "body_alias", .analyzer = "standard" },
+        .{ .path = "large_unrelated", .emitted_name = "large_unrelated", .analyzer = "standard" },
+    } }} };
+    const queries = [_]HighlightQuery{.{ .query = .{ .match = .{ .field = "body_alias", .text = "needle" } }, .text_analysis = .{}, .runtime_schema = schema }};
+    var automatic = try PreparedHighlights.init(a, .{}, &queries);
+    defer automatic.deinit();
+    try std.testing.expectEqual(@as(usize, 1), automatic.source_fields.?.len);
+    try std.testing.expectEqualStrings("body", automatic.source_fields.?[0]);
+    var explicit = try PreparedHighlights.init(a, .{ .fields = &.{"body"} }, &queries);
+    defer explicit.deinit();
+    try std.testing.expectEqual(@as(usize, 1), explicit.source_fields.?.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"body\":\"a needle here\"}", .{});
+    defer parsed.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var hit: types.SearchHit = .{ .id = try a.dupe(u8, "one") };
+    defer hit.deinit(a);
+    try explicit.attachValue(a, scratch.allocator(), &hit, parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), hit.highlights.len);
+    try std.testing.expectEqualStrings("body", hit.highlights[0].field);
+    const unknown = [_]HighlightQuery{.{ .query = .{ .match = .{ .field = "body", .text = "needle" } }, .text_analysis = .{}, .runtime_schema = null }};
+    var conservative = try PreparedHighlights.init(a, .{}, &unknown);
+    defer conservative.deinit();
+    try std.testing.expect(conservative.source_fields == null);
 }

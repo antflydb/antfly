@@ -51,6 +51,7 @@ pub const Hydrator = struct {
     columns: [4]?Column = @splat(null),
     tick: u64 = 0,
     column_values: usize = 0,
+    column_opens: usize = 0,
 
     pub fn init(a: A) Hydrator {
         return .{ .blocks = .init(a, 1024 * 1024) };
@@ -85,45 +86,77 @@ pub const Hydrator = struct {
             previous.cursor.deinit();
             a.free(previous.name);
         }
+        self.column_opens += 1;
         self.columns[oldest] = .{ .reader = reader, .name = owned, .cursor = Cursor.init(scoped), .used = self.tick };
         return &self.columns[oldest].?.cursor;
     }
-    pub fn append(self: *Hydrator, a: A, snapshot: *const local.index.IndexSnapshot, doc: u32, expected_key: []const u8, fields: []const []const u8, target: *std.json.Value) !void {
-        const resolved = snapshot.resolveDocId(doc) orelse return error.InvalidNativeLakeTextCorpus;
-        const segment = try snapshot.readSegment(resolved.seg_idx);
+    pub const batch_limit = 64;
+    /// Process one field across a bounded, ordinal-sorted winner permutation.
+    /// Result positions stay unchanged and a wide projection needs no wider
+    /// cursor cache. Each legacy row is parsed once for the complete projection.
+    pub fn appendBatch(self: *Hydrator, a: A, snapshot: *const local.index.IndexSnapshot, docs: []const u32, expected_keys: []const []const u8, fields: []const []const u8, targets: []?std.json.Value) !void {
+        if (docs.len > batch_limit or docs.len != targets.len or docs.len != expected_keys.len) return error.InvalidNativeLakeTextCorpus;
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
-        const sa = scratch.allocator();
-        const id = (try segment.reader.storedIdScoped(sa, resolved.local_id)) orelse return error.InvalidNativeLakeTextCorpus;
-        if (!std.mem.eql(u8, id, expected_key)) return error.ExternalLakeSnapshotMismatch;
-        var remaining: std.ArrayList([]const u8) = .empty;
-        defer remaining.deinit(a);
-        for (fields) |field| {
-            var path = field;
-            var tail: ?[]const u8 = null;
-            var cursor = try self.column(&segment.reader, path);
-            if (cursor == null) if (std.mem.indexOfScalar(u8, field, '.')) |dot| {
-                path = field[0..dot];
-                tail = field[dot + 1 ..];
-                cursor = try self.column(&segment.reader, path);
+        var legacy: [batch_limit]bool = @splat(false);
+        var permutation: [batch_limit]usize = undefined;
+        for (docs, 0..) |doc, i| {
+            permutation[i] = i;
+            _ = scratch.reset(.retain_capacity);
+            const resolved = snapshot.resolveDocId(doc) orelse return error.InvalidNativeLakeTextCorpus;
+            const segment = try snapshot.readSegment(resolved.seg_idx);
+            const id = (try segment.reader.storedIdScoped(scratch.allocator(), resolved.local_id)) orelse return error.InvalidNativeLakeTextCorpus;
+            if (!std.mem.eql(u8, id, expected_keys[i])) return error.ExternalLakeSnapshotMismatch;
+            if (targets[i] == null or targets[i].? != .object) return error.InvalidNativeLakeTextCorpus;
+            const columnar = block: {
+                for (segment.reader.fields) |field| for (field.sections) |section| {
+                    if (section.section_type == .columnar_stored) break :block true;
+                };
+                break :block false;
             };
-            const bytes = if (cursor) |value| try value.get(resolved.local_id) else null;
-            if (bytes) |encoded| {
-                const root = try local.storage_typed_json.decodeBinary(sa, encoded);
+            if (!columnar) {
+                legacy[i] = true;
+                const stored = (try snapshot.storedDocWithBlockCache(&self.blocks, doc)) orelse return error.InvalidNativeLakeTextCorpus;
+                try appendStoredValue(a, stored.id, stored.data, expected_keys[i], fields, &targets[i].?);
+            }
+        }
+        std.mem.sort(usize, permutation[0..docs.len], docs, struct {
+            fn less(ordinals: []const u32, l: usize, r: usize) bool {
+                return ordinals[l] < ordinals[r];
+            }
+        }.less);
+        for (fields) |field| for (permutation[0..docs.len]) |i| {
+            if (legacy[i]) continue;
+            _ = scratch.reset(.retain_capacity);
+            const resolved = snapshot.resolveDocId(docs[i]).?;
+            const segment = try snapshot.readSegment(resolved.seg_idx);
+            var tail: ?[]const u8 = null;
+            var cursor = try self.column(&segment.reader, field);
+            if (cursor == null) if (std.mem.indexOfScalar(u8, field, '.')) |dot| {
+                tail = field[dot + 1 ..];
+                cursor = try self.column(&segment.reader, field[0..dot]);
+            };
+            if (if (cursor) |value| try value.get(resolved.local_id) else null) |encoded| {
+                const root = try local.storage_typed_json.decodeBinary(scratch.allocator(), encoded);
                 const value = if (tail) |suffix| local.api_json_helpers.extractJsonPathValue(root, suffix) orelse return error.InvalidNativeLakeTextCorpus else root;
-                if (target.* != .object or target.object.contains(field)) return error.InvalidNativeLakeTextCorpus;
+                const target = &targets[i].?;
+                if (target.object.contains(field)) return error.InvalidNativeLakeTextCorpus;
                 const key = try a.dupe(u8, field);
                 errdefer a.free(key);
                 var owned = try local.storage_db_types.cloneJsonValue(a, value);
                 errdefer local.storage_db_types.deinitJsonValue(a, &owned);
                 try target.object.put(a, key, owned);
                 self.column_values += 1;
-            } else try remaining.append(a, field);
-        }
-        if (remaining.items.len != 0) {
-            const stored = (try snapshot.storedDocWithBlockCache(&self.blocks, doc)) orelse return error.InvalidNativeLakeTextCorpus;
-            try appendStoredValue(a, stored.id, stored.data, expected_key, remaining.items, target);
-        }
+            } else {
+                const stored = (try snapshot.storedDocWithBlockCache(&self.blocks, docs[i])) orelse return error.InvalidNativeLakeTextCorpus;
+                try appendStoredValue(a, stored.id, stored.data, expected_keys[i], &.{field}, &targets[i].?);
+            }
+        };
+    }
+    pub fn append(self: *Hydrator, a: A, snapshot: *const local.index.IndexSnapshot, doc: u32, expected_key: []const u8, fields: []const []const u8, target: *std.json.Value) !void {
+        var targets = [_]?std.json.Value{target.*};
+        defer target.* = targets[0].?;
+        try self.appendBatch(a, snapshot, &.{doc}, &.{expected_key}, fields, &targets);
     }
 };
 
@@ -241,6 +274,8 @@ test "external lake bounded window profiles typed source columns project without
         var row: std.json.ObjectMap = .empty;
         try row.put(sa, "body", .{ .string = id });
         try row.put(sa, "counter", .{ .integer = 9007199254740993 });
+        try row.put(sa, "flag", .{ .bool = true });
+        try row.put(sa, "bucket", .{ .integer = 37 });
         try row.put(sa, "payload", .{ .string = payload });
         var nested: std.json.ObjectMap = .empty;
         try nested.put(sa, "text", .{ .string = id });
@@ -288,6 +323,32 @@ test "external lake bounded window profiles typed source columns project without
             }
         };
         try Run.run(a, snapshot);
+        const Batch = struct {
+            fn run(alloc: A, snap: *const local.index.IndexSnapshot) !void {
+                var hydrator = Hydrator.init(alloc);
+                defer hydrator.deinit();
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                const ordinals = [_]u32{ 2, 0, 1 };
+                var keys: [3][]const u8 = undefined;
+                for (ordinals, &keys) |doc, *key| key.* = (try snap.storedIdScoped(scratch.allocator(), doc)).?;
+                var targets: [3]?std.json.Value = @splat(std.json.Value{ .object = .empty });
+                defer for (&targets) |*value| if (value.*) |*row| local.storage_db_types.deinitJsonValue(alloc, row);
+                try hydrator.appendBatch(alloc, snap, &ordinals, &keys, &.{ "body", "counter", "nested.text", "flag", "bucket" }, &targets);
+                for (targets, keys) |row, key| {
+                    try std.testing.expectEqualStrings(key, row.?.object.get("body").?.string);
+                    try std.testing.expectEqualStrings(key, row.?.object.get("nested.text").?.string);
+                    try std.testing.expect(row.?.object.get("flag").?.bool);
+                    try std.testing.expectEqual(@as(i64, 37), row.?.object.get("bucket").?.integer);
+                }
+                try std.testing.expectEqual(@as(usize, 5), hydrator.column_opens);
+                try std.testing.expectEqual(@as(usize, 15), hydrator.column_values);
+                try std.testing.expectEqual(@as(usize, 0), hydrator.blocks.decode_count);
+            }
+        };
+        try Batch.run(a, snapshot);
+        var batch_stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(batch_stable.allocator(), Batch.run, .{snapshot});
         var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
         try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{snapshot});
         const full = (try snapshot.storedDocDecompressed(a, 0)).?;

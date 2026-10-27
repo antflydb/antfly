@@ -1638,12 +1638,12 @@ including required Boolean intersections and minimum-should-match unions. Requir
 children take the minimum ceiling; required disjunctions sum child ceilings before
 dividing by their minimum match count. Unrestricted and unknown producers,
 including phrase leaves, retain the corpus ceiling; required term children in a
-lowered phrase can still provide a bound. Exclusions never increase selectivity. This ceiling
-only chooses a driver: exact counts, eligibility, scoring, authorization and cursor
+lowered phrase can still provide a bound. Exclusions never increase selectivity.
+This ceiling only chooses a driver: exact counts, eligibility, scoring, authorization and cursor
 proofs continue to use their authoritative implementations. A postings choice
 survives pack routing and the downstream collector even without profiling.
 
-The stored-source recipe v3 writes the complete declared row as independently
+The stored-source recipe v4 writes the complete declared row as independently
 compressed `columnar_stored` sections using the existing typed AJV1 value codec.
 An authenticated non-JSON marker occupies each ordinary stored-body slot; it is
 not a second serialized row. Unindexed large fields remain available as source
@@ -1668,3 +1668,39 @@ presence, scalar kinds and exact integers survive the rewrite. The authenticated
 recipe changes when this source representation changes, so reuse cannot claim
 column capability for a monolithic producer. Local embedded builders retain their
 existing source mode unless they explicitly select column storage.
+
+
+### Bounded source batches and indexed chunk navigation
+
+Native source projection processes one requested column across at most 64 winning
+rows before moving to the next column. A compact ordinal permutation retains the
+public rank order and validates every native row key under the current pack pin.
+Four reusable field cursors still bound live decoded state; a projection wider
+than four fields no longer reopens every column for every row. Legacy monolithic
+rows keep one parse per projected row. The existing result owner retains projected
+values and frees partial output if allocation or cancellation fails.
+
+Recipe v4 uses a source-column directory with a payload-relative end offset and
+inclusive first/last document IDs per chunk. These row ranges are authenticated
+by the enclosing segment, checked for monotonicity, and verified against each
+selected decoded chunk. Sparse gaps can return without opening payloads. Random
+seeks decode the selected chunk only. A per-chunk record-offset index is validated
+once, so individual value reads do not repeatedly parse all entries. Append and
+sorted compaction use the same cursors; old columns advance to an adjacent chunk
+before falling back to payload-bound navigation. Chunk raw-byte and oversized-value
+rules remain in force. The source recipe fences the new producer capability.
+
+Native Parquet/Iceberg text builders retain typed source directly. Allocation-free
+AJV1 sizing shares the encoder's tag selection and exact integer/array widths;
+batch thresholds, segment splitting and scratch admission do not depend on a
+throwaway full-row JSON string. Retained source trees remain charged as inputs,
+and selected-field indexing still cannot claim sort/doc-value coverage for an
+omitted non-null field. Ordinary embedded source builders retain their existing
+representation unless they select source-column mode.
+
+Prepared highlights own a source-dependency plan. Explicit fields and static
+source aliases require only their source columns; unknown or dynamic mappings
+conservatively require complete source. The lake path maps these dependencies
+once per batch, reuses already projected values when they cover the plan, and
+fetches hidden fields under the same native identity checks when needed. Final
+response projection continues to hide fields requested only for highlighting.
