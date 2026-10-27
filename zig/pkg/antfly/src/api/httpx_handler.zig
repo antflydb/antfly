@@ -9622,6 +9622,16 @@ pub const AntflyApiHandler = struct {
         return self.pinEntitiesDistinct(ctx, table_name, key);
     }
 
+    pub fn listEntityResolverProgress(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, _: metadata_server_openapi.server.ListEntityResolverProgressParams) !httpx.Response {
+        return self.resolverRequest(ctx, .entity_progress, table_name, "", key);
+    }
+
+    pub fn namespaceListEntityResolverProgress(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, _: metadata_server_openapi.server.NamespaceListEntityResolverProgressParams) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.resolverRequest(ctx, .entity_progress, table_name, "", key);
+    }
+
     pub fn listEntityResolverState(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
         return self.resolverRequest(ctx, .entity_redirects, table_name, "", key);
     }

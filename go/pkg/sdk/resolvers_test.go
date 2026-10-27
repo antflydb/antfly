@@ -194,3 +194,32 @@ func TestCurationProposalPreservesExplicitZeroAndEmptyOptions(t *testing.T) {
 		})
 	}
 }
+
+func TestEntityResolverProgressPagingAndNamespace(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		prefix := "/db/v1/tables/notes"
+		if calls == 2 {
+			prefix = "/db/v1/databases/app/namespaces/private/tables/notes"
+		}
+		if r.URL.EscapedPath() != prefix+"/entities/concept%2Falpha/progress" || r.URL.Query().Get("limit") != "7" || r.URL.Query().Get("cursor") != "opaque-next" {
+			t.Errorf("unexpected progress request %s", r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entity_table":"notes","key":"concept/alpha","catalog_revision":3,"complete":false,"next_cursor":"page-two","results":[]}`))
+	}))
+	defer server.Close()
+	client, err := NewAntflyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := client.ListEntityResolverProgress(context.Background(), "notes", "concept/alpha", &ListEntityResolverProgressParams{Limit: 7, Cursor: "opaque-next"})
+	if err != nil || page.Complete || page.NextCursor != "page-two" {
+		t.Fatalf("invalid page: %+v %v", page, err)
+	}
+	_, err = client.NamespaceListEntityResolverProgress(context.Background(), "app", "private", "notes", "concept/alpha", &NamespaceListEntityResolverProgressParams{Limit: 7, Cursor: "opaque-next"})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

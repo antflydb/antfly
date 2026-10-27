@@ -613,6 +613,19 @@ pub const LookupNamespaceTableDocumentParams = struct {
     consistency: ?[]const u8 = null,
 };
 
+/// List a bounded page of entity consumer replay progress
+pub const NamespaceListEntityResolverProgressPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+pub const NamespaceListEntityResolverProgressParams = struct {
+    limit: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+};
+
 /// list entity resolver state
 pub const NamespaceListEntityResolverStatePathParams = struct {
     database_name: []const u8,
@@ -1523,6 +1536,17 @@ pub const ReprocessDocumentArtifactPathParams = struct {
     artifact_name: []const u8,
 };
 
+/// List a bounded page of entity consumer replay progress
+pub const ListEntityResolverProgressPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+pub const ListEntityResolverProgressParams = struct {
+    limit: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+};
+
 /// list entity resolver state
 pub const ListEntityResolverStatePathParams = struct {
     table_name: []const u8,
@@ -2219,6 +2243,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept", .operation_id = "namespaceAcceptCurationProposal", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject", .operation_id = "namespaceRejectCurationProposal", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}", .operation_id = "lookupNamespaceTableDocument", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/progress", .operation_id = "namespaceListEntityResolverProgress", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects", .operation_id = "namespaceListEntityResolverState", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct", .operation_id = "namespacePinEntitiesDistinct", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge", .operation_id = "namespaceMergeEntity", .request_body = .buffered, .streaming_response = false },
@@ -2312,6 +2337,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/progress", .operation_id = "listEntityResolverProgress", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/redirects", .operation_id = "listEntityResolverState", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:distinct", .operation_id = "pinEntitiesDistinct", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:merge", .operation_id = "mergeEntity", .request_body = .buffered, .streaming_response = false },
@@ -2450,6 +2476,7 @@ pub const routes = [_]Route{
 //   fn namespaceAcceptCurationProposal(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response
 //   fn namespaceRejectCurationProposal(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response
 //   fn lookupNamespaceTableDocument(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !httpx.Response
+//   fn namespaceListEntityResolverProgress(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: NamespaceListEntityResolverProgressParams) !httpx.Response
 //   fn namespaceListEntityResolverState(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespacePinEntitiesDistinct(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespaceMergeEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
@@ -2543,6 +2570,7 @@ pub const routes = [_]Route{
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn listEntityResolverProgress(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListEntityResolverProgressParams) !httpx.Response
 //   fn listEntityResolverState(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn pinEntitiesDistinct(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn mergeEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response

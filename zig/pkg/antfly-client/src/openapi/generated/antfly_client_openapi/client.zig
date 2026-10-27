@@ -237,6 +237,11 @@ pub const LookupNamespaceTableDocumentParams = struct {
     consistency: ?[]const u8 = null,
 };
 
+pub const NamespaceListEntityResolverProgressParams = struct {
+    limit: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+};
+
 pub const NamespaceUnmergeResolverKeyParams = struct {
     pin_distinct: ?[]const u8 = null,
 };
@@ -431,6 +436,11 @@ pub const ListDocumentArtifactManifestsParams = struct {
 pub const GetDocumentArtifactManifestParams = struct {
     /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
     detail: ?[]const u8 = null,
+};
+
+pub const ListEntityResolverProgressParams = struct {
+    limit: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
 };
 
 pub const GetLakeCommitOutcomeParams = struct {
@@ -2404,6 +2414,47 @@ pub const Client = struct {
         return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
     }
 
+    /// List a bounded page of entity consumer replay progress
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/progress
+    pub fn namespaceListEntityResolverProgress(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: NamespaceListEntityResolverProgressParams) !ApiResponse(types.EntityConsumerProgressPage) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/entities/{s}/progress", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.EntityConsumerProgressPage).fromResponse(self.allocator, &resp);
+    }
+
     /// list entity resolver state
     /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects
     pub fn namespaceListEntityResolverState(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !ApiResponse(types.EntityCurationResult) {
@@ -4003,6 +4054,43 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// List a bounded page of entity consumer replay progress
+    /// GET /db/v1/tables/{tableName}/entities/{key}/progress
+    pub fn listEntityResolverProgress(self: *@This(), table_name: []const u8, key: []const u8, params: ListEntityResolverProgressParams) !ApiResponse(types.EntityConsumerProgressPage) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/entities/{s}/progress", .{ self.base_url, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.EntityConsumerProgressPage).fromResponse(self.allocator, &resp);
     }
 
     /// list entity resolver state
