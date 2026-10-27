@@ -30291,7 +30291,7 @@ static void termite_metal_initialize_lightonocr3_mpp(termite_metal_decode_runtim
     if (@available(macOS 26.1, *)) {
         MTLCompileOptions *tensor_options = [MTLCompileOptions new];
         tensor_options.languageVersion = MTLLanguageVersion4_0;
-        tensor_options.fastMathEnabled = NO;
+        tensor_options.mathMode = MTLMathModeSafe;
         NSError *tensor_error = nil;
         id<MTLLibrary> tensor_library = [device newLibraryWithSource:termite_metal_lightonocr3_tensor_source()
                                                              options:tensor_options
@@ -30349,7 +30349,6 @@ static void termite_metal_initialize_lightonocr3_recurrent(termite_metal_decode_
     if (runtime->device.argumentBuffersSupport != MTLArgumentBuffersTier2) return;
     MTLCompileOptions *options = [MTLCompileOptions new];
     options.languageVersion = MTLLanguageVersion3_1;
-    options.fastMathEnabled = NO;
     if (![options respondsToSelector:@selector(setMathMode:)]) return;
     options.mathMode = MTLMathModeSafe;
     NSError *error = nil;
@@ -41683,7 +41682,6 @@ static void termite_metal_initialize_lighton_prefill_ffn(termite_metal_decode_ru
     if (@available(macOS 26.1, *)) {
         MTLCompileOptions *options = [MTLCompileOptions new];
         options.languageVersion = MTLLanguageVersion4_0;
-        options.fastMathEnabled = NO;
         options.mathMode = MTLMathModeSafe;
         NSError *error = nil;
         id<MTLLibrary> library = [r->device newLibraryWithSource:termite_metal_lighton_prefill_ffn_source()
