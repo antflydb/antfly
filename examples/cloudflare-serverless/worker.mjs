@@ -33,23 +33,23 @@ export { R2CommitCoordinator } from "./r2-coordinator.mjs";
 export { CommitCoordinator } from "./coordinator.mjs";
 const localRuntime=createRuntime(),appReadRuntime=createRuntime({kernel:readerKernel,sharedCache,resources:()=>({...kernelMetrics(),...directReadViews.metrics()}),pointReadLanes:true,readViews:directReadViews});
 let admitted=0,readerCursor=0;const ingressBudget=new IngressBudget();
-async function run(env,input,signal,collection,trace,direct=false){
+async function run(env,input,signal,collection,trace,direct=false,backgroundTasks){
  let timer;
  if(direct&&env.DIRECT_READS==="true"&&readOperations.has(input.op)){
   const deadline=new AbortController();timer=setTimeout(()=>deadline.abort(),30000);
   signal=AbortSignal.any(signal?[signal,deadline.signal]:[deadline.signal]);
  }
  try{
-  if(isExactSearch(env,input))return await exactSearch(env,input,next=>runStep(env,next,signal,collection,trace,direct),{signal});
-  return await runStep(env,input,signal,collection,trace,direct);
+  if(isExactSearch(env,input))return await exactSearch(env,input,next=>runStep(env,next,signal,collection,trace,direct,backgroundTasks),{signal});
+  return await runStep(env,input,signal,collection,trace,direct,backgroundTasks);
  }finally{clearTimeout(timer);}
 }
-async function runStep(env,input,signal,collection,trace,direct){
+async function runStep(env,input,signal,collection,trace,direct,backgroundTasks){
  const read=readOperations.has(input.op);
  if(read&&direct&&env.DIRECT_READS==="true"){
   if(env.COORDINATOR_BACKEND!=="r2"||env.SPLIT_RUNTIME!=="true")throw Error("InvalidDirectReaderProfile");
   enableAppReads();const release=reserveInput(32768);
-  try{return await appReadRuntime.run(env,input,signal,collection,undefined,trace);}finally{release();}
+  try{return await appReadRuntime.run(env,input,signal,collection,undefined,trace,undefined,{background:backgroundTasks});}finally{release();}
  }
  const binding=read?env.READERS:env.BUILDERS;
  if(env.COORDINATOR_BACKEND==="r2"&&input.op!=="mutate"&&binding){
@@ -57,7 +57,7 @@ async function runStep(env,input,signal,collection,trace,direct){
   try{return await binding.getByName(runtimeName(env.ANTFLY_INCARNATION,slot)).execute(input,collection,{trace_id:trace?.id});}
   catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"execute"))throw error;}
  }
- return localRuntime.run(env,input,signal,collection,undefined,trace);
+ return localRuntime.run(env,input,signal,collection,undefined,trace,undefined,{background:backgroundTasks});
 }
 async function background(env,input){
  if(env.COORDINATOR_BACKEND==="r2"&&env.BUILDERS)return env.BUILDERS.getByName(runtimeName(env.ANTFLY_INCARNATION,0)).execute(input);
@@ -140,7 +140,7 @@ export default {
       }
       if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "compact", "enrich", "latest", "reindex"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
       rejectPrivateScanInput(args);
-      const result = await trace.span("dispatch",()=>run(env, args, request.signal,undefined,trace,true));
+      const result = await trace.span("dispatch",()=>run(env, args, request.signal,undefined,trace,true,ctx?.waitUntil?promise=>ctx.waitUntil(promise):undefined));
       if (args.op === "reindex" && result.has_more && args.reindex_action !== "status") {
         try { result.maintenance_pending = !await enqueue(env, "reindex", result.job_id); }
         catch { result.maintenance_pending = true; }

@@ -27,7 +27,7 @@ import {createImmutableReadCache} from "../../zig/lib/objectstore/wasm/cache.mjs
 const utf8 = new TextEncoder();
 const hex=bytes=>Array.from(typeof bytes==="string"?utf8.encode(bytes):bytes,n=>n.toString(16).padStart(2,"0")).join("");
 const compare = (l, r) => {const a = utf8.encode(l), b = utf8.encode(r); for (let i=0; i<Math.min(a.length,b.length); i++) if (a[i]!==b[i]) return a[i]-b[i]; return a.length-b.length;};
-function rootMetrics(state){try{const root=JSON.parse(state?.root??'null');return{inline_root_format:root?.format??0,inline_root_rows:root?.format===3?root.read_rows.exact.length:0,inline_root_has_pin:root?.format===3&&root.read_rows.selected!=null,inline_root_bytes:utf8.encode(state?.root??'').byteLength};}catch{return{inline_root_format:0};}}
+function rootMetrics(state){try{const root=JSON.parse(state?.root??'null');return{log_slot:state?.next??0,log_revision:state?.revision??0,inline_root_format:root?.format??0,inline_root_rows:root?.format===3?root.read_rows.exact.length:0,inline_root_has_pin:root?.format===3&&root.read_rows.selected!=null,inline_root_bytes:utf8.encode(state?.root??'').byteLength};}catch{return{inline_root_format:0};}}
 export const encode = value => JSON.stringify(value, (_, v) => v instanceof Uint8Array || v instanceof ArrayBuffer ? {__antfly_bytes: Array.from(new Uint8Array(v.buffer ?? v, v.byteOffset ?? 0, v.byteLength))} : v);
 const decode = value => JSON.parse(value, (_, v) => v && Object.keys(v).length === 1 && Array.isArray(v.__antfly_bytes) ? Uint8Array.from(v.__antfly_bytes) : v);
 export class R2CoordinatorStore {
@@ -130,12 +130,12 @@ export class R2CoordinatorStore {
     while(this.rows.size>=256||this.rowBytes+this.hintBytes+bytes>512*1024){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
     this.rows.set(key,{value:structuredClone(value),bytes});this.rowBytes+=bytes;
   }
-  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive"}={}){
+  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background}={}){
     if(this.ownerReady)await this.ownerReady;
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
     const owned=this.acquired,captured=structuredClone(owned?this.state:(this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=this.clock()+5000,started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
     const reserve=(operations,bytes)=>{if(usedOperations+operations>=254||usedBytes+bytes>=8*1024*1024){admissionBudgetExceeded=true;throw Error("ReadSnapshotNeedsAdmission");}usedOperations+=operations;usedBytes+=bytes;};
-    const cached=this.cache.wrap(this.remoteCache(instrumentTransport(this.rawTransport,physical),{budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}}),`coordinator/${this.namespace}`);
+    const cached=this.cache.wrap(this.remoteCache(instrumentTransport(this.rawTransport,physical),{background,budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}}),`coordinator/${this.namespace}`);
     const raw=(request,body)=>{onAdmission?.();return cached(request,body);};
     const guarded=async(request,body)=>{if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");return raw(request,body);};
     let transport,proofTransport=guarded;

@@ -1213,3 +1213,33 @@ even if an HTTP retry succeeds. A completed native cancellation can carry the
 same failure code with `io_draining=false`; it retains ordinary warm retry
 semantics. The failure code alone cannot identify unsettled I/O. The original
 control waits for its transport before native cancellation and remains unchanged.
+
+## Request-owned cache fill lifetimes
+
+Direct app reads previously constructed their cache transports without the
+request's background callback. A confirmed immutable GET therefore waited for
+Cache API `put` before returning, both for data objects and native metadata.
+The app now passes the submitting request's `waitUntil` callback through runtime
+admission and native read views. No callback is stored in a shared observer or
+sent over RPC. Actor runtimes retain their existing lifetime callback.
+
+Cache fills keep the existing shared limit of two active fills and 512 KiB of
+charged memory. Their reservations remain held until settlement; excess fills
+are skipped rather than queued. R2 confirmation still determines the result.
+Held-cache regressions verify that reads return while writes remain pending,
+that requests use their own callback and that reservations are released only at
+settlement. Actual Worker coverage checks `waitUntil` for RPC, native and capsule
+read-admission variants. Background cache memory/CPU errors emit a fixed resource
+signal even when the foreground request has already completed.
+
+The offered-load driver also separates bounded report persistence from arrivals:
+one active checkpoint and one latest pending checkpoint, joined at completion.
+It continues measuring scheduling delay and never drops offered rounds. Abort
+now stops new arrivals and joins outstanding calls, avoiding synthetic cancelled
+calls after an intentionally interrupted qualification. Neither change alters
+the fixed cadence, request budgets or gate thresholds.
+
+Diagnostic coverage records fixed disconnect reasons and WebSocket close codes.
+Heartbeat checks use monotonic elapsed time and the pinned Wrangler's ten-second
+ping payload. A lost connection remains a failed population; reconnecting cannot
+repair it. Progress checkpoints fail promptly on observed diagnostic gaps.

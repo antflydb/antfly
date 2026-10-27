@@ -23,7 +23,8 @@ import{createHash}from'node:crypto';
 const gate=JSON.parse(await readFile(process.argv[2])),artifacts=[];
 async function artifact(path){const bytes=await readFile(path),sha256=createHash('sha256').update(bytes).digest('hex');artifacts.push({path:resolve(path),sha256});return bytes;}
 const native=(await artifact(process.argv[3])).toString(),node=(await artifact(process.argv[4])).toString(),worker=(await artifact(process.argv[5])).toString();
-if(![...native.matchAll(/([0-9]+) passed; [0-9]+ skipped; 0 failed; 0 leaked/g)].some(match=>Number(match[1])>=545)||/error:|FAIL|[1-9][0-9]* leaked|[1-9][0-9]* failed/.test(native)||!passingNodeTestLog(node,241)||!passingNodeTestLog(worker,18))throw Error('complete passing test logs required');
+if(![...native.matchAll(/([0-9]+) passed; [0-9]+ skipped; 0 failed; 0 leaked/g)].some(match=>Number(match[1])>=545)||/error:|FAIL|[1-9][0-9]* leaked|[1-9][0-9]* failed/.test(native)||!passingNodeTestLog(node,245)||!passingNodeTestLog(worker,18))throw Error('complete passing test logs required');
+for(const pattern of[/report persistence does not block fixed arrivals/,/cancelled offered workloads stop before another arrival/,/per-request cache lifetimes return before fills/,/native app metadata cache fills use only the submitting request lifetime/])if(!pattern.test(node))throw Error('request lifetime or offered workload regression missing');
 for(const pattern of [/suspended host deadline returns before storage settles/,/suspended host abort returns before storage settles/,/ambiguous metadata deadlines retain native reservations/])if(!pattern.test(node))throw Error('draining deadline safety regression missing');
 if(!/expired native I\/O retains reservations through RPC completion/.test(worker))throw Error('draining I/O caller-context regression missing');
 if(!/constructor reset replay preserves stable warm identities/.test(node))throw Error('constructor reset replay safety regression missing');

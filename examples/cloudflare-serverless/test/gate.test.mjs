@@ -277,3 +277,14 @@ test('expired read admission retries only stable warm identities within the orig
   let calls=0;const client=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async()=>{calls++;return Response.json({error},{status:409});}});await assert.rejects(client.call('a',input,phase),/HTTP 409/);assert.equal(calls,1);assert.equal(client.resourceErrors.length,error.includes('OutOfMemory')?1:0);
  }
 });
+
+test('report persistence does not block fixed arrivals and is joined before completion',async()=>{
+ const{runOfferedWorkload}=await import('../qualification/offered-workload.mjs');let release,entered,next,completed=false,calls=0;const held=new Promise(r=>release=r),started=new Promise(r=>entered=r),second=new Promise(r=>next=r),side={errors:[],round:async()=>{if(++calls===2)next();},progress:async()=>{}};
+ const work=runOfferedWorkload({sides:[side],seconds:1,period:100,onProgress:async()=>{entered();await held;completed=true;}});await started;
+ try{assert.equal(await Promise.race([second.then(()=>true),new Promise(r=>setTimeout(()=>r(false),500))]),true,'a held journal must not block the next offered round');assert.equal(completed,false);}finally{release();await work;}
+ assert.equal(completed,true);assert.equal(calls,10);assert.deepEqual(side.errors,[]);
+});
+test('cancelled offered workloads stop before another arrival and join outstanding work',async()=>{
+ const{runOfferedWorkload}=await import('../qualification/offered-workload.mjs'),abortController=new AbortController();let calls=0,settled=false;const side={abortController,errors:[],round:async()=>{calls++;await new Promise(r=>setTimeout(r,20));settled=true;},progress:async()=>{}};
+ await assert.rejects(runOfferedWorkload({sides:[side],seconds:60,period:100,onProgress:()=>abortController.abort(Error('QualificationInterrupted'))}),/QualificationInterrupted/);assert.equal(calls,1);assert.equal(settled,true);
+});

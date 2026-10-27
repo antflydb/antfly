@@ -1812,3 +1812,25 @@ that it is true across a timed-out RPC with held storage and false for the next
 completed caller; a completed native cancellation alone remains recoverable.
 Native artifacts and acceptance thresholds are unchanged by this diagnostic fix.
 The corrected 50,000-document run also completes all nine stages successfully.
+
+The subsequent three `b300673c7438` populations fail qualification. Several tail
+connections close near the same wall-clock instant, leaving diagnostic gaps;
+their collector did not record a close code, so the cause is unresolved. There
+are zero observed resource or unsettled-I/O signals before those gaps, which
+does not prove absence of failures afterward. Trial 3 also exceeds the allowed
+number of slow requests before the hour finishes. Trial 2's control exhausts
+the existing retry budget on compaction with `WorkLeaseLost` and one timeout.
+Those are real control failures; no retry budget or control binary is changed.
+
+The pre-interruption reports are preserved with exact bytes and SHA-256 in
+`archive-stream-gaps-<execution>/`. The old load driver continued recording
+cancelled calls after interruption; those later calls did not add cloud traffic
+and must not be interpreted as data-plane failures. The corrected driver stops
+arrivals on abort. All 300 reserved recovery epochs remain unused.
+
+The next candidate removes confirmed foreground cache-fill waits using bounded,
+request-owned background lifetimes. The common driver makes report persistence
+independent of arrivals and records diagnostic disconnect causes. These changes
+pass 245 Node regressions; live latency and longer diagnostic capture still need
+qualification. The approved control remains `c44896ac8c`, including its original
+native modules. The gate remains unpassed.

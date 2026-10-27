@@ -38,7 +38,7 @@ export class NativeReadViews {
     const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
     if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
     return captureReadView(tx,keys,options,this.clock);
-   },{traceId:options.trace_id,traceIds,onAdmission:close});
+   },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background});
   },options.trace_id,{untilAdmission:true});
  }
 }

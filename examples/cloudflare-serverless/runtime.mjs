@@ -34,7 +34,8 @@ const lanes = {interactive: null, maintenance: null};
 const busy = {interactive: false, maintenance: false};
 const cache = sharedCache??createImmutableReadCache();
 const profiles=new Set();
-async function run(env, input, signal, collection, host, trace,readAdmission) {
+async function run(env, input, signal, collection, host, trace,readAdmission,requestOptions={}) {
+  const requestBackground=requestOptions.background??background;
   const ownedTrace=!trace;
   trace??=new CriticalPath({scope:"runtime:"+input.op});
   const runtimeStarted=trace.started;
@@ -45,8 +46,8 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
     // has its original 30-second deadline and metadata/WAL grace bound. Prepare
     // independent views before scarce WASM admission. Publication leases remain
     // inside admission because their lifetime is only thirty seconds.
-    readAdmission??=await prepareReadAdmission(env,input,trace,readViews?.get(env));
-    const execute=host=>run(env,input,signal,collection,host,trace,readAdmission),options={signal,fairKey:env.ANTFLY_INCARNATION,priority:["publish","enrich"].includes(input.op)?"publication":["compact","collect","collect_metadata","reindex"].includes(input.op)?"maintenance":"interactive",onStage:sample=>trace.stage(sample)};
+    readAdmission??=await prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground});
+    const execute=host=>run(env,input,signal,collection,host,trace,readAdmission,requestOptions),options={signal,fairKey:env.ANTFLY_INCARNATION,priority:["publish","enrich"].includes(input.op)?"publication":["compact","collect","collect_metadata","reindex"].includes(input.op)?"maintenance":"interactive",onStage:sample=>trace.stage(sample)};
     const small=pointReadLanes&&env.DIRECT_READS==="true"&&input.op==="lookup"&&!input.cursor&&readAdmission?.view&&JSON.stringify(input).length<=4096;
     try{return await (small?withPointReadLane(kernel,execute,{...options,onPromote:()=>trace.stage({name:"point_read_capacity_promotion",duration_ms:0})}):kernel.withHost(execute,options));}finally{if(ownedTrace)trace.emit(env.LOG_METRICS==="true");}
   }
@@ -90,7 +91,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
       try{publicationView??=await rpc("openPublication",Number(env.PUBLICATION_RECORDS??16));}
       catch(error){if(!unsupportedRpc(error,"openPublication"))throw error;}
     }
-    let transport = cache.wrap(withCommitCoordinator(edgeCacheForEnv(env,{background,budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),physical)),
+    let transport = cache.wrap(withCommitCoordinator(edgeCacheForEnv(env,{background:requestBackground,budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),physical)),
       env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)?preparedPublication??publicationCoordinator({objectCall:coordinator.objectCall,publicationCall:(request,body,expected)=>rpc("publicationCall",request,body,expected,readHints?.forHead(request,body))},publicationView):coordinator, collection), env.ANTFLY_INCARNATION, env.DATABASE);
     if(readHints)transport=readHints.wrap(transport);
     if(env.COORDINATOR_BACKEND==="r2"&&!readAdmission?.legacy&&["lookup","list","count","search","status","latest"].includes(input.op))transport=withReadView(transport,coordinator,env.ANTFLY_INCARNATION,{initial:readAdmission?.view,admittedAt:readAdmission?.started,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});

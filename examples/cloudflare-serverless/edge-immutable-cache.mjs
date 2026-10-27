@@ -15,10 +15,11 @@
 
 import {isImmutableObjectKey} from "../../zig/lib/objectstore/wasm/cache.mjs";
 import {ObjectStoreError} from "../../zig/lib/objectstore/wasm/r2.mjs";
+import {resourceFailureCode} from "./performance.mjs";
 
 const sharedFills={active:0,bytes:0};
 const encode=new TextEncoder(),decode=new TextDecoder("utf-8",{fatal:true});
-const resourceError=error=>/OutOfMemory|MemoryLimitExceeded|CPULimitExceeded|memory limit|CPU.*limit/i.test(String(error));
+const resourceError=error=>resourceFailureCode(error)!==null;
 const base64=bytes=>btoa(Array.from(bytes,b=>String.fromCharCode(b)).join(""));
 const digest=async value=>Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",typeof value==="string"?encode.encode(value):value)),b=>b.toString(16).padStart(2,"0")).join("");
 
@@ -27,13 +28,13 @@ const digest=async value=>Array.from(new Uint8Array(await crypto.subtle.digest("
 // is retained across actors. Mutable floors/heads and misses always reach R2.
 export function createEdgeImmutableCache({scope,storage=globalThis.caches,background,onMetrics=()=>{},maxObjectBytes=65536,fills=sharedFills,budgetKey}={}){
  if(typeof scope!=="string"||!scope.length||!Number.isSafeInteger(maxObjectBytes)||maxObjectBytes<1||maxObjectBytes>65536)throw Error("InvalidEdgeImmutableCache");
- return (transport,{onMetrics:observe=onMetrics,budgetKey:requestBudgetKey=budgetKey}={})=>{
+ return (transport,{onMetrics:observe=onMetrics,budgetKey:requestBudgetKey=budgetKey,background:requestBackground=background}={})=>{
  const localBudget={};
  const budget=()=>requestBudgetKey?.()??localBudget;
  const metric=value=>{try{observe(value);}catch{}};
  const claim=()=>{const value=budget();if((value.edge_cache_calls??0)>=32||(value.calls??0)+(value.edge_cache_calls??0)>=960)return false;value.edge_cache_calls=(value.edge_cache_calls??0)+1;return true;};
  const remote=(request,body)=>{const value=budget();if((value.calls??0)+(value.edge_cache_calls??0)>=960)throw new ObjectStoreError(8,"combined object/cache I/O budget exceeded");return transport(request,body);};
- const cacheFailure=error=>{if(resourceError(error)){metric({edge_cache_resource_errors:1});throw error;}metric({edge_cache_errors:1});};
+ const cacheFailure=error=>{if(resourceError(error)){metric({edge_cache_resource_errors:1});try{console.error(JSON.stringify({event:"antfly.resource_failure",failure_code:resourceFailureCode(error)}));}catch{}throw error;}metric({edge_cache_errors:1});};
  return async(request,body=new Uint8Array())=>{
   if(!storage?.open||!isImmutableObjectKey(request.key??"",{includeCommitLog:true})||!["get","put"].includes(request.op))return remote(request,body);
   const put=request.op==="put";
@@ -90,7 +91,7 @@ export function createEdgeImmutableCache({scope,storage=globalThis.caches,backgr
   const save=Promise.resolve().then(()=>cache.put(key,response)).then(()=>metric({edge_cache_writes:1}),cacheFailure).finally(()=>{fills.active--;fills.bytes-=charge;});
   // Foreground writes are acknowledged by R2, independently of cache success.
   // Observe failures even when a host does not provide a background lifetime.
-  if(background){background(save);save.catch(error=>{if(resourceError(error))console.error("Antfly edge cache resource failure",String(error));});}else await save;
+  if(requestBackground){requestBackground(save);save.catch(()=>{});}else await save;
   return result;
  };
  };

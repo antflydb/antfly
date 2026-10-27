@@ -26,19 +26,19 @@ import{assertGateRun}from'./gate-scope.mjs';
 import{resourceFailureCode}from'../performance.mjs';
 const roles=['app','writer','reader','builder'];
 export class DiagnosticCoverage{
- constructor(runs){this.streams=runs.flatMap(run=>roles.map(role=>({run:run.id,role,connected:false,gap:false,events:0,resource_failures:0})));}
+ constructor(runs){this.streams=runs.flatMap(run=>roles.map(role=>({run:run.id,role,connected:false,gap:false,events:0,resource_failures:0,gap_reasons:{}})));}
  stream(run,role){const row=this.streams.find(s=>s.run===run&&s.role===role);if(!row)throw Error('UnknownDiagnosticStream');return row;}
  connected(run,role){this.stream(run,role).connected=true;}
- lost(run,role){this.stream(run,role).gap=true;}
+ lost(run,role,reason='connection_closed',code){const row=this.stream(run,role);row.gap=true;row.gap_reasons[reason]=(row.gap_reasons[reason]??0)+1;if(Number.isInteger(code))row.last_close_code=code;}
  observe(run,role,event){
-  const row=this.stream(run,role);row.events++;if(event.truncated===true)row.gap=true;
+  const row=this.stream(run,role);row.events++;if(event.truncated===true)this.lost(run,role,'log_truncated');
   if(['exceededMemory','exceededCpu'].includes(event.outcome))row.resource_failures++;
   for(const error of event.exceptions??[])if(resourceFailureCode(error.message))row.resource_failures++;
   for(const log of event.logs??[])for(const message of log.message??[]){let value;try{value=JSON.parse(message);}catch{continue;}
-   if(resourceFailureCode(value.failure_code)||resourceFailureCode(value.error)||value.physical?.resource_failures>0)row.resource_failures++;
+   if(resourceFailureCode(value.failure_code)||resourceFailureCode(value.error)||value.physical?.resource_failures>0||value.physical?.edge_cache_resource_errors>0)row.resource_failures++;
    // The host reports actual abandoned binding I/O. Completed native
    // cancellations have no such uncertainty and retain ordinary retry policy.
-   if(value.io_draining===true)row.gap=true;
+   if(value.io_draining===true)this.lost(run,role,'native_io_draining');
   }
  }
  report(){const streams=this.streams.map(row=>({...row}));return{passed:streams.length===8&&streams.every(s=>s.connected&&!s.gap&&s.resource_failures===0),streams};}
@@ -81,12 +81,12 @@ export async function startLiveDiagnostics(runs,executionId,dir){
    const socket=session.socket=new WebSocket(record.url,'trace-v1',{maxPayload:1024*1024,handshakeTimeout:30000});
    socket.on('message',data=>{
     try{const safe=sanitizeTailEvent(JSON.parse(data.toString()));if(!safe)return;coverage.observe(run.id,role,safe);const encoded=JSON.stringify(safe)+'\n',bytes=Buffer.byteLength(encoded);
-     if((session.pendingBytes??0)+bytes>4*1024*1024){coverage.lost(run.id,role);socket.terminate();return;}
-     session.pendingBytes=(session.pendingBytes??0)+bytes;session.writes=session.writes.then(()=>session.file.writeFile(encoded)).catch(()=>{coverage.lost(run.id,role);}).finally(()=>session.pendingBytes-=bytes);}catch{coverage.lost(run.id,role);}
+     if((session.pendingBytes??0)+bytes>4*1024*1024){coverage.lost(run.id,role,'journal_capacity');socket.terminate();return;}
+     session.pendingBytes=(session.pendingBytes??0)+bytes;session.writes=session.writes.then(()=>session.file.writeFile(encoded)).catch(()=>{coverage.lost(run.id,role,'journal_write');}).finally(()=>session.pendingBytes-=bytes);}catch{coverage.lost(run.id,role,'frame_parse');}
    });
-   socket.on('error',()=>coverage.lost(run.id,role));socket.on('close',()=>{if(!closing)coverage.lost(run.id,role);});
+   socket.on('error',error=>coverage.lost(run.id,role,error.code==='WS_ERR_UNSUPPORTED_MESSAGE_LENGTH'?'frame_size':'connection_error'));socket.on('close',code=>{if(!closing)coverage.lost(run.id,role,'connection_closed',code);});
    await new Promise((ok,bad)=>{socket.once('open',()=>{socket.send(JSON.stringify({debug:false}));coverage.connected(run.id,role);ok();});socket.once('error',()=>bad(Error('DiagnosticConnectionFailed')));socket.once('close',()=>bad(Error('DiagnosticConnectionClosed')));});
-   session.pong=Date.now();socket.on('pong',()=>session.pong=Date.now());session.ping=setInterval(()=>{if(Date.now()-session.pong>45000){coverage.lost(run.id,role);socket.terminate();}else socket.ping();},15000);
+   const pingMessage=Buffer.from('wrangler tail ping');session.pong=performance.now();socket.on('pong',data=>{if(data.equals(pingMessage))session.pong=performance.now();});session.ping=setInterval(()=>{if(performance.now()-session.pong>45000){coverage.lost(run.id,role,'heartbeat_timeout');socket.terminate();}else socket.ping(pingMessage);},10000);
   }
   coverage.assertClean();
  }catch(error){await close().catch(()=>{});throw error;}

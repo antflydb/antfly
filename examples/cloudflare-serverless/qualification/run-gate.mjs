@@ -52,7 +52,7 @@ try{
  await markPhase('setup');
  console.log('seeding',trial);await runPairedPhase([baseline,candidate],side=>side.seed(documents,{executionId:resumedSeedExecutionId??executionId}));console.log('seeded',trial);
  await markPhase('workload');
- workload=await runOfferedWorkload({sides:[baseline,candidate],seconds,period,documents,orderOffset:trial,onProgress:async state=>{console.log('minute',trial,state.minute,'pending rounds',state.pending_rounds);await save();}});
+ workload=await runOfferedWorkload({sides:[baseline,candidate],seconds,period,documents,orderOffset:trial,onProgress:async state=>{console.log('minute',trial,state.minute,'pending rounds',state.pending_rounds);diagnostics.assertClean();await save();}});
  offered=seconds*1000;await runPairedPhase([baseline,candidate],side=>side.converge());await runPairedPhase([baseline,candidate],side=>side.verify(documents));await save();
  if(seconds>=3600||process.argv.includes('--cold')){
   let evidence;try{evidence=JSON.parse(await readFile(resolve(gate.dir,'evidence.json')));}catch{}
