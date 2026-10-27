@@ -14,6 +14,9 @@
 // limitations under the License.
 
 const std = @import("std");
+test {
+    _ = @import("relation_population.zig");
+}
 const sql_parser = @import("sql_parser");
 const lexer = sql_parser.lexer;
 const token = sql_parser.token;
@@ -557,6 +560,7 @@ const Parser = struct {
     uses_current_setting: bool = false,
     uses_sequences: bool = false,
     relation_depth: usize = 0,
+    into_target: ?*?ast.RelationPopulation = null,
 
     fn fail(self: *Parser, err: Error, message: []const u8) Error {
         const current = if (self.pos < self.tokens.len) self.tokens[self.pos] else null;
@@ -1497,6 +1501,10 @@ const Parser = struct {
     }
 
     fn selectCore(self: *Parser) Error!ast.Select {
+        // Only the outer SELECT may own INTO. Nested expressions and set
+        // arms must never convert a read producer into a catalog mutation.
+        const into_target = self.into_target;
+        self.into_target = null;
         const distinct: ?[]const *const ast.Scalar = if (self.keyword(.distinct)) blk: {
             if (!self.keyword(.on)) break :blk &.{};
             try self.expect(.lparen);
@@ -1515,6 +1523,12 @@ const Parser = struct {
         while (true) {
             try columns.append(self.alloc, try self.parseProjection(true));
             if (!self.take(.comma)) break;
+        }
+        if (self.keyword(.into)) {
+            const destination = into_target orelse return self.fail(error.InvalidSqlSyntax, "INTO is not allowed in this query producer");
+            const persistence = if (self.ddlWord("TEMP") or self.ddlWord("TEMPORARY")) ast.RelationPopulation.Persistence.temporary else if (self.ddlWord("UNLOGGED")) ast.RelationPopulation.Persistence.unlogged else ast.RelationPopulation.Persistence.permanent;
+            _ = self.keyword(.table);
+            destination.* = .{ .operation = .select_into, .name = try self.name(), .persistence = persistence };
         }
         const source = if (self.keyword(.from)) try self.relation() else null;
         if (source == null) for (columns.items) |projection| if (projection.wildcard and projection.field.len == 0) return self.fail(error.InvalidSqlSyntax, "wildcard projection requires a FROM source");
@@ -2698,6 +2712,81 @@ const Parser = struct {
         }
     }
 
+    fn tableAsAhead(self: *Parser) bool {
+        // Inspect only the table header. Scanning for any top-level AS would
+        // steal DOCUMENT SCHEMA ... AS JSON from ordinary CREATE TABLE.
+        var position = self.pos;
+        if (position < self.tokens.len and self.tokens[position].isKeyword(.@"if")) {
+            position += 1;
+            if (position >= self.tokens.len or !self.tokens[position].isKeyword(.not)) return false;
+            position += 1;
+            if (position >= self.tokens.len or !self.tokens[position].isKeyword(.exists)) return false;
+            position += 1;
+        }
+        if (position >= self.tokens.len or self.tokens[position].kind != .identifier) return false;
+        position += 1;
+        while (position < self.tokens.len and self.tokens[position].kind == .dot) {
+            position += 1;
+            if (position >= self.tokens.len or self.tokens[position].kind != .identifier) return false;
+            position += 1;
+        }
+        if (position < self.tokens.len and self.tokens[position].kind == .lparen) {
+            var depth: usize = 1;
+            position += 1;
+            while (position < self.tokens.len and depth != 0) : (position += 1) {
+                switch (self.tokens[position].kind) {
+                    .lparen => depth += 1,
+                    .rparen => depth -= 1,
+                    .semicolon => return false,
+                    else => {},
+                }
+            }
+            if (depth != 0) return false;
+        }
+        if (position < self.tokens.len and !self.tokens[position].owned and
+            std.ascii.eqlIgnoreCase(self.tokens[position].text, "TABLESPACE"))
+        {
+            position += 1;
+            if (position >= self.tokens.len or self.tokens[position].kind != .identifier) return false;
+            position += 1;
+        }
+        return position < self.tokens.len and self.tokens[position].isKeyword(.as);
+    }
+
+    fn populationDdl(self: *Parser, operation: @FieldType(ast.RelationPopulation, "operation"), persistence: ast.RelationPopulation.Persistence) Error!ast.RelationPopulation {
+        try self.node();
+        var intent: ast.RelationPopulation = .{ .operation = operation, .name = undefined, .persistence = persistence };
+        if (operation == .refresh_materialized_view) intent.concurrently = self.ddlWord("CONCURRENTLY") else if (self.keyword(.@"if")) {
+            try self.expectKeyword(.not);
+            try self.expectKeyword(.exists);
+            intent.if_not_exists = true;
+        }
+        intent.name = try self.name();
+        if (operation != .refresh_materialized_view) {
+            intent.columns = if (self.peek(.lparen)) try self.ddlColumnList() else &.{};
+            if (intent.columns.len > 1024) return self.fail(error.SqlLimitExceeded, "population output column limit exceeded");
+            if (self.ddlWord("TABLESPACE")) intent.tablespace = try self.identifier();
+            try self.expectKeyword(.as);
+            if (self.pos >= self.tokens.len) return self.fail(error.InvalidSqlSyntax, "population requires a source query");
+            const start = self.tokens[self.pos].source_start;
+            self.relation_depth += 1;
+            defer self.relation_depth -= 1;
+            if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "population query nesting limit exceeded");
+            const statement_ = try self.statement();
+            if (statement_ != .select) return self.fail(error.InvalidSqlSyntax, "population requires a read query");
+            const query = try self.alloc.create(ast.Select);
+            query.* = statement_.select;
+            intent.query = query;
+            intent.query_sql = try self.alloc.dupe(u8, self.source[start..self.tokens[self.pos - 1].source_end]);
+            if (operation == .create_materialized_view and self.parameter_count != 0) return self.fail(error.InvalidSqlParameter, "materialized view definitions cannot contain parameters");
+        }
+        if (self.keyword(.with)) {
+            intent.with_data = !self.ddlWord("NO");
+            if (!self.ddlWord("DATA")) return self.fail(error.InvalidSqlSyntax, "population WITH requires DATA or NO DATA");
+        }
+        return intent;
+    }
+
     fn viewDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action"), replace: bool) Error!ast.CatalogDdl {
         try self.node();
         var conditional = false;
@@ -3752,6 +3841,13 @@ const Parser = struct {
             }
             const source: *ast.Select = switch (result) {
                 .select => &result.select,
+                .catalog_ddl => if (result.catalog_ddl.population) |*population| pop: {
+                    if (population.operation != .select_into) return self.fail(error.InvalidSqlSyntax, "WITH requires a query or mutation");
+                    const copy = try self.alloc.create(ast.Select);
+                    copy.* = population.query.?.*;
+                    population.query = copy;
+                    break :pop copy;
+                } else return self.fail(error.InvalidSqlSyntax, "WITH requires a query or mutation"),
                 .insert => blk: {
                     const original = result.insert.source orelse return self.fail(error.UnsupportedSqlShape, "WITH INSERT requires a SELECT source");
                     const copy = try self.alloc.create(ast.Select);
@@ -3784,7 +3880,20 @@ const Parser = struct {
             source.* = .{ .derived = .{ .query = query, .alias = "$parenthesized" } };
             return .{ .select = try self.selectFinish(.{ .source = source }) };
         }
-        if (self.keyword(.select)) return .{ .select = try self.select() };
+        if (self.keyword(.select)) {
+            var destination: ?ast.RelationPopulation = null;
+            const previous_into = self.into_target;
+            self.into_target = &destination;
+            defer self.into_target = previous_into;
+            const query = try self.select();
+            if (destination) |*intent| {
+                const source = try self.alloc.create(ast.Select);
+                source.* = query;
+                intent.query = source;
+                return .{ .catalog_ddl = intent.ddl() };
+            }
+            return .{ .select = query };
+        }
         if (self.keyword(.values)) return .{ .select = try self.selectFinish(try self.valuesCore()) };
         if (self.keyword(.insert)) return .{ .insert = try self.insert() };
         if (self.keyword(.update)) return .{ .update = try self.update() };
@@ -3833,13 +3942,34 @@ const Parser = struct {
             if (self.ddlWord("SEQUENCE")) return .{ .catalog_ddl = try self.sequenceDdl(.create) };
             if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.create, false) };
             if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.create) };
-            if (self.keyword(.table)) return .{ .create_table = try self.createTable() };
+            if (self.keyword(.materialized)) {
+                if (!self.ddlWord("VIEW")) return self.fail(error.InvalidSqlSyntax, "MATERIALIZED requires VIEW");
+                return .{ .catalog_ddl = (try self.populationDdl(.create_materialized_view, .permanent)).ddl() };
+            }
+            const persistence: ast.RelationPopulation.Persistence = if (self.ddlWord("TEMP") or self.ddlWord("TEMPORARY")) .temporary else if (self.ddlWord("UNLOGGED")) .unlogged else .permanent;
+            if (self.keyword(.table)) {
+                if (self.tableAsAhead()) return .{ .catalog_ddl = (try self.populationDdl(.create_table_as, persistence)).ddl() };
+                var create = try self.createTable();
+                create.persistence = persistence;
+                return .{ .create_table = create };
+            }
+            if (persistence != .permanent) return self.fail(error.InvalidSqlSyntax, "table persistence requires TABLE");
             const unique = self.keyword(.unique);
             if (self.keyword(.index)) return .{ .catalog_ddl = try self.indexDdl(true, unique) };
             if (unique) return self.fail(error.InvalidSqlSyntax, "UNIQUE requires INDEX");
             return .{ .catalog_ddl = try self.catalogDdl(.create) };
         }
+        if (self.ddlWord("REFRESH")) {
+            if (!self.keyword(.materialized) or !self.ddlWord("VIEW")) return self.fail(error.InvalidSqlSyntax, "REFRESH requires MATERIALIZED VIEW");
+            return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
+        }
         if (self.keyword(.drop)) {
+            if (self.keyword(.materialized)) {
+                if (!self.ddlWord("VIEW")) return self.fail(error.InvalidSqlSyntax, "MATERIALIZED requires VIEW");
+                var ddl = try self.viewDdl(.drop, false);
+                ddl.materialized = true;
+                return .{ .catalog_ddl = ddl };
+            }
             if (self.ddlWord("SEQUENCE")) return .{ .catalog_ddl = try self.sequenceDdl(.drop) };
             if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.drop, false) };
             if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.drop) };
@@ -5280,4 +5410,71 @@ test "SQL COPY input advanced options retain owned column domains and PostgreSQL
         "COPY t FROM STDIN (REJECT_LIMIT 1)",
         "COPY t FROM STDIN (ON_ERROR ignore, REJECT_LIMIT 0)",
     }) |sql| try std.testing.expectError(error.SqlInvalidParameterValue, compile(a, sql, .{}));
+}
+
+test "SQL relation population originals retain read producers persistence output names and publication options" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0351", "sql-0352", "sql-0353", "sql-0356", "sql-0357", "sql-0364", "sql-0365", "sql-0366", "sql-0367", "sql-0368", "sql-0567", "sql-0568", "sql-0569" }) |id| {
+        const original = try corpus.get(id);
+        var compiled = try compile(a, original.sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(.populate, ddl.action);
+        const intent = ddl.population.?;
+        try std.testing.expectEqualStrings(ddl.name.table, intent.name.table);
+        if (std.mem.eql(u8, id, "sql-0356") or std.mem.eql(u8, id, "sql-0357")) {
+            try std.testing.expectEqual(.refresh_materialized_view, intent.operation);
+            try std.testing.expect(intent.query == null);
+        } else try std.testing.expect(intent.query != null);
+        if (std.mem.eql(u8, id, "sql-0357")) {
+            try std.testing.expect(intent.concurrently);
+            try std.testing.expect(!intent.with_data);
+        }
+        if (std.mem.eql(u8, id, "sql-0365")) try std.testing.expect(!intent.with_data);
+        if (std.mem.eql(u8, id, "sql-0366") or std.mem.eql(u8, id, "sql-0367")) try std.testing.expect(intent.if_not_exists);
+        if (std.mem.eql(u8, id, "sql-0367") or std.mem.eql(u8, id, "sql-0568")) try std.testing.expectEqual(.temporary, intent.persistence);
+        if (std.mem.eql(u8, id, "sql-0368") or std.mem.eql(u8, id, "sql-0569")) try std.testing.expectEqual(.unlogged, intent.persistence);
+        if (std.mem.eql(u8, id, "sql-0352")) {
+            try std.testing.expectEqual(@as(usize, 2), intent.columns.len);
+            try std.testing.expectEqualStrings("record_id", intent.columns[0]);
+            try std.testing.expectEqualStrings("record_status", intent.columns[1]);
+        }
+    }
+    for ([_][]const u8{ "sql-0358", "sql-0359" }) |id| {
+        const original = try corpus.get(id);
+        var compiled = try compile(a, original.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(compiled.statement.catalog_ddl.materialized);
+        try std.testing.expectEqual(.drop, compiled.statement.catalog_ddl.action);
+    }
+}
+
+test "SQL relation population producer parsing isolates nested INTO and preserves typed source parameters" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "CREATE TABLE dst(x) AS SELECT $1::bigint WITH NO DATA",
+        "CREATE TABLE dst AS WITH src AS (SELECT $1::bigint AS x) SELECT x FROM src",
+        "WITH src AS (SELECT $1::bigint AS x) SELECT x INTO dst FROM src",
+    }) |sql| {
+        var compiled = try compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(@as(u32, 1), compiled.parameter_count);
+        try std.testing.expect(compiled.statement.catalog_ddl.population.?.query != null);
+    }
+    for ([_][]const u8{
+        "CREATE TABLE dst AS SELECT 1 INTO another",
+        "CREATE MATERIALIZED VIEW dst AS SELECT 1 INTO another",
+        "SELECT (SELECT 1 INTO another)",
+    }) |sql| {
+        if (compile(a, sql, .{})) |value| {
+            var accepted = value;
+            accepted.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+    var materialized = try compile(a, "CREATE MATERIALIZED VIEW dst(a,b) AS SELECT 1,2 WITH NO DATA", .{});
+    defer materialized.deinit();
+    try std.testing.expectEqualStrings("SELECT 1,2", materialized.statement.catalog_ddl.population.?.query_sql.?);
 }

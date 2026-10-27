@@ -10796,7 +10796,13 @@ pub const DB = struct {
                         input_bytes = std.math.add(usize, input_bytes, artifact.key.len +| artifact.value.len) catch return error.TransactionTooLarge;
                         if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
                     }
+                    const population_version: ?u64 = if (page.population != null) population: {
+                        var progress = try @import("restore_staging.zig").Progress.decode(self.alloc, page.next);
+                        defer progress.deinit();
+                        break :population (progress.value.scope.population orelse return error.InvalidRestoreStagingCommand).write_version;
+                    } else null;
                     for (page.timestamps, req.writes) |timestamp, row| {
+                        if (population_version) |version| if (timestamp.timestamp != version) return error.InvalidRestoreStagingCommand;
                         if (timestamp.timestamp == 0 or !std.mem.eql(u8, timestamp.key, row.key)) return error.InvalidRestoreStagingCommand;
                         input_bytes = std.math.add(usize, input_bytes, row.key.len +| row.value.len) catch return error.TransactionTooLarge;
                         if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
@@ -10816,7 +10822,7 @@ pub const DB = struct {
                     apply_req.sync_level = if (page.artifact_page or page.source_generation_proof_page) .write else .full_index;
                     var apply_opts = opts;
                     apply_opts.wait_for_sync_level = !page.artifact_page and !page.source_generation_proof_page;
-                    apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page, .source_generation_proof_page = page.source_generation_proof_page };
+                    apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page, .source_generation_proof_page = page.source_generation_proof_page, .population = page.population };
                     apply_opts.restore_timestamps = &timestamps;
                     apply_opts.restore_replication_request = req;
                     apply_opts.restore_artifacts = page.artifacts;
@@ -40544,7 +40550,13 @@ pub const DB = struct {
             if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &scope.digest())) return error.RestoreStagingScopeChanged;
             source_proofs_required = bootstrap.value.source_generation_proof_digest != null;
         }
-        const initial = try (staging.Progress{ .scope = scope, .phase = if (scope.empty_generation) .imported else .importing, .source_generation_proofs_complete = !source_proofs_required, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null }).encode(alloc);
+        var progress: staging.Progress = .{ .scope = scope, .phase = if (scope.empty_generation) .imported else .importing, .source_generation_proofs_complete = !source_proofs_required, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null };
+        if (scope.population) |binding| {
+            progress.population = try @import("relational_population_contract.zig").Cursor.init(binding);
+            progress.logical_digest = progress.population.?.chain;
+            progress.artifacts_complete = true;
+        }
+        const initial = try progress.encode(alloc);
         defer alloc.free(initial);
         try txn.put(staging.key, initial);
         try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);

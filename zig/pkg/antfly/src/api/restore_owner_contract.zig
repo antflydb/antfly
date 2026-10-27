@@ -45,6 +45,8 @@ pub const Request = struct {
     rewrite: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.Intent = null,
     rewrite_tail: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.TailChunk = null,
     rewrite_finish: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.FinalReceipt = null,
+    population_page: ?@import("antfly_local_sources").storage_db_relational_population_contract.Page = null,
+    population_complete: ?@import("antfly_local_sources").storage_db_relational_population_contract.Completion = null,
     max_rows: u16 = 128,
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
@@ -56,6 +58,17 @@ pub const Request = struct {
     }
     pub fn validate(self: Request, group_id: u64) !void {
         try self.scope.validate();
+        if (self.scope.population) |binding| {
+            const fields = @as(u8, @intFromBool(self.population_page != null)) + @intFromBool(self.population_complete != null);
+            if ((self.action == .import_page and fields != 1) or (self.action != .import_page and fields != 0) or
+                self.source != null or self.source_chunk != null or self.rewrite != null or self.rewrite_tail != null or self.rewrite_finish != null or self.generation_admissions != null)
+                return error.InvalidRestoreStagingCommand;
+            if (self.population_page) |page| {
+                _ = try page.digest();
+                if (!std.mem.eql(u8, &page.binding, &try binding.digest()) or page.rows.len > self.max_rows) return error.RestoreStagingScopeChanged;
+            }
+            if (self.population_complete) |receipt| if (!std.mem.eql(u8, &receipt.binding, &try binding.digest())) return error.RestoreStagingScopeChanged;
+        } else if (self.population_page != null or self.population_complete != null) return error.InvalidRestoreStagingCommand;
         if ((self.action == .install_generation_admissions) != (self.generation_admissions != null)) return error.InvalidRestoreStagingCommand;
         if (self.generation_admissions) |command| {
             try command.validate();
@@ -81,7 +94,7 @@ pub const Request = struct {
             if (self.action != .import_page or self.source != null or self.rewrite == null) return error.InvalidRestoreStagingCommand;
             try receipt.validate(self.scope.rewrite orelse return error.InvalidRestoreStagingCommand);
         }
-        if (self.action == .import_page) {
+        if (self.action == .import_page and self.scope.population == null) {
             if ((self.rewrite == null) != (self.scope.rewrite == null)) return error.InvalidRestoreStagingCommand;
             if (self.rewrite_tail != null or self.rewrite_finish != null) return;
             const source = self.source orelse return error.RestoreSourceProofMissing;
@@ -98,6 +111,7 @@ pub const Response = struct {
     rows: u64,
     receipt: staging.Digest,
     generation_admission_receipt: ?staging.Digest = null,
+    population: ?@import("antfly_local_sources").storage_db_relational_population_contract.Cursor = null,
     rewrite: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.Progress = null,
     tail_next: u32 = 0,
     source_next_offset: u64 = 0,

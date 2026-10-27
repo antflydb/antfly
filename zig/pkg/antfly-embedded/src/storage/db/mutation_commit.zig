@@ -437,6 +437,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Only authenticated hot-standby replay may supply final scoped metadata effects
             // without local participant intents. Scope, key kinds, owner range and
             // generation are revalidated below under the apply fence.
+            const historical_restore = if (opts.restore_staging) |admission| admission.population == null else false;
             const scoped_restore_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope != null and opts.restore_staging == null;
             const live_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope == null and opts.restore_staging == null;
             if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply) {
@@ -453,8 +454,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var prepared_document: ?mapper.PreparedDocumentBatch = null;
             defer if (prepared_document) |*prepared| prepared.deinit();
             if (request_schema_view) |view| if (view.storageMode() == .document and (if (view.validator()) |validator| validator.requiresDocumentPreparation() else false) and effective_req.writes.len != 0) {
-                const validator = preparationValidator(view.validator(), opts.restore_staging != null) orelse return error.InvalidSchemaUpdateRequest;
-                prepared_document = try mapper.PreparedDocumentBatch.init(preparation_alloc, effective_req.writes, validator, opts.restore_staging != null or opts.preserve_logical_values or opts.replication_applied_lsn_marker != null or req.split_replication != null or req.merge_replication != null);
+                const validator = preparationValidator(view.validator(), historical_restore) orelse return error.InvalidSchemaUpdateRequest;
+                prepared_document = try mapper.PreparedDocumentBatch.init(preparation_alloc, effective_req.writes, validator, historical_restore or opts.preserve_logical_values or opts.replication_applied_lsn_marker != null or req.split_replication != null or req.merge_replication != null);
                 effective_req.writes = prepared_document.?.writes;
             };
             // Integrity effects may only enter through durable transaction prepare.
@@ -557,7 +558,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         S.ownerField(self, "backend_runtime").*.io(),
                         self,
                         effective_req.writes,
-                        preparationValidator(view.validator(), opts.restore_staging != null),
+                        preparationValidator(view.validator(), historical_restore),
                         view.tableSchema().*,
                         view.physicalLayout(),
                         write_plan_snapshot.?.plan().*,
@@ -566,7 +567,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         rows,
                         opts.durable_rows,
                         opts.restore_timestamps,
-                        opts.restore_staging != null or opts.preserve_logical_values,
+                        historical_restore or opts.preserve_logical_values,
                     );
                     if (prepared_index_keys) |*keys| {
                         var largest_document: usize = 0;
@@ -898,7 +899,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var restore_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer restore_read.abort();
                 if (opts.restore_staging) |admission|
-                    try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len)
+                    try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len, req.writes)
                 else if (opts.transaction_resolution == null) {
                     if (opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope != null) {
                         try @import("restore_staging.zig").requireMutableScope(preparation_alloc, &restore_read, effective_req.restore_staging_scope);
@@ -1546,9 +1547,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk prepared;
                 } else if (apply_schema_view) |view|
                     if (write.json_null_fields.len != 0)
-                        try mapper.PreparedRelationalWrite.initTyped(S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, false, write.key, write.value, preparationValidator(view.validator(), opts.restore_staging != null), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, opts.restore_staging != null or opts.preserve_logical_values)
-                    else if (opts.restore_staging != null or opts.preserve_logical_values)
-                        try mapper.PreparedRelationalWrite.initPreserved(S.ownerField(self, "alloc").*, write.key, write.value, preparationValidator(view.validator(), opts.restore_staging != null), view.tableSchema().*, view.physicalLayout())
+                        try mapper.PreparedRelationalWrite.initTyped(S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, false, write.key, write.value, preparationValidator(view.validator(), historical_restore), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, historical_restore or opts.preserve_logical_values)
+                    else if (historical_restore or opts.preserve_logical_values)
+                        try mapper.PreparedRelationalWrite.initPreserved(S.ownerField(self, "alloc").*, write.key, write.value, preparationValidator(view.validator(), historical_restore), view.tableSchema().*, view.physicalLayout())
                     else
                         try mapper.PreparedRelationalWrite.initFromIntent(
                             S.ownerField(self, "alloc").*,
@@ -3301,7 +3302,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var generated_memo = GeneratedEmbeddingMemo.init(allocator_guard.allocator());
             // Cache restoration is an internal preservation operation. Ordinary
             // writes and explicit regeneration retain their provider semantics.
-            generated_memo.reuse_stored_artifacts = if (opts.restore_staging) |admission| !admission.rewrite else false;
+            generated_memo.reuse_stored_artifacts = if (opts.restore_staging) |admission| !admission.rewrite and admission.population == null else false;
             defer generated_memo.deinit();
             while (true) {
                 self.batchInternalPrepared(req, profile, opts, &generated_memo, allocator_guard) catch |err| switch (err) {

@@ -76,6 +76,9 @@ pub const Output = struct {
     sql_nulls: ?[]const []const bool = null,
     pattern_sources: ?[]const []const ?*@import("scalar.zig").PatternSet = null,
     rows_affected: u64 = 0,
+    /// Internal completion count for population SELECT tags. The statement
+    /// writes rows but returns no DataRows; transports must not report zero.
+    completion_rows: ?u64 = null,
     command_tag: []const u8,
     mutation_outcome: ?catalog.MutationOutcome = null,
     ddl_receipt: ?catalog.DdlReceipt = null,
@@ -297,6 +300,26 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
         return .{ .columns = try arena.dupe(Column, &.{.{ .name = "QUERY PLAN", .type = .string }}), .rows = try arena.dupe([]const Json, &.{row}), .command_tag = "EXPLAIN" };
     }
     const ddl = @import("ddl_runtime.zig");
+    if (compiled.statement == .catalog_ddl) if (compiled.statement.catalog_ddl.population) |intent| {
+        const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
+        // Persistence is a lifecycle contract. Never turn TEMP or UNLOGGED
+        // syntax into an ordinary global durable table.
+        if (intent.persistence != .permanent) return error.UnsupportedSqlExecution;
+        const source = if (intent.query != null)
+            try @import("relation_population.zig").Source.init(arena, backend, compiled, intent, parameters, limits)
+        else
+            null;
+        defer if (source) |owned| owned.deinit();
+        try backend.vtable.checkpoint(backend.ptr);
+        const result = try dispatch(backend.ptr, .{ .result = arena, .scratch = alloc }, .{ .populate = .{ .intent = intent, .source = if (source) |owned| owned.iface() else null } });
+        // The owner finishes the synchronous producer before publishing. Do
+        // not add a fallible checkpoint after a possibly durable admission.
+        return .{ .rows_affected = result.rows_affected, .completion_rows = result.rows_affected, .command_tag = if (result.mutation_outcome == .committed_pending or (result.receipt != null and result.receipt.?.state != .ready)) "DDL PENDING" else switch (intent.operation) {
+            .create_table_as, .select_into => if (!intent.with_data or result.population_skipped) "CREATE TABLE AS" else "SELECT",
+            .create_materialized_view => if (!intent.with_data or result.population_skipped) "CREATE MATERIALIZED VIEW" else "SELECT",
+            .refresh_materialized_view => "REFRESH MATERIALIZED VIEW",
+        }, .mutation_outcome = result.mutation_outcome, .ddl_receipt = result.receipt, .catalog_receipt = result.catalog_receipt };
+    };
     if (ddl.accepts(compiled.statement)) {
         const result = try ddl.execute(.{ .result = arena, .scratch = alloc }, backend, compiled.statement);
         return .{ .command_tag = result.command_tag, .mutation_outcome = result.mutation_outcome, .ddl_receipt = result.receipt, .catalog_receipt = result.catalog_receipt };

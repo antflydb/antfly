@@ -3639,6 +3639,12 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const population = switch (command) {
+        .apply_restore_staging => |bytes| @import("schema_reader_wire.zig").requiresPopulation(bytes),
+        .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresPopulation(request.plan_json),
+        else => false,
+    };
+    if (population) return metadata_topology_protocol.sql_population_version;
     if (command == .compare_and_set_job_state) return metadata_topology_protocol.job_state_version;
     if (command == .apply_resolver_authority) return metadata_topology_protocol.resolver_records_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresResourceComments(command.apply_system_catalog)) return metadata_topology_protocol.sql_resource_comments_version;
@@ -24058,4 +24064,9 @@ test "runtime status source authority merge preserves negotiated media and expli
     try std.testing.expect(!statuses[0].enrichment.output_counts_available);
     try std.testing.expectEqual(@as(u64, 0), statuses[0].enrichment.output_counts.embedding.complete);
     try std.testing.expectEqual(@as(u32, 7), statuses[0].schema_epoch);
+}
+
+test "relational integrity restore staging population admission requires the complete decoder floor" {
+    try std.testing.expectEqual(metadata_topology_protocol.sql_population_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"plan\":{\"targets\":[{\"population\":{}}]}}" }));
+    try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"plan\":{\"targets\":[{\"population\":null}]}}" }) < metadata_topology_protocol.sql_population_version);
 }

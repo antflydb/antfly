@@ -30,6 +30,9 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_relation_population, .err = error.InvalidRelationPopulation },
+    .{ .status = .relation_population_page_too_large, .err = error.RelationPopulationPageTooLarge },
+    .{ .status = .relation_population_changed, .err = error.RelationPopulationChanged },
     .{ .status = .foreign_key_validation_required, .err = error.ForeignKeyValidationRequired },
     .{ .status = .undefined_column, .err = error.UndefinedColumn },
     .{ .status = .conflicting_data_apply_batch, .err = error.ConflictingDataApplyBatch },

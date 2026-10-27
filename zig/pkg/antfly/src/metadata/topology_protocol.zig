@@ -136,7 +136,10 @@ const std = @import("std");
 /// Version 73 combines durable document jobs and SQL index publication.
 /// Main owns command tag 79; the unreleased SQL index ACK moves to tag 89.
 /// Re-fence the complete index cohort so every admitted job can finish.
-pub const current_version: u16 = 73;
+/// Version 74 decodes query-population captures and sealed typed-row delivery.
+/// It does not authorize replaying a lost request-owned query evaluation.
+pub const current_version: u16 = 74;
+pub const sql_population_version: u16 = 74;
 pub const job_state_version: u16 = 73;
 pub const sql_drop_generation_version: u16 = 72;
 pub const sql_view_domains_version: u16 = 71;

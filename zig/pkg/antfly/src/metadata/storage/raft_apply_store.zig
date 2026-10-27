@@ -32708,6 +32708,17 @@ pub const RaftApplyStore = struct {
         };
         defer parsed.deinit();
         const command = parsed.value;
+        if (command.plan) |plan| for (plan.targets) |target| {
+            if (target.population != null) {
+                // New captures are inadmissible until the exact metadata
+                // voter cohort has durably activated this decoder.
+                _ = self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_population_version) catch |err| switch (err) {
+                    error.TableTopologyProtocolUpgradeRequired => return,
+                    else => return err,
+                };
+                break;
+            }
+        };
         if (command.plan) |plan| if (plan.readerPublicationRequired()) {
             _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.schema_reader_publication_version);
         };

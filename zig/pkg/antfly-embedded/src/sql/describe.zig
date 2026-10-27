@@ -543,6 +543,19 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
         return bindInternal(allocator, pinned, &executable, validated.parameter_types);
     }
     if (@import("ddl_runtime.zig").accepts(compiled.statement)) {
+        if (compiled.statement == .catalog_ddl) if (compiled.statement.catalog_ddl.population) |intent| {
+            if (backend.vtable.ddl == null) return error.UnsupportedSqlExecution;
+            if (intent.query) |query| {
+                var read = compiled.*;
+                read.statement = .{ .select = query.* };
+                var bound = try bindInternal(allocator, backend, &read, explicit_parameter_types);
+                // Retain source identity/parameter constraints for prepared
+                // validation, but population DDL has no result row metadata.
+                bound.columns = &.{};
+                bound.action = .admin;
+                return bound;
+            }
+        };
         if (compiled.parameter_count != 0) return error.InvalidSqlParameters;
         if (backend.vtable.ddl == null) return error.UnsupportedSqlExecution;
         try backend.vtable.checkpoint(backend.ptr);

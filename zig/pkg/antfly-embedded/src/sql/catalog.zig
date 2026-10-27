@@ -1303,7 +1303,30 @@ pub const MutationOutcome = enum {
     committed_graph_metric_materialization_rejected,
 };
 
+/// Synchronous, bounded producer borrowed only for the DDL callback. A job may
+/// retain its immutable capture identity, never these request-owned callbacks.
+pub const PopulationSource = struct {
+    schema_json: []const u8,
+    definition: [32]u8,
+    source_definition: [32]u8,
+    ptr: *anyopaque,
+    next: *const fn (*anyopaque, u32) anyerror!?[]const @import("../storage/db/relational_population_contract.zig").Row,
+    finish: *const fn (*anyopaque) anyerror!void,
+};
+
 pub const Ddl = union(enum) {
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        // Request-owned producer callbacks cannot become stored catalog data.
+        if (self == .populate) return error.WriteFailed;
+        try writer.beginObject();
+        try writer.objectField(@tagName(self));
+        switch (self) {
+            .populate => unreachable,
+            inline else => |value| try writer.write(value),
+        }
+        try writer.endObject();
+    }
+    populate: struct { intent: ast.RelationPopulation, source: ?PopulationSource = null },
     create_table: struct {
         name: ast.Name,
         schema_json: []const u8,
@@ -1397,7 +1420,7 @@ pub const DdlAllocators = struct {
     completion: Completion = .bounded,
 };
 
-pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null, catalog_receipt: ?CatalogOperationReceipt = null };
+pub const DdlOutcome = struct { rows_affected: u64 = 0, population_skipped: bool = false, mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null, catalog_receipt: ?CatalogOperationReceipt = null };
 
 pub const ScanQuota = @import("native_scan_quota.zig").Quota;
 

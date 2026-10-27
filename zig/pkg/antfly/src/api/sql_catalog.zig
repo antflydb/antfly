@@ -939,6 +939,7 @@ fn createConflict(server: *server_mod.ApiHttpServer, context: operation.RequestC
 }
 
 pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: catalog.Ddl, path: ?*const SearchPath) !catalog.DdlOutcome {
+    if (input == .populate) return error.UnsupportedSqlExecution;
     const alloc = allocators.result;
     try context.ensureActive();
     if (input == .policy_ddl) return @import("sql_policy_ddl.zig").execute(server, identity, context, database, namespace, alloc, input.policy_ddl);
@@ -958,7 +959,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         .create_table => |v| v.name,
         .drop_table => |v| v.table,
         .catalog_ddl => |v| v.name,
-        .policy_ddl => unreachable,
+        .policy_ddl, .populate => unreachable,
     };
     var target: domain.Target = .{ .database = name.database orelse database, .namespace = name.namespace orelse namespace, .table = name.table };
     try target.validate();
@@ -967,7 +968,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .index, .view, .role, .sequence => unreachable,
             inline else => |tag| @field(domain.Kind, @tagName(tag)),
         },
-        .policy_ddl => unreachable,
+        .policy_ddl, .populate => unreachable,
         else => .table,
     };
     var route: @import("../system_catalog/routes.zig").Route = .{ .kind = kind, .database = target.database, .namespace = target.namespace, .name = target.table };
@@ -992,9 +993,10 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         .drop_table => .drop,
         .catalog_ddl => |ddl| switch (ddl.action) {
             .alter_schema, .truncate, .role_default, .comment, .alter_sequence => unreachable,
+            .populate => return error.UnsupportedSqlExecution,
             inline else => |tag| @field(domain.Action, @tagName(tag)),
         },
-        .policy_ddl => unreachable,
+        .policy_ddl, .populate => unreachable,
     }, .kind = kind, .database = target.database, .namespace = target.namespace, .name = target.table } };
     var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
@@ -1098,7 +1100,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
                 } else if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, destination_resource, .admin)) return error.Forbidden;
             }
         },
-        .policy_ddl => unreachable,
+        .policy_ddl, .populate => unreachable,
     }
     if (request.mutation.tablespace) |tablespace| if (identity) |authenticated| {
         if (!server_mod.permissionsAllow(authenticated.permissions, .tablespace, tablespace, .read)) return error.Forbidden;
@@ -1110,7 +1112,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .create_table => |create| if (err == error.CatalogAlreadyExists or err == error.TableAlreadyExists) return createConflict(server, context, a, target, generated_names, create.if_not_exists, err, allocators.scratch),
             .drop_table => |drop| if (drop.if_exists and (err == error.CatalogNotFound or err == error.TableNotFound)) return .{},
             .catalog_ddl => |ddl| if (ddl.conditional and ((ddl.action == .create and err == error.CatalogAlreadyExists) or (ddl.action == .drop and err == error.CatalogNotFound))) return .{},
-            .policy_ddl => unreachable,
+            .policy_ddl, .populate => unreachable,
         }
         if (err == error.ForeignKeyReferenced and input == .drop_table) return error.SqlDependentConstraint;
         if (err == error.ConstraintRetirementRequired and input == .drop_table)

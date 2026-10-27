@@ -44,6 +44,7 @@ fn generatedConstraintNamesAlloc(a: std.mem.Allocator, create: ast.CreateTable) 
 
 pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, statement: ast.Statement) !Output {
     const alloc = allocators.scratch;
+    if (statement == .catalog_ddl and (statement.catalog_ddl.action == .populate or statement.catalog_ddl.materialized)) return error.UnsupportedSqlExecution;
     const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
     try backend.vtable.checkpoint(backend.ptr);
     const preparation: @import("immutable_plan.zig").Limits = if (backend.scalar_control) |control| .{ .checkpoint = control.checkpoint, .checkpoint_context = control.ptr } else .{};
@@ -68,6 +69,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
     try backend.vtable.checkpoint(backend.ptr);
     const outcome = try dispatch(backend.ptr, allocators, request);
     return .{ .command_tag = if (outcome.mutation_outcome == .committed_pending or (outcome.receipt != null and outcome.receipt.?.state != .ready) or (outcome.catalog_receipt != null and outcome.catalog_receipt.?.state == .unknown)) "DDL PENDING" else switch (request) {
+        .populate => unreachable,
         .create_table => "CREATE TABLE",
         .drop_table => "DROP TABLE",
         .policy_ddl => |ddl| switch (ddl.action) {
@@ -79,6 +81,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
         },
         .catalog_ddl => |ddl| switch (ddl.action) {
             .comment => "COMMENT",
+            .populate => return error.UnsupportedSqlExecution,
             .role_default => "ALTER ROLE",
             .alter_sequence => "ALTER SEQUENCE",
             .truncate => "TRUNCATE TABLE",
@@ -335,6 +338,7 @@ fn documentSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable, docume
 }
 
 pub fn createSchemaAllocWithLimits(alloc: std.mem.Allocator, create: ast.CreateTable, limits: @import("immutable_plan.zig").Limits) anyerror![]u8 {
+    if (create.persistence != .permanent) return error.UnsupportedSqlExecution;
     if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     if (create.document) |document| return documentSchemaAlloc(alloc, create, document.*, limits);
     if (create.columns.len == 0) return error.UnsupportedSqlShape;

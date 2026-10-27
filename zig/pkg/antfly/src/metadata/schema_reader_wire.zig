@@ -17,6 +17,17 @@
 //! FK and restore envelopes. Schema/row strings are validated but never copied.
 const std = @import("std");
 
+pub fn requiresPopulation(bytes: []const u8) bool {
+    return requiresMarker(bytes, "population");
+}
+
+test "relational integrity restore staging population decoder marker ignores opaque source strings" {
+    for ([_][]const u8{ "{}", "{\"population\":null}", "{\"schema_json\":\"population capture_id\"}" }) |legacy|
+        try std.testing.expect(!requiresPopulation(legacy));
+    for ([_][]const u8{ "{\"plan\":{\"targets\":[{\"population\":{}}]}}", "{\"popul\\u0061tion\":{}}", "{" }) |current|
+        try std.testing.expect(requiresPopulation(current));
+}
+
 pub fn requiresPublication(bytes: []const u8) bool {
     return requiresMarker(bytes, "schema_reader_requirements");
 }

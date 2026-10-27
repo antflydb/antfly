@@ -83,6 +83,7 @@ pub const OwnerBootstrap = struct {
     }
     pub fn validate(self: @This()) !void {
         try self.scope.validate();
+        if (self.scope.population != null and (self.source_generation_proof_digest != null or self.generation_admission != null or self.empty_generation_handoff != null)) return error.InvalidRestoreStagingCommand;
         // Empty-generation targets cannot be opened without the immutable
         // source authority they must install before publication. Catch a
         // missing cold-descriptor projection before it reaches Raft apply.
@@ -139,6 +140,9 @@ pub const Timestamp = struct { key: []const u8, timestamp: u64 };
 pub const Artifact = struct { key: []const u8, value: []const u8 };
 
 pub const ImportPage = struct {
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "population") and self.population == null;
+    }
     expected: Digest,
     next: []const u8,
     scope: Digest,
@@ -156,6 +160,7 @@ pub const ImportPage = struct {
     /// One bounded, replicated proof-only metadata page precedes row import.
     /// It is never admitted as a user artifact or active FK authority.
     source_generation_proof_page: bool = false,
+    population: ?@import("relational_population_contract.zig").Delivery = null,
 };
 
 /// Source admission evidence is not portable authority: physical child IDs and
@@ -363,7 +368,8 @@ pub const Control = union(enum) {
 pub const Scope = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
         return (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
-            (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null);
+            (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null) or
+            (std.mem.eql(u8, name, "population") and self.population == null);
     }
     plan_id: [16]u8,
     plan_digest: Digest,
@@ -379,8 +385,20 @@ pub const Scope = struct {
     /// metadata plan. Only an empty owner may carry this retirement barrier.
     graph_retirement_digest: ?Digest = null,
     rewrite: ?@import("relational_rewrite_contract.zig").Binding = null,
+    population: ?@import("relational_population_contract.zig").Binding = null,
 
+    fn validatePopulation(self: Scope) !void {
+        if (self.population) |binding| {
+            try binding.validate();
+            if (self.empty_generation or self.preserve_artifacts or self.rewrite != null or self.graph_retirement_digest != null or binding.partition != self.target_namespace.shard_id or
+                self.source_namespace.table_id != 0 or self.source_namespace.shard_id != 0 or self.source_namespace.range_id != 0 or
+                !std.mem.eql(u8, &binding.target_schema, &self.target_schema_digest) or
+                !std.mem.eql(u8, &try binding.digest(), &self.source_artifact_digest) or
+                !std.mem.allEqual(u8, &self.source_descriptor_digest, 0)) return error.InvalidRestoreStagingCommand;
+        }
+    }
     pub fn validateReservation(self: Scope) !void {
+        try self.validatePopulation();
         if (self.empty_generation and (self.preserve_artifacts or self.rewrite != null)) return error.InvalidRestoreStagingCommand;
         if (!self.empty_generation and self.graph_retirement_digest != null) return error.InvalidRestoreStagingCommand;
         if (self.rewrite) |rewrite| {
@@ -394,6 +412,7 @@ pub const Scope = struct {
     }
 
     pub fn validate(self: Scope) !void {
+        try self.validatePopulation();
         if (self.empty_generation and (self.preserve_artifacts or self.rewrite != null or !std.mem.allEqual(u8, &self.source_artifact_digest, 0) or !std.mem.allEqual(u8, &self.source_descriptor_digest, 0))) return error.InvalidRestoreStagingCommand;
         if (!self.empty_generation and self.graph_retirement_digest != null) return error.InvalidRestoreStagingCommand;
         if (self.preserve_artifacts and self.rewrite != null) return error.InvalidRestoreStagingCommand;
@@ -404,7 +423,7 @@ pub const Scope = struct {
         if (std.mem.allEqual(u8, &self.plan_id, 0) or std.mem.allEqual(u8, &self.plan_digest, 0) or
             (!self.empty_generation and std.mem.allEqual(u8, &self.source_artifact_digest, 0)) or self.target_namespace.table_id == 0 or
             self.target_namespace.shard_id == 0 or self.target_namespace.range_id == 0 or
-            self.source_namespace.table_id == 0 or self.source_namespace.table_id == self.target_namespace.table_id)
+            (self.population == null and (self.source_namespace.table_id == 0 or self.source_namespace.table_id == self.target_namespace.table_id)))
             return error.InvalidRestoreStagingCommand;
     }
     pub fn digest(self: Scope) Digest {
@@ -422,6 +441,10 @@ pub const Scope = struct {
             }
         }
         hash.update(&self.target_schema_digest);
+        if (self.population) |binding| {
+            hash.update("query-population-v1");
+            hash.update(&binding.fingerprint());
+        }
         if (self.preserve_artifacts) hash.update("native-artifact-preservation-v1");
         if (self.empty_generation) hash.update("empty-generation-v1");
         if (self.graph_retirement_digest) |retirement| {
@@ -512,9 +535,13 @@ test "sealed portable bootstrap requires source proof even without mapped admiss
 }
 
 pub const Progress = struct {
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "population") and self.population == null;
+    }
     scope: Scope,
     phase: Phase = .importing,
     source_generation_proofs_complete: bool = false,
+    population: ?@import("relational_population_contract.zig").Cursor = null,
     rows: u64 = 0,
     cursor: []const u8 = "",
     logical_digest: Digest = @splat(0),
@@ -551,6 +578,18 @@ pub const Progress = struct {
         return parsed;
     }
     fn validateRewrite(self: Progress) !void {
+        if (self.scope.population) |binding| {
+            if (self.phase != .reserved and !(self.phase == .canceled and self.population == null)) {
+                const cursor = self.population orelse return error.InvalidRestoreStagingCommand;
+                try cursor.validate();
+                if (!std.mem.eql(u8, &cursor.binding, &try binding.digest()) or cursor.rows != self.rows or
+                    !std.mem.eql(u8, &cursor.chain, &self.logical_digest) or
+                    ((self.phase == .imported or self.phase == .validated or self.phase == .published) and !cursor.sealed) or
+                    (self.phase == .importing and cursor.sealed) or !self.source_generation_proofs_complete or
+                    self.cursor.len != 0 or self.artifact_cursor.len != 0 or self.projection_cursor.len != 0 or
+                    !self.artifacts_complete or self.rows_complete != cursor.sealed) return error.InvalidRestoreStagingCommand;
+            }
+        } else if (self.population != null) return error.InvalidRestoreStagingCommand;
         if (self.scope.empty_generation and (self.phase == .importing or self.rows != 0 or self.cursor.len != 0 or self.artifact_cursor.len != 0 or self.projection_cursor.len != 0 or self.rewrite != null or !std.mem.allEqual(u8, &self.logical_digest, 0))) return error.InvalidRestoreStagingCommand;
         if (self.scope.rewrite) |binding| {
             // Reservations and terminal cancellation may precede initialization.
@@ -566,6 +605,14 @@ pub const Progress = struct {
         hash.update(&self.scope.digest());
         hash.update(@tagName(self.phase));
         hash.update(&self.logical_digest);
+        if (self.population) |cursor| {
+            hash.update("query-population-v1");
+            hash.update(&cursor.binding);
+            var pages: [8]u8 = undefined;
+            std.mem.writeInt(u64, &pages, cursor.pages, .little);
+            hash.update(&pages);
+            hash.update(&.{@intFromBool(cursor.sealed)});
+        }
         if (self.rewrite) |rewrite| {
             var sequence: [8]u8 = undefined;
             std.mem.writeInt(u64, &sequence, rewrite.sequence, .little);

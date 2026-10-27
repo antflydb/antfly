@@ -340,7 +340,7 @@ pub const DocumentTable = struct {
     enforce_types: bool = false,
     schemas: []const struct { name: []const u8, schema_json: []const u8 },
 };
-pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null, document: ?*const DocumentTable = null };
+pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null, document: ?*const DocumentTable = null, persistence: RelationPopulation.Persistence = .permanent };
 pub const DropTable = struct { table: Name, if_exists: bool = false };
 /// Immutable SQL intent, not a catalog identity. OWNED BY names must bind to
 /// stable relation/attribute IDs in the authoritative catalog transaction.
@@ -378,9 +378,32 @@ pub const SequenceOptions = struct {
         return options;
     }
 };
+/// A source query and destination intent, never a published relation identity.
+pub const RelationPopulation = struct {
+    pub const Persistence = enum { permanent, temporary, unlogged };
+    operation: enum { create_table_as, select_into, create_materialized_view, refresh_materialized_view },
+    name: Name,
+    query: ?*const Select = null,
+    /// Stored materialized-view definitions retain exact source query text.
+    /// SELECT INTO has no durable query definition and uses its parsed AST.
+    query_sql: ?[]const u8 = null,
+    columns: []const []const u8 = &.{},
+    persistence: Persistence = .permanent,
+    if_not_exists: bool = false,
+    with_data: bool = true,
+    concurrently: bool = false,
+    tablespace: ?[]const u8 = null,
+    pub fn materialized(self: @This()) bool {
+        return self.operation == .create_materialized_view or self.operation == .refresh_materialized_view;
+    }
+    pub fn ddl(self: @This()) CatalogDdl {
+        return .{ .kind = if (self.materialized()) .view else .table, .action = .populate, .name = self.name, .population = self };
+    }
+};
+
 pub const CatalogDdl = struct {
     kind: enum { database, namespace, tablespace, table, index, view, role, sequence },
-    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence },
+    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence, populate },
     name: Name,
     new_name: ?[]const u8 = null,
     tablespace: ?[]const u8 = null,
@@ -400,6 +423,8 @@ pub const CatalogDdl = struct {
     comment_column: ?[]const u8 = null,
     sequence_options: ?SequenceOptions = null,
     sequence_targets: []const Name = &.{},
+    population: ?RelationPopulation = null,
+    materialized: bool = false,
 };
 /// Compiler-owned view intent. The parsed query is reused for semantic
 /// preparation; retained text is for durable definition/rebinding, not execution.

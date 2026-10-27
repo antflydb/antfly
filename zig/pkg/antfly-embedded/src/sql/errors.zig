@@ -286,7 +286,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.InvalidCatalogName => .{ .code = "22023", .message = "The database, namespace, or table name is invalid.", .hint = "Use a valid catalog name without empty components." },
         error.SqlWorkingMemoryLimitExceeded => .{ .code = "54000", .message = "The statement exceeds its working-memory limit (default: 256 MiB, 268435456 bytes).", .hint = "Reduce the number and size of simultaneously retained rows or increase the runtime retained-byte limit.", .retryable = false },
         error.SqlRequestTooLarge => .{ .code = "54000", .message = "The SQL JSON request exceeds the 64 MiB (67108864 byte) limit.", .hint = "Reduce the statement and parameter payload size.", .retryable = false },
-        error.QueryCandidateBudgetExceeded, error.SqlProgramLimitExceeded, error.ProgramLimitExceeded, error.SqlLimitExceeded, error.SqlResultTooLarge, error.RelationalRowResultTooLarge, error.RelationalExpressionBudgetExceeded, error.TransactionTooLarge, error.IntegrityRecordTooLarge, error.RelationalIndexKeyTooLarge, error.SettingLimitExceeded => .{ .code = "54000", .message = "The statement exceeds the supported work, result, or mutation limit.", .hint = "Narrow the predicate or reduce the number and size of rows." },
+        error.RelationPopulationPageTooLarge, error.QueryCandidateBudgetExceeded, error.SqlProgramLimitExceeded, error.ProgramLimitExceeded, error.SqlLimitExceeded, error.SqlResultTooLarge, error.RelationalRowResultTooLarge, error.RelationalExpressionBudgetExceeded, error.TransactionTooLarge, error.IntegrityRecordTooLarge, error.RelationalIndexKeyTooLarge, error.SettingLimitExceeded => .{ .code = "54000", .message = "The statement exceeds the supported work, result, or mutation limit.", .hint = "Narrow the predicate or reduce the number and size of rows." },
         error.SqlNegativeLimit => .{ .code = "2201W", .message = "LIMIT must not be negative." },
         error.SqlNegativeOffset => .{ .code = "2201X", .message = "OFFSET must not be negative." },
         error.InvalidSqlLimit => .{ .code = "54000", .message = "The SQL execution limit is invalid.", .hint = "Choose execution limits within the configured capacity." },
@@ -459,4 +459,9 @@ test "SQL FK validity guard is explicit unsupported work without replay permissi
     try std.testing.expectEqualStrings("0A000", diagnostic.code);
     try std.testing.expectEqual(@as(u16, 501), diagnostic.httpStatus());
     try std.testing.expectEqual(@as(?bool, false), diagnostic.retryable);
+}
+
+test "SQL relation population delivery limits retain a controlled PostgreSQL work-limit diagnostic" {
+    try std.testing.expectEqualStrings("54000", describe(error.RelationPopulationPageTooLarge).code);
+    try std.testing.expect(!isRowEvaluationError(error.RelationPopulationPageTooLarge));
 }

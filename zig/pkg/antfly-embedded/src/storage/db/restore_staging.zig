@@ -168,8 +168,8 @@ pub fn requireMutableScope(alloc: Allocator, txn: anytype, expected: ?Digest) !v
 }
 
 /// Internal PreparedRow import admission, consumed under the DB apply fence.
-pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false, source_generation_proof_page: bool = false };
-pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission, row_count: usize, delete_count: usize) !void {
+pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false, source_generation_proof_page: bool = false, population: ?@import("relational_population_contract.zig").Delivery = null };
+pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission, row_count: usize, delete_count: usize, original_writes: []const @import("types.zig").BatchWrite) !void {
     const raw = (try optional(txn)) orelse return error.RestoreStagingScopeChanged;
     if (!std.mem.eql(u8, &digest(raw), &admission.expected)) return error.RestoreStagingProgressChanged;
     var before = try Progress.decode(alloc, raw);
@@ -184,6 +184,15 @@ pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission,
         !std.mem.eql(u8, &before.value.scope.digest(), &admission.scope) or !std.mem.eql(u8, &after.value.scope.digest(), &admission.scope) or
         after.value.rows != std.math.add(u64, before.value.rows, row_count +| delete_count) catch return error.InvalidRestoreStagingCommand)
         return error.InvalidRestoreStagingCommand;
+    // The data-bound population verifier runs at the native mutation boundary.
+    // Ordinary source import cannot advance a query producer's receipt.
+    if ((before.value.scope.population != null) != (admission.population != null)) return error.InvalidRestoreStagingCommand;
+    if (admission.population) |delivery| {
+        if (admission.rewrite or admission.artifact_page or admission.projection_page or admission.source_generation_proof_page or
+            admission.source_effects != 0 or row_count != original_writes.len) return error.InvalidRestoreStagingCommand;
+        try @import("relational_population_staging.zig").validate(before.value, after.value, delivery, original_writes, delete_count);
+        return;
+    }
     if (admission.rewrite != (before.value.scope.rewrite != null)) return error.InvalidRestoreStagingCommand;
     if (admission.source_generation_proof_page) {
         if (admission.rewrite or admission.artifact_page or admission.projection_page or
@@ -313,20 +322,20 @@ test "native restore artifact phase cannot skip row fencing or mutate logical pr
     const encoded = try next.encode(alloc);
     defer alloc.free(encoded);
     var admission: BatchAdmission = .{ .expected = digest(raw), .next = encoded, .scope = scope.digest(), .artifact_page = true };
-    try validateImport(alloc, &read, admission, 0, 0);
-    try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 1, 0));
+    try validateImport(alloc, &read, admission, 0, 0, &.{});
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 1, 0, &.{}));
     admission.artifact_page = false;
-    try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 0, 0));
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 0, 0, &.{}));
     next.artifacts_complete = true;
     next.artifact_cursor = "";
     const completed = try next.encode(alloc);
     defer alloc.free(completed);
     admission.next = completed;
     admission.artifact_page = true;
-    try validateImport(alloc, &read, admission, 0, 0);
+    try validateImport(alloc, &read, admission, 0, 0, &.{});
     read.value = completed;
     admission.expected = digest(completed);
-    try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 0, 0));
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 0, 0, &.{}));
 }
 
 fn applyTestPage(alloc: Allocator, db: *@import("antfly_source_root").antfly_sources.physical_db.DB, req: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {

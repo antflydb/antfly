@@ -1177,7 +1177,7 @@ const Job = struct {
             .rows = result.output.rows,
             .sql_nulls = result.output.sql_nulls,
             .rows_affected = result.output.rows_affected,
-            .command_tag = try commandTag(self.alloc, result.output.command_tag, result.output.rowCount(), result.output.rows_affected),
+            .command_tag = try commandTag(self.alloc, result.output.command_tag, result.output.completion_rows orelse result.output.rowCount(), result.output.rows_affected),
             .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {
                 inline else => |kind| @field(wire.MutationOutcome, @tagName(kind)),
             } else null,
@@ -1296,11 +1296,12 @@ fn wireType(kind: ast.ColumnType) !wire.Type {
     };
 }
 
-fn commandTag(alloc: std.mem.Allocator, command: []const u8, rows: usize, affected: u64) ![]const u8 {
+fn commandTag(alloc: std.mem.Allocator, command: []const u8, rows: u64, affected: u64) ![]const u8 {
     if (std.mem.eql(u8, command, "DDL PENDING")) return alloc.dupe(u8, command);
     if (std.mem.eql(u8, command, "SELECT")) return std.fmt.allocPrint(alloc, "SELECT {d}", .{rows});
     if (std.mem.eql(u8, command, "INSERT")) return std.fmt.allocPrint(alloc, "INSERT 0 {d}", .{affected});
     if (std.mem.eql(u8, command, "UPDATE") or std.mem.eql(u8, command, "DELETE") or std.mem.eql(u8, command, "MERGE")) return std.fmt.allocPrint(alloc, "{s} {d}", .{ command, affected });
+    if (std.mem.eql(u8, command, "REFRESH MATERIALIZED VIEW")) return alloc.dupe(u8, command);
     if (std.mem.startsWith(u8, command, "CREATE ") or std.mem.startsWith(u8, command, "DROP ") or std.mem.startsWith(u8, command, "ALTER ")) return alloc.dupe(u8, command);
     inline for (.{ "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "SET CONSTRAINTS", "TRUNCATE TABLE" }) |tag| if (std.mem.eql(u8, command, tag)) return alloc.dupe(u8, command);
     return error.UnsupportedSqlExecution;
@@ -2355,7 +2356,9 @@ test "SQL pgwire native frozen JSON renders exact numbers without scalar deliver
                     var scratch = std.heap.FixedBufferAllocator.init(&.{});
                     const cell = try OwnedRead.PageOwner.cell(&owner, scratch.allocator(), 0, 0);
                     try std.testing.expect(!cell.sql_null and cell.value == .null and cell.json_bytes == null and cell.frozen_json != null);
-                    const expected = try std.json.Stringify.valueAlloc(alloc, root, .{});
+                    // Independent PostgreSQL 18 jsonb::text witness: JSONB
+                    // canonical order/spacing applies to frozen cells too.
+                    const expected = "{\"s\": \"a\\nb\", \"x\": [9007199254740993, 1.25]}";
                     for ([_]u16{ 0, 1 }) |format| {
                         var buffer: [256]u8 = undefined;
                         var output: std.Io.Writer = .fixed(&buffer);
@@ -2452,4 +2455,18 @@ test "SQL pgwire retained mutation preparation fences write authority cancellati
         // Cleanup remains permitted after cancellation and authority revocation.
     }
     try std.testing.expectEqual(@as(usize, 1), native_owner.closes);
+}
+
+test "SQL pgwire native population completion counts destination rows without returning DataRows" {
+    const a = std.testing.allocator;
+    const output: @import("antfly_local_sources").sql_runtime.Output = .{ .command_tag = "SELECT", .rows_affected = 257, .completion_rows = 257 };
+    try std.testing.expectEqual(@as(usize, 0), output.rowCount());
+    const tag = try commandTag(a, output.command_tag, output.completion_rows orelse output.rowCount(), output.rows_affected);
+    defer a.free(tag);
+    try std.testing.expectEqualStrings("SELECT 257", tag);
+    for ([_][]const u8{ "CREATE TABLE AS", "CREATE MATERIALIZED VIEW", "REFRESH MATERIALIZED VIEW" }) |expected| {
+        const actual = try commandTag(a, expected, 0, 0);
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
 }
