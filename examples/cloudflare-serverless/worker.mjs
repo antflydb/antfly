@@ -191,7 +191,8 @@ export default {
           message.ack(); continue;
         }
         if (message.body.kind === "compact") {
-          await run(env, {op: "compact"});await continueMaintenance(env,message,"compact",{done:true});message.ack();continue;
+          const ticket=message.body.maintenance;
+          await run(env, {op: "compact",...(env.COORDINATOR_BACKEND==="r2"&&ticket?{operation_id:`queue/compact/${ticket.id}/${ticket.step}`}:{})});await continueMaintenance(env,message,"compact",{done:true});message.ack();continue;
         }
         if (message.body.kind === "collect") {
           const result = await background(env,{op:"collect",job_id:message.body.job_id});

@@ -181,7 +181,8 @@ WAL durability; index publication occurs separately.
 | `search` | additionally `fresh:true`, scalar `filters`, or `required_visibility` | Merges published text candidates with recent mutations before limiting; suppresses stale hits and admits newly matching documents. Returns observed `visibility`. |
 | `count` | optional `required_visibility` | Exact current document count as a decimal string, including unique recent updates and tombstones. Filtered counts are not supported. |
 | `status` | none | Accepted visibility token, published watermark, and published pending-embedding count. |
-| `compact` | none | Run the existing native compactor on the published head, subject to deployment admission limits; unpublished WAL remains separate. |
+| `compact` | optional `operation_id` in R2 mode | Run the native compactor on the published head, subject to deployment admission limits. A stable identity retains the original durable outcome for replay. |
+| `compact_status` | `operation_id` | R2 mode: return `unknown`, `pending`, or `complete` with the original compaction result. |
 | `collect` | optional `job_id` | Runs one durable GC step; returns phase, job ID, continuation and any grace-period delay. |
 | `enrich` | none | Runs a configured native embedding batch with source validation and durable progress. |
 | `publish` | none | Runs one fenced publication prefix. Returns decimal-string `version`, `wal_end_lsn`, and `has_more`. The next invocation resumes from the committed watermark. |
@@ -303,6 +304,14 @@ an executing bounded step can still delay its tenant's next background step.
   prefix, so eviction does not reset tuning. These input bounds do not promise that every
   possible index build fits Workers CPU or memory; large workloads fail and
   need a different maintenance profile.
+
+In R2 mode, use a stable `operation_id` (at most 256 UTF-8 bytes) when a lost
+response must be recoverable. `compact_status` reports the durable state;
+resubmitting that same identity returns its original result after completion.
+Changing the deployment's compaction limits requires a new identity. Ticketed
+R2 Queue compactions derive a stable identity from their ticket and step.
+See the [receipt protocol](../../docs/design/cloudflare-compaction-receipts.md)
+for atomic publication, recovery and retention semantics.
 
 `compact` calls the existing native `Compactor`, with host I/O, its existing
 work lease, and guarded publication. `COMPACTION_MAX_DOCUMENTS` defaults to

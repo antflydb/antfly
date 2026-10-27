@@ -16,6 +16,10 @@ R2-native deployments use `wrangler.r2.jsonc`; the existing configuration remain
 the SQLite compatibility profile. The details below describe the original
 profile unless explicitly stated otherwise.
 
+R2 compaction can also retain a stable operation outcome in the same native
+metadata commit as HEAD and lease release. Public keyed calls and ticketed Queue
+redelivery use this [compaction receipt protocol](cloudflare-compaction-receipts.md).
+
 ## Execution and storage
 
 ```text

@@ -25,6 +25,13 @@ same keyed request. Completion returns the original `published`, `version` and
 `artifact_count`, even after later publications and coordinator restarts.
 There is no automatic replay of a differently identified request.
 
+R2 Queue compactions carrying a durable maintenance ticket derive their operation
+identity from the ticket ID and step. If compaction completes but finishing the
+ticket or acknowledging the message fails, redelivery recovers that receipt
+before completing the ticket. Legacy messages without a ticket keep their
+existing behavior. This does not change the qualification HTTP client's retry
+policy.
+
 ## Durable protocol
 
 The coordinator hashes the bounded operation identity into an Antfly metadata

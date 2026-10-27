@@ -30,6 +30,8 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
     export class R2CommitCoordinator extends R2Base {
       commitMutations(inputs,deadline){this.groupSizes??=[];this.groupSizes.push(inputs.length);return super.commitMutations(inputs,deadline);}
       mutationDiagnostics(){return this.groupSizes??[];}
+      loseMaintenanceFinish(){this.loseFinish=true;return true;}
+      finishMaintenance(kind,ticket){if(this.loseFinish){this.loseFinish=false;throw Error("InjectedMaintenanceFinishLoss");}return super.finishMaintenance(kind,ticket);}
       rootFormat(){return this.store.transaction(tx=>JSON.parse(tx.snapshot().root).format??0);}
       async erasePlatformStorage(){await this.ctx.storage.deleteAll();}
       diagnostics(){return this.store.transaction(async tx=>({state:await tx.get("__antfly_collection"),tasks:(await tx.list({prefix:"__antfly_gc/tasks/"})).size,pending:(await tx.list({prefix:"__antfly_gc/pending/"})).size,marks:(await tx.list({prefix:"__antfly_gc/marks/"})).size}));}
@@ -49,6 +51,8 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
       if(path==="/source-frozen-write"){try {await source.objectCall({op:"put",key:"antfly/progress/test/HEAD"},new Uint8Array([1]));return Response.json({accepted:true});}catch(error){return Response.json({error:String(error)});}}
       if(path==="/profile")return Response.json(await stub.ensureEmbeddingProfile({model:"@cf/test/profile",dimensions:4,revision:"1"}));
       if(path==="/native-root")return Response.json(await stub.rootFormat());
+      if(path==="/prepare-compaction-message"){const ticket=await stub.requestMaintenance("compact");await stub.loseMaintenanceFinish();return Response.json({incarnation:env.ANTFLY_INCARNATION,kind:"compact",maintenance:{id:ticket.id,step:ticket.step}});}
+      if(path==="/deliver-compaction-message"){let ack=0,retry=0;await worker.queue({messages:[{body:await request.json(),ack(){ack++;},retry(){retry++;}}]},env);return Response.json({ack,retry});}
       return worker.fetch(request,{...env,MAINTENANCE:{async send(){}}},ctx);
     }};
   `},{type:"ESModule",path:join(output,"worker.js")},...wasm.map(name=>({type:"CompiledWasm",path:join(output,name)}))],compatibilityDate:"2026-10-23",bindings:{...(inlineRoots?{INLINE_METADATA_ROOTS:"true"}:{}),...(process.env.ANTFLY_TEST_TRACE?{LOG_METRICS:"true"}:{}),EDGE_IMMUTABLE_CACHE_SCOPE:"01234567-0123-4567-89ab-0123456789aa",EDGE_IMMUTABLE_CACHE:"true",API_TOKEN:"test-r2",ANTFLY_INCARNATION:namespace,PAGED_PROJECTIONS:"true",PUBLICATION_RECORDS:"8",COORDINATOR_BACKEND:migration?"sqlite":"r2"},r2Buckets:["DATABASE"],durableObjects:{COMMITS:{className:migration?"CommitCoordinator":"R2CommitCoordinator",useSQLite:true,unsafeUniqueKey:migration?"legacy":"native"}},resourcePersistencePath:join(persist,"resources"),isolatedResourcePersistencePath:join(persist,"isolated")};
@@ -95,6 +99,20 @@ test('keyed compaction exposes durable status and replays its original outcome a
   assert.deepEqual(await f.call(input),result);assert.equal((await f.call({op:'count'})).count,'2');
   f.options.bindings.COMPACTION_MAX_DOCUMENTS='2000';await f.reopen();
   assert.match((await f.call(input,'/api',409)).error,/CompactionOperationConflict/);
+ }finally{await f.close();}
+});
+
+test('compaction queue redelivery recovers its completed receipt after ticket completion fails',{timeout:120000},async()=>{
+ const f=await fixture('compaction-queue-receipts');
+ try{
+  f.options.bindings.PAGED_TEXT='true';await f.reopen();
+  await f.call({op:'mutate',operation_id:'first',mutations:[{kind:'upsert',doc_id:'first',body:'{"text":"first"}'}]});while((await f.call({op:'publish'})).has_more){}
+  const message=await f.call({},'/prepare-compaction-message'),operation_id='queue/compact/'+message.maintenance.id+'/'+message.maintenance.step;
+  assert.deepEqual(await f.call(message,'/deliver-compaction-message'),{ack:0,retry:1});
+  const completed=await f.call({op:'compact_status',operation_id});assert.equal(completed.state,'complete');
+  await f.call({op:'mutate',operation_id:'second',mutations:[{kind:'upsert',doc_id:'second',body:'{"text":"second"}'}]});while((await f.call({op:'publish'})).has_more){}
+  await f.reopen();assert.deepEqual(await f.call(message,'/deliver-compaction-message'),{ack:1,retry:0});
+  assert.deepEqual(await f.call({op:'compact_status',operation_id}),completed);assert.equal((await f.call({op:'count'})).count,'2');
  }finally{await f.close();}
 });
 
