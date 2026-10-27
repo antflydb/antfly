@@ -531,6 +531,7 @@ pub const TextDocument = struct {
     unindexed_paths: []const []const u8 = &.{},
     typed_fields: ?[]const TypedFieldValue = null,
     typed_source: ?std.json.Value = null,
+    stored_source: ?std.json.Value = null,
 };
 
 pub const TextField = struct {
@@ -567,6 +568,8 @@ pub const BuildTextOptions = struct {
     /// Retain the document key but omit the source body from the text segment.
     /// The primary database remains authoritative for source projection.
     store_document_source: bool = true,
+    /// Store source as independently compressed typed field columns.
+    store_source_columns: bool = false,
 };
 
 pub const BuildTextProfile = struct {
@@ -1054,7 +1057,7 @@ fn writeTextSegmentWithScratch(
         if (options.store_documents) {
             try seg_writer.addStoredDocFromInput(
                 text_doc.id,
-                if (options.store_document_source) text_doc.stored_data else "{}",
+                if (options.store_document_source) (if (options.store_source_columns) segment_mod.columnar_source_marker else text_doc.stored_data) else "{}",
             );
         } else {
             if (text_doc.doc_ordinal == null) return error.MissingTextDocOrdinal;
@@ -1263,6 +1266,27 @@ fn writeTextSegmentWithScratch(
             .write = InitialSectionProducer.write,
         });
         producer_count += 1;
+    }
+    var source_fields: std.StringHashMapUnmanaged(void) = .empty;
+    defer source_fields.deinit(alloc);
+    if (options.store_source_columns and options.store_document_source) {
+        for (docs) |doc| {
+            const root = doc.stored_source orelse return error.InvalidSegment;
+            if (root != .object) return error.InvalidSegment;
+            for (root.object.keys()) |key| try source_fields.put(alloc, key, {});
+        }
+    }
+    const source_producers = try alloc.alloc(SourceColumnProducer, source_fields.count());
+    defer alloc.free(source_producers);
+    var source_names = source_fields.keyIterator();
+    for (source_producers) |*producer| {
+        const name = source_names.next().?.*;
+        const field_idx = blk: {
+            for (seg_writer.fields.items, 0..) |field, i| if (std.mem.eql(u8, field.name, name)) break :blk @as(u16, @intCast(i));
+            break :blk try seg_writer.addField(name);
+        };
+        producer.* = .{ .state = &build_state, .docs = docs, .order = if (index_sort.len > 0 and !attested) doc_order else &.{}, .field = name };
+        try seg_writer.addSectionBuilder(field_idx, .columnar_stored, .{ .context = producer, .write = SourceColumnProducer.write });
     }
     noteBuildMemorySample(profile, profile_working_set, "rss_after_postings_build");
 
@@ -1909,6 +1933,30 @@ const InitialSectionBuildState = struct {
 
     fn adjust(self: *@This(), extra: u64) !void {
         try self.tracker.adjust(self.input_bytes + self.postings_bytes + self.typed_bytes + extra + @as(u64, @intCast(self.output.residentBytes())));
+    }
+};
+
+const SourceColumnProducer = struct {
+    state: *InitialSectionBuildState,
+    docs: []const TextDocument,
+    order: []const TextIndexSortEntry,
+    field: []const u8,
+    fn write(a: Allocator, raw: *anyopaque, sink: *segment_mod.SegmentSink) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var writer = @import("section/doc_values.zig").StreamingWriter.init(a, sink, 1024);
+        defer writer.deinit();
+        for (0..self.docs.len) |i| {
+            const doc = self.docs[if (self.order.len != 0) self.order[i].doc_index else i];
+            const value = doc.stored_source.?.object.get(self.field) orelse continue;
+            // Input rows remain leased; one encoded value and one raw/compressed
+            // field chunk coexist. Reserve that scratch under the build owner.
+            try self.state.adjust(3 *| (@as(u64, @intCast(doc.stored_data.len)) +| 64 * 1024));
+            const bytes = try @import("storage/typed_json.zig").encodeBinary(a, value);
+            defer a.free(bytes);
+            try writer.add(@intCast(i), bytes);
+        }
+        if (!try writer.finish()) return error.InvalidSegment;
+        try self.state.adjust(0);
     }
 };
 

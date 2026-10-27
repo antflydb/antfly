@@ -45,21 +45,85 @@ pub fn appendStored(a: A, snapshot: *const local.index.IndexSnapshot, doc: u32, 
 /// One scope per result batch, not per hit or server. Reuses decompression for
 /// nearby/interleaved ranked hits without retaining unbounded decoded bodies.
 pub const Hydrator = struct {
+    const Cursor = @import("antfly_local_sources").section_doc_values.Cursor;
+    const Column = struct { reader: *const local.segment.SegmentReader, name: []u8, cursor: Cursor, used: u64 };
     blocks: local.index.IndexSnapshot.StoredDocBlockCache,
+    columns: [4]?Column = @splat(null),
+    tick: u64 = 0,
+    column_values: usize = 0,
 
     pub fn init(a: A) Hydrator {
         return .{ .blocks = .init(a, 1024 * 1024) };
     }
 
     pub fn deinit(self: *Hydrator) void {
+        for (&self.columns) |*slot| if (slot.*) |*value| {
+            value.cursor.deinit();
+            self.blocks.allocator.free(value.name);
+        };
         self.blocks.deinit();
         self.* = undefined;
     }
 
+    fn column(self: *Hydrator, reader: *const local.segment.SegmentReader, name: []const u8) !?*Cursor {
+        self.tick +|= 1;
+        var oldest: usize = 0;
+        for (&self.columns, 0..) |*slot, i| {
+            if (slot.*) |*value| {
+                if (value.reader == reader and std.mem.eql(u8, value.name, name)) {
+                    value.used = self.tick;
+                    return &value.cursor;
+                }
+                if (self.columns[oldest] != null and value.used < self.columns[oldest].?.used) oldest = i;
+            } else oldest = i;
+        }
+        const a = self.blocks.allocator;
+        var scoped = (try reader.storedColumnScoped(a, name)) orelse return null;
+        errdefer scoped.deinit();
+        const owned = try a.dupe(u8, name);
+        if (self.columns[oldest]) |*previous| {
+            previous.cursor.deinit();
+            a.free(previous.name);
+        }
+        self.columns[oldest] = .{ .reader = reader, .name = owned, .cursor = Cursor.init(scoped), .used = self.tick };
+        return &self.columns[oldest].?.cursor;
+    }
     pub fn append(self: *Hydrator, a: A, snapshot: *const local.index.IndexSnapshot, doc: u32, expected_key: []const u8, fields: []const []const u8, target: *std.json.Value) !void {
-        const stored = (try snapshot.storedDocWithBlockCache(&self.blocks, doc)) orelse return error.InvalidNativeLakeTextCorpus;
-        // Parse/clone before another get can invalidate borrowed block bytes.
-        try appendStoredValue(a, stored.id, stored.data, expected_key, fields, target);
+        const resolved = snapshot.resolveDocId(doc) orelse return error.InvalidNativeLakeTextCorpus;
+        const segment = try snapshot.readSegment(resolved.seg_idx);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const id = (try segment.reader.storedIdScoped(sa, resolved.local_id)) orelse return error.InvalidNativeLakeTextCorpus;
+        if (!std.mem.eql(u8, id, expected_key)) return error.ExternalLakeSnapshotMismatch;
+        var remaining: std.ArrayList([]const u8) = .empty;
+        defer remaining.deinit(a);
+        for (fields) |field| {
+            var path = field;
+            var tail: ?[]const u8 = null;
+            var cursor = try self.column(&segment.reader, path);
+            if (cursor == null) if (std.mem.indexOfScalar(u8, field, '.')) |dot| {
+                path = field[0..dot];
+                tail = field[dot + 1 ..];
+                cursor = try self.column(&segment.reader, path);
+            };
+            const bytes = if (cursor) |value| try value.get(resolved.local_id) else null;
+            if (bytes) |encoded| {
+                const root = try local.storage_typed_json.decodeBinary(sa, encoded);
+                const value = if (tail) |suffix| local.api_json_helpers.extractJsonPathValue(root, suffix) orelse return error.InvalidNativeLakeTextCorpus else root;
+                if (target.* != .object or target.object.contains(field)) return error.InvalidNativeLakeTextCorpus;
+                const key = try a.dupe(u8, field);
+                errdefer a.free(key);
+                var owned = try local.storage_db_types.cloneJsonValue(a, value);
+                errdefer local.storage_db_types.deinitJsonValue(a, &owned);
+                try target.object.put(a, key, owned);
+                self.column_values += 1;
+            } else try remaining.append(a, field);
+        }
+        if (remaining.items.len != 0) {
+            const stored = (try snapshot.storedDocWithBlockCache(&self.blocks, doc)) orelse return error.InvalidNativeLakeTextCorpus;
+            try appendStoredValue(a, stored.id, stored.data, expected_key, remaining.items, target);
+        }
     }
 };
 
@@ -163,4 +227,75 @@ test "external lake ranked sidecar hydration reuses bounded decoded blocks acros
     // One full interleaving covers all ownership paths; repeated cache hits
     // above exercise reuse without quadratically growing the fault sweep.
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ writer.snapshot(), 1 });
+}
+
+test "external lake bounded window profiles typed source columns project without whole rows and survive both compaction orders" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    const payload = try sa.alloc(u8, 256 * 1024);
+    @memset(payload, 'x');
+    var docs: [4]local.introducer.TextDocument = undefined;
+    for (&docs, [_][]const u8{ "a", "c", "b", "d" }) |*doc, id| {
+        var row: std.json.ObjectMap = .empty;
+        try row.put(sa, "body", .{ .string = id });
+        try row.put(sa, "counter", .{ .integer = 9007199254740993 });
+        try row.put(sa, "payload", .{ .string = payload });
+        var nested: std.json.ObjectMap = .empty;
+        try nested.put(sa, "text", .{ .string = id });
+        try row.put(sa, "nested", .{ .object = nested });
+        const root: std.json.Value = .{ .object = row };
+        doc.* = .{ .id = id, .stored_data = try std.json.Stringify.valueAlloc(sa, root, .{}), .stored_source = root, .text_fields = &.{} };
+    }
+    const sort = [_]local.segment.SegmentIndexSortField{.{ .field = "_id" }};
+    const first = try local.introducer.buildSegmentFromTextWithAnalysisOptions(a, docs[0..2], &local.search_analysis.default_analyzer, .{}, .{ .store_source_columns = true, .index_sort = &sort });
+    defer a.free(first);
+    const second = try local.introducer.buildSegmentFromTextWithAnalysisOptions(a, docs[2..4], &local.search_analysis.default_analyzer, .{}, .{ .store_source_columns = true, .index_sort = &sort });
+    defer a.free(second);
+    var r1 = try local.segment.SegmentReader.init(a, first);
+    defer r1.deinit();
+    var r2 = try local.segment.SegmentReader.init(a, second);
+    defer r2.deinit();
+    var deleted = local.encoding_roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.add(1);
+    for ([_]bool{ false, true }) |ordered| {
+        const merged = try local.segment.mergeSegmentInputsWithOptions(a, &.{ .{ .reader = &r1, .deleted = deleted }, .{ .reader = &r2 } }, .{ .index_sort = if (ordered) &sort else &.{} });
+        defer a.free(merged);
+        var writer = try local.index.IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegmentWithId(1, merged);
+        const snapshot = writer.snapshot();
+        const Run = struct {
+            fn run(alloc: A, snap: *const local.index.IndexSnapshot) !void {
+                var hydrator = Hydrator.init(alloc);
+                defer hydrator.deinit();
+                for ([_]u32{ 2, 0, 1 }) |doc| {
+                    var scratch = std.heap.ArenaAllocator.init(alloc);
+                    defer scratch.deinit();
+                    const key = (try snap.storedIdScoped(scratch.allocator(), doc)).?;
+                    var row: std.json.Value = .{ .object = .empty };
+                    defer local.storage_db_types.deinitJsonValue(alloc, &row);
+                    try hydrator.append(alloc, snap, doc, key, &.{ "body", "counter", "nested.text" }, &row);
+                    try std.testing.expectEqualStrings(key, row.object.get("body").?.string);
+                    try std.testing.expectEqualStrings(key, row.object.get("nested.text").?.string);
+                    try std.testing.expectEqual(@as(i64, 9007199254740993), row.object.get("counter").?.integer);
+                }
+                try std.testing.expectEqual(@as(usize, 9), hydrator.column_values);
+                try std.testing.expectEqual(@as(usize, 0), hydrator.blocks.decode_count);
+                for (hydrator.columns) |column| if (column) |value| try std.testing.expect(!std.mem.eql(u8, value.name, "payload"));
+            }
+        };
+        try Run.run(a, snapshot);
+        var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{snapshot});
+        const full = (try snapshot.storedDocDecompressed(a, 0)).?;
+        defer a.free(full.data);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, full.data, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, payload.len), parsed.value.object.get("payload").?.string.len);
+        const reader = try snapshot.readSegment(0);
+        try std.testing.expectEqual(@as(?u32, 5), try reader.reader.storedDocLength(0));
+    }
 }

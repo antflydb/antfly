@@ -1089,10 +1089,8 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
                 for term, descending in (("quasar", False), ("pulsar", True)):
                     request = {
                         "full_text_search": {
-                            "conjuncts": [
-                                {"match": term, "field": "body"},
-                                {"match": "control", "field": "body"},
-                            ]
+                            "match_phrase": "control " + term,
+                            "field": "body",
                         },
                         "fields": ["id", "bucket"],
                         "limit": 20,
@@ -1216,7 +1214,8 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
 
 
 @pytest.mark.parametrize(
-    "case", ["native_selective", "metadata_selective", "wide_boundary"]
+    "case",
+    ["native_selective", "metadata_selective", "boolean_selective", "wide_boundary"],
 )
 def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
     tmp_path, monkeypatch, case
@@ -1285,7 +1284,7 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
         [{"column": "bucket", "nulls": "first"}, {"column": "wide"}, {"column": "id"}]
         if wide
         else [{"column": "bucket", "nulls": "first"}, {"column": "id"}]
-        if case == "metadata_selective"
+        if case in ("metadata_selective", "boolean_selective")
         else [{"column": "id", "nulls": "first"}]
     )
     definition = {
@@ -1356,7 +1355,10 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
                         ("pulsar", False, list(range(8128, 8148))),
                         ("quasar", True, list(range(63, 43, -1))),
                     ):
-                        if case == "metadata_selective" and descending:
+                        if (
+                            case in ("metadata_selective", "boolean_selective")
+                            and descending
+                        ):
                             wanted = list(range(20))
                         request = {
                             "full_text_search": {"match": term, "field": "body"},
@@ -1366,13 +1368,21 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
                             "order_by": [
                                 {
                                     "field": "bucket"
-                                    if case == "metadata_selective"
+                                    if case
+                                    in ("metadata_selective", "boolean_selective")
                                     else "id",
                                     "desc": descending,
                                 }
                             ],
                         }
-                        if case == "metadata_selective":
+                        if case == "boolean_selective":
+                            request["full_text_search"] = {
+                                "conjuncts": [
+                                    request["full_text_search"],
+                                    {"match": "control", "field": "body"},
+                                ]
+                            }
+                        if case in ("metadata_selective", "boolean_selective"):
                             request["filter_query"] = {
                                 "range": {"path": "/bucket", "gte": 0}
                             }

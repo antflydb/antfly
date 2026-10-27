@@ -911,6 +911,7 @@ pub const BuildTextSegmentsOptions = struct {
     profile: ?*introducer_mod.BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     store_document_source: bool = true,
+    store_source_columns: bool = false,
 };
 
 pub const BuildTextSegmentsResult = struct {
@@ -1036,6 +1037,7 @@ pub const TextProjectionBatchBuilder = struct {
             .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
             .stored_data = doc.stored_data,
+            .stored_source = doc.typed_source,
             .doc_ordinal = doc.doc_ordinal,
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
@@ -1430,6 +1432,7 @@ fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introdu
         .postings_run_directory = options.postings_run_directory,
         .index_sort = options.index_sort,
         .store_document_source = options.store_document_source,
+        .store_source_columns = options.store_source_columns,
     };
     if (options.target_build_memory_bytes) |target| build_options.build_memory_target_bytes = target;
     if (options.doc_scratch_retained_bytes) |retained| build_options.doc_scratch_retained_bytes = retained;

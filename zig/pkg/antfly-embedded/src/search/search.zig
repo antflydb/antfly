@@ -3611,6 +3611,44 @@ pub const TextNavigationPlan = struct {
             else => return null,
         };
     }
+    /// Conservative membership ceiling for optional driver costing, never an
+    /// exact count or a pruning proof. Exclusions cannot increase cardinality.
+    pub fn candidateUpperBound(self: *const TextNavigationPlan) u32 {
+        return self.nodeCandidateUpperBound(self.root);
+    }
+    fn nodeCandidateUpperBound(self: *const TextNavigationPlan, node: *const LoweredText) u32 {
+        const count = self.stats.count;
+        return switch (node.kind) {
+            .none => 0,
+            .all, .bitmap => count,
+            .term => blk: {
+                const term = node.term.?;
+                const field = self.stats.fields.get(term.field) orelse break :blk count;
+                break :blk @min(count, (field.frequencies.get(term.term) orelse break :blk count).value);
+            },
+            .filter => blk: {
+                const terms = node.pattern_terms orelse break :blk count;
+                var sum: u64 = 0;
+                for (terms) |term| {
+                    const field = self.stats.fields.get(term.field) orelse break :blk count;
+                    sum +|= (field.frequencies.get(term.term) orelse break :blk count).value;
+                }
+                break :blk @intCast(@min(count, sum));
+            },
+            .phrase => count,
+            .boolean => blk: {
+                var upper = count;
+                for (node.must) |child| upper = @min(upper, self.nodeCandidateUpperBound(child));
+                if (node.minimum != 0) {
+                    if (node.minimum > node.should.len) break :blk 0;
+                    var sum: u64 = 0;
+                    for (node.should) |child| sum +|= self.nodeCandidateUpperBound(child);
+                    upper = @min(upper, @as(u32, @intCast(@min(count, sum / node.minimum))));
+                }
+                break :blk upper;
+            },
+        };
+    }
     pub fn bound(self: *const TextNavigationPlan, source: Summaries) !f32 {
         return (try self.rangeBound(source)).upper;
     }
@@ -10923,6 +10961,9 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         .{ .match = .{ .field = "title", .text = "COMMON rare common", .analyzer = &custom } },
         common,
         .{ .bool_query = .{ .must = &.{ common, missing } } },
+        .{ .bool_query = .{ .must = &.{ common, rare } } },
+        .{ .bool_query = .{ .should = &.{ rare, rare }, .min_should = 2 } },
+        .{ .bool_query = .{ .should = &.{ common, .match_all }, .min_should = 2 } },
         .{ .bool_query = .{ .should = &.{ common, missing }, .min_should = 2 } },
         .{ .bool_query = .{ .must = &.{common}, .should = &.{missing} } },
         .{ .term_phrase = .{ .field = "title", .terms = &.{ "common", "missing" } } },
@@ -10952,6 +10993,7 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         try std.testing.expectError(error.Timeout, countMatchesPreparedWithControl(a, source.snapshot, query, plan, .{ .deadline_ns = 1 }));
         try std.testing.expectEqual(try countMatches(a, source.snapshot, query), try countMatchesPrepared(a, source.snapshot, query, plan));
         if (plan.exactMetadataCount()) |count| try std.testing.expectEqual(try countMatches(a, source.snapshot, query), count);
+        try std.testing.expect(plan.candidateUpperBound() >= try countMatches(a, source.snapshot, query));
         // Physical membership wrapping must borrow the analyzed child without
         // bypassing the new required branch.
         const wrapped: SearchQuery = .{ .bool_query = .{ .must = &.{ query, .{ .match_none = {} } } } };
@@ -10983,6 +11025,7 @@ test "external lake metadata navigation shares scorer lowering and conservative 
     const baseline: SearchQuery = .{ .bool_query = .{ .must_not = &.{rare} } };
     const full = (try TextNavigationPlan.prepare(a, baseline, .{ .ptr = &source, .count = 2, .average = Source.average, .frequencies = Source.frequencies }, .{})).?;
     defer full.deinit();
+    try std.testing.expectEqual(@as(u32, 2), full.candidateUpperBound());
     var reference = try execute(a, source.snapshot, .{ .query = baseline, .k = 10, .include_stored = false });
     defer reference.deinit();
     var reused = try execute(a, source.snapshot, .{ .query = baseline, .k = 10, .include_stored = false, .text_navigation_plan = full });

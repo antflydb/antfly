@@ -35,6 +35,7 @@ test {
     _ = @import("api/lake_text_window_ahead.zig");
     _ = @import("api/lake_text_pack_wave.zig");
     _ = @import("api/lake_text_delivery.zig");
+    _ = @import("api/lake_index_source_projection.zig");
     _ = @import("api/lake_search_overlay.zig");
     _ = @import("api/lake_recent_text_cache.zig");
     _ = @import("api/lake_wal_cut_cache.zig");

@@ -372,6 +372,61 @@ pub const DocValuesReader = struct {
     }
 };
 
+/// Caller-owned navigation plus one decoded chunk. Borrowed values expire on
+/// the next get; no field payload is retained in the shared segment cache.
+pub const Cursor = struct {
+    reader: DocValuesReader,
+    chunk: ?u32 = null,
+    bytes: []u8 = &.{},
+    first: u32 = 0,
+    last: u32 = 0,
+    pub fn init(reader: DocValuesReader) Cursor {
+        return .{ .reader = reader };
+    }
+    pub fn deinit(self: *Cursor) void {
+        self.reader.alloc.free(self.bytes);
+        self.reader.deinit();
+    }
+    pub fn get(self: *Cursor, doc: u32) !?[]const u8 {
+        if (self.chunk != null and doc >= self.first and doc <= self.last) return self.find(doc);
+        var low: u32 = 0;
+        var high = self.reader.num_chunks;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (self.chunk != mid) {
+                self.reader.alloc.free(self.bytes);
+                self.bytes = &.{};
+                self.chunk = null;
+                self.bytes = try self.reader.decodeChunk(mid);
+                _ = try self.find(doc);
+                self.chunk = mid;
+            }
+            if (doc < self.first) high = mid else if (doc > self.last) low = mid + 1 else return self.find(doc);
+        }
+        return null;
+    }
+    fn find(self: *Cursor, doc: u32) !?[]const u8 {
+        if (self.bytes.len < 4) return error.InvalidData;
+        const count = std.mem.readInt(u32, self.bytes[0..4], .little);
+        if (count == 0 or count > (self.bytes.len - 4) / 8) return error.InvalidData;
+        var at: usize = 4;
+        var selected: ?[]const u8 = null;
+        for (0..count) |i| {
+            if (self.bytes.len - at < 8) return error.InvalidData;
+            const id = std.mem.readInt(u32, self.bytes[at..][0..4], .little);
+            const len = std.mem.readInt(u32, self.bytes[at + 4 ..][0..4], .little);
+            at += 8;
+            if (len > self.bytes.len - at or (i != 0 and id <= self.last)) return error.InvalidData;
+            if (i == 0) self.first = id;
+            self.last = id;
+            if (doc == id) selected = self.bytes[at..][0..len];
+            at += len;
+        }
+        if (at != self.bytes.len) return error.InvalidData;
+        return selected;
+    }
+};
+
 pub const DocValue = struct {
     doc_id: u32,
     value: []u8,

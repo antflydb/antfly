@@ -1167,29 +1167,26 @@ const Execution = struct {
                 return left.ordinal < right.ordinal;
             }
         }.less);
-        var cursor = local.segment.SegmentReader.StoredDocCursor.init(a);
-        defer cursor.deinit();
-        var segment_index: usize = 0;
-        var lower: u32 = 0;
+        var hydrator = @import("lake_index_source_projection.zig").Hydrator.init(a);
+        defer hydrator.deinit();
         for (winners) |winner| {
             try self.context.ensureActive();
-            while (segment_index < pin.snapshot.segments.len and winner.ordinal - lower >= pin.snapshot.segments[segment_index].reader.doc_count) {
-                lower = try std.math.add(u32, lower, pin.snapshot.segments[segment_index].reader.doc_count);
-                segment_index += 1;
-            }
-            if (segment_index == pin.snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
-            const segment = try pin.snapshot.readSegment(segment_index);
-            const doc = (try cursor.get(&segment.reader, winner.ordinal - lower)) orelse return error.InvalidNativeLakeTextCorpus;
             _ = input.reset(.retain_capacity);
-            try self.attachStoredSnippet(a, input.allocator(), prepared, hits[winner.index .. winner.index + 1], doc);
+            try self.attachStoredSnippet(a, input.allocator(), prepared, &hydrator, pin.snapshot, winner.ordinal, &hits[winner.index]);
         }
     }
-    fn attachStoredSnippet(self: *Execution, a: A, scratch: A, prepared: *const search.PreparedHighlights, hit: []types.SearchHit, doc: local.segment.SegmentReader.StoredDocRef) !void {
-        const expected = try nativeKey(self, scratch, hit[0].id);
-        if (!std.mem.eql(u8, doc.id, expected)) return error.InvalidNativeLakeTextCorpus;
-        const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, doc.data, .{ .parse_numbers = false });
-        if (value != .object) return error.InvalidNativeLakeTextCorpus;
-        try prepared.attachValue(a, scratch, &hit[0], value);
+    fn attachStoredSnippet(self: *Execution, a: A, scratch: A, prepared: *const search.PreparedHighlights, hydrator: *@import("lake_index_source_projection.zig").Hydrator, snapshot: *const local.index.IndexSnapshot, ordinal: u32, hit: *types.SearchHit) !void {
+        const expected = try nativeKey(self, scratch, hit.id);
+        var fields: std.ArrayList([]const u8) = .empty;
+        try appendHydrationPath(scratch, self.table, &fields, "_type");
+        for (prepared.options.fields) |field| try appendHydrationPath(scratch, self.table, &fields, field);
+        for (prepared.indexed_queries) |query| if (!try appendIndexHydration(scratch, self.table, &fields, query)) {
+            for (self.table.columns) |column| try appendHydrationPath(scratch, self.table, &fields, column.path);
+            break;
+        };
+        var value: std.json.Value = .{ .object = .empty };
+        try hydrator.append(scratch, snapshot, ordinal, expected, fields.items, &value);
+        try prepared.attachValue(a, scratch, hit, value);
     }
     /// Sort a compact permutation, retaining result order and only one reader
     /// and decoded stored block. Hidden source is released after each snippet.
@@ -1224,17 +1221,15 @@ const Execution = struct {
             };
             defer pin.deinit();
             if (pin.snapshot.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
-            const segment = try pin.snapshot.readSegment(0);
-            var cursor = local.segment.SegmentReader.StoredDocCursor.init(a);
-            defer cursor.deinit();
+            var hydrator = @import("lake_index_source_projection.zig").Hydrator.init(a);
+            defer hydrator.deinit();
             for (winners[begin..end], begin..) |winner, position| {
                 for (winners[position..@min(end, position + 4)]) |upcoming| try pin.snapshot.prefetchStoredDoc(upcoming.location.document);
                 try self.context.ensureActive();
                 _ = input.reset(.retain_capacity);
                 const ia = input.allocator();
                 const page = hits[winner.index .. winner.index + 1];
-                const doc = (try cursor.get(&segment.reader, winner.location.document)) orelse return error.InvalidNativeLakeTextCorpus;
-                try self.attachStoredSnippet(a, ia, prepared, page, doc);
+                try self.attachStoredSnippet(a, ia, prepared, &hydrator, pin.snapshot, winner.location.document, &page[0]);
             }
             begin = end;
         }
@@ -2565,13 +2560,14 @@ const Execution = struct {
             else => return err,
         };
         defer if (prepared) |held| held.deinit();
-        if (prepared) |held| if (held.plan.?.exactMetadataCount()) |count| {
+        if (prepared) |held| {
+            const count = held.plan.?.candidateUpperBound();
             const goal = @as(usize, req.offset) +| req.limit;
             if (!local.storage_db_query_search_exec.preferOrderedCandidates(count, root.collection.?.documents, goal)) {
                 attempt.prefer_text_candidates = true;
                 return null;
             }
-        };
+        }
         var predicate = (try @import("lake_index_sql_rows.zig").tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc, .filter_query_json = req.filter_query_json })) orelse return null;
         defer predicate.deinit();
         var membership: OrderedMembership = .{ .cancellation = token };

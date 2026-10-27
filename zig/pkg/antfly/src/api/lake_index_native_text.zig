@@ -73,9 +73,10 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     }
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
-    // v2 stores the complete declared relational row even when `field`
-    // selects only one searchable text field. v1 retained only that field.
-    hash.update("native-lake-text-stored-source-v2");
+    // v3 stores the complete declared row in independent typed source columns,
+    // including fields excluded from text indexing. Old monolithic recipes
+    // cannot attest this projection capability and are rebuilt.
+    hash.update("native-lake-text-stored-source-v3");
     hash.update(&original);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
@@ -2567,7 +2568,7 @@ const Compactor = struct {
     }
 };
 fn flush(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, store_source: bool) !void {
-    return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .index_sort = compactor.index_sort });
+    return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .store_source_columns = store_source, .index_sort = compactor.index_sort });
 }
 fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, build_options: mapper.BuildTextSegmentsOptions) !void {
     try compactor.finishEncoding();
@@ -2772,7 +2773,7 @@ fn flushRetained(compactor: *Compactor, arena: *std.heap.ArenaAllocator, leases:
             arena.* = .init(compactor.a);
             leases.* = .{};
             transferred = true;
-            try encoder.enqueue(batch, owned, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .index_sort = compactor.index_sort });
+            try encoder.enqueue(batch, owned, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .store_source_columns = store_source, .index_sort = compactor.index_sort });
             return;
         }
     }
