@@ -3262,3 +3262,10 @@ text savings and records performance and device-qualification limits.
 quantized projection policies, narrow CPU panel sharing, shared paged decode
 and its masked-window fixes. It distinguishes maintained code, stored
 expansions, measured performance and transferred byte-identical CUDA evidence.
+
+### AB native CPU four-column consolidation
+
+[The AB outcome register](unified-execution-ab-outcomes.md) records one native
+Q8 family for blocks, panels and fused SDOT, with preserved scale-load and
+publication order. It also records the fractional-timing correction, retained
+failed prototypes and explicit full-kernel instruction audits.

@@ -4,6 +4,11 @@ Baseline: `adc9e4d78d`, the merge of main through `ef25cb9405`. Main's typed
 `antfly_document_runs` control protocol and shared readers module are retained.
 Earlier campaigns and upstream changes receive no new deletion credit.
 
+The CPU timing follow-up in [AB](unified-execution-ab-outcomes.md) supplies
+raw-batch, explicit-call-boundary measurements and a disassembly audit. The
+approximately 7% CPU figure below describes the original inlined harness, not
+a context-independent gain; AB records the later comparison separately.
+
 ## Ownership and specialization
 
 Metal quantized projections now use native compile-time families for column
