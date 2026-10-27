@@ -1595,12 +1595,37 @@ failure remains optional and retries through the authoritative reader. All
 packs in the current metadata page finish before its boundary can stop traversal.
 
 
-When all final ordered winners share one stored-source pack, the coordinator
-retains the last admitted winner's shared pin and validates the complete winning
-heap's pack identity before restoring any native document numbers. It transfers
-that single pin only after the optional ordered plan succeeds. Mixed/unlocated
-winners retain physical hydration. The pin is useful only when its authenticated
-stored-field coverage intersects the requested projection; normal coverage
-splitting and native-key verification still apply. This avoids an extra physical
-source lookup after sorting without pinning one source per winner or allowing a
-failed attempt to change fallback delivery state.
+The global ordered attempt uses exact prepared single-term cardinality for every
+compatible metadata ordering, including orders different from native physical
+order. If postings are cheaper, that choice remains attached to the attempt:
+optional metadata pack enumeration cannot recreate the declined prefix walk.
+Required predicate membership and exact counts retain their existing proofs.
+Profiles preserve the final text collector source when no ordered rows were read.
+
+Bitmap admission protects the current pack's prepared patterns while evicting
+older membership entries and retrying allocation. If no other entry can be
+reclaimed, the pack remembers the declined bitmap admission for this attempt;
+subsequent pages cannot repeatedly allocate an oversized bitmap. Sparse probes
+retain their independent bounded state.
+
+When all final winners share one stored-source pack, the coordinator retains its
+outer shared pin and validates every winner before restoring native ordinals.
+Otherwise complete, request-owned winner locators permit native delivery across
+packs for both ordered and ordinary text windows. A compact permutation groups
+only final hits by pack without changing result order. Each wave opens at most
+four packs through the shared scheduler, releases each consumed pin promptly,
+and joins all remaining work on errors or cancellation. Missing locators decline
+before changing any hits. Optional open failures retry through the authoritative
+reader; integrity and cancellation failures propagate. WAL/overlay results retain
+the established overlay-aware hydration path.
+
+Every delivery batch applies authenticated stored-field coverage, reads uncovered
+fields through the physical source, verifies native keys, and clears temporary
+native ordinals before releasing its pin. Locator keys outlive result retirement
+and postprocessing. Hydration metrics distinguish covered native batches from
+physical source batches (`hydration_native` and `hydration_source`); they are
+nested process counters, not request-attributed deltas. Health metrics refresh
+asynchronously, so isolated E2E counter assertions wait for the refreshed query
+snapshot. The real Parquet test spans multiple serving packs and verifies covered
+projection and hidden highlight fields before and after restart with the original
+Parquet object unavailable.

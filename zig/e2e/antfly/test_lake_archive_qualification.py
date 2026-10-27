@@ -75,7 +75,7 @@ def test_real_parquet_archive_qualification_preserves_cache_and_refresh_contract
         del command[position : position + 2]
     with log.open("w") as stream:
         completed = subprocess.run(
-            command, stdout=stream, stderr=subprocess.STDOUT, timeout=240
+            command, check=False, stdout=stream, stderr=subprocess.STDOUT, timeout=240
         )
     assert completed.returncode == 0, log.read_text()
     report = json.loads((output / "report.json").read_text())
@@ -281,6 +281,7 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
                 "--timeout",
                 "120",
             ],
+            check=False,
             stdout=stream,
             stderr=subprocess.STDOUT,
             timeout=180,
@@ -446,7 +447,7 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
         matching = [i for i in range(count) if not conjunction or i % 3 == 0]
         for descending in [False, True]:
 
-            def key(i):
+            def key(i, descending=descending):
                 rank = ranks[i]
                 if descending:
                     return rank is None, -rank if rank is not None else 0, -i
@@ -807,6 +808,7 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(
                 "--timeout",
                 "120",
             ],
+            check=False,
             stdout=stream,
             stderr=subprocess.STDOUT,
             timeout=240,
@@ -841,6 +843,7 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(
     # Replay actual public cursor tuples under their retained publication,
     # including a reversed primary scan whose public-ID direction stays forward.
     import importlib.util
+
     import conftest as harness
 
     spec = importlib.util.spec_from_file_location(
@@ -995,6 +998,7 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
     if not binary.is_file():
         pytest.skip("Build the Antfly binary first")
     import importlib.util
+
     import conftest as harness
 
     root = Path(__file__).resolve().parents[2]
@@ -1221,6 +1225,7 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     import importlib.util
+
     import conftest as harness
 
     binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
@@ -1392,6 +1397,8 @@ def test_ordered_native_delivery_spans_packs_without_parquet_payloads(
     import base64
     import importlib.util
     import random
+    import time
+
     import conftest as harness
 
     pa = pytest.importorskip("pyarrow")
@@ -1496,10 +1503,8 @@ def test_ordered_native_delivery_spans_packs_without_parquet_payloads(
                         for highlights in (False, True):
                             request = {
                                 "full_text_search": {
-                                    "conjuncts": [
-                                        {"match": "common", "field": "body"},
-                                        {"match": "needle", "field": "body"},
-                                    ]
+                                    "match": "needle",
+                                    "field": "body",
                                 },
                                 "fields": ["id"] if highlights else ["id", "body"],
                                 "order_by": [{"field": "bucket"}],
@@ -1512,7 +1517,26 @@ def test_ordered_native_delivery_spans_packs_without_parquet_payloads(
                                 request["highlight"] = {"fields": ["body"]}
                             before = client.metrics()
                             result = client.query({"request": request})
-                            after = client.metrics()
+                            # The health endpoint refreshes its cached metrics
+                            # asynchronously every five seconds. Wait for this
+                            # isolated query's hydration before taking a delta.
+                            deadline = time.monotonic() + 20
+                            while True:
+                                after = client.metrics()
+                                if (
+                                    after["antfly_lake_query_hydration_calls_total"]
+                                    > before["antfly_lake_query_hydration_calls_total"]
+                                ):
+                                    break
+                                assert time.monotonic() < deadline, (
+                                    "hydration metrics did not refresh"
+                                )
+                                time.sleep(0.1)
+                            hydration = {
+                                k: after[k] - before[k]
+                                for k in after
+                                if "hydration" in k
+                            }
                             hits = result["hits"]["hits"]
                             assert [hit["_source"]["id"] for hit in hits] == list(
                                 range(24)
@@ -1528,7 +1552,12 @@ def test_ordered_native_delivery_spans_packs_without_parquet_payloads(
                                     "antfly_lake_query_hydration_native_calls_total"
                                 ]
                                 >= 2
-                            )
+                            ), {
+                                "ordered": ordered,
+                                "highlights": highlights,
+                                "hydration": hydration,
+                                "sort": result["profile"]["sort"],
+                            }
                             assert (
                                 after["antfly_lake_query_hydration_source_calls_total"]
                                 == before[
