@@ -11203,6 +11203,11 @@ components:
           type: string
           maxLength: 1024
           description: Exact logical object path; overlapping paths and wildcards are not supported.
+        mode:
+          type: string
+          enum: [value, identity]
+          default: value
+          description: Value mode delivers the value unless if_match succeeds. Identity mode returns only a freshly authorized identity; existing values have state reference and are omitted from _source independently of if_match. Reference state is execution evidence, never a read grant.
         if_match:
           type: array
           maxItems: 4096
@@ -11227,11 +11232,11 @@ components:
       properties:
         state:
           type: string
-          enum: [value, unchanged, missing]
-          description: Stored null is a value. Missing has no identity; unchanged omits the value from _source.
+          enum: [value, unchanged, missing, reference]
+          description: Stored null is a value. Missing has no identity; unchanged and reference omit the value from _source.
         identity:
           type: string
-          description: Opaque versioned value identity, present for value and unchanged states.
+          description: Opaque versioned value identity, present for value, unchanged and reference states.
     QueryHit:
       type: object
       description: A single query result hit

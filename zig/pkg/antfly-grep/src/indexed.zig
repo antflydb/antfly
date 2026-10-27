@@ -21,7 +21,7 @@ const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
 const descriptors = @import("image_descriptor.zig");
 const SourceCondition = struct { id: []const u8, identity: []const u8 };
-const SourceField = struct { field: []const u8, if_match: []const SourceCondition = &.{} };
+const SourceField = struct { field: []const u8, mode: ?enum { identity } = null, if_match: []const SourceCondition = &.{} };
 const SourceProjection = struct { fields: []const SourceField };
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
 pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
@@ -54,6 +54,15 @@ pub fn run(search: anytype) !void {
     if (execution.max_documents == 0 or execution.max_bytes == 0 or execution.max_regex_work == 0 or execution.max_documents > std.math.maxInt(i64) or execution.max_bytes > std.math.maxInt(i64) or execution.max_regex_work > std.math.maxInt(i64)) return error.InvalidTableConfig;
     if (config.version != 1 or config.tables.len == 0 or config.page_size == 0 or config.page_size > 1000 or config.max_response_bytes < 1024 or config.max_response_bytes > 256 * 1024 * 1024 or config.max_page_memory < 4096 or config.max_page_memory > 1024 * 1024 * 1024) return error.InvalidTableConfig;
     try @import("providers.zig").validateCustom(config.endpoint);
+    if (search.options.indexed_media_transport == .source) {
+        const tables = try std.Uri.parse(config.endpoint);
+        const inference = try std.Uri.parse(search.options.endpoint);
+        const table_host = tables.host orelse return error.InvalidTableConfig;
+        const inference_host = inference.host orelse return error.InvalidTableConfig;
+        const table_port = tables.port orelse @as(u16, if (std.ascii.eqlIgnoreCase(tables.scheme, "https")) 443 else 80);
+        const inference_port = inference.port orelse @as(u16, if (std.ascii.eqlIgnoreCase(inference.scheme, "https")) 443 else 80);
+        if (!std.ascii.eqlIgnoreCase(tables.scheme, inference.scheme) or !std.ascii.eqlIgnoreCase(table_host.percent_encoded, inference_host.percent_encoded) or table_port != inference_port) return error.ConflictingMediaOptions;
+    }
     for (config.tables, 0..) |table, i| {
         if (table.name.len == 0 or table.document_field.len == 0 or std.mem.eql(u8, table.name, ".") or std.mem.eql(u8, table.name, "..") or std.mem.indexOfScalar(u8, table.name, 0) != null) return error.InvalidTableConfig;
         if (table.candidate_index) |index| if (index.version != 1 or index.field.len == 0 or index.version_field.len == 0 or std.mem.indexOfScalar(u8, index.field, 0) != null or std.mem.indexOfScalar(u8, index.version_field, 0) != null) return error.InvalidCandidateIndex;
@@ -460,7 +469,7 @@ fn sourceCacheScope(a: A, options: *const @import("options.zig").Options, config
 /// and verify identities before any score or descriptor reaches result output.
 fn plannedRecords(search: anytype, a: A, config: Config, table: Table, id: []const u8, parent: std.json.Value, path: []const u8, units: []const @import("antfly_source_evidence").Unit) ![16]?descriptors.Record {
     var out: [16]?descriptors.Record = @splat(null);
-    if (search.options.ask == null or search.options.model == null or !descriptors.enabled(search.options) or (search.shared_limits orelse &search.limits).source_projection_unsupported.load(.acquire)) return out;
+    if (search.options.indexed_media_transport == .source or search.options.ask == null or search.options.model == null or !descriptors.enabled(search.options) or (search.shared_limits orelse &search.limits).source_projection_unsupported.load(.acquire)) return out;
     var arena = std.heap.ArenaAllocator.init(search.a);
     defer arena.deinit();
     const temp = arena.allocator();
@@ -569,7 +578,7 @@ fn prefetchAssets(search: anytype, pool: *@import("worker_pool.zig").Pool, http:
         const records = try plannedRecords(search, a, config, table, id, value, path, selected[0..wave]);
         var bytes: usize = 65536;
         for (selected[0..wave], records[0..wave]) |unit, expected| {
-            bytes +|= if (expected != null) @as(usize, 256) else unit.asset.byte_length *| 2;
+            bytes +|= if (expected != null or search.options.indexed_media_transport == .source) @as(usize, 256) else unit.asset.byte_length *| 2;
         }
         const field_records = try a.alloc(?descriptors.Record, fields.items.len);
         for (fields.items, field_records) |field, *record| {
@@ -658,11 +667,11 @@ fn prefetchAssets(search: anytype, pool: *@import("worker_pool.zig").Pool, http:
             for (planned.items) |parent| if (parent.records[i]) |record| {
                 try conditions.append(a, .{ .id = parent.id, .identity = record.identity });
             };
-            try projected.append(a, .{ .field = field, .if_match = conditions.items });
+            try projected.append(a, .{ .field = field, .mode = if (search.options.indexed_media_transport == .source) .identity else null, .if_match = conditions.items });
         }
         const job = &jobs[started];
         job.* = .{
-            .fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = group_config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false, .source_projection = if (descriptors.enabled(search.options)) .{ .fields = projected.items } else null },
+            .fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = group_config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false, .source_projection = if (search.options.indexed_media_transport == .source or descriptors.enabled(search.options)) .{ .fields = projected.items } else null },
             .size = ids.items.len,
             .shape = shape,
             .parents = planned.items,
@@ -1169,9 +1178,9 @@ fn AssetResolver(comptime SearchType: type) type {
                     condition.* = .{ .id = self.id, .identity = identity };
                     conditions = @as(*[1]SourceCondition, @ptrCast(condition));
                 }
-                try projected.append(a, .{ .field = field, .if_match = conditions });
+                try projected.append(a, .{ .field = field, .mode = if (self.search.options.indexed_media_transport == .source) .identity else null, .if_match = conditions });
             }
-            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false, .source_projection = if (descriptors.enabled(self.search.options)) .{ .fields = projected.items } else null };
+            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false, .source_projection = if (self.search.options.indexed_media_transport == .source or descriptors.enabled(self.search.options)) .{ .fields = projected.items } else null };
             defer self.search.summary.index_requests += fetch.summary.index_requests;
             // Point reads deliberately omit ordering/cursors. They reauthorize
             // current rows without creating a durable pagination snapshot.
@@ -1219,6 +1228,28 @@ fn AssetResolver(comptime SearchType: type) type {
                 const state = if (projection) |map| document.field(map, unit.asset.field) else null;
                 const state_name = if (state) |entry| (document.string(entry, "state") catch return error.InvalidEvidenceIdentity) else "";
                 const identity = if (state) |entry| (document.string(entry, "identity") catch "") else "";
+                if (self.search.options.indexed_media_transport == .source) {
+                    if (std.mem.eql(u8, state_name, "missing")) continue;
+                    if (!std.mem.eql(u8, state_name, "reference") or !descriptors.validIdentity(identity) or document.at(source, unit.asset.field) != null) return error.InvalidEvidenceIdentity;
+                    var digest: [32]u8 = undefined;
+                    _ = try std.fmt.hexToBytes(&digest, unit.asset.sha256);
+                    item.* = .{ .image = .{ .data_url = "", .sha256 = digest, .mime_type = unit.asset.mime_type, .bytes = unit.asset.byte_length, .width = 0, .height = 0, .table_source = .{
+                        .table = self.table.name,
+                        .document_id = self.id,
+                        .field = unit.asset.field,
+                        .revision_field = try std.fmt.allocPrint(a, "{s}.revision", .{self.table.document_field}),
+                        .revision = self.revision,
+                        .permissions_field = try std.fmt.allocPrint(a, "{s}.permissions", .{self.table.document_field}),
+                        .principals = self.config.principals,
+                        .filter_query = self.filter,
+                        .identity = identity,
+                        .sha256 = unit.asset.sha256,
+                        .mime_type = unit.asset.mime_type,
+                        .byte_length = unit.asset.byte_length,
+                        .max_pixels = self.search.options.max_image_pixels,
+                    } } };
+                    continue;
+                }
                 if (std.mem.eql(u8, state_name, "unchanged")) {
                     if (self.force_full or !descriptors.validIdentity(identity) or document.at(source, unit.asset.field) != null) return error.InvalidEvidenceIdentity;
                     const retained = if (borrowed) retained: {

@@ -154,8 +154,8 @@ fn planSource(scratch: A, id: []const u8, prepared: protocol.Prepared, authority
             if (field.kind != .leaf) return null;
             const digest = certificate.find(field.index) orelse return null;
             token = try std.fmt.allocPrint(scratch, "sv1-{s}", .{std.fmt.bytesToHex(digest, .lower)});
-            state = .value;
-            if (conditions.get(id)) |expected| if (std.mem.eql(u8, expected, token.?)) {
+            state = if (entry.mode == .value) .value else .reference;
+            if (entry.mode == .value) if (conditions.get(id)) |expected| if (std.mem.eql(u8, expected, token.?)) {
                 state = .unchanged;
             };
         }
@@ -429,6 +429,14 @@ test "logical value conditional identities avoid payload reads and reject stale 
             try std.testing.expectEqual(@as(usize, 0), mock.full_reads);
             try std.testing.expect(mock.range_bytes < 64);
             try std.testing.expectEqual(@as(usize, 2), mock.metadata_reads);
+            mock.metadata_reads = 0;
+            const references = try protocol.Prepared.init(temp, .{ .fields = &.{.{ .field = "payload.image", .mode = .identity }} });
+            const reference = (try load(a, temp, &mock, physical, "doc", &.{ "payload.image", "revision" }, references)).?;
+            defer a.free(reference.source);
+            defer a.free(reference.identities);
+            try std.testing.expectEqualStrings(warm.source, reference.source);
+            try std.testing.expect(std.mem.indexOf(u8, reference.identities, "reference") != null);
+            try std.testing.expectEqual(@as(usize, 0), mock.full_reads);
             mock.metadata_reads = 0;
             const window = try Window.prepare(temp, &mock, (@as([64][]const u8, @splat(physical)))[0..width], (@as([64][]const u8, @splat("doc")))[0..width]);
             try std.testing.expectEqual(@as(usize, 2), mock.metadata_reads);

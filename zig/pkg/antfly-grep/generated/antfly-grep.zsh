@@ -73,6 +73,7 @@ _arguments -s \
  '--include-dependencies[include-dependencies]' \
  '--include-sensitive[include-sensitive]' \
  '--include-zero[include-zero]' \
+ '--indexed-media-transport[indexed-media-transport]:value:(inline source)' \
  '--invert-match[invert-match]' \
  '--json[json]' \
  '--json-compact[json-compact]' \

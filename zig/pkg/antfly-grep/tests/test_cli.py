@@ -388,11 +388,16 @@ class DecisionHandler(BaseHTTPRequestHandler):
                         c["id"] == hit["_id"] and c["identity"] == identity
                         for c in entry.get("if_match", [])
                     )
+                    reference = entry.get("mode") == "identity"
                     states[entry["field"]] = {
-                        "state": "unchanged" if unchanged else "value",
+                        "state": "reference"
+                        if reference
+                        else "unchanged"
+                        if unchanged
+                        else "value",
                         "identity": identity,
                     }
-                    if unchanged:
+                    if unchanged or reference:
                         del parent[parts[-1]]
                 returned["_source_projection"] = states
             if asset_read:
@@ -439,6 +444,20 @@ class DecisionHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    @staticmethod
+    def assert_image_evidence(part):
+        source = part.get("source")
+        if source is None:
+            assert part["image_url"].startswith("data:image/")
+            return
+        assert "image_url" not in part
+        assert source["table"] and source["document_id"] and source["field"]
+        assert source["revision"] and source["revision_field"]
+        assert source["identity"].startswith("sv1-")
+        assert re.fullmatch(r"[0-9a-f]{64}", source["sha256"])
+        assert source["mime_type"].startswith("image/")
+        assert source["byte_length"] > 0
+
     def decision(self):
         if "/tables/" in self.path:
             return self.index_query()
@@ -480,7 +499,7 @@ class DecisionHandler(BaseHTTPRequestHandler):
             if visual:
                 parts = [p for message in body["input"] for p in message["content"]]
                 assert [p["type"] for p in parts] == ["input_text", "input_image"]
-                assert parts[1]["image_url"].startswith("data:image/")
+                self.assert_image_evidence(parts[1])
                 text = "TARGET 1: STOP\n" + parts[0]["text"]
             body = {**body, "inputs": [{"id": "single", "input": text}]}
         if any(isinstance(item["input"], list) for item in body.get("inputs", [])):
@@ -489,7 +508,7 @@ class DecisionHandler(BaseHTTPRequestHandler):
                 if isinstance(item["input"], list):
                     parts = [p for message in item["input"] for p in message["content"]]
                     assert [p["type"] for p in parts] == ["input_text", "input_image"]
-                    assert parts[1]["image_url"].startswith("data:image/")
+                    self.assert_image_evidence(parts[1])
                     item["input"] = "TARGET 1: STOP\n" + parts[0]["text"]
         if body.get("context_version") == 1:
             body = json.loads(json.dumps(body))
@@ -4556,6 +4575,69 @@ class CliTests(unittest.TestCase):
                     self.assertIn(b"IndexAuthorizationFailed", denied.stderr)
                     self.assertEqual(len(self.server.requests), before)
                     self.server.asset_mode = None
+
+    def test_media_gateway_sources_preserve_fresh_identity_checks_without_payload_transfer(
+        self,
+    ):
+        config = self.visual_parents(count=4, page_size=4, units=2)
+        self.server.source_projection_mode = "enabled"
+        args = [
+            *self.decision_args(),
+            "--media=images",
+            "--indexed-media-transport=source",
+            "--json",
+            "--table-config",
+            config,
+            "--no-rank",
+        ]
+        cold = self.raw_cli(*args)
+        self.assertEqual(cold.returncode, 0, cold.stderr)
+        self.assertEqual(self.server.projected_asset_bytes, 0)
+        requests = [request for _, _, request in self.server.requests]
+        self.assertTrue(requests)
+        images = [
+            part
+            for request in requests
+            for item in request["inputs"]
+            for message in item["input"]
+            for part in message["content"]
+            if part["type"] == "input_image"
+        ]
+        self.assertTrue(images)
+        self.assertTrue(
+            all("source" in image and "image_url" not in image for image in images)
+        )
+        self.assertTrue(
+            all(image["source"]["identity"].startswith("sv1-") for image in images)
+        )
+        self.assertTrue(
+            all(
+                image["source"]["permissions_field"] == "grep.permissions"
+                for image in images
+            )
+        )
+        warm = self.raw_cli(*args)
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+        self.assertEqual(len(self.server.requests), len(requests))
+        self.assertEqual(self.server.projected_asset_bytes, 0)
+        # Caller metadata is not authority: changing only stored bytes must
+        # change the current identity and invalidate the cached decision.
+        row = self.server.index_documents[0]
+        row["_source"]["payloads"]["preview0"] = (
+            "data:image/png;base64,"
+            + base64.b64encode(self.image_fixture(width=999, height=3)).decode()
+        )
+        changed = self.raw_cli(*args)
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertGreater(len(self.server.requests), len(requests))
+        self.assertEqual(self.server.projected_asset_bytes, 0)
+        self.assertTrue(
+            any(
+                field.get("mode") == "identity"
+                for _, _, query in self.server.index_requests
+                for field in query.get("source_projection", {}).get("fields", [])
+            )
+        )
 
     def test_media_conditional_projection_avoids_warm_images_and_materializes_score_misses(
         self,

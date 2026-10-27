@@ -1392,6 +1392,9 @@ pub const IndexManager = struct {
     source_payload_store: ?*source_payload_store_mod.Store = null,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     native_read_scratch: *native_read_scratch_pool.Pool,
+    analysis_contributions: ?*introducer_mod.AnalyzedContributionCache = null,
+    analysis_contributions_enabled: bool = true,
+    analysis_contributions_mutex: std.atomic.Mutex = .unlocked,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     bind_cache_resource_manager: bool,
     retained_vector_cache_enabled: ?bool,
@@ -3144,6 +3147,23 @@ pub const IndexManager = struct {
             self.* = undefined;
         }
     };
+
+    fn analysisContributionCache(self: *IndexManager, docs: []const introducer_mod.TextDocument) ?*introducer_mod.AnalyzedContributionCache {
+        if (!self.analysis_contributions_enabled) return null;
+        const eligible = eligible: {
+            for (docs) |doc| for (doc.text_fields) |field| {
+                if (field.text.len >= @import("../../../search/analyzed_contribution_cache.zig").minimum_input) break :eligible true;
+            };
+            break :eligible false;
+        };
+        if (!eligible or !self.analysis_contributions_mutex.tryLock()) return null;
+        defer self.analysis_contributions_mutex.unlock();
+        if (self.analysis_contributions == null) {
+            const manager = self.resource_manager orelse return null;
+            self.analysis_contributions = introducer_mod.AnalyzedContributionCache.create(manager) catch return null;
+        }
+        return self.analysis_contributions;
+    }
 
     pub fn initWithOptions(alloc: Allocator, base_path: []const u8, opts: db_config.IndexBackendOptions) !IndexManager {
         var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
@@ -7127,6 +7147,7 @@ pub const IndexManager = struct {
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
         for (self.resolvers.items) |*entry| entry.deinit(self.alloc);
         for (self.retired_resolvers.items) |*entry| entry.deinit(self.alloc);
+        if (self.analysis_contributions) |cache| cache.deinit();
         self.text_indexes.deinit(self.alloc);
         self.dense_indexes.deinit(self.alloc);
         self.sparse_indexes.deinit(self.alloc);
@@ -19198,6 +19219,7 @@ pub const IndexManager = struct {
                     entry.text_analysis,
                     .{
                         .scratch_allocator = introducer_mod.textBuildScratchAllocator(),
+                        .contribution_cache = self.analysisContributionCache(projection_batch.docs),
                         .postings_run_io = if (textBuildSpoolDirectory(entry) != null) entry.io else null,
                         .postings_run_directory = textBuildSpoolDirectory(entry) orelse ".",
                         .target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes()),

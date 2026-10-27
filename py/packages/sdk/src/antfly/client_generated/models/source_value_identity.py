@@ -16,9 +16,9 @@ T = TypeVar("T", bound="SourceValueIdentity")
 class SourceValueIdentity:
     """
     Attributes:
-        state (SourceValueIdentityState): Stored null is a value. Missing has no identity; unchanged omits the value
-            from _source.
-        identity (str | Unset): Opaque versioned value identity, present for value and unchanged states.
+        state (SourceValueIdentityState): Stored null is a value. Missing has no identity; unchanged and reference omit
+            the value from _source.
+        identity (str | Unset): Opaque versioned value identity, present for value, unchanged and reference states.
     """
 
     state: SourceValueIdentityState

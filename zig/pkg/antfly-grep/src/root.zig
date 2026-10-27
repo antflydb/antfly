@@ -1956,7 +1956,7 @@ pub const Search = struct {
                 // avoid retaining a second full body per input. Account URL
                 // retention, transient decode and bounded provider scratch
                 // independently from the transport-wave limit.
-                working_set +|= unit.asset.byte_length *| 4 +| unit.text.len *| 8 +| doc.path.len *| 8 +| 65536;
+                working_set +|= (if (self.options.indexed_media_transport == .source) @as(usize, 0) else unit.asset.byte_length *| 4) +| unit.text.len *| 8 +| doc.path.len *| 8 +| 65536;
                 end += 1;
             }
             if (end == offset) return failure orelse error.InvalidEvidenceUnits;
@@ -1997,7 +1997,7 @@ pub const Search = struct {
                     }
                     inputs[count] = try decision.visualInput(a, doc.path, unit, image);
                     inputs[count].serialized_evidence_bytes = try inputs[count].evidenceBytes();
-                    if (inputs[count].serialized_evidence_bytes.? > 1024 * 1024) {
+                    if (try inputs[count].admissionBytes() > 1024 * 1024) {
                         failure = failure orelse error.DecisionLimitExceeded;
                         continue;
                     }

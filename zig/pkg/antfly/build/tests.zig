@@ -227,6 +227,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Parser/worker projection contracts need no HTTP server or linked kernel.
     // Reuse the lean source-discovery root so this boundary remains affordable
     // to check independently of the full API runtime harness.
+    const contribution_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "analyzed contributions", "introducer." },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("analyzed-contribution-test", "Verify bounded analysis reuse on the existing document format")
+        .dependOn(&b.addRunArtifact(contribution_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, contribution_tests, "analyzed-contribution-test-build", "Build portable analysis reuse tests", "antfly-analyzed-contribution-tests");
+
     const query_contract_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "api query contract", "local query contract", "decision functions worker transport" } });
     b.step("query-contract-test", "Run query parsing, worker transport and projection contracts").dependOn(&b.addRunArtifact(query_contract_tests).step);
 

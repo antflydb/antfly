@@ -94,6 +94,7 @@ pub const Image = struct {
     // Borrowed immutable slice proven JSON-safe by the image constructors.
     // Bind the proof to the original extent so replacing data_url fails closed.
     json_safe_url: ?[]const u8 = null,
+    table_source: ?input.TableSourceReference = null,
     pub fn hasJsonSafeUrl(self: Image) bool {
         const safe = self.json_safe_url orelse return false;
         return safe.ptr == self.data_url.ptr and safe.len == self.data_url.len;

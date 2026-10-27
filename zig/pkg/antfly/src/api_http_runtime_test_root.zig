@@ -106,3 +106,8 @@ test "external lake SQL schema cache discovery" {
 test "api HTTP runtime discovery" {
     _ = httpx_handler;
 }
+
+test "httpx inference gateway source discovery" {
+    _ = @import("api/inference_gateway.zig");
+    _ = @import("api/inference_source.zig");
+}

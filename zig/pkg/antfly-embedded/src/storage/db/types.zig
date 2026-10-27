@@ -2640,6 +2640,16 @@ pub const GraphMetricRerankScoreDetails = struct {
 pub const ColumnSource = @import("column_source.zig").Row;
 pub const ColumnSourcePage = @import("column_source.zig").Page;
 
+/// Producer receipt for normalized, publicly projected JSON. This is local
+/// execution evidence, never a document-access grant or a wire input. Its bytes
+/// remain owned by SearchHit; replacement or transport serialization retires it.
+pub const FinalizedSource = struct {
+    bytes: []const u8,
+    pub fn matches(self: @This(), bytes: []const u8) bool {
+        return self.bytes.ptr == bytes.ptr and self.bytes.len == bytes.len;
+    }
+};
+
 pub const SearchHit = struct {
     /// Owned internal selection proof; absent on ordinary/public results.
     document_authority: ?*const @import("query/document_authority.zig").Authority = null,
@@ -2661,6 +2671,7 @@ pub const SearchHit = struct {
     stored_data: ?[]u8 = null,
     /// Storage-certified final delivery states; owned and never caller metadata.
     source_projection_json: ?[]u8 = null,
+    finalized_source: ?FinalizedSource = null,
     /// Owned typed source for providers that hydrate after source-dependent
     /// ranking/filtering. Highlighting and public projection consume this
     /// directly; encoding happens once at the response boundary. Providers
@@ -2711,6 +2722,11 @@ pub const SearchHit = struct {
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
         cloned.source_projection_json = if (self.source_projection_json) |data| try alloc.dupe(u8, data) else null;
+        if (self.finalized_source) |receipt| if (self.stored_data) |previous| {
+            if (receipt.matches(previous)) {
+                if (cloned.stored_data) |bytes| cloned.finalized_source = .{ .bytes = bytes };
+            }
+        };
         cloned.source_value = if (self.source_value) |value| try cloneJsonValue(alloc, value) else null;
         cloned.column_source = if (self.column_source) |source| try source.cloneInto(alloc) else null;
         cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
@@ -2741,6 +2757,7 @@ pub const SearchHit = struct {
         if (self.column_source) |source| source.deinit();
         self.stored_data = null;
         self.source_projection_json = null;
+        self.finalized_source = null;
         self.source_value = null;
         self.column_source = null;
     }

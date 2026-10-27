@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class SourceValueIdentityState(StrEnum):
     MISSING = "missing"
+    REFERENCE = "reference"
     UNCHANGED = "unchanged"
     VALUE = "value"
 

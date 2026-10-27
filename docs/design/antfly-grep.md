@@ -606,3 +606,49 @@ evaluation budgets retain serial admission. Every launch, cancellation, decode,
 output and drain failure joins borrowers before releasing their pages. The shared
 64 MiB conservative image admission pool remains in place; warm reuse removes
 transfer and validation work instead of raising that pool's limit.
+
+
+## Format migration split (2026-10-26)
+
+PR #1263 retains the existing ASCH25 writer and reader contract. Automatic
+format activation, immutable document manifests, logical-authority v2,
+source/field publication packs, migration/replay coordination and their
+format-specific transfer/recovery paths are deferred together to the
+`experiment/immutable-document-format` follow-up branch. That branch preserves
+the complete implementation, design history, fixtures and qualification tools;
+it is experimental and is not approved for automatic migration.
+
+The PR retains format-independent sparse FST cleanup, bounded analyzed-text
+contribution reuse and the existing query/gateway improvements. The analysis
+cache keys actual text bytes and the complete analyzer pipeline. It is lazy,
+resource-accounted and reclaimable, and cache hits write no durable metadata.
+It cannot supply source authority or select an old document revision. Tests
+compare complete encoded segments across analyzers, reclamation, changed and
+reordered document updates, and compaction. The update fixture checks that
+schema format stays at 25 and primary rows remain ordinary JSON.
+
+The experimental qualification showed 16% lower CPU and 15% lower RSS for dense
+code updates against the earlier native implementation. Compared with legacy
+inline storage, large metadata-only updates used about 32x fewer primary WAL
+bytes, but 4 KiB rows in already-admitted tables used about 4x CPU and 3.7x update
+elapsed time. The 2x update-speed target failed. These measurements describe
+the experimental branch, not the smaller format-independent PR; they must not
+be reused as performance claims for the split PR.
+
+Before automatic upgrades can return, qualify a hybrid layout with cheap
+small-row storage, source planning before body hydration, and compiled-field
+reuse across publication/compaction. Require paired old-binary comparisons on
+mixed small/large, sparse/dense, changing/unchanged, entropy/compressible,
+read-heavy and sustained-compaction workloads, plus recovery and distributed
+transfer tests. CPU, peak memory and tail latency must meet explicit regression
+budgets; large-payload write savings alone do not qualify all-user migration.
+Older-reader fencing and snapshot-based rollback remain mandatory for any new
+physical format. No released table is converted by this PR.
+
+Split validation on macOS passed 67 compiler/update tests (one benchmark skip),
+21 FST tests, 152 query-contract tests and 97 logical-field tests (one skip),
+with no reported leaks. The CLI sweep covered 290 cases: after correcting the
+source-reference fixture and regenerating packaged tooling, its six failed
+cases all passed on the optimized recheck; two optional cases were skipped.
+This is split/correctness validation, not a new performance qualification or
+an independent Linux hardware result.

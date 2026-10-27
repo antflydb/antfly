@@ -270,12 +270,18 @@ from .decision_evidence_image_type import DecisionEvidenceImageType
 from .decision_evidence_message import DecisionEvidenceMessage
 from .decision_evidence_message_role import DecisionEvidenceMessageRole
 from .decision_evidence_message_type import DecisionEvidenceMessageType
+from .decision_evidence_table_image import DecisionEvidenceTableImage
+from .decision_evidence_table_image_detail import DecisionEvidenceTableImageDetail
+from .decision_evidence_table_image_type import DecisionEvidenceTableImageType
 from .decision_evidence_text import DecisionEvidenceText
 from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
 from .decision_similarity import DecisionSimilarity
+from .decision_table_source import DecisionTableSource
+from .decision_table_source_filter_query import DecisionTableSourceFilterQuery
+from .decision_table_source_mime_type import DecisionTableSourceMimeType
 from .decision_usage import DecisionUsage
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
 from .dense_native_storage_phase import DenseNativeStoragePhase
@@ -1491,6 +1497,7 @@ from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from .source_projection import SourceProjection
 from .source_projection_field import SourceProjectionField
+from .source_projection_field_mode import SourceProjectionFieldMode
 from .source_value_condition import SourceValueCondition
 from .source_value_identity import SourceValueIdentity
 from .source_value_identity_state import SourceValueIdentityState
@@ -1977,12 +1984,18 @@ __all__ = (
     "DecisionEvidenceMessage",
     "DecisionEvidenceMessageRole",
     "DecisionEvidenceMessageType",
+    "DecisionEvidenceTableImage",
+    "DecisionEvidenceTableImageDetail",
+    "DecisionEvidenceTableImageType",
     "DecisionEvidenceText",
     "DecisionEvidenceTextType",
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
     "DecisionSimilarity",
+    "DecisionTableSource",
+    "DecisionTableSourceFilterQuery",
+    "DecisionTableSourceMimeType",
     "DecisionUsage",
     "DeleteArtifactEnrichmentResponse201",
     "DenseNativeStoragePhase",
@@ -3182,6 +3195,7 @@ __all__ = (
     "SortProfileSortLifecycleState",
     "SourceProjection",
     "SourceProjectionField",
+    "SourceProjectionFieldMode",
     "SourceValueCondition",
     "SourceValueIdentity",
     "SourceValueIdentityState",

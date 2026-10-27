@@ -41439,6 +41439,7 @@ pub const DB = struct {
                     hit.clearSource(alloc);
                     hit.stored_data = value.source;
                     hit.source_projection_json = value.identities;
+                    hit.finalized_source = .{ .bytes = value.source };
                     rows[i - start] = null;
                     certificate_hits += 1;
                     continue;
@@ -142511,4 +142512,221 @@ test "logical source certificates skip revision reads across unrelated writes an
         try std.testing.expect(std.mem.indexOf(u8, rows[0].bytes.?, "new") != null);
     }
     try std.testing.expectEqual(@as(usize, 1), db.core.store.source_certificates.entries.count());
+}
+
+test "analyzed contributions preserve exact postings across analyzers and reclamation" {
+    const a = std.testing.allocator;
+    const intro = @import("../../introducer.zig");
+    const analysis = @import("../../search/analysis.zig");
+    const resources = @import("../resource_manager.zig");
+    var manager = resources.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    const cache = try intro.AnalyzedContributionCache.create(&manager);
+    defer cache.deinit();
+    const text = try a.alloc(u8, 16 * 1024);
+    defer a.free(text);
+    const fragment = "Running runners café THE alpha beta beta <b>Greek</b> ";
+    for (text, 0..) |*byte, i| byte.* = fragment[i % fragment.len];
+    const empty = try a.alloc(u8, 9 * 1024);
+    defer a.free(empty);
+    @memset(empty, ' ');
+    const analyzers = [_]*const analysis.Analyzer{ &analysis.default_analyzer, &analysis.simple_analyzer, &analysis.html_analyzer, &analysis.search_as_you_type_2gram_analyzer, &analysis.substring_analyzer, &analysis.keyword_analyzer };
+    for (analyzers) |analyzer| {
+        const fields = [_]intro.TextField{
+            .{ .field_name = "_all", .text = "before with gaps", .analyzer = analyzer },
+            .{ .field_name = "body", .text = text, .analyzer = analyzer },
+            .{ .field_name = "_all", .text = text, .analyzer = analyzer },
+            .{ .field_name = "_all", .text = empty, .analyzer = analyzer },
+            .{ .field_name = "_all", .text = "after another repeated beta", .analyzer = analyzer },
+        };
+        const docs = [_]intro.TextDocument{
+            .{ .id = "z", .stored_data = "{}", .text_fields = &fields },
+            .{ .id = "a", .stored_data = "{}", .text_fields = &fields },
+        };
+        const expected = try intro.buildSegmentFromTextWithAnalysisOptions(a, &docs, &analysis.default_analyzer, .{}, .{});
+        defer a.free(expected);
+        for (0..3) |_| {
+            const actual = try intro.buildSegmentFromTextWithAnalysisOptions(a, &docs, &analysis.default_analyzer, .{}, .{ .contribution_cache = cache });
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(u8, expected, actual);
+        }
+        const key = try intro.AnalyzedContributionCache.key(analyzer, text);
+        if (cache.borrow(key)) |borrowed| {
+            var lease = borrowed;
+            // A live lease survives pressure; subsequent misses remain correct.
+            _ = intro.AnalyzedContributionCache.reclaim(cache, std.math.maxInt(u64));
+            try std.testing.expect(lease.tokens != 0);
+            lease.deinit();
+        }
+        _ = intro.AnalyzedContributionCache.reclaim(cache, std.math.maxInt(u64));
+        const after_reclaim = try intro.buildSegmentFromTextWithAnalysisOptions(a, &docs, &analysis.default_analyzer, .{}, .{ .contribution_cache = cache });
+        defer a.free(after_reclaim);
+        try std.testing.expectEqualSlices(u8, expected, after_reclaim);
+    }
+    try std.testing.expect(cache.hits.load(.monotonic) > 0);
+    // Lossless signed deltas cover duplicates, gaps, backwards positions and
+    // the u32 endpoints, including custom analyzer position streams.
+    const positions = [_]u32{ 0, 1, 4000, 4000, 3, std.math.maxInt(u32), 0 };
+    const digest: [32]u8 = @splat(93);
+    cache.put(digest, &.{.{ .term = "term", .positions = &positions }}, positions.len, 8192);
+    var lease = cache.borrow(digest).?;
+    defer lease.deinit();
+    var iterator = lease.hitAt(0).iterator();
+    var decoded: u32 = undefined;
+    for (positions) |position| {
+        try std.testing.expect(iterator.read(&decoded));
+        try std.testing.expectEqual(position, decoded);
+    }
+    try std.testing.expect(!iterator.read(&decoded));
+}
+
+test "analyzed contributions workload survives reordered sparse updates and compaction" {
+    const benchmark = std.c.getenv("ANTFLY_BENCH_CONTRIBUTIONS") != null;
+    const a = if (benchmark) @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator) else std.testing.allocator;
+    const reference = benchmark and std.c.getenv("ANTFLY_BENCH_CONTRIBUTIONS_REFERENCE") != null;
+    const count: usize = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_ROWS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 8) else 4;
+    const length: usize = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_BYTES")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 64 * 1024) else 64 * 1024;
+    const rounds: usize = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_ROUNDS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 16) else 3;
+    const sparse = std.c.getenv("ANTFLY_BENCH_CONTRIBUTIONS_SPARSE") != null;
+    const changing = std.c.getenv("ANTFLY_BENCH_CONTRIBUTIONS_CHANGING") != null;
+    if (count == 0 or count > 128 or length < 4096 or length > 1024 * 1024 or rounds == 0 or rounds > 1024) return error.InvalidArgument;
+    var directory = try TestDirectory.init("document-contribution-workload");
+    defer directory.cleanup();
+    const path = directory.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{});
+    defer db.close();
+    try db.setSchema(.{});
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    db.core.index_manager.analysis_contributions_enabled = !reference;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const seeds = try scratch.alloc(types.BatchWrite, count);
+    const bodies = try scratch.alloc([]u8, count);
+    const entropy = std.c.getenv("ANTFLY_BENCH_DOCUMENT_ENTROPY") != null;
+    const prose = "Running native indexers preserve source revisions and permissions while reusable body contributions avoid repeated tokenization. ";
+    const corpus = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_CONTRIBUTIONS_CORPUS")) |raw| try std.Io.Dir.cwd().readFileAlloc(std.testing.io, std.mem.span(raw), scratch, .limited(4 * 1024 * 1024)) else null) else null;
+    if (corpus != null and corpus.?.len == 0) return error.InvalidArgument;
+    var random = std.Random.DefaultPrng.init(0x434f4e54524942);
+    for (seeds, bodies, 0..) |*seed, *body, i| {
+        body.* = try scratch.alloc(u8, length);
+        if (entropy) {
+            random.random().bytes(body.*);
+            for (body.*) |*byte| byte.* = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[byte.* % 62];
+            var boundary: usize = 31;
+            while (boundary < length) : (boundary += 32) body.*[boundary] = ' ';
+        } else {
+            const source = corpus orelse prose;
+            for (body.*, 0..) |*byte, offset| byte.* = source[offset % source.len];
+            // A fixed-size window may end inside the last UTF-8 scalar.
+            @memset(body.*[length - 4 ..], ' ');
+        }
+        // Distinct source identities per row, even in the repeated-text corpus.
+        body.*[0] = 'A' + @as(u8, @intCast(i % 26));
+        body.*[1] = 'A' + @as(u8, @intCast(i / 26));
+        const body_json = try std.json.Stringify.valueAlloc(scratch, body.*, .{});
+        seed.* = .{ .key = try std.fmt.allocPrint(scratch, "doc-{d:0>4}", .{i}), .value = try std.fmt.allocPrint(scratch, "{{\"body\":{s},\"metadata\":\"seed\"}}", .{body_json}) };
+    }
+    try db.batch(.{ .writes = seeds, .sync_level = .full_index });
+    for (seeds, bodies) |*seed, body| {
+        const body_json = try std.json.Stringify.valueAlloc(scratch, body, .{});
+        seed.value = try std.fmt.allocPrint(scratch, "{{\"body\":{s},\"metadata\":\"warm\"}}", .{body_json});
+    }
+    // A different metadata value avoids no-op elision while keeping body
+    // identity stable, which is the real physical-admission trigger.
+    try db.batch(.{ .writes = seeds, .sync_level = .full_index });
+    const first_compact_started = platform_time.monotonicNs();
+    try db.core.index_manager.forceCompactAllTextIndexes();
+    const initial_compaction_ns = platform_time.monotonicNs() - first_compact_started;
+    const changes = try scratch.alloc(types.DocumentTransform, if (sparse) 1 else count);
+    const backend = db.core.primary_store_owner.lsmBackend().?;
+    const stats_before = backend.snapshotWriteStats();
+    const held_cache = db.core.index_manager.analysis_contributions;
+    const hits_before = if (held_cache) |cache| cache.hits.load(.monotonic) else 0;
+    const tokens_before = if (held_cache) |cache| cache.tokens_reused.load(.monotonic) else 0;
+    var compaction_ns: u64 = 0;
+    var change_arena = std.heap.ArenaAllocator.init(a);
+    defer change_arena.deinit();
+    const started = platform_time.monotonicNs();
+    for (0..rounds) |round| {
+        _ = change_arena.reset(.free_all);
+        const ca = change_arena.allocator();
+        const metadata = if (round % 2 == 0) "\"metadataomega\"" else "\"metadatakappa\"";
+        const ops = try ca.alloc(types.TransformOp, if (changing) 2 else 1);
+        ops[0] = .{ .op = .set, .path = "metadata", .value_json = metadata };
+        for (changes, 0..) |*change, offset| {
+            const ordinal = (round + count - 1 - offset) % count;
+            if (changing) {
+                // One body really changes: exact cache identities must miss.
+                const body_json = try std.json.Stringify.valueAlloc(ca, bodies[ordinal], .{});
+                const owned_ops = try ca.dupe(types.TransformOp, ops);
+                body_json[1] = 'a' + @as(u8, @intCast(round % 26));
+                owned_ops[1] = .{ .op = .set, .path = "body", .value_json = body_json };
+                change.* = .{ .key = seeds[ordinal].key, .operations = owned_ops };
+            } else change.* = .{ .key = seeds[ordinal].key, .operations = ops };
+        }
+        try db.batch(.{ .transforms = changes, .sync_level = .full_index });
+        if (round % 4 == 3) {
+            const compact_started = platform_time.monotonicNs();
+            try db.core.index_manager.forceCompactAllTextIndexes();
+            compaction_ns += platform_time.monotonicNs() - compact_started;
+        }
+    }
+    const elapsed_ns = platform_time.monotonicNs() - started;
+    const stats_after = backend.snapshotWriteStats();
+    const sync_started = platform_time.monotonicNs();
+    try backend.sync(true);
+    const sync_ns = platform_time.monotonicNs() - sync_started;
+    try std.testing.expect(stats_after.wal_sync_records - stats_before.wal_sync_records >= rounds);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const schema_storage = @import("../schema.zig");
+        const encoded = try read.get(schema_storage.schema_key);
+        try std.testing.expectEqual(@as(u32, 25), std.mem.readInt(u32, encoded[4..8], .little));
+        for (seeds) |seed| {
+            const physical = try internal_keys.documentKeyAlloc(a, seed.key);
+            defer a.free(physical);
+            const raw = try read.get(physical);
+            try std.testing.expect(raw.len != 0 and raw[0] == '{');
+        }
+    }
+    // Stored afterimages and query visibility survive both repartitioning and
+    // reordered batches. Read every body, not just a checksum/count.
+    for (seeds, bodies, 0..) |seed, body, i| {
+        const value = (try db.get(a, seed.key)).?;
+        defer a.free(value);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, value, .{});
+        defer parsed.deinit();
+        const actual = parsed.value.object.get("body").?.string;
+        try std.testing.expectEqualSlices(u8, body[1..], actual[1..]);
+        var last_round: ?usize = null;
+        for (0..rounds) |round| {
+            if (!sparse or (round + count - 1) % count == i) last_round = round;
+        }
+        if (last_round) |round| {
+            try std.testing.expectEqualStrings(if (round % 2 == 0) "metadataomega" else "metadatakappa", parsed.value.object.get("metadata").?.string);
+            try std.testing.expectEqual(if (changing) 'a' + @as(u8, @intCast(round % 26)) else body[0], actual[0]);
+        } else try std.testing.expectEqualStrings("warm", parsed.value.object.get("metadata").?.string);
+    }
+    var result = try db.search(a, .{ .query = .{ .match_all = {} }, .limit = @intCast(count) });
+    defer result.deinit();
+    try std.testing.expectEqual(count, result.hits.len);
+    for ([_][]const u8{ "metadata", "_all" }) |field| for ([_][]const u8{ "metadataomega", "metadatakappa" }, 0..) |term, parity| {
+        var expected_hits: usize = 0;
+        for (0..count) |i| {
+            var last_round: ?usize = null;
+            for (0..rounds) |round| if (!sparse or (round + count - 1) % count == i) {
+                last_round = round;
+            };
+            if (last_round) |round| if (round % 2 == parity) {
+                expected_hits += 1;
+            };
+        }
+        var matches = try db.search(a, .{ .index_name = "text", .query = .{ .match = .{ .field = field, .text = term } }, .limit = @intCast(count) });
+        defer matches.deinit();
+        try std.testing.expectEqual(expected_hits, matches.hits.len);
+    };
+    if (benchmark) std.debug.print("DOCUMENT_CONTRIBUTIONS fast={d} code={d} entropy={d} reference={d} rows={d} payload={d} sparse={d} changing={d} rounds={d} elapsed_ns={d} sync_ns={d} initial_compaction_ns={d} compaction_ns={d} wal_syncs={d} wal_bytes={d} cache_hits={d} reused_tokens={d}\n", .{ @intFromBool(builtin.mode == .fast), @intFromBool(corpus != null), @intFromBool(entropy), @intFromBool(reference), count, length, @intFromBool(sparse), @intFromBool(changing), rounds, elapsed_ns, sync_ns, initial_compaction_ns, compaction_ns, stats_after.wal_sync_records - stats_before.wal_sync_records, stats_after.wal_append_bytes - stats_before.wal_append_bytes, if (!reference and held_cache != null) held_cache.?.hits.load(.monotonic) - hits_before else 0, if (!reference and held_cache != null) held_cache.?.tokens_reused.load(.monotonic) - tokens_before else 0 });
 }

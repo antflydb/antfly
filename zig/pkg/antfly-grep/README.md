@@ -4826,3 +4826,22 @@ All 28 real-server indexed integration cases pass against the final native binar
 (seven opt-in benchmark skips). The 24 identity/storage regressions also pass in
 the constrained Linux VM, including canonical-string receipt activation and scope
 boundaries.
+
+
+### Experimental storage format is deferred
+
+PR #1263 keeps the existing document storage format. Immutable payloads, field
+publication packs and automatic migration are preserved separately on the
+`experiment/immutable-document-format` branch pending mixed-workload
+qualification. Format-independent analysis caching and FST cleanup require no
+storage upgrade. See the [split decision](../../../docs/design/antfly-grep.md#format-migration-split-2026-10-26)
+for the measured tradeoffs and upgrade criteria.
+
+For indexed images, `--indexed-media-transport=source` targets the Antfly inference
+gateway. The CLI obtains fresh authorized value identities and sends table,
+document, field, revision and content-hash references instead of downloading and
+resending image bytes. The gateway rechecks authorization, revision, identity
+and content before provider delivery. Expanded-image admission limits still
+apply; a reference is not a read grant. The default inline transport remains
+available for ordinary decision endpoints. This uses the existing document
+format.
