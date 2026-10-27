@@ -941,3 +941,12 @@ request. This removes repeated admission/output binding without a global plan
 cache or cross-request parameter state. Failure injection verifies cleanup and
 cloned-parameter isolation. Manually constructed requests retain owned local
 preparation, so older workers and non-parser consumers preserve their behavior.
+
+
+Raw output validation counts logical JSON values for the VM work budget, not
+scanner fragments or object keys. Escaped strings and surrogate-pair Unicode
+therefore have the same value-step budget as the typed VM. Fragment scanning
+polls cancellation independently of those steps. Validation has a bounded
+container stack in a separate leaf helper, so recursive CASE frames do not each
+reserve that stack. Native equivalence fixtures include large escaped strings,
+Unicode, wide objects, cancellation and empty malformed input.

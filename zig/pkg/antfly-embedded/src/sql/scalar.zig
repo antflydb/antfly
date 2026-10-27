@@ -3233,23 +3233,12 @@ const Evaluator = struct {
                 if (depth >= self.limits.depth) return self.workOwner().limit();
                 if (try loader.read(loader.context, self.alloc, ordinal)) |raw| {
                     try self.workOwner().charge(1);
-                    if (raw.len > self.limits.output_bytes) return self.workOwner().limit();
-                    // Scanner validates syntax, UTF-8 and nesting without allocating
-                    // payload strings. Charge tokens and poll cancellation in chunks.
-                    var scanner = std.json.Scanner.initCompleteInput(self.alloc, raw);
-                    defer scanner.deinit();
-                    var nesting: usize = 0;
-                    while (true) {
-                        const token = try scanner.next();
-                        if (token == .end_of_document) break;
-                        try self.workOwner().charge(1);
-                        if (token == .array_end or token == .object_end) {
-                            nesting -= 1;
-                            continue;
-                        }
-                        if (nesting >= self.limits.depth) return self.workOwner().limit();
-                        if (token == .array_begin or token == .object_begin) nesting += 1;
-                    }
+                    try @import("raw_json_budget.zig").validate(self.alloc, raw, .{
+                        .wire_bytes = self.limits.output_bytes,
+                        .depth = self.limits.depth,
+                        .checkpoint = self.limits.checkpoint,
+                        .checkpoint_context = self.limits.checkpoint_context,
+                    }, self.workOwner());
                     return .{ .raw = raw };
                 }
             },
