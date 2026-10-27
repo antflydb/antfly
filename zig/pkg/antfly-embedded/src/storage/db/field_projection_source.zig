@@ -28,15 +28,19 @@ pub const OperandPlans = struct {
     const Selector = @import("query/json_projection_plan.zig");
     const Operand = struct { parts: []const []const u8, selector: *const Selector.Selector };
     paths: std.StringHashMapUnmanaged(Operand) = .empty,
+    selector: *const Selector.Selector,
     pub fn init(a: A, plan: *const projection.Plan) !OperandPlans {
-        var self: OperandPlans = .{};
+        var paths: std.ArrayList(Selector.Path) = .empty;
+        var self: OperandPlans = .{ .selector = undefined };
         var fields = plan.required_fields.keyIterator();
         while (fields.next()) |path| {
             var parts: std.ArrayList([]const u8) = .empty;
             var tokens = std.mem.splitScalar(u8, path.*, '.');
             while (tokens.next()) |part| try parts.append(a, part);
+            try paths.append(a, .{ .parts = parts.items });
             try self.paths.put(a, path.*, .{ .parts = parts.items, .selector = try Selector.compile(a, &.{.{ .parts = parts.items }}) });
         }
+        self.selector = try Selector.compile(a, paths.items);
         return self;
     }
 };
@@ -50,6 +54,8 @@ pub const Row = struct {
     public_plan: ?*const query.PublicPlan = null,
     operands: ?*const OperandPlans = null,
     raw_sources: std.StringHashMapUnmanaged([]const u8) = .empty,
+    raw_operands: std.StringHashMapUnmanaged([]const u8) = .empty,
+    full_view: ?OperandPlans.View = null,
     values: std.StringHashMapUnmanaged(V) = .empty,
     identities: std.StringHashMapUnmanaged(sql.Datum) = .empty,
     metadata_hits: usize = 0,
@@ -79,6 +85,7 @@ pub const Row = struct {
     fn readRaw(raw: *anyopaque, _: A, path: []const u8) !?[]const u8 {
         const self: *Row = @ptrCast(@alignCast(raw));
         try @import("query/search_exec.zig").checkSearchRequestDeadline(self.req);
+        if (self.raw_operands.get(path)) |value| return value;
         const operands = self.operands orelse return null;
         const operand = operands.paths.get(path) orelse return null;
         if (std.mem.eql(u8, path, "_id")) return null;
@@ -87,8 +94,18 @@ pub const Row = struct {
             try self.raw_sources.put(self.a, path, bytes);
             break :loaded bytes;
         };
-        var view = OperandPlans.View.init(self.a, bytes);
-        try view.prepareProjectionWithOptions(operand.selector, .all, .object_only, .{ .defer_fanout = true });
+        var partial = OperandPlans.View.init(self.a, bytes);
+        const view = if (self.full_bytes != null) full: {
+            if (self.full_view == null) {
+                var prepared = OperandPlans.View.init(self.a, self.full_bytes.?);
+                try prepared.prepareProjectionWithOptions(operands.selector, .all, .object_only, .{ .defer_fanout = true });
+                self.full_view = prepared;
+            }
+            break :full &self.full_view.?;
+        } else projected: {
+            try partial.prepareProjectionWithOptions(operand.selector, .all, .object_only, .{ .defer_fanout = true });
+            break :projected &partial;
+        };
         var node = &view.root;
         for (operand.parts) |part| {
             node = switch (node.kind()) {
@@ -97,6 +114,7 @@ pub const Row = struct {
                 else => return null,
             };
         }
+        try self.raw_operands.put(self.a, path, node.raw);
         return node.raw;
     }
     fn read(raw: *anyopaque, a: A, path: []const u8, kind: sql.ColumnRead) anyerror!sql.Datum {
@@ -219,4 +237,27 @@ test "api query contract opaque identity proves exact path without certifying de
     _ = try row.source().read(&row, a, "items", .identity);
     try std.testing.expectEqual(@as(usize, 0), row.value_reads);
     try std.testing.expectError(error.DocumentNotFound, row.source().read(&row, a, "items.child", .missing));
+}
+
+test "api query contract raw full fallback shares one row view and memoized operands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = try std.json.parseFromSliceLeaky([]const V, a,
+        \\[ {"name":"first","expression":{"field":"body.first"}},
+        \\  {"name":"second","expression":{"field":"body.second"}} ]
+    , .{});
+    var plan = try projection.Plan.init(a, .{ .fields = fields });
+    defer plan.deinit();
+    const operands = try OperandPlans.init(a, &plan);
+    var row: Row = .{ .a = a, .txn = null, .physical = "a", .id = "a", .req = .{}, .authority = .{}, .operands = &operands, .full_bytes = "{\"body\":{\"first\":[1,null],\"second\":\"two\"},\"unused\":{\"large\":[0,1,2]}}" };
+    const source = row.source();
+    const first = (try source.read_raw.?(source.context, a, "body.first")).?;
+    try std.testing.expectEqualStrings("[1,null]", first);
+    try std.testing.expectEqualStrings("\"two\"", (try source.read_raw.?(source.context, a, "body.second")).?);
+    const again = (try source.read_raw.?(source.context, a, "body.first")).?;
+    try std.testing.expect(first.ptr == again.ptr);
+    try std.testing.expectEqual(@as(usize, 2), row.raw_operands.count());
+    try std.testing.expectEqual(@as(usize, 0), row.full_view.?.materialized_values);
+    try std.testing.expectEqual(@as(usize, 0), row.value_reads);
 }

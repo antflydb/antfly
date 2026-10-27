@@ -2776,8 +2776,9 @@ def test_conditional_select_binds_current_values_and_query_selection(
 
 
 @pytest.mark.parametrize("opaque", [False, True])
+@pytest.mark.parametrize("num_shards", [1, 2])
 def test_conditional_source_projection_upgrades_persisted_certificates(
-    monkeypatch, opaque
+    monkeypatch, opaque, num_shards
 ):
     """An implementation-only upgrade may repair metadata, never change values."""
     from conftest import StandaloneAntflyServer, find_free_port, resolve_binary_path
@@ -2795,7 +2796,7 @@ def test_conditional_source_projection_upgrades_persisted_certificates(
     )
     try:
         base = server.api_url + "/tables/conditional_upgrade"
-        created = requests.post(base, json={"num_shards": 1}, timeout=60)
+        created = requests.post(base, json={"num_shards": num_shards}, timeout=60)
         created.raise_for_status()
         deadline = time.monotonic() + 30
         while requests.get(base, timeout=5).status_code != 200:
@@ -3033,3 +3034,29 @@ def test_select_literal_and_unused_parameter_depth_admission(stateful_api):
         assert response.status_code in (400, 422), response.text
         healthy = requests.post(url, json={"query": {"match_all": {}}}, timeout=30)
         assert healthy.status_code == 200, healthy.text
+
+
+@pytest.mark.parametrize("padding", [0, 32768])
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_many_native_json_outputs(stateful_api, padding, num_shards):
+    table = "select_wide_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    values = {f"f{i}": [i, None, f"v-{i}"] for i in range(64)}
+    stateful_api.batch_write(
+        table,
+        inserts={"a": {"body": values, "padding": "x" * padding}},
+        sync_level="full_index",
+    )
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/query",
+        json={
+            "query": {"match_all": {}},
+            "fields": [],
+            "select": {name: {"field": f"body.{name}"} for name in values},
+        },
+        timeout=60,
+    )
+    assert response.status_code == 200, response.text
+    hit = response.json()["responses"][0]["hits"]["hits"][0]
+    assert hit["_computed"] == values, hit
+    assert hit.get("_source", {}) == {}, hit

@@ -896,7 +896,9 @@ writer. Limits apply to raw data independently of expression/alias depth.
 
 Native scalar delivery prepares source masks and operand selectors once per
 owner request, alongside its immutable SQL programs. Row-local views borrow
-only bytes loaded under that row's pinned revision and authorization. Direct
+only bytes loaded under that row's pinned revision and authorization. Full-body
+fallbacks share one prepared row view across operands, and resolved raw spans
+are memoized, avoiding repeated full-row indexing for many-output requests. Direct
 JSON columns and the selected CASE branch can forward validated raw spans to
 `_computed`; CASE conditions and operations still use the shared SQL VM. Alias
 outputs keep those spans until a consumer needs a typed value, then materialize

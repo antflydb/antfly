@@ -86,6 +86,12 @@ def main():
     )
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument(
+        "--metadata-outputs",
+        type=int,
+        default=0,
+        help="add 0..60 distinct small scalar outputs to qualify wide rows",
+    )
+    parser.add_argument(
         "--queries-per-phase",
         type=int,
         default=1,
@@ -122,6 +128,7 @@ def main():
         not 1 <= args.documents <= 64
         or not 16384 <= args.value_bytes <= 1048576
         or not 0 <= args.metadata_updates <= 100
+        or not 0 <= args.metadata_outputs <= 60
         or args.rounds < 1
         or not 1 <= args.queries_per_phase <= 100
     ):
@@ -161,6 +168,9 @@ def main():
         if workload == "wide":
             payload.update({f"sibling{j:03}": j for j in range(128)})
         out = {"metadata": {"revision": "r1", "allowed": True}, "payload": payload}
+        out["metadata"].update(
+            {f"extra_{j}": f"value-{j}" for j in range(args.metadata_outputs)}
+        )
         if workload == "numeric":
             out["padding"] = "p" * args.value_bytes
         return out
@@ -228,6 +238,12 @@ def main():
                         "select": conditional_select("payload.large"),
                         "params": {"known": {}},
                     }
+                    request["select"].update(
+                        {
+                            f"extra_{j}": {"field": f"metadata.extra_{j}"}
+                            for j in range(args.metadata_outputs)
+                        }
+                    )
                     for phase in (
                         "ordinary",
                         "reference_full",
@@ -293,6 +309,8 @@ def main():
                             for hit in hits:
                                 if phase != "ordinary":
                                     values = hit["_computed"]
+                                    for j in range(args.metadata_outputs):
+                                        assert values[f"extra_{j}"] == f"value-{j}"
                                     assert values["changed"] == (
                                         phase in ("full", "reference_full")
                                     ), (phase, hit["_id"])
@@ -471,6 +489,7 @@ def main():
         "rounds": args.rounds,
         "queries_per_phase": args.queries_per_phase,
         "metadata_updates": args.metadata_updates,
+        "metadata_outputs": args.metadata_outputs,
         "documents": args.documents,
         "value_bytes": args.value_bytes,
         "corpus_sha256": corpus,

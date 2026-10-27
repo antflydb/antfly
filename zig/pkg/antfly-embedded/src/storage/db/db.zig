@@ -41861,6 +41861,7 @@ pub const DB = struct {
                 hit.computed_json = encoded;
                 if (row.metadata_hits != 0) scalar_metadata_rows += 1 else scalar_fallback_rows += 1;
                 if (row.certificate_hits != 0) scalar_certificate_rows += 1;
+                if (scalar_authorities.rows[index % 64].repair) self.document_authority_backfill_requested.store(true, .release);
                 break :lazy .{ .json = source };
             } else if (req.document_authority_mode == .hydrate or eager)
                 try self.lookupPrimarySnapshotWithPreparedProjection(projection_scratch.allocator(), body_allocator, hit.id, lookup_opts, &read.?, schema_view, raw_primary, version, &plans)
