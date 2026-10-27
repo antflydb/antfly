@@ -1715,3 +1715,11 @@ resource failures. Candidate warm observers also overlap their initial proof
 reads; those changes require a new sealed candidate and independent live run.
 The updated candidate and driver pass 228 Node checks and 15 persisted Worker
 checks. Native modules are unchanged from the merged-source scale runs.
+
+Separate workerd probes also reproduce the two remaining caller-context defects
+in approved control `8a61f42df8`: both mutation groups and runtime-actor queues
+execute separately admitted `a`, `b`, `c` under contexts `a`, `a`, `a`. A
+[two-file correction proposal](cloudflare-control-callers.md) preserves original
+capacities and native artifacts, passes all 90 original Node tests, and observes
+`a`, `b`, `c` in both probes. The live control remains unchanged pending the
+frozen-control replacement decision.
