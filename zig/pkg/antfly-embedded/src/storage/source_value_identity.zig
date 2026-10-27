@@ -43,8 +43,9 @@ pub fn keyForRevision(key: anytype) Key {
     return result;
 }
 /// Separate bounded metadata preserves the existing path directory's coverage
-/// and admission budget. Leaf ranges are disjoint, so canonical hashing adds
-/// linear write work; arrays and opaque subtrees retain full-value fallback.
+/// and admission budget. Terminal ranges are disjoint, so canonical hashing adds
+/// linear write work, including arrays and opaque objects. Expanded parents
+/// are excluded; old certificates fall back until republished.
 pub fn build(a: std.mem.Allocator, body: []const u8, kind: u8, digest: [32]u8, directory: []const u8) !?[]u8 {
     var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
     defer arena.deinit();
@@ -54,7 +55,7 @@ pub fn build(a: std.mem.Allocator, body: []const u8, kind: u8, digest: [32]u8, d
     if (paths.version < 2) return null;
     var collector: Collector = .{ .a = temp };
     for (paths.fields) |field| {
-        if (field.kind == .leaf) try Collector.visit(&collector, field.index, body[@intCast(field.offset)..][0..@intCast(field.length)]);
+        if (field.kind != .object) try Collector.visit(&collector, field.index, body[@intCast(field.offset)..][0..@intCast(field.length)]);
     }
     return try collector.encode(a, body.len, kind, digest, directory);
 }
@@ -72,7 +73,7 @@ const Collector = struct {
     fn encode(self: *const Collector, a: std.mem.Allocator, bytes: usize, kind: u8, digest: [32]u8, directory: []const u8) ![]u8 {
         const count = self.count;
         const output = try a.alloc(u8, header_bytes + count * record_bytes);
-        @memcpy(output[0..4], "SVI1");
+        @memcpy(output[0..4], "SVI2");
         std.mem.writeInt(u64, output[4..12], bytes, .little);
         @memcpy(output[12..44], &digest);
         output[44] = kind;
@@ -115,9 +116,9 @@ pub fn buildAuthorityReusing(a: std.mem.Allocator, body: []const u8, kind: u8, d
     const certificate = Certificate.open(prior.identities, prior.directory, prior) orelse return buildAuthority(a, body, kind, digest);
     if (old.version != 2) return buildAuthority(a, body, kind, digest);
     // Keep the fused reference writer for layouts with no worthwhile leaf.
-    // Metadata-only/opaque rows should not pay for a second directory decode.
+    // Metadata-only rows should not pay for a second directory decode.
     const worthwhile = for (old.fields) |field| {
-        if (field.kind == .leaf and field.length >= 4096 and certificate.find(field.index) != null) break true;
+        if (field.kind != .object and field.length >= 4096 and certificate.find(field.index) != null) break true;
     } else false;
     if (!worthwhile) return buildAuthority(a, body, kind, digest);
     const directory = (try projection.buildAuthority(a, body, kind, digest)) orelse return .{ .directory = null, .identities = null };
@@ -142,7 +143,7 @@ pub fn buildAuthorityReusing(a: std.mem.Allocator, body: []const u8, kind: u8, d
                 },
             }
         }
-        if (field.kind != .leaf) continue;
+        if (field.kind == .object) continue;
         if (mapped[field.index]) |index| {
             const previous = old.fields[index];
             if (previous.length == field.length and std.mem.eql(u8, &previous.digest, &field.digest)) {
@@ -162,9 +163,13 @@ pub fn buildAuthorityReusing(a: std.mem.Allocator, body: []const u8, kind: u8, d
 }
 
 pub const Certificate = struct {
+    /// Coverage epoch, separate from the unchanged canonical value ABI.
+    opaque_coverage: bool = false,
     records: []const u8,
     pub fn open(raw: []const u8, directory: []const u8, proof: anytype) ?Certificate {
-        if (raw.len < header_bytes or raw.len > maximum_bytes or !std.mem.eql(u8, raw[0..4], "SVI1")) return null;
+        if (raw.len < header_bytes or raw.len > maximum_bytes) return null;
+        const opaque_coverage = std.mem.eql(u8, raw[0..4], "SVI2");
+        if (!opaque_coverage and !std.mem.eql(u8, raw[0..4], "SVI1")) return null;
         if (!std.mem.eql(u8, raw[79..111], &canonical_abi)) return null;
         if (std.mem.readInt(u64, raw[4..12], .little) != proof.bytes or raw[44] != proof.kind or !std.mem.eql(u8, raw[12..44], &proof.digest)) return null;
         var directory_digest: [32]u8 = undefined;
@@ -178,7 +183,12 @@ pub const Certificate = struct {
             if (index >= projection.maximum_fields or (prior != null and index <= prior.?)) return null;
             prior = index;
         }
-        return .{ .records = raw[header_bytes..] };
+        return .{ .records = raw[header_bytes..], .opaque_coverage = opaque_coverage };
+    }
+    pub fn needsCoverageRepair(self: Certificate, directory: projection.Directory) bool {
+        if (self.opaque_coverage) return false;
+        for (directory.fields) |field| if (field.kind == .subtree) return true;
+        return false;
     }
     pub fn find(self: Certificate, index: u16) ?[32]u8 {
         var low: usize = 0;
@@ -192,3 +202,43 @@ pub const Certificate = struct {
         return null;
     }
 };
+
+test "logical value conditional opaque terminal identities reuse without parent overlap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const payload = try a.alloc(u8, 32768);
+    @memset(payload, 'x');
+    const body = try std.fmt.allocPrint(a, "{{\"arr\":[{{\"value\":\"{s}\"}}],\"metadata\":1}}", .{payload});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    const publication = try buildAuthority(a, body, 16, digest);
+    const proof = .{ .bytes = @as(u64, body.len), .kind = @as(u8, 16), .digest = digest };
+    const directory = (try projection.Directory.open(a, publication.directory.?, proof)).?;
+    const field = directory.resolveExact("arr").?;
+    try std.testing.expect(field.kind == .subtree);
+    try std.testing.expect(directory.resolveExact("arr.0") == null);
+    const certificate = Certificate.open(publication.identities.?, publication.directory.?, proof).?;
+    try std.testing.expect(!certificate.needsCoverageRepair(directory));
+    const legacy = try a.dupe(u8, publication.identities.?);
+    @memcpy(legacy[0..4], "SVI1");
+    const old_certificate = Certificate.open(legacy, publication.directory.?, proof).?;
+    try std.testing.expect(old_certificate.needsCoverageRepair(directory));
+    const expected = (try validatedScalarDigest(a, body[@intCast(field.offset)..][0..@intCast(field.length)])).?;
+    try std.testing.expectEqualSlices(u8, &expected, &certificate.find(field.index).?);
+    const next_body = try std.fmt.allocPrint(a, "{{\"metadata\":2,\"arr\":[{{\"value\":\"{s}\"}}]}}", .{payload});
+    var next_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(next_body, &next_digest, .{});
+    var stats: ReuseStats = .{};
+    const next = try buildAuthorityReusing(a, next_body, 16, next_digest, .{ .bytes = body.len, .kind = 16, .digest = digest, .directory = publication.directory.?, .identities = publication.identities.? }, &stats);
+    const reference = try buildAuthority(a, next_body, 16, next_digest);
+    try std.testing.expectEqualSlices(u8, reference.identities.?, next.identities.?);
+    try std.testing.expectEqual(@as(usize, @intCast(field.length)), stats.reused_bytes);
+    try std.testing.expect(stats.canonical_bytes < 16);
+    try std.testing.expect(Certificate.open(publication.identities.?, next.directory.?, .{ .bytes = @as(u64, next_body.len), .kind = @as(u8, 16), .digest = next_digest }) == null);
+    var deep: std.Io.Writer.Allocating = .init(a);
+    for (0..300) |_| try deep.writer.writeByte('[');
+    try deep.writer.writeAll("null");
+    for (0..300) |_| try deep.writer.writeByte(']');
+    try std.testing.expect(try validatedScalarDigest(a, deep.written()) == null);
+}

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 import requests
+import re
 import test_auth as auth
 from e2e_scheduler import e2e_resource
 from helpers import start_http_server
@@ -2774,7 +2775,10 @@ def test_conditional_select_binds_current_values_and_query_selection(
     assert query(request)[0]["_computed"]["value"] == "changed-payload"
 
 
-def test_conditional_source_projection_upgrades_persisted_certificates(monkeypatch):
+@pytest.mark.parametrize("opaque", [False, True])
+def test_conditional_source_projection_upgrades_persisted_certificates(
+    monkeypatch, opaque
+):
     """An implementation-only upgrade may repair metadata, never change values."""
     from conftest import StandaloneAntflyServer, find_free_port, resolve_binary_path
 
@@ -2785,6 +2789,7 @@ def test_conditional_source_projection_upgrades_persisted_certificates(monkeypat
             "Set ANTFLY_BASELINE_BIN and ANTFLY_BIN for persisted upgrade checks"
         )
     monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE", "1")
+    payload = [{"value": "value-" * 8192}] if opaque else "value-" * 8192
     server = StandaloneAntflyServer(
         resolve_binary_path(baseline), "127.0.0.1", find_free_port()
     )
@@ -2799,7 +2804,7 @@ def test_conditional_source_projection_upgrades_persisted_certificates(monkeypat
         response = requests.post(
             base + "/batch",
             json={
-                "inserts": {"a": {"image": "value-" * 8192, "revision": "r1"}},
+                "inserts": {"a": {"image": payload, "revision": "r1"}},
                 "sync_level": "full_index",
             },
             timeout=60,
@@ -2820,17 +2825,35 @@ def test_conditional_source_projection_upgrades_persisted_certificates(monkeypat
             assert result["status"] == 200, result
             return result["hits"]["hits"][0]
 
+        server.pause()
         log_start = server.log_path.stat().st_size
         server.binary = resolve_binary_path(current)
         server.resume()
         original = query()
         token = original["_computed"]["identity"]
-        assert original["_computed"]["value"] == "value-" * 8192
+        assert original["_computed"]["value"] == payload
         request["params"]["known"] = {"a": token}
         warm = query()
         assert warm["_source"] == {"revision": "r1"}
         assert warm["_computed"]["value"] is None
         assert warm["_computed"]["changed"] is False
+        # SVI1 opaque coverage repairs once without changing public identities.
+        deadline = time.monotonic() + 30
+        while True:
+            logs = server.log_path.read_text(errors="replace")[log_start:]
+            if any(int(n) > 0 for n in re.findall(r"certificate_rows=(\d+)", logs)):
+                break
+            assert time.monotonic() < deadline, logs
+            time.sleep(0.05)
+            assert query()["_computed"]["identity"] == token
+        # Disposable certificate epochs must not prevent an older reader from
+        # reading the same unchanged document representation.
+        server.pause()
+        server.binary = resolve_binary_path(baseline)
+        server.resume()
+        rollback = query()
+        assert rollback["_computed"]["identity"] == token
+        assert rollback["_computed"]["value"] is None
     finally:
         server.stop()
 
@@ -2953,3 +2976,60 @@ def test_select_alias_depth_rejected_without_losing_server(stateful_api):
     assert set(
         valid.json()["responses"][0]["hits"]["hits"][0]["_computed"].values()
     ) == {1}
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_public_source_excludes_internal_fields(stateful_api, num_shards):
+    table = "select_private_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    private = {
+        "_resolution_work",
+        "_hierarchy_unit_revision_token",
+        "_artifact_unit_fingerprint",
+    }
+    doc = {"visible": "ok", "nested": {"_type": "user"}, "padding": "x" * 32768}
+    doc.update({name: "private" for name in private})
+    stateful_api.batch_write(table, inserts={"a": doc}, sync_level="full_index")
+    for fields in [None, ["*"], ["-padding"], ["nested._type"], ["nested.*"]]:
+        body = {"query": {"match_all": {}}, "select": {"c": {"literal": 1}}}
+        if fields is not None:
+            body["fields"] = fields
+        response = requests.post(
+            stateful_api.url + f"/tables/{table}/query", json=body, timeout=60
+        )
+        assert response.status_code == 200, response.text
+        hit = response.json()["responses"][0]["hits"]["hits"][0]
+        assert not private.intersection(hit["_source"]), hit
+        assert hit["_source"]["nested"]["_type"] == "user", hit
+        assert hit["_computed"] == {"c": 1}, hit
+
+
+def test_select_literal_and_unused_parameter_depth_admission(stateful_api):
+    table = "select_data_depth_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": 1})
+    stateful_api.batch_write(table, inserts={"a": {"n": 1}}, sync_level="full_index")
+    deep = 1
+    for _ in range(300):
+        deep = [deep]
+    url = stateful_api.url + f"/tables/{table}/query"
+    for selected, params in [
+        ({"deep": {"literal": deep}}, {}),
+        (
+            {
+                "deep": {
+                    "case": [{"when": {"literal": False}, "then": {"literal": deep}}],
+                    "else": {"literal": 1},
+                }
+            },
+            {},
+        ),
+        ({"c": {"literal": 1}}, {"unused": deep}),
+    ]:
+        response = requests.post(
+            url,
+            json={"query": {"match_all": {}}, "select": selected, "params": params},
+            timeout=30,
+        )
+        assert response.status_code in (400, 422), response.text
+        healthy = requests.post(url, json={"query": {"match_all": {}}}, timeout=30)
+        assert healthy.status_code == 200, healthy.text

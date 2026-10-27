@@ -41676,10 +41676,14 @@ pub const DB = struct {
         defer arena.deinit();
         var plan = try protocol.decode(arena.allocator(), req.field_projection_json);
         defer plan.deinit();
+        var public_plan = try @import("document_query.zig").PublicPlan.init(arena.allocator(), .{ .fields = req.fields, .include_all_fields = req.include_all_fields });
+        defer public_plan.deinit();
+        const operands = try @import("field_projection_source.zig").OperandPlans.init(arena.allocator(), &plan);
         var schema = self.core.acquireSchemaView();
         defer if (schema) |*view| view.release();
         var start: usize = 0;
         var metadata_rows: usize = 0;
+        var certificate_rows: usize = 0;
         var fallback_rows: usize = 0;
         while (start < result.hits.len) {
             const end = @min(result.hits.len, start + 64);
@@ -41706,13 +41710,13 @@ pub const DB = struct {
                 var row_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
                 defer row_arena.deinit();
                 const a = row_arena.allocator();
-                var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &txn, .physical = keys[i], .id = hit.id, .authority = authorities.rows[i], .req = req };
+                var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &txn, .physical = keys[i], .id = hit.id, .authority = authorities.rows[i], .req = req, .public_plan = &public_plan, .operands = &operands };
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
-                const computed = try plan.evaluate(a, row.source(), previous, protocol.requestLimits(&req));
-                const encoded = try @import("document_query.zig").serializeWithOutput(@import("antfly_platform").allocator.reclaimingScratch(a), alloc, computed);
+                const encoded = try plan.evaluateEncoded(a, alloc, row.source(), previous, protocol.requestLimits(&req));
                 errdefer alloc.free(encoded);
                 const source = try row.base(alloc);
                 if (row.metadata_hits != 0) metadata_rows += 1 else fallback_rows += 1;
+                if (row.certificate_hits != 0) certificate_rows += 1;
                 hit.clearSource(alloc);
                 if (hit.computed_json) |bytes| alloc.free(bytes);
                 hit.computed_json = encoded;
@@ -41722,7 +41726,7 @@ pub const DB = struct {
             }
             start = end;
         }
-        if (benchQueryProfileEnabled()) std.log.info("antfly_bench_projection metadata_rows={d} fallback_rows={d}", .{ metadata_rows, fallback_rows });
+        if (benchQueryProfileEnabled()) std.log.info("antfly_bench_projection metadata_rows={d} fallback_rows={d} certificate_rows={d}", .{ metadata_rows, fallback_rows, certificate_rows });
     }
 
     fn attachDistributedDocumentAuthority(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
@@ -41742,8 +41746,12 @@ pub const DB = struct {
         const native_json = if (schema_view) |view| view.tableSchema().storage_mode != .relational and view.tableSchema().external_base_source == null else true;
         var scalar_plan: ?scalar.Plan = if (native_json and scalar.hydrationEligible(req)) try scalar.decode(scalar_arena.allocator(), req.field_projection_json) else null;
         defer if (scalar_plan) |*plan| plan.deinit();
+        var scalar_public_plan = if (scalar_plan != null) try @import("document_query.zig").PublicPlan.init(scalar_arena.allocator(), .{ .fields = req.fields, .include_all_fields = req.include_all_fields }) else null;
+        defer if (scalar_public_plan) |*plan| plan.deinit();
+        const scalar_operands = if (scalar_plan) |*plan| try @import("field_projection_source.zig").OperandPlans.init(scalar_arena.allocator(), plan) else null;
         var scalar_authorities: @import("../conditional_source.zig").Window = .{};
         var scalar_metadata_rows: usize = 0;
+        var scalar_certificate_rows: usize = 0;
         var scalar_fallback_rows: usize = 0;
         const lookup_opts: types.LookupOptions = .{ .output_exact = req.document_output_exact, .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields };
         var plans = try LookupProjectionPlans.init(alloc, lookup_opts);
@@ -41844,15 +41852,15 @@ pub const DB = struct {
             if (!projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = projection_scratch.reset(.free_all);
             var projected: ?types.LookupResult = if (scalar_plan) |*plan| lazy: {
                 const a = projection_scratch.allocator();
-                var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &read.?, .physical = store_key, .id = hit.id, .req = req, .authority = scalar_authorities.rows[index % 64], .full_bytes = raw_primary };
+                var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &read.?, .physical = store_key, .id = hit.id, .req = req, .authority = scalar_authorities.rows[index % 64], .full_bytes = raw_primary, .public_plan = if (scalar_public_plan) |*public| public else null, .operands = if (scalar_operands) |*operands| operands else null };
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
-                const values = try plan.evaluate(a, row.source(), previous, scalar.requestLimits(&req));
-                const encoded = try @import("document_query.zig").serializeWithOutput(@import("antfly_platform").allocator.reclaimingScratch(a), alloc, values);
+                const encoded = try plan.evaluateEncoded(a, alloc, row.source(), previous, scalar.requestLimits(&req));
                 errdefer alloc.free(encoded);
                 const source = try row.base(body_allocator);
                 if (hit.computed_json) |bytes| alloc.free(bytes);
                 hit.computed_json = encoded;
                 if (row.metadata_hits != 0) scalar_metadata_rows += 1 else scalar_fallback_rows += 1;
+                if (row.certificate_hits != 0) scalar_certificate_rows += 1;
                 break :lazy .{ .json = source };
             } else if (req.document_authority_mode == .hydrate or eager)
                 try self.lookupPrimarySnapshotWithPreparedProjection(projection_scratch.allocator(), body_allocator, hit.id, lookup_opts, &read.?, schema_view, raw_primary, version, &plans)
@@ -41885,7 +41893,7 @@ pub const DB = struct {
             if (scalar_plan != null) hit.finalized_source = .{ .bytes = document_bytes.? };
         }
         result.document_authority_version = 1;
-        if (scalar_plan != null and benchQueryProfileEnabled()) std.log.info("antfly_bench_projection metadata_rows={d} fallback_rows={d}", .{ scalar_metadata_rows, scalar_fallback_rows });
+        if (scalar_plan != null and benchQueryProfileEnabled()) std.log.info("antfly_bench_projection metadata_rows={d} fallback_rows={d} certificate_rows={d}", .{ scalar_metadata_rows, scalar_fallback_rows, scalar_certificate_rows });
     }
 
     fn searchLockedWithExecutionContextRaw(

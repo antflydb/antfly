@@ -228,6 +228,44 @@ fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, p
     return .{ .json = try (Projection{ .object = projected }).serializeWithPolicy(a, output, exact) };
 }
 
+/// Immutable request-owned selector. Public exclusions participate in the same
+/// projection as caller masks, so indexed arrays are never compacted twice.
+pub const PublicPlan = struct {
+    arena: std.heap.ArenaAllocator,
+    opts: types.LookupOptions,
+    span: ?SpanProjectionPlan,
+    pub fn init(backing: Allocator, opts: types.LookupOptions) !PublicPlan {
+        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(backing));
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var fields: std.ArrayList([]const u8) = .empty;
+        try fields.appendSlice(a, opts.fields);
+        if (opts.fields.len == 0 and opts.include_all_fields) try fields.append(a, "*");
+        if (fields.items.len != 0) for (@import("../hierarchy_navigation.zig").public_internal_fields) |name| {
+            try fields.append(a, try std.fmt.allocPrint(a, "-{s}", .{name}));
+        };
+        var normalized = opts;
+        normalized.fields = fields.items;
+        return .{ .arena = arena, .opts = normalized, .span = try SpanProjectionPlan.init(a, normalized) };
+    }
+    pub fn deinit(self: *PublicPlan) void {
+        if (self.span) |*span| span.deinit();
+        self.arena.deinit();
+    }
+    pub fn apply(self: *const PublicPlan, scratch: Allocator, output: Allocator, raw: []const u8) !types.LookupResult {
+        if (self.span) |*span| return lookupJsonWithSourcesPolicy(scratch, output, raw, span, &.{}, self.opts.output_exact);
+        var parsed = try std.json.parseFromSlice(std.json.Value, scratch, raw, .{});
+        defer parsed.deinit();
+        var projected = try projectLookupView(scratch, parsed.value, self.opts);
+        defer deinitProjectionView(scratch, &projected);
+        // Projection views borrow values: remove map entries without freeing them.
+        if (projected == .object) for (@import("../hierarchy_navigation.zig").public_internal_fields) |name| {
+            _ = projected.object.swapRemove(name);
+        };
+        return .{ .json = try serializeWithOutput(scratch, output, projected) };
+    }
+};
+
 pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8, opts: types.LookupOptions) !types.LookupResult {
     if (opts.fields.len == 0 and opts.include_all_fields) return .{ .json = try output.dupe(u8, raw) };
     if (try SpanProjectionPlan.init(alloc, opts)) |value| {
@@ -1086,4 +1124,22 @@ test "public graph metric borrowed wire raw scan fields preserve lexemes and res
         try writeRawScanFields(a, &writer.writer, raw);
         try std.testing.expectEqualStrings(want, writer.written());
     }
+}
+
+test "api query contract public selector strips private roots with one array projection" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            for ([_][]const []const u8{ &.{"*"}, &.{"-padding"}, &.{"arr.1.n"}, &.{"nested.*"} }) |fields| {
+                var plan = try PublicPlan.init(a, .{ .fields = fields, .include_all_fields = false });
+                defer plan.deinit();
+                var result = try plan.apply(a, a, "{\"arr\":[{\"n\":1},{\"n\":2}],\"nested\":{\"_type\":\"user\"},\"padding\":0,\"_resolution_work\":{\"secret\":1},\"_hierarchy_unit_revision_token\":\"private\",\"_artifact_unit_fingerprint\":\"private\"}");
+                defer result.deinit(a);
+                try std.testing.expect(std.mem.indexOf(u8, result.json, "private") == null);
+                try std.testing.expect(std.mem.indexOf(u8, result.json, "secret") == null);
+                if (std.mem.eql(u8, fields[0], "arr.1.n")) try std.testing.expectEqualStrings("{\"arr\":[{\"n\":2}]}", result.json);
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

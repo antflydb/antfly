@@ -21,6 +21,33 @@ const sql = @import("../sql/scalar.zig");
 const ast = @import("../sql/ast.zig");
 const A = std.mem.Allocator;
 const V = std.json.Value;
+/// Leave room for the internal request envelope in std.json's fixed-depth
+/// writer. Data inside literals/parameters is not an expression AST, but must
+/// pass this iterative budget before any recursive copy, hash or stringify.
+pub fn validateInput(a: A, value: V) !void {
+    const Item = struct { value: V, depth: usize };
+    var pending: std.ArrayList(Item) = .empty;
+    defer pending.deinit(a);
+    try pending.append(a, .{ .value = value, .depth = 0 });
+    var scheduled: usize = 1;
+    while (pending.pop()) |item| {
+        switch (item.value) {
+            .array, .object => {
+                if (item.depth >= 240) return error.DecisionLimitExceeded;
+                const count = if (item.value == .array) item.value.array.items.len else item.value.object.count();
+                if (count > 65536 -| scheduled) return error.DecisionLimitExceeded;
+                scheduled += count;
+                if (item.value == .array) {
+                    for (item.value.array.items) |child| try pending.append(a, .{ .value = child, .depth = item.depth + 1 });
+                } else {
+                    var members = item.value.object.iterator();
+                    while (members.next()) |member| try pending.append(a, .{ .value = member.value_ptr.*, .depth = item.depth + 1 });
+                }
+            },
+            else => {},
+        }
+    }
+}
 /// Normalize the stable string field mask and named scalar expressions once.
 /// The encoded plan is internal request ownership, not a new public protocol.
 pub fn encode(a: A, fields: []const []const u8, selected: V, params: V) ![]u8 {
@@ -28,6 +55,8 @@ pub fn encode(a: A, fields: []const []const u8, selected: V, params: V) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const temp = arena.allocator();
+    try validateInput(temp, selected);
+    try validateInput(temp, params);
     var counter: std.Io.Writer.Discarding = .init(&.{});
     try std.json.Stringify.value(params, .{}, &counter.writer);
     if (counter.fullCount() > 1024 * 1024) return error.DecisionLimitExceeded;
@@ -156,6 +185,7 @@ pub const Request = struct { fields: []const V, params: V = .{ .object = .empty 
 pub const Source = struct {
     context: *anyopaque,
     read: *const fn (*anyopaque, A, []const u8, sql.ColumnRead) anyerror!sql.Datum,
+    read_raw: ?*const fn (*anyopaque, A, []const u8) anyerror!?[]const u8 = null,
 };
 const Dependency = union(enum) { field: []const u8, binding: usize };
 const Binding = struct { name: []const u8, expression: V, state: enum { unseen, visiting, ready } = .unseen, program: ?sql.Program = null, dependencies: []const Dependency = &.{}, height: usize = 0 };
@@ -177,6 +207,14 @@ pub const Plan = struct {
         var self: Plan = .{ .arena = arena };
         errdefer self.deinit();
         const a = self.arena.allocator();
+        if (input.fields.len > 4160 or input.params != .object) return error.InvalidQueryRequest;
+        // Validate the complete data tree, including literal/parameter payloads,
+        // before the first recursive serialization below.
+        for (input.fields) |field| try validateInput(a, field);
+        try validateInput(a, input.params);
+        var counter: std.Io.Writer.Discarding = .init(&.{});
+        try std.json.Stringify.value(input, .{}, &counter.writer);
+        if (counter.fullCount() > 16 * 1024 * 1024) return error.DecisionLimitExceeded;
         const owned = try std.json.Stringify.valueAlloc(a, input, .{});
         const request = try std.json.parseFromSliceLeaky(Request, a, owned, .{});
         if (request.fields.len > 4160 or request.params != .object) return error.InvalidQueryRequest;
@@ -329,6 +367,57 @@ pub const Plan = struct {
         try observer.writer.writer.writeByte('}');
         return .{ .bytes = try a.dupe(u8, observer.writer.written()) };
     }
+    /// Native delivery keeps borrowed JSON through pure output expressions;
+    /// aliases materialize once only when a consuming operator requires Datum.
+    pub fn evaluateEncoded(self: *const Plan, a: A, output: A, source: Source, previous: ?V, limits: sql.EvalLimits) ![]u8 {
+        if (previous != null) return std.json.Stringify.valueAlloc(output, try self.evaluate(a, source, previous, limits), .{});
+        if (limits.checkpoint) |poll| try poll(limits.checkpoint_context);
+        const values = try a.alloc(?sql.Datum, self.bindings.len);
+        @memset(values, null);
+        const raw_values = try a.alloc(?[]const u8, self.bindings.len);
+        @memset(raw_values, null);
+        var row: Row = .{ .plan = self, .a = a, .source = source, .values = values, .raw_values = raw_values, .limits = limits };
+        var bytes: usize = 0;
+        for (self.evaluation_order) |i| {
+            var frame: Row.Frame = .{ .row = &row, .index = i };
+            var local = limits;
+            local.column_loader = .{ .context = &frame, .read = Row.Frame.read };
+            local.output_column_loader = .{ .context = &frame, .read = Row.Frame.readRaw };
+            const result = self.bindings[i].program.?.evaluateOutput(a, &.{}, self.parameters.items, local) catch |err| return scalarFailure(err);
+            switch (result) {
+                .raw => |raw| {
+                    raw_values[i] = raw;
+                    bytes +|= raw.len;
+                },
+                .datum => |datum| {
+                    values[i] = datum;
+                    bytes +|= try @import("../sql/operators.zig").datumBytes(datum);
+                },
+            }
+            if (bytes > limits.output_bytes) return error.DecisionLimitExceeded;
+        }
+        var encoded: std.Io.Writer.Allocating = .init(@import("antfly_platform").allocator.reclaimingScratch(a));
+        defer encoded.deinit();
+        try encoded.writer.writeByte('{');
+        for (self.bindings, 0..) |binding, i| {
+            if (i != 0) try encoded.writer.writeByte(',');
+            try std.json.Stringify.value(binding.name, .{}, &encoded.writer);
+            try encoded.writer.writeByte(':');
+            if (raw_values[i]) |raw| try encoded.writer.writeAll(raw) else {
+                const value = binding.program.?.resultJson(a, values[i].?, limits) catch |err| return scalarFailure(err);
+                try std.json.Stringify.value(value, .{}, &encoded.writer);
+            }
+            if (encoded.written().len > limits.output_bytes) return error.DecisionLimitExceeded;
+        }
+        if (self.bindings.len != 0) try encoded.writer.writeByte(',');
+        try std.json.Stringify.value(marker, .{}, &encoded.writer);
+        try encoded.writer.writeByte(':');
+        try std.json.Stringify.value(&self.fingerprint, .{}, &encoded.writer);
+        try encoded.writer.writeByte('}');
+        if (encoded.written().len > limits.output_bytes) return error.DecisionLimitExceeded;
+        return output.dupe(u8, encoded.written());
+    }
+
     pub fn evaluate(self: *const Plan, a: A, source: Source, previous: ?V, limits: sql.EvalLimits) !V {
         if (limits.checkpoint) |poll| try poll(limits.checkpoint_context);
         if (self.hasOutputs(previous)) return previous.?;
@@ -472,17 +561,30 @@ const Row = struct {
     a: A,
     source: Source,
     values: []?sql.Datum,
+    raw_values: ?[]?[]const u8 = null,
     limits: sql.EvalLimits,
     const Frame = struct {
         row: *Row,
         index: usize,
+        fn readRaw(raw: *anyopaque, a: A, ordinal: u32) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return switch (self.row.plan.bindings[self.index].dependencies[ordinal]) {
+                .field => |path| if (self.row.source.read_raw) |read_raw| read_raw(self.row.source.context, a, path) else null,
+                .binding => |index| if (self.row.raw_values) |values| values[index] else null,
+            };
+        }
         fn read(raw: *anyopaque, _: A, ordinal: u32, kind: sql.ColumnRead) !sql.Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const dependency = self.row.plan.bindings[self.index].dependencies[ordinal];
             return switch (dependency) {
                 .field => |path| self.row.source.read(self.row.source.context, self.row.a, path, kind),
                 .binding => |index| blk: {
-                    const value = self.row.values[index] orelse return error.InvalidQueryResponse;
+                    if (self.row.values[index] == null) {
+                        const raws = self.row.raw_values orelse return error.InvalidQueryResponse;
+                        const bytes = raws[index] orelse return error.InvalidQueryResponse;
+                        self.row.values[index] = sql.Datum.json(try @import("antfly-json").parseFromSliceLeaky(V, self.row.a, bytes, .{ .allocate = .alloc_if_needed }));
+                    }
+                    const value = self.row.values[index].?;
                     break :blk switch (kind) {
                         .value => value,
                         .missing => sql.Datum.json(.{ .bool = value.missing }),
@@ -684,4 +786,59 @@ test "api query contract projection wire spans validate receipts and preserve le
     try std.testing.expectError(error.InvalidQueryResponse, plan.wireOutput(a, missing, false));
     try std.testing.expect((try plan.wireOutput(a, "{\"unrelated\":true}", false)) == null);
     try std.testing.expectError(error.DuplicateField, plan.wireOutput(a, "{\"n\":1,\"n\":2}", false));
+}
+
+test "api query contract raw CASE outputs match VM and materialize alias consumers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = try std.json.parseFromSliceLeaky([]const V, a,
+        \\[ {"name":"body","expression":{"case":[{"when":{"literal":true},"then":{"field":"body"}}],"else":{"field":"absent"}}},
+        \\  {"name":"copy","expression":{"ref":"body"}},
+        \\  {"name":"kind","expression":{"call":"jsonb_typeof","args":[{"ref":"copy"}]}},
+        \\  {"name":"null","expression":{"field":"null"}},
+        \\  {"name":"missing","expression":{"field":"absent"}} ]
+    , .{});
+    var plan = try Plan.init(a, .{ .fields = fields });
+    defer plan.deinit();
+    const Mock = struct {
+        json: JsonSource,
+        raw_reads: usize = 0,
+        fn raw(ptr: *anyopaque, _: A, path: []const u8) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, path, "body")) {
+                self.raw_reads += 1;
+                return "{\"arr\":[1,null,\"escaped\\n\"],\"n\":9007199254740993}";
+            }
+            if (std.mem.eql(u8, path, "null")) return "null";
+            return null;
+        }
+        fn read(ptr: *anyopaque, a2: A, path: []const u8, kind: sql.ColumnRead) !sql.Datum {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.json.source().read(&self.json, a2, path, kind);
+        }
+    };
+    var source: Mock = .{ .json = .{ .id = "a", .root = try std.json.parseFromSliceLeaky(V, a, "{\"body\":{\"arr\":[1,null,\"escaped\\n\"],\"n\":9007199254740993},\"null\":null}", .{}) } };
+    const normal = try plan.evaluate(a, .{ .context = &source, .read = Mock.read }, null, .{});
+    const encoded = try plan.evaluateEncoded(a, a, .{ .context = &source, .read = Mock.read, .read_raw = Mock.raw }, null, .{});
+    const expected = try std.json.Stringify.valueAlloc(a, normal, .{});
+    try std.testing.expectEqualStrings(expected, encoded);
+    try std.testing.expectEqual(@as(usize, 1), source.raw_reads);
+    try std.testing.expectError(error.DecisionLimitExceeded, plan.evaluateEncoded(a, a, .{ .context = &source, .read = Mock.read, .read_raw = Mock.raw }, null, .{ .output_bytes = 8 }));
+}
+
+test "api query contract literal and parameter depth bounded before stringify" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var value: V = .null;
+    for (0..300) |_| {
+        var items: std.array_list.Managed(V) = .init(a);
+        try items.append(value);
+        value = .{ .array = items };
+    }
+    try std.testing.expectError(error.DecisionLimitExceeded, validateInput(a, value));
+    var params: std.json.ObjectMap = .empty;
+    try params.put(a, "unused", value);
+    try std.testing.expectError(error.DecisionLimitExceeded, Plan.init(a, .{ .fields = &.{}, .params = .{ .object = params } }));
 }

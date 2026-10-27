@@ -214,7 +214,15 @@ pub const ColumnLoader = struct {
     context: *anyopaque,
     read: *const fn (*anyopaque, Allocator, u32, ColumnRead) anyerror!Datum,
 };
+/// Validated borrowed JSON may cross a pure JSON column/CASE output without
+/// building a DOM. Ordinary operators continue to consume typed Datum values.
+pub const Output = union(enum) { datum: Datum, raw: []const u8 };
+pub const OutputColumnLoader = struct {
+    context: *anyopaque,
+    read: *const fn (*anyopaque, Allocator, u32) anyerror!?[]const u8,
+};
 pub const EvalLimits = struct {
+    output_column_loader: ?OutputColumnLoader = null,
     /// Optional pinned source access. The VM requests only executed branches;
     /// identity/existence reads can use authenticated metadata without payloads.
     column_loader: ?ColumnLoader = null,
@@ -482,6 +490,13 @@ pub const Program = struct {
         var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
         const result = try context.runDatum(self.root, 0);
         _ = try context.validateJson(result.value, 0);
+        return result;
+    }
+
+    pub fn evaluateOutput(self: *const Program, alloc: Allocator, cells: []const Datum, parameters: []const Json, limits: EvalLimits) !Output {
+        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
+        const result = try context.runOutput(self.root, 0);
+        if (result == .datum) _ = try context.validateJson(result.datum.value, 0);
         return result;
     }
 
@@ -3199,6 +3214,55 @@ const Evaluator = struct {
         return result.value;
     }
 
+    fn selectedCase(self: *Evaluator, case: anytype, depth: usize) !?u32 {
+        for (case.branches) |branch| {
+            const condition = try self.runDatum(branch.condition, depth + 1);
+            if (!condition.sql_null) {
+                if (condition.value != .bool) return error.SqlTypeMismatch;
+                if (condition.value.bool) return branch.value;
+            }
+        }
+        return case.otherwise;
+    }
+
+    fn runOutput(self: *Evaluator, index: u32, depth: usize) anyerror!Output {
+        const instruction = self.program.instructions[index];
+        // Typed coercions and modifiers must always use the regular VM.
+        if (instruction.type.kind == .json) switch (instruction.operation) {
+            .column => |ordinal| if (self.limits.output_column_loader) |loader| {
+                if (depth >= self.limits.depth) return self.workOwner().limit();
+                if (try loader.read(loader.context, self.alloc, ordinal)) |raw| {
+                    try self.workOwner().charge(1);
+                    if (raw.len > self.limits.output_bytes) return self.workOwner().limit();
+                    // Scanner validates syntax, UTF-8 and nesting without allocating
+                    // payload strings. Charge tokens and poll cancellation in chunks.
+                    var scanner = std.json.Scanner.initCompleteInput(self.alloc, raw);
+                    defer scanner.deinit();
+                    var nesting: usize = 0;
+                    while (true) {
+                        const token = try scanner.next();
+                        if (token == .end_of_document) break;
+                        try self.workOwner().charge(1);
+                        if (token == .array_end or token == .object_end) {
+                            nesting -= 1;
+                            continue;
+                        }
+                        if (nesting >= self.limits.depth) return self.workOwner().limit();
+                        if (token == .array_begin or token == .object_begin) nesting += 1;
+                    }
+                    return .{ .raw = raw };
+                }
+            },
+            .case_when => |case| {
+                if (depth >= self.limits.depth) return self.workOwner().limit();
+                try self.workOwner().charge(1);
+                return if (try self.selectedCase(case, depth)) |selected| self.runOutput(selected, depth + 1) else .{ .datum = .{} };
+            },
+            else => {},
+        };
+        return .{ .datum = try self.runDatum(index, depth) };
+    }
+
     fn runDatum(self: *Evaluator, index: u32, depth: usize) anyerror!Datum {
         if (depth >= self.limits.depth) return self.workOwner().limit();
         try self.workOwner().charge(1);
@@ -3345,14 +3409,7 @@ const Evaluator = struct {
                 break :blk Datum.json(comparison(binary.op, try self.compareValues(left, right)));
             } else Datum.fromJson(try self.runLegacy(index, depth)),
             .case_when => |case| blk: {
-                for (case.branches) |branch| {
-                    const condition = try self.runDatum(branch.condition, depth + 1);
-                    if (!condition.sql_null) {
-                        if (condition.value != .bool) return error.SqlTypeMismatch;
-                        if (condition.value.bool) break :blk try self.runDatum(branch.value, depth + 1);
-                    }
-                }
-                break :blk if (case.otherwise) |other| try self.runDatum(other, depth + 1) else .{};
+                break :blk if (try self.selectedCase(case, depth)) |selected| try self.runDatum(selected, depth + 1) else .{};
             },
             .in_list => |list| blk: {
                 const operand = try self.runDatum(list.operand, depth + 1);

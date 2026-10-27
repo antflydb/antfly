@@ -216,7 +216,7 @@ fn encodeTree(a: A, source: []const u8, kind: u8, digest: [32]u8, tree: *Tree, o
     var pos: usize = header_size;
     for (order[0..count]) |i| {
         const field = tree.nodes.items[i].field;
-        if (observer) |sink| if (field.kind == .leaf)
+        if (observer) |sink| if (field.kind != .object)
             try sink.visit(sink.ctx, mapped[i], source[@intCast(field.offset)..][0..@intCast(field.length)]);
         const parent = if (field.parent == no_parent) no_parent else mapped[field.parent];
         const descriptor = field.offset | (@as(u64, parent) << 53) | (@as(u64, @backingInt(field.kind)) << 62);
@@ -335,6 +335,19 @@ pub const Directory = struct {
     }
     /// Logical dot paths descend through proven objects. Arrays, legacy roots,
     /// and bounded opaque objects retain their entire subtree and boundaries.
+    /// Unlike resolve (which returns an opaque ancestor), this proves the
+    /// exact selected path. Required before metadata can certify existence.
+    pub fn resolveExact(self: Directory, path: []const u8) ?Field {
+        var parts = std.mem.splitScalar(u8, path, '.');
+        var parent: ?Field = null;
+        while (parts.next()) |name| {
+            const field = (if (parent) |p| self.within(p.first_child, p.child_count, name) else self.find(name)) orelse return null;
+            if (parts.peek() == null) return field;
+            if (field.kind != .object) return null;
+            parent = field;
+        }
+        return null;
+    }
     pub fn resolve(self: Directory, path: []const u8) ?Field {
         var remaining = path;
         var parent: ?Field = null;

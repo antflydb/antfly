@@ -106,7 +106,8 @@ pub const Window = struct {
                 out.rows[i].repair = true;
                 continue;
             };
-            out.rows[i].certificate = .{ .records = try scratch.dupe(u8, certificate.records) };
+            out.rows[i].repair = out.rows[i].repair or certificate.needsCoverageRepair(directory);
+            out.rows[i].certificate = .{ .records = try scratch.dupe(u8, certificate.records), .opaque_coverage = certificate.opaque_coverage };
         }
         return out;
     }

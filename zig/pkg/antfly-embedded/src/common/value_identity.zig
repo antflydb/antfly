@@ -63,6 +63,27 @@ pub fn validatedScalarDigest(a: std.mem.Allocator, raw: []const u8) !?[32]u8 {
         hash.final(&digest);
         return digest;
     }
+    // Composite certificates are optional. Bound canonicalization before DOM
+    // allocation and std.json's fixed-depth writer; quoted brackets are data.
+    var depth: usize = 0;
+    var quoted = false;
+    var escaped = false;
+    for (value) |byte| {
+        if (quoted) {
+            if (escaped) escaped = false else if (byte == '\\') escaped = true else if (byte == '"') quoted = false;
+        } else switch (byte) {
+            '"' => quoted = true,
+            '[', '{' => {
+                depth += 1;
+                if (depth > 128) return null;
+            },
+            ']', '}' => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
     var parsed = std.json.parseFromSlice(V, a, value, .{}) catch |err| {
         if (err == error.OutOfMemory) return err;
         return null;

@@ -608,7 +608,7 @@ Native output-only queries evaluate after retrieval under the publication lease.
 Each 64-row window pins a read transaction, batches authenticated content and
 identity metadata, and releases per-row scratch and read scopes. Identity and
 existence use exact current metadata when available; selected fields load through
-the ordinary verified logical range reader. Opaque, small, stale and unsupported
+the ordinary verified logical range reader. Uncertified, small, stale and unsupported
 layouts fall back safely. Source-dependent stages retain complete afterimages
 and project at final output; column providers use lazy selected-column access.
 Distributed retrieval selects the global page before scalar evaluation. Large
@@ -636,7 +636,7 @@ hashing and omission. Eligible native JSON retrieval instead uses bounded,
 storage-owned canonical-value certificates published atomically with the primary
 value, content proof, projection directory and mutation revision. Certificates
 bind the original content length/digest, exact directory digest, value kind and
-semantic canonicalizer ABI. They certify disjoint scalar leaves; raw directory
+semantic canonicalizer ABI. They certify disjoint terminal ranges (scalar leaves, arrays and opaque objects); expanded object parents are excluded to avoid overlapping work. Raw directory
 hashes are never value identities. The existing directory format and coverage
 budget are unchanged. Rows below the existing 16 KiB projection threshold
 receive no certificate. Each optional certificate is bounded below 18 KiB.
@@ -646,7 +646,7 @@ tests, compiler identity, and lookup implementation. Fixed canonicalization and
 ABI golden vectors gate toolchain changes; a semantic change requires an ABI
 revision. Unknown ABIs fall back safely. Editing certificate plumbing does not
 invalidate an existing table's proofs. Atomic writes and bounded repair collect
-canonical leaf identities during the successful directory encoding walk, rather
+canonical terminal identities during the successful directory encoding walk, rather
 than reparsing the finished directory. Already validated, unescaped UTF-8 JSON
 strings and booleans/null use borrowed canonical bytes; escaped strings and
 numbers retain typed canonicalization. Both routes must produce identical sv1
@@ -664,11 +664,11 @@ metadata updates, full-source masks, row counts, output size, CPU and peak memor
 Earlier source-delivery benchmark reports used the removed experimental protocol;
 they are historical measurements, not measurements of the select interface.
 
-Primary rewrites may reuse canonical leaf certificates from the same writer
+Primary rewrites may reuse canonical terminal certificates from the same writer
 snapshot. The previous content proof must match the current mutation revision;
 its directory and certificate must pass length, kind, digest and canonical ABI
-checks. Layouts without a qualified scalar leaf of at least 4 KiB retain the
-fused reference writer. Reuse requires matching decoded ancestry/name, leaf kind, raw length and
+checks. Layouts without a qualified terminal of at least 4 KiB retain the
+fused reference writer. Reuse requires matching decoded ancestry/name, terminal kind, raw length and
 raw SHA-256 digest. Packed indices and offsets are never sufficient. Added,
 reordered, renamed or moved siblings cannot misassociate records. Repeated writes
 in one transaction use its latest publication. Missing/stale/incompatible proofs
@@ -694,12 +694,12 @@ the same writer transaction and retained snapshots. Failed commits, leader
 changes, export/import and crash recovery must preserve those ownership facts. The current format remains full primary JSON;
 certificate reuse alone makes no claim about avoiding its disk writes.
 
-A current certificate permits unchanged leaves to be omitted without loading or
+A current certificate permits unchanged terminals to be omitted without loading or
 hashing those payloads. Current permissions, revision, query membership and
 publication fences still apply. Missing, stale, unsupported or ABI-incompatible
 certificates use the full-value reference path. Existing bounded authority
 backfill repairs eligible legacy rows without changing their logical revisions.
-Opaque/subtree values and source-dependent operators retain reference execution.
+Uncertified opaque values and source-dependent operators retain reference execution.
 Other selected metadata may still require storage-frame reads or a full-layout
 fallback: certificate reuse is not a guarantee of zero physical disk I/O.
 
@@ -885,3 +885,43 @@ and OpenAPI/specification/license-boundary checks. Native tests cover small/larg
 array rows in one and two shards, nested underscore keys, rejected oversized alias
 depth, and a legal 64-alias chain. Fixtures establish behavior, not live-provider
 quality or an independent Linux hardware result.
+
+
+### Bounded scalar delivery and opaque identity coverage
+
+Admission walks every literal and parameter value iteratively before recursive
+copying, hashing or encoding. The budget includes unused parameters and untaken
+CASE branches; invalid requests fail without entering the fixed-depth JSON
+writer. Limits apply to raw data independently of expression/alias depth.
+
+Native scalar delivery prepares source masks and operand selectors once per
+owner request, alongside its immutable SQL programs. Row-local views borrow
+only bytes loaded under that row's pinned revision and authorization. Direct
+JSON columns and the selected CASE branch can forward validated raw spans to
+`_computed`; CASE conditions and operations still use the shared SQL VM. Alias
+outputs keep those spans until a consumer needs a typed value, then materialize
+once. Numeric coercions, array fanout and unsupported paths use the typed
+reference path. Both paths enforce cancellation, nesting, work and output
+budgets. This is request-local reuse; no global cache retains user parameters,
+source bytes, snapshots or permissions across requests.
+
+The final public source selector applies caller masks and reserved root-field
+exclusions together, before native finalization. It is shared across hydrated
+rows. Arrays are projected once, and nested user keys such as `metadata._type`
+remain visible. Unsupported selector shapes keep the strict DOM fallback.
+
+Opaque terminal certificates use coverage epoch SVI2 with the existing bounded
+sidecar layout, without changing the document format or canonical ABI. New
+readers accept SVI1 and SVI2; older readers safely fall back for an unknown
+sidecar epoch. SVI1 directories containing opaque terminals request bounded
+repair. SVI2 records that coverage was attempted, so unsupported deep terminals
+do not trigger repeated repair. Captured object parents are not
+hashed again. Exact path resolution is mandatory: an array or opaque object's
+certificate cannot prove a descendant's existence or identity. Missing records
+in older sidecars retain the reference read and bounded repair. Composite
+canonicalization declines optional certificates beyond 128 levels before DOM
+allocation; ordinary document ingestion does not require a certificate. Reuse
+still checks revision, content proof, directory binding, ancestry, kind, length
+and raw digest. It avoids canonicalizing an unchanged large array/object during
+metadata updates, while continuing to validate and rewrite the incoming primary
+row. No zero-cost or universal throughput guarantee follows from this change.

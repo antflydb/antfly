@@ -23,6 +23,23 @@ const conditional = @import("../conditional_source.zig");
 const query = @import("document_query.zig");
 const A = std.mem.Allocator;
 const V = std.json.Value;
+pub const OperandPlans = struct {
+    const View = @import("query/json_view.zig").View;
+    const Selector = @import("query/json_projection_plan.zig");
+    const Operand = struct { parts: []const []const u8, selector: *const Selector.Selector };
+    paths: std.StringHashMapUnmanaged(Operand) = .empty,
+    pub fn init(a: A, plan: *const projection.Plan) !OperandPlans {
+        var self: OperandPlans = .{};
+        var fields = plan.required_fields.keyIterator();
+        while (fields.next()) |path| {
+            var parts: std.ArrayList([]const u8) = .empty;
+            var tokens = std.mem.splitScalar(u8, path.*, '.');
+            while (tokens.next()) |part| try parts.append(a, part);
+            try self.paths.put(a, path.*, .{ .parts = parts.items, .selector = try Selector.compile(a, &.{.{ .parts = parts.items }}) });
+        }
+        return self;
+    }
+};
 pub const Row = struct {
     a: A,
     txn: ?*@import("../docstore.zig").DocStore.Txn,
@@ -30,14 +47,18 @@ pub const Row = struct {
     id: []const u8,
     authority: conditional.Authority,
     req: @import("types.zig").SearchRequest,
+    public_plan: ?*const query.PublicPlan = null,
+    operands: ?*const OperandPlans = null,
+    raw_sources: std.StringHashMapUnmanaged([]const u8) = .empty,
     values: std.StringHashMapUnmanaged(V) = .empty,
     identities: std.StringHashMapUnmanaged(sql.Datum) = .empty,
     metadata_hits: usize = 0,
+    certificate_hits: usize = 0,
     value_reads: usize = 0,
     full_bytes: ?[]const u8 = null,
     full_root: ?V = null,
     pub fn source(self: *Row) projection.Source {
-        return .{ .context = self, .read = read };
+        return .{ .context = self, .read = read, .read_raw = readRaw };
     }
     fn load(self: *Row, roots: []const []const u8) ![]const u8 {
         try @import("query/search_exec.zig").checkSearchRequestDeadline(self.req);
@@ -55,6 +76,29 @@ pub const Row = struct {
         if (!rows[0].projected) self.full_bytes = bytes;
         return bytes;
     }
+    fn readRaw(raw: *anyopaque, _: A, path: []const u8) !?[]const u8 {
+        const self: *Row = @ptrCast(@alignCast(raw));
+        try @import("query/search_exec.zig").checkSearchRequestDeadline(self.req);
+        const operands = self.operands orelse return null;
+        const operand = operands.paths.get(path) orelse return null;
+        if (std.mem.eql(u8, path, "_id")) return null;
+        const bytes = self.raw_sources.get(path) orelse loaded: {
+            const bytes = try self.load(&.{path});
+            try self.raw_sources.put(self.a, path, bytes);
+            break :loaded bytes;
+        };
+        var view = OperandPlans.View.init(self.a, bytes);
+        try view.prepareProjectionWithOptions(operand.selector, .all, .object_only, .{ .defer_fanout = true });
+        var node = &view.root;
+        for (operand.parts) |part| {
+            node = switch (node.kind()) {
+                '{' => (try view.field(node, part)) orelse return null,
+                '[' => if (OperandPlans.Selector.index(part)) |index| (try view.element(node, index)) orelse return null else return null,
+                else => return null,
+            };
+        }
+        return node.raw;
+    }
     fn read(raw: *anyopaque, a: A, path: []const u8, kind: sql.ColumnRead) anyerror!sql.Datum {
         const self: *Row = @ptrCast(@alignCast(raw));
         try @import("query/search_exec.zig").checkSearchRequestDeadline(self.req);
@@ -64,27 +108,28 @@ pub const Row = struct {
         }
         if (kind == .identity) if (self.identities.get(path)) |identity| return identity;
         if (kind != .value) if (self.authority.source.directory) |directory| {
-            if (directory.resolve(path)) |field| {
+            if (directory.resolveExact(path)) |field| {
                 // Opaque subtrees do not prove that a descendant exists.
-                if (field.kind != .subtree) {
+                {
                     if (kind == .missing) {
                         self.metadata_hits += 1;
                         return sql.Datum.json(.{ .bool = false });
                     }
-                    if (field.kind == .leaf) if (self.authority.certificate) |certificate| if (certificate.find(field.index)) |digest| {
+                    if (field.kind != .object) if (self.authority.certificate) |certificate| if (certificate.find(field.index)) |digest| {
                         const value = sql.Datum.json(.{ .string = try std.fmt.allocPrint(a, "sv1-{s}", .{std.fmt.bytesToHex(digest, .lower)}) });
                         try self.identities.put(self.a, path, value);
                         self.metadata_hits += 1;
+                        self.certificate_hits += 1;
                         return value;
                     };
                 }
-            } else if (directory.version == 2) {
+            } else if (directory.version == 2 and directory.resolve(path) == null) {
                 self.metadata_hits += 1;
                 return if (kind == .missing) sql.Datum.json(.{ .bool = true }) else .{};
             }
         };
         const root = self.full_root orelse self.values.get(path) orelse loaded: {
-            const bytes = try self.load(&.{path});
+            const bytes = self.raw_sources.get(path) orelse try self.load(&.{path});
             // The authenticated range loader preserves opaque array positions.
             // Parse that immutable row view directly: re-masking compacts array
             // indexes, and copying/encoding it adds work proportional to payload.
@@ -98,7 +143,10 @@ pub const Row = struct {
     pub fn base(self: *Row, output: A) ![]u8 {
         if (!self.req.include_all_fields and self.req.fields.len == 0) return output.dupe(u8, "{}");
         const bytes = try self.load(if (self.req.include_all_fields) &.{} else self.req.fields);
-        return (try query.lookupJsonWithOutput(self.a, output, bytes, .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields })).json;
+        if (self.public_plan) |plan| return (try plan.apply(self.a, output, bytes)).json;
+        var plan = try query.PublicPlan.init(self.a, .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields });
+        defer plan.deinit();
+        return (try plan.apply(self.a, output, bytes)).json;
     }
 };
 
@@ -152,4 +200,23 @@ test "api query contract native scalar base preserves indexed array selection" {
         var row: Row = .{ .a = a, .txn = null, .physical = "a", .id = "a", .req = .{ .fields = &.{"arr.1.n"}, .include_all_fields = false }, .authority = .{}, .full_bytes = bytes };
         try std.testing.expectEqualStrings("{\"arr\":[{\"n\":2}]}", try row.base(a));
     }
+}
+
+test "api query contract opaque identity proves exact path without certifying descendants" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const directory = @import("../document_projection.zig");
+    const fields = [_]directory.Field{.{ .name = "items", .kind = .subtree, .offset = 0, .length = 0, .digest = @splat(0), .index = 0 }};
+    const digest = try @import("../../common/value_identity.zig").digestValue(.null);
+    var record: [34]u8 = undefined;
+    std.mem.writeInt(u16, record[0..2], 0, .little);
+    record[2..].* = digest;
+    var row: Row = .{ .a = a, .txn = null, .physical = "a", .id = "a", .req = .{}, .authority = .{
+        .source = .{ .directory = .{ .fields = &fields, .root_count = 1, .version = 2 } },
+        .certificate = .{ .records = &record },
+    } };
+    _ = try row.source().read(&row, a, "items", .identity);
+    try std.testing.expectEqual(@as(usize, 0), row.value_reads);
+    try std.testing.expectError(error.DocumentNotFound, row.source().read(&row, a, "items.child", .missing));
 }

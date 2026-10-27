@@ -321,7 +321,8 @@ pub const BackfillPage = struct {
                         if (err == error.NotFound) break :blk true;
                         return err;
                     };
-                    break :blk value_identity.Certificate.open(certificate, encoded, proof) == null;
+                    const qualified = value_identity.Certificate.open(certificate, encoded, proof) orelse break :blk true;
+                    break :blk qualified.needsCoverageRepair(paths);
                 } else false;
                 if (cached == null or needs_projection) {
                     // Independently scoped primary bytes die after this row;

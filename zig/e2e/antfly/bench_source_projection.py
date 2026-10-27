@@ -381,12 +381,15 @@ def main():
                             logs,
                         )
                     ]
+                    identity_rows = sum(
+                        int(n) for n in re.findall(r"certificate_rows=(\d+)", logs)
+                    )
                     if (
                         variant == "candidate"
                         and args.mask == "exact"
-                        and args.workload in ("ascii", "escaped", "unicode", "numeric")
-                        and sum(a for a, _ in counts)
-                        < 2 * args.documents * args.queries_per_phase
+                        and args.workload
+                        in ("ascii", "escaped", "unicode", "numeric", "opaque")
+                        and identity_rows < 2 * args.documents * args.queries_per_phase
                     ):
                         failure = args.output.with_suffix(".server-failure.log")
                         failure.parent.mkdir(parents=True, exist_ok=True)
@@ -397,7 +400,7 @@ def main():
                     if (
                         variant == "candidate"
                         and args.mask == "exact"
-                        and args.workload in ("small", "opaque")
+                        and args.workload == "small"
                     ):
                         assert sum(a for a, _ in counts) == 0, counts
                         assert (
@@ -408,7 +411,10 @@ def main():
                         {
                             "variant": variant,
                             "round": round_id,
-                            "certificate_hits": sum(a for a, _ in counts),
+                            "certificate_hits": identity_rows,
+                            "certificate_counter_available": "certificate_rows="
+                            in logs,
+                            "metadata_rows": sum(a for a, _ in counts),
                             "full_fallbacks": sum(b for _, b in counts),
                         }
                     )
@@ -455,7 +461,7 @@ def main():
                 }
             )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "workload": args.workload,
         "mask": args.mask,
         "scope": "Native single-shard JSON tables, synthetic varied source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
