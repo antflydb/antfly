@@ -3504,6 +3504,34 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-population-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-population-recovery-test",
+        "antfly-metadata-restore-staging-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-population-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_population_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_population_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -9229,18 +9257,54 @@
     },
     {
       "id": "sql-0364",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original executes through mounted SQL HTTP, metadata Raft admission, native typed-row population and atomic catalog publication for relational and document inputs. Independent PostgreSQL qualifies full destination rows, nullable text columns and completion tags; WITH NO DATA and conditional repeats perform no source reads.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0365",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original executes through mounted SQL HTTP, metadata Raft admission, native typed-row population and atomic catalog publication for relational and document inputs. Independent PostgreSQL qualifies full destination rows, nullable text columns and completion tags; WITH NO DATA and conditional repeats perform no source reads.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0366",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original executes through mounted SQL HTTP, metadata Raft admission, native typed-row population and atomic catalog publication for relational and document inputs. Independent PostgreSQL qualifies full destination rows, nullable text columns and completion tags; WITH NO DATA and conditional repeats perform no source reads.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0367",
@@ -12256,8 +12320,20 @@
     },
     {
       "id": "sql-0567",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original executes through mounted SQL HTTP, metadata Raft admission, native typed-row population and atomic catalog publication for relational and document inputs. Independent PostgreSQL qualifies full destination rows, nullable text columns and completion tags; WITH NO DATA and conditional repeats perform no source reads.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0568",

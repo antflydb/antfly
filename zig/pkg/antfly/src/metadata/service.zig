@@ -4124,7 +4124,11 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
 pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const u8, context: api_operation.RequestContext) !void {
     try context.ensureActive();
     if (@import("schema_reader_wire.zig").requiresPopulation(bytes))
-        try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_population_version);
+        try ensureQueryPopulationCapabilityWithContext(service, context);
+}
+
+pub fn ensureQueryPopulationCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_population_version);
 }
 
 /// Capability observation alone does not install the apply-side barrier. Own

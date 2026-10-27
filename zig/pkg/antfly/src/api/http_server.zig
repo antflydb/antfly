@@ -17727,7 +17727,7 @@ pub const ApiHttpServer = struct {
         return self.requireGenerationAuthority(principal, names, true);
     }
 
-    fn requireGenerationAuthority(self: *ApiHttpServer, principal: []const u8, names: []const []const u8, whole_table: bool) !void {
+    pub fn requireGenerationAuthority(self: *ApiHttpServer, principal: []const u8, names: []const []const u8, whole_table: bool) !void {
         if (std.mem.eql(u8, principal, stored_destination_authorization.auth_disabled_principal)) {
             if (!self.cfg.auth_enabled) return;
             return error.StoredDestinationAuthorizationRevoked;
@@ -19432,8 +19432,11 @@ pub const ApiHttpServer = struct {
         const is_rewrite = for (job.value.plan.targets) |target| {
             if (target.rewrite != null) break true;
         } else false;
+        const is_population = for (job.value.plan.targets) |target| {
+            if (target.population != null) break true;
+        } else false;
         var rewrite_diagnostic: ?restore_jobs.RewriteProgress = null;
-        errdefer if (zig017_return_error) |err| if (permanentStagingFailure(err) and job.value.state != .published) {
+        errdefer if (zig017_return_error) |err| if ((permanentStagingFailure(err) or (is_population and err == error.CatalogGenerationChanged)) and job.value.state != .published) {
             if (restore_staging_diagnostic_gate.admit(platform_time.monotonicNs()))
                 std.log.warn("restore staging permanent rejection phase={s} rewrite_phase={s} owner={d} class={s}", .{ @tagName(job.value.state), if (rewrite_diagnostic) |progress| @tagName(progress.phase) else "none", if (rewrite_diagnostic) |progress| progress.owner else 0, @errorName(err) });
             if (self.restore_job_store.recordStagingFailure(self.alloc, restore.job_id, restore.attempt_id, @errorName(err))) |recorded| {
@@ -19462,6 +19465,21 @@ pub const ApiHttpServer = struct {
             if (target.rewrite) |rewrite| if (rewrite.column_transforms.len != 0) break true;
         } else false;
         if (!failed and !worker_state.value.cancel_requested and job.value.state != .published and job.value.state != .canceled) {
+            if (worker_state.value.source_kind == .query_population and self.cfg.auth_enabled) {
+                const manager = self.cfg.user_manager orelse return error.StoredDestinationAuthorizationRevoked;
+                for (job.value.plan.targets) |target| {
+                    const capture = target.population orelse return error.RestoreStagingScopeChanged;
+                    const current = manager.currentUserInstance(capture.principal_name) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        zig017_return_error = error.StoredDestinationAuthorizationRevoked;
+                        return error.StoredDestinationAuthorizationRevoked;
+                    };
+                    if (!std.mem.eql(u8, &current, &capture.principal_instance)) {
+                        zig017_return_error = error.StoredDestinationAuthorizationRevoked;
+                        return error.StoredDestinationAuthorizationRevoked;
+                    }
+                }
+            }
             if (worker_state.value.source_kind == .empty_generation or worker_state.value.source_kind == .query_population) {
                 (self.requireEmptyGenerationAuthority(worker_state.value.destination_authorization_principal, worker_state.value.table_names orelse return zig017_failure: {
                     zig017_return_error = error.CorruptRestoreJobStore;
@@ -20212,6 +20230,10 @@ pub const ApiHttpServer = struct {
                             zig017_return_error = zig017_err;
                             return zig017_err;
                         });
+                        if (is_population and !has_old and !has_admissions and job.value.state == .validating) {
+                            zig017_return_error = error.CatalogGenerationChanged;
+                            return error.CatalogGenerationChanged;
+                        }
                     },
                     .cutover => {
                         const has_admissions = outer: for (job.value.plan.targets) |target| {
@@ -20273,8 +20295,8 @@ pub const ApiHttpServer = struct {
                             return zig017_err;
                         });
                         defer self.alloc.free(statuses);
-                        for (table_names, statuses) |name, *status| {
-                            const present = for (job.value.plan.targets) |target| {
+                        for (table_names, statuses, 0..) |name, *status, index| {
+                            const present = if (worker_state.value.source_kind == .query_population) index < job.value.plan.targets.len else for (job.value.plan.targets) |target| {
                                 if (std.mem.eql(u8, target.table.name, name)) break true;
                             } else false;
                             status.* = .{ .name = name, .status = if (present) "committed" else "skipped", .@"error" = null };
@@ -60448,4 +60470,8 @@ test "httpx inference gateway document authority recovery does not block existin
 test "staged restore worker query population publishes sealed SQL output and retires abandoned evaluations" {
     const fixture = @import("restore_worker_fixture.zig");
     for ([_]fixture.PopulationScenario{ .populated, .no_data, .abandoned }) |scenario| try fixture.runPopulation(RestoreWorkerTestDriver, scenario);
+}
+
+test "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages" {
+    for ([_]bool{ false, true }) |document| for ([_][]const u8{ "sql-0364", "sql-0365", "sql-0366", "sql-0567" }) |id| try @import("restore_worker_fixture.zig").runPopulationPublic(RestoreWorkerTestDriver, id, document);
 }

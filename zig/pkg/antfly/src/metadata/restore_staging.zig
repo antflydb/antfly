@@ -200,12 +200,14 @@ pub const Target = struct {
         return (std.mem.eql(u8, name, "sequence_handoffs") and self.sequence_handoffs.len == 0) or
             (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
             (std.mem.eql(u8, name, "population") and self.population == null) or
+            (std.mem.eql(u8, name, "creation_guard") and self.creation_guard == null) or
             (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null) or
             (std.mem.eql(u8, name, "source_table_name") and self.source_table_name.len == 0) or
             (std.mem.eql(u8, name, "target_schema_digest") and self.target_schema_digest == null) or
             (std.mem.eql(u8, name, "generation_handoffs") and self.generation_handoffs.len == 0) or
             (std.mem.eql(u8, name, "source_generation_admissions") and self.source_generation_admissions.len == 0);
     }
+    creation_guard: ?@import("relation_create.zig").Guard = null,
     source_table_id: u64,
     source_table_name: []const u8 = "",
     target_schema_digest: ?Digest = null,

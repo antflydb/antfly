@@ -939,7 +939,7 @@ fn createConflict(server: *server_mod.ApiHttpServer, context: operation.RequestC
 }
 
 pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: catalog.Ddl, path: ?*const SearchPath) !catalog.DdlOutcome {
-    if (input == .populate) return error.UnsupportedSqlExecution;
+    if (input == .populate) return @import("sql_population.zig").execute(server, identity, context, database, namespace, allocators, input.populate, path);
     const alloc = allocators.result;
     try context.ensureActive();
     if (input == .policy_ddl) return @import("sql_policy_ddl.zig").execute(server, identity, context, database, namespace, alloc, input.policy_ddl);

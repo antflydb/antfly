@@ -36,7 +36,7 @@ pub const Binding = struct {
     partition: u64,
 
     pub fn validate(self: Binding) !void {
-        if (self.catalog_revision == 0 or self.write_version == 0 or self.partition == 0 or zero(&self.capture_id) or zero(&self.definition) or zero(&self.source_definition) or zero(&self.target_schema) or zero(&self.principal_instance)) return error.InvalidRelationPopulation;
+        if (self.write_version == 0 or self.partition == 0 or zero(&self.capture_id) or zero(&self.definition) or zero(&self.source_definition) or zero(&self.target_schema) or zero(&self.principal_instance)) return error.InvalidRelationPopulation;
     }
     pub fn digest(self: Binding) !Digest {
         try self.validate();
@@ -61,6 +61,7 @@ pub const Binding = struct {
 /// A metadata plan retains the common request identity. Each destination
 /// receives a distinct partition binding derived from this immutable capture.
 pub const Capture = struct {
+    principal_name: []const u8 = "",
     capture_id: [16]u8,
     definition: Digest,
     source_definition: Digest,
@@ -76,7 +77,7 @@ pub const Capture = struct {
         return .{ .capture_id = self.capture_id, .definition = self.definition, .source_definition = self.source_definition, .target_schema = self.target_schema, .principal_instance = self.principal_instance, .catalog_revision = self.catalog_revision, .write_version = self.write_version, .partition = partition };
     }
     pub fn validate(self: Capture) !void {
-        if (self.expires_at_ms == 0 or self.expires_at_ms > std.math.maxInt(i64)) return error.InvalidRelationPopulation;
+        if (self.principal_name.len > 256 or self.expires_at_ms == 0 or self.expires_at_ms > std.math.maxInt(i64)) return error.InvalidRelationPopulation;
         try self.forPartition(1).validate();
     }
 };

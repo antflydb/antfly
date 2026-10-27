@@ -31,7 +31,7 @@ pub const Destination = struct {
     scope: staging.Scope,
     range: local.storage_byte_range.ByteRange = .{ .start = "", .end = "" },
 };
-pub const Stats = struct { source_rows: u64 = 0, page_requests: u64 = 0, buffer_peak_bytes: usize = 0 };
+pub const Stats = struct { source_rows: u64 = 0, page_requests: u64 = 0, buffer_peak_bytes: usize = 0, seals_started: bool = false };
 pub const Options = struct { buffer_bytes: usize = 8 * 1024 * 1024, stats: ?*Stats = null };
 
 pub fn deliver(a: std.mem.Allocator, destination: Destination, source: catalog.PopulationSource, context: operation.RequestContext) !contract.Cursor {
@@ -179,6 +179,7 @@ pub fn deliverCohort(a: std.mem.Allocator, destinations: []const Destination, so
     }
     try source.finish(source.ptr);
     for (destinations, cursors, pending) |destination, *cursor, *buffer| try flush(a, buffered_alloc, destination, cursor, buffer, context);
+    if (options.stats) |stats| stats.seals_started = true;
     for (destinations, cursors) |destination, *cursor| {
         const completion = cursor.completionForSource(source_rows);
         const expected = try cursor.seal(completion);

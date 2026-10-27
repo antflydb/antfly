@@ -862,6 +862,9 @@ pub const Adapter = struct {
 
     fn ddl(ptr: *anyopaque, allocators: catalog.DdlAllocators, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        // Catalog jobs are not transaction participants yet. Never commit
+        // their namespace change independently of an explicit SQL transaction.
+        if (input == .populate and self.active_transaction != null) return error.UnsupportedSqlExecution;
         return @import("sql_catalog.zig").executeWithAllocators(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path);
     }
 

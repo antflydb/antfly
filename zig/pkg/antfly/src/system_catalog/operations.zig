@@ -2013,6 +2013,14 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .relational_index_source_accept => |request| acceptRelationalIndexSource(svc, alloc, context, request),
         .relational_index_source_complete => |request| completeRelationalIndexSource(svc, alloc, context, request),
         .relational_index_source_accept_status => |request| relationalIndexSourceAcceptanceStatusJson(svc, alloc, context, request),
+        .query_population_prepare => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try @import("../metadata/service.zig").ensureQueryPopulationCapabilityWithContext(svc, context);
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_population_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.prepareRelationCreateJsonWithContext(alloc, svc.metadata_group_id, request, .query_population, context);
+        },
         .fk_initial_create_prepare => |request| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;
             if (request.generated_constraint_names.len != 0)

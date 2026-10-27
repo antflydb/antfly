@@ -65,6 +65,7 @@ pub const users_read_reference = @embedFile("fixtures/sql_users_read_reference.j
 pub const document_alias_reference = @embedFile("fixtures/sql_document_alias_reference.json");
 pub const document_projection_reference = @embedFile("fixtures/sql_document_projection_reference.json");
 pub const read_campaign_reference = @embedFile("fixtures/sql_read_campaign_reference.json");
+pub const population_reference = @embedFile("fixtures/sql_population_reference.json");
 pub const read_campaign_profile = @embedFile("fixtures/sql_read_campaign_profile.json");
 pub const name_resolution_campaign = @embedFile("fixtures/sql_name_resolution_campaign.json");
 pub const digest_read_reference = @embedFile("fixtures/sql_digest_read_campaign_reference.json");

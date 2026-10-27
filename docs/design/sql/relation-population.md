@@ -71,34 +71,44 @@ uses constant work per receipt rather than rescanning the full owner cohort.
 Voter capability activation is observed durably before compound admission;
 readiness checks alone do not satisfy the apply-side floor.
 
+The public adapter now activates ordinary permanent `CREATE TABLE AS` and
+`SELECT INTO` through shared destination planning and compound admission. It
+checks namespace/tablespace placement, destination authority and source access.
+An admitted capture nonce must match before the request can deliver rows. A
+conditional create skips a committed existing relation before source evaluation;
+a pending name reservation remains a transition, not a successful conditional
+create. Catalog epoch checks protect admission, and immutable database,
+namespace and tablespace fingerprints protect publication. Durable rejected jobs
+retain cancellation tombstones so delayed requests cannot revive them.
+
+The request returns an owned job receipt if publication remains pending or an
+acknowledgement becomes uncertain after sealing starts. The worker rechecks
+stored authority and the submitting user's immutable instance before publishing.
+The HTTP path observes publication for a bounded interval; pgwire uses its
+statement deadline. Population cannot join an explicit SQL transaction yet.
+
 The recovery campaign runs actual SQL producers through metadata Raft and native
 LSM owners with lost replies and cold reopen. It checks complete typed postimages
-and SQL-null provenance for populated output, empty `WITH NO DATA` publication,
-and hidden partial-output cancellation. Separate metadata tests qualify compound
-admission collisions, unsupported data owners and exact count accumulation
-across reopen. These are lifecycle component tests, not mounted public case
-closure evidence.
+and SQL-null provenance, empty publication, and hidden partial-output
+cancellation. The mounted HTTP campaign executes four unchanged original
+statements against both document and relational sources, comparing complete rows,
+nullable text columns and conditional-repeat behavior with a checked-in,
+input-hash-verified PostgreSQL reference. WITH NO DATA and conditional repeats
+perform no source reads. These close sql-0364, sql-0365, sql-0366 and sql-0567.
 
 ## Activation still required
 
-The public catalog adapter deliberately rejects population commands until the
-complete lifecycle is integrated. Parser and component coverage do not close
-original parity cases. In particular, the following are unfinished:
-
-- Public destination planning, transaction participation, namespace/tablespace
-  and placement checks,
-  conditional-create semantics, and connecting the request-owned producer to
-  compound admission. A retry must inspect the persisted capture nonce before
-  adopting output; it must never attach a new evaluation to an existing job.
+- Explicit transaction participation for population and its catalog publication.
 - Materialized definitions, bound dependencies and owner authority in the
   existing view catalog; atomic backing-generation publication and retirement;
   unpopulated-read errors; refresh isolation, MAINTAIN checks and concurrent
   refresh prerequisites.
 - Connection-owned TEMP lifetimes and UNLOGGED crash semantics. Neither may be
   silently implemented as an ordinary global durable table.
-- Mounted public SQL/pgwire campaigns for unchanged originals, complete
-  postimages, authority/RLS, publication failures, cancellation, cold recovery
-  and mixed document/relational inputs, compared with independent PostgreSQL.
+- Broader public fault campaigns for live authority/RLS revocation, namespace
+  changes during population, mixed-version placement and multi-owner cutover.
+  The existing recovery tests cover lifecycle components; they do not replace
+  these end-to-end qualification cases.
 
 PostgreSQL completion tags distinguish populated output (`SELECT n`) from
 `WITH NO DATA` or a conditional no-op (`CREATE TABLE AS` or

@@ -1,0 +1,106 @@
+{
+  "format": 1,
+  "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
+  "profile_sha256": "61b2349bfcd48d300e1e741f119acfb30c6914cbd1024f6de4b0968bad0584ec",
+  "entries": [
+    {
+      "id": "sql-0364",
+      "source_entry_sha256": "befa08ce3823908de0183a1b6c4c60d6907c687ba439e02c992b350d13599f52",
+      "sql": "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
+      "command_tag": "SELECT 1",
+      "columns": [
+        [
+          "id",
+          "text",
+          false
+        ],
+        [
+          "status",
+          "text",
+          false
+        ]
+      ],
+      "rows": [
+        [
+          "u5",
+          "closed"
+        ]
+      ]
+    },
+    {
+      "id": "sql-0365",
+      "source_entry_sha256": "7316388be87932f8f8dcb04d6b5ea99f1563ed3791b99767a641ec73162ab9d2",
+      "sql": "CREATE TABLE usage_archive_empty AS SELECT id, status FROM usage_records WHERE status = 'closed' WITH NO DATA",
+      "command_tag": "CREATE TABLE AS",
+      "columns": [
+        [
+          "id",
+          "text",
+          false
+        ],
+        [
+          "status",
+          "text",
+          false
+        ]
+      ],
+      "rows": []
+    },
+    {
+      "id": "sql-0366",
+      "source_entry_sha256": "fcf3ea267de6c2c592b1409b191e094b54f1c712dfd25994129b54b0b146acd0",
+      "sql": "CREATE TABLE IF NOT EXISTS usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
+      "command_tag": "SELECT 1",
+      "columns": [
+        [
+          "id",
+          "text",
+          false
+        ],
+        [
+          "status",
+          "text",
+          false
+        ]
+      ],
+      "rows": [
+        [
+          "u5",
+          "closed"
+        ]
+      ],
+      "repeat_command_tag": "CREATE TABLE AS",
+      "repeat_rows": [
+        [
+          "u5",
+          "closed"
+        ]
+      ]
+    },
+    {
+      "id": "sql-0567",
+      "source_entry_sha256": "9440534ab1aa36916e5e25d84c9803e0ef41a241de312dacf0957fba3336433f",
+      "sql": "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'",
+      "command_tag": "SELECT 1",
+      "columns": [
+        [
+          "id",
+          "text",
+          false
+        ],
+        [
+          "status",
+          "text",
+          false
+        ]
+      ],
+      "rows": [
+        [
+          "u5",
+          "closed"
+        ]
+      ]
+    }
+  ],
+  "postgres_version": "18.6 (Homebrew)"
+}

@@ -62,10 +62,17 @@ const Fixture = struct {
     fn status(_: *anyopaque) !metadata.MetadataStatus {
         return .{ .metadata_group_id = 1, .metrics = .{} };
     }
-    fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+    fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self = cast(ptr);
         self.catalog_reads += 1;
         return switch (call) {
+            .setting_snapshot => |scope| std.json.Stringify.valueAlloc(a, @import("antfly_local_sources").sql_setting_catalog.RawSnapshot{ .scope = scope, .epoch = 7, .definitions = &.{} }, .{}),
+            .sql_column_sequence_handoffs => |query| blk: {
+                try std.testing.expect(context.setting_admin);
+                // This fixture has no identity columns or owned sequences.
+                // Preserve the exact planned targets across catalog enrichment.
+                break :blk std.json.Stringify.valueAlloc(a, query.targets, .{});
+            },
             .snapshot => blk: {
                 const resources = try a.alloc(domain.Resource, 2 + self.tableCount());
                 resources[0] = domain.default_database;

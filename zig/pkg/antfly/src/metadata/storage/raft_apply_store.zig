@@ -20819,11 +20819,18 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn fkInitialCreatePrepareJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        return self.prepareRelationCreateJsonWithContext(alloc, group_id, request, .foreign_key, context);
+    }
+
+    pub fn prepareRelationCreateJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../relation_create.zig").Request, purpose: @import("../relation_create.zig").Purpose, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         if (request.namespace_id == 0 or request.logical_name.len == 0 or request.logical_name.len > 256 or
-            request.candidate.table_id != 0 or request.candidate.name.len != 0 or
-            !try fk_generation_publication.schemaHasForeignKeys(self.alloc, request.candidate.schema_json))
-            return error.InvalidGenerationPublication;
+            request.candidate.table_id != 0 or request.candidate.name.len != 0) return error.InvalidGenerationPublication;
+        if (purpose == .foreign_key) {
+            if (request.physical_name != null or !try fk_generation_publication.schemaHasForeignKeys(self.alloc, request.candidate.schema_json)) return error.InvalidGenerationPublication;
+        } else {
+            if (request.physical_name == null or !@import("../relation_create.zig").validPhysicalName(request.physical_name.?) or request.generated_constraint_names.len != 0) return error.InvalidGenerationPublication;
+        }
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -20844,7 +20851,17 @@ pub const RaftApplyStore = struct {
         var name_buf: [512]u8 = undefined;
         if (try stagingGet(&txn, try fk_generation_publication.initialNameKey(&name_buf, group_id, request.namespace_id, request.logical_name)) != null)
             return error.GenerationPublicationChanged;
-        const physical_name = try std.fmt.allocPrint(a, "table:{d}", .{meta.next_id});
+        if (purpose == .query_population) {
+            var registry = try RelationRegistry(docstore.DocStore.Txn).init(a, &txn, group_id);
+            if (registry.live == null or !try relationWriterEnabledTxn(&txn, group_id)) return error.CatalogOccupancyNotReady;
+            if (try registry.getEntry(.{ .namespace_id = request.namespace_id, .name = request.logical_name })) |entry| {
+                if (entry.active != null) return error.CatalogAlreadyExists;
+                return error.TableTransitionActive;
+            }
+            if (try system_catalog_storage.find(a, &txn, group_id, .view, request.namespace_id, request.logical_name) != null or
+                try system_catalog_storage.find(a, &txn, group_id, .sequence, request.namespace_id, request.logical_name) != null) return error.CatalogAlreadyExists;
+        }
+        const physical_name = request.physical_name orelse try std.fmt.allocPrint(a, "table:{d}", .{meta.next_id});
         var child = request.candidate;
         var name_admission: ?relation_names.constraint_naming.Admission = null;
         if (request.generated_constraint_names.len != 0) {
@@ -20853,6 +20870,7 @@ pub const RaftApplyStore = struct {
             child.schema_json = try a.dupe(u8, names.schema_json);
             name_admission = try names.admission.dupe(a);
         }
+        if (purpose == .query_population) child.schema_reader_requirements = try @import("antfly_local_sources").schema_mod.readerRequirementsForDefinitions(a, child.schema_json, child.read_schema_json);
         child.name = physical_name;
         const derived_id = std.hash.Wyhash.hash(0x54424c45, physical_name);
         child.table_id = if (derived_id == 0) 1 else derived_id;
@@ -20879,6 +20897,10 @@ pub const RaftApplyStore = struct {
         const existing_groups = try self.indexedTableRangeIdsTxn(a, &txn, group_id, child.table_id);
         if (existing_groups.len != 0 or fence.range_membership.count != 0) return error.TableTransitionActive;
         const ranges = try @import("../../api/tables.zig").deriveInitialRangesForGeneration(a, child, fence.generation);
+        if (purpose == .query_population) for (ranges) |*range| {
+            range.doc_identity_shard_id = range.group_id;
+            range.doc_identity_range_id = range.group_id;
+        };
         for (ranges) |range| {
             var group_buf: [160]u8 = undefined;
             if (try stagingGet(&txn, try rangeKeyForGroup(&group_buf, group_id, range.group_id)) != null or
@@ -20889,7 +20911,9 @@ pub const RaftApplyStore = struct {
         var incarnation_key_buf: [160]u8 = undefined;
         const incarnation_bytes = txn.get(try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id)) catch return error.InvalidMetadataIncarnation;
         const incarnation = (try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation;
+        const guard = if (purpose == .query_population) try creationGuardForBinding(a, catalog_view, .{ .kind = .table, .id = child.table_id, .parent_id = namespace.id, .tablespace_id = explicit_tablespace_id, .name = request.logical_name, .storage_name = child.name }) else null;
         const result: fk_generation_publication.InitialCreatePrepare = .{
+            .creation_guard = guard,
             .constraint_name_admission = name_admission,
             .catalog_id = meta.next_id,
             .expected_catalog_revision = meta.revision,
@@ -32596,7 +32620,7 @@ pub const RaftApplyStore = struct {
         // Replays, cancellation and prior admission win before any reservation
         // is inspected or created. The caller receives the durable first row.
         if (try stagingGet(txn, logical_key) != null) return;
-        const Header = struct { job_id: u64, attempt_id: u64, staging_attempt_id: u64, source_kind: []const u8, phase: []const u8, cancel_requested: bool = false };
+        const Header = struct { job_id: u64, attempt_id: u64, staging_attempt_id: u64, source_kind: []const u8, phase: []const u8, cancel_requested: bool = false, table_names: []const []const u8 = &.{}, restore_mode: []const u8 = "fail_if_exists" };
         var header = std.json.parseFromSlice(Header, self.alloc, record.value, .{ .ignore_unknown_fields = true }) catch |err| {
             if (err == error.OutOfMemory) return err;
             return;
@@ -32617,6 +32641,20 @@ pub const RaftApplyStore = struct {
         const query_population = std.mem.eql(u8, header.value.source_kind, "query_population");
         if (!std.mem.eql(u8, &plan.value.id, &expected_id) or plan.value.preparing_sources != (!empty_generation and !query_population)) return;
         for (plan.value.targets) |target| if (target.empty_generation != empty_generation or (target.population != null) != query_population) return;
+        if (query_population) {
+            if (header.value.table_names.len != plan.value.targets.len or !std.mem.eql(u8, header.value.restore_mode, "fail_if_exists")) return;
+            var arena: std.heap.ArenaAllocator = .init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const meta = try system_catalog_storage.readMeta(a, txn, group_id);
+            const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = meta };
+            for (plan.value.targets, header.value.table_names) |target, name| {
+                const logical = system_catalog.Target.parse(name) catch return;
+                const namespace = view.namespaceFor(logical.database, logical.namespace) catch return;
+                const binding = target.catalog_binding orelse return;
+                if (namespace.id != binding.parent_id or !std.mem.eql(u8, logical.table, binding.name)) return;
+            }
+        }
         const reserve: restore_staging.Command = .{ .id = expected_id, .action = .reserve, .plan = plan.value };
         reserve.validate(self.alloc) catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -32632,10 +32670,59 @@ pub const RaftApplyStore = struct {
         // The shared reservation validates exact source definitions, ranges,
         // incoming dependency closure and every identity collision first.
         try self.applyRestoreStagingTxn(txn, group_id, bytes);
-        if (try stagingGet(txn, plan_key) == null) return;
+        if (try stagingGet(txn, plan_key) == null) {
+            if (query_population) {
+                const reason = try self.queryPopulationRejectionTxn(txn, group_id, plan.value);
+                try self.rejectQueryPopulationTxn(txn, group_id, record, expected_id, logical_key, reason);
+            }
+            return;
+        }
         try txn.put(logical_key, record.value);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = logical_key });
         self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
+    }
+
+    fn queryPopulationRejectionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, plan: restore_staging.Plan) ![]const u8 {
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const meta = try system_catalog_storage.readMeta(a, txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
+        var registry = try RelationRegistry(docstore.DocStore.Txn).init(a, txn, group);
+        for (plan.targets) |target| {
+            const binding = target.catalog_binding orelse return "CatalogGenerationChanged";
+            if (try registry.getEntry(.{ .namespace_id = binding.parent_id, .name = binding.name })) |entry| {
+                if (entry.active != null) return "CatalogAlreadyExists";
+                return "TableTransitionActive";
+            }
+            if (try view.lookup(.table, binding.parent_id, binding.name) != null or
+                try view.lookup(.view, binding.parent_id, binding.name) != null or
+                try view.lookup(.sequence, binding.parent_id, binding.name) != null) return "CatalogAlreadyExists";
+        }
+        if (!try self.relationalTopologyStoresAtLeastTxn(txn, group, metadata_table_manager.query_population_protocol_version)) return "RelationalTopologyProtocolUpgradeRequired";
+        return "CatalogGenerationChanged";
+    }
+
+    fn rejectQueryPopulationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, record: RestoreJobWithStaging, id: restore_staging.Id, logical_key: []const u8, reason: []const u8) !void {
+        // An applied rejection is a durable result, not an unknown admission.
+        // Its tombstone also defeats a delayed reserve from the same request.
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, a, record.value, .{ .parse_numbers = false });
+        if (value != .object) return;
+        const header = try std.json.parseFromSliceLeaky(struct { created_at_ms: u64 = 0 }, a, record.value, .{ .ignore_unknown_fields = true });
+        try value.object.put(a, "phase", .{ .string = "failed" });
+        try value.object.put(a, "not_before_ms", .{ .integer = 0 });
+        try value.object.put(a, "staging_resolution", .{ .string = "canceled" });
+        try value.object.put(a, "staging_failure", .{ .string = reason });
+        try value.object.put(a, "last_error", .{ .string = reason });
+        try value.object.put(a, "expires_at_ms", .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{header.created_at_ms +| 7 * 24 * 60 * 60 * 1000}) });
+        const cancel = try std.json.Stringify.valueAlloc(a, restore_staging.Command{ .id = id, .action = .cancel_reservation }, .{});
+        try self.applyRestoreStagingTxn(txn, group, cancel);
+        try txn.put(logical_key, try std.json.Stringify.valueAlloc(a, value, .{}));
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group, .key = logical_key });
+        self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group });
     }
 
     fn restoreIncomingDependenciesClosedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: restore_staging.Plan) !bool {
@@ -32661,6 +32748,14 @@ pub const RaftApplyStore = struct {
         return true;
     }
 
+    fn creationGuardForBinding(a: std.mem.Allocator, view: system_catalog_storage.View, binding: system_catalog.Resource) !@import("../relation_create.zig").Guard {
+        const create = @import("../relation_create.zig");
+        const namespace = (try view.byId(.namespace, binding.parent_id)) orelse return error.InvalidRestoreStaging;
+        const database = (try view.byId(.database, namespace.parent_id)) orelse return error.InvalidRestoreStaging;
+        const space = try view.effectiveTablespace(namespace, binding.tablespace_id);
+        return .{ .database = try create.fingerprint(a, database), .namespace = try create.fingerprint(a, namespace), .tablespace_id = if (space) |value| value.id else 0, .tablespace = if (space) |value| try create.fingerprint(a, value) else null };
+    }
+
     /// Validate every logical destination before any topology is changed.
     /// Schema rewrites inherit an existing binding; restore admission supplies
     /// explicit bindings for previously absent or differently named owners.
@@ -32681,6 +32776,20 @@ pub const RaftApplyStore = struct {
             try validateColumnSequenceHandoffsTxn(alloc, txn, group_id, target);
             const old = if (target.replace) |replacement| try view.byId(.table, replacement.table.table_id) else null;
             var binding = target.catalog_binding orelse old orelse continue;
+            if (target.population) |capture| {
+                if (target.creation_guard) |expected| {
+                    if (!std.meta.eql(expected, try creationGuardForBinding(alloc, view, binding))) return error.InvalidRestoreStaging;
+                }
+                var active_buf: [256]u8 = undefined;
+                const active = try restore_staging.activeKey(&active_buf, group_id, plan.id);
+                if (try stagingGet(txn, active) == null) {
+                    if (meta.revision != capture.catalog_revision) return error.InvalidRestoreStaging;
+                    var registry = try RelationRegistry(docstore.DocStore.Txn).init(alloc, txn, group_id);
+                    if (try registry.getEntry(.{ .namespace_id = binding.parent_id, .name = binding.name }) != null or
+                        try view.lookup(.view, binding.parent_id, binding.name) != null or
+                        try view.lookup(.sequence, binding.parent_id, binding.name) != null) return error.InvalidRestoreStaging;
+                }
+            }
             if (try view.byId(.namespace, binding.parent_id) == null or try view.byId(.table, target.table.table_id) != null) return error.InvalidRestoreStaging;
             if (binding.tablespace_id != 0 and try view.byId(.tablespace, binding.tablespace_id) == null) return error.InvalidRestoreStaging;
             const current = try view.lookup(.table, binding.parent_id, binding.name);
@@ -55746,7 +55855,7 @@ test "relational integrity restore staging population atomically raises data own
     defer a.free(schema);
     const target: restore_staging.Target = .{
         .source_table_id = 0,
-        .population = .{ .expires_at_ms = 9000000000000, .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = try restore_staging.runtimeSchemaDigestForTable(a, schema), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 7 },
+        .population = .{ .expires_at_ms = 9000000000000, .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = try restore_staging.runtimeSchemaDigestForTable(a, schema), .principal_instance = @splat(5), .catalog_revision = 0, .write_version = 7 },
         .table = .{ .table_id = 11, .name = "population_storage", .schema_json = schema, .min_ranges = 2 },
         .catalog_binding = .{ .kind = .table, .id = 11, .parent_id = system_catalog.default_namespace_id, .name = "populated", .storage_name = "population_storage" },
         .ranges = &.{ .{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "", .end_key = "8" }, .{ .table_id = 11, .group_id = 702, .range_id = 702, .doc_identity_shard_id = 702, .doc_identity_range_id = 702, .start_key = "8" } },
@@ -55756,7 +55865,7 @@ test "relational integrity restore staging population atomically raises data own
     const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
     defer a.free(plan_json);
     const logical_key = restore_job_logical_prefix ++ "000000000000005b";
-    const logical_job = "{\"job_id\":91,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"query_population\",\"phase\":\"queued\"}";
+    const logical_job = "{\"job_id\":91,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"query_population\",\"table_names\":[\"populated\"],\"phase\":\"queued\"}";
     var key_buf: [512]u8 = undefined;
     const job_key = try a.dupe(u8, try restore_staging.jobKey(&key_buf, group, plan.id));
     defer a.free(job_key);
@@ -55768,11 +55877,34 @@ test "relational integrity restore staging population atomically raises data own
         errdefer txn.abort();
         try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&key_buf, group), activation);
         _ = try store.writeStoreComponentsTxn(&txn, group, data.store_id, data, false, null, null);
-        try applyRestoreTransitionForTest(&store, &txn, group, .{ .create_restore_job_with_staging = .{ .key = logical_key, .value = logical_job, .plan_json = plan_json } });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
         try std.testing.expectError(error.NotFound, txn.get(job_key));
         try txn.commit();
     }
     try std.testing.expectEqual(@as(u16, 0), try store.getRelationalTopologyProtocolActivationVersion(group));
+    // Compound admission returns a durable failure, including after a later
+    // capability upgrade. A delayed reservation must not revive this capture.
+    var rejected_plan = plan;
+    rejected_plan.id = try restore_staging.idForAttempt(92, 1);
+    const rejected_json = try std.json.Stringify.valueAlloc(a, rejected_plan, .{});
+    defer a.free(rejected_json);
+    const rejected_key = restore_job_logical_prefix ++ "000000000000005c";
+    const rejected_job = "{\"job_id\":92,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"query_population\",\"table_names\":[\"populated\"],\"phase\":\"queued\",\"created_at_ms\":1,\"not_before_ms\":7}";
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try applyRestoreTransitionForTest(&store, &txn, group, .{ .create_restore_job_with_staging = .{ .key = rejected_key, .value = rejected_job, .plan_json = rejected_json } });
+        try txn.commit();
+    }
+    const rejected_bytes = (try store.getRestoreJobValue(a, group, rejected_key)).?;
+    defer a.free(rejected_bytes);
+    const rejection = try std.json.parseFromSlice(struct { phase: []const u8, staging_resolution: []const u8, last_error: []const u8, not_before_ms: u64 }, a, rejected_bytes, .{ .ignore_unknown_fields = true });
+    defer rejection.deinit();
+    try std.testing.expectEqualStrings("failed", rejection.value.phase);
+    try std.testing.expectEqualStrings("canceled", rejection.value.staging_resolution);
+    try std.testing.expectEqualStrings("RelationalTopologyProtocolUpgradeRequired", rejection.value.last_error);
+    try std.testing.expectEqual(@as(u64, 0), rejection.value.not_before_ms);
+    try std.testing.expectEqual(restore_staging.State.canceled, (try store.loadRestoreStagingProgress(a, group, rejected_plan.id)).?.state);
     data.relational_topology_protocol_version = metadata_table_manager.query_population_protocol_version;
     {
         var txn = try store.store.beginWriteTxn();
@@ -55784,7 +55916,7 @@ test "relational integrity restore staging population atomically raises data own
         const encoded = try encodeTableRecord(a, target.table);
         defer a.free(encoded);
         try txn.put(table_key, encoded);
-        try applyRestoreTransitionForTest(&store, &txn, group, .{ .create_restore_job_with_staging = .{ .key = logical_key, .value = logical_job, .plan_json = plan_json } });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
         try std.testing.expectError(error.NotFound, txn.get(job_key));
         try txn.delete(try tableKeyForGroup(&key_buf, group, target.table.table_id));
         try txn.commit();
@@ -55797,6 +55929,17 @@ test "relational integrity restore staging population atomically raises data own
         _ = try txn.get(job_key);
         try txn.commit();
     }
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try applyRestoreTransitionForTest(&store, &txn, group, .{ .create_restore_job_with_staging = .{ .key = rejected_key, .value = rejected_job, .plan_json = rejected_json } });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = rejected_plan.id, .action = .reserve, .plan = rejected_plan });
+        try txn.commit();
+    }
+    const replayed_rejection = (try store.getRestoreJobValue(a, group, rejected_key)).?;
+    defer a.free(replayed_rejection);
+    try std.testing.expectEqualStrings(rejected_bytes, replayed_rejection);
+    try std.testing.expect((try store.loadRestoreStaging(a, group, rejected_plan.id)) == null);
     try std.testing.expectEqual(metadata_table_manager.query_population_protocol_version, try store.getRelationalTopologyProtocolActivationVersion(group));
     store.deinit();
     live = false;

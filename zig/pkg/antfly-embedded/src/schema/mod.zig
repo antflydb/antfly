@@ -1496,22 +1496,27 @@ test "relational declarations exact NUMERIC generated programs publish capabilit
 
 test "relational declarations NUMERIC cast modifiers publish capability for nonnumeric results" {
     const a = std.testing.allocator;
-    for ([_]struct { sql: []const u8, requires_modifiers: bool }{
-        .{ .sql = "CREATE TABLE t (n bigint DEFAULT CAST(CAST(1.245 AS numeric(4,2)) AS bigint))", .requires_modifiers = false },
-        .{ .sql = "CREATE TABLE t (source numeric, n bigint GENERATED ALWAYS AS (CAST(CAST(source AS numeric(4,2)) AS bigint)) STORED)", .requires_modifiers = true },
-        .{ .sql = "CREATE TABLE t (n bigint, CHECK (CAST(n AS numeric(4,2)) > 0))", .requires_modifiers = true },
-        .{ .sql = "CREATE TABLE t (n bigint, CHECK (CAST(1.245 AS numeric(4,2)) > 0))", .requires_modifiers = false },
+    // The bigint default folds to a literal. CHECK programs retain their
+    // typed casts, including constant operands, and need both capabilities.
+    for ([_]struct { sql: []const u8, requires_modifiers: bool, requires_values: bool }{
+        .{ .sql = "CREATE TABLE t (n bigint DEFAULT CAST(CAST(1.245 AS numeric(4,2)) AS bigint))", .requires_modifiers = false, .requires_values = false },
+        .{ .sql = "CREATE TABLE t (source numeric, n bigint GENERATED ALWAYS AS (CAST(CAST(source AS numeric(4,2)) AS bigint)) STORED)", .requires_modifiers = true, .requires_values = true },
+        .{ .sql = "CREATE TABLE t (n bigint, CHECK (CAST(n AS numeric(4,2)) > 0))", .requires_modifiers = true, .requires_values = true },
+        .{ .sql = "CREATE TABLE t (n bigint, CHECK (CAST(1.245 AS numeric(4,2)) > 0))", .requires_modifiers = true, .requires_values = true },
     }) |case| {
         var compiled = try @import("../sql/compiler.zig").compile(a, case.sql, .{});
         defer compiled.deinit();
         const source = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
         defer a.free(source);
+        errdefer std.debug.print("NUMERIC capability SQL={s} schema={s}\n", .{ case.sql, source });
         var validator = try CompiledTableValidator.init(a, source);
         defer validator.deinit(a);
         const runtime = try deriveRuntimeTableSchema(a, validator.schema);
         defer storage_schema.freeSchema(a, runtime);
         const checks = try deriveRelationalCheckLayout(a, validator.schema);
         defer storage_schema.freeSchema(a, checks);
+        try std.testing.expectEqual(case.requires_values, runtime.requires_exact_numeric_expressions);
+        try std.testing.expectEqual(case.requires_values, checks.requires_exact_numeric_expressions);
         try std.testing.expectEqual(case.requires_modifiers, runtime.requires_numeric_modifiers);
         try std.testing.expectEqual(case.requires_modifiers, checks.requires_numeric_modifiers);
         const bytes = try storage_schema.serializeSchema(a, runtime);
@@ -1519,7 +1524,7 @@ test "relational declarations NUMERIC cast modifiers publish capability for nonn
         const restored = try storage_schema.deserializeSchema(a, bytes);
         defer storage_schema.freeSchema(a, restored);
         try std.testing.expectEqual(case.requires_modifiers, restored.requires_numeric_modifiers);
-        try std.testing.expect(restored.requires_exact_numeric_expressions);
+        try std.testing.expectEqual(case.requires_values, restored.requires_exact_numeric_expressions);
     }
 }
 
