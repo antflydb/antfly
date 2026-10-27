@@ -789,6 +789,7 @@ pub const Owner = struct {
     }
 
     fn bindGroupSourceState(self: *Owner, root: *h.Handle) !void {
+        root.owned_lite_backend.?.native_docstore.?.file.defer_allocator_verification = self.options.profile == .native;
         if (self.maintenance_root_incarnation != root.db.root_incarnation) {
             self.deinitMaintenanceSchedules();
             self.maintenance_schedules = .empty;
@@ -1098,6 +1099,11 @@ pub const Owner = struct {
         const foreground = try self.refresh();
         if (needsOutcomeReconciliation(foreground)) return false;
         const foreground_file = &foreground.owned_lite_backend.?.native_docstore.?.file;
+        // Marker service is directory-bounded and needs no allocator proof.
+        // Reap crash/normal-exit leftovers even if this short-lived owner is
+        // canceled before its detached graph walk can finish.
+        if (self.options.open_mode == .writer)
+            try foreground.owned_lite_backend.?.native_docstore.?.artifact_marker_sweep.run(foreground_file);
         if (self.options.open_mode == .writer and !foreground_file.free_pages_verified) {
             // Source-recovery, group-source and TTL control slices below can
             // write before detached provider replay starts. Prove their free
@@ -1130,10 +1136,9 @@ pub const Owner = struct {
             gate_locked = true;
             lease = try native.lockWriterPathWithIo(alloc, io, self.path);
             lease_held = true;
-            // The originating runtime remains pinned until reader cleanup.
-            // Refreshing while pinned would unnecessarily fork that runtime
-            // and publish new lease metadata, invalidating this exact proof.
-            // Observe the current on-disk generation without opening a DB.
+            // Observe the published generation without constructing a DB.
+            // Local append-only commits preserve the captured proof lineage;
+            // foreign publications still require a fresh capture.
             var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
             defer probe.close();
             if (self.current) |current| {

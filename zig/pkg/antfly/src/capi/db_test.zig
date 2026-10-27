@@ -5256,6 +5256,10 @@ test "capi native idle maintenance verifies allocator outside connection and wri
             var handle: ?*anyopaque = null;
             try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
             defer antfly_db_close(handle);
+            const marker_path = try std.fmt.allocPrint(a, "{s}/.aflite-lease-0123456789abcdef0123456789abcdef", .{std.fs.path.dirname(path).?});
+            defer a.free(marker_path);
+            const marker = try std.Io.Dir.cwd().createFile(shared.handleLockIo(), marker_path, .{});
+            marker.close(shared.handleLockIo());
             const owner = blk: {
                 const guard = public.enterHandle(handle, .exclusive).?;
                 defer guard.leave();
@@ -5292,6 +5296,15 @@ test "capi native idle maintenance verifies allocator outside connection and wri
                         self.owner.collectRetired();
                         try std.testing.expectEqual(@as(usize, 1), self.owner.retired.items.len);
                     }
+                    if (!replace) {
+                        const file = &self.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+                        file.defer_allocator_verification = true;
+                        defer file.defer_allocator_verification = false;
+                        const current = self.owner.current.?;
+                        try file.putCatalogRecord("proof/local-append", "foreground progress");
+                        try std.testing.expect(try self.owner.refresh() == current);
+                        try std.testing.expect(!file.free_pages_verified);
+                    }
                     if (cancel) self.owner.verification_cancel.request();
                 }
             };
@@ -5303,13 +5316,14 @@ test "capi native idle maintenance verifies allocator outside connection and wri
             } else {
                 try std.testing.expect(try owner.maintenanceTurnForTest());
             }
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(shared.handleLockIo(), marker_path, .{}));
             if (probe.failure) |err| return err;
             try std.testing.expectEqual(@as(usize, 1), probe.calls);
             // Completion must release the retired proof owner before another API call.
             try std.testing.expectEqual(@as(usize, 0), owner.retired.items.len);
             const guard = public.enterHandle(handle, .read).?;
             defer guard.leave();
-            // Reopening can change the header fence; only inherit an exact proof.
+            // A foreign reopen breaks lineage; locally authored appends preserve it.
             if (!replace) try std.testing.expectEqual(!cancel, guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
             try std.testing.expectEqual(@as(usize, 0), guard.handle.maintenance_references);
             try std.testing.expectEqual(@as(usize, 0), guard.handle.allocator_verification_references);
