@@ -1844,6 +1844,7 @@ pub const Store = struct {
         while (iterator.next()) |id| {
             root_frame.reset();
             const r = root_frame.allocator();
+            temporary.a = r;
             const root_hash = try hash(r, id.*);
             var own_digest: [32]u8 = undefined;
             @import("antfly_hash").Sha256.hash(id.*, &own_digest, .{});
@@ -5750,6 +5751,15 @@ test "resolver curation dependency compact proof bounds distinct configured inva
         const small_result = try constrained.queryExecutionPrepared(prepared_small, &.{"entity/unpinned-root"}, &.{}, true);
         try std.testing.expectEqual(@as(usize, 0), small_result.namespace.state.distinct.len);
         std.debug.print("DEPENDENCY DISTINCT constrained64k=success used={d}\n", .{bounded.end_index});
+        if (count == 256) {
+            // Root-local helper allocations must reset even if every summary
+            // is empty and the point-lookup branch never executes.
+            var absent_roots: std.StringHashMapUnmanaged(void) = .empty;
+            for (0..8192) |i| try absent_roots.put(a, try std.fmt.allocPrint(a, "entity/absent-root-{d}", .{i}), {});
+            const projection = try parse(Store.PinProjection, a, memory.rows.get(try std.mem.concat(a, u8, &.{ try store.pinProjectionRoot(template, id), "state" })).?);
+            try std.testing.expect(try current.pinRootsCurrent(prepared, projection, absent_roots, reader.lookup()));
+            try std.testing.expect(request.queryCapacity() < 64 * 1024);
+        }
     }
 }
 

@@ -2866,7 +2866,8 @@ from `zig/`, or include them through the complete `memory-test` target.
 
 The distinct-invalidation regression edits 256 and 4,096 different configured
 keys. Both unrelated zero-result queries use six scans and less than 34 KiB
-of request arena; both succeed with a 64-KiB fixed request allocator. The former
+of request arena; both succeed with a 64-KiB fixed request allocator. An
+8,192-root proof checks scratch reuse when every summary is empty. The former
 4,096-key path used 133 scans, 3.75 MiB of arena and exhausted that allocator.
 A 128-pin root repair completes in 52 owner turns with an unrelated routing edit
 before every turn (49 without churn), moving all 128 members. Previously it moved
