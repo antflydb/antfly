@@ -453,6 +453,16 @@ format remains unchanged. See the [collection safety argument](../../docs/design
 
 ## Workers AI and AI Gateway
 
+Antfly's regular provider configuration now supports `provider: "cloudflare"`
+and optional `gateway_id` across its qualified model adapters; see
+[Cloudflare models](../../docs/guides/cloudflare-models.md). Native deployments
+use `account_id`, `model` and a resolved `api_key`. This Worker profile calls
+the Workers AI binding through the typed WASM inference bridge: `AI_GATEWAY`
+selects the gateway, and `EMBEDDING_MODEL` or `AI_MODEL` selects the model.
+The binding supplies Cloudflare authentication. The current database bridge
+implements bounded embedding tasks; further task bridges should reuse the
+regular providers' typed contracts, model identity and deadline accounting.
+
 Optionally set `AI_MODEL` to a Workers AI model ID beginning with `@cf/`, and
 `AI_GATEWAY` to a configured gateway ID. `POST /ai` passes its JSON task input
 to `env.AI.run(model, input, {gateway:{id}})`. Choose a model supporting that

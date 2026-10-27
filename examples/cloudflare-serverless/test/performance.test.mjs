@@ -696,3 +696,14 @@ test('transaction queue hands off ownership before exposing a completed owner re
  class Store extends R2CoordinatorStore{async native(input){const state=this.state??{epoch:Array(16).fill(1),owner:this.owner,revision:1,next:1,root:''};if(input.action==='begin'){events.push('begin:'+(this.trace.id===traceA?'a':'b'));if(this.trace.id===traceA){entered();await held;}return{state,has_more:false,base:'base',page_prefix:'page'};}if(input.action==='commit')return{state:{...state,revision:state.revision+1,next:state.next+1}};throw Error('unexpected native action');}}
  const store=new Store(module,new Bucket(),'ownership-before-response');const first=store.transaction(tx=>tx.put('a',1),{priority:'maintenance',traceId:traceA}).then(()=>events.push('response:a'));await started;const second=store.transaction(tx=>tx.put('b',2),{traceId:traceB});release();await Promise.all([first,second]);assert.ok(events.indexOf('begin:b')<events.indexOf('response:a'),JSON.stringify(events));assert.equal(store.pending.length,0);assert.equal(store.running,false);
 });
+
+
+test('bounded role caches protect data across metadata churn without increasing shared memory',async()=>{
+ const{createRoleCache}=await import('../role-cache.mjs'),cache=createRoleCache({maxBytes:65536,maxEntries:64}),bucket={},scoped=cache.forBucket(bucket),dataKey='antfly/artifacts/sha256/aa/'+'b'.repeat(62);let dataGets=0;
+ const data=scoped.wrap(async req=>{dataGets++;return{body:new Uint8Array(4096).fill(7),json:{etag:'data'}};},'data'),metadata=scoped.metadata.wrap(async()=>({body:new Uint8Array(8192),json:{etag:'metadata'}}),'coordinator/meta');
+ await data({op:'get',bucket:'database',key:dataKey});for(let i=0;i<32;i++)await metadata({op:'get',bucket:'database',key:'antfly/artifacts/sha256/cc/'+i.toString(16).padStart(62,'0')});assert.equal((await data({op:'get',bucket:'database',key:dataKey})).body[0],7);assert.equal(dataGets,1);assert.ok(cache.retainedBytes()<=65536);assert.ok(cache.metadataBytes()<=16384);assert.ok(cache.dataBytes()<=49152);cache.clear();assert.equal(cache.retainedBytes(),0);
+});
+test('role cache binding scopes isolate identical immutable names across R2 buckets',async()=>{
+ const{createRoleCache}=await import('../role-cache.mjs'),cache=createRoleCache({maxBytes:16384,maxEntries:16}),a={},b={},key='antfly/manifests/same/manifests/1.bin';let gets=0;const transport=label=>async()=>{gets++;return{body:utf8.encode(label),json:{etag:label}};};
+ const left=cache.wrap(transport('a'),'same',a),right=cache.wrap(transport('b'),'same',b);assert.equal(new TextDecoder().decode((await left({op:'get',bucket:'database',key})).body),'a');assert.equal(new TextDecoder().decode((await right({op:'get',bucket:'database',key})).body),'b');await left({op:'get',bucket:'database',key});await right({op:'get',bucket:'database',key});assert.equal(gets,2);assert.ok(cache.retainedBytes()<=16384);
+});

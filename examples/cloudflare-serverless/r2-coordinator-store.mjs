@@ -37,7 +37,9 @@ export class R2CoordinatorStore {
     const randomOwner=()=>Array.from(crypto.getRandomValues(new Uint8Array(16)));
     this.owner=typeof owner?.then==="function"||owner==null?randomOwner():copyOwner(owner);
     if(typeof owner?.then==="function"){this.ownerReady=Promise.resolve(owner).then(value=>{if(value!=null)this.owner=copyOwner(value);});this.ownerReady.catch(()=>{});}
-    this.cache = cache??createImmutableReadCache({includeCommitLog:true,maxEntries:1024,writeThrough:true});
+    const scopedCache=cache?.forBucket?.(bucket)??cache;
+    this.cache = scopedCache?.metadata??scopedCache??createImmutableReadCache({includeCommitLog:true,maxEntries:1024,writeThrough:true});
+    this.dataCache=scopedCache??this.cache;
     const raw=transport??createR2Transport({database:bucket},{maxPutBytes:4*1024*1024});
     this.rawTransport=raw;this.remoteCache=remoteCache;this.snapshotKernel=readKernel??kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;
     this.transport = this.cache.wrap(this.remoteCache(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body),{budgetKey:()=>this.physical??={},onMetrics:sample=>{for(const[key,value]of Object.entries(sample)){this.physical??={};this.physical[key]=(this.physical[key]??0)+value;}}}), `coordinator/${namespace}`);

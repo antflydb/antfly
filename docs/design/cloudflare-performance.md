@@ -1021,3 +1021,58 @@ A workerd mutation-group regression reproduced contexts `a, a, a` for separately
 admitted callers `a, b, c`; the candidate records `a, b, c`. A separate test checks
 that metadata handoff precedes the completed owner's response. These changes
 apply only to the candidate; the approved control remains `8a61f42df8`.
+
+## Shared Cloudflare provider integration
+
+Main's Cloudflare model adapters and optional AI Gateway routing are merged into
+this branch through `a69c0b582e` (merge `19f4c5226f`). Regular native deployments
+configure `provider: "cloudflare"`, `account_id`, `model`, a resolved `api_key`
+and optional `gateway_id`. The shared Cloudflare transport retains provider
+pooling, caller deadlines/cancellation and attempt accounting, and sends the
+Gateway ID with the request. Qualified task coverage and model-specific limits
+are documented in [Cloudflare models](../guides/cloudflare-models.md).
+
+The Worker profile retains the Workers AI binding as the host transport for its
+freestanding WASM database. `AI_GATEWAY`, `EMBEDDING_MODEL` and `AI_MODEL` select
+the same gateway/model identities through the binding. Native database embedding
+windows still use their existing bounded typed host contract and immutable
+profile. Extending the Worker bridge to further tasks should implement those
+shared provider contracts, with the same source checks, dimensions, deadlines
+and bounded response decoding. The ordinary provider merge does not itself
+qualify extra WASM task bridges or live model availability.
+
+The artifact-store merge retains both the hosted body-pack option and main's
+shared-namespace identity fields. Sealed performance comparisons continue on
+their declared pre-merge native artifacts; merged-source results must be recorded
+separately before being presented as qualification of a rebuilt module.
+
+## Frozen clocks and cache isolation
+
+Live traces observed one-to-five-ms context clock gaps that remained after a
+zero-delay refresh and caused `clock_valid: false`. Before native entry and every
+Asyncify resume, a regressed context now waits for a fresh sample for the observed
+gap plus one millisecond, capped at 50 ms. A sample still behind the host's high
+water mark rejects the operation and retires the host. The clock is never clamped,
+the high water mark is never reset and the request's absolute deadline is unchanged.
+Tests preserve exact bodies/receipts across admission and resumption gaps and
+reject a persistent rollback after the bounded refresh.
+
+The builder/reader actor admission queue also registers each execution in its
+submitting RPC. Releasing a slot only resolves that caller's permit; accounting
+and next-owner handoff precede its response. A workerd reproduction observed
+`a, a, a` for three separately admitted builders; the fixed queue observes
+`a, b, c`. Capacity, priorities, input charges and thirty-second deadlines remain
+unchanged. This completes the candidate's kernel, transaction, mutation and
+runtime-actor continuation fixes without modifying the frozen control.
+
+The immutable cache keeps its existing eight-MiB/1,024-entry aggregate ceiling.
+Metadata receives two MiB/256 entries and application data six MiB/768 entries,
+so short-lived metadata pages cannot evict the entire useful data working set.
+Coordinator traffic selects the metadata view; WAL preparation and queries select
+data. Both retain the same immutable-only admission, byte charging, conditional
+keys and native integrity validation. Integrity clearing invalidates both views.
+Weak bucket-binding identities scope equal namespace/object names independently;
+no request handles or credentials are retained. Numeric metrics expose each
+partition's charged bytes. A deterministic churn test retains the data hit while
+bounding both partitions; another test prevents cross-bucket manifest reuse.
+These are bounded cache properties, not a claimed live latency pass.

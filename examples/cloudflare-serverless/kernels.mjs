@@ -17,9 +17,9 @@ import full from "./dist/antfly-serverless.wasm";
 import compact from "./dist/antfly-serverless-compact.wasm";
 import observe from "./dist/antfly-serverless-observe.wasm";
 import {instantiateHost} from "../../zig/lib/objectstore/wasm/asyncify.mjs";
-import {createImmutableReadCache} from "../../zig/lib/objectstore/wasm/cache.mjs";
+import{createRoleCache}from"./role-cache.mjs";
 import {RequestPool} from "./request-pool.mjs";
-export const sharedCache=createImmutableReadCache({includeCommitLog:true,maxEntries:1024,writeThrough:true});
+export const sharedCache=createRoleCache();
 export const readerKernel=new RequestPool(job=>instantiateHost(job.hostKey==="observe"?observe:compact,null),2,{maxReservedBytes:32*1024*1024,reservationBytes:16*1024*1024,defaultKernelVariant:"compact",recycleBytes:job=>(job.hostKey==="observe"?7:12)*1024*1024});
 const standaloneMetadataKernel=new RequestPool(()=>instantiateHost(compact,null),1);
 export let metadataKernel=standaloneMetadataKernel;
@@ -41,4 +41,4 @@ export function enableAppReads(){if(runtimeRole==="app-reader")return;if(runtime
 const stores=new Map();
 export function boundRows(store){stores.delete(store);stores.set(store,true);while(stores.size>8){const oldest=stores.keys().next().value;oldest.rows.clear();oldest.rowBytes=0;oldest.hintBytes=0;oldest.readHints=null;stores.delete(oldest);}}
 
-export function kernelMetrics(){return {reader_pool_slots:readerKernel.slots.length,reader_pool_reserved_bytes:readerKernel.reservedBytes,reader_pool_limit_bytes:readerKernel.maxReservedBytes,reader_pool_linear_bytes:readerKernel.memoryBytes(),observation_pool_linear_bytes:snapshotKernel.memoryBytes(),observation_pool_slots:snapshotKernel.slots.length,writer_pool_slots:writerKernel.slots.length,writer_pool_limit_bytes:writerKernel.maxReservedBytes,writer_pool_reserved_bytes:writerKernel.reservedBytes,writer_pool_linear_bytes:writerKernel.memoryBytes(),wasm_pool_linear_bytes:readerKernel.memoryBytes()+standaloneMetadataKernel.memoryBytes()+standaloneBuildKernel.memoryBytes()+snapshotKernel.memoryBytes()+writerKernel.memoryBytes(),runtime_role:runtimeRole,wasm_pool_limit_bytes:roles[runtimeRole][5]*1024*1024,shared_cache_bytes:sharedCache.retainedBytes(),decoded_row_charge_bytes:[...stores.keys()].reduce((n,store)=>n+store.rowBytes+(store.hintBytes??0),0)};}
+export function kernelMetrics(){return {reader_pool_slots:readerKernel.slots.length,reader_pool_reserved_bytes:readerKernel.reservedBytes,reader_pool_limit_bytes:readerKernel.maxReservedBytes,reader_pool_linear_bytes:readerKernel.memoryBytes(),observation_pool_linear_bytes:snapshotKernel.memoryBytes(),observation_pool_slots:snapshotKernel.slots.length,writer_pool_slots:writerKernel.slots.length,writer_pool_limit_bytes:writerKernel.maxReservedBytes,writer_pool_reserved_bytes:writerKernel.reservedBytes,writer_pool_linear_bytes:writerKernel.memoryBytes(),wasm_pool_linear_bytes:readerKernel.memoryBytes()+standaloneMetadataKernel.memoryBytes()+standaloneBuildKernel.memoryBytes()+snapshotKernel.memoryBytes()+writerKernel.memoryBytes(),runtime_role:runtimeRole,wasm_pool_limit_bytes:roles[runtimeRole][5]*1024*1024,shared_cache_bytes:sharedCache.retainedBytes(),shared_metadata_cache_bytes:sharedCache.metadataBytes(),shared_data_cache_bytes:sharedCache.dataBytes(),decoded_row_charge_bytes:[...stores.keys()].reduce((n,store)=>n+store.rowBytes+(store.hintBytes??0),0)};}

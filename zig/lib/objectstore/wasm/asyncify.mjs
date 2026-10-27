@@ -19,7 +19,7 @@ import { ObjectStoreError } from "./r2.mjs";
 import { validatePutBatch, executePutBatch } from "./batch.mjs";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now, refreshClock = () => new Promise(resolve => setTimeout(resolve, 0)) } = {}) {
+export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now, refreshClock = (delayMs = 0) => new Promise(resolve => setTimeout(resolve, delayMs)) } = {}) {
   if (!(module instanceof WebAssembly.Module)) throw new TypeError("a precompiled WebAssembly.Module is required");
   if (!Number.isSafeInteger(stackBytes) || stackBytes < 4096 || stackBytes > 8 * 1024 * 1024) throw new TypeError("invalid suspension stack size");
   let wasm, pending, completed, activeTransport, activeOptions, operations, inferenceCalls, transferred, busy = false, poisoned = false;
@@ -119,20 +119,26 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
     const started = performance.now();
     const manifestCacheHitsBefore=Number(wasm.antfly_host_manifest_cache_hits?.()??0);
     try {
-      // Workers freeze timers in an I/O context. A pooled host may next run in
-      // an older context, even though no wall clock rolled back. Refresh that
-      // context with a timer event BEFORE entering native code or consulting
-      // cached leases. Never clamp time or reset the host's high-water mark:
-      // a regression still present after fresh I/O fails closed as before.
-      const admissionWall = clock();
-      if (admissionWall < lastWall) {
-        clockRegressionMs = lastWall - admissionWall;
+      // A different I/O context can remain a few milliseconds behind even
+      // after a zero-delay timer. Wait for a truthful nonregressing sample;
+      // never clamp wall time, reset authority or extend the request deadline.
+      // Recheck after every suspension as shared immutable I/O can complete in
+      // a context whose frozen clock is older than this host's last sample.
+      const freshClock = async () => {
+        const wall = clock();
+        if (wall >= lastWall) return;
+        const regression = lastWall - wall;
+        clockRegressionMs = Math.max(clockRegressionMs, regression);
+        const delayMs = Math.min(50, Math.ceil(regression) + 1);
         clockRefreshes++;
-        try { await refreshClock(); } catch (error) { invalidClock = true; throw error; }
+        try { await refreshClock(delayMs); } catch (error) { invalidClock = true; throw error; }
         if (clock() < lastWall) invalidClock = true;
-      }
+        if (invalidClock) throw new Error("ManifestReadLeaseExpired");
+      };
+      if(clock()<lastWall)await freshClock();
       requestPtr = allocate(input);
       while (true) {
+        if(clock()<lastWall)await freshClock();
         const result = wasm.antfly_host_request(requestPtr, input.byteLength);
         if (wasm.asyncify_get_state() === 0) {
           if (completed) throw new Error("unconsumed I/O completion");

@@ -1641,3 +1641,35 @@ finite numeric metrics, fixed operation labels, UUID trace IDs and recognized
 error codes. HTTP events, headers, bodies, arbitrary strings and raw CLI stderr
 are discarded before writing. This replaces raw log capture rejected by automatic
 approval review and introduces no credential upload or new approval requirement.
+
+Latest main, including the regular Cloudflare task providers and Gateway option,
+was merged through `a69c0b582e` in `19f4c5226f`. The artifact-store conflict retains
+both hosted body packing and shared namespace identity. The merged native
+serverless target passes 657 tests (six skipped), and `lib-cloudflare-test` passes.
+Its WASM rebuild has new identities, so refreshed ANN/scale evidence is staged
+separately from the still-sealed pre-merge comparisons.
+
+The c732 short pair-1 run completes all 2,052 body/count checks and eight receipt
+replays on each side with zero final HTTP/resource errors. Candidate read/write
+p95 is 1,426/2,755 ms versus control 5,986/7,337 ms. It remains a five-minute
+comparison with reads above target. The c732 full pair-3 trial accumulated final
+transport failures and was interrupted: its original snapshot is archived before
+annotation, with all cold epochs preserved. Pair 2 subsequently exhausted the
+unchanged setup deadline because control publication did not converge. These
+reports remain failed or incomplete evidence.
+
+New actual-workerd and host fixtures reproduce the remaining runtime-actor
+context leak and small frozen-clock gaps. The candidate fixes preserve the
+approved control `8a61f42df8`, resource budgets and numerical thresholds. The
+merged candidate with those fixes and the partitioned cache passes 226 Node and
+15 persisted Worker checks. The provider guide and Worker README now distinguish
+regular provider configuration from the typed binding bridge and link the shared
+contracts. Extra live model availability or extra WASM task bridges are not
+inferred from the merge or these fixtures.
+
+Both refreshed ANN workloads pass the unchanged paired checks: 10,000 synthetic
+vectors and 1,000 model embeddings, at 8, 32 and exhaustive probes. Recall is
+unchanged, exhaustive recall is one, and R2 GETs and bytes do not exceed the
+original control. At exhaustive synthetic search, average GETs fall from 170.7
+to 140.3; the model workload at eight probes transfers 1,029,942 bytes versus
+1,116,461. These local reports are separate from the pre-merge live trials.

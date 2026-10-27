@@ -44,7 +44,13 @@ class RuntimeActor extends DurableObject {
   return new Promise((resolve,reject)=>{
    const trace=this.role==="reader"?new CriticalPath({id:traceMeta?.trace_id,scope:"actor:reader"}):null;
    const preparation=trace?prepareReadAdmission(this.runtimeEnv,input,trace,this.readViews).then(value=>({value}),error=>({error})):null;
-   this.pendingBytes+=bytes;this.pending.push({input,collection,traceId:traceMeta?.trace_id,trace,preparation,bytes,resolve,reject,at:Date.now(),deadline:Date.now()+30000,release});this.drain();
+   let admit;const admitted=new Promise(start=>admit=start),job={input,collection,traceId:traceMeta?.trace_id,trace,preparation,bytes,at:Date.now(),deadline:Date.now()+30000,release,admit:()=>admit()};
+   admitted.then(async()=>{
+    let outcome;try{outcome=await this.executeAdmitted(job);}catch(error){outcome={error};}
+    // Future work must enter its own caller context before this RPC can end.
+    this.running--;this.drain();outcome.error?reject(outcome.error):resolve(outcome.value);
+   });
+   this.pendingBytes+=bytes;this.pending.push(job);this.drain();
   });
  }
  drain(){
@@ -52,7 +58,7 @@ class RuntimeActor extends DurableObject {
   while(this.pending.length&&this.running<capacity){
    let index=0;if(this.role==="builder"){const urgent=this.pending.findIndex(job=>["publish","enrich"].includes(job.input.op));if(urgent>=0&&Date.now()-this.pending[0].at<5000)index=urgent;}
    const job=this.pending.splice(index,1)[0];this.running++;
-   this.executeAdmitted(job).finally(()=>{this.running--;this.drain();});
+   job.admit();
   }
  }
  async executeAdmitted(job){
@@ -62,8 +68,8 @@ class RuntimeActor extends DurableObject {
    const prepared=job.preparation?await job.preparation:null;if(prepared?.error)throw prepared.error;
    if(Date.now()>=job.deadline)throw new Error("DeadlineExceeded");
    const result=await this.perform(job.input,job.collection,AbortSignal.timeout(Math.max(1,job.deadline-Date.now())),trace,prepared?.value);
-   job.resolve(result);
-  }catch(error){trace.error("execute",error);job.reject(error);}
+   return{value:result};
+  }catch(error){trace.error("execute",error);return{error};}
   finally{this.pendingBytes-=job.bytes;job.release();trace.emit(this.runtimeEnv.LOG_METRICS==="true");}
  }
  perform(input,collection,signal,trace,readAdmission){

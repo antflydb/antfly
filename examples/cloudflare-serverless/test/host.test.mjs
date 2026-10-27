@@ -952,3 +952,15 @@ test("pooled host refreshes an older I/O context before native entry without ext
  await failed.request(request("count"));now--;
  await assert.rejects(failed.request(request("count")),/clock refresh failed/);assert.equal(failed.usable(),false);
 });
+
+
+test("pooled host waits out small frozen clock gaps at admission and I/O resumption",async()=>{
+ let now=10000;const waits=[],bucket=new Bucket(),{host,transport}=await setup(bucket,undefined,{clock:()=>now,refreshClock:async delay=>{waits.push(delay);now+=delay;}});
+ const accepted=await host.request(request('mutate',{operation_id:'small-clock-gap',mutations:[{kind:'upsert',doc_id:'a',body:'{"text":"gap"}'}]}));await host.request(request('publish'));await host.request(request('count'));
+ now-=5;assert.equal((await host.request(request('count'))).count,'1');assert.equal(waits[0],6);assert.ok(host.usable());
+ let shifted=false;const before=waits.length,result=await host.request(request('lookup',{doc_id:'a',required_visibility:accepted.visibility}),{transport:async(req,body)=>{const value=await transport(req,body);if(!shifted&&req.op==='get'){shifted=true;now-=3;}return value;}});
+ assert.equal(JSON.parse(result.body).text,'gap');assert.ok(shifted);assert.ok(waits.length>before);assert.ok(waits.every(delay=>delay>=1&&delay<=50));assert.ok(host.usable());assert.equal((await host.request(request('mutate',{operation_id:'small-clock-gap',mutations:[{kind:'upsert',doc_id:'a',body:'{"text":"gap"}'}]}))).visibility,accepted.visibility);
+});
+test("pooled host rejects a clock still behind after bounded fresh I/O",async()=>{
+ let now=10000;const waits=[],{host}=await setup(new Bucket(),undefined,{clock:()=>now,refreshClock:async delay=>waits.push(delay)});await host.request(request('mutate',{operation_id:'clock-rollback',mutations:[{kind:'upsert',doc_id:'a',body:'{"text":"clock"}'}]}));await host.request(request('publish'));await host.request(request('count'));now-=1000;await assert.rejects(host.request(request('count')),/ManifestReadLeaseExpired/);assert.deepEqual(waits,[50]);assert.equal(host.usable(),false);
+});
