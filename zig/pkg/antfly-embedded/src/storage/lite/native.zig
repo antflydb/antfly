@@ -527,6 +527,81 @@ test "lite coordinated data readers retain their coordinator after writer shutdo
     try std.testing.expectEqualStrings("retained", value);
 }
 
+test "lite allocator proof read window coalesces IO and still rejects corrupt value pages" {
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (checked.deinit() != 0) @panic("allocator proof fixture leaked allocations");
+    const a = checked.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "proof-read-window.aflite");
+    defer a.free(path);
+    const value = try a.alloc(u8, 64 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    {
+        var owner = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer owner.close();
+        var keys: [32][16]u8 = undefined;
+        var mutations: [32]DocumentMutation = undefined;
+        for (&mutations, &keys, 0..) |*mutation, *key, i| mutation.* = .{
+            .key = try std.fmt.bufPrint(key, "value-{d:0>4}", .{i}),
+            .value = value,
+        };
+        try owner.putDocumentBatch(&mutations);
+    }
+    var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    file.page_cache_enabled.store(false, .monotonic);
+    const checkpoint = file.activeCheckpoint();
+    const state = try file.loadLedger(checkpoint);
+    file.test_backing_read_calls.store(0, .monotonic);
+    file.test_page_reads.store(0, .monotonic);
+    try std.testing.expectEqual(@as(u64, 32), try file.validateIndexedAllocator(checkpoint, state, null));
+    const physical = file.test_backing_read_calls.load(.monotonic);
+    const logical = file.test_page_reads.load(.monotonic);
+    try std.testing.expect(logical > 512);
+    if (physical * 8 >= logical) std.debug.print("allocator proof backing reads={d} logical pages={d}\n", .{ physical, logical });
+    try std.testing.expect(physical * 8 < logical);
+    try std.testing.expect(file.allocator_proof_window == null);
+    {
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 4, .hard_limit_bytes = 8 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        const previous = file.page_cache.resource_manager;
+        file.page_cache.resource_manager = &manager;
+        defer file.page_cache.resource_manager = previous;
+        // Less than one page of optional scratch admission must fall back to
+        // ordinary reads, with the same complete proof and no reservation leak.
+        file.test_backing_read_calls.store(0, .monotonic);
+        try std.testing.expectEqual(@as(u64, 32), try file.validateIndexedAllocator(checkpoint, state, null));
+        try std.testing.expect(file.test_backing_read_calls.load(.monotonic) > physical);
+        try std.testing.expect(file.allocator_proof_window == null);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
+    }
+
+    const reference = (try file.lookupDocumentIndexPage(checkpoint, "value-0000")).?;
+    const raw_record = try file.readPageAlloc(a, reference);
+    defer a.free(raw_record);
+    const record = try decodeDocumentEntry(try decodePagePayload(raw_record, .document));
+    const root = record.external_value_root_page;
+    try std.testing.expect(root != 0);
+    {
+        // A positive count passes checkpoint liveness but must still match
+        // the exact active graph ownership, even when that graph is reused.
+        const references = state.count(root);
+        state.counts.items[@intCast(root)] = references + 1;
+        defer state.counts.items[@intCast(root)] = references;
+        try std.testing.expectError(error.InvalidNativeAllocator, file.validateIndexedAllocator(checkpoint, state, null));
+        try std.testing.expect(file.allocator_proof_window == null);
+    }
+    const raw_value = try file.readPageAlloc(a, root);
+    defer a.free(raw_value);
+    raw_value[page_header_size] ^= 1;
+    try file.file.writePositionalAll(std.testing.io, raw_value, root * @as(u64, file.header.page_size));
+    try std.testing.expectError(error.NativePageChecksumMismatch, file.validateIndexedAllocator(checkpoint, state, null));
+    try std.testing.expect(file.allocator_proof_window == null);
+}
+
 test "lite allocator packed graph proof reads physical bundles rather than individual records" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3625,6 +3700,7 @@ pub const NativeFile = struct {
     /// `validateReachableFreeMap`) always re-verifies regardless of this
     /// flag, for explicit integrity audits.
     free_pages_verified: bool = false,
+    allocator_proof_window: ?*AllocatorProofWindow = null,
     // Structural scaling assertions count page operations, independent of
     // filesystem speed and cache warmth. No counters exist in production.
     // Exact backing-file page reads, after shared and cursor-local caches.
@@ -3934,6 +4010,18 @@ pub const NativeFile = struct {
     /// this file's allocator. Keep the reader at a stable address because its
     /// page-cache reclamation callbacks can borrow it while the walk runs.
     pub fn allocatorVerificationSnapshot(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !*NativeFile {
+        const reader = try self.captureAllocatorVerificationSnapshot(cancel);
+        errdefer {
+            reader.close();
+            self.allocator.destroy(reader);
+        }
+        try reader.completeAllocatorVerification();
+        return reader;
+    }
+
+    /// Capture only the immutable header/inode fence. The caller can release
+    /// its foreground gate before walking the protected page graphs.
+    pub fn captureAllocatorVerificationSnapshot(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !*NativeFile {
         if (cancel) |token| try token.check();
         const reader = try self.allocator.create(NativeFile);
         errdefer self.allocator.destroy(reader);
@@ -3943,18 +4031,23 @@ pub const NativeFile = struct {
         reader.allocator_cancel_token = cancel;
         if (!std.meta.eql(self.header, reader.header) or
             (try self.file.stat(self.runtime())).inode != (try reader.file.stat(reader.runtime())).inode) return error.EnrichmentWaitCanceled;
-        const checkpoint = reader.activeCheckpoint();
-        if (reader.header.indexed_reclamation) {
-            const state = try reader.loadLedger(checkpoint);
-            if (checkpoint.free_map_root_page != 0) _ = try reader.validateIndexedAllocator(checkpoint, state, cancel);
+        return reader;
+    }
+
+    pub fn completeAllocatorVerification(self: *NativeFile) !void {
+        const cancel = self.allocator_cancel_token;
+        if (cancel) |token| try token.check();
+        const checkpoint = self.activeCheckpoint();
+        if (self.header.indexed_reclamation) {
+            const state = try self.loadLedger(checkpoint);
+            if (checkpoint.free_map_root_page != 0) _ = try self.validateIndexedAllocator(checkpoint, state, cancel);
         } else {
-            const pages = try reader.readFreePagesAlloc(checkpoint);
-            defer reader.allocator.free(pages);
-            try reader.validateFreePagesSafeForCheckpointSlots(pages);
+            const pages = try self.readFreePagesAlloc(checkpoint);
+            defer self.allocator.free(pages);
+            try self.validateFreePagesSafeForCheckpointSlots(pages);
         }
         if (cancel) |token| try token.check();
-        reader.free_pages_verified = true;
-        return reader;
+        self.free_pages_verified = true;
     }
 
     fn headerFingerprint(self: *NativeFile) [32]u8 {
@@ -4179,11 +4272,7 @@ pub const NativeFile = struct {
         return graph;
     }
 
-    fn validateIndexedOwnership(self: *NativeFile, checkpoint: CheckpointSlot, state: *allocator_v4.State, cancel: ?*const maintenance.CancelToken) !void {
-        var expected = allocator_v4.State.init(self.allocator);
-        defer expected.deinit();
-        var graph = try self.indexedGraph(checkpoint, &expected, cancel);
-        defer graph.deinit(self.allocator);
+    fn validateIndexedOwnership(self: *NativeFile, checkpoint: CheckpointSlot, state: *allocator_v4.State, graph: *IndexedGraph, expected: *allocator_v4.State, cancel: ?*const maintenance.CancelToken) !void {
         var current_metadata: ReachablePageSet = .empty;
         defer current_metadata.deinit(self.allocator);
         for (state.metadata.items) |page| {
@@ -4197,13 +4286,13 @@ pub const NativeFile = struct {
             if (cancel) |token| try token.check();
             if (item.kind != .record and physicalPage(item.page) != item.page) return error.InvalidNativeAllocator;
             if (item.epoch > checkpoint.commit_sequence) return error.InvalidNativeAllocator;
-            try self.indexedMark(&graph, checkpoint, item.page);
+            try self.indexedMark(graph, checkpoint, item.page);
             switch (item.kind) {
                 .allocator_chain => {
                     var page = item.page;
                     while (page != 0) {
                         if (cancel) |token| try token.check();
-                        try self.indexedMark(&graph, checkpoint, page);
+                        try self.indexedMark(graph, checkpoint, page);
                         if (state.count(page) != 0 or page == state.root_page or metadata_retirements.contains(page) or current_metadata.contains(page)) return error.InvalidNativeAllocator;
                         try metadata_retirements.put(self.allocator, page, {});
                         const next = try self.retiredAllocatorNext(page, checkpoint);
@@ -4215,7 +4304,7 @@ pub const NativeFile = struct {
                     try metadata_retirements.put(self.allocator, item.page, {});
                 },
                 .page => try expected.retain(item.page),
-                .value => try self.indexedValue(&graph, checkpoint, item.page, item.length, cancel),
+                .value => try self.indexedValue(graph, checkpoint, item.page, item.length, cancel),
                 .index => {
                     if (graph.nodes.contains(item.page)) return error.InvalidNativeAllocator;
                     try graph.nodes.put(self.allocator, item.page, {});
@@ -4225,7 +4314,7 @@ pub const NativeFile = struct {
                     var node = try decodeDocumentIndexNode(self.allocator, payload);
                     defer node.deinit(self.allocator);
                     for (node.key_pages.?) |key_page| if (key_page != 0) {
-                        try self.indexedMark(&graph, checkpoint, key_page);
+                        try self.indexedMark(graph, checkpoint, key_page);
                         try expected.retain(key_page);
                     };
                 },
@@ -4246,7 +4335,7 @@ pub const NativeFile = struct {
                         },
                         else => return error.InvalidNativeAllocator,
                     };
-                    if (root != 0) try self.indexedValue(&graph, checkpoint, root, length, cancel);
+                    if (root != 0) try self.indexedValue(graph, checkpoint, root, length, cancel);
                 },
             }
         }
@@ -4266,12 +4355,22 @@ pub const NativeFile = struct {
     }
 
     fn validateIndexedAllocator(self: *NativeFile, checkpoint: CheckpointSlot, state: *allocator_v4.State, cancel: ?*const maintenance.CancelToken) !u64 {
+        var window: AllocatorProofWindow = undefined;
+        window.initInto(self);
+        defer window.deinit();
+        if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
         var active_records: u64 = 0;
+        var validated_active = false;
         for (self.header.checkpoints, 0..) |slot, index| {
             if (!validCheckpointSlot(slot)) continue;
-            var graph = try self.indexedGraph(slot, null, cancel);
+            const active = index == self.header.active_checkpoint;
+            var expected = allocator_v4.State.init(self.allocator);
+            defer expected.deinit();
+            // Retain the active graph's exact reference counts during its
+            // liveness walk instead of reading and checking every page again.
+            var graph = try self.indexedGraph(slot, if (active) &expected else null, cancel);
             defer graph.deinit(self.allocator);
-            if (index == self.header.active_checkpoint) active_records = graph.record_count;
+            if (active) active_records = graph.record_count;
             var pages = graph.pages.keyIterator();
             while (pages.next()) |page| {
                 if (cancel) |token| try token.check();
@@ -4289,9 +4388,13 @@ pub const NativeFile = struct {
                 if (cancel) |token| try token.check();
                 if (state.count(page) == allocator_v4.free) return error.InvalidNativeAllocator;
             }
+            if (active) {
+                if (!std.meta.eql(slot, checkpoint)) return error.InvalidNativeAllocator;
+                try self.validateIndexedOwnership(checkpoint, state, &graph, &expected, cancel);
+                validated_active = true;
+            }
         }
-        if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
-        try self.validateIndexedOwnership(checkpoint, state, cancel);
+        if (!validated_active) return error.InvalidNativeAllocator;
         return active_records;
     }
 
@@ -4862,7 +4965,73 @@ pub const NativeFile = struct {
         return page;
     }
 
+    /// A proof still validates every referenced page and both checkpoint
+    /// graphs. Its short-lived read window only coalesces backing I/O; it is
+    /// discarded before any publication can mutate this file.
+    const AllocatorProofWindow = struct {
+        file: *NativeFile,
+        buffer: ?[]u8 = null,
+        reservation: ?resource_manager_mod.Reservation = null,
+        offset: u64 = 0,
+        length: usize = 0,
+        limit: u64 = 0,
+
+        fn initInto(self: *@This(), file: *NativeFile) void {
+            self.* = .{ .file = file };
+            if (file.allocator_proof_window != null) return;
+            const size = (file.file.stat(file.runtimeIo()) catch return).size;
+            var capacity: usize = @intCast(@min(size, 1024 * 1024));
+            if (file.page_cache.resource_manager) |manager| {
+                self.reservation = manager.reserveAtMostWithoutReclaim(.lite_native_page_cache, capacity) catch return;
+                capacity = @intCast(@min(capacity, self.reservation.?.reservedBytes()));
+            }
+            capacity -= capacity % file.header.page_size;
+            if (capacity == 0) return;
+            // Optional acceleration must not turn allocator/cache admission
+            // failure into failure of an otherwise valid bounded proof.
+            self.buffer = file.allocator.alloc(u8, capacity) catch {
+                if (self.reservation) |*reservation| reservation.release();
+                self.reservation = null;
+                return;
+            };
+            self.limit = size;
+            file.allocator_proof_window = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            if (self.buffer) |buffer| {
+                std.debug.assert(self.file.allocator_proof_window == self);
+                self.file.allocator_proof_window = null;
+                self.file.allocator.free(buffer);
+            }
+            if (self.reservation) |*reservation| reservation.release();
+        }
+
+        fn read(self: *@This(), out: []u8, offset: u64) !bool {
+            const buffer = self.buffer.?;
+            if (out.len > buffer.len or offset > self.limit or out.len > self.limit - offset) return false;
+            if (self.length == 0 or offset < self.offset or offset - self.offset > self.length or
+                out.len > self.length - @as(usize, @intCast(offset - self.offset)))
+            {
+                const start = offset / buffer.len * buffer.len;
+                const count: usize = @intCast(@min(buffer.len, self.limit - start));
+                if (out.len > count - @as(usize, @intCast(offset - start))) return false;
+                try self.file.readBackingPagesUncached(buffer[0..count], start);
+                self.offset = start;
+                self.length = count;
+            }
+            const begin: usize = @intCast(offset - self.offset);
+            @memcpy(out, buffer[begin..][0..out.len]);
+            return true;
+        }
+    };
+
     fn readBackingPages(self: *NativeFile, out: []u8, offset: u64) !void {
+        if (self.allocator_proof_window) |window| if (try window.read(out, offset)) return;
+        try self.readBackingPagesUncached(out, offset);
+    }
+
+    fn readBackingPagesUncached(self: *NativeFile, out: []u8, offset: u64) !void {
         if (builtin.is_test) {
             _ = self.test_backing_read_calls.fetchAdd(1, .monotonic);
             _ = self.test_backing_read_bytes.fetchAdd(out.len, .monotonic);
@@ -9212,6 +9381,9 @@ pub const NativeFile = struct {
     }
 
     fn validateFreePagesSafeForCheckpointSlots(self: *NativeFile, free_pages: []const u64) !void {
+        var window: AllocatorProofWindow = undefined;
+        window.initInto(self);
+        defer window.deinit();
         // Append-only writes have nothing to reclaim. Walking both checkpoint
         // graphs here makes each small catalog write proportional to history.
         // Nonempty free maps still require the full protected-page proof.

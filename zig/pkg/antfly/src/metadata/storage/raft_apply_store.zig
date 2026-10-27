@@ -28285,6 +28285,9 @@ pub const RaftApplyStore = struct {
         extension_dependency,
         shuffle_join_lease,
         restore_job,
+        job_state,
+        job_owner,
+        job_schedule,
         backup_cohort,
         backup_cohort_progress,
         backup_cohort_lock,
@@ -28337,6 +28340,9 @@ pub const RaftApplyStore = struct {
         .{ .projection = .schema_validation_dependency, .key = .{ .prefix = @import("../schema_validation_dependencies.zig").prefixForGroup } },
         .{ .projection = .sql_column_identities, .key = .{ .prefix = column_identities.prefixForGroup } },
         .{ .projection = .sql_sequence_counters, .key = .{ .prefix = sql_sequences.journal.prefixForGroup } },
+        .{ .projection = .job_state, .key = .{ .prefix = jobStatePrefixForGroup } },
+        .{ .projection = .job_owner, .key = .{ .prefix = jobOwnerPrefixForGroup } },
+        .{ .projection = .job_schedule, .key = .{ .prefix = jobSchedulePrefixForGroup } },
         .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
@@ -28490,6 +28496,7 @@ pub const RaftApplyStore = struct {
             .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
             .upsert_restore_job, .create_restore_job, .remove_restore_job, .remove_restore_jobs, .remove_restore_job_if_matches => metadataSnapshotProjectionBit(.restore_job),
             .create_restore_job_with_staging => metadataSnapshotProjectionBit(.restore_job) | metadataSnapshotProjectionBit(.restore_staging),
+            .compare_and_set_job_state => metadataSnapshotProjectionBit(.job_state) | metadataSnapshotProjectionBit(.job_owner) | metadataSnapshotProjectionBit(.job_schedule),
             .compare_and_set_backup_cohort => metadataSnapshotProjectionBit(.backup_cohort) | metadataSnapshotProjectionBit(.backup_cohort_progress) | metadataSnapshotProjectionBit(.backup_cohort_lock),
             .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request) |
                 metadataSnapshotProjectionBit(.reallocation_request_pending),
@@ -55527,6 +55534,10 @@ test "metadata durable job state CAS rejects stale owners across replay and reop
     try std.testing.expectError(error.InvalidDocumentCheckpoint, encodeTransitionCommand(a, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = "short", .value = "x" } }));
 }
 
+fn jobOwnerPrefixForGroup(buf: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:job_owner:{d}:", .{group});
+}
+
 fn jobOwnerKeyForGroup(buf: []u8, group: u64, owner: []const u8) ![]const u8 {
     const hash = @import("../job_state.zig").digest(owner);
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:job_owner:{d}:{s}", .{ group, std.fmt.bytesToHex(&hash, .lower) });
@@ -55602,4 +55613,60 @@ test "metadata durable job state keeps quotas and due indexes atomic and paged" 
     defer after.deinit();
     for (after.value.rows) |row| try std.testing.expect(!std.mem.eql(u8, row.key, "documents/bounded-0"));
     try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, "../bad-cursor"));
+}
+
+test "metadata durable job state snapshot retains scheduling quotas and group isolation" {
+    const a = std.testing.allocator;
+    const contract = @import("../job_state.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/job-snapshot", .{tmp.sub_path});
+    defer a.free(root);
+    const target_root = try std.fmt.allocPrint(a, "{s}-target", .{root});
+    defer a.free(target_root);
+    var source = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer source.deinit();
+    var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+    defer target.deinit();
+    const queued = "{\"owner\":\"alice\",\"state\":\"queued\"}";
+    const finished = "{\"owner\":\"bob\",\"state\":\"succeeded\",\"expires_at_ms\":1}";
+    for ([_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "documents/active", .value = queued },
+        .{ .key = "documents/finished", .value = finished },
+    }) |row| try source.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = row.key, .expected_hash = "", .value = row.value } });
+    try target.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = "documents/stale", .expected_hash = "", .value = queued } });
+    try target.applyStandaloneCommand(42, .{ .compare_and_set_job_state = .{ .key = "documents/neighbor", .expected_hash = "", .value = queued } });
+    const snapshot = try source.snapshotBuilder().buildSnapshot(a, 41);
+    defer a.free(snapshot);
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, 41, 100, snapshot));
+    try std.testing.expect((try target.getJobState(a, 41, "documents/stale")) == null);
+    for ([_]*RaftApplyStore{ &source, &target }) |reader| {
+        const active = (try reader.getJobState(a, 41, "documents/active")).?;
+        defer a.free(active);
+        try std.testing.expectEqualStrings(queued, active);
+        try std.testing.expectEqual(@as(u64, 1), try reader.getJobOwnerCount(a, 41, "alice"));
+        try std.testing.expectEqual(@as(u64, 0), try reader.getJobOwnerCount(a, 41, "bob"));
+        const bytes = try reader.scanJobState(a, 41, null);
+        defer a.free(bytes);
+        var page = try std.json.parseFromSlice(contract.Page, a, bytes, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 2), page.value.rows.len);
+        try std.testing.expectEqualStrings("documents/active", page.value.rows[0].key);
+        try std.testing.expectEqualStrings("documents/finished", page.value.rows[1].key);
+    }
+    const neighbor = (try target.getJobState(a, 42, "documents/neighbor")).?;
+    defer a.free(neighbor);
+    try std.testing.expectEqualStrings(queued, neighbor);
+    try std.testing.expectEqual(@as(u64, 1), try target.getJobOwnerCount(a, 42, "alice"));
+    // A restored scheduler must still atomically release quota and retire its
+    // due row when a worker completes the active job.
+    const hash = contract.digest(queued);
+    try target.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = "documents/active", .expected_hash = &hash, .value = "{\"owner\":\"alice\",\"state\":\"succeeded\"}" } });
+    try std.testing.expectEqual(@as(u64, 0), try target.getJobOwnerCount(a, 41, "alice"));
+    const remaining = try target.scanJobState(a, 41, null);
+    defer a.free(remaining);
+    var page = try std.json.parseFromSlice(contract.Page, a, remaining, .{});
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
+    try std.testing.expectEqualStrings("documents/finished", page.value.rows[0].key);
 }

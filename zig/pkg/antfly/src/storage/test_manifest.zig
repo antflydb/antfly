@@ -247,6 +247,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_chunker;
     _ = @import("antfly_local_sources").storage_db_enrichment_chunker_stub;
     _ = @import("antfly_local_sources").storage_db_enrichment_config_validation;
+    _ = @import("antfly_local_sources").storage_db_enrichment_document_checkpoints;
     _ = @import("antfly_local_sources").storage_db_enrichment_vector_label_cache;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_extraction;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_unit_fingerprint;

@@ -6880,6 +6880,124 @@ test "capi SQL conflict owner probes leave unrelated namespaces unopened" {
     try std.testing.expect(!root.embedded_tables.contains("unrelated"));
 }
 
+test "capi native idle maintenance verifies allocator outside connection and writer gates" {
+    const a = std.testing.allocator;
+    const native = @import("antfly_local_sources").storage_lite_native;
+    inline for (.{ false, true }) |cancel| {
+        var directory = try TestDirectory.init("capi-allocator-proof-gates");
+        defer directory.cleanup();
+        const path = try tempTestAflitePath(a, directory.path(), "database");
+        defer a.free(path);
+        defer cleanupTestFile(path);
+        var options: capi.OpenOptions = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+        options.storage_kind = capi.storage_kind_lite;
+        options.profile = capi.profile_hosted;
+        var handle: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+        defer antfly_db_close(handle);
+        const owner = blk: {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+            break :blk guard.connection.?.owner;
+        };
+        const Owner = @TypeOf(owner.*);
+        const Probe = struct {
+            owner: *Owner,
+            calls: usize = 0,
+            failure: ?anyerror = null,
+            fn notify(ptr: *anyopaque, _: *native.NativeFile) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+                if (!self.owner.gate.mutex.tryLock()) {
+                    self.failure = error.TestUnexpectedResult;
+                    return;
+                }
+                self.owner.gate.mutex.unlock(shared.handleLockIo());
+                var lease = native.lockWriterPathWithIo(std.testing.allocator, shared.handleLockIo(), self.owner.path) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                lease.close();
+                if (cancel) self.owner.verification_cancel.request();
+            }
+        };
+        var probe: Probe = .{ .owner = owner };
+        owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
+        defer owner.test_after_allocator_capture = null;
+        if (cancel) {
+            try std.testing.expectError(error.MaintenanceCanceled, owner.maintenanceTurnForTest());
+        } else {
+            try std.testing.expect(try owner.maintenanceTurnForTest());
+        }
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        const guard = public.enterHandle(handle, .read).?;
+        defer guard.leave();
+        try std.testing.expectEqual(!cancel, guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+        try std.testing.expectEqual(@as(usize, 0), guard.handle.maintenance_references);
+    }
+}
+
+test "capi SQL staged transcript upserts keep large values and unrelated namespaces lazy" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-transcript-upserts");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE threads(id TEXT PRIMARY KEY, title TEXT)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE history(id TEXT PRIMARY KEY, body TEXT)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE unrelated(id TEXT PRIMARY KEY)");
+    try sqlFkRecoveryStatement(handle, "INSERT INTO history(id,body) VALUES ('existing','old')");
+    try sqlRefreshCleanGeneration(handle);
+
+    var session: u64 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, struct {
+        extern fn antfly_db_sql_session_open(?*anyopaque, *u64) capi.ErrorCode;
+    }.antfly_db_sql_session_open(handle, &session));
+    try sqlSessionStatement(handle, session, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    try sqlSessionStatement(handle, session, "INSERT INTO threads(id,title) VALUES ('thread','transcript') ON CONFLICT(id) DO UPDATE SET title=excluded.title");
+    // #1304 combines a value larger than 1 MiB with conflict resolution after
+    // another table has staged writes. That path needs the complete metadata
+    // catalog, but must not construct unrelated table/index runtimes.
+    const body = try a.alloc(u8, 1024 * 1024 + 128 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    const statement = try std.fmt.allocPrint(a, "INSERT INTO history(id,body) VALUES ('existing','{s}') ON CONFLICT(id) DO UPDATE SET body=excluded.body", .{body});
+    defer a.free(statement);
+    try sqlSessionStatement(handle, session, statement);
+    try sqlSessionStatement(handle, session, "INSERT INTO history(id,body) VALUES ('new','tail') ON CONFLICT(id) DO UPDATE SET body=excluded.body");
+    try sqlSessionStatement(handle, session, "COMMIT");
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expectEqual(@as(usize, 2), guard.handle.embedded_tables.count());
+        try std.testing.expect(guard.handle.embedded_tables.contains("threads"));
+        try std.testing.expect(guard.handle.embedded_tables.contains("history"));
+        try std.testing.expect(!guard.handle.embedded_tables.contains("unrelated"));
+        try std.testing.expect(!guard.handle.embedded_tables_discovered);
+    }
+    // Reopening the generation must retain the complete large conflict update.
+    try sqlRefreshCleanGeneration(handle);
+    var response: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("{\"statement\":\"SELECT body FROM history WHERE id='existing'\"}"), &response));
+    defer freeRawBuffer(response.ptr, response.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.ptr.?[0..response.len], .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings(body, rows[0].array.items[0].string);
+}
+
 test "capi SQL refreshed generations retain complete FK catalogs and unqualified indexes" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-refreshed-integrity");
@@ -7879,6 +7997,56 @@ test "capi SQL runtime refresh fences serving inputs while reusing lease and sha
         else
             try std.testing.expect(before != after);
     }
+}
+
+test "capi graph replacement retains indexed serving edges across deferred reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-replacement-visible-reopen");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    // A manual owner makes the source visibility and unfinished replacement
+    // deterministic, rather than racing a background replay or using sleeps.
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"old","kind":"graph","edge_types":[{"name":"links","field":"links"}]}
+    )));
+    var inserted: capi.Buffer = .{};
+    // No-gap replacement preserves the old generation's visible contents.
+    // A write-only receipt does not establish that those contents are indexed.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .fromSlice(
+        \\{"inserts":{"a":{"links":["b"]},"b":{}},"sync_level":"full_index"}
+    ), &inserted));
+    freeRawBuffer(inserted.ptr, inserted.len);
+    antfly_db_close(handle);
+    handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","kind":"graph","replaces":"old","edge_types":[{"name":"links","field":"links"}]}
+    )));
+    {
+        const guard = public.enterHandle(handle, .read).?;
+        defer guard.leave();
+        try std.testing.expect(guard.handle.database().core.index_manager.get("old") != null);
+        try std.testing.expect(guard.handle.database().core.index_manager.get("new") == null);
+    }
+    var response: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(handle, .fromSlice(
+        \\{"graph_queries":{"q":{"index":"old","traverse":{"start":{"keys":["a"]},"direction":"out","edge_types":["links"],"max_depth":1,"limit":10}}},"limit":1}
+    ), &response));
+    defer freeRawBuffer(response.ptr, response.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.ptr.?[0..response.len], .{});
+    defer parsed.deinit();
+    const nodes = parsed.value.object.get("responses").?.array.items[0].object.get("graph_results").?.object.get("q").?.object.get("nodes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), nodes.len);
+    try std.testing.expectEqualStrings("b", nodes[0].object.get("key").?.string);
 }
 
 test "capi native replacement wait observes its background owner without rebuilding" {
