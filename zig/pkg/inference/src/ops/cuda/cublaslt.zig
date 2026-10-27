@@ -245,6 +245,9 @@ const AttentionPlan = struct {
 pub const CublasLt = struct {
     // Immutable serving policy, scoped by the owning CUDA model profile.
     florence_canonical_f16_decode: bool = false,
+    lighton_canonical_gdn_decode: bool = false,
+    canonical_gdn_calls: usize = 0,
+    canonical_gdn_plans: usize = 0,
     canonical_f16_calls: usize = 0,
     canonical_f16_plans: usize = 0,
     canonical_f16_declines: usize = 0,
@@ -559,7 +562,7 @@ pub const CublasLt = struct {
         bias: ?buffer_mod.DeviceBuffer,
         residual: ?buffer_mod.DeviceBuffer,
     ) Error!MatmulSelection {
-        const canonical_decode = self.canonicalDecodeRows(kind, input_type, output_type, 1, rows, tuning) != 0;
+        const canonical_decode = input_type == CUDA_R_16F and self.canonicalDecodeRows(kind, input_type, output_type, 1, rows, in_dim, out_dim, tuning) != 0;
         // Count the entire invocation's failure, including validation, capture
         // misses, descriptor/probe discovery and a rejected actual submission.
         // Nested descriptor-only probes do not represent another invocation.
@@ -656,7 +659,13 @@ pub const CublasLt = struct {
         return plan.selection;
     }
 
-    fn canonicalDecodeRows(self: *const CublasLt, kind: TensorCorePlanKind, input_type: c_int, output_type: c_int, batch_count: usize, rows: usize, tuning: MatmulTuning) u32 {
+    fn canonicalDecodeRows(self: *const CublasLt, kind: TensorCorePlanKind, input_type: c_int, output_type: c_int, batch_count: usize, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) u32 {
+        // Query a descriptor at M128, but execute only the real rows. GB10's
+        // M65..127 heuristic for the 0.8B GDN projection can select a slower
+        // tile. AlgoCheck below still validates the exact original layouts.
+        if (self.lighton_canonical_gdn_decode and kind == .dense and input_type == CUDA_R_16BF and
+            output_type == CUDA_R_32F and batch_count == 1 and rows >= 65 and rows <= 128 and
+            in_dim == 1024 and out_dim == 6144 and !tuning.enabled) return 128;
         return if (self.florence_canonical_f16_decode and input_type == CUDA_R_16F and output_type == CUDA_R_32F and
             (kind == .dense or kind == .dense_bias) and batch_count == 1 and rows >= 1 and rows <= 64 and !tuning.enabled) 32 else 0;
     }
@@ -696,9 +705,11 @@ pub const CublasLt = struct {
             .alignment_c_bytes = cappedPointerAlignment(invocation.dst.ptr),
             .alignment_d_bytes = @min(cappedPointerAlignment(invocation.dst.ptr), cappedPointerAlignment(if (invocation.bias) |value| value.ptr else invocation.dst.ptr)),
             .tuning_fingerprint = effective_tuning.fingerprint(),
-            .canonical_rows = self.canonicalDecodeRows(kind, input_type, output_type, batch_count, rows, effective_tuning),
+            .canonical_rows = self.canonicalDecodeRows(kind, input_type, output_type, batch_count, rows, in_dim, out_dim, effective_tuning),
         };
-        if (key.canonical_rows != 0) self.canonical_f16_calls += 1;
+        if (key.canonical_rows != 0) {
+            if (key.input_type == CUDA_R_16BF) self.canonical_gdn_calls += 1 else self.canonical_f16_calls += 1;
+        }
 
         // Keep the steady-state path to one short plan-map lookup. The much
         // longer tuning mutex is taken only after a cache miss, then the map
@@ -829,10 +840,10 @@ pub const CublasLt = struct {
 
         var heuristics: [maximum_matmul_heuristics]MatmulHeuristicResult = undefined;
         var returned: c_int = 0;
+        const gdn_probe = key.canonical_rows != 0 and key.input_type == CUDA_R_16BF;
         const requested: c_int = if (tuning.enabled)
             @intCast(tuning.candidate_count)
-        else
-            1;
+        else if (gdn_probe and key.rows != key.canonical_rows) 2 else 1;
         if (key.canonical_rows != 0 and key.rows != key.canonical_rows) {
             // Query only descriptors at the canonical row count. No probe
             // GEMM executes and no extra device storage is allocated. The
@@ -840,10 +851,26 @@ pub const CublasLt = struct {
             var probe_key = key;
             probe_key.rows = key.canonical_rows;
             probe_key.canonical_rows = 0;
-            const probe = try self.createTensorCorePlan(probe_key, .{}, ctx, invocation);
+            const probe = self.createTensorCorePlan(probe_key, .{}, ctx, invocation) catch |err| {
+                if (!gdn_probe or err != error.CublasLtUnsupported) return err;
+                // A library may decline the descriptor probe while supporting
+                // the real shape. Preserve its ordinary cuBLAS route.
+                var ordinary_key = key;
+                ordinary_key.canonical_rows = 0;
+                const ordinary = try self.createTensorCorePlan(ordinary_key, tuning, ctx, invocation);
+                self.destroyTensorCorePlan(plan);
+                return ordinary;
+            };
             defer self.destroyTensorCorePlan(probe);
             heuristics[0] = .{ .algo = probe.algo, .workspace_size = probe.workspace_size, .state = CUBLAS_STATUS_SUCCESS, .waves_count = 0, .reserved = @splat(0) };
             returned = 1;
+            if (gdn_probe) {
+                // Keep the ordinary exact-shape heuristic as a fallback when
+                // the preferred tile cannot execute these actual buffers.
+                var ordinary_count: c_int = 0;
+                try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, plan.op_desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.d_desc, pref, 1, heuristics[1..].ptr, &ordinary_count));
+                if (ordinary_count == 1) returned = 2;
+            }
         } else {
             try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, plan.op_desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.d_desc, pref, requested, &heuristics, &returned));
         }
@@ -885,7 +912,9 @@ pub const CublasLt = struct {
         const fallback = firstUsableHeuristicIndex(candidates, invocation.workspace.len) orelse {
             return error.CublasLtUnsupported;
         };
-        if (key.canonical_rows != 0) self.canonical_f16_plans += 1;
+        if (key.canonical_rows != 0) {
+            if (gdn_probe) self.canonical_gdn_plans += 1 else self.canonical_f16_plans += 1;
+        }
 
         var selected = fallback;
         var timed_selection = false;

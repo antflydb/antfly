@@ -4672,6 +4672,7 @@ pub const CudaCompute = struct {
         if (profile == .lightonocr3) if (cublaslt) |*blas| try blas.setPlanCacheCapacity(platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES") orelse 1024);
         if (cublaslt) |*blas| blas.florence_canonical_f16_decode = profile == .florence2 and ctx.info.compute_major == 12 and ctx.info.compute_minor == 1 and
             platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_CANONICAL_DECODE_GEMM");
+        if (cublaslt) |*blas| blas.lighton_canonical_gdn_decode = profile == .lightonocr3 and ctx.info.compute_major == 12 and ctx.info.compute_minor == 1;
         if (cublaslt_bf16_tuning_profile != .off and cublaslt == null) {
             // An explicit env request fails closed; the promoted SM89 default
             // degrades to off so capability-only inits keep working without
@@ -4918,6 +4919,7 @@ pub const CudaCompute = struct {
         self.lighton_attention.deinit(&self.ctx);
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
             std.debug.print("LIGHTONOCR3 cuda_bucketed_linear_calls={d}\n", .{self.stats.bf16_bucketed_linear_calls});
+            if (self.cublaslt) |*blas| std.debug.print("LIGHTONOCR3 cuda_canonical_gdn_calls={d} plans={d}\n", .{ blas.canonical_gdn_calls, blas.canonical_gdn_plans });
             std.debug.print("LIGHTONOCR3 cuda_bf16_decode_output_calls={d}\n", .{self.stats.bf16_decode_output_calls});
             std.debug.print("LIGHTONOCR3 cuda_bf16_prefill_ffn_calls={d}\n", .{self.lighton_bf16_prefill_ffn_calls});
             std.debug.print("LIGHTONOCR3 cuda_fused_ffn_calls={d} paired_weights={d}\n", .{ self.lighton_fused_ffn_calls, self.lighton_gate_up_cache.count() });
@@ -35180,4 +35182,74 @@ test "LightOnOCR3 CUDA compact vision norm QKV preserves rounded normalization F
         defer a.free(unchanged_weight);
         for (matrix, unchanged_weight) |bits, value| try std.testing.expectEqual(@as(u32, bits) << 16, @as(u32, @bitCast(value)));
     }
+}
+
+test "LightOnOCR3 CUDA canonical GDN GEMM preserves exact rows and output bounds" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const blas = if (compute.cublaslt) |*value| value else return error.CublasLtUnavailable;
+    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    const k = 1024;
+    const n = 6144;
+    const max_rows = 129;
+    const inputs = try a.alloc(u16, max_rows * k);
+    defer a.free(inputs);
+    const weights = try a.alloc(u16, n * k);
+    defer a.free(weights);
+    for (inputs, 0..) |*v, i| v.* = f32ToBf16BitsRoundNearestEven(@sin(@as(f32, @floatFromInt(i)) * 0.037) * 0.125);
+    for (weights, 0..) |*v, i| v.* = f32ToBf16BitsRoundNearestEven(@sin(@as(f32, @floatFromInt(i)) * 0.013) * 0.0625);
+    var input = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, inputs.len * 2);
+    defer input.free(&compute.ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, weights.len * 2);
+    defer weight.free(&compute.ctx);
+    var owner = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, (max_rows * n + 128) * 4);
+    defer owner.free(&compute.ctx);
+    var reference = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, max_rows * n * 4);
+    defer reference.free(&compute.ctx);
+    const output = buffer_mod.DeviceBuffer{ .ptr = owner.ptr + 256, .len = max_rows * n * 4 };
+    try input.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(inputs));
+    try weight.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(weights));
+    const host = try a.alloc(f32, max_rows * n + 128);
+    defer a.free(host);
+    const golden = try a.alloc(f32, max_rows * n);
+    defer a.free(golden);
+    for ([_]usize{ 63, 64, 65, 66, 85, 96, 127, 128, 129 }) |rows| {
+        blas.lighton_canonical_gdn_decode = false;
+        try blas.matmulBf16WeightF32Out(&compute.ctx, reference, input, weight, .{}, rows, k, n);
+        try reference.copyToHost(&compute.ctx, std.mem.sliceAsBytes(golden[0 .. rows * n]));
+        try compute.ctx.synchronize();
+        blas.lighton_canonical_gdn_decode = true;
+        const before = blas.canonical_gdn_calls;
+        try compute.kernels.launchFillF32(&compute.ctx, owner, host.len, 123.25);
+        try blas.matmulBf16WeightF32Out(&compute.ctx, output, input, weight, .{}, rows, k, n);
+        try owner.copyToHost(&compute.ctx, std.mem.sliceAsBytes(host));
+        try compute.ctx.synchronize();
+        try std.testing.expectEqual(before + @as(usize, @intFromBool(rows >= 65 and rows <= 128)), blas.canonical_gdn_calls);
+        for (host[0..64]) |v| try std.testing.expectEqual(@as(f32, 123.25), v);
+        for (host[64 + rows * n ..]) |v| try std.testing.expectEqual(@as(f32, 123.25), v);
+        for (golden[0 .. rows * n], host[64..][0 .. rows * n]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 2e-5);
+        for ([_]usize{ 0, rows - 1 }) |row| {
+            for ([_]usize{ 0, 31, n - 1 }) |col| {
+                var expected: f64 = 0;
+                for (0..k) |i| {
+                    const x: f32 = @bitCast(@as(u32, inputs[row * k + i]) << 16);
+                    const w: f32 = @bitCast(@as(u32, weights[col * k + i]) << 16);
+                    expected += @as(f64, x) * @as(f64, w);
+                }
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), host[64 + row * n + col], 2e-5);
+            }
+        }
+    }
+    const saved_input = try a.alloc(u16, inputs.len);
+    defer a.free(saved_input);
+    const saved_weight = try a.alloc(u16, weights.len);
+    defer a.free(saved_weight);
+    try input.copyToHost(&compute.ctx, std.mem.sliceAsBytes(saved_input));
+    try weight.copyToHost(&compute.ctx, std.mem.sliceAsBytes(saved_weight));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u16, inputs, saved_input);
+    try std.testing.expectEqualSlices(u16, weights, saved_weight);
+    try std.testing.expect(blas.canonical_gdn_plans > 0);
 }
