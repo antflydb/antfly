@@ -455,7 +455,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_rowsource_logical;
     _ = @import("antfly_local_sources").storage_rowsource_external;
     _ = @import("antfly_local_sources").storage_rowsource_local;
-    _ = @import("antfly_local_sources").storage_rowsource_logical;
     _ = @import("rowsource/mod.zig");
     _ = @import("antfly_local_sources").storage_rowsource_types;
     _ = @import("antfly_local_sources").storage_schema;

@@ -41,7 +41,7 @@ pub fn create(ctx: Context) Suite {
         ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
     const tests = b.addTest(.{
-        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if ((ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) or ctx.backend.enable_cuda) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -52,6 +52,7 @@ pub fn create(ctx: Context) Suite {
     });
     tests.root_module.strip = ctx.strip;
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
+    tests.root_module.addImport("antfly_cloudflare", ctx.graph.inference_mod.import_table.get("antfly_cloudflare").?);
     tests.root_module.addImport("antfly_decisions", ctx.graph.inference_mod.import_table.get("antfly_decisions").?);
     tests.root_module.addImport("antfly_structured", ctx.graph.inference_mod.import_table.get("antfly_structured").?);
     ctx.graph.identities.addImports(tests.root_module);
@@ -85,6 +86,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);
     tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
+    tests.root_module.addImport("antfly_documents", ctx.graph.inference_mod.import_table.get("antfly_documents").?);
     tests.root_module.addImport("antfly_video", ctx.graph.inference_mod.import_table.get("antfly_video").?);
     tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);

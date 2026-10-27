@@ -131,7 +131,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     chunking_mod.addImport("antfly-json", json_mod);
     chunking_mod.addImport("antfly_chunking_api_openapi", api.chunking_api);
     chunking_mod.addImport("antfly_chunking_openapi", api.chunking);
+    const cloudflare_config_mod = b.createModule(.{ .root_source_file = b.path("lib/cloudflare/routing.zig"), .target = wasm_target, .optimize = optimize });
+    cloudflare_config_mod.addAnonymousImport("cloudflare_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig") });
     const reranking_mod = b.createModule(.{ .root_source_file = b.path("lib/reranking/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    reranking_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     reranking_mod.addImport("antfly-json", json_mod);
     reranking_mod.addImport("antfly_reranking_openapi", api.reranking);
     const embedded_wasm_deps = .{
@@ -271,6 +274,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    inference_execution_control_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     inference_execution_control_mod.addImport("antfly_platform", wasm_platform_mod);
     inference_execution_control_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
     const inference_execution_context_mod = b.createModule(.{
@@ -284,11 +288,13 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     inference_execution_context_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
     inference_execution_context_mod.addImport("antfly_inference_execution_control", inference_execution_control_mod);
     embedded_support_wasm_mod.addImport("antfly_inference_execution_context", inference_execution_context_mod);
-    embedded_support_wasm_mod.addImport("antfly_reader_config", b.createModule(.{
+    const wasm_reader_config = b.createModule(.{
         .root_source_file = b.path("lib/readers/src/config.zig"),
         .target = wasm_target,
         .optimize = optimize,
-    }));
+    });
+    wasm_reader_config.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    embedded_support_wasm_mod.addImport("antfly_reader_config", wasm_reader_config);
 
     const embedded_wasm_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/engine/root.zig"),
@@ -433,6 +439,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_schema_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_schema_mod.addImport("antfly_regex", regex_mod);
     const wasm_generating_mod = b.createModule(.{ .root_source_file = b.path("lib/generating/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     wasm_generating_mod.addImport("antfly-json", json_mod);
     wasm_generating_mod.addImport("antfly_generating_openapi", api.generating);
     const wasm_apple_mod = b.createModule(.{ .root_source_file = b.path("lib/apple_native/src/mod.zig"), .target = wasm_target, .optimize = optimize });
@@ -442,7 +449,12 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_apple_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_apple_mod.addImport("httpx", httpx_mod);
     wasm_generating_mod.addImport("antfly_apple_native", wasm_apple_mod);
+    const wasm_cloudflare_mod = b.createModule(.{ .root_source_file = b.path("lib/cloudflare/root.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_cloudflare_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    wasm_decisions_mod.addImport("antfly_cloudflare", wasm_cloudflare_mod);
     const wasm_extracting_mod = b.createModule(.{ .root_source_file = b.path("lib/extracting/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_extracting_mod.addImport("antfly_cloudflare", wasm_cloudflare_mod);
+    wasm_extracting_mod.addImport("antfly_image", wasm_image_mod);
     wasm_extracting_mod.addImport("httpx", httpx_mod);
     wasm_extracting_mod.addImport("antfly_extraction_openapi", api.extraction);
     const wasm_structured_mod = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = wasm_target, .optimize = optimize });

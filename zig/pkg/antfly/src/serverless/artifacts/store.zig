@@ -263,6 +263,9 @@ pub const IoGuard = struct {
 pub const ArtifactStore = struct {
     /// Opt-in facts v4 body packs. Other profiles continue writing v3 facts.
     pack_document_bodies: bool = false,
+    /// The host guarantees that replacement owners resolve the same immutable namespace.
+    shared_across_owners: bool = false,
+    namespace_identity: ?[32]u8 = null,
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,

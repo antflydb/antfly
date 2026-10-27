@@ -4059,6 +4059,35 @@ test "relational contract schema parsing uses bounded stack and unwinds partial 
     const Probe = struct {
         input: []const u8,
         failure: ?anyerror = null,
+        stack_start: usize = 0,
+        peak_stack_bytes: usize = 0,
+        backing: std.mem.Allocator = undefined,
+
+        fn observeStack(self: *@This()) void {
+            const here = @frameAddress();
+            const used = if (here < self.stack_start) self.stack_start - here else here - self.stack_start;
+            self.peak_stack_bytes = @max(self.peak_stack_bytes, used);
+        }
+        fn allocate(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observeStack();
+            return self.backing.rawAlloc(len, alignment, ra);
+        }
+        fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observeStack();
+            return self.backing.rawResize(bytes, alignment, len, ra);
+        }
+        fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observeStack();
+            return self.backing.rawRemap(bytes, alignment, len, ra);
+        }
+        fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observeStack();
+            self.backing.rawFree(bytes, alignment, ra);
+        }
 
         fn parse(a: std.mem.Allocator, text: []const u8) !void {
             var parsed = try parseSchema(a, text);
@@ -4073,18 +4102,24 @@ test "relational contract schema parsing uses bounded stack and unwinds partial 
             // on the normal test thread.
             var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
             defer std.debug.assert(checked.deinit() == 0);
-            parse(checked.allocator(), self.input) catch |err| {
+            self.backing = checked.allocator();
+            self.stack_start = @frameAddress();
+            const measured: std.mem.Allocator = .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+            parse(measured, self.input) catch |err| {
                 self.failure = err;
             };
         }
     };
     var probe = Probe{ .input = input.items };
-    // Keep 32 nested objects within one serving-thread-sized stack, including
-    // leak checking and JSON parsing. Scalar scratch must not accumulate
-    // along the recursive child path.
-    const thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Probe.run, .{&probe});
+    // Linux includes static TLS in the requested pthread stack mapping. Its
+    // size varies with linked runtime owners, so a 1 MiB mapping does not give
+    // the parser 1 MiB of usable stack. Use the ordinary serving stack and
+    // measure parser/ownership traversal at every allocation and release.
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
     thread.join();
     if (probe.failure) |err| return err;
+    std.debug.print("SCHEMA_STACK depth=32 peak_bytes={d} budget_bytes={d}\n", .{ probe.peak_stack_bytes, 1024 * 1024 });
+    try std.testing.expect(probe.peak_stack_bytes > 0 and probe.peak_stack_bytes <= 1024 * 1024);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Probe.parse, .{input.items});
 }
 

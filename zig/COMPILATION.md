@@ -208,6 +208,46 @@ warm builds, then verifies these source changes:
 This expensive check runs with `zig-full / build-cache`. The lightweight
 configuration fixtures remain useful for option and generator dependencies.
 
+The native Linux audit has a separate scheduling envelope from production
+builds. [Run 40380791678](https://github.com/antflydb/antfly/actions/runs/40380791678)
+completed its cold build in 1,364.871 seconds (1,637.813 CPU seconds), with a
+7,656,402,944-byte peak summed process RSS. The preceding run timed out at
+1,800 seconds with a similar 7.47 GB peak. Both used the immutable Nix
+`3swwykg6la02jblm03z3s4fxhiqdmpsm-zig-0.17.0` compiler, linked to glibc.
+
+For that exact compiler on native x86_64 Linux, the audit tool explicitly
+selects baseline GNU Debug, stripped symbols, CPU inference, and Debug inference
+dependencies. Its overlay caps larger reservations at **9 GiB per compile**,
+retains smaller authored claims, and keeps the **20 GiB** aggregate admission
+budget and **two-job** limit. The cap is over 25% above the largest sampled
+whole-build process RSS. Two large claims leave **2 GiB** for ready auxiliary
+work, whose reservation can precede its actual execution. They also fit the
+host-aware fallback budget (80% of a 24 GiB pod).
+
+[Run 40395513767](https://github.com/antflydb/antfly/actions/runs/40395513767)
+qualified the compiler/profile selection and diagnostics but timed out at
+1,800 seconds. Its previous 10 GiB caps still spent most samples on one
+compiler; the final API archive completed just before the timeout, and the
+source-owner fixture had only started. Peak summed process RSS was
+7,477,886,976 bytes; sampled anonymous memory peaked at 6,827,483,136 bytes,
+file cache at 8,177,479,680 bytes, and total cgroup memory at 14.01 GiB.
+This was active compilation, not an OOM. The tighter 9 GiB envelope retains
+measured headroom while reserving space for auxiliary work; its paired timing
+and memory qualification is pending CI. It affects only the audit's transitive
+compilation graph, not production reservations. Other compiler derivations
+retain existing claims until measured. No runner capacity or timeout was
+increased.
+
+Audit reports retain periodic active-process CPU time, state, RSS, artifact
+name and source root (including Zig response files). A timeout captures this
+snapshot before killing the tree, because `wait4` cannot recover its child CPU
+accounting afterward. Full compiler command lines are not retained in these
+process snapshots. The successful job's cgroup peak was 21.07 GiB; cgroup
+usage also includes cached output pages and is not interchangeable with summed
+process RSS. Reports now sample anonymous, file, dirty-file, inactive-file,
+and kernel memory separately every 30 seconds so paired qualification can
+verify actual pressure within the unchanged 24 GiB pod limit.
+
 A matched native Darwin Debug experiment compared the test ownership split
 (`c50cc4b0c`) with its parent (`60ff56514`), before the subsequent main merge.
 It compiled four consumer families, their physical partitions, three owner

@@ -1252,6 +1252,7 @@ pub const AntflyApiHandler = struct {
         if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
         const mutation = classifyHotStandbyMutation(ctx.request.method, path) orelse return null;
+        if (@import("inference_route_policy.zig").isDocumentJobMutation(@tagName(ctx.request.method), path) and self.api_server.documentJobsFailoverSafe()) return null;
         // Backup and table restore are adapters over the same durable cohort
         // and staging authority; handlers reject uncertified historical cuts.
         if ((mutation.surface == .cluster_restore or mutation.surface == .restore_job or mutation.surface == .table_restore or mutation.surface == .backup) and
@@ -1360,6 +1361,18 @@ pub const AntflyApiHandler = struct {
         try root_server.postResponseStreaming("/ai/v1/chat/completions", httpx.Handler.bind(self, gatewayChat));
         try root_server.postResponseStreaming("/ai/v1/embeddings", httpx.Handler.bind(self, gatewayEmbeddings));
         try root_server.postResponseStreaming("/ai/v1/decisions", httpx.Handler.bind(self, gatewayDecisions));
+        try root_server.postResponseStreaming("/ai/v1/read/jobs", httpx.Handler.bind(self, documentReadCreate));
+        try root_server.get("/ai/v1/read/jobs/:job_id", httpx.Handler.bind(self, documentReadStatus));
+        try root_server.get("/ai/v1/read/jobs/:job_id/result", httpx.Handler.bind(self, documentReadResult));
+        try root_server.get("/ai/v1/read/jobs/:job_id/events", httpx.Handler.bind(self, documentReadEvents));
+        try root_server.postResponseStreaming("/ai/v1/read/jobs/:job_id/resume", httpx.Handler.bind(self, documentReadResume));
+        try root_server.postResponseStreaming("/ai/v1/read/jobs/:job_id/cancel", httpx.Handler.bind(self, documentReadCancel));
+        try root_server.postResponseStreaming("/ai/v1/extract/jobs", httpx.Handler.bind(self, documentExtractCreate));
+        try root_server.get("/ai/v1/extract/jobs/:job_id", httpx.Handler.bind(self, documentExtractStatus));
+        try root_server.get("/ai/v1/extract/jobs/:job_id/result", httpx.Handler.bind(self, documentExtractResult));
+        try root_server.get("/ai/v1/extract/jobs/:job_id/events", httpx.Handler.bind(self, documentExtractEvents));
+        try root_server.postResponseStreaming("/ai/v1/extract/jobs/:job_id/resume", httpx.Handler.bind(self, documentExtractResume));
+        try root_server.postResponseStreaming("/ai/v1/extract/jobs/:job_id/cancel", httpx.Handler.bind(self, documentExtractCancel));
         try root_server.postResponseStreaming("/ai/v1/read", httpx.Handler.bind(self, gatewayRead));
         try root_server.postResponseStreaming("/ai/v1/extract", httpx.Handler.bind(self, gatewayExtract));
         try root_server.postResponseStreaming("/ai/v1/rewrite", httpx.Handler.bind(self, gatewayRewrite));
@@ -1635,7 +1648,7 @@ pub const AntflyApiHandler = struct {
     fn respondRetrievalReadError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
         const payload = retrieval_agent.retryableReadFailure(err) orelse return null;
         try ctx.setHeader("Retry-After", "1");
-        return try ctx.status(if (err == error.StorageReadTemporarilyUnavailable) 503 else 409).json(payload);
+        return try ctx.status(if (err == error.StorageReadTemporarilyUnavailable or err == error.IndexRebuilding) 503 else 409).json(payload);
     }
 
     fn respondQueryOperationalError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
@@ -1822,12 +1835,14 @@ pub const AntflyApiHandler = struct {
             .idempotency_key = ctx.header("idempotency-key") orelse "",
         }, identity, tableMutationContext(ctx, &identity));
         defer response.deinit(self.api_server.alloc);
+        if (response.status == 503 or response.status == 429) try ctx.setHeader("Retry-After", "1");
         return jsonResponse(ctx, response.status, response.body);
     }
 
     fn memoryFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         const code = @import("memory.zig").status(err);
-        return jsonResponse(ctx, code, try std.json.Stringify.valueAlloc(ctx.allocator, .{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @errorName(err) }, .{}));
+        if (code == 503 or code == 429) try ctx.setHeader("Retry-After", "1");
+        return ctx.status(code).json(.{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @errorName(err) });
     }
 
     fn extensionRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -4308,6 +4323,48 @@ pub const AntflyApiHandler = struct {
     fn gatewayDecisions(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .decide);
     }
+    fn documentReadCreate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .create);
+    }
+    fn documentReadStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .status);
+    }
+    fn documentReadResult(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .result);
+    }
+    fn documentReadEvents(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .events);
+    }
+    fn documentReadResume(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .@"resume");
+    }
+    fn documentReadCancel(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .cancel);
+    }
+    fn documentExtractCreate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .create);
+    }
+    fn documentExtractStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .status);
+    }
+    fn documentExtractResult(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .result);
+    }
+    fn documentExtractEvents(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .events);
+    }
+    fn documentExtractResume(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .@"resume");
+    }
+    fn documentExtractCancel(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .cancel);
+    }
+    fn documentJob(self: *AntflyApiHandler, ctx: *httpx.Context, operation: @import("document_jobs.zig").Operation, action: @import("document_jobs.zig").Action) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        return @import("document_jobs.zig").handle(self.api_server, ctx, if (identity) |value| value.credential_principal else "anonymous", operation, action) catch |err| gatewayFailure(ctx, err);
+    }
     fn gatewayExtract(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .extract);
     }
@@ -4398,6 +4455,12 @@ pub const AntflyApiHandler = struct {
             error.InferenceUpstreamUnavailable, error.ServiceUnavailable => 503,
             error.DecisionRefused => 422,
             error.Timeout => 504,
+            error.DocumentRunNotFound => 404,
+            error.DocumentRunExpired => 410,
+            error.DocumentRunBusy, error.DocumentRunLeaseLost, error.DocumentRunTerminal => 409,
+            error.DocumentStorageNotConfigured, error.NotLeader => 503,
+            error.TooManyActiveJobs => 429,
+            error.InlineCredentialNotAllowed => 400,
             error.EmbeddingIdentityMismatch => 409,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
@@ -13161,9 +13224,9 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
 
     const alloc = std.testing.allocator;
     var reads = BlockingReads{};
-    defer reads.release.store(true, .release);
     var status_source = AuthStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), null);
+    defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.initWithLimits(alloc, &api_server, 8, 32) catch |err| switch (err) {
@@ -13171,6 +13234,8 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         else => return err,
     };
     defer e2e_server.deinit();
+    // On an assertion failure, release callbacks before joining the server.
+    defer reads.release.store(true, .release);
 
     const address = e2e_server.server.boundAddress() orelse return error.AddressNotAvailable;
     const client_io = std.Io.Threaded.global_single_threaded.io();
@@ -13209,6 +13274,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         for (0..wave_convergence_poll_attempts) |_| {
             const admission = api_server.queryAdmissionStats();
             if (admission.in_flight == 8 and
+                reads.started.load(.acquire) == 8 and
                 admission.rejected_total >= minimum_rejected and
                 e2e_server.server.runtimeStats().active_connections <= 8)
             {
@@ -18098,14 +18164,14 @@ test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NU
 
 test "httpx retrieval read failures preserve retryable JSON and conflict status" {
     const alloc = std.testing.allocator;
-    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged }) |failure| {
+    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged, error.IndexRebuilding }) |failure| {
         var request = try httpx.Request.init(alloc, .POST, "http://localhost/db/v1/agents/retrieval");
         defer request.deinit();
         var ctx = httpx.Context.init(alloc, std.testing.io, &request);
         defer ctx.deinit();
         var response = (try AntflyApiHandler.respondRetrievalReadError(&ctx, failure)).?;
         defer response.deinit();
-        try std.testing.expectEqual(@as(u16, if (failure == error.StorageReadTemporarilyUnavailable) 503 else 409), response.status.code);
+        try std.testing.expectEqual(@as(u16, if (failure == error.StorageReadTemporarilyUnavailable or failure == error.IndexRebuilding) 503 else 409), response.status.code);
         try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
         var parsed = try std.json.parseFromSlice(retrieval_agent.RetryableReadFailure, alloc, response.body.?, .{});
         defer parsed.deinit();
@@ -18585,6 +18651,20 @@ test "native memory HTTP validates route and space without loading a model" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "InvalidMemoryId") != null);
     const selected = try @import("memory.zig").route("GET", "/memory/v1/spaces/team/memories/a/history");
     try std.testing.expectEqual(@import("memory.zig").memory.Action.history, selected.action);
+    for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable }) |failure| {
+        var operation = try httpx.Request.init(a, .POST, "http://localhost/memory/v1/spaces/team/maintenance");
+        defer operation.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &operation);
+        defer ctx.deinit();
+        var busy = try AntflyApiHandler.memoryFailure(&ctx, failure);
+        defer busy.deinit();
+        try std.testing.expectEqual(@as(u16, 503), busy.status.code);
+        try std.testing.expectEqualStrings("1", busy.headers.get("Retry-After").?);
+        var payload = try std.json.parseFromSlice(std.json.Value, a, busy.body.?, .{});
+        defer payload.deinit();
+        try std.testing.expect(payload.value.object.get("retryable").?.bool);
+        try std.testing.expectEqualStrings(@errorName(failure), payload.value.object.get("code").?.string);
+    }
 }
 
 test "native memory HTTP and MCP share persistent storage and private provenance" {
@@ -18815,6 +18895,22 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     var hidden = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
     defer hidden.deinit(a);
     try std.testing.expectEqual(@as(u16, 404), hidden.status);
+    const IngressClock = struct {
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = 0 };
+        }
+    };
+    var ingress_vtable = std.testing.io.vtable.*;
+    ingress_vtable.now = IngressClock.now;
+    const ingress_io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &ingress_vtable };
+    // List uses a native scan, which cannot interpret an arbitrary ingress
+    // clock origin. A live five-second ingress budget must stay live there.
+    var listed = try api.executeMemoryService("team", .{ .action = .list }, null, .{
+        .deadline_ns = 5 * std.time.ns_per_s,
+        .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&ingress_io),
+    });
+    defer listed.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), listed.status);
 }
 
 test "native memory catalog ownership denies generic and batched data admission" {
@@ -20174,6 +20270,54 @@ test "public execution composes every internal budget and validates combined hea
     try std.testing.expectEqual(@as(u64, 0), ctx.application_deadline_ns.?);
 }
 
+test "httpx inference gateway configured readers preserve documents artifacts status and exact values" {
+    const Target = struct {
+        calls: usize = 0,
+        const reply = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"receipt\",\"status\":\"unresolved\",\"fields\":{\"amount\":9007199254740993.01}}],\"document\":{\"artifact_id\":\"opaque\"},\"events\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}";
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            const a = context.allocator.asStd();
+            const parsed = std.json.parseFromSlice(std.json.Value, a, context.body.slice(), .{}) catch return inference_connection_abi.statusFromError(error.InvalidArgument);
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            if (!std.mem.eql(u8, context.operation.slice(), "read") or !std.mem.eql(u8, root.get("model").?.string, "backend") or !std.mem.eql(u8, root.get("prompt").?.string, "defaults") or root.get("max_tokens").?.integer != 99) return inference_connection_abi.statusFromError(error.InvalidArgument);
+            if (root.get("documents")) |documents| {
+                const doc = documents.array.items[0].object;
+                if (!std.mem.eql(u8, doc.get("id").?.string, "receipt") or doc.get("pages").?.array.items[0].integer != 2 or !root.get("retain_artifact").?.bool) return inference_connection_abi.statusFromError(error.InvalidArgument);
+            }
+            self.calls += 1;
+            const body = a.dupe(u8, reply) catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = body.ptr, .len = body.len } };
+            return .ok;
+        }
+    };
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    try config.readers.registerConfig("agent", .{ .provider = .antfly, .model = "backend", .prompt = "defaults", .max_tokens = 99 });
+    var source = AuthStatusSource{};
+    var target = Target{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_][]const u8{
+        "{\"model\":\"readers/agent\",\"documents\":[{\"id\":\"receipt\",\"url\":\"https://example.invalid/r.pdf\",\"media_type\":\"application/pdf\",\"pages\":[2]}],\"retain_artifact\":true}",
+        "{\"model\":\"readers/agent\",\"images\":[\"data:image/png;base64,AQ==\"]}",
+    }) |body| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/read");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayRead(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expectEqualStrings(Target.reply, response.body.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), target.calls);
+    try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}
+
 test "linear merge HTTP accepts scoped media and rejects an out of range mutation" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
     const Fixture = struct {
@@ -20234,4 +20378,116 @@ test "linear merge HTTP accepts scoped media and rejects an out of range mutatio
     defer bad.deinit();
     try std.testing.expectEqual(@as(u16, 400), bad.status.code);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.monotonic));
+}
+
+test "httpx inference gateway document jobs persist before dispatch and publish principal scoped atomic results" {
+    const readers = @import("antfly_readers");
+    const module = @import("document_jobs.zig");
+    const runs = readers.document_runs;
+    const Target = struct {
+        io: std.Io,
+        calls: std.atomic.Value(usize) = .init(0),
+        const reply = "{\"object\":\"list\",\"data\":[{\"text\":\"receipt\"}]}";
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            complete(self, context) catch |err| return inference_connection_abi.statusFromError(err);
+            return .ok;
+        }
+        fn complete(self: *@This(), call: *const inference_connection_abi.InvokeContext) !void {
+            const a = call.allocator.asStd();
+            var client = try readers.document_rpc.Client.initBound(a, call.document_store, self.io);
+            defer client.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const work = arena.allocator();
+            const store = client.store();
+            const record = try store.loadAt(work, client.id, client.owner, research_jobs.nowMillis());
+            try std.testing.expectEqual(@as(usize, 1), record.inputs.len);
+            const submitted = try store.read(work, record.inputs[0], 1024 * 1024);
+            try std.testing.expectEqualStrings(submitted, call.body.slice());
+            const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+            try store.prepare(work, lease, record.identity, record.limits, record.inputs, research_jobs.nowMillis());
+            const key: runs.Digest = @splat(17);
+            const events = "[{\"phase\":\"complete\"}]";
+            try std.testing.expect(try store.reserve(work, lease, key, .{ .calls = 1, .output_bytes = 1024 }, research_jobs.nowMillis()));
+            const final = try store.completeWithEvents(work, lease, key, .{ .calls = 1, .output_bytes = reply.len + events.len }, reply, events, research_jobs.nowMillis());
+            try store.finish(work, lease, final.payload, research_jobs.nowMillis());
+            const bytes = try a.dupe(u8, reply);
+            call.out_response.* = .{ .status = 200, .body = .{ .ptr = bytes.ptr, .len = bytes.len } };
+            _ = self.calls.fetchAdd(1, .release);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/document-jobs", .{tmp.sub_path});
+    defer a.free(path);
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var target = Target{ .io = runtime.apiNetworkIo().? };
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    var source = AuthStatusSource{};
+    var server = try ApiHttpServer.initWithConfig(a, .{ .deployment_mode = .standalone, .backend_runtime = &runtime, .node_config = &config, .document_job_store_path = path, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var id: []u8 = undefined;
+    {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/read/jobs");
+        defer request.deinit();
+        request.body = "{\"request\":{\"model\":\"local/native-reader\",\"documents\":[{\"id\":\"receipt\",\"url\":\"https://example.invalid/receipt.pdf\",\"media_type\":\"application/pdf\"}]},\"retention_seconds\":60}";
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.documentReadCreate(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 202), response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        id = try a.dupe(u8, parsed.value.object.get("id").?.string);
+        try std.testing.expectEqual(@as(usize, 0), target.calls.load(.acquire));
+    } // Submitting HTTP context is gone before execution starts.
+    defer a.free(id);
+    var persistence = try module.context(&server);
+    const store = try persistence.interface();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    try std.testing.expectError(error.DocumentRunNotFound, store.load(work, id, "bob"));
+    try server.scheduleDocumentsOnce();
+    const until = research_jobs.nowMillis() + 5000;
+    while (target.calls.load(.acquire) == 0 and research_jobs.nowMillis() < until) try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+    try std.testing.expectEqual(@as(usize, 1), target.calls.load(.acquire));
+    const record = try store.loadAt(work, id, "anonymous", research_jobs.nowMillis());
+    try std.testing.expectEqual(.succeeded, record.state);
+    try std.testing.expectEqual(@as(u64, 1), record.used.calls);
+    var result_request = try httpx.Request.init(a, .GET, "http://localhost/ai/v1/read/jobs/placeholder/result");
+    defer result_request.deinit();
+    var result_ctx = httpx.Context.init(a, std.testing.io, &result_request);
+    defer result_ctx.deinit();
+    result_ctx.params = &.{.{ .name = "job_id", .value = id }};
+    var result = try handler.documentReadResult(&result_ctx);
+    defer result.deinit();
+    try std.testing.expectEqualStrings(Target.reply, result.body.?);
+    // Cross-operation lookup cannot expose even the status of the job.
+    var wrong_ctx = httpx.Context.init(a, std.testing.io, &result_request);
+    defer wrong_ctx.deinit();
+    wrong_ctx.params = result_ctx.params;
+    var wrong = try handler.documentExtractStatus(&wrong_ctx);
+    defer wrong.deinit();
+    try std.testing.expectEqual(@as(u16, 404), wrong.status.code);
+
+    // Opaque extraction schemas may use credential-shaped field names. Exercise
+    // the public submission boundary so provider-credential scans cannot be
+    // reintroduced after the operation-specific envelope validation.
+    var extract_request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/extract/jobs");
+    defer extract_request.deinit();
+    extract_request.body = "{\"request\":{\"model\":\"local/native-extractor\",\"schema_version\":2,\"schema\":{\"structures\":{\"record\":{\"fields\":{\"api_key\":\"str\"}}}},\"inputs\":[{\"content\":\"Find the key label\"}]}}";
+    var extract_ctx = httpx.Context.init(a, std.testing.io, &extract_request);
+    defer extract_ctx.deinit();
+    var submitted = try handler.documentExtractCreate(&extract_ctx);
+    defer submitted.deinit();
+    try std.testing.expectEqual(@as(u16, 202), submitted.status.code);
+    var submitted_json = try std.json.parseFromSlice(std.json.Value, a, submitted.body.?, .{});
+    defer submitted_json.deinit();
+    try store.cancel(work, submitted_json.value.object.get("id").?.string, "anonymous");
 }

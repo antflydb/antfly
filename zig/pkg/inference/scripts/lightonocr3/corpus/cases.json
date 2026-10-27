@@ -1,0 +1,59 @@
+{
+  "description": "Four synthetic OCR smoke pages; not a representative accuracy corpus.",
+  "license": "Apache-2.0",
+  "font": "Arial.ttf",
+  "cases": [
+    {
+      "name": "invoice",
+      "image": "../../../src/models/testdata/lightonocr3/invoice.png",
+      "expected": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+      "required": [
+        "Antfly",
+        "12345",
+        "42.00"
+      ],
+      "max_new_tokens": 128
+    },
+    {
+      "name": "receipt",
+      "image": "receipt.png",
+      "expected": "ANTFLY MARKET\nReceipt 40872\nDate: 2026-10-21\n\nCoffee             USD 4.50\nNotebook           USD 7.25\n\nSubtotal          USD 11.75\nTax                USD 0.94\nTotal             USD 12.69",
+      "required": [
+        "40872",
+        "4.50",
+        "7.25",
+        "11.75",
+        "0.94",
+        "12.69"
+      ],
+      "max_new_tokens": 256
+    },
+    {
+      "name": "letter",
+      "image": "letter.png",
+      "expected": "Delivery confirmation\n\nReference: ORDER-76291\n\nThe replacement parts will arrive on Friday.\nPlease leave the package at reception.\n\nContact: Morgan Lee\nTelephone: 555-0148",
+      "required": [
+        "ORDER-76291",
+        "Friday",
+        "reception",
+        "Morgan Lee",
+        "555-0148"
+      ],
+      "max_new_tokens": 256
+    },
+    {
+      "name": "shipping",
+      "image": "shipping.png",
+      "expected": "EXPRESS DELIVERY\n\nSHIP TO:\nAvery Chen\n184 Cedar Street\nPortland OR 97205\n\nTracking: 987654321012\nWeight: 2.40 kg\nService: NEXT DAY",
+      "required": [
+        "Avery Chen",
+        "184",
+        "97205",
+        "987654321012",
+        "2.40",
+        "NEXT DAY"
+      ],
+      "max_new_tokens": 256
+    }
+  ]
+}

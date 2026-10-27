@@ -53,6 +53,8 @@ pub const ObjectStore = struct {
     s3_client: ?*objectstore.S3.Client = null,
     owns_client: bool = true,
     read_only: bool = false,
+    shared_namespace: bool = false,
+    namespace_identity: ?[32]u8 = null,
     local_inventory: ?@import("fs_store.zig").FsStore = null,
     remote_retention: @import("remote_retained_closure.zig") = .{},
     bucket: []u8,
@@ -287,6 +289,8 @@ pub const ObjectStore = struct {
     }
     pub fn artifactStore(self: *ObjectStore) artifact_store.ArtifactStore {
         return .{
+            .shared_across_owners = self.shared_namespace or self.s3_client != null or self.gcs_client != null,
+            .namespace_identity = self.namespace_identity,
             .allocator = self.alloc,
             .ptr = self,
             .vtable = if (@import("builtin").os.tag == .freestanding) &hosted_vtable else &vtable,

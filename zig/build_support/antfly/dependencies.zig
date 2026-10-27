@@ -627,11 +627,14 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     jsonschema_mod.addImport("antfly_platform", platform_mod);
     const structured_mod = b.addModule("antfly_structured", .{ .root_source_file = b.path("lib/structured/root.zig") });
     structured_mod.addImport("antfly_jsonschema", jsonschema_mod);
+    const cloudflare_config_mod = b.modules.get("antfly_cloudflare_config") orelse b.addModule("antfly_cloudflare_config", .{ .root_source_file = b.path("lib/cloudflare/routing.zig") });
+    cloudflare_config_mod.addAnonymousImport("cloudflare_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig") });
     const generating_mod = b.createModule(.{
         .root_source_file = b.path("lib/generating/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
+    generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     generating_mod.addImport("antfly-json", json_mod);
     generating_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     const chunking_mod = b.createModule(.{
@@ -647,6 +650,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    embeddings_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     embeddings_mod.addImport("antfly-json", json_mod);
     embeddings_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     const scraping_mod = b.createModule(.{
@@ -667,6 +671,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    reranking_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     reranking_mod.addImport("antfly-json", json_mod);
     reranking_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
     const extracting_mod = b.createModule(.{
@@ -683,6 +688,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
 
     const image_mod = image_build.createModule(b, b.path("lib/image"), target, optimize, hash_mod);
     structured_mod.addImport("antfly_image", image_mod);
+    extracting_mod.addImport("antfly_image", image_mod);
     const pdf_standard_fonts_mod = @import("fonts.zig").create(b, target, optimize);
     const font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
@@ -847,11 +853,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
 
     const transcribing_mod = inference_graph.transcribing_mod;
     const reader_config_mod = inference_graph.reader_config_mod;
-    const readers_mod = b.createModule(.{
-        .root_source_file = b.path("lib/readers/src/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const readers_mod = inference_graph.inference_mod.import_table.get("antfly_readers").?;
     readers_mod.addImport("httpx", httpx_mod);
     readers_mod.addImport("inference_api", inference_api_mod);
     readers_mod.addImport("antfly_google", google_mod);
@@ -868,6 +870,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     synthesizing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     synthesizing_mod.addImport("httpx", httpx_mod);
+    synthesizing_mod.addImport("antfly_cloudflare", b.modules.get("antfly_cloudflare").?);
     synthesizing_mod.addImport("antfly_google", google_mod);
 
     const inference_workflow = @import("../../pkg/inference/build/context.zig").Context{
@@ -1089,6 +1092,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    inference_execution_control_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     inference_execution_control_mod.addImport("antfly_platform", platform_mod);
     inference_execution_control_mod.addImport("antfly_cancellation", cancellation_mod);
     const inference_execution_context_mod = b.createModule(.{

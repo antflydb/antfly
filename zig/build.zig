@@ -488,6 +488,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_structured_tests = b.addRunArtifact(structured_tests);
     b.step("lib-structured-test", "Run constrained output, evidence and generated extraction tests").dependOn(&run_structured_tests.step);
     const decisions_test_module = b.createModule(.{ .root_source_file = b.path("lib/decisions/root.zig"), .target = target, .optimize = optimize });
+    decisions_test_module.addImport("antfly_cloudflare", b.modules.get("antfly_cloudflare").?);
     decisions_test_module.addImport("antfly_structured", b.modules.get("antfly_structured").?);
     const decisions_tests = b.addTest(.{
         .root_module = decisions_test_module,
@@ -499,6 +500,12 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_decisions_unit_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, decisions_tests);
     run_decisions_unit_tests.addArgs(&.{ "--skip-test-filter", "^evidence.test." });
     b.step("lib-decisions-test", "Run shared decision wire and generated contract tests").dependOn(&run_decisions_tests.step);
+
+    const cloudflare_test_module = b.createModule(.{ .root_source_file = b.path("lib/cloudflare/root.zig"), .target = target, .optimize = optimize });
+    var cloudflare_imports = b.modules.get("antfly_cloudflare").?.import_table.iterator();
+    while (cloudflare_imports.next()) |entry| cloudflare_test_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const cloudflare_tests = b.addTest(.{ .root_module = cloudflare_test_module });
+    b.step("lib-cloudflare-test", "Run Cloudflare wire and response validation tests").dependOn(&b.addRunArtifact(cloudflare_tests).step);
 
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
@@ -633,6 +640,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_mod = platform_mod,
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
+    const documents_tests = b.addTest(.{ .root_module = b.modules.get("antfly_documents").? });
+    const run_documents_tests = b.addRunArtifact(documents_tests);
+    b.step("lib-documents-test", "Run checked OOXML, DrawingML, slide and layout tests without inference").dependOn(&run_documents_tests.step);
     const pdf_integration = antfly_tests_build.createPdfIntegration(b, .{
         .root = b.path("pkg/antfly"),
         .fixture = b.path("lib/pdf/integration_fixture.zig"),
@@ -830,6 +840,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&run_documents_tests.step);
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
     unit_test_step.dependOn(&run_exact_float_tests.step);
@@ -875,6 +886,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_png_tests.step);
     lib_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     lib_test_step.dependOn(&run_lib_pdf_tests.step);
+    lib_test_step.dependOn(&run_documents_tests.step);
     lib_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
     lib_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
     lib_test_step.dependOn(&run_lib_scraping_tests.step);

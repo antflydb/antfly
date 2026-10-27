@@ -157,6 +157,12 @@ from .classification_step_config import ClassificationStepConfig
 from .classification_transformation_result import ClassificationTransformationResult
 from .close_prepared_sql_response_200 import ClosePreparedSQLResponse200
 from .close_sql_connection_response_200 import CloseSQLConnectionResponse200
+from .cloudflare_embedder_config import CloudflareEmbedderConfig
+from .cloudflare_embedder_config_provider import CloudflareEmbedderConfigProvider
+from .cloudflare_generator_config import CloudflareGeneratorConfig
+from .cloudflare_generator_config_provider import CloudflareGeneratorConfigProvider
+from .cloudflare_reranker_config import CloudflareRerankerConfig
+from .cloudflare_reranker_config_provider import CloudflareRerankerConfigProvider
 from .cluster_backup_request import ClusterBackupRequest
 from .cluster_backup_request_format import ClusterBackupRequestFormat
 from .cluster_backup_response import ClusterBackupResponse
@@ -273,7 +279,6 @@ from .date_range_string_query import DateRangeStringQuery
 from .decider_config import DeciderConfig
 from .decider_config_decision_method import DeciderConfigDecisionMethod
 from .decider_config_embedding_options import DeciderConfigEmbeddingOptions
-from .decider_config_embedding_options_dimensions import DeciderConfigEmbeddingOptionsDimensions
 from .decider_config_embedding_options_task_type import DeciderConfigEmbeddingOptionsTaskType
 from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
@@ -331,6 +336,8 @@ from .document_field_mapping_fields import DocumentFieldMappingFields
 from .document_field_mapping_missing_null_policy import DocumentFieldMappingMissingNullPolicy
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
+from .document_source import DocumentSource
+from .document_source_media_type import DocumentSourceMediaType
 from .document_subfield_mapping import DocumentSubfieldMapping
 from .document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from .drop_extension_request import DropExtensionRequest
@@ -963,6 +970,12 @@ from .inference_dictation_segment import InferenceDictationSegment
 from .inference_dictation_style import InferenceDictationStyle
 from .inference_dictation_transcript import InferenceDictationTranscript
 from .inference_dictation_word import InferenceDictationWord
+from .inference_document_job import InferenceDocumentJob
+from .inference_document_job_operation import InferenceDocumentJobOperation
+from .inference_document_job_request import InferenceDocumentJobRequest
+from .inference_document_job_request_request import InferenceDocumentJobRequestRequest
+from .inference_document_job_state import InferenceDocumentJobState
+from .inference_document_job_usage import InferenceDocumentJobUsage
 from .inference_embed_request import InferenceEmbedRequest
 from .inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
 from .inference_embed_request_error_policy import InferenceEmbedRequestErrorPolicy
@@ -1071,9 +1084,18 @@ from .inference_read_object import InferenceReadObject
 from .inference_read_object_object import InferenceReadObjectObject
 from .inference_read_request import InferenceReadRequest
 from .inference_read_response import InferenceReadResponse
+from .inference_read_response_document import InferenceReadResponseDocument
+from .inference_read_response_events_item import InferenceReadResponseEventsItem
 from .inference_read_response_object import InferenceReadResponseObject
 from .inference_read_result import InferenceReadResult
-from .inference_read_result_fields import InferenceReadResultFields
+from .inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
+from .inference_read_result_inherited_parts_item import InferenceReadResultInheritedPartsItem
+from .inference_read_result_kind import InferenceReadResultKind
+from .inference_read_result_origin import InferenceReadResultOrigin
+from .inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
+from .inference_read_result_status import InferenceReadResultStatus
+from .inference_read_result_tables_item import InferenceReadResultTablesItem
+from .inference_read_result_transform import InferenceReadResultTransform
 from .inference_request_admission_config import InferenceRequestAdmissionConfig
 from .inference_rerank_object import InferenceRerankObject
 from .inference_rerank_object_object import InferenceRerankObjectObject
@@ -1099,6 +1121,10 @@ from .inference_text_content import InferenceTextContent
 from .inference_text_content_part import InferenceTextContentPart
 from .inference_text_content_part_type import InferenceTextContentPartType
 from .inference_text_region import InferenceTextRegion
+from .inference_text_region_children_item import InferenceTextRegionChildrenItem
+from .inference_text_region_fields_type_0 import InferenceTextRegionFieldsType0
+from .inference_text_region_origin import InferenceTextRegionOrigin
+from .inference_text_region_tables_item import InferenceTextRegionTablesItem
 from .inference_tool import InferenceTool
 from .inference_tool_call_delta import InferenceToolCallDelta
 from .inference_tool_call_delta_type import InferenceToolCallDeltaType
@@ -2174,6 +2200,8 @@ from .restore_job_result_restore import RestoreJobResultRestore
 from .restore_job_result_status import RestoreJobResultStatus
 from .restore_job_scope import RestoreJobScope
 from .restore_request import RestoreRequest
+from .result_extract_document_job_response_200 import ResultExtractDocumentJobResponse200
+from .result_read_document_job_response_200 import ResultReadDocumentJobResponse200
 from .retrieval_agent_request import RetrievalAgentRequest
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
@@ -2604,6 +2632,12 @@ __all__ = (
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
     "CloseSQLConnectionResponse200",
+    "CloudflareEmbedderConfig",
+    "CloudflareEmbedderConfigProvider",
+    "CloudflareGeneratorConfig",
+    "CloudflareGeneratorConfigProvider",
+    "CloudflareRerankerConfig",
+    "CloudflareRerankerConfigProvider",
     "ClusterBackupRequest",
     "ClusterBackupRequestFormat",
     "ClusterBackupResponse",
@@ -2720,7 +2754,6 @@ __all__ = (
     "DeciderConfig",
     "DeciderConfigDecisionMethod",
     "DeciderConfigEmbeddingOptions",
-    "DeciderConfigEmbeddingOptionsDimensions",
     "DeciderConfigEmbeddingOptionsTaskType",
     "DeciderConfigProvider",
     "DecisionBatchItem",
@@ -2776,6 +2809,8 @@ __all__ = (
     "DocumentFieldMappingMissingNullPolicy",
     "DocumentSchema",
     "DocumentSchemaSchema",
+    "DocumentSource",
+    "DocumentSourceMediaType",
     "DocumentSubfieldMapping",
     "DocumentSubfieldMappingMissingNullPolicy",
     "DropExtensionRequest",
@@ -3400,6 +3435,12 @@ __all__ = (
     "InferenceDictationStyle",
     "InferenceDictationTranscript",
     "InferenceDictationWord",
+    "InferenceDocumentJob",
+    "InferenceDocumentJobOperation",
+    "InferenceDocumentJobRequest",
+    "InferenceDocumentJobRequestRequest",
+    "InferenceDocumentJobState",
+    "InferenceDocumentJobUsage",
     "InferenceEmbeddingBatchSummary",
     "InferenceEmbeddingContentInput",
     "InferenceEmbeddingGroup",
@@ -3508,9 +3549,18 @@ __all__ = (
     "InferenceReadObjectObject",
     "InferenceReadRequest",
     "InferenceReadResponse",
+    "InferenceReadResponseDocument",
+    "InferenceReadResponseEventsItem",
     "InferenceReadResponseObject",
     "InferenceReadResult",
-    "InferenceReadResultFields",
+    "InferenceReadResultFieldsType0",
+    "InferenceReadResultInheritedPartsItem",
+    "InferenceReadResultKind",
+    "InferenceReadResultOrigin",
+    "InferenceReadResultRasterToSourceType0",
+    "InferenceReadResultStatus",
+    "InferenceReadResultTablesItem",
+    "InferenceReadResultTransform",
     "InferenceRequestAdmissionConfig",
     "InferenceRerankObject",
     "InferenceRerankObjectObject",
@@ -3535,6 +3585,10 @@ __all__ = (
     "InferenceTextContentPart",
     "InferenceTextContentPartType",
     "InferenceTextRegion",
+    "InferenceTextRegionChildrenItem",
+    "InferenceTextRegionFieldsType0",
+    "InferenceTextRegionOrigin",
+    "InferenceTextRegionTablesItem",
     "InferenceTool",
     "InferenceToolCallDelta",
     "InferenceToolCallDeltaType",
@@ -4393,6 +4447,8 @@ __all__ = (
     "RestoreJobResultStatus",
     "RestoreJobScope",
     "RestoreRequest",
+    "ResultExtractDocumentJobResponse200",
+    "ResultReadDocumentJobResponse200",
     "RetrievalAgentRequest",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",

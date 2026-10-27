@@ -261,6 +261,7 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.resource_manager = &self.resource_manager;
         self.read_cache.backend_runtime = self.backend_runtime;
         self.read_cache.antfly_provider = read_source.antfly_provider;
+        self.read_cache.decision_registry = read_source.decision_registry;
         self.read_cache.secret_store = read_source.secret_store;
         // Capability discovery is a storage-runtime service, not a query-only
         // concern. Bind the same cache into writer enrichment so semantic
@@ -268,6 +269,7 @@ pub const ProvisionedGroupStorage = struct {
         // across documents.
         _ = write_source.withRemoteCapabilityCache(&self.read_cache.remote_capability_cache);
         read_source.reranker_runtime = try self.read_cache.ensureRerankerRuntime();
+        read_source.provider_runtime = &read_source.reranker_runtime.?.providers;
         // Resident writer DBs also serve freshness-sensitive reads. Leaving
         // their cache unset makes the LSM backend retain a private decoded
         // index for every run, bypassing both the shared cache bound and the
