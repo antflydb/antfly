@@ -38,6 +38,7 @@ else
 
 pub const ManagedReadRuntimeConfig = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,

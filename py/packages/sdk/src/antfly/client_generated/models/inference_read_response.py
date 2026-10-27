@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     from ..models.inference_batch_execution_report import InferenceBatchExecutionReport
     from ..models.inference_generate_usage import InferenceGenerateUsage
     from ..models.inference_read_object import InferenceReadObject
+    from ..models.inference_read_response_document import InferenceReadResponseDocument
+    from ..models.inference_read_response_events_item import InferenceReadResponseEventsItem
 
 
 T = TypeVar("T", bound="InferenceReadResponse")
@@ -25,6 +27,11 @@ class InferenceReadResponse:
         object_ (InferenceReadResponseObject): Object type, always "list"
         data (list[InferenceReadObject]): Read result objects, one per input image.
         model (str): Name of model used for reading
+        document (InferenceReadResponseDocument | Unset): Versioned reading metadata containing status, source
+            fingerprints, definition fingerprint, pinned model identities, adapter version and optional artifact retention
+            handle.
+        events (list[InferenceReadResponseEventsItem] | Unset): Bounded progress and audit events. These contain model
+            names and source IDs, never credentials.
         usage (InferenceGenerateUsage | Unset):
         execution (InferenceBatchExecutionReport | Unset): Observed executor behavior, not a capability prediction.
     """
@@ -32,6 +39,8 @@ class InferenceReadResponse:
     object_: InferenceReadResponseObject
     data: list[InferenceReadObject]
     model: str
+    document: InferenceReadResponseDocument | Unset = UNSET
+    events: list[InferenceReadResponseEventsItem] | Unset = UNSET
     usage: InferenceGenerateUsage | Unset = UNSET
     execution: InferenceBatchExecutionReport | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -45,6 +54,17 @@ class InferenceReadResponse:
             data.append(data_item)
 
         model = self.model
+
+        document: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.document, Unset):
+            document = self.document.to_dict()
+
+        events: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.events, Unset):
+            events = []
+            for events_item_data in self.events:
+                events_item = events_item_data.to_dict()
+                events.append(events_item)
 
         usage: dict[str, Any] | Unset = UNSET
         if not isinstance(self.usage, Unset):
@@ -63,6 +83,10 @@ class InferenceReadResponse:
                 "model": model,
             }
         )
+        if document is not UNSET:
+            field_dict["document"] = document
+        if events is not UNSET:
+            field_dict["events"] = events
         if usage is not UNSET:
             field_dict["usage"] = usage
         if execution is not UNSET:
@@ -75,6 +99,8 @@ class InferenceReadResponse:
         from ..models.inference_batch_execution_report import InferenceBatchExecutionReport
         from ..models.inference_generate_usage import InferenceGenerateUsage
         from ..models.inference_read_object import InferenceReadObject
+        from ..models.inference_read_response_document import InferenceReadResponseDocument
+        from ..models.inference_read_response_events_item import InferenceReadResponseEventsItem
 
         d = dict(src_dict)
         object_ = InferenceReadResponseObject(d.pop("object"))
@@ -87,6 +113,22 @@ class InferenceReadResponse:
             data.append(data_item)
 
         model = d.pop("model")
+
+        _document = d.pop("document", UNSET)
+        document: InferenceReadResponseDocument | Unset
+        if isinstance(_document, Unset):
+            document = UNSET
+        else:
+            document = InferenceReadResponseDocument.from_dict(_document)
+
+        _events = d.pop("events", UNSET)
+        events: list[InferenceReadResponseEventsItem] | Unset = UNSET
+        if _events is not UNSET:
+            events = []
+            for events_item_data in _events:
+                events_item = InferenceReadResponseEventsItem.from_dict(events_item_data)
+
+                events.append(events_item)
 
         _usage = d.pop("usage", UNSET)
         usage: InferenceGenerateUsage | Unset
@@ -106,6 +148,8 @@ class InferenceReadResponse:
             object_=object_,
             data=data,
             model=model,
+            document=document,
+            events=events,
             usage=usage,
             execution=execution,
         )

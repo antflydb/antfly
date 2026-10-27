@@ -37,8 +37,278 @@ paths:
           description: Invalid or unsupported synthesis options
         '502':
           description: Upstream synthesis failure
+  /read/jobs:
+    post:
+      operationId: createReadDocumentJob
+      summary: Submit a durable read job
+      description: Unified Antfly API only. Persists the request before returning. Jobs continue after the submitting client disconnects. Sources and accepted stages are immutable snapshots; ambiguous calls remain charged on retry. Retention is absolute and is not extended by polling or resuming.
+      tags: [Documents]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentJobRequest'
+      responses:
+        '202':
+          description: Durable job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentJob'
+  /read/jobs/{job_id}:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getReadDocumentJob
+      summary: Get principal-scoped document job status
+      tags: [Documents]
+      responses:
+        '200':
+          description: Job status without source bytes or internal artifact references
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentJob'
+  /read/jobs/{job_id}/result:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: resultReadDocumentJob
+      summary: Atomic final response
+      description: Atomic final response; unavailable until the whole job succeeds
+      tags: [Documents]
+      responses:
+        '200':
+          description: Atomic final response; unavailable until the whole job succeeds
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /read/jobs/{job_id}/events:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: eventsReadDocumentJob
+      summary: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+      description: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+      tags: [Documents]
+      responses:
+        '200':
+          description: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /read/jobs/{job_id}/resume:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: resumeReadDocumentJob
+      summary: Requeue an interrupted job without resetting its budget or retention
+      description: Requeue an interrupted job without resetting its budget or retention
+      tags: [Documents]
+      responses:
+        '200':
+          description: Requeue an interrupted job without resetting its budget or retention
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentJob'
+  /read/jobs/{job_id}/cancel:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: cancelReadDocumentJob
+      summary: Fence the current attempt and cancel the job
+      description: Fence the current attempt and cancel the job
+      tags: [Documents]
+      responses:
+        '200':
+          description: Fence the current attempt and cancel the job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentJob'
+  /extract/jobs:
+    post:
+      operationId: createExtractDocumentJob
+      summary: Submit a durable extract job
+      description: Unified Antfly API only. Persists the request before returning. Jobs continue after the submitting client disconnects. Sources and accepted stages are immutable snapshots; ambiguous calls remain charged on retry. Retention is absolute and is not extended by polling or resuming.
+      tags: [Documents]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentJobRequest'
+      responses:
+        '202':
+          description: Durable job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentJob'
+  /extract/jobs/{job_id}:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getExtractDocumentJob
+      summary: Get principal-scoped document job status
+      tags: [Documents]
+      responses:
+        '200':
+          description: Job status without source bytes or internal artifact references
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentJob'
+  /extract/jobs/{job_id}/result:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: resultExtractDocumentJob
+      summary: Atomic final response
+      description: Atomic final response; unavailable until the whole job succeeds
+      tags: [Documents]
+      responses:
+        '200':
+          description: Atomic final response; unavailable until the whole job succeeds
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /extract/jobs/{job_id}/events:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: eventsExtractDocumentJob
+      summary: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+      description: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+      tags: [Documents]
+      responses:
+        '200':
+          description: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /extract/jobs/{job_id}/resume:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: resumeExtractDocumentJob
+      summary: Requeue an interrupted job without resetting its budget or retention
+      description: Requeue an interrupted job without resetting its budget or retention
+      tags: [Documents]
+      responses:
+        '200':
+          description: Requeue an interrupted job without resetting its budget or retention
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentJob'
+  /extract/jobs/{job_id}/cancel:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: cancelExtractDocumentJob
+      summary: Fence the current attempt and cancel the job
+      description: Fence the current attempt and cancel the job
+      tags: [Documents]
+      responses:
+        '200':
+          description: Fence the current attempt and cancel the job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentJob'
+
 components:
   schemas:
+    DocumentJobRequest:
+      type: object
+      additionalProperties: false
+      required: [request]
+      description: Durable document execution on the unified Antfly API. Requires configured durable job storage and local inference orchestration. The request uses the ordinary read or extract schema. Credentials must use server connections, environment variables, or secret references.
+      properties:
+        request:
+          type: object
+          additionalProperties: true
+        retention_seconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          default: 86400
+    DocumentJob:
+      type: object
+      required: [id, operation, state, attempt, sequence, expires_at_ms, usage]
+      properties:
+        id:
+          type: string
+        operation:
+          type: string
+          enum: [read, extract]
+        state:
+          type: string
+          enum: [queued, running, succeeded, failed, cancelled]
+        attempt:
+          type: integer
+          format: int64
+        sequence:
+          type: integer
+          format: int64
+        expires_at_ms:
+          type: integer
+          format: int64
+        usage:
+          type: object
+          additionalProperties: true
+        error:
+          type: string
+
     SynthesisRequest:
       type: object
       required: [model, text]

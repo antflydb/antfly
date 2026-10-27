@@ -317,3 +317,26 @@ def test_decisions_preserve_zero_predicate_and_action_probability():
     assert predicate.probability == 0
     assert predicate.act_probability == 0
     assert response.to_dict() == payload
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {
+            "documents": [
+                {"id": "receipt", "media_type": "application/pdf", "url": "data:application/pdf;base64,ZmFrZQ=="}
+            ]
+        },
+        {"read_artifact": "a" * 64},
+    ],
+)
+def test_document_and_artifact_extraction_preserve_nonempty_v2_results(source):
+    request = {"model": "balanced", "schema_version": 2, "schema": {"structures": {}}, **source}
+    payload = {"object": "extraction", "model": "balanced", "schema_version": 2, "data": [{"id": "receipt"}]}
+
+    def handler(incoming):
+        assert json.loads(incoming.read()) == request
+        return httpx.Response(200, json=payload)
+
+    client = client_with_transport(handler)
+    assert client.extract(request).to_dict() == payload

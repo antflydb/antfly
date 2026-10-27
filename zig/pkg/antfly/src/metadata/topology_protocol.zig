@@ -74,7 +74,8 @@ const std = @import("std");
 /// Version 39 decodes native per-record resolver authority and its atomic heads.
 /// Version 40 carries compact physical namespace bindings and projection reads.
 /// Version 41 carries shared content-addressed namespace execution attachments.
-pub const current_version: u16 = 44;
+pub const current_version: u16 = 45;
+pub const job_state_version: u16 = 45;
 pub const resolver_records_version: u16 = 42;
 pub const native_service_tables_version: u16 = 38;
 pub const resolver_namespaces_version: u16 = 37;
@@ -88,7 +89,10 @@ pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
 }
 
 /// Version 43 adds atomic transaction sessions; version 44 adds graph definitions.
-pub const transaction_sessions_version: u16 = 43;
+/// Version 45 adds durable document job state alongside both capabilities.
+// Main used version 43 for job state; fence transaction sessions above that
+// peer's decoder even though the pre-merge graph branch introduced them at 43.
+pub const transaction_sessions_version: u16 = 45;
 pub const graph_definition_version: u16 = 44;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;

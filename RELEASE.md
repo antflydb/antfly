@@ -391,6 +391,9 @@ exist on `main` before a newly introduced label can be used. The suites share
 every product declared by `build-contract.json` through the production archive
 script with the pinned Nix Zig. Linux includes x86-64 and ARM64, GNU and musl;
 Darwin cross-compiles on the Linux x86-64 release runner with the pinned SDK.
+The macOS SDK is pinned to 26.1 (including Metal 4 declarations), while the
+Darwin deployment target remains macOS 15.0. Optional newer Metal paths retain
+runtime OS and device availability checks.
 Both entry workflows can also be dispatched on `main` without publishing.
 Embedded package snapshots record their source policy's wheel platform tags;
 verification preserves historical schema-1 snapshots and does not reinterpret

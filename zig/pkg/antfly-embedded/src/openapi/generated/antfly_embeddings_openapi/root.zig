@@ -5,6 +5,7 @@ pub const types = @import("types.zig");
 
 pub const AntflyEmbedderConfig = types.AntflyEmbedderConfig;
 pub const BedrockEmbedderConfig = types.BedrockEmbedderConfig;
+pub const CloudflareEmbedderConfig = types.CloudflareEmbedderConfig;
 pub const CohereEmbedderConfig = types.CohereEmbedderConfig;
 pub const EmbedderConfig = types.EmbedderConfig;
 pub const EmbedderProvider = types.EmbedderProvider;

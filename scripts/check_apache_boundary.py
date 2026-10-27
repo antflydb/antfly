@@ -154,6 +154,11 @@ SOURCE_MODULES = {
     "antfly_decision_evidence": ("zig/lib/decisions/evidence.zig",),
     "antfly_source_evidence": ("zig/lib/source_evidence/root.zig",),
     "antfly_decisions": ("zig/lib/decisions/root.zig",),
+    "antfly_cloudflare": ("zig/lib/cloudflare/root.zig",),
+    "antfly_cloudflare_config": ("zig/lib/cloudflare/routing.zig",),
+    "cloudflare_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig",
+    ),
     "antfly_structured": ("zig/lib/structured/root.zig",),
     "antfly_decision_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",

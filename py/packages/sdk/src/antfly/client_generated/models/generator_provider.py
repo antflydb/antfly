@@ -7,6 +7,7 @@ class GeneratorProvider(StrEnum):
     APPLE = "apple"
     BEDROCK = "bedrock"
     CHATGPT = "chatgpt"
+    CLOUDFLARE = "cloudflare"
     GEMINI = "gemini"
     OLLAMA = "ollama"
     OPENAI = "openai"

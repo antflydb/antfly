@@ -1703,6 +1703,11 @@ class RuntimeCacheTest(unittest.TestCase):
                 # Establish the owned input before warming the cache: replacing
                 # a symlink with a copy is itself an input change in Zig 0.17.
                 path = self.own(source)
+                metal_options = (
+                    self.own("zig/pkg/inference/src/backends/metal_compile_options.h")
+                    if backend == "metal"
+                    else None
+                )
                 first = self.build(
                     "cache-identity", "runtime-unit-cli", backend=backend
                 )
@@ -1730,7 +1735,10 @@ class RuntimeCacheTest(unittest.TestCase):
                 # Check the preserved bundle domain, count, length, and order
                 # independently of the Zig hashing implementation.
                 qualifier = (
-                    ["src/backends/metal_runtime.zig"]
+                    [
+                        "src/backends/metal_runtime.zig",
+                        "src/backends/metal_compile_options.h",
+                    ]
                     if backend == "metal"
                     else ["src/ops/cuda/kernels.zig"]
                 ) + ["src/graph/kernel_jit.zig", "src/graph/quant_kernel_compiler.zig"]
@@ -1766,6 +1774,19 @@ class RuntimeCacheTest(unittest.TestCase):
                 )
                 self.assertNotEqual(self.probe(output, label).split()[1], after[1])
                 self.assert_compile(output, "cli", "cached")
+                if metal_options is not None:
+                    before_options = self.probe(output, label).split()
+                    metal_options.write_bytes(
+                        metal_options.read_bytes() + b"\n// precision policy edit\n"
+                    )
+                    output = self.build(
+                        "cache-identity", "runtime-unit-cli", backend=backend
+                    )
+                    after_options = self.probe(output, label).split()
+                    self.assertEqual(after_options[0], before_options[0])
+                    self.assertNotEqual(after_options[1], before_options[1])
+                    self.assertEqual(after_options[1], self.bundle_digest(qualifier))
+                    self.assert_compile(output, "cli", "cached")
 
     def bundle_digest(self, paths):
         digest = hashlib.sha256(b"antfly-runtime-jit-source-bundle/v1")

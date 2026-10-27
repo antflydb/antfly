@@ -64,6 +64,9 @@ const DeviceBufferRef = struct {
     ref_count: usize,
     released: bool,
     release_on_drop: bool,
+    /// An owned retain of external/runtime storage is not an allocation lease.
+    /// Its final release must never make that storage available to the pool.
+    recycle_on_drop: bool = true,
     /// Legacy wrappers retain the C allocator. Strict bounded callers may
     /// supply an owner that outlives every retained view of this buffer.
     allocator: std.mem.Allocator = std.heap.c_allocator,
@@ -516,8 +519,9 @@ pub const MetalTensor = struct {
     }
 
     /// Wrap an existing MTLBuffer handle as a device-resident tensor. Takes
-    /// ownership: `deinit` will release the handle via
-    /// `termite_metal_buffer_release`. Host `data`/`len` are left as a
+    /// ownership of the allocation: its last view may recycle storage through
+    /// the runtime. Use `deviceRetainedExternal` for a retained handle whose
+    /// allocation is still owned elsewhere. Host `data`/`len` are left as a
     /// placeholder with len=0 — callers must go through `toHostSlice` to
     /// materialize host storage.
     pub fn deviceOwned(
@@ -542,6 +546,21 @@ pub const MetalTensor = struct {
         noteDeviceOwnedCreate(handle, byte_len, dims);
         for (dims, 0..) |axis_dim, i| t.shape_buf[i] = axis_dim;
         return t;
+    }
+
+    /// Consume a retained handle whose allocation remains owned elsewhere.
+    /// Views share the retained handle, and the last view releases its retain
+    /// without recycling storage that the external owner can still use.
+    pub fn deviceRetainedExternal(
+        runtime: *anyopaque,
+        handle: *anyopaque,
+        byte_offset: usize,
+        byte_len: usize,
+        dims: []const i32,
+    ) MetalTensor {
+        var tensor = deviceOwned(runtime, handle, byte_offset, byte_len, dims);
+        tensor.device.?.ref.recycle_on_drop = false;
+        return tensor;
     }
 
     /// Wrap a runtime-owned device buffer without taking ownership of the
@@ -595,7 +614,10 @@ pub const MetalTensor = struct {
         if (ref.ref_count == 0) return;
         ref.ref_count -= 1;
         if (ref.ref_count == 0 and ref.release_on_drop and !ref.released) {
-            termite_metal_decode_runtime_release_buffer(ref.runtime, ref.handle);
+            if (ref.recycle_on_drop)
+                termite_metal_decode_runtime_release_buffer(ref.runtime, ref.handle)
+            else
+                termite_metal_buffer_release(ref.handle);
             ref.released = true;
             noteDeviceOwnedRelease(ref.handle, ref.byte_len);
         }

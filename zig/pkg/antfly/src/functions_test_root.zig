@@ -175,3 +175,7 @@ test "decision functions graph evaluation preserves vector hit offset restrictio
         \\{"limit":1,"offset":1,"embeddings":{"vector":[0.1,0.2]},"graph_queries":{"customers":{"index":"graph","match":{"anchor":"customer","nodes":{"customer":{}},"edges":[]},"return":{"bindings":["customer"],"include_documents":true,"limit":1}}},"evaluate":{"graph_query":"customers","scope":"candidates","candidate_count":20,"compute":{"x":{"literal":1}}}}
     ));
 }
+
+test "decision provider shared Cloudflare extraction preserves exact numbers and measured usage" {
+    try @import("antfly_extracting").testCloudflareExtraction();
+}

@@ -27,6 +27,7 @@ import ChunkingForm from "./ChunkingForm";
 import { Combobox } from "./Combobox";
 
 const staticModelSuggestions: Record<IndexEmbedderProvider, string[]> = {
+  cloudflare: ["@cf/baai/bge-base-en-v1.5", "@cf/qwen/qwen3-embedding-0.6b"],
   antfly: ["all-MiniLM-L6-v2"],
   ollama: ["all-minilm", "nomic-embed-text", "embeddinggemma"],
   openai: ["text-embedding-3-small", "text-embedding-3-large"],
@@ -55,7 +56,7 @@ const IndexForm: React.FC<IndexFormProps> = ({
   showName = true,
   allowArtifactSources = false,
 }) => {
-  const { control, watch } = useFormContext();
+  const { control, watch, setValue } = useFormContext();
   const prefix = fieldPrefix ? `${fieldPrefix}.` : "";
   const artifactSources = useFieldArray({
     control,
@@ -97,7 +98,13 @@ const IndexForm: React.FC<IndexFormProps> = ({
             <FormLabel>Provider</FormLabel>
             <Select
               value={field.value}
-              onValueChange={(value) => field.onChange(value as IndexEmbedderProvider)}
+              onValueChange={(value) => {
+                field.onChange(value as IndexEmbedderProvider);
+                if (value !== "cloudflare") {
+                  setValue(`${prefix}embedder.account_id`, undefined);
+                  setValue(`${prefix}embedder.gateway_id`, undefined);
+                }
+              }}
             >
               <FormControl>
                 <SelectTrigger>
@@ -360,6 +367,53 @@ const IndexForm: React.FC<IndexFormProps> = ({
                 </div>
               )}
 
+              {provider === "cloudflare" && (
+                <>
+                  <FormField
+                    control={control}
+                    name={`${prefix}embedder.account_id`}
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Cloudflare account ID</FormLabel>
+                        <FormControl>
+                          <Input {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={control}
+                    name={`${prefix}embedder.gateway_id`}
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>AI Gateway ID (optional)</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            value={field.value ?? ""}
+                            onChange={(event) => field.onChange(event.target.value || undefined)}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={control}
+                    name={`${prefix}embedder.api_key`}
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>API token or secret reference</FormLabel>
+                        <FormControl>
+                          <Input type="password" {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </>
+              )}
               {provider === "gemini" && (
                 <FormField
                   control={control}

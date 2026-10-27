@@ -18,6 +18,7 @@ import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connection
 import { cn } from "@/lib/utils";
 
 export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, string>> = {
+  cloudflare: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   antfly: "gemma-3-1b-it",
   ollama: "llama3.3:70b",
   gemini: "gemini-2.5-flash",
@@ -27,6 +28,7 @@ export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, stri
 };
 
 export const GENERATOR_PROVIDER_LABELS: Partial<Record<GeneratorProvider, string>> = {
+  cloudflare: "Cloudflare Workers AI",
   antfly: "Antfly (Local)",
   bedrock: "Amazon Bedrock",
   anthropic: "Anthropic (Claude)",
@@ -48,6 +50,7 @@ export const GENERATOR_DEFAULT_CONFIG: GeneratorConfig = {
 
 /** Providers shown in the query-builder generator selectors. */
 export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
+  "cloudflare",
   "anthropic",
   "bedrock",
   "apple",
@@ -186,6 +189,22 @@ export function GeneratorSelector({
       });
       return;
     }
+    if (nextProvider === "cloudflare") {
+      onChange({
+        provider: "cloudflare",
+        account_id: "",
+        model: GENERATOR_PROVIDER_DEFAULTS.cloudflare!,
+        ...(value.max_tokens !== undefined && { max_tokens: value.max_tokens }),
+      });
+      return;
+    }
+    if (value.provider === "cloudflare") {
+      onChange({
+        provider: nextProvider,
+        model: liveGenerators[nextProvider]?.[0] ?? GENERATOR_PROVIDER_DEFAULTS[nextProvider] ?? "",
+      } as GeneratorConfig);
+      return;
+    }
     if (nextProvider === "anthropic") {
       // Do not inherit another vendor's credentials or sampling defaults.
       // Current Claude models can require their native sampling defaults.
@@ -303,6 +322,26 @@ export function GeneratorSelector({
               </SelectContent>
             </Select>
           </div>
+          {value.provider === "cloudflare" && (
+            <>
+              <div className="space-y-2">
+                <Label className="text-xs text-muted-foreground">Cloudflare account ID</Label>
+                <Input
+                  value={value.account_id}
+                  onChange={(event) => onChange({ ...value, account_id: event.target.value })}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs text-muted-foreground">AI Gateway ID (optional)</Label>
+                <Input
+                  value={value.gateway_id ?? ""}
+                  onChange={(event) =>
+                    onChange({ ...value, gateway_id: event.target.value || undefined })
+                  }
+                />
+              </div>
+            </>
+          )}
           {value.provider === "chatgpt" && (
             <div className="space-y-2">
               <Label className="text-xs text-muted-foreground">ChatGPT account</Label>

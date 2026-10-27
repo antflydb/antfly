@@ -213,8 +213,14 @@ pub const View = struct {
                             .rewrite => self.providers.rewriter_configs.get(value.name).?,
                             else => self.providers.predictor_configs.get(value.name).?,
                         };
-                        out.backend_model = cfg.model;
-                        out.connection = cfg.connection;
+                        if (cfg.generator) |name| {
+                            const generator = try self.providers.getGeneratorConfig(name);
+                            out.backend_model = generator.model;
+                            out.executor = @tagName(generator.provider);
+                        } else {
+                            out.backend_model = cfg.model;
+                            out.connection = cfg.connection;
+                        }
                     },
                 }
             },

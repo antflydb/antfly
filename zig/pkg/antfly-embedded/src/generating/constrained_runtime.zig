@@ -205,6 +205,7 @@ pub const Runtime = struct {
             var result = while (true) {
                 const generated = generating.executeChainWithOptions(a, self.runtime.http, &.{.{ .generator = cfg }}, .{
                     .antfly_provider = self.runtime.options.antfly_provider,
+                    .provider_runtime = self.runtime.options.provider_runtime,
                     .secret_store = self.runtime.options.secret_store,
                     .inference_api_key = self.runtime.options.inference_api_key,
                     .max_response_bytes = self.runtime.options.max_response_bytes,

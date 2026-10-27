@@ -29,6 +29,8 @@ pub const Provider = struct {
     attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    gateway_id: ?[]const u8 = null,
+    header_storage: [2][2][]const u8 = undefined,
     response_format_json: ?[]const u8 = null,
     logprobs: bool = false,
     tools_json: ?[]const u8 = null,
@@ -353,9 +355,17 @@ pub const Provider = struct {
         if (calls.len > 0) alloc.free(calls);
     }
 
-    fn authHeaders(self: *const Provider) ?[]const [2][]const u8 {
-        if (self.auth_header) |*h| return @as(*const [1][2][]const u8, h);
-        return null;
+    fn authHeaders(self: *Provider) ?[]const [2][]const u8 {
+        var count: usize = 0;
+        if (self.auth_header) |h| {
+            self.header_storage[count] = h;
+            count += 1;
+        }
+        if (self.gateway_id) |id| {
+            self.header_storage[count] = .{ "cf-aig-gateway-id", id };
+            count += 1;
+        }
+        return if (count > 0) self.header_storage[0..count] else null;
     }
 
     const embedder_vtable = inference.Embedder.VTable{

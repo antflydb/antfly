@@ -1,0 +1,3526 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Cloudflare Workers AI model wire types",
+    "version": "2026-10-24",
+    "description": "Pinned official per-model JSON schemas. See cloudflare/sources.json for upstream content hashes. The account run API OpenAPI union omits System One models."
+  },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "BgeBaseEnV15Input": {
+        "type": "object",
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "description": "The text to embed",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "array",
+                    "description": "Batch of text values to embed",
+                    "items": {
+                      "type": "string",
+                      "description": "The text to embed",
+                      "minLength": 1
+                    },
+                    "maxItems": 100
+                  }
+                ]
+              },
+              "pooling": {
+                "type": "string",
+                "enum": [
+                  "mean",
+                  "cls"
+                ],
+                "default": "mean",
+                "description": "The pooling method used in the embedding process. `cls` pooling will generate more accurate embeddings on larger inputs - however, embeddings created with cls pooling are not compatible with embeddings generated with mean pooling. The default pooling method is `mean` in order for this to not be a breaking change, but we highly suggest using the new `cls` pooling for better accuracy."
+              }
+            },
+            "required": [
+              "text"
+            ]
+          },
+          {
+            "properties": {
+              "requests": {
+                "type": "array",
+                "description": "Batch of the embeddings requests to run using async-queue",
+                "items": {
+                  "properties": {
+                    "text": {
+                      "oneOf": [
+                        {
+                          "type": "string",
+                          "description": "The text to embed",
+                          "minLength": 1
+                        },
+                        {
+                          "type": "array",
+                          "description": "Batch of text values to embed",
+                          "items": {
+                            "type": "string",
+                            "description": "The text to embed",
+                            "minLength": 1
+                          },
+                          "maxItems": 100
+                        }
+                      ]
+                    },
+                    "pooling": {
+                      "type": "string",
+                      "enum": [
+                        "mean",
+                        "cls"
+                      ],
+                      "default": "mean",
+                      "description": "The pooling method used in the embedding process. `cls` pooling will generate more accurate embeddings on larger inputs - however, embeddings created with cls pooling are not compatible with embeddings generated with mean pooling. The default pooling method is `mean` in order for this to not be a breaking change, but we highly suggest using the new `cls` pooling for better accuracy."
+                    }
+                  },
+                  "required": [
+                    "text"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "requests"
+            ]
+          }
+        ]
+      },
+      "BgeBaseEnV15Output": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/BgeBaseEnV15OutputVariant0"
+          },
+          {
+            "$ref": "#/components/schemas/BgeBaseEnV15OutputVariant1"
+          }
+        ]
+      },
+      "BgeRerankerBaseInput": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "A query you wish to perform against the provided contexts."
+          },
+          "top_k": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Number of returned results starting with the best score."
+          },
+          "contexts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BgeRerankerBaseInputContextsItem"
+            },
+            "description": "List of provided contexts. Note that the index in this array is important, as the response will refer to it."
+          }
+        },
+        "required": [
+          "query",
+          "contexts"
+        ]
+      },
+      "BgeRerankerBaseOutput": {
+        "type": "object",
+        "contentType": "application/json",
+        "properties": {
+          "response": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BgeRerankerBaseOutputResponseItem"
+            }
+          }
+        }
+      },
+      "ClairicInput": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "pattern": "^(clairic|@cf/cloudflare/clairic)$",
+            "default": "clairic",
+            "description": "Required. The model selector: \"clairic\"."
+          },
+          "state": {
+            "type": "string",
+            "default": "",
+            "description": "The text to read and predict from. Must be non-empty unless images are sent. Text answers are spans of this string."
+          },
+          "fields": {
+            "type": "object",
+            "description": "Required. Map of field name to a typed field spec. At least one field; no upper limit. Fields that do not fit next to the state in one 8,192-token pass are split across parallel passes.",
+            "minProperties": 1,
+            "propertyNames": {
+              "pattern": "^[A-Za-z_][A-Za-z0-9_.\\-]{0,63}$"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "number",
+                    "date",
+                    "time",
+                    "datetime",
+                    "duration",
+                    "list",
+                    "estimate",
+                    "forecast"
+                  ]
+                },
+                "instructions": {
+                  "type": "string",
+                  "description": "What the field should contain."
+                },
+                "unit": {
+                  "type": "string",
+                  "description": "Unit label. For durations, one of seconds, minutes, hours, days, weeks, months, years (default seconds)."
+                },
+                "integer": {
+                  "type": "boolean",
+                  "description": "Numbers and durations only."
+                },
+                "decimals": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 6,
+                  "description": "Numbers, durations and number lists only."
+                },
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "number",
+                    "date"
+                  ],
+                  "description": "Required for list fields."
+                },
+                "min": {
+                  "description": "Required for estimate/forecast: a number, or an ISO date for date estimates."
+                },
+                "max": {
+                  "description": "Required for estimate/forecast: a number, or an ISO date for date estimates."
+                },
+                "step": {
+                  "description": "Estimate grid: a positive number (days for date estimates), or \"month\" / \"year\"."
+                },
+                "scale": {
+                  "type": "string",
+                  "enum": [
+                    "linear",
+                    "log"
+                  ],
+                  "default": "linear"
+                },
+                "null_threshold": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 1,
+                  "description": "Probability of null above which the value is null (default 0.5)."
+                },
+                "horizon": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 64,
+                  "description": "Forecast only: number of steps."
+                },
+                "interval": {
+                  "type": "string",
+                  "enum": [
+                    "step",
+                    "minute",
+                    "hour",
+                    "day",
+                    "week",
+                    "month",
+                    "quarter",
+                    "year"
+                  ],
+                  "description": "Forecast only."
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          },
+          "images": {
+            "type": "array",
+            "description": "Optional embedded PNG, JPEG or WebP images placed before the state (max 4; 4 MiB each, 8 MiB total decoded; request body max 16 MiB). Remote URLs are not accepted.",
+            "maxItems": 4,
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "title": "Data URL",
+                  "pattern": "^[Dd][Aa][Tt][Aa]:"
+                },
+                {
+                  "$ref": "#/components/schemas/ClairicInputImagesItemVariant1"
+                }
+              ]
+            }
+          },
+          "reference_date": {
+            "type": "string",
+            "description": "ISO date that anchors dates written without a year."
+          },
+          "options": {
+            "$ref": "#/components/schemas/ClairicInputOptions"
+          }
+        },
+        "required": [
+          "model",
+          "fields"
+        ]
+      },
+      "ClairicOutput": {
+        "type": "object",
+        "contentType": "application/json",
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "answers": {
+            "type": "object",
+            "description": "One answer per field, keyed by field name. value is null when the input does not determine it.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string"
+                },
+                "value": {},
+                "guess": {},
+                "p_null": {
+                  "type": "number"
+                },
+                "confidence": {
+                  "type": "number"
+                },
+                "span": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                },
+                "spans": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "mean": {},
+                "median": {},
+                "p10": {},
+                "p90": {},
+                "p_below": {
+                  "type": "number"
+                },
+                "p_above": {
+                  "type": "number"
+                },
+                "quantiles": {
+                  "type": "array"
+                },
+                "steps": {
+                  "type": "array",
+                  "description": "Forecast only: one estimate per step."
+                }
+              },
+              "required": [
+                "type",
+                "value"
+              ]
+            }
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "state_text": {
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/ClairicOutputUsage"
+          }
+        },
+        "required": [
+          "model",
+          "answers",
+          "truncated",
+          "usage"
+        ]
+      },
+      "ClefInput": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "pattern": "^\\s*(clef|clef-flash)\\s*$",
+            "description": "Required. The model selector: \"clef\" for @cf/cloudflare/clef, \"clef-flash\" for @cf/cloudflare/clef-flash."
+          },
+          "state": {
+            "description": "Required. The content to evaluate: a string, or structured data (object/array) such as records, chat logs, or application state. Long text state is truncated to fit the model's token limit."
+          },
+          "questions": {
+            "type": "object",
+            "description": "Map of question id to a typed question (noul, choice, or score). 1 to 64 questions; ids may use letters, digits, '_', '.', '-' (max 100 chars). Answers are returned under the same ids.",
+            "minProperties": 1,
+            "maxProperties": 64,
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "Noul",
+                  "description": "A yes/no question. Returns the probability the answer is yes.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "noul"
+                      ]
+                    },
+                    "instructions": {
+                      "description": "Required. The yes/no question to evaluate: a non-empty string, or an object/array that holds the question in one field and referenced data in others."
+                    },
+                    "criteria": {
+                      "type": "object",
+                      "description": "Optional descriptions of what a yes and a no mean.",
+                      "properties": {
+                        "true": {
+                          "description": "What a yes (value near 1) means."
+                        },
+                        "false": {
+                          "description": "What a no (value near 0) means."
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "instructions"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "Choice",
+                  "description": "Pick one option from a set you define. Returns the chosen option, a probability per option, and confidence.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "choice"
+                      ]
+                    },
+                    "instructions": {
+                      "description": "Required. What the model should decide: a non-empty string, or an object/array holding the question and referenced data."
+                    },
+                    "criteria": {
+                      "type": "object",
+                      "description": "Map of option id (non-empty string) to its description: string, object, array, or null when no detail is needed. 2 to 255 options.",
+                      "additionalProperties": {}
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "instructions",
+                    "criteria"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "Score",
+                  "description": "Rate the state on an ordered rubric. Returns a probability-weighted score, a probability per level, and confidence.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "score"
+                      ]
+                    },
+                    "instructions": {
+                      "description": "Required. What the model should rate: a non-empty string, or an object/array holding the question and referenced data."
+                    },
+                    "criteria": {
+                      "type": "array",
+                      "description": "Ordered level descriptions (string, object, or array), lowest first; levels are indexed from 0. 2 to 10 levels.",
+                      "minItems": 2,
+                      "maxItems": 10,
+                      "items": {}
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "instructions",
+                    "criteria"
+                  ]
+                }
+              ]
+            }
+          },
+          "images": {
+            "type": "array",
+            "description": "Clef extension to the System One API. Optional embedded PNG, JPEG, or WebP images placed before the state (max 4; 4 MiB and 16 megapixels each, 8 MiB total decoded; whole request body max 13 MiB). Remote URLs are not accepted.",
+            "maxItems": 4,
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "title": "Data URL",
+                  "description": "A base64 data URL: data:image/png;base64,..., data:image/jpeg;base64,..., or data:image/webp;base64,...",
+                  "pattern": "^[Dd][Aa][Tt][Aa]:"
+                },
+                {
+                  "$ref": "#/components/schemas/ClefInputImagesItemVariant1"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "model",
+          "state",
+          "questions"
+        ]
+      },
+      "ClefOutput": {
+        "type": "object",
+        "contentType": "application/json",
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "The model that performed the evaluation."
+          },
+          "answers": {
+            "type": "object",
+            "description": "One answer per question, keyed by the question ids from the request.",
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "Noul answer",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "noul"
+                      ]
+                    },
+                    "noul": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1,
+                      "description": "Probability the answer is yes."
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "noul"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "Choice answer",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "choice"
+                      ]
+                    },
+                    "choice": {
+                      "type": "string",
+                      "description": "The highest-probability option."
+                    },
+                    "probabilities": {
+                      "type": "object",
+                      "description": "Probability per option/level; values sum to 1.",
+                      "additionalProperties": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      }
+                    },
+                    "confidence": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1,
+                      "description": "How certain the model is, derived from the probabilities."
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "choice",
+                    "probabilities",
+                    "confidence"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "Score answer",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "score"
+                      ]
+                    },
+                    "score": {
+                      "type": "number",
+                      "description": "Probability-weighted level; can land between levels."
+                    },
+                    "legend": {
+                      "type": "object",
+                      "description": "Level index (string) mapped to its description.",
+                      "additionalProperties": {}
+                    },
+                    "probabilities": {
+                      "type": "object",
+                      "description": "Probability per option/level; values sum to 1.",
+                      "additionalProperties": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      }
+                    },
+                    "confidence": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1,
+                      "description": "How certain the model is, derived from the probabilities."
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "score",
+                    "legend",
+                    "probabilities",
+                    "confidence"
+                  ]
+                }
+              ]
+            }
+          },
+          "usage": {
+            "$ref": "#/components/schemas/ClefOutputUsage"
+          }
+        },
+        "required": [
+          "model",
+          "answers",
+          "usage"
+        ]
+      },
+      "DistilbertSst2Int8Input": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The text that you want to classify"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "DistilbertSst2Int8Output": {
+        "type": "array",
+        "contentType": "application/json",
+        "description": "An array of classification results for the input text",
+        "items": {
+          "$ref": "#/components/schemas/DistilbertSst2Int8OutputItem"
+        }
+      },
+      "M2M10012BInput": {
+        "type": "object",
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The text to be translated"
+              },
+              "source_lang": {
+                "type": "string",
+                "default": "en",
+                "description": "The language code of the source text (e.g., 'en' for English). Defaults to 'en' if not specified"
+              },
+              "target_lang": {
+                "type": "string",
+                "description": "The language code to translate the text into (e.g., 'es' for Spanish)"
+              }
+            },
+            "required": [
+              "text",
+              "target_lang"
+            ]
+          },
+          {
+            "properties": {
+              "requests": {
+                "type": "array",
+                "description": "Batch of the embeddings requests to run using async-queue",
+                "items": {
+                  "$ref": "#/components/schemas/M2M10012BInputVariant1RequestsItem"
+                }
+              }
+            },
+            "required": [
+              "requests"
+            ]
+          }
+        ]
+      },
+      "M2M10012BOutput": {
+        "type": "object",
+        "contentType": "application/json",
+        "oneOf": [
+          {
+            "properties": {
+              "translated_text": {
+                "type": "string",
+                "description": "The translated text in the target language"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/M2M10012BOutputVariant1"
+          }
+        ]
+      },
+      "WhisperLargeV3TurboInput": {
+        "type": "object",
+        "properties": {
+          "audio": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "Base64 encoded value of the audio data."
+              },
+              {
+                "$ref": "#/components/schemas/WhisperLargeV3TurboInputAudioVariant1"
+              }
+            ]
+          },
+          "task": {
+            "type": "string",
+            "default": "transcribe",
+            "description": "Supported tasks are 'translate' or 'transcribe'."
+          },
+          "language": {
+            "type": "string",
+            "description": "The language of the audio being transcribed or translated."
+          },
+          "vad_filter": {
+            "type": "boolean",
+            "default": false,
+            "description": "Preprocess the audio with a voice activity detection model."
+          },
+          "initial_prompt": {
+            "type": "string",
+            "description": "A text prompt to help provide context to the model on the contents of the audio."
+          },
+          "prefix": {
+            "type": "string",
+            "description": "The prefix appended to the beginning of the output of the transcription and can guide the transcription result."
+          },
+          "beam_size": {
+            "type": "integer",
+            "default": 5,
+            "description": "The number of beams to use in beam search decoding. Higher values may improve accuracy at the cost of speed."
+          },
+          "condition_on_previous_text": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whether to condition on previous text during transcription. Setting to false may help prevent hallucination loops."
+          },
+          "no_speech_threshold": {
+            "type": "number",
+            "default": 0.6,
+            "description": "Threshold for detecting no-speech segments. Segments with no-speech probability above this value are skipped."
+          },
+          "compression_ratio_threshold": {
+            "type": "number",
+            "default": 2.4,
+            "description": "Threshold for filtering out segments with high compression ratio, which often indicate repetitive or hallucinated text."
+          },
+          "log_prob_threshold": {
+            "type": "number",
+            "default": -1,
+            "description": "Threshold for filtering out segments with low average log probability, indicating low confidence."
+          },
+          "hallucination_silence_threshold": {
+            "type": "number",
+            "description": "Optional threshold (in seconds) to skip silent periods that may cause hallucinations."
+          }
+        },
+        "required": [
+          "audio"
+        ]
+      },
+      "WhisperLargeV3TurboOutput": {
+        "type": "object",
+        "contentType": "application/json",
+        "properties": {
+          "transcription_info": {
+            "$ref": "#/components/schemas/WhisperLargeV3TurboOutputTranscription_info"
+          },
+          "text": {
+            "type": "string",
+            "description": "The complete transcription of the audio."
+          },
+          "word_count": {
+            "type": "number",
+            "description": "The total number of words in the transcription."
+          },
+          "segments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WhisperLargeV3TurboOutputSegmentsItem"
+            }
+          },
+          "vtt": {
+            "type": "string",
+            "description": "The transcription in WebVTT format, which includes timing and text information for use in subtitles."
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "Llama3370BInstructFp8FastInput": {
+        "type": "object",
+        "oneOf": [
+          {
+            "title": "Prompt",
+            "properties": {
+              "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The input text prompt for the model to generate a response."
+              },
+              "lora": {
+                "type": "string",
+                "description": "Name of the LoRA (Low-Rank Adaptation) model to fine-tune the base model."
+              },
+              "response_format": {
+                "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant0Response_format"
+              },
+              "raw": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, a chat template is not applied and you must adhere to the specific model's expected formatting."
+              },
+              "stream": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, the response will be streamed back incrementally using SSE, Server Sent Events."
+              },
+              "max_tokens": {
+                "type": "integer",
+                "default": 256,
+                "description": "The maximum number of tokens to generate in the response."
+              },
+              "temperature": {
+                "type": "number",
+                "default": 0.6,
+                "minimum": 0,
+                "maximum": 5,
+                "description": "Controls the randomness of the output; higher values produce more random results."
+              },
+              "top_p": {
+                "type": "number",
+                "minimum": 0.001,
+                "maximum": 1,
+                "description": "Adjusts the creativity of the AI's responses by controlling how many possible words it considers. Lower values make outputs more predictable; higher values allow for more varied and creative responses."
+              },
+              "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Limits the AI to choose from the top 'k' most probable words. Lower values make responses more focused; higher values introduce more variety and potential surprises."
+              },
+              "seed": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9999999999,
+                "description": "Random seed for reproducibility of the generation."
+              },
+              "repetition_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Penalty for repeated tokens; higher values discourage repetition."
+              },
+              "frequency_penalty": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 2,
+                "description": "Decreases the likelihood of the model repeating the same lines verbatim."
+              },
+              "presence_penalty": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 2,
+                "description": "Increases the likelihood of the model introducing new topics."
+              }
+            },
+            "required": [
+              "prompt"
+            ]
+          },
+          {
+            "title": "Messages",
+            "properties": {
+              "messages": {
+                "type": "array",
+                "description": "An array of message objects representing the conversation history.",
+                "items": {
+                  "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant1MessagesItem"
+                }
+              },
+              "functions": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant1FunctionsItem"
+                }
+              },
+              "tools": {
+                "type": "array",
+                "description": "A list of tools available for the assistant to use.",
+                "items": {
+                  "type": "object",
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "description": "The name of the tool. More descriptive the better."
+                        },
+                        "description": {
+                          "type": "string",
+                          "description": "A brief description of what the tool does."
+                        },
+                        "parameters": {
+                          "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant1ToolsItemVariant0Parameters"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "description",
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "description": "Specifies the type of tool (e.g., 'function')."
+                        },
+                        "function": {
+                          "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant1ToolsItemVariant1Function"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "function"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "response_format": {
+                "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant1Response_format"
+              },
+              "raw": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, a chat template is not applied and you must adhere to the specific model's expected formatting."
+              },
+              "stream": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, the response will be streamed back incrementally using SSE, Server Sent Events."
+              },
+              "max_tokens": {
+                "type": "integer",
+                "default": 256,
+                "description": "The maximum number of tokens to generate in the response."
+              },
+              "temperature": {
+                "type": "number",
+                "default": 0.6,
+                "minimum": 0,
+                "maximum": 5,
+                "description": "Controls the randomness of the output; higher values produce more random results."
+              },
+              "top_p": {
+                "type": "number",
+                "minimum": 0.001,
+                "maximum": 1,
+                "description": "Adjusts the creativity of the AI's responses by controlling how many possible words it considers. Lower values make outputs more predictable; higher values allow for more varied and creative responses."
+              },
+              "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Limits the AI to choose from the top 'k' most probable words. Lower values make responses more focused; higher values introduce more variety and potential surprises."
+              },
+              "seed": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9999999999,
+                "description": "Random seed for reproducibility of the generation."
+              },
+              "repetition_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Penalty for repeated tokens; higher values discourage repetition."
+              },
+              "frequency_penalty": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 2,
+                "description": "Decreases the likelihood of the model repeating the same lines verbatim."
+              },
+              "presence_penalty": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 2,
+                "description": "Increases the likelihood of the model introducing new topics."
+              }
+            },
+            "required": [
+              "messages"
+            ]
+          },
+          {
+            "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant2"
+          }
+        ]
+      },
+      "Llama3370BInstructFp8FastOutput": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/Llama3370BInstructFp8FastOutputVariant0"
+          },
+          {
+            "type": "string",
+            "contentType": "text/event-stream",
+            "format": "binary"
+          },
+          {
+            "$ref": "#/components/schemas/Llama3370BInstructFp8FastOutputVariant2"
+          }
+        ]
+      },
+      "MistralSmall3124BInstructInput": {
+        "type": "object",
+        "oneOf": [
+          {
+            "title": "Prompt",
+            "properties": {
+              "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The input text prompt for the model to generate a response."
+              },
+              "guided_json": {
+                "type": "object",
+                "description": "JSON schema that should be fulfilled for the response."
+              },
+              "raw": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, a chat template is not applied and you must adhere to the specific model's expected formatting."
+              },
+              "stream": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, the response will be streamed back incrementally using SSE, Server Sent Events."
+              },
+              "max_tokens": {
+                "type": "integer",
+                "default": 256,
+                "description": "The maximum number of tokens to generate in the response."
+              },
+              "temperature": {
+                "type": "number",
+                "default": 0.15,
+                "minimum": 0,
+                "maximum": 5,
+                "description": "Controls the randomness of the output; higher values produce more random results."
+              },
+              "top_p": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Adjusts the creativity of the AI's responses by controlling how many possible words it considers. Lower values make outputs more predictable; higher values allow for more varied and creative responses."
+              },
+              "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Limits the AI to choose from the top 'k' most probable words. Lower values make responses more focused; higher values introduce more variety and potential surprises."
+              },
+              "seed": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9999999999,
+                "description": "Random seed for reproducibility of the generation."
+              },
+              "repetition_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Penalty for repeated tokens; higher values discourage repetition."
+              },
+              "frequency_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Decreases the likelihood of the model repeating the same lines verbatim."
+              },
+              "presence_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Increases the likelihood of the model introducing new topics."
+              }
+            },
+            "required": [
+              "prompt"
+            ]
+          },
+          {
+            "title": "Messages",
+            "properties": {
+              "messages": {
+                "type": "array",
+                "description": "An array of message objects representing the conversation history.",
+                "items": {
+                  "$ref": "#/components/schemas/MistralSmall3124BInstructInputVariant1MessagesItem"
+                }
+              },
+              "functions": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/MistralSmall3124BInstructInputVariant1FunctionsItem"
+                }
+              },
+              "tools": {
+                "type": "array",
+                "description": "A list of tools available for the assistant to use.",
+                "items": {
+                  "type": "object",
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "description": "The name of the tool. More descriptive the better."
+                        },
+                        "description": {
+                          "type": "string",
+                          "description": "A brief description of what the tool does."
+                        },
+                        "parameters": {
+                          "$ref": "#/components/schemas/MistralSmall3124BInstructInputVariant1ToolsItemVariant0Parameters"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "description",
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "description": "Specifies the type of tool (e.g., 'function')."
+                        },
+                        "function": {
+                          "$ref": "#/components/schemas/MistralSmall3124BInstructInputVariant1ToolsItemVariant1Function"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "function"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "guided_json": {
+                "type": "object",
+                "description": "JSON schema that should be fufilled for the response."
+              },
+              "raw": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, a chat template is not applied and you must adhere to the specific model's expected formatting."
+              },
+              "stream": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, the response will be streamed back incrementally using SSE, Server Sent Events."
+              },
+              "max_tokens": {
+                "type": "integer",
+                "default": 256,
+                "description": "The maximum number of tokens to generate in the response."
+              },
+              "temperature": {
+                "type": "number",
+                "default": 0.15,
+                "minimum": 0,
+                "maximum": 5,
+                "description": "Controls the randomness of the output; higher values produce more random results."
+              },
+              "top_p": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Adjusts the creativity of the AI's responses by controlling how many possible words it considers. Lower values make outputs more predictable; higher values allow for more varied and creative responses."
+              },
+              "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Limits the AI to choose from the top 'k' most probable words. Lower values make responses more focused; higher values introduce more variety and potential surprises."
+              },
+              "seed": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9999999999,
+                "description": "Random seed for reproducibility of the generation."
+              },
+              "repetition_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Penalty for repeated tokens; higher values discourage repetition."
+              },
+              "frequency_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Decreases the likelihood of the model repeating the same lines verbatim."
+              },
+              "presence_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Increases the likelihood of the model introducing new topics."
+              }
+            },
+            "required": [
+              "messages"
+            ]
+          }
+        ]
+      },
+      "MistralSmall3124BInstructOutput": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/MistralSmall3124BInstructOutputVariant0"
+          },
+          {
+            "type": "string",
+            "contentType": "text/event-stream",
+            "format": "binary"
+          }
+        ]
+      },
+      "Qwen330BA3BFp8Input": {
+        "type": "object",
+        "oneOf": [
+          {
+            "title": "Prompt",
+            "properties": {
+              "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The input text prompt for the model to generate a response."
+              },
+              "lora": {
+                "type": "string",
+                "description": "Name of the LoRA (Low-Rank Adaptation) model to fine-tune the base model."
+              },
+              "response_format": {
+                "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant0Response_format"
+              },
+              "raw": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, a chat template is not applied and you must adhere to the specific model's expected formatting."
+              },
+              "stream": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, the response will be streamed back incrementally using SSE, Server Sent Events."
+              },
+              "max_tokens": {
+                "type": "integer",
+                "default": 2000,
+                "description": "The maximum number of tokens to generate in the response."
+              },
+              "temperature": {
+                "type": "number",
+                "default": 0.6,
+                "minimum": 0,
+                "maximum": 5,
+                "description": "Controls the randomness of the output; higher values produce more random results."
+              },
+              "top_p": {
+                "type": "number",
+                "minimum": 0.001,
+                "maximum": 1,
+                "description": "Adjusts the creativity of the AI's responses by controlling how many possible words it considers. Lower values make outputs more predictable; higher values allow for more varied and creative responses."
+              },
+              "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Limits the AI to choose from the top 'k' most probable words. Lower values make responses more focused; higher values introduce more variety and potential surprises."
+              },
+              "seed": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9999999999,
+                "description": "Random seed for reproducibility of the generation."
+              },
+              "repetition_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Penalty for repeated tokens; higher values discourage repetition."
+              },
+              "frequency_penalty": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 2,
+                "description": "Decreases the likelihood of the model repeating the same lines verbatim."
+              },
+              "presence_penalty": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 2,
+                "description": "Increases the likelihood of the model introducing new topics."
+              }
+            },
+            "required": [
+              "prompt"
+            ]
+          },
+          {
+            "title": "Messages",
+            "properties": {
+              "messages": {
+                "type": "array",
+                "description": "An array of message objects representing the conversation history.",
+                "items": {
+                  "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant1MessagesItem"
+                }
+              },
+              "functions": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant1FunctionsItem"
+                }
+              },
+              "tools": {
+                "type": "array",
+                "description": "A list of tools available for the assistant to use.",
+                "items": {
+                  "type": "object",
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "description": "The name of the tool. More descriptive the better."
+                        },
+                        "description": {
+                          "type": "string",
+                          "description": "A brief description of what the tool does."
+                        },
+                        "parameters": {
+                          "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant1ToolsItemVariant0Parameters"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "description",
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "description": "Specifies the type of tool (e.g., 'function')."
+                        },
+                        "function": {
+                          "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant1ToolsItemVariant1Function"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "function"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "response_format": {
+                "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant1Response_format"
+              },
+              "raw": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, a chat template is not applied and you must adhere to the specific model's expected formatting."
+              },
+              "stream": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, the response will be streamed back incrementally using SSE, Server Sent Events."
+              },
+              "max_tokens": {
+                "type": "integer",
+                "default": 2000,
+                "description": "The maximum number of tokens to generate in the response."
+              },
+              "temperature": {
+                "type": "number",
+                "default": 0.6,
+                "minimum": 0,
+                "maximum": 5,
+                "description": "Controls the randomness of the output; higher values produce more random results."
+              },
+              "top_p": {
+                "type": "number",
+                "minimum": 0.001,
+                "maximum": 1,
+                "description": "Adjusts the creativity of the AI's responses by controlling how many possible words it considers. Lower values make outputs more predictable; higher values allow for more varied and creative responses."
+              },
+              "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Limits the AI to choose from the top 'k' most probable words. Lower values make responses more focused; higher values introduce more variety and potential surprises."
+              },
+              "seed": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9999999999,
+                "description": "Random seed for reproducibility of the generation."
+              },
+              "repetition_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Penalty for repeated tokens; higher values discourage repetition."
+              },
+              "frequency_penalty": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 2,
+                "description": "Decreases the likelihood of the model repeating the same lines verbatim."
+              },
+              "presence_penalty": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 2,
+                "description": "Increases the likelihood of the model introducing new topics."
+              }
+            },
+            "required": [
+              "messages"
+            ]
+          },
+          {
+            "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant2"
+          }
+        ]
+      },
+      "Qwen330BA3BFp8Output": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/Qwen330BA3BFp8OutputVariant0"
+          },
+          {
+            "$ref": "#/components/schemas/Qwen330BA3BFp8OutputVariant1"
+          },
+          {
+            "type": "string",
+            "contentType": "text/event-stream",
+            "format": "binary"
+          },
+          {
+            "$ref": "#/components/schemas/Qwen330BA3BFp8OutputVariant3"
+          }
+        ]
+      },
+      "MelottsInput": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "description": "A text description of the audio you want to generate"
+          },
+          "lang": {
+            "type": "string",
+            "default": "en",
+            "description": "The speech language (e.g., 'en' for English, 'fr' for French). Defaults to 'en' if not specified"
+          }
+        },
+        "required": [
+          "prompt"
+        ]
+      },
+      "MelottsOutput": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/MelottsOutputVariant0"
+          },
+          {
+            "type": "string",
+            "contentType": "audio/mpeg",
+            "format": "binary",
+            "description": "The generated audio in MP3 format"
+          }
+        ]
+      },
+      "Aura2EnInput": {
+        "type": "object",
+        "properties": {
+          "speaker": {
+            "type": "string",
+            "enum": [
+              "amalthea",
+              "andromeda",
+              "apollo",
+              "arcas",
+              "aries",
+              "asteria",
+              "athena",
+              "atlas",
+              "aurora",
+              "callista",
+              "cora",
+              "cordelia",
+              "delia",
+              "draco",
+              "electra",
+              "harmonia",
+              "helena",
+              "hera",
+              "hermes",
+              "hyperion",
+              "iris",
+              "janus",
+              "juno",
+              "jupiter",
+              "luna",
+              "mars",
+              "minerva",
+              "neptune",
+              "odysseus",
+              "ophelia",
+              "orion",
+              "orpheus",
+              "pandora",
+              "phoebe",
+              "pluto",
+              "saturn",
+              "thalia",
+              "theia",
+              "vesta",
+              "zeus"
+            ],
+            "default": "luna",
+            "description": "Speaker used to produce the audio."
+          },
+          "encoding": {
+            "type": "string",
+            "enum": [
+              "linear16",
+              "flac",
+              "mulaw",
+              "alaw",
+              "mp3",
+              "opus",
+              "aac"
+            ],
+            "description": "Encoding of the output audio."
+          },
+          "container": {
+            "type": "string",
+            "enum": [
+              "none",
+              "wav",
+              "ogg"
+            ],
+            "description": "Container specifies the file format wrapper for the output audio. The available options depend on the encoding type.."
+          },
+          "text": {
+            "type": "string",
+            "description": "The text content to be converted to speech"
+          },
+          "sample_rate": {
+            "type": "number",
+            "description": "Sample Rate specifies the sample rate for the output audio. Based on the encoding, different sample rates are supported. For some encodings, the sample rate is not configurable"
+          },
+          "bit_rate": {
+            "type": "number",
+            "description": "The bitrate of the audio in bits per second. Choose from predefined ranges or specific values based on the encoding type."
+          }
+        }
+      },
+      "Aura2EnOutput": {
+        "type": "string",
+        "contentType": "audio/mpeg",
+        "format": "binary",
+        "description": "The generated audio in MP3 format"
+      },
+      "Qwen3Embedding06BInput": {
+        "type": "object",
+        "properties": {
+          "queries": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "A single query string",
+                "minLength": 1
+              },
+              {
+                "type": "array",
+                "description": "An array of query strings",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "maxItems": 32
+              }
+            ]
+          },
+          "instruction": {
+            "type": "string",
+            "default": "Given a web search query, retrieve relevant passages that answer the query",
+            "description": "Optional instruction for the task"
+          },
+          "documents": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "A single document string",
+                "minLength": 1
+              },
+              {
+                "type": "array",
+                "description": "An array of document strings",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "maxItems": 32
+              }
+            ]
+          },
+          "text": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "Alias for documents: a single text string",
+                "minLength": 1
+              },
+              {
+                "type": "array",
+                "description": "Alias for documents: an array of text strings",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "maxItems": 32
+              }
+            ]
+          }
+        }
+      },
+      "Qwen3Embedding06BOutput": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "items": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "shape": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        }
+      },
+      "Embeddinggemma300MInput": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "The text to embed",
+                "minLength": 1
+              },
+              {
+                "type": "array",
+                "description": "Batch of text values to embed",
+                "items": {
+                  "type": "string",
+                  "description": "The text to embed",
+                  "minLength": 1
+                },
+                "maxItems": 100
+              }
+            ]
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "Embeddinggemma300MOutput": {
+        "type": "object",
+        "contentType": "application/json",
+        "properties": {
+          "shape": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "data": {
+            "type": "array",
+            "description": "Embeddings of the requested text values",
+            "items": {
+              "type": "array",
+              "description": "Floating point embedding representation shaped by the embedding model",
+              "items": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      },
+      "BgeBaseEnV15OutputVariant0": {
+        "type": "object",
+        "contentType": "application/json",
+        "properties": {
+          "shape": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "data": {
+            "type": "array",
+            "description": "Embeddings of the requested text values",
+            "items": {
+              "type": "array",
+              "description": "Floating point embedding representation shaped by the embedding model",
+              "items": {
+                "type": "number"
+              }
+            }
+          },
+          "pooling": {
+            "type": "string",
+            "enum": [
+              "mean",
+              "cls"
+            ],
+            "description": "The pooling method used in the embedding process."
+          }
+        }
+      },
+      "BgeBaseEnV15OutputVariant1": {
+        "type": "object",
+        "contentType": "application/json",
+        "title": "Async response",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "The async request id that can be used to obtain the results."
+          }
+        }
+      },
+      "BgeRerankerBaseInputContextsItem": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "description": "One of the provided context content"
+          }
+        }
+      },
+      "BgeRerankerBaseOutputResponseItem": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Index of the context in the request"
+          },
+          "score": {
+            "type": "number",
+            "description": "Score of the context under the index."
+          }
+        }
+      },
+      "ClairicInputImagesItemVariant1": {
+        "type": "object",
+        "title": "Base64 image",
+        "properties": {
+          "content_type": {
+            "type": "string"
+          },
+          "base64": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content_type",
+          "base64"
+        ]
+      },
+      "ClairicInputOptions": {
+        "type": "object",
+        "properties": {
+          "include_quantiles": {
+            "type": "boolean",
+            "default": false,
+            "description": "Add 99 percentiles to estimates."
+          },
+          "return_state_text": {
+            "type": "boolean",
+            "default": false,
+            "description": "Return the text that spans index into."
+          }
+        }
+      },
+      "ClairicOutputUsage": {
+        "type": "object",
+        "properties": {
+          "state_tokens": {
+            "type": "integer"
+          },
+          "image_tokens": {
+            "type": "integer"
+          },
+          "schema_tokens": {
+            "type": "integer"
+          },
+          "input_tokens": {
+            "type": "integer"
+          },
+          "output_tokens": {
+            "type": "integer"
+          },
+          "passes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ]
+      },
+      "ClefInputImagesItemVariant1": {
+        "type": "object",
+        "title": "Base64 image",
+        "properties": {
+          "content_type": {
+            "type": "string",
+            "description": "image/png, image/jpeg, or image/webp."
+          },
+          "base64": {
+            "type": "string",
+            "description": "Base64-encoded image bytes."
+          }
+        },
+        "required": [
+          "content_type",
+          "base64"
+        ]
+      },
+      "ClefOutputUsage": {
+        "type": "object",
+        "properties": {
+          "input_tokens": {
+            "type": "integer"
+          },
+          "output_tokens": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ]
+      },
+      "DistilbertSst2Int8OutputItem": {
+        "type": "object",
+        "properties": {
+          "score": {
+            "type": "number",
+            "description": "Confidence score indicating the likelihood that the text belongs to the specified label"
+          },
+          "label": {
+            "type": "string",
+            "description": "The classification label assigned to the text (e.g., 'POSITIVE' or 'NEGATIVE')"
+          }
+        }
+      },
+      "M2M10012BInputVariant1RequestsItem": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The text to be translated"
+          },
+          "source_lang": {
+            "type": "string",
+            "default": "en",
+            "description": "The language code of the source text (e.g., 'en' for English). Defaults to 'en' if not specified"
+          },
+          "target_lang": {
+            "type": "string",
+            "description": "The language code to translate the text into (e.g., 'es' for Spanish)"
+          }
+        },
+        "required": [
+          "text",
+          "target_lang"
+        ]
+      },
+      "M2M10012BOutputVariant1": {
+        "type": "object",
+        "contentType": "application/json",
+        "title": "Async response",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "The async request id that can be used to obtain the results."
+          }
+        }
+      },
+      "WhisperLargeV3TurboInputAudioVariant1": {
+        "type": "object",
+        "properties": {
+          "body": {
+            "type": "object"
+          },
+          "contentType": {
+            "type": "string"
+          }
+        }
+      },
+      "WhisperLargeV3TurboOutputTranscription_info": {
+        "type": "object",
+        "properties": {
+          "language": {
+            "type": "string",
+            "description": "The language of the audio being transcribed or translated."
+          },
+          "language_probability": {
+            "type": "number",
+            "description": "The confidence level or probability of the detected language being accurate, represented as a decimal between 0 and 1."
+          },
+          "duration": {
+            "type": "number",
+            "description": "The total duration of the original audio file, in seconds."
+          },
+          "duration_after_vad": {
+            "type": "number",
+            "description": "The duration of the audio after applying Voice Activity Detection (VAD) to remove silent or irrelevant sections, in seconds."
+          }
+        }
+      },
+      "WhisperLargeV3TurboOutputSegmentsItemWordsItem": {
+        "type": "object",
+        "properties": {
+          "word": {
+            "type": "string",
+            "description": "The individual word transcribed from the audio."
+          },
+          "start": {
+            "type": "number",
+            "description": "The starting time of the word within the audio, in seconds."
+          },
+          "end": {
+            "type": "number",
+            "description": "The ending time of the word within the audio, in seconds."
+          }
+        }
+      },
+      "WhisperLargeV3TurboOutputSegmentsItem": {
+        "type": "object",
+        "properties": {
+          "start": {
+            "type": "number",
+            "description": "The starting time of the segment within the audio, in seconds."
+          },
+          "end": {
+            "type": "number",
+            "description": "The ending time of the segment within the audio, in seconds."
+          },
+          "text": {
+            "type": "string",
+            "description": "The transcription of the segment."
+          },
+          "temperature": {
+            "type": "number",
+            "description": "The temperature used in the decoding process, controlling randomness in predictions. Lower values result in more deterministic outputs."
+          },
+          "avg_logprob": {
+            "type": "number",
+            "description": "The average log probability of the predictions for the words in this segment, indicating overall confidence."
+          },
+          "compression_ratio": {
+            "type": "number",
+            "description": "The compression ratio of the input to the output, measuring how much the text was compressed during the transcription process."
+          },
+          "no_speech_prob": {
+            "type": "number",
+            "description": "The probability that the segment contains no speech, represented as a decimal between 0 and 1."
+          },
+          "words": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WhisperLargeV3TurboOutputSegmentsItemWordsItem"
+            }
+          }
+        }
+      },
+      "Llama3370BInstructFp8FastInputVariant0Response_format": {
+        "title": "JSON Mode",
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "json_object",
+              "json_schema"
+            ]
+          },
+          "json_schema": {}
+        }
+      },
+      "Llama3370BInstructFp8FastInputVariant1MessagesItemContentVariant1Item": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Type of the content (text)"
+          },
+          "text": {
+            "type": "string",
+            "description": "Text content"
+          }
+        }
+      },
+      "Llama3370BInstructFp8FastInputVariant1MessagesItem": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "The role of the message sender (e.g., 'user', 'assistant', 'system', 'tool')."
+          },
+          "content": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "The content of the message as a string."
+              },
+              {
+                "type": "array",
+                "description": "Array of text content parts.",
+                "items": {
+                  "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant1MessagesItemContentVariant1Item"
+                }
+              }
+            ]
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ]
+      },
+      "Llama3370BInstructFp8FastInputVariant1FunctionsItem": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "code"
+        ]
+      },
+      "Llama3370BInstructFp8FastInputVariant1ToolsItemVariant0Parameters": {
+        "type": "object",
+        "description": "Schema defining the parameters accepted by the tool.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "The type of the parameters object (usually 'object')."
+          },
+          "required": {
+            "type": "array",
+            "description": "List of required parameter names.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "properties": {
+            "type": "object",
+            "description": "Definitions of each parameter.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "The data type of the parameter."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "A description of the expected parameter."
+                }
+              },
+              "required": [
+                "type",
+                "description"
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "properties"
+        ]
+      },
+      "Llama3370BInstructFp8FastInputVariant1ToolsItemVariant1FunctionParameters": {
+        "type": "object",
+        "description": "Schema defining the parameters accepted by the function.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "The type of the parameters object (usually 'object')."
+          },
+          "required": {
+            "type": "array",
+            "description": "List of required parameter names.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "properties": {
+            "type": "object",
+            "description": "Definitions of each parameter.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "The data type of the parameter."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "A description of the expected parameter."
+                }
+              },
+              "required": [
+                "type",
+                "description"
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "properties"
+        ]
+      },
+      "Llama3370BInstructFp8FastInputVariant1ToolsItemVariant1Function": {
+        "type": "object",
+        "description": "Details of the function tool.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the function."
+          },
+          "description": {
+            "type": "string",
+            "description": "A brief description of what the function does."
+          },
+          "parameters": {
+            "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant1ToolsItemVariant1FunctionParameters"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "parameters"
+        ]
+      },
+      "Llama3370BInstructFp8FastInputVariant1Response_format": {
+        "title": "JSON Mode",
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "json_object",
+              "json_schema"
+            ]
+          },
+          "json_schema": {}
+        }
+      },
+      "Llama3370BInstructFp8FastInputVariant2RequestsItemResponse_format": {
+        "title": "JSON Mode",
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "json_object",
+              "json_schema"
+            ]
+          },
+          "json_schema": {}
+        }
+      },
+      "Llama3370BInstructFp8FastInputVariant2RequestsItem": {
+        "type": "object",
+        "properties": {
+          "external_reference": {
+            "type": "string",
+            "description": "User-supplied reference. This field will be present in the response as well it can be used to reference the request and response. It's NOT validated to be unique."
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Prompt for the text generation model"
+          },
+          "stream": {
+            "type": "boolean",
+            "default": false,
+            "description": "If true, the response will be streamed back incrementally using SSE, Server Sent Events."
+          },
+          "max_tokens": {
+            "type": "integer",
+            "default": 256,
+            "description": "The maximum number of tokens to generate in the response."
+          },
+          "temperature": {
+            "type": "number",
+            "default": 0.6,
+            "minimum": 0,
+            "maximum": 5,
+            "description": "Controls the randomness of the output; higher values produce more random results."
+          },
+          "top_p": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "description": "Adjusts the creativity of the AI's responses by controlling how many possible words it considers. Lower values make outputs more predictable; higher values allow for more varied and creative responses."
+          },
+          "seed": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9999999999,
+            "description": "Random seed for reproducibility of the generation."
+          },
+          "repetition_penalty": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "description": "Penalty for repeated tokens; higher values discourage repetition."
+          },
+          "frequency_penalty": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "description": "Decreases the likelihood of the model repeating the same lines verbatim."
+          },
+          "presence_penalty": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "description": "Increases the likelihood of the model introducing new topics."
+          },
+          "response_format": {
+            "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant2RequestsItemResponse_format"
+          }
+        }
+      },
+      "Llama3370BInstructFp8FastInputVariant2": {
+        "title": "Async Batch",
+        "type": "object",
+        "properties": {
+          "requests": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Llama3370BInstructFp8FastInputVariant2RequestsItem"
+            }
+          }
+        }
+      },
+      "Llama3370BInstructFp8FastOutputVariant0Usage": {
+        "type": "object",
+        "description": "Usage statistics for the inference request",
+        "properties": {
+          "prompt_tokens": {
+            "type": "number",
+            "description": "Total number of tokens in input",
+            "default": 0
+          },
+          "completion_tokens": {
+            "type": "number",
+            "description": "Total number of tokens in output",
+            "default": 0
+          },
+          "total_tokens": {
+            "type": "number",
+            "description": "Total number of input and output tokens",
+            "default": 0
+          }
+        }
+      },
+      "Llama3370BInstructFp8FastOutputVariant0Tool_callsItem": {
+        "type": "object",
+        "properties": {
+          "arguments": {
+            "type": "object",
+            "description": "The arguments passed to be passed to the tool call request"
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the tool to be called"
+          }
+        }
+      },
+      "Llama3370BInstructFp8FastOutputVariant0": {
+        "type": "object",
+        "contentType": "application/json",
+        "properties": {
+          "response": {
+            "type": "string",
+            "description": "The generated text response from the model"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Llama3370BInstructFp8FastOutputVariant0Usage"
+          },
+          "tool_calls": {
+            "type": "array",
+            "description": "An array of tool calls requests made during the response generation",
+            "items": {
+              "$ref": "#/components/schemas/Llama3370BInstructFp8FastOutputVariant0Tool_callsItem"
+            }
+          }
+        },
+        "required": [
+          "response"
+        ]
+      },
+      "Llama3370BInstructFp8FastOutputVariant2": {
+        "type": "object",
+        "contentType": "application/json",
+        "title": "Async response",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "The async request id that can be used to obtain the results."
+          }
+        }
+      },
+      "MistralSmall3124BInstructInputVariant1MessagesItemContentVariant1ItemImage_url": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "pattern": "^data:*",
+            "description": "image uri with data (e.g. data:image/jpeg;base64,/9j/...). HTTP URL will not be accepted"
+          }
+        }
+      },
+      "MistralSmall3124BInstructInputVariant1MessagesItemContentVariant1Item": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Type of the content provided"
+          },
+          "text": {
+            "type": "string"
+          },
+          "image_url": {
+            "$ref": "#/components/schemas/MistralSmall3124BInstructInputVariant1MessagesItemContentVariant1ItemImage_url"
+          }
+        }
+      },
+      "MistralSmall3124BInstructInputVariant1MessagesItemContentVariant2Image_url": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "pattern": "^data:*",
+            "description": "image uri with data (e.g. data:image/jpeg;base64,/9j/...). HTTP URL will not be accepted"
+          }
+        }
+      },
+      "MistralSmall3124BInstructInputVariant1MessagesItemContentVariant2": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Type of the content provided"
+          },
+          "text": {
+            "type": "string"
+          },
+          "image_url": {
+            "$ref": "#/components/schemas/MistralSmall3124BInstructInputVariant1MessagesItemContentVariant2Image_url"
+          }
+        }
+      },
+      "MistralSmall3124BInstructInputVariant1MessagesItem": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "The role of the message sender (e.g., 'user', 'assistant', 'system', 'tool')."
+          },
+          "tool_call_id": {
+            "type": "string",
+            "description": "The tool call id. Must be supplied for tool calls for Mistral-3. If you don't know what to put here you can fall back to 000000001"
+          },
+          "content": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "The content of the message as a string."
+              },
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/MistralSmall3124BInstructInputVariant1MessagesItemContentVariant1Item"
+                }
+              },
+              {
+                "$ref": "#/components/schemas/MistralSmall3124BInstructInputVariant1MessagesItemContentVariant2"
+              }
+            ]
+          }
+        }
+      },
+      "MistralSmall3124BInstructInputVariant1FunctionsItem": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "code"
+        ]
+      },
+      "MistralSmall3124BInstructInputVariant1ToolsItemVariant0Parameters": {
+        "type": "object",
+        "description": "Schema defining the parameters accepted by the tool.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "The type of the parameters object (usually 'object')."
+          },
+          "required": {
+            "type": "array",
+            "description": "List of required parameter names.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "properties": {
+            "type": "object",
+            "description": "Definitions of each parameter.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "The data type of the parameter."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "A description of the expected parameter."
+                }
+              },
+              "required": [
+                "type",
+                "description"
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "properties"
+        ]
+      },
+      "MistralSmall3124BInstructInputVariant1ToolsItemVariant1FunctionParameters": {
+        "type": "object",
+        "description": "Schema defining the parameters accepted by the function.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "The type of the parameters object (usually 'object')."
+          },
+          "required": {
+            "type": "array",
+            "description": "List of required parameter names.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "properties": {
+            "type": "object",
+            "description": "Definitions of each parameter.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "The data type of the parameter."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "A description of the expected parameter."
+                }
+              },
+              "required": [
+                "type",
+                "description"
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "properties"
+        ]
+      },
+      "MistralSmall3124BInstructInputVariant1ToolsItemVariant1Function": {
+        "type": "object",
+        "description": "Details of the function tool.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the function."
+          },
+          "description": {
+            "type": "string",
+            "description": "A brief description of what the function does."
+          },
+          "parameters": {
+            "$ref": "#/components/schemas/MistralSmall3124BInstructInputVariant1ToolsItemVariant1FunctionParameters"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "parameters"
+        ]
+      },
+      "MistralSmall3124BInstructOutputVariant0Usage": {
+        "type": "object",
+        "description": "Usage statistics for the inference request",
+        "properties": {
+          "prompt_tokens": {
+            "type": "number",
+            "description": "Total number of tokens in input",
+            "default": 0
+          },
+          "completion_tokens": {
+            "type": "number",
+            "description": "Total number of tokens in output",
+            "default": 0
+          },
+          "total_tokens": {
+            "type": "number",
+            "description": "Total number of input and output tokens",
+            "default": 0
+          }
+        }
+      },
+      "MistralSmall3124BInstructOutputVariant0Tool_callsItem": {
+        "type": "object",
+        "properties": {
+          "arguments": {
+            "type": "object",
+            "description": "The arguments passed to be passed to the tool call request"
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the tool to be called"
+          }
+        }
+      },
+      "MistralSmall3124BInstructOutputVariant0": {
+        "type": "object",
+        "contentType": "application/json",
+        "properties": {
+          "response": {
+            "type": "string",
+            "description": "The generated text response from the model"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/MistralSmall3124BInstructOutputVariant0Usage"
+          },
+          "tool_calls": {
+            "type": "array",
+            "description": "An array of tool calls requests made during the response generation",
+            "items": {
+              "$ref": "#/components/schemas/MistralSmall3124BInstructOutputVariant0Tool_callsItem"
+            }
+          }
+        },
+        "required": [
+          "response"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant0Response_format": {
+        "title": "JSON Mode",
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "json_object",
+              "json_schema"
+            ]
+          },
+          "json_schema": {}
+        }
+      },
+      "Qwen330BA3BFp8InputVariant1MessagesItemContentVariant1Item": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Type of the content (text)"
+          },
+          "text": {
+            "type": "string",
+            "description": "Text content"
+          }
+        }
+      },
+      "Qwen330BA3BFp8InputVariant1MessagesItem": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "The role of the message sender (e.g., 'user', 'assistant', 'system', 'tool')."
+          },
+          "content": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "The content of the message as a string."
+              },
+              {
+                "type": "array",
+                "description": "Array of text content parts.",
+                "items": {
+                  "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant1MessagesItemContentVariant1Item"
+                }
+              }
+            ]
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant1FunctionsItem": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "code"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant1ToolsItemVariant0Parameters": {
+        "type": "object",
+        "description": "Schema defining the parameters accepted by the tool.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "The type of the parameters object (usually 'object')."
+          },
+          "required": {
+            "type": "array",
+            "description": "List of required parameter names.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "properties": {
+            "type": "object",
+            "description": "Definitions of each parameter.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "The data type of the parameter."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "A description of the expected parameter."
+                }
+              },
+              "required": [
+                "type",
+                "description"
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "properties"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant1ToolsItemVariant1FunctionParameters": {
+        "type": "object",
+        "description": "Schema defining the parameters accepted by the function.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "The type of the parameters object (usually 'object')."
+          },
+          "required": {
+            "type": "array",
+            "description": "List of required parameter names.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "properties": {
+            "type": "object",
+            "description": "Definitions of each parameter.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "The data type of the parameter."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "A description of the expected parameter."
+                }
+              },
+              "required": [
+                "type",
+                "description"
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "properties"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant1ToolsItemVariant1Function": {
+        "type": "object",
+        "description": "Details of the function tool.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the function."
+          },
+          "description": {
+            "type": "string",
+            "description": "A brief description of what the function does."
+          },
+          "parameters": {
+            "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant1ToolsItemVariant1FunctionParameters"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "parameters"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant1Response_format": {
+        "title": "JSON Mode",
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "json_object",
+              "json_schema"
+            ]
+          },
+          "json_schema": {}
+        }
+      },
+      "Qwen330BA3BFp8InputVariant2RequestsItemVariant0Response_format": {
+        "title": "JSON Mode",
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "json_object",
+              "json_schema"
+            ]
+          },
+          "json_schema": {}
+        }
+      },
+      "Qwen330BA3BFp8InputVariant2RequestsItemVariant1MessagesItemContentVariant1Item": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Type of the content (text)"
+          },
+          "text": {
+            "type": "string",
+            "description": "Text content"
+          }
+        }
+      },
+      "Qwen330BA3BFp8InputVariant2RequestsItemVariant1MessagesItem": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "The role of the message sender (e.g., 'user', 'assistant', 'system', 'tool')."
+          },
+          "content": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "The content of the message as a string."
+              },
+              {
+                "type": "array",
+                "description": "Array of text content parts.",
+                "items": {
+                  "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant2RequestsItemVariant1MessagesItemContentVariant1Item"
+                }
+              }
+            ]
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant2RequestsItemVariant1FunctionsItem": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "code"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant2RequestsItemVariant1ToolsItemVariant0Parameters": {
+        "type": "object",
+        "description": "Schema defining the parameters accepted by the tool.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "The type of the parameters object (usually 'object')."
+          },
+          "required": {
+            "type": "array",
+            "description": "List of required parameter names.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "properties": {
+            "type": "object",
+            "description": "Definitions of each parameter.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "The data type of the parameter."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "A description of the expected parameter."
+                }
+              },
+              "required": [
+                "type",
+                "description"
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "properties"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant2RequestsItemVariant1ToolsItemVariant1FunctionParameters": {
+        "type": "object",
+        "description": "Schema defining the parameters accepted by the function.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "The type of the parameters object (usually 'object')."
+          },
+          "required": {
+            "type": "array",
+            "description": "List of required parameter names.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "properties": {
+            "type": "object",
+            "description": "Definitions of each parameter.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "The data type of the parameter."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "A description of the expected parameter."
+                }
+              },
+              "required": [
+                "type",
+                "description"
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "properties"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant2RequestsItemVariant1ToolsItemVariant1Function": {
+        "type": "object",
+        "description": "Details of the function tool.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the function."
+          },
+          "description": {
+            "type": "string",
+            "description": "A brief description of what the function does."
+          },
+          "parameters": {
+            "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant2RequestsItemVariant1ToolsItemVariant1FunctionParameters"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "parameters"
+        ]
+      },
+      "Qwen330BA3BFp8InputVariant2RequestsItemVariant1Response_format": {
+        "title": "JSON Mode",
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "json_object",
+              "json_schema"
+            ]
+          },
+          "json_schema": {}
+        }
+      },
+      "Qwen330BA3BFp8InputVariant2": {
+        "title": "Async Batch",
+        "type": "object",
+        "properties": {
+          "requests": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "oneOf": [
+                {
+                  "title": "Prompt",
+                  "properties": {
+                    "prompt": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "The input text prompt for the model to generate a response."
+                    },
+                    "lora": {
+                      "type": "string",
+                      "description": "Name of the LoRA (Low-Rank Adaptation) model to fine-tune the base model."
+                    },
+                    "response_format": {
+                      "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant2RequestsItemVariant0Response_format"
+                    },
+                    "raw": {
+                      "type": "boolean",
+                      "default": false,
+                      "description": "If true, a chat template is not applied and you must adhere to the specific model's expected formatting."
+                    },
+                    "stream": {
+                      "type": "boolean",
+                      "default": false,
+                      "description": "If true, the response will be streamed back incrementally using SSE, Server Sent Events."
+                    },
+                    "max_tokens": {
+                      "type": "integer",
+                      "default": 256,
+                      "description": "The maximum number of tokens to generate in the response."
+                    },
+                    "temperature": {
+                      "type": "number",
+                      "default": 0.6,
+                      "minimum": 0,
+                      "maximum": 5,
+                      "description": "Controls the randomness of the output; higher values produce more random results."
+                    },
+                    "top_p": {
+                      "type": "number",
+                      "minimum": 0.001,
+                      "maximum": 1,
+                      "description": "Adjusts the creativity of the AI's responses by controlling how many possible words it considers. Lower values make outputs more predictable; higher values allow for more varied and creative responses."
+                    },
+                    "top_k": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 50,
+                      "description": "Limits the AI to choose from the top 'k' most probable words. Lower values make responses more focused; higher values introduce more variety and potential surprises."
+                    },
+                    "seed": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9999999999,
+                      "description": "Random seed for reproducibility of the generation."
+                    },
+                    "repetition_penalty": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 2,
+                      "description": "Penalty for repeated tokens; higher values discourage repetition."
+                    },
+                    "frequency_penalty": {
+                      "type": "number",
+                      "minimum": -2,
+                      "maximum": 2,
+                      "description": "Decreases the likelihood of the model repeating the same lines verbatim."
+                    },
+                    "presence_penalty": {
+                      "type": "number",
+                      "minimum": -2,
+                      "maximum": 2,
+                      "description": "Increases the likelihood of the model introducing new topics."
+                    }
+                  },
+                  "required": [
+                    "prompt"
+                  ]
+                },
+                {
+                  "title": "Messages",
+                  "properties": {
+                    "messages": {
+                      "type": "array",
+                      "description": "An array of message objects representing the conversation history.",
+                      "items": {
+                        "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant2RequestsItemVariant1MessagesItem"
+                      }
+                    },
+                    "functions": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant2RequestsItemVariant1FunctionsItem"
+                      }
+                    },
+                    "tools": {
+                      "type": "array",
+                      "description": "A list of tools available for the assistant to use.",
+                      "items": {
+                        "type": "object",
+                        "oneOf": [
+                          {
+                            "properties": {
+                              "name": {
+                                "type": "string",
+                                "description": "The name of the tool. More descriptive the better."
+                              },
+                              "description": {
+                                "type": "string",
+                                "description": "A brief description of what the tool does."
+                              },
+                              "parameters": {
+                                "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant2RequestsItemVariant1ToolsItemVariant0Parameters"
+                              }
+                            },
+                            "required": [
+                              "name",
+                              "description",
+                              "parameters"
+                            ]
+                          },
+                          {
+                            "properties": {
+                              "type": {
+                                "type": "string",
+                                "description": "Specifies the type of tool (e.g., 'function')."
+                              },
+                              "function": {
+                                "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant2RequestsItemVariant1ToolsItemVariant1Function"
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "function"
+                            ]
+                          }
+                        ]
+                      }
+                    },
+                    "response_format": {
+                      "$ref": "#/components/schemas/Qwen330BA3BFp8InputVariant2RequestsItemVariant1Response_format"
+                    },
+                    "raw": {
+                      "type": "boolean",
+                      "default": false,
+                      "description": "If true, a chat template is not applied and you must adhere to the specific model's expected formatting."
+                    },
+                    "stream": {
+                      "type": "boolean",
+                      "default": false,
+                      "description": "If true, the response will be streamed back incrementally using SSE, Server Sent Events."
+                    },
+                    "max_tokens": {
+                      "type": "integer",
+                      "default": 256,
+                      "description": "The maximum number of tokens to generate in the response."
+                    },
+                    "temperature": {
+                      "type": "number",
+                      "default": 0.6,
+                      "minimum": 0,
+                      "maximum": 5,
+                      "description": "Controls the randomness of the output; higher values produce more random results."
+                    },
+                    "top_p": {
+                      "type": "number",
+                      "minimum": 0.001,
+                      "maximum": 1,
+                      "description": "Adjusts the creativity of the AI's responses by controlling how many possible words it considers. Lower values make outputs more predictable; higher values allow for more varied and creative responses."
+                    },
+                    "top_k": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 50,
+                      "description": "Limits the AI to choose from the top 'k' most probable words. Lower values make responses more focused; higher values introduce more variety and potential surprises."
+                    },
+                    "seed": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9999999999,
+                      "description": "Random seed for reproducibility of the generation."
+                    },
+                    "repetition_penalty": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 2,
+                      "description": "Penalty for repeated tokens; higher values discourage repetition."
+                    },
+                    "frequency_penalty": {
+                      "type": "number",
+                      "minimum": -2,
+                      "maximum": 2,
+                      "description": "Decreases the likelihood of the model repeating the same lines verbatim."
+                    },
+                    "presence_penalty": {
+                      "type": "number",
+                      "minimum": -2,
+                      "maximum": 2,
+                      "description": "Increases the likelihood of the model introducing new topics."
+                    }
+                  },
+                  "required": [
+                    "messages"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "requests"
+        ]
+      },
+      "Qwen330BA3BFp8OutputVariant0ChoicesItemMessageTool_callsItemFunction": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name of the function to call"
+          },
+          "arguments": {
+            "type": "string",
+            "description": "JSON string of arguments for the function"
+          }
+        },
+        "required": [
+          "name",
+          "arguments"
+        ]
+      },
+      "Qwen330BA3BFp8OutputVariant0ChoicesItemMessageTool_callsItem": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the tool call"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "function"
+            ],
+            "description": "Type of tool call"
+          },
+          "function": {
+            "$ref": "#/components/schemas/Qwen330BA3BFp8OutputVariant0ChoicesItemMessageTool_callsItemFunction"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "function"
+        ]
+      },
+      "Qwen330BA3BFp8OutputVariant0ChoicesItemMessage": {
+        "type": "object",
+        "description": "The message generated by the model",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "Role of the message author"
+          },
+          "content": {
+            "type": "string",
+            "description": "The content of the message"
+          },
+          "reasoning_content": {
+            "type": "string",
+            "description": "Internal reasoning content (if available)"
+          },
+          "tool_calls": {
+            "type": "array",
+            "description": "Tool calls made by the assistant",
+            "items": {
+              "$ref": "#/components/schemas/Qwen330BA3BFp8OutputVariant0ChoicesItemMessageTool_callsItem"
+            }
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ]
+      },
+      "Qwen330BA3BFp8OutputVariant0ChoicesItem": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "number",
+            "description": "Index of the choice in the list"
+          },
+          "message": {
+            "$ref": "#/components/schemas/Qwen330BA3BFp8OutputVariant0ChoicesItemMessage"
+          },
+          "finish_reason": {
+            "type": "string",
+            "description": "Reason why the model stopped generating"
+          },
+          "stop_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stop reason (may be null)"
+          },
+          "logprobs": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Log probabilities (if requested)"
+          }
+        }
+      },
+      "Qwen330BA3BFp8OutputVariant0Usage": {
+        "type": "object",
+        "description": "Usage statistics for the inference request",
+        "properties": {
+          "prompt_tokens": {
+            "type": "number",
+            "description": "Total number of tokens in input",
+            "default": 0
+          },
+          "completion_tokens": {
+            "type": "number",
+            "description": "Total number of tokens in output",
+            "default": 0
+          },
+          "total_tokens": {
+            "type": "number",
+            "description": "Total number of input and output tokens",
+            "default": 0
+          }
+        }
+      },
+      "Qwen330BA3BFp8OutputVariant0": {
+        "type": "object",
+        "contentType": "application/json",
+        "title": "Chat Completion Response",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the completion"
+          },
+          "object": {
+            "type": "string",
+            "enum": [
+              "chat.completion"
+            ],
+            "description": "Object type identifier"
+          },
+          "created": {
+            "type": "number",
+            "description": "Unix timestamp of when the completion was created"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model used for the completion"
+          },
+          "choices": {
+            "type": "array",
+            "description": "List of completion choices",
+            "items": {
+              "$ref": "#/components/schemas/Qwen330BA3BFp8OutputVariant0ChoicesItem"
+            }
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Qwen330BA3BFp8OutputVariant0Usage"
+          },
+          "prompt_logprobs": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Log probabilities for the prompt (if requested)"
+          }
+        }
+      },
+      "Qwen330BA3BFp8OutputVariant1ChoicesItem": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "number",
+            "description": "Index of the choice in the list"
+          },
+          "text": {
+            "type": "string",
+            "description": "The generated text completion"
+          },
+          "finish_reason": {
+            "type": "string",
+            "description": "Reason why the model stopped generating"
+          },
+          "stop_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stop reason (may be null)"
+          },
+          "logprobs": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Log probabilities (if requested)"
+          },
+          "prompt_logprobs": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Log probabilities for the prompt (if requested)"
+          }
+        },
+        "required": [
+          "index",
+          "text",
+          "finish_reason"
+        ]
+      },
+      "Qwen330BA3BFp8OutputVariant1Usage": {
+        "type": "object",
+        "description": "Usage statistics for the inference request",
+        "properties": {
+          "prompt_tokens": {
+            "type": "number",
+            "description": "Total number of tokens in input",
+            "default": 0
+          },
+          "completion_tokens": {
+            "type": "number",
+            "description": "Total number of tokens in output",
+            "default": 0
+          },
+          "total_tokens": {
+            "type": "number",
+            "description": "Total number of input and output tokens",
+            "default": 0
+          }
+        }
+      },
+      "Qwen330BA3BFp8OutputVariant1": {
+        "type": "object",
+        "contentType": "application/json",
+        "title": "Text Completion Response",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the completion"
+          },
+          "object": {
+            "type": "string",
+            "enum": [
+              "text_completion"
+            ],
+            "description": "Object type identifier"
+          },
+          "created": {
+            "type": "number",
+            "description": "Unix timestamp of when the completion was created"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model used for the completion"
+          },
+          "choices": {
+            "type": "array",
+            "description": "List of completion choices",
+            "items": {
+              "$ref": "#/components/schemas/Qwen330BA3BFp8OutputVariant1ChoicesItem"
+            }
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Qwen330BA3BFp8OutputVariant1Usage"
+          }
+        }
+      },
+      "Qwen330BA3BFp8OutputVariant3": {
+        "type": "object",
+        "contentType": "application/json",
+        "title": "Async response",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "The async request id that can be used to obtain the results."
+          }
+        }
+      },
+      "MelottsOutputVariant0": {
+        "type": "object",
+        "contentType": "application/json",
+        "properties": {
+          "audio": {
+            "type": "string",
+            "description": "The generated audio in MP3 format, base64-encoded"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1367,6 +1367,19 @@ pub const TextRun = struct {
     clip_points: ?[]const [2]f64 = null,
     clip_fill_rule: FillRule = .nonzero,
 
+    /// Page-space bounds of horizontal text, including its transformed basis
+    /// and font ascent/descent. Vertical writing needs per-glyph vertical
+    /// origins; leave that geometry unknown rather than inventing a rectangle.
+    pub fn bounds(self: TextRun) ?PageBox {
+        if (self.vertical) return null;
+        inline for (.{ self.x, self.y, self.a, self.b, self.c, self.d, self.advance_width, self.ascent, self.descent }) |value| if (!std.math.isFinite(value)) return null;
+        if (self.ascent < 0 or self.descent < 0) return null;
+        const box = textRunBounds(self);
+        inline for (.{ box.min_x, box.min_y, box.max_x, box.max_y }) |value| if (!std.math.isFinite(value)) return null;
+        if (box.min_x >= box.max_x or box.min_y >= box.max_y) return null;
+        return .{ .min_x = box.min_x, .min_y = box.min_y, .max_x = box.max_x, .max_y = box.max_y };
+    }
+
     pub fn deinit(self: *TextRun, alloc: Allocator) void {
         if (self.clip_points) |points| alloc.free(points);
         if (self.fill_pattern_name) |name| alloc.free(name);
@@ -1399,10 +1412,32 @@ const LayoutTextRun = struct {
     }
 };
 
+/// Inspect decoded operators without materializing images or vector paths.
+/// Strings/comments are lexed normally, so text containing operator names does
+/// not trigger visual work. Form/image invocations conservatively require it.
+fn contentHasNontextPaint(alloc: Allocator, bytes: []const u8, cancellation: CancellationProbe) !bool {
+    var scanner = syntax.Scanner.init(alloc, bytes);
+    defer scanner.deinit();
+    var count: usize = 0;
+    while (true) {
+        if (count & 255 == 0) try cancellation.check();
+        count +|= 1;
+        var token = (try readContentLexeme(&scanner)) orelse continue;
+        defer syntax.Scanner.freeLexeme(alloc, &token);
+        if (token == .eof) return false;
+        if (token != .keyword) continue;
+        for ([_][]const u8{ "Do", "BI", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "sh" }) |operator| {
+            if (std.mem.eql(u8, token.keyword, operator)) return true;
+        }
+    }
+}
+
 pub const PageTextAnalysis = struct {
     text: []u8,
     runs: []TextRun,
     outline_fallback: bool = false,
+    has_nontext_visual: bool = false,
+    has_unrendered_annotations: bool = false,
 
     pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
         alloc.free(self.text);
@@ -3167,25 +3202,34 @@ fn markTextShowRunGroupTracking(runs: anytype) void {
 
 const PositionedTextOutput = union(enum) {
     layout: *std.ArrayList(LayoutTextRun),
-    analysis: *std.ArrayList(TextRun),
+    analysis: struct { runs: *std.ArrayList(TextRun), max_runs: usize },
     render: *std.ArrayList(TextRun),
 
     fn len(self: PositionedTextOutput) usize {
         return switch (self) {
             .layout => |out| out.items.len,
-            .analysis, .render => |out| out.items.len,
+            .analysis => |out| out.runs.items.len,
+            .render => |out| out.items.len,
         };
     }
 
     fn markTextShowTracking(self: PositionedTextOutput, start: usize) void {
         switch (self) {
             .layout => |out| markTextShowRunsTracking(out.items[start..]),
-            .analysis, .render => |out| markTextShowRunsTracking(out.items[start..]),
+            .analysis, .render => markTextShowRunsTracking(self.textRuns().items[start..]),
         }
     }
 
     fn isTextOnly(self: PositionedTextOutput) bool {
         return self != .render;
+    }
+
+    fn textRuns(self: PositionedTextOutput) *std.ArrayList(TextRun) {
+        return switch (self) {
+            .analysis => |out| out.runs,
+            .render => |out| out,
+            .layout => unreachable,
+        };
     }
 };
 
@@ -4623,21 +4667,318 @@ pub const Reader = struct {
         return owned_text;
     }
 
+    /// Metadata-only coverage inspection: never decode appearance streams or
+    /// execute annotation actions. Non-hidden screen/print content needs a
+    /// compositor; a page-content-only renderer must not silently omit it.
+    pub fn pageHasVisibleAnnotations(self: *Reader, page_num: usize) !bool {
+        var page = try self.readPageObject(page_num);
+        defer page.deinit(self.alloc);
+        return self.pageHasVisibleAnnotationsFromObject(&page);
+    }
+
+    const AnnotationValue = struct {
+        value: syntax.Object,
+        owned: bool = false,
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.owned) self.value.deinit(alloc);
+        }
+    };
+    fn annotationValue(self: *Reader, object: *const syntax.Object) !AnnotationValue {
+        var result = AnnotationValue{ .value = object.* };
+        errdefer result.deinit(self.alloc);
+        for (0..32) |_| {
+            if (result.value != .obj_ref) return result;
+            try self.checkCancellation();
+            const next = try self.readIndirectObject(result.value.obj_ref);
+            result.deinit(self.alloc);
+            result = .{ .value = next, .owned = true };
+        }
+        return error.InvalidPdfAnnotations;
+    }
+    fn annotationNumber(self: *Reader, object: *const syntax.Object) !f64 {
+        var resolved = try self.annotationValue(object);
+        defer resolved.deinit(self.alloc);
+        const number: f64 = switch (resolved.value) {
+            .integer => |n| @floatFromInt(n),
+            .real => |n| n,
+            else => return error.InvalidPdfAnnotations,
+        };
+        if (!std.math.isFinite(number)) return error.InvalidPdfAnnotations;
+        return number;
+    }
+    fn pageHasVisibleAnnotationsFromObject(self: *Reader, page: *const syntax.Object) !bool {
+        const annotations = page.get("Annots") orelse return false;
+        var resolved = try self.annotationValue(annotations);
+        defer resolved.deinit(self.alloc);
+        if (resolved.value == .null) return false;
+        if (resolved.value != .array or resolved.value.array.len > 16384) return error.InvalidPdfAnnotations;
+        // Validate all entries even after visible content is found. The bound
+        // and cancellation apply to the entire array, including hidden entries.
+        var visible = false;
+        for (resolved.value.array) |*entry| {
+            try self.checkCancellation();
+            var annotation = try self.annotationValue(entry);
+            defer annotation.deinit(self.alloc);
+            if (annotation.value != .dict) return error.InvalidPdfAnnotations;
+            visible = (try self.annotationIsVisible(&annotation.value)) or visible;
+        }
+        return visible;
+    }
+    fn annotationIsVisible(self: *Reader, annotation: *const syntax.Object) !bool {
+        var flags: u32 = 0;
+        if (annotation.get("F")) |field| {
+            var value = try self.annotationValue(field);
+            defer value.deinit(self.alloc);
+            if (value.value != .integer) return error.InvalidPdfAnnotations;
+            flags = std.math.cast(u32, value.value.integer) orelse return error.InvalidPdfAnnotations;
+        }
+        if (flags & 2 != 0 or (flags & 32 != 0 and flags & 4 == 0 and flags & 256 == 0)) return false;
+        if (annotation.get("Rect")) |field| {
+            var rect = try self.annotationValue(field);
+            defer rect.deinit(self.alloc);
+            if (rect.value != .array or rect.value.array.len != 4) return error.InvalidPdfAnnotations;
+            var box: [4]f64 = undefined;
+            for (&box, rect.value.array) |*n, *coordinate| n.* = try self.annotationNumber(coordinate);
+            if (box[0] == box[2] or box[1] == box[3]) return false;
+        }
+        // Borderless hyperlinks without an appearance have no static paint.
+        // Other unknown/viewer-generated appearances remain unsupported.
+        if (annotation.get("Subtype")) |field| {
+            var subtype = try self.annotationValue(field);
+            defer subtype.deinit(self.alloc);
+            if (subtype.value == .name and std.mem.eql(u8, subtype.value.name, "Link")) {
+                if (annotation.get("AP")) |appearance| {
+                    var ap = try self.annotationValue(appearance);
+                    defer ap.deinit(self.alloc);
+                    if (ap.value != .null) return true;
+                }
+                if (annotation.get("BS")) |field_bs| {
+                    var bs = try self.annotationValue(field_bs);
+                    defer bs.deinit(self.alloc);
+                    if (bs.value != .dict) return error.InvalidPdfAnnotations;
+                    if (bs.value.get("W")) |width| return (try self.annotationNumber(width)) != 0;
+                    return true; // Default border width is nonzero.
+                }
+                if (annotation.get("Border")) |field_border| {
+                    var border = try self.annotationValue(field_border);
+                    defer border.deinit(self.alloc);
+                    if (border.value != .array or border.value.array.len < 3) return error.InvalidPdfAnnotations;
+                    return (try self.annotationNumber(&border.value.array[2])) != 0;
+                }
+            }
+        }
+        return true;
+    }
+
+    const StaticAppearance = struct {
+        stream: syntax.Object,
+        rect: [4]f64,
+        bounds: [4]f64,
+        fn deinit(self: *StaticAppearance, a: Allocator) void {
+            self.stream.deinit(a);
+        }
+    };
+
+    /// Resolve only static normal appearances. No actions, scripts, rollover
+    /// state or viewer-generated painting are executed by this path.
+    fn staticAppearance(self: *Reader, annotation: *const syntax.Object) !?StaticAppearance {
+        if (annotation.get("OC") != null) return null; // Optional-content visibility needs its own policy.
+        if (annotation.get("CA")) |alpha| if (try self.annotationNumber(alpha) != 1) return null;
+        if (annotation.get("BM")) |blend| {
+            var resolved = try self.annotationValue(blend);
+            defer resolved.deinit(self.alloc);
+            if (!std.mem.eql(u8, resolved.value.asName() orelse return null, "Normal")) return null;
+        }
+        if (annotation.get("F")) |raw| {
+            var flags = try self.annotationValue(raw);
+            defer flags.deinit(self.alloc);
+            if (flags.value != .integer) return error.InvalidPdfAnnotations;
+            if (flags.value.integer & (8 | 16) != 0) return null; // NoZoom/NoRotate need device-specific painting.
+        }
+        const raw_rect = annotation.get("Rect") orelse return null;
+        var rect = try self.annotationValue(raw_rect);
+        defer rect.deinit(self.alloc);
+        if (rect.value != .array or rect.value.array.len != 4) return error.InvalidPdfAnnotations;
+        var box: [4]f64 = undefined;
+        for (&box, rect.value.array) |*n, *v| n.* = try self.annotationNumber(v);
+        const normalized = [4]f64{ @min(box[0], box[2]), @min(box[1], box[3]), @max(box[0], box[2]), @max(box[1], box[3]) };
+        var ap = try self.annotationValue(annotation.get("AP") orelse return null);
+        defer ap.deinit(self.alloc);
+        if (ap.value != .dict) return null;
+        var normal = try self.annotationValue(ap.value.get("N") orelse return null);
+        defer normal.deinit(self.alloc);
+        if (normal.value == .dict) {
+            var state = try self.annotationValue(annotation.get("AS") orelse return null);
+            defer state.deinit(self.alloc);
+            if (state.value != .name) return error.InvalidPdfAnnotations;
+            const selected = normal.value.get(state.value.name) orelse return null;
+            var resolved = try self.annotationValue(selected);
+            defer resolved.deinit(self.alloc);
+            const owned = try resolved.value.clone(self.alloc);
+            normal.deinit(self.alloc);
+            normal = .{ .value = owned, .owned = true };
+        }
+        if (normal.value != .stream) return null;
+        const subtype = normal.value.get("Subtype") orelse return null;
+        if (!std.mem.eql(u8, subtype.asName() orelse return null, "Form")) return null;
+        var bounds = try self.annotationValue(normal.value.get("BBox") orelse return null);
+        defer bounds.deinit(self.alloc);
+        if (bounds.value != .array or bounds.value.array.len != 4) return error.InvalidPdfAnnotations;
+        var b: [4]f64 = undefined;
+        for (&b, bounds.value.array) |*n, *v| n.* = try self.annotationNumber(v);
+        if (b[0] >= b[2] or b[1] >= b[3]) return error.InvalidPdfAnnotations;
+        var matrix = [6]f64{ 1, 0, 0, 1, 0, 0 };
+        if (normal.value.get("Matrix")) |raw| {
+            var resolved = try self.annotationValue(raw);
+            defer resolved.deinit(self.alloc);
+            if (resolved.value != .array or resolved.value.array.len != 6) return error.InvalidPdfAnnotations;
+            for (&matrix, resolved.value.array) |*n, *v| n.* = try self.annotationNumber(v);
+        }
+        var transformed = [4]f64{ std.math.inf(f64), std.math.inf(f64), -std.math.inf(f64), -std.math.inf(f64) };
+        for ([_][2]f64{ .{ b[0], b[1] }, .{ b[2], b[1] }, .{ b[2], b[3] }, .{ b[0], b[3] } }) |corner| {
+            const x = matrix[0] * corner[0] + matrix[2] * corner[1] + matrix[4];
+            const y = matrix[1] * corner[0] + matrix[3] * corner[1] + matrix[5];
+            if (!std.math.isFinite(x) or !std.math.isFinite(y)) return error.InvalidPdfAnnotations;
+            transformed[0] = @min(transformed[0], x);
+            transformed[1] = @min(transformed[1], y);
+            transformed[2] = @max(transformed[2], x);
+            transformed[3] = @max(transformed[3], y);
+        }
+        if (transformed[0] >= transformed[2] or transformed[1] >= transformed[3]) return error.InvalidPdfAnnotations;
+        var stream = try normal.value.clone(self.alloc);
+        errdefer stream.deinit(self.alloc);
+        try self.setRenderNumericArray(&stream, "BBox", &b);
+        try self.setRenderNumericArray(&stream, "Matrix", &matrix);
+        return .{ .stream = stream, .rect = normalized, .bounds = transformed };
+    }
+
+    fn setRenderNumericArray(self: *Reader, object: *syntax.Object, key: []const u8, numbers: []const f64) !void {
+        const items = try self.alloc.alloc(syntax.Object, numbers.len);
+        errdefer self.alloc.free(items);
+        for (items, numbers) |*item, number| item.* = .{ .real = number };
+        try self.setRenderDictionaryValue(object, key, .{ .array = items });
+    }
+
+    fn pageHasUnsupportedAnnotationsFromObject(self: *Reader, page: *const syntax.Object) !bool {
+        if (!try self.pageHasVisibleAnnotationsFromObject(page)) return false;
+        var annotations = try self.annotationValue(page.get("Annots").?);
+        defer annotations.deinit(self.alloc);
+        for (annotations.value.array) |*raw| {
+            try self.checkCancellation();
+            var annotation = try self.annotationValue(raw);
+            defer annotation.deinit(self.alloc);
+            if (!try self.annotationIsVisible(&annotation.value)) continue;
+            var appearance = (try self.staticAppearance(&annotation.value)) orelse return true;
+            appearance.deinit(self.alloc);
+        }
+        return false;
+    }
+
+    // `value` transfers only after a successful insertion. Existing resource
+    // keys are replaced on the page-local clone, never in shared source state.
+    fn setRenderDictionaryValue(self: *Reader, object: *syntax.Object, key: []const u8, value: syntax.Object) !void {
+        const entries: *[]syntax.DictEntry = switch (object.*) {
+            .dict => &object.dict,
+            .stream => &object.stream.header,
+            else => return error.InvalidPdfAnnotations,
+        };
+        for (entries.*) |*entry| if (std.mem.eql(u8, entry.key, key)) {
+            entry.value.deinit(self.alloc);
+            entry.value = value;
+            return;
+        };
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        entries.* = try self.alloc.realloc(entries.*, entries.len + 1);
+        entries.*[entries.len - 1] = .{ .key = owned_key, .value = value };
+    }
+
+    /// Add appearance Forms after page content, with an isolated graphics state
+    /// and a collision-free page-local resource name. Existing Form rendering
+    /// supplies clipping, transparency, fonts and bounded resource decoding.
+    fn pageAnnotationContentAlloc(self: *Reader, page: *syntax.Object, content: []const u8) !?[]u8 {
+        if (!try self.pageHasVisibleAnnotationsFromObject(page)) return null;
+        var annotations = try self.annotationValue(page.get("Annots").?);
+        defer annotations.deinit(self.alloc);
+        var resources = (try self.findInheritedPageValue(page, "Resources")) orelse syntax.Object{ .dict = try self.alloc.alloc(syntax.DictEntry, 0) };
+        defer resources.deinit(self.alloc);
+        if (resources != .dict) return error.InvalidPdfAnnotations;
+        var xobjects = if (resources.get("XObject")) |raw| try self.resolveValue(raw) else syntax.Object{ .dict = try self.alloc.alloc(syntax.DictEntry, 0) };
+        defer xobjects.deinit(self.alloc);
+        if (xobjects != .dict) return error.InvalidPdfAnnotations;
+        var output: std.Io.Writer.Allocating = .init(self.alloc);
+        defer output.deinit();
+        output.writer.writeAll("q\n") catch return error.OutOfMemory;
+        output.writer.writeAll(content) catch return error.OutOfMemory;
+        output.writer.writeAll("\nQ\n") catch return error.OutOfMemory;
+        var id: usize = 0;
+        for (annotations.value.array) |*raw| {
+            try self.checkCancellation();
+            var annotation = try self.annotationValue(raw);
+            defer annotation.deinit(self.alloc);
+            if (!try self.annotationIsVisible(&annotation.value)) continue;
+            var appearance = (try self.staticAppearance(&annotation.value)) orelse return error.UnsupportedPdfAnnotationRendering;
+            defer appearance.deinit(self.alloc);
+            var name_buffer: [64]u8 = undefined;
+            const name = while (true) : (id += 1) {
+                const candidate = try std.fmt.bufPrint(&name_buffer, "AntflyStaticAnnotation{d}", .{id});
+                if (xobjects.get(candidate) == null) break candidate;
+            };
+            const owned = try appearance.stream.clone(self.alloc);
+            self.setRenderDictionaryValue(&xobjects, name, owned) catch |err| {
+                var cleanup = owned;
+                cleanup.deinit(self.alloc);
+                return err;
+            };
+            const sx = (appearance.rect[2] - appearance.rect[0]) / (appearance.bounds[2] - appearance.bounds[0]);
+            const sy = (appearance.rect[3] - appearance.rect[1]) / (appearance.bounds[3] - appearance.bounds[1]);
+            const tx = appearance.rect[0] - sx * appearance.bounds[0];
+            const ty = appearance.rect[1] - sy * appearance.bounds[1];
+            if (!std.math.isFinite(sx) or !std.math.isFinite(sy) or !std.math.isFinite(tx) or !std.math.isFinite(ty)) return error.InvalidPdfAnnotations;
+            output.writer.print("q {d} {d} {d} {d} re W n {d} 0 0 {d} {d} {d} cm /{s} Do Q\n", .{
+                appearance.rect[0], appearance.rect[1], appearance.rect[2] - appearance.rect[0], appearance.rect[3] - appearance.rect[1], sx, sy, tx, ty, name,
+            }) catch return error.OutOfMemory;
+        }
+        const owned_xobjects = try xobjects.clone(self.alloc);
+        self.setRenderDictionaryValue(&resources, "XObject", owned_xobjects) catch |err| {
+            var cleanup = owned_xobjects;
+            cleanup.deinit(self.alloc);
+            return err;
+        };
+        const owned_resources = try resources.clone(self.alloc);
+        self.setRenderDictionaryValue(page, "Resources", owned_resources) catch |err| {
+            var cleanup = owned_resources;
+            cleanup.deinit(self.alloc);
+            return err;
+        };
+        return try output.toOwnedSlice();
+    }
+
     /// Extracts canonical page text and positioned text runs while sharing the
     /// page object, resource collection, content stream resolution, and stream
     /// decoding work between both representations.
     /// Paint-only resources are not needed for character positions. Keep mask
     /// and image decoding in the rendering APIs, as in plain-text extraction.
     pub fn extractPageTextAnalysisAlloc(self: *Reader, page_num: usize) !PageTextAnalysis {
+        return self.extractPageTextAnalysisWithRunLimitAlloc(page_num, std.math.maxInt(usize));
+    }
+
+    /// The shared run count includes nested forms and all content streams.
+    /// Reject excess runs before copying their text or reconstructing layout.
+    pub fn extractPageTextAnalysisWithRunLimitAlloc(self: *Reader, page_num: usize, max_runs: usize) !PageTextAnalysis {
         try self.beginImageCacheScope();
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
+        const annotations = try self.pageHasUnsupportedAnnotationsFromObject(&page);
+        const visible_annotations = try self.pageHasVisibleAnnotationsFromObject(&page);
         const contents = page.get("Contents") orelse return .{
             .text = try self.alloc.dupe(u8, ""),
             .runs = try self.alloc.alloc(TextRun, 0),
             .outline_fallback = false,
+            .has_unrendered_annotations = annotations,
+            .has_nontext_visual = visible_annotations,
         };
         var stream_ranges: ?[]ContentStreamRange = null;
         const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
@@ -4659,8 +5000,11 @@ pub const Reader = struct {
             self.alloc.free(color_spaces);
         }
 
-        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, &.{}, forms, color_spaces);
+        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, &.{}, forms, color_spaces, max_runs);
+        errdefer analysis.deinit(self.alloc);
+        analysis.has_unrendered_annotations = annotations;
         analysis.outline_fallback = pageFontsUsedOutlineFallback(fonts);
+        analysis.has_nontext_visual = visible_annotations or try contentHasNontextPaint(self.alloc, decoded_content, self.cancellation);
         return analysis;
     }
 
@@ -4811,11 +5155,14 @@ pub const Reader = struct {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
         const page_box = try self.extractPageBoxFromObject(&page);
-        const decoded_content = if (page.get("Contents")) |contents|
+        const original_content = if (page.get("Contents")) |contents|
             try self.readCombinedContentStreamsAlloc(contents)
         else
             try self.alloc.alloc(u8, 0);
-        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(original_content);
+        const annotation_content = try self.pageAnnotationContentAlloc(&page, original_content);
+        defer if (annotation_content) |bytes| self.alloc.free(bytes);
+        const decoded_content = annotation_content orelse original_content;
         try self.checkCancellation();
 
         const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
@@ -6026,6 +6373,7 @@ pub const Reader = struct {
         gstates: []const PageExtGState,
         forms: []const PageForm,
         color_spaces: []const PageColorSpace,
+        max_runs: usize,
     ) !PageTextAnalysis {
         var text = std.ArrayList(u8).empty;
         errdefer text.deinit(self.alloc);
@@ -6034,7 +6382,7 @@ pub const Reader = struct {
             for (runs.items) |*run| run.deinit(self.alloc);
             runs.deinit(self.alloc);
         }
-        var run_parser = try PositionedTextParser.init(self.alloc, .{ .analysis = &runs }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
+        var run_parser = try PositionedTextParser.init(self.alloc, .{ .analysis = .{ .runs = &runs, .max_runs = max_runs } }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer run_parser.deinit();
         run_parser.cancellation = self.cancellation;
 
@@ -6046,8 +6394,8 @@ pub const Reader = struct {
             // ordered reconstruction is intentionally not content order.
             var text_parser = TextContentParser.init(self.alloc, &text);
             defer text_parser.deinit();
-            try text_parser.consume(stream_content, fonts, forms, 0);
             try run_parser.consume(stream_content, fonts, gstates, forms);
+            try text_parser.consume(stream_content, fonts, forms, 0);
         }
 
         var owned_text = try text.toOwnedSlice(self.alloc);
@@ -15665,7 +16013,7 @@ fn applyTextRunOperator(
         next_group_id.* = nested_parser.next_group_id;
         switch (out) {
             .layout => {},
-            .analysis, .render => |render_out| for (render_out.items[start_len..]) |*run| {
+            .analysis, .render => for (out.textRuns().items[start_len..]) |*run| {
                 if (vectorize_form_text) {
                     // Recursively nested runs already hold the innermost
                     // resource borrow. Otherwise translate this Form-local
@@ -17198,7 +17546,9 @@ fn appendTextRunDecodedString(
                 .paint_order = paint_order,
             });
         },
-        .analysis, .render => |render_out| {
+        .analysis, .render => {
+            const render_out = out.textRuns();
+            if (out == .analysis and render_out.items.len >= out.analysis.max_runs) return error.TextRunLimitExceeded;
             const vectorizable = if (state.current_font_index) |font_idx|
                 fonts[font_idx].type3 != null or
                     fonts[font_idx].type1 != null or
@@ -31541,4 +31891,171 @@ test "reader resolves indirect Type0 subtype before decoding" {
     const text = try reader.extractPlainTextAlloc();
     defer alloc.free(text);
     try std.testing.expectEqualStrings("A\n", text);
+}
+
+test "document PDF coverage inspects paint operators without confusing literal text" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!try contentHasNontextPaint(a, "BT (S Do BI) Tj ET % f\n", .{}));
+    try std.testing.expect(try contentHasNontextPaint(a, "0 0 30 40 re f", .{}));
+    try std.testing.expect(try contentHasNontextPaint(a, "/Figure Do", .{}));
+    try std.testing.expect(try contentHasNontextPaint(a, "BI /W 1 /H 1 ID binary", .{}));
+}
+
+test "document PDF annotation coverage is bounded and prevents incomplete native painting" {
+    const Case = struct {
+        fn check(a: Allocator) !void {
+            const bytes = try buildImageDecodeTestPdfAlloc(a, &.{
+                "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+                "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots 4 0 R >>\nendobj\n",
+                "4 0 obj\n[5 0 R]\nendobj\n",
+                "5 0 obj\n<< /Subtype /Stamp /Rect [0 0 20 20] /F 6 0 R >>\nendobj\n",
+                "6 0 obj\n4\nendobj\n",
+                "7 0 obj\n8 0 R\nendobj\n",
+                "8 0 obj\n7 0 R\nendobj\n",
+            });
+            defer a.free(bytes);
+            var pdf_reader = try Reader.init(a, bytes);
+            defer pdf_reader.deinit();
+            var analysis = try pdf_reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            try std.testing.expect(analysis.has_unrendered_annotations);
+            if (pdf_reader.extractPageRenderRunsAlloc(1)) |value| {
+                var runs = value;
+                defer runs.deinit(a);
+                return error.TestUnexpectedResult;
+            } else |err| if (err != error.UnsupportedPdfAnnotationRendering) return err;
+            const cycle = syntax.Object{ .obj_ref = .{ .id = 7, .gen = 0 } };
+            if (pdf_reader.annotationValue(&cycle)) |value| {
+                var resolved = value;
+                defer resolved.deinit(a);
+                return error.TestUnexpectedResult;
+            } else |err| if (err != error.InvalidPdfAnnotations) return err;
+            inline for (.{
+                .{ "<< /Subtype /Stamp /F 2 >>", false },
+                .{ "<< /Subtype /Stamp /F 32 >>", false },
+                .{ "<< /Subtype /Stamp /F 36 >>", true },
+                .{ "<< /Subtype /Stamp /F 288 >>", true },
+                .{ "<< /Subtype /Link /Border [0 0 0] >>", false },
+                .{ "<< /Subtype /Link /BS << /W 0 >> >>", false },
+                .{ "<< /Subtype /Link /Border [0 0 0] /AP << /N 5 0 R >> >>", true },
+                .{ "<< /Subtype /Widget /Rect [0 0 20 20] >>", true },
+                .{ "<< /Subtype /Stamp /Rect [0 0 0 20] >>", false },
+            }) |fixture| {
+                var scanner = syntax.Scanner.init(a, fixture[0]);
+                defer scanner.deinit();
+                var annotation = try scanner.readObject();
+                defer annotation.deinit(a);
+                try std.testing.expectEqual(fixture[1], try pdf_reader.annotationIsVisible(&annotation));
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
+}
+
+test "document text bounds use transformed font metrics and leave unsupported geometry unknown" {
+    const run: TextRun = .{ .text = "Text", .x = 10, .y = 20, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2, .horizontal_scale = 1 };
+    const cases = .{
+        .{ .basis = [4]f64{ 1, 0, 0, 1 }, .box = [4]f64{ 10, 18, 50, 28 } },
+        .{ .basis = [4]f64{ 0, 1, -1, 0 }, .box = [4]f64{ 2, 20, 12, 60 } },
+        .{ .basis = [4]f64{ 2, 0.5, 0.3, 3 }, .box = [4]f64{ 9.4, 14, 92.4, 64 } },
+        .{ .basis = [4]f64{ -1, 0, 0, 1 }, .box = [4]f64{ -30, 18, 10, 28 } },
+    };
+    inline for (cases) |case| {
+        var transformed = run;
+        transformed.a = case.basis[0];
+        transformed.b = case.basis[1];
+        transformed.c = case.basis[2];
+        transformed.d = case.basis[3];
+        const box = transformed.bounds().?;
+        inline for (.{ box.min_x, box.min_y, box.max_x, box.max_y }, case.box) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 0.000001);
+    }
+    var unsupported = run;
+    unsupported.vertical = true;
+    try std.testing.expect(unsupported.bounds() == null);
+    unsupported = run;
+    unsupported.a = std.math.nan(f64);
+    try std.testing.expect(unsupported.bounds() == null);
+    unsupported = run;
+    unsupported.d = 0;
+    try std.testing.expect(unsupported.bounds() == null);
+}
+
+test "document bounded PDF analysis rejects excess runs before layout and preserves the reader" {
+    const a = std.testing.allocator;
+    const bytes = try buildTextOrderingTestPdfAlloc(a, "BT /F1 12 Tf 10 20 Td (One) Tj (Two) Tj (Three) Tj ET\n");
+    defer a.free(bytes);
+    var reader = try Reader.init(a, bytes);
+    defer reader.deinit();
+    try std.testing.expectError(error.TextRunLimitExceeded, reader.extractPageTextAnalysisWithRunLimitAlloc(1, 2));
+    var complete = try reader.extractPageTextAnalysisWithRunLimitAlloc(1, 3);
+    defer complete.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), complete.runs.len);
+}
+
+test "document bounded PDF runs share one allowance across consumes and nested forms" {
+    const a = std.testing.allocator;
+    var runs: std.ArrayList(TextRun) = .empty;
+    defer {
+        for (runs.items) |*run| run.deinit(a);
+        runs.deinit(a);
+    }
+    var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 2 } }, .{}, &.{}, .nonzero);
+    defer parser.deinit();
+    try parser.consume("BT 3 Tr (Invisible) Tj 0 Tr (First) Tj ET", &.{}, &.{}, &.{});
+    const form = PageForm{ .name = @constCast("Fm"), .content = @constCast("BT (Second) Tj (Excess) Tj ET") };
+    try std.testing.expectError(error.TextRunLimitExceeded, parser.consume("/Fm Do", &.{}, &.{}, &.{form}));
+    try std.testing.expectEqual(@as(usize, 2), runs.items.len);
+    try std.testing.expectEqualStrings("Second", runs.items[1].text);
+}
+
+test "document bounded PDF run allocation failures release partially collected text" {
+    const Runner = struct {
+        fn run(a: Allocator) !void {
+            var runs: std.ArrayList(TextRun) = .empty;
+            defer {
+                for (runs.items) |*item| item.deinit(a);
+                runs.deinit(a);
+            }
+            var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 1 } }, .{}, &.{}, .nonzero);
+            defer parser.deinit();
+            parser.consume("BT (First) Tj (Excess) Tj ET", &.{}, &.{}, &.{}) catch |err| switch (err) {
+                error.TextRunLimitExceeded => return,
+                else => return err,
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "document PDF static annotation states composite through Form geometry and preserve native coverage" {
+    const a = std.testing.allocator;
+    const appearance = "1 0 0 rg 0 0 10 10 re f";
+    const stream = try std.fmt.allocPrint(a, "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Matrix [0 1 -1 0 10 0] /Resources << >> /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ appearance.len, appearance });
+    defer a.free(stream);
+    const bytes = try buildImageDecodeTestPdfAlloc(a, &.{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [4 0 R 5 0 R] >>\nendobj\n",
+        "4 0 obj\n<< /Subtype /Stamp /Rect [20 30 60 70] /AS /On /AP << /N << /On 6 0 R >> >> >>\nendobj\n",
+        "5 0 obj\n<< /Subtype /Widget /Rect [0 0 100 100] /F 2 >>\nendobj\n",
+        stream,
+    });
+    defer a.free(bytes);
+    var parsed = try Reader.init(a, bytes);
+    defer parsed.deinit();
+    var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expect(!analysis.has_unrendered_annotations);
+    try std.testing.expect(analysis.has_nontext_visual);
+    var runs = try parsed.extractPageRenderRunsAlloc(1);
+    defer runs.deinit(a);
+    try std.testing.expect(runs.shape_runs.len > 0);
+    const raster = try @import("render.zig").renderPageContentRgbaInBoxRotatedCancelable(a, runs.page_box, runs.text_runs, runs.image_runs, runs.shading_runs, runs.pattern_runs, runs.shape_runs, .none, .{});
+    defer a.free(raster.rgba);
+    // The red stamp is visible at the page center, with unpainted white corners.
+    const center = ((raster.height / 2) * raster.width + raster.width / 2) * 4;
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, raster.rgba[center..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, raster.rgba[0..4]);
 }

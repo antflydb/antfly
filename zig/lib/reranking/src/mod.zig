@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const cloudflare = @import("antfly_cloudflare_config");
 const json = @import("antfly-json");
 const openapi = @import("antfly_reranking_openapi");
 
@@ -48,6 +49,7 @@ pub fn providerCapabilities(provider: Provider) ProviderCapabilities {
             .credential_kind = .optional_api_key,
             .credential_env = "ANTFLY_INFERENCE_API_KEY",
         },
+        .cloudflare => .{ .default_model = "@cf/baai/bge-reranker-base", .default_url = "", .max_candidate_count = max_candidate_count, .model_required = true, .credential_kind = .api_key, .credential_env = "CLOUDFLARE_API_TOKEN" },
         .cohere => .{
             .default_model = "rerank-english-v3.0",
             .default_url = "https://api.cohere.com",
@@ -134,6 +136,8 @@ pub fn defaultModelForProvider(provider: Provider) []const u8 {
 }
 
 pub const Config = struct {
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,
     field: []const u8 = "",
@@ -146,23 +150,27 @@ pub const Config = struct {
     candidate_count: ?u32 = null,
     top_n: ?u32 = null,
 
-    pub fn clone(self: Config, alloc: Allocator) !Config {
-        return .{
-            .rate_limit = self.rate_limit,
-            .provider = self.provider,
-            .field = if (self.field.len > 0) try alloc.dupe(u8, self.field) else "",
-            .template = if (self.template.len > 0) try alloc.dupe(u8, self.template) else "",
-            .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
-            .url = if (self.url.len > 0) try alloc.dupe(u8, self.url) else "",
-            .api_key = if (self.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
-            .project_id = if (self.project_id.len > 0) try alloc.dupe(u8, self.project_id) else "",
-            .credentials_path = if (self.credentials_path.len > 0) try alloc.dupe(u8, self.credentials_path) else "",
-            .candidate_count = self.candidate_count,
-            .top_n = self.top_n,
-        };
+    pub fn clone(self: Config, alloc: std.mem.Allocator) !Config {
+        var result = self;
+        inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |name, T| {
+            if (T == []const u8) @field(result, name) = "";
+            if (T == ?[]const u8) @field(result, name) = null;
+        }
+        errdefer result.deinit(alloc);
+        inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |name, T| {
+            if (T == []const u8) {
+                if (@field(self, name).len > 0) @field(result, name) = try alloc.dupe(u8, @field(self, name));
+            }
+            if (T == ?[]const u8) if (@field(self, name)) |value| {
+                @field(result, name) = try alloc.dupe(u8, value);
+            };
+        }
+        return result;
     }
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
+        if (self.account_id) |v| alloc.free(v);
+        if (self.gateway_id) |v| alloc.free(v);
         if (self.field.len > 0) alloc.free(self.field);
         if (self.template.len > 0) alloc.free(self.template);
         if (self.model.len > 0) alloc.free(self.model);
@@ -174,7 +182,13 @@ pub const Config = struct {
     }
 
     pub fn validate(self: Config) !void {
+        if (self.provider == .cloudflare) {
+            try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
+            try cloudflare.modelId(self.model);
+            if (self.gateway_id) |id| try cloudflare.identifier(id);
+        } else if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
         if (self.field.len == 0 and self.template.len == 0) return error.InvalidRerankerConfig;
+        if (self.provider == .cloudflare and !std.mem.eql(u8, self.model, "@cf/baai/bge-reranker-base")) return error.UnsupportedCloudflareModel;
         const capabilities = providerCapabilities(self.provider);
         const model = std.mem.trim(u8, self.model, " \t\r\n");
         if ((self.model.len > 0 and model.len == 0) or (capabilities.model_required and model.len == 0))
@@ -243,16 +257,18 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
 
 pub fn configFromOpenApi(alloc: Allocator, generated: openapi.RerankerConfig) !Config {
     const model = generated.model orelse defaultModelForProvider(generated.provider);
-    var cfg = Config{
+    const cfg = Config{
         .rate_limit = generated.rate_limit,
         .provider = generated.provider,
-        .field = if (generated.field) |field| try alloc.dupe(u8, field) else "",
-        .template = if (generated.template) |template| try alloc.dupe(u8, template) else "",
-        .model = if (model.len > 0) try alloc.dupe(u8, model) else "",
-        .url = if (generated.url) |url| try alloc.dupe(u8, url) else "",
-        .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
-        .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else "",
-        .credentials_path = if (generated.credentials_path) |credentials_path| try alloc.dupe(u8, credentials_path) else "",
+        .account_id = if (generated.account_id) |v| v else null,
+        .gateway_id = if (generated.gateway_id) |v| v else null,
+        .field = if (generated.field) |field| field else "",
+        .template = if (generated.template) |template| template else "",
+        .model = if (model.len > 0) model else "",
+        .url = if (generated.url) |url| url else "",
+        .api_key = if (generated.api_key) |api_key| api_key else null,
+        .project_id = if (generated.project_id) |project_id| project_id else "",
+        .credentials_path = if (generated.credentials_path) |credentials_path| credentials_path else "",
         .candidate_count = if (generated.candidate_count) |candidate_count|
             std.math.cast(u32, candidate_count) orelse return error.InvalidRerankerConfig
         else
@@ -262,9 +278,8 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.RerankerConfig) !C
         else
             null,
     };
-    errdefer cfg.deinit(alloc);
     try cfg.validate();
-    return cfg;
+    return cfg.clone(alloc);
 }
 
 test "external reranker models have executable defaults" {
@@ -298,6 +313,8 @@ test "external reranker models have executable defaults" {
 pub fn openApiFromConfig(cfg: Config) openapi.RerankerConfig {
     return .{
         .rate_limit = cfg.rate_limit,
+        .account_id = cfg.account_id,
+        .gateway_id = cfg.gateway_id,
         .provider = cfg.provider,
         .field = if (cfg.field.len > 0) cfg.field else null,
         .template = if (cfg.template.len > 0) cfg.template else null,

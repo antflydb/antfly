@@ -1,10 +1,21 @@
 """SDK compatibility for raw similarity decisions and ordered embedding groups."""
 
+from antfly.client_generated.models.decider_config import DeciderConfig
 from antfly.client_generated.models.embedding_choice_answer import EmbeddingChoiceAnswer
 from antfly.client_generated.models.embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
 from antfly.client_generated.models.inference_decide_response import InferenceDecideResponse
 from antfly.client_generated.models.inference_embed_request import InferenceEmbedRequest
 from antfly.client_generated.models.inference_embedding_group import InferenceEmbeddingGroup
+
+
+def test_named_embedder_dimensions_round_trip_without_native_geometry_restriction():
+    for dimensions in (1, 384, 1024, 65535):
+        raw = {
+            "decision_method": "embedding_similarity",
+            "embedder": "dense",
+            "embedding_options": {"dimensions": dimensions},
+        }
+        assert DeciderConfig.from_dict(raw).to_dict() == raw
 
 
 def test_abstained_choice_round_trips_without_probabilities():

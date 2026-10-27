@@ -734,6 +734,7 @@ pub const BoundedInvocationAllocator = struct {
     live_bytes: usize = 0,
     peak_live_bytes: usize = 0,
     limit_exceeded: bool = false,
+    mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(backing: std.mem.Allocator, max_live_bytes: usize) BoundedInvocationAllocator {
         return .{ .backing = backing, .max_live_bytes = max_live_bytes };
@@ -746,6 +747,13 @@ pub const BoundedInvocationAllocator = struct {
             .remap = remap,
             .free = free,
         } };
+    }
+
+    // The limit check, backing operation and accounting form one transaction.
+    // Duplex transport can free upload buffers while parsing response frames;
+    // this also serializes access to a thread-confined backing allocator.
+    fn lock(self: *BoundedInvocationAllocator) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
     fn permit(self: *BoundedInvocationAllocator, additional: usize) bool {
@@ -763,6 +771,8 @@ pub const BoundedInvocationAllocator = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         if (!self.permit(len)) return null;
         const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.recordGrowth(len);
@@ -771,6 +781,8 @@ pub const BoundedInvocationAllocator = struct {
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         const growth = new_len -| memory.len;
         if (growth > 0 and !self.permit(growth)) return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
@@ -781,6 +793,8 @@ pub const BoundedInvocationAllocator = struct {
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         const growth = new_len -| memory.len;
         if (growth > 0 and !self.permit(growth)) return null;
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
@@ -791,6 +805,8 @@ pub const BoundedInvocationAllocator = struct {
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         self.backing.rawFree(memory, alignment, ret_addr);
         self.live_bytes -|= memory.len;
     }

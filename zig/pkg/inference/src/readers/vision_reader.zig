@@ -331,6 +331,10 @@ pub const LoadedVisionReader = struct {
             self.florence_final_logits_bias_zero,
         );
         reader_pipeline.execution_control = options.execution_control;
+        if (self.loaded_model) |model| {
+            if (reading_pipeline_mod.nativeFlorencePreprocessOverlapEnabled(self.encoder_session))
+                reader_pipeline.native_execution_lane = &model.native_reader_execution_lane;
+        }
         return reader_pipeline;
     }
 

@@ -635,6 +635,9 @@ pub fn hostedCapabilities(cfg: anytype) Capabilities {
                 if (std.mem.eql(u8, name, model) or datedSnapshot(name, model)) return .{ .tool_call = true, .images = !std.mem.eql(u8, model, "o3-mini"), .json_schema = true, .token_logprobs = std.mem.startsWith(u8, model, "gpt-4") };
             }
         },
+        .cloudflare => {
+            for ([_][]const u8{ "llama-3.3-70b-instruct-fp8-fast", "qwen3-30b-a3b-fp8", "mistral-small-3.1-24b-instruct" }) |model| if (std.mem.eql(u8, name, model)) return .{ .tool_call = true, .images = std.mem.startsWith(u8, model, "mistral-small") };
+        },
         .gemini, .vertex => {
             for ([_][]const u8{ "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-pro-preview", "gemini-3-flash-preview" }) |model| if (std.mem.eql(u8, name, model)) return .{ .tool_call = true, .images = true };
         },
@@ -651,7 +654,7 @@ fn datedSnapshot(name: []const u8, model: []const u8) bool {
     return true;
 }
 test "constrained hosted metadata rejects unqualified task variants and unknown aliases" {
-    const Provider = enum { openai, gemini, vertex, antfly };
+    const Provider = enum { openai, gemini, vertex, antfly, cloudflare };
     const Config = struct { provider: Provider = .openai, model: []const u8 };
     try std.testing.expect((hostedCapabilities(Config{ .model = "gpt-4.1-2025-04-14" })).token_logprobs);
     for ([_][]const u8{ "gpt-4o-audio-preview", "gpt-4o-mini-transcribe", "gpt-4.1-custom-alias", "o3-deep-research" }) |name| try std.testing.expectError(error.UnsupportedConstrainedOutput, hostedCapabilities(Config{ .model = name }).select(.auto, null));

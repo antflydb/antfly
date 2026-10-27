@@ -17,10 +17,7 @@
 //! Scores are cosine similarities, never probabilities or confidence values.
 const std = @import("std");
 pub fn validDimension(dimensions: usize) bool {
-    return switch (dimensions) {
-        128, 256, 512, 768 => true,
-        else => false,
-    };
+    return dimensions > 0 and dimensions <= 65536;
 }
 pub const renderer_version = "instruction-category-v1";
 

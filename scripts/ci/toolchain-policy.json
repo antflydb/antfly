@@ -19,8 +19,8 @@
     "aarch64LinuxSha256": "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8"
   },
   "macosCrossSdk": {
-    "version": "15.5",
-    "sha256": "c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd"
+    "version": "26.1",
+    "sha256": "beee7212d265a6d2867d0236cc069314b38d5fb3486a6515734e76fa210c784c"
   },
   "rust": {
     "version": "1.95.0"

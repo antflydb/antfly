@@ -50,6 +50,59 @@ pub const AntflyRerankerConfig = struct {
     }
 };
 
+/// Cloudflare Workers AI reranking. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+pub const CloudflareRerankerConfig = struct {
+    provider: []const u8,
+    account_id: []const u8,
+    /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
+    gateway_id: ?[]const u8 = null,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned endpoint override.
+    url: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "account_id", "account_id", false },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", false },
+        .{ "api_key", "api_key", true },
+        .{ "url", "url", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("account_id");
+        try jw.write(self.account_id);
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Configuration for the Cohere reranking provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** rerank-english-v3.0 (default), rerank-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/rerank
 pub const CohereRerankerConfig = struct {
     provider: []const u8,
@@ -93,6 +146,8 @@ pub const RateLimitConfig = antfly_provider_openapi.RateLimitConfig;
 
 /// A unified configuration for a reranking provider.
 pub const RerankerConfig = struct {
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
     provider: RerankerProvider,
     /// Field name to extract from documents for reranking.
@@ -105,9 +160,8 @@ pub const RerankerConfig = struct {
     candidate_count: ?i64 = null,
     /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
     top_n: ?i64 = null,
-    /// Optional bearer API key for remote Antfly inference. Supports secret references and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound credentials.
     api_key: ?[]const u8 = null,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    /// Optional deployment-owned endpoint override.
     url: ?[]const u8 = null,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
@@ -116,6 +170,8 @@ pub const RerankerConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "rate_limit", "rate_limit", false },
         .{ "provider", "provider", true },
         .{ "field", "field", true },
@@ -139,6 +195,14 @@ pub const RerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
         if (self.rate_limit) |value| {
             try jw.objectField("rate_limit");
             try jw.write(value);
@@ -190,12 +254,14 @@ pub const RerankerConfig = struct {
 
 /// The reranking provider to use.
 pub const RerankerProvider = enum {
+    cloudflare,
     antfly,
     cohere,
     vertex,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .cloudflare => "cloudflare",
             .antfly => "antfly",
             .cohere => "cohere",
             .vertex => "vertex",
@@ -209,6 +275,7 @@ pub const RerankerProvider = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cloudflare", .cloudflare },
             .{ "antfly", .antfly },
             .{ "cohere", .cohere },
             .{ "vertex", .vertex },

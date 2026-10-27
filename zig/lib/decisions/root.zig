@@ -16,6 +16,7 @@
 //! Public named-array decision contract. The model adapters retain their
 //! private typed-classification representation behind this boundary.
 const std = @import("std");
+pub const cloudflare = @import("antfly_cloudflare");
 pub const evidence = @import("evidence.zig");
 pub const generated = @import("generated.zig");
 pub const legacy = @import("trained.zig");

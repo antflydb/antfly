@@ -15,6 +15,7 @@ pub const ChunkRequest = types.ChunkRequest;
 pub const ChunkResponse = types.ChunkResponse;
 pub const Config = types.Config;
 pub const ContentPart = types.ContentPart;
+pub const DocumentSource = types.DocumentSource;
 pub const EmbedRequest = types.EmbedRequest;
 pub const EmbedResponse = types.EmbedResponse;
 pub const Error = types.Error;

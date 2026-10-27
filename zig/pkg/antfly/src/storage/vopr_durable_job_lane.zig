@@ -460,3 +460,104 @@ test "VOPR durable job owner uses production pause close and reopen protocol" {
     try std.testing.expectEqual(@as(usize, 1), context.runs);
     try std.testing.expectEqual(@as(usize, 2), context.deinits);
 }
+
+test "VOPR durable document owner takeover replays accepted stages and rejects delayed completion" {
+    const readers = @import("antfly_readers");
+    const runs = readers.document_runs;
+    const Fixture = struct {
+        io: std.Io,
+        store: runs.Store,
+        old: runs.Lease,
+        identity: runs.Identity,
+        physical_calls: u64 = 1,
+        replayed: bool = false,
+        deinits: usize = 0,
+        old_delay: u64,
+        fn now(self: *@This()) u64 {
+            return @intCast(@divFloor(std.Io.Clock.real.now(self.io).toNanoseconds(), std.time.ns_per_ms));
+        }
+        fn oldRun(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.io.sleep(.fromMilliseconds(@intCast(self.old_delay)), .awake);
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            _ = self.store.complete(arena.allocator(), self.old, @splat(1), .{ .calls = 1, .tokens = 3, .output_bytes = 3 }, "old", self.now()) catch |err| switch (err) {
+                error.DocumentRunLeaseLost => return,
+                else => return err,
+            };
+        }
+        fn newRun(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.io.sleep(.fromMilliseconds(15), .awake);
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const lease = try self.store.claim(a, "simulated", "alice", self.identity, self.now(), 100);
+            const record = try self.store.load(a, "simulated", "alice");
+            var index = try runs.Index.init(std.testing.allocator, self.store, record, 100, 16384);
+            defer index.deinit();
+            const result = if (index.get(@splat(1))) |accepted| result: {
+                self.replayed = true;
+                break :result accepted;
+            } else result: {
+                if (!try self.store.reserve(a, lease, @splat(1), .{ .calls = 1, .tokens = 7, .output_bytes = 32 }, self.now())) return error.TestUnexpectedResult;
+                self.physical_calls += 1;
+                break :result try self.store.complete(a, lease, @splat(1), .{ .calls = 1, .tokens = 3, .output_bytes = 3 }, "new", self.now());
+            };
+            try self.store.finish(a, lease, result, self.now());
+        }
+        fn deinitJob(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.deinits += 1;
+        }
+        fn simulate(seed: u64) ![32]u8 {
+            const a = std.testing.allocator;
+            var runtime = try vopr.vopr_io.VoprIo.init(.{ .seed = seed, .task_allocator = a });
+            defer runtime.deinit();
+            var adapter = Lane.init(a, runtime.io());
+            defer adapter.deinit();
+            var memory = readers.testing.Store{ .a = a };
+            defer memory.deinit();
+            const store = memory.interface();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const work = arena.allocator();
+            const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+            try store.create(.{ .run_id = "simulated", .owner = "alice", .identity = identity, .inputs = &.{}, .limits = .{ .calls = 4, .tokens = 100, .output_bytes = 1000 } });
+            const initial = try store.claim(work, "simulated", "alice", identity, 0, 10);
+            try std.testing.expect(try store.reserve(work, initial, @splat(1), .{ .calls = 1, .tokens = 7, .output_bytes = 32 }, 0));
+            var fixture = @This(){ .io = runtime.io(), .store = store, .old = initial, .identity = identity, .old_delay = if (seed % 2 == 0) 5 else 20 };
+            try adapter.lane().submit(.{ .owner_id = 1, .class = .maintenance, .ptr = &fixture, .run = oldRun, .deinit = deinitJob });
+            try adapter.lane().submit(.{ .owner_id = 2, .class = .maintenance, .ptr = &fixture, .run = newRun, .deinit = deinitJob });
+            var choices = std.Random.DefaultPrng.init(seed);
+            var trace = std.crypto.hash.sha2.Sha256.init(.{});
+            var sink: vopr.event.Sink = .{};
+            defer sink.deinit(a);
+            for (0..128) |_| {
+                var transitions: vopr.transition.List = .{};
+                defer transitions.deinit(a);
+                try runtime.scheduler().enumerateReady(&transitions, a);
+                try transitions.canonicalize();
+                if (transitions.items.items.len == 0) break;
+                const selected = transitions.items.items[choices.random().uintLessThan(usize, transitions.items.items.len)];
+                trace.update(std.mem.asBytes(&selected.id));
+                try runtime.scheduler().executeReady(selected.id, &sink, a);
+            }
+            _ = try adapter.lane().poll(16);
+            try std.testing.expectEqual(@as(usize, 0), adapter.stats().pending_jobs);
+            try std.testing.expectEqual(@as(usize, 2), fixture.deinits);
+            try std.testing.expectEqual(@as(u64, 0), adapter.stats().failed_jobs);
+            const final = try store.load(work, "simulated", "alice");
+            try std.testing.expectEqual(.succeeded, final.state);
+            try std.testing.expectEqual(@as(u64, if (fixture.replayed) 1 else 2), fixture.physical_calls);
+            try std.testing.expectEqual(@as(u64, if (fixture.replayed) 3 else 10), final.used.tokens);
+            try std.testing.expectEqual(@as(u64, if (fixture.replayed) 0 else 7), final.uncertain.tokens);
+            return trace.finalResult();
+        }
+    };
+    for (0..16) |seed| {
+        const first = try Fixture.simulate(seed);
+        const replay = try Fixture.simulate(seed);
+        try std.testing.expectEqualSlices(u8, &first, &replay);
+    }
+}

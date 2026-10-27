@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const cloudflare = @import("antfly_cloudflare_config");
 const audio = @import("antfly_audio_openapi");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
@@ -33,12 +34,14 @@ pub const Speaker = audio.Speaker;
 pub const Provider = enum {
     antfly,
     openai,
+    cloudflare,
     vertex,
     apple,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.write(switch (self) {
             .antfly => "antfly",
+            .cloudflare => "cloudflare",
             .openai => "openai",
             .vertex => "vertex",
             .apple => "apple",
@@ -51,6 +54,7 @@ pub const Provider = enum {
             else => return error.UnexpectedToken,
         };
         if (std.mem.eql(u8, raw, "antfly")) return .antfly;
+        if (std.mem.eql(u8, raw, "cloudflare")) return .cloudflare;
         if (std.mem.eql(u8, raw, "openai")) return .openai;
         if (std.mem.eql(u8, raw, "vertex")) return .vertex;
         if (std.mem.eql(u8, raw, "apple")) return .apple;
@@ -59,6 +63,8 @@ pub const Provider = enum {
 };
 
 pub const Config = struct {
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     provider: Provider,
     model: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
@@ -91,6 +97,11 @@ pub const Config = struct {
     download_assets: bool = false,
 
     pub fn validate(self: Config) !void {
+        if (self.provider == .cloudflare) {
+            try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
+            try cloudflare.modelId(self.model orelse return error.UnsupportedCloudflareModel);
+            if (self.gateway_id) |id| try cloudflare.identifier(id);
+        } else if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
         if (self.provider != .apple) return;
         if (self.model != null) return error.InvalidAppleTranscribingConfig;
         if (self.api_key != null or self.bearer_token != null or self.capability_token != null or self.capability_revision != null or
@@ -457,6 +468,7 @@ fn initTranscriberWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config
     try cfg.validate();
     return switch (cfg.provider) {
         .antfly => try AntflyTranscriberState.init(alloc, http, cfg, options),
+        .cloudflare => try CloudflareTranscriberState.init(alloc, http, cfg, options),
         .openai => try OpenAiTranscriberState.init(alloc, http, cfg, options),
         .vertex => try VertexTranscriberState.init(alloc, http, cfg, options),
         .apple => try AppleTranscriberState.init(alloc, http, cfg, options),
@@ -886,6 +898,117 @@ fn antflySpeakersAlloc(alloc: Allocator, api_speakers: []const []const u8) ![]Sp
         filled += 1;
     }
     return speakers;
+}
+
+const CloudflareTranscriberState = struct {
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    options: RemoteOptions,
+
+    fn init(a: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
+        if (!std.mem.eql(u8, cfg.model.?, "@cf/openai/whisper-large-v3-turbo")) return error.UnsupportedCloudflareModel;
+        if ((cfg.diarization orelse false) or cfg.use_enhanced != null or cfg.enable_automatic_punctuation != null) return error.UnsupportedTranscriptionOptions;
+        const self = try a.create(@This());
+        errdefer a.destroy(self);
+        self.* = .{ .alloc = a, .http = http, .cfg = try cloneConfig(a, cfg), .options = options };
+        return .{ .ptr = self, .vtable = &.{ .transcribe = transcribe, .deinit = deinit } };
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        deinitConfig(self.alloc, &self.cfg);
+        self.alloc.destroy(self);
+    }
+    fn transcribe(raw: *anyopaque, a: Allocator, req: Request) anyerror!Response {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (req.diarization orelse false) return error.UnsupportedTranscriptionOptions;
+        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const content = try resolveAudioContentWithContext(work, self.http.io, req.url, self.cfg.max_download_bytes, self.options, control);
+        const encoded = try work.alloc(u8, std.base64.standard.Encoder.calcSize(content.data.len));
+        _ = std.base64.standard.Encoder.encode(encoded, content.data);
+        const cf = @import("antfly_cloudflare");
+        const wire = try std.json.Stringify.valueAlloc(work, cloudflare.wire.types.WhisperLargeV3TurboInput{
+            .audio = cf.string(encoded),
+            .language = req.language orelse self.cfg.language_code,
+        }, .{ .emit_null_optional_fields = false });
+        const payload = try std.json.parseFromSliceLeaky(std.json.Value, work, wire, .{ .parse_numbers = false });
+        const value = try cf.invokeNative(self.http, work, .{
+            .account_id = self.cfg.account_id.?,
+            .model = self.cfg.model.?,
+            .api_key = self.cfg.bearer_token orelse self.cfg.api_key orelse return error.MissingCloudflareCredentials,
+            .gateway_id = self.cfg.gateway_id,
+            .url = self.cfg.base_url orelse self.cfg.url,
+        }, payload, .{
+            .max_response_bytes = self.cfg.max_response_bytes orelse httpx.types.default_max_body_size,
+            .timeout_ms = try control.remainingTimeoutMs(),
+            .cancellation = self.options.cancellation,
+        });
+        return cloudflareTranscript(a, value, req.timestamps orelse self.cfg.timestamps orelse true);
+    }
+};
+
+fn cloudflareTimestamp(seconds: f64) !i64 {
+    if (!std.math.isFinite(seconds) or seconds < 0 or seconds >= 9e15) return error.InvalidCloudflareResponse;
+    return @intFromFloat(@round(seconds * 1000));
+}
+
+fn cloudflareTranscript(a: Allocator, value: std.json.Value, timestamps: bool) !Response {
+    var parsed = std.json.parseFromValue(cloudflare.wire.types.WhisperLargeV3TurboOutput, a, value, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCloudflareResponse,
+    };
+    defer parsed.deinit();
+    const wire = parsed.value;
+    var response = Response{};
+    errdefer deinitResponse(a, &response);
+    response.text = try a.dupe(u8, wire.text);
+    if (wire.transcription_info) |info| {
+        response.language = try dupOpt(a, info.language);
+        response.duration_ms = if (info.duration) |duration| try cloudflareTimestamp(duration) else null;
+    }
+    if (timestamps) if (wire.segments) |segments| {
+        const output = try a.alloc(Segment, segments.len);
+        @memset(output, .{});
+        response.segments = output;
+        for (segments, output) |segment, *out| {
+            const start = try cloudflareTimestamp(segment.start orelse return error.InvalidCloudflareResponse);
+            const end = try cloudflareTimestamp(segment.end orelse return error.InvalidCloudflareResponse);
+            if (end < start) return error.InvalidCloudflareResponse;
+            out.* = .{ .start_ms = start, .end_ms = end };
+            out.text = try dupOpt(a, segment.text);
+            if (segment.words) |words| {
+                const items = try a.alloc(WordTimestamp, words.len);
+                @memset(items, .{});
+                out.words = items;
+                for (words, items) |word, *item| {
+                    const word_start = try cloudflareTimestamp(word.start orelse return error.InvalidCloudflareResponse);
+                    const word_end = try cloudflareTimestamp(word.end orelse return error.InvalidCloudflareResponse);
+                    if (word_end < word_start or word_start < start or word_end > end) return error.InvalidCloudflareResponse;
+                    item.* = .{ .start_ms = word_start, .end_ms = word_end };
+                    item.word = try dupOpt(a, word.word);
+                }
+            }
+        }
+    };
+    return response;
+}
+
+pub fn testCloudflareTranscription() !void {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"text":"hello","transcription_info":{"language":"en","duration":1},"segments":[{"start":0,"end":1,"text":"hello","words":[{"word":"hello","start":0.1,"end":0.9}]}]}
+    , .{});
+    defer parsed.deinit();
+    var response = try cloudflareTranscript(a, parsed.value, true);
+    defer deinitResponse(a, &response);
+    try std.testing.expectEqualStrings("en", response.language.?);
+    try std.testing.expectEqual(@as(i64, 1000), response.duration_ms.?);
+    try std.testing.expectEqual(@as(i64, 100), response.segments.?[0].words.?[0].start_ms.?);
+    try std.testing.expectError(error.InvalidCloudflareResponse, cloudflareTimestamp(std.math.inf(f64)));
+    try std.testing.expectError(error.InvalidCloudflareResponse, cloudflareTimestamp(-1));
 }
 
 const OpenAiTranscriberState = struct {

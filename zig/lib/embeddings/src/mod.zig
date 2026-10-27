@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const cloudflare = @import("antfly_cloudflare_config");
 const json = @import("antfly-json");
 const openapi = @import("antfly_embeddings_openapi");
 
@@ -42,7 +43,7 @@ fn retrievalCapabilities(provider: Provider, model: []const u8, request_format: 
         else
             .{},
         .antfly => .{ .query_instruction = true },
-        .openai, .openrouter, .ollama => .{},
+        .cloudflare, .openai, .openrouter, .ollama => .{},
     };
 }
 
@@ -101,6 +102,8 @@ pub const Inputs = struct {
 };
 
 pub const Config = struct {
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     sparse: ?bool = null,
     rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,
@@ -128,35 +131,27 @@ pub const Config = struct {
     /// discover yet.
     inputs: ?Inputs = null,
 
-    pub fn clone(self: Config, alloc: Allocator) !Config {
-        return .{
-            .rate_limit = self.rate_limit,
-            .sparse = self.sparse,
-            .provider = self.provider,
-            .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
-            .model_identity = if (self.model_identity.len > 0) try alloc.dupe(u8, self.model_identity) else "",
-            .request_format = if (self.request_format.len > 0) try alloc.dupe(u8, self.request_format) else "",
-            .task_encoding = if (self.task_encoding.len > 0) try alloc.dupe(u8, self.task_encoding) else "",
-            .url = if (self.url.len > 0) try alloc.dupe(u8, self.url) else "",
-            .api_key = if (self.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
-            .project_id = if (self.project_id.len > 0) try alloc.dupe(u8, self.project_id) else "",
-            .location = if (self.location.len > 0) try alloc.dupe(u8, self.location) else "",
-            .credentials_path = if (self.credentials_path.len > 0) try alloc.dupe(u8, self.credentials_path) else "",
-            .region = if (self.region.len > 0) try alloc.dupe(u8, self.region) else "",
-            .dimension = self.dimension,
-            .dimensions = self.dimensions,
-            .input_type = if (self.input_type.len > 0) try alloc.dupe(u8, self.input_type) else "",
-            .query_input_type = if (self.query_input_type.len > 0) try alloc.dupe(u8, self.query_input_type) else "",
-            .document_input_type = if (self.document_input_type.len > 0) try alloc.dupe(u8, self.document_input_type) else "",
-            .query_instruction = if (self.query_instruction.len > 0) try alloc.dupe(u8, self.query_instruction) else "",
-            .truncate = if (self.truncate.len > 0) try alloc.dupe(u8, self.truncate) else "",
-            .batch_size = self.batch_size,
-            .strip_new_lines = self.strip_new_lines,
-            .inputs = self.inputs,
-        };
+    pub fn clone(self: Config, alloc: std.mem.Allocator) !Config {
+        var result = self;
+        inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |name, T| {
+            if (T == []const u8) @field(result, name) = "";
+            if (T == ?[]const u8) @field(result, name) = null;
+        }
+        errdefer result.deinit(alloc);
+        inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |name, T| {
+            if (T == []const u8) {
+                if (@field(self, name).len > 0) @field(result, name) = try alloc.dupe(u8, @field(self, name));
+            }
+            if (T == ?[]const u8) if (@field(self, name)) |value| {
+                @field(result, name) = try alloc.dupe(u8, value);
+            };
+        }
+        return result;
     }
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
+        if (self.account_id) |v| alloc.free(v);
+        if (self.gateway_id) |v| alloc.free(v);
         if (self.model.len > 0) alloc.free(self.model);
         if (self.model_identity.len > 0) alloc.free(self.model_identity);
         if (self.request_format.len > 0) alloc.free(self.request_format);
@@ -176,6 +171,12 @@ pub const Config = struct {
     }
 
     pub fn validate(self: Config) !void {
+        if (self.provider == .cloudflare and (self.sparse orelse false)) return error.InvalidEmbedderConfig;
+        if (self.provider == .cloudflare) {
+            try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
+            try cloudflare.modelId(self.model);
+            if (self.gateway_id) |id| try cloudflare.identifier(id);
+        } else if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
         if (self.model_identity.len > 0) {
             if (self.provider != .antfly or self.model_identity.len != 64) return error.InvalidEmbedderConfig;
             for (self.model_identity) |c| if (!(c >= '0' and c <= '9') and !(c >= 'a' and c <= 'f')) return error.InvalidEmbedderConfig;
@@ -291,25 +292,27 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
         if (retrieval) |value| value.query_instruction else null,
         generated.query_instruction,
     );
-    var cfg = Config{
+    const cfg = Config{
         .rate_limit = generated.rate_limit,
         .sparse = generated.sparse,
         .provider = std.meta.stringToEnum(Provider, provider_name) orelse return error.InvalidEmbedderConfig,
-        .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
-        .model_identity = if (generated.model_identity) |identity| try alloc.dupe(u8, identity) else "",
-        .request_format = if (generated.request_format) |request_format| try alloc.dupe(u8, request_format) else "",
-        .task_encoding = if (generated.task_encoding) |value| try alloc.dupe(u8, value) else "",
+        .account_id = if (generated.account_id) |v| v else null,
+        .gateway_id = if (generated.gateway_id) |v| v else null,
+        .model = if (generated.model) |model| model else "",
+        .model_identity = if (generated.model_identity) |identity| identity else "",
+        .request_format = if (generated.request_format) |request_format| request_format else "",
+        .task_encoding = if (generated.task_encoding) |value| value else "",
         .url = if (generated.url) |url|
-            try alloc.dupe(u8, url)
+            url
         else if (generated.api_url) |api_url|
-            try alloc.dupe(u8, api_url)
+            api_url
         else
             "",
-        .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
-        .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else "",
-        .location = if (generated.location) |location| try alloc.dupe(u8, location) else "",
-        .credentials_path = if (generated.credentials_path) |credentials_path| try alloc.dupe(u8, credentials_path) else "",
-        .region = if (generated.region) |region| try alloc.dupe(u8, region) else "",
+        .api_key = if (generated.api_key) |api_key| api_key else null,
+        .project_id = if (generated.project_id) |project_id| project_id else "",
+        .location = if (generated.location) |location| location else "",
+        .credentials_path = if (generated.credentials_path) |credentials_path| credentials_path else "",
+        .region = if (generated.region) |region| region else "",
         .dimension = if (generated.dimension) |dimension|
             std.math.cast(u32, dimension) orelse return error.InvalidEmbedderConfig
         else
@@ -318,11 +321,11 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
             std.math.cast(u32, dimensions) orelse return error.InvalidEmbedderConfig
         else
             null,
-        .input_type = if (generated.input_type) |input_type| try alloc.dupe(u8, input_type) else "",
-        .query_input_type = if (query_input_type) |value| try alloc.dupe(u8, value) else "",
-        .document_input_type = if (document_input_type) |value| try alloc.dupe(u8, value) else "",
-        .query_instruction = if (query_instruction) |value| try alloc.dupe(u8, value) else "",
-        .truncate = if (generated.truncate) |truncate| try alloc.dupe(u8, truncate) else "",
+        .input_type = if (generated.input_type) |input_type| input_type else "",
+        .query_input_type = if (query_input_type) |value| value else "",
+        .document_input_type = if (document_input_type) |value| value else "",
+        .query_instruction = if (query_instruction) |value| value else "",
+        .truncate = if (generated.truncate) |truncate| truncate else "",
         .batch_size = if (generated.batch_size) |batch_size|
             std.math.cast(u32, batch_size) orelse return error.InvalidEmbedderConfig
         else
@@ -330,14 +333,15 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
         .strip_new_lines = generated.strip_new_lines,
         .inputs = if (generated.inputs) |input_names| try Inputs.fromNames(input_names) else null,
     };
-    errdefer cfg.deinit(alloc);
     try cfg.validate();
-    return cfg;
+    return cfg.clone(alloc);
 }
 
 pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
     return .{
         .rate_limit = cfg.rate_limit,
+        .account_id = cfg.account_id,
+        .gateway_id = cfg.gateway_id,
         .sparse = cfg.sparse,
         .provider = @tagName(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,

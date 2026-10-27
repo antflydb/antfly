@@ -1,5 +1,14 @@
 import type { components } from "../src/public-api.js";
 
+for (const dimensions of [384, 1024, 65535]) {
+  const decider: components["schemas"]["DeciderConfig"] = {
+    decision_method: "embedding_similarity",
+    embedder: "dense",
+    embedding_options: { dimensions },
+  };
+  void decider;
+}
+
 const group: components["schemas"]["InferenceEmbedRequest"] = {
   model: "embeddinggemma2",
   model_identity: "a".repeat(64),

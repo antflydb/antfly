@@ -10,6 +10,7 @@ components:
     EmbedderProvider:
       type: string
       enum:
+        - cloudflare
         - gemini
         - vertex
         - ollama
@@ -19,6 +20,39 @@ components:
         - cohere
         - antfly
       description: "The embedding provider to use."
+
+    CloudflareEmbedderConfig:
+      type: object
+      description: Cloudflare Workers AI embedding. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum: [cloudflare]
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: "@cf/baai/bge-base-en-v1.5"
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+        dimensions:
+          type: integer
+          minimum: 1
+          description: Expected fixed model output dimension; the adapter validates returned vectors and never requests unsupported resizing.
+        dimension:
+          type: integer
+          minimum: 1
+          description: Alias of dimensions.
+      required: [provider, account_id, model]
 
     GoogleEmbedderConfig:
       type: object
@@ -456,6 +490,7 @@ components:
         canonical provider configurations; it does not define a second provider
         namespace.
       oneOf:
+        - $ref: "#/components/schemas/CloudflareEmbedderConfig"
         - $ref: "#/components/schemas/OllamaEmbedderConfig"
         - $ref: "#/components/schemas/OpenAIEmbedderConfig"
         - $ref: "#/components/schemas/OpenRouterEmbedderConfig"
@@ -467,6 +502,7 @@ components:
       discriminator:
         propertyName: provider
         mapping:
+          cloudflare: "#/components/schemas/CloudflareEmbedderConfig"
           ollama: "#/components/schemas/OllamaEmbedderConfig"
           openai: "#/components/schemas/OpenAIEmbedderConfig"
           openrouter: "#/components/schemas/OpenRouterEmbedderConfig"
@@ -612,6 +648,7 @@ components:
         - Batch processing embeddings offline before ingestion
       allOf:
         - oneOf:
+            - $ref: "#/components/schemas/CloudflareEmbedderConfig"
             - $ref: "#/components/schemas/GoogleEmbedderConfig"
             - $ref: "#/components/schemas/VertexEmbedderConfig"
             - $ref: "#/components/schemas/OllamaEmbedderConfig"

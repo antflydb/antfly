@@ -1,0 +1,13 @@
+{
+  "source_commit": "47ccdc89adaba10bb65068f4949c653b2917ad18",
+  "source_tree": "73248b6631ffec83d9708a00e039ec249024d1bf",
+  "archive": "lightonocr3-history-47ccdc89ad.tar.gz",
+  "archive_sha256": "776cec6787d08a8d32c84483467cfc6c11564ef45fca0df1377f6a246619ca07",
+  "archive_bytes": 74763747,
+  "file_count": 9197,
+  "uncompressed_file_bytes": 130080074,
+  "verification": "Every archived regular file compared byte-for-byte with the tracked checkout; git archive preserves original repository paths.",
+  "uri": "gs://antfly-image-artifacts-zig-build-artifacts/benchmarks/lightonocr3/47ccdc89adaba10bb65068f4949c653b2917ad18/776cec6787d08a8d32c84483467cfc6c11564ef45fca0df1377f6a246619ca07/lightonocr3-history.tar.gz",
+  "generation": "1793049388086202",
+  "archive_branch": "archive/lightonocr3-experiments-47ccdc89ad"
+}

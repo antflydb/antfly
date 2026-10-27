@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const cloudflare = @import("antfly_cloudflare_config");
 
 const Allocator = std.mem.Allocator;
 
@@ -39,12 +40,14 @@ test "native reader batch policy defaults and clamps" {
 pub const Provider = enum {
     antfly,
     openai,
+    cloudflare,
     vertex,
     apple,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.write(switch (self) {
             .antfly => "antfly",
+            .cloudflare => "cloudflare",
             .openai => "openai",
             .vertex => "vertex",
             .apple => "apple",
@@ -57,6 +60,7 @@ pub const Provider = enum {
             else => return error.UnexpectedToken,
         };
         if (std.mem.eql(u8, raw, "antfly")) return .antfly;
+        if (std.mem.eql(u8, raw, "cloudflare")) return .cloudflare;
         if (std.mem.eql(u8, raw, "openai")) return .openai;
         if (std.mem.eql(u8, raw, "vertex")) return .vertex;
         if (std.mem.eql(u8, raw, "apple")) return .apple;
@@ -65,6 +69,8 @@ pub const Provider = enum {
 };
 
 pub const Config = struct {
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     provider: Provider,
     model: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
@@ -84,6 +90,11 @@ pub const Config = struct {
     uses_language_correction: bool = false,
 
     pub fn validate(self: Config) !void {
+        if (self.provider == .cloudflare) {
+            try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
+            try cloudflare.modelId(self.model orelse return error.UnsupportedCloudflareModel);
+            if (self.gateway_id) |id| try cloudflare.identifier(id);
+        } else if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
         if (self.provider == .antfly) {
             const model = self.model orelse return error.InvalidReaderConfig;
             if (std.mem.trim(u8, model, " \t\r\n").len == 0)

@@ -297,6 +297,7 @@ pub fn addOpenApiSourceSteps(
             .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
             .{ "../ai/decision.yaml", "antfly_decision_openapi" },
         }),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/cloudflare-openapi.json"), "cloudflare_api", antfly_generated_root ++ "/cloudflare_api", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
         .{
             .directory = openapi_build.addGeneratedDirectory(b, .{

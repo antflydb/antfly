@@ -13,6 +13,7 @@ pub const ChatGPTGeneratorConfig = types.ChatGPTGeneratorConfig;
 pub const ChatMessage = types.ChatMessage;
 pub const ChatMessageContent = types.ChatMessageContent;
 pub const ChatMessageRole = types.ChatMessageRole;
+pub const CloudflareGeneratorConfig = types.CloudflareGeneratorConfig;
 pub const CohereGeneratorConfig = types.CohereGeneratorConfig;
 pub const ConstrainedGenerationBatch = types.ConstrainedGenerationBatch;
 pub const ConstrainedGeneratorProducerConfig = types.ConstrainedGeneratorProducerConfig;

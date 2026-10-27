@@ -10,10 +10,36 @@ components:
     RerankerProvider:
       type: string
       enum:
+        - cloudflare
         - antfly
         - cohere
         - vertex
       description: "The reranking provider to use."
+
+    CloudflareRerankerConfig:
+      type: object
+      description: Cloudflare Workers AI reranking. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum: [cloudflare]
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: "@cf/baai/bge-reranker-base"
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+      required: [provider, account_id, model]
 
     AntflyRerankerConfig:
       type: object
@@ -111,12 +137,17 @@ components:
       discriminator:
         propertyName: provider
         mapping:
+          cloudflare: "#/components/schemas/CloudflareRerankerConfig"
           antfly: "#/components/schemas/AntflyRerankerConfig"
           cohere: "#/components/schemas/CohereRerankerConfig"
           vertex: "#/components/schemas/VertexRerankerConfig"
       allOf:
         - type: object
           properties:
+            account_id:
+              type: string
+            gateway_id:
+              type: string
             rate_limit:
               x-go-type-skip-optional-pointer: false
               $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
@@ -147,6 +178,7 @@ components:
           required:
             - provider
         - oneOf:
+            - $ref: "#/components/schemas/CloudflareRerankerConfig"
             - $ref: "#/components/schemas/AntflyRerankerConfig"
             - $ref: "#/components/schemas/CohereRerankerConfig"
             - $ref: "#/components/schemas/VertexRerankerConfig"

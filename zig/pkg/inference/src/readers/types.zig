@@ -53,6 +53,8 @@ pub const Region = struct {
 };
 
 pub const Result = struct {
+    completion: @import("antfly_readers").Completion = .complete,
+    completion_tokens: ?usize = null,
     text: []const u8,
     fields: []Field = &.{},
     regions: []Region = &.{},

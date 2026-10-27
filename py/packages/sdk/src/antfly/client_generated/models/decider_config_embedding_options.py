@@ -5,7 +5,6 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
-from ..models.decider_config_embedding_options_dimensions import DeciderConfigEmbeddingOptionsDimensions
 from ..models.decider_config_embedding_options_task_type import DeciderConfigEmbeddingOptionsTaskType
 from ..types import UNSET, Unset
 
@@ -14,8 +13,10 @@ T = TypeVar("T", bound="DeciderConfigEmbeddingOptions")
 
 @_attrs_define
 class DeciderConfigEmbeddingOptions:
-    """EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden
-    per question. Other models reject these options. Raw cosine similarities never represent probabilities.
+    """Geometry and acceptance defaults for embedding_similarity decisions. Named embedders require dimensions matching
+    their configured dense output. Direct Antfly model routes support EmbeddingGemma 2 dimensions and fitted
+    calibrations. Acceptance is serialized onto each question and can be overridden per question. Raw cosine
+    similarities never represent probabilities.
 
         Attributes:
             calibration_id (str | Unset): Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the
@@ -23,15 +24,15 @@ class DeciderConfigEmbeddingOptions:
                 thresholds. Does not produce probabilities.
             task_type (DeciderConfigEmbeddingOptionsTaskType | Unset):  Default:
                 DeciderConfigEmbeddingOptionsTaskType.CLUSTERING.
-            dimensions (DeciderConfigEmbeddingOptionsDimensions | Unset):  Default:
-                DeciderConfigEmbeddingOptionsDimensions.VALUE_768.
+            dimensions (int | Unset): Must match the named embedder's configured dimensions. Without embedder, the direct
+                EmbeddingGemma 2 route accepts only 768, 512, 256 or 128. Default: 768.
             min_similarity (float | Unset):
             min_margin (float | Unset):
     """
 
     calibration_id: str | Unset = UNSET
     task_type: DeciderConfigEmbeddingOptionsTaskType | Unset = DeciderConfigEmbeddingOptionsTaskType.CLUSTERING
-    dimensions: DeciderConfigEmbeddingOptionsDimensions | Unset = DeciderConfigEmbeddingOptionsDimensions.VALUE_768
+    dimensions: int | Unset = 768
     min_similarity: float | Unset = UNSET
     min_margin: float | Unset = UNSET
 
@@ -42,9 +43,7 @@ class DeciderConfigEmbeddingOptions:
         if not isinstance(self.task_type, Unset):
             task_type = self.task_type.value
 
-        dimensions: int | Unset = UNSET
-        if not isinstance(self.dimensions, Unset):
-            dimensions = self.dimensions.value
+        dimensions = self.dimensions
 
         min_similarity = self.min_similarity
 
@@ -78,12 +77,7 @@ class DeciderConfigEmbeddingOptions:
         else:
             task_type = DeciderConfigEmbeddingOptionsTaskType(_task_type)
 
-        _dimensions = d.pop("dimensions", UNSET)
-        dimensions: DeciderConfigEmbeddingOptionsDimensions | Unset
-        if isinstance(_dimensions, Unset):
-            dimensions = UNSET
-        else:
-            dimensions = DeciderConfigEmbeddingOptionsDimensions(_dimensions)
+        dimensions = d.pop("dimensions", UNSET)
 
         min_similarity = d.pop("min_similarity", UNSET)
 
