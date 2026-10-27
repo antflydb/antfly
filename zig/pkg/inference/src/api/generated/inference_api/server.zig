@@ -161,6 +161,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/embed", .operation_id = "generateEmbeddings", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/extract", .operation_id = "extract", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/extract/execute", .operation_id = "executeExtractDocumentRemote", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/generate", .operation_id = "generateContent", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/generate/batch", .operation_id = "generateBatchContent", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/generate/context/checkpoint", .operation_id = "prepareNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
@@ -173,6 +174,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/predict", .operation_id = "predict", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/predictors", .operation_id = "listPredictors", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/read", .operation_id = "readImages", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/read/execute", .operation_id = "executeReadDocumentRemote", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/rerank", .operation_id = "rerankDocuments", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/rewrite", .operation_id = "rewriteText", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transcribe", .operation_id = "transcribeAudio", .request_body = .buffered, .streaming_response = false },
@@ -202,6 +204,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "generateEmbeddings")) @compileError("ServerRouter: Impl missing required method 'generateEmbeddings'");
         if (!@hasDecl(Impl, "createEmbedding")) @compileError("ServerRouter: Impl missing required method 'createEmbedding'");
         if (!@hasDecl(Impl, "extract")) @compileError("ServerRouter: Impl missing required method 'extract'");
+        if (!@hasDecl(Impl, "executeExtractDocumentRemote")) @compileError("ServerRouter: Impl missing required method 'executeExtractDocumentRemote'");
         if (!@hasDecl(Impl, "generateContent")) @compileError("ServerRouter: Impl missing required method 'generateContent'");
         if (!@hasDecl(Impl, "generateBatchContent")) @compileError("ServerRouter: Impl missing required method 'generateBatchContent'");
         if (!@hasDecl(Impl, "prepareNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'prepareNativeKvCheckpoint'");
@@ -214,6 +217,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "predict")) @compileError("ServerRouter: Impl missing required method 'predict'");
         if (!@hasDecl(Impl, "listPredictors")) @compileError("ServerRouter: Impl missing required method 'listPredictors'");
         if (!@hasDecl(Impl, "readImages")) @compileError("ServerRouter: Impl missing required method 'readImages'");
+        if (!@hasDecl(Impl, "executeReadDocumentRemote")) @compileError("ServerRouter: Impl missing required method 'executeReadDocumentRemote'");
         if (!@hasDecl(Impl, "rerankDocuments")) @compileError("ServerRouter: Impl missing required method 'rerankDocuments'");
         if (!@hasDecl(Impl, "rewriteText")) @compileError("ServerRouter: Impl missing required method 'rewriteText'");
         if (!@hasDecl(Impl, "transcribeAudio")) @compileError("ServerRouter: Impl missing required method 'transcribeAudio'");
@@ -241,6 +245,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/embed", httpx.Handler.bind(self.impl, generateEmbeddings));
             try server.post("/embeddings", httpx.Handler.bind(self.impl, createEmbedding));
             try server.post("/extract", httpx.Handler.bind(self.impl, extract));
+            try server.post("/extract/execute", httpx.Handler.bind(self.impl, executeExtractDocumentRemote));
             try server.post("/generate", httpx.Handler.bind(self.impl, generateContent));
             try server.post("/generate/batch", httpx.Handler.bind(self.impl, generateBatchContent));
             try server.post("/generate/context/checkpoint", httpx.Handler.bind(self.impl, prepareNativeKvCheckpoint));
@@ -253,6 +258,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/predict", httpx.Handler.bind(self.impl, predict));
             try server.get("/predictors", httpx.Handler.bind(self.impl, listPredictors));
             try server.post("/read", httpx.Handler.bind(self.impl, readImages));
+            try server.post("/read/execute", httpx.Handler.bind(self.impl, executeReadDocumentRemote));
             try server.post("/rerank", httpx.Handler.bind(self.impl, rerankDocuments));
             try server.post("/rewrite", httpx.Handler.bind(self.impl, rewriteText));
             try server.post("/transcribe", httpx.Handler.bind(self.impl, transcribeAudio));
@@ -304,6 +310,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /extract
         fn extract(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.extract(ctx);
+        }
+
+        /// Execute a durable document task over a duplex persistence channel
+        /// POST /extract/execute
+        fn executeExtractDocumentRemote(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.executeExtractDocumentRemote(ctx);
         }
 
         /// Generate text using LLM (OpenAI-compatible)
@@ -377,6 +389,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /read
         fn readImages(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.readImages(ctx);
+        }
+
+        /// Execute a durable document task over a duplex persistence channel
+        /// POST /read/execute
+        fn executeReadDocumentRemote(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.executeReadDocumentRemote(ctx);
         }
 
         /// Rerank documents by relevance
@@ -454,6 +472,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn generateEmbeddings(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createEmbedding(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn extract(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn executeExtractDocumentRemote(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateContent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateBatchContent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn prepareNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
@@ -466,6 +485,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn predict(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listPredictors(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn readImages(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn executeReadDocumentRemote(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn rerankDocuments(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn rewriteText(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn transcribeAudio(self: *Impl, ctx: *httpx.Context) !httpx.Response

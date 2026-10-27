@@ -6,21 +6,14 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="InferenceReadResultFields")
+T = TypeVar("T", bound="InferenceReadResultInheritedPartsItem")
 
 
 @_attrs_define
-class InferenceReadResultFields:
-    """Structured fields extracted by document understanding models (Donut, Florence-2).
-    Fields are flattened with dot notation for nested structures.
-    Only present for models that output structured data.
+class InferenceReadResultInheritedPartsItem:
+    """ """
 
-        Example:
-            {'menu.nm': 'Coffee', 'menu.price': '$3.50', 'total': '$123.45'}
-
-    """
-
-    additional_properties: dict[str, str] = _attrs_field(init=False, factory=dict)
+    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
 
@@ -32,19 +25,19 @@ class InferenceReadResultFields:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        inference_read_result_fields = cls()
+        inference_read_result_inherited_parts_item = cls()
 
-        inference_read_result_fields.additional_properties = d
-        return inference_read_result_fields
+        inference_read_result_inherited_parts_item.additional_properties = d
+        return inference_read_result_inherited_parts_item
 
     @property
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> str:
+    def __getitem__(self, key: str) -> Any:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: str) -> None:
+    def __setitem__(self, key: str, value: Any) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:

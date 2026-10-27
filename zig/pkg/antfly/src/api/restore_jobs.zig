@@ -195,7 +195,9 @@ pub const ReplicatedPersistence = extern struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    pub const abi_version: u32 = 5;
+    job_state: @import("../metadata/job_state.zig").Persistence = .disabled(),
+
+    pub const abi_version: u32 = 6;
 
     pub const OwnedRow = struct { key: []u8, value: []u8 };
     pub const AbiRow = extern struct {
@@ -255,6 +257,7 @@ pub const ReplicatedPersistence = extern struct {
         ) callconv(.c) runtime_error_abi.Status,
     };
     pub const LocalVTable = struct {
+        job_state: ?@import("../metadata/job_state.zig").Persistence.Local = null,
         create_with_staging: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) anyerror![]u8 = null,
         delete_matching: ?*const fn (ptr: *anyopaque, key: []const u8, value_hash: []const u8, leadership_term: u64) anyerror!bool = null,
         create: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, leadership_term: u64) anyerror![]u8 = null,
@@ -271,7 +274,7 @@ pub const ReplicatedPersistence = extern struct {
     };
 
     pub fn fromLocal(ptr: *anyopaque, comptime local: LocalVTable) ReplicatedPersistence {
-        return .{ .ptr = ptr, .vtable = &LocalAdapter(local).vtable };
+        return .{ .ptr = ptr, .vtable = &LocalAdapter(local).vtable, .job_state = if (local.job_state) |state| @import("../metadata/job_state.zig").Persistence.fromLocal(ptr, state) else .disabled() };
     }
 
     fn LocalAdapter(comptime local: LocalVTable) type {

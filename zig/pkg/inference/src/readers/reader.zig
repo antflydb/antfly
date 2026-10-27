@@ -124,7 +124,10 @@ const VisionLoadedReader = struct {
         var raw = try self.core.readRaw(image_data, forwarded);
         defer raw.deinit();
 
-        return parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
+        var parsed = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
+        parsed.completion = raw.completion;
+        parsed.completion_tokens = raw.completion_tokens;
+        return parsed;
     }
 
     pub fn readBatch(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
@@ -177,6 +180,8 @@ const VisionLoadedReader = struct {
 
         for (raw_results, 0..) |raw, i| {
             out[i] = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
+            out[i].completion = raw.completion;
+            out[i].completion_tokens = raw.completion_tokens;
             filled += 1;
         }
         return .{
@@ -254,7 +259,10 @@ const NativeMoondreamLoadedReader = struct {
     pub fn read(self: *NativeMoondreamLoadedReader, image_data: []const u8, options: ReadOptions) !Result {
         var raw = try self.core.readRaw(image_data, options);
         defer raw.deinit();
-        return parseOutput(self.allocator, .moondream, raw.text, options.prompt);
+        var parsed = try parseOutput(self.allocator, .moondream, raw.text, options.prompt);
+        parsed.completion = if (std.mem.eql(u8, raw.finish_reason, "length")) .length else .complete;
+        parsed.completion_tokens = raw.tokens_used;
+        return parsed;
     }
 
     pub fn readBatch(self: *NativeMoondreamLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
