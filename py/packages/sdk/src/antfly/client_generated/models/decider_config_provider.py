@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class DeciderConfigProvider(StrEnum):
     ANTFLY = "antfly"
+    CLOUDFLARE = "cloudflare"
     JEV = "jev"
     OPENAI = "openai"
 

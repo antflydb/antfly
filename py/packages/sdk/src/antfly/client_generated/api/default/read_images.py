@@ -148,7 +148,8 @@ def sync_detailed(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest):
+        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
+            absent or simultaneous input forms before inference.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -221,7 +222,8 @@ def sync(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest):
+        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
+            absent or simultaneous input forms before inference.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -289,7 +291,8 @@ async def asyncio_detailed(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest):
+        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
+            absent or simultaneous input forms before inference.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -360,7 +363,8 @@ async def asyncio(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest):
+        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
+            absent or simultaneous input forms before inference.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
