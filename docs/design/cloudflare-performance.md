@@ -1243,3 +1243,26 @@ Diagnostic coverage records fixed disconnect reasons and WebSocket close codes.
 Heartbeat checks use monotonic elapsed time and the pinned Wrangler's ten-second
 ping payload. A lost connection remains a failed population; reconnecting cannot
 repair it. Progress checkpoints fail promptly on observed diagnostic gaps.
+
+A longer idle probe reproduces an abnormal `1006` close after seven minutes,
+without a heartbeat timeout. Persisted-log API access returns `403` with the
+current account credential. Qualification therefore maintains two independently
+created provider tail sessions per logical service, repairing a disconnected
+replica against its existing session URL. At least one connection must remain
+continuously healthy. Losing both is a permanent coverage failure, even after
+repair; truncation, unsettled native I/O, journal errors and resource signals
+also remain unconditional failures. This provides overlap rather than inferring
+that a reconnect recovered missed events.
+
+There are sixteen physical sessions per pair and eight logical journals. The
+journals retain a numeric replica index and may contain duplicate events;
+diagnostic event counts are not request or billing counts. Both replicas share
+the existing 4 MiB pending-write bound per logical stream and the final 256 MiB
+journal ceiling. Finalization stops repair timers, terminates sockets and deletes
+only the sixteen exact session IDs created by that execution. Tests exercise
+single-replica repair, complete coverage loss, late failure retention, bounded
+sanitization, journal hashes and exact owned-session cleanup.
+
+The gate checks coverage once per second during preparation as well as the
+measured workload and recovery. A permanent gap cancels both clients and joins
+outstanding calls, rather than continuing a seed that can no longer qualify.

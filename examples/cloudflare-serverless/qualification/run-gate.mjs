@@ -32,7 +32,7 @@ for(const side of[baseline,candidate])assertUnusedRecovery(side.run);
 const executionId=crypto.randomUUID();baseline.executionId=executionId;candidate.executionId=executionId;
 const resumePath=process.argv.find(v=>v.startsWith('--resume-setup='))?.slice(15);
 const resumedSeedExecutionId=resumePath?resumeSeedExecution(JSON.parse(await readFile(resumePath)),baseline.run,candidate.run):null;
-let offered=0,fatal,workload,diagnostics,diagnosticReport,evidenceSummary={};
+let offered=0,fatal,workload,diagnostics,diagnosticReport,diagnosticGuard,evidenceSummary={};
 for(const signal of['SIGTERM','SIGINT'])process.once(signal,()=>{baseline.stop(Error('QualificationInterrupted'));candidate.stop(Error('QualificationInterrupted'));});
 const report=()=>({schema:1,execution_id:executionId,resumed_seed_execution_id:resumedSeedExecutionId,trial,documents,offered_period_ms:period,soak_ms:offered,workload,diagnostics:diagnosticReport??diagnostics?.report(),...evidenceSummary,baseline:baseline.report(),candidate:candidate.report(),fatal,limitations:['Fresh physical actors do not prove complete platform isolate eviction.','Live R2 attempts and sampled memory are not billing or absolute memory peaks.']});
 async function save(){const data=report();data.evaluation=evaluateTrial(data);await writeFile(output+'.tmp',JSON.stringify(data,null,2));await rename(output+'.tmp',output);}
@@ -49,6 +49,7 @@ async function lifecycle(action,id){await new Promise((resolve,reject)=>{const c
 try{
  for(const side of[baseline,candidate])if(side.run.paused)await lifecycle('resume',side.run.id);
  diagnostics=await startLiveDiagnostics([baseline.run,candidate.run],executionId,gate.dir);
+ diagnosticGuard=setInterval(()=>{try{diagnostics.assertClean();}catch(error){baseline.stop(error);candidate.stop(error);}},1000);
  await markPhase('setup');
  console.log('seeding',trial);await runPairedPhase([baseline,candidate],side=>side.seed(documents,{executionId:resumedSeedExecutionId??executionId}));console.log('seeded',trial);
  await markPhase('workload');
@@ -66,5 +67,6 @@ try{
   await candidate.verify(documents);
  }
 }catch(error){fatal=String(error);console.error('gate trial failed',trial,fatal);}
+clearInterval(diagnosticGuard);
 if(diagnostics)try{diagnosticReport=await diagnostics.finish();if(!diagnosticReport.passed)fatal??='LiveResourceDiagnosticsFailed';}catch{fatal??='LiveResourceDiagnosticFinalizationFailed';}
 await save();await writeFile(resolve(gate.dir,'trial-'+trial+'-'+executionId+'.json'),JSON.stringify(report(),null,2));console.log('saved',output,JSON.stringify(evaluateTrial(report())));if(fatal)process.exitCode=1;

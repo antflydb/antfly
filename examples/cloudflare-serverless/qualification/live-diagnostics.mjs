@@ -26,9 +26,10 @@ import{assertGateRun}from'./gate-scope.mjs';
 import{resourceFailureCode}from'../performance.mjs';
 const roles=['app','writer','reader','builder'];
 export class DiagnosticCoverage{
- constructor(runs){this.streams=runs.flatMap(run=>roles.map(role=>({run:run.id,role,connected:false,gap:false,events:0,resource_failures:0,gap_reasons:{}})));}
+ constructor(runs){this.streams=runs.flatMap(run=>roles.map(role=>({run:run.id,role,connected:false,active_connections:0,replica_disconnects:0,gap:false,events:0,resource_failures:0,gap_reasons:{}})));}
  stream(run,role){const row=this.streams.find(s=>s.run===run&&s.role===role);if(!row)throw Error('UnknownDiagnosticStream');return row;}
- connected(run,role){this.stream(run,role).connected=true;}
+ connected(run,role){const row=this.stream(run,role);row.connected=true;row.active_connections++;}
+ disconnected(run,role,reason,code){const row=this.stream(run,role);if(row.active_connections<1)throw Error('DiagnosticConnectionUnderflow');row.active_connections--;row.replica_disconnects++;if(Number.isInteger(code))row.last_close_code=code;if(row.active_connections===0)this.lost(run,role,reason,code);}
  lost(run,role,reason='connection_closed',code){const row=this.stream(run,role);row.gap=true;row.gap_reasons[reason]=(row.gap_reasons[reason]??0)+1;if(Number.isInteger(code))row.last_close_code=code;}
  observe(run,role,event){
   const row=this.stream(run,role);row.events++;if(event.truncated===true)this.lost(run,role,'log_truncated');
@@ -51,48 +52,61 @@ async function accountToken(){
   child.on('error',()=>bad(Error('DiagnosticCredentialLookupFailed')));child.on('exit',code=>{if(code!==0)return bad(Error('DiagnosticCredentialLookupFailed'));try{const auth=JSON.parse(text);if(!['oauth','api_token'].includes(auth.type)||typeof auth.token!=='string')throw Error();ok(auth.token);}catch{bad(Error('DiagnosticCredentialResponseInvalid'));}});
  });
 }
-export async function startLiveDiagnostics(runs,executionId,dir){
+export async function startLiveDiagnostics(runs,executionId,dir,{authenticate=accountToken,fetch:fetchImpl=fetch,Socket=WebSocket}={}){
  if(runs.length!==2||runs[0].id===runs[1].id||runs[0].account!==runs[1].account||!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(executionId))throw Error('DiagnosticScopeMismatch');
  for(const run of runs)assertGateRun(run);
- const token=await accountToken(),coverage=new DiagnosticCoverage(runs),sessions=[],directory=resolve(dir,'diagnostics-'+executionId);let closing=false;
+ const token=await authenticate(),coverage=new DiagnosticCoverage(runs),sessions=[],journals=[],directory=resolve(dir,'diagnostics-'+executionId);let closing=false;
  await mkdir(directory,{recursive:false});
  async function api(run,path,method,body){
-  const response=await fetch('https://api.cloudflare.com/client/v4/accounts/'+run.account+'/workers/scripts/'+encodeURIComponent(run.id+(path.role==='app'?'':'-'+path.role))+'/tails'+(path.id?'/'+encodeURIComponent(path.id):''),{method,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{}),signal:AbortSignal.timeout(30000)});
+  const response=await fetchImpl('https://api.cloudflare.com/client/v4/accounts/'+run.account+'/workers/scripts/'+encodeURIComponent(run.id+(path.role==='app'?'':'-'+path.role))+'/tails'+(path.id?'/'+encodeURIComponent(path.id):''),{method,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{}),signal:AbortSignal.timeout(30000)});
   let value;try{value=await response.json();}catch{throw Error('DiagnosticApiMalformed');}if(!response.ok||value.success!==true)throw Error('DiagnosticApiFailedStatus'+response.status);return value.result;
  }
  async function close(){
   closing=true;const errors=[];
   await Promise.all(sessions.map(async s=>{
-   clearInterval(s.ping);
+   clearInterval(s.ping);clearTimeout(s.reconnectTimer);
    if(s.socket&&s.socket.readyState!==WebSocket.CLOSED)await new Promise(done=>{const timer=setTimeout(()=>{coverage.lost(s.run.id,s.role);done();},5000);s.socket.once('close',()=>{clearTimeout(timer);done();});s.socket.terminate();});
    if(s.id)try{await api(s.run,{role:s.role,id:s.id},'DELETE');s.id=null;}catch{errors.push('TailSessionCleanupFailed');}
-   if(s.file){await s.writes;await s.file.close();s.file=null;}
   }));
+  for(const journal of journals){await journal.writes;await journal.file.close();}
   if(errors.length)throw Error(errors.join('; '));
+ }
+ function connect(session,url){
+  if(closing)return Promise.resolve();
+  const{run,role,journal}=session,socket=session.socket=new Socket(url,'trace-v1',{maxPayload:1024*1024,handshakeTimeout:30000});let healthy=false,ended=false;
+  const reconnect=()=>{if(closing||session.reconnectTimer)return;session.reconnectTimer=setTimeout(()=>{session.reconnectTimer=null;connect(session,url).catch(reconnect);},1000);};
+  const lost=(reason,code)=>{if(ended)return;ended=true;clearInterval(session.ping);if(healthy)coverage.disconnected(run.id,role,reason,code);socket.terminate();reconnect();};
+  socket.on('message',data=>{
+   try{const safe=sanitizeTailEvent(JSON.parse(data.toString()));if(!safe)return;coverage.observe(run.id,role,safe);const encoded=JSON.stringify({...safe,diagnostic_replica:session.replica})+'\n',bytes=Buffer.byteLength(encoded);
+    if((journal.pendingBytes??0)+bytes>4*1024*1024){coverage.lost(run.id,role,'journal_capacity');socket.terminate();return;}
+    journal.pendingBytes=(journal.pendingBytes??0)+bytes;journal.writes=journal.writes.then(()=>journal.file.writeFile(encoded)).catch(()=>{coverage.lost(run.id,role,'journal_write');}).finally(()=>journal.pendingBytes-=bytes);}catch{coverage.lost(run.id,role,'frame_parse');}
+  });
+  socket.on('error',error=>{if(error.code==='WS_ERR_UNSUPPORTED_MESSAGE_LENGTH')coverage.lost(run.id,role,'frame_size');lost('connection_error');});socket.on('close',code=>{if(!closing)lost('connection_closed',code);});
+  return new Promise((ok,bad)=>{socket.once('open',()=>{
+   if(closing||ended){socket.terminate();bad(Error('DiagnosticConnectionClosed'));return;}
+   socket.send(JSON.stringify({debug:false}));healthy=true;coverage.connected(run.id,role);
+   const pingMessage=Buffer.from('wrangler tail ping');let pong=performance.now();socket.on('pong',data=>{if(data.equals(pingMessage))pong=performance.now();});session.ping=setInterval(()=>{if(performance.now()-pong>45000)lost('heartbeat_timeout');else if(socket.readyState===WebSocket.OPEN)socket.ping(pingMessage);},10000);ok();
+  });socket.once('error',()=>bad(Error('DiagnosticConnectionFailed')));socket.once('close',()=>bad(Error('DiagnosticConnectionClosed')));});
  }
  try{
   // Bounded sequential creation avoids a credential/session request burst.
   for(const run of runs)for(const role of roles){
-   const session={run,role,writes:Promise.resolve(),path:resolve(directory,run.id+'-'+role+'.jsonl')};sessions.push(session);
+   const journal={writes:Promise.resolve(),path:resolve(directory,run.id+'-'+role+'.jsonl')};journal.file=await open(journal.path,'ax',0o600);journals.push(journal);
+   // Independent provider sessions overlap throughout qualification. Repair a
+   // dropped replica without losing coverage from its already connected peer.
+   for(let replica=0;replica<2;replica++){
+   const session={run,role,journal,replica};sessions.push(session);
    const record=await api(run,{role},'POST',{filters:[]});
    if(typeof record.id!=='string'||!/^[a-zA-Z0-9-]{1,128}$/.test(record.id))throw Error('DiagnosticSessionInvalid');session.id=record.id;
    if(typeof record.url!=='string'||new URL(record.url).protocol!=='wss:')throw Error('DiagnosticSessionInvalid');
-   session.file=await open(session.path,'ax',0o600);
-   const socket=session.socket=new WebSocket(record.url,'trace-v1',{maxPayload:1024*1024,handshakeTimeout:30000});
-   socket.on('message',data=>{
-    try{const safe=sanitizeTailEvent(JSON.parse(data.toString()));if(!safe)return;coverage.observe(run.id,role,safe);const encoded=JSON.stringify(safe)+'\n',bytes=Buffer.byteLength(encoded);
-     if((session.pendingBytes??0)+bytes>4*1024*1024){coverage.lost(run.id,role,'journal_capacity');socket.terminate();return;}
-     session.pendingBytes=(session.pendingBytes??0)+bytes;session.writes=session.writes.then(()=>session.file.writeFile(encoded)).catch(()=>{coverage.lost(run.id,role,'journal_write');}).finally(()=>session.pendingBytes-=bytes);}catch{coverage.lost(run.id,role,'frame_parse');}
-   });
-   socket.on('error',error=>coverage.lost(run.id,role,error.code==='WS_ERR_UNSUPPORTED_MESSAGE_LENGTH'?'frame_size':'connection_error'));socket.on('close',code=>{if(!closing)coverage.lost(run.id,role,'connection_closed',code);});
-   await new Promise((ok,bad)=>{socket.once('open',()=>{socket.send(JSON.stringify({debug:false}));coverage.connected(run.id,role);ok();});socket.once('error',()=>bad(Error('DiagnosticConnectionFailed')));socket.once('close',()=>bad(Error('DiagnosticConnectionClosed')));});
-   const pingMessage=Buffer.from('wrangler tail ping');session.pong=performance.now();socket.on('pong',data=>{if(data.equals(pingMessage))session.pong=performance.now();});session.ping=setInterval(()=>{if(performance.now()-session.pong>45000){coverage.lost(run.id,role,'heartbeat_timeout');socket.terminate();}else socket.ping(pingMessage);},10000);
+   await connect(session,record.url);
+   }
   }
   coverage.assertClean();
  }catch(error){await close().catch(()=>{});throw error;}
  return{
   report:()=>coverage.report(),assertClean:()=>coverage.assertClean(),
-  async finish(){await close();const artifacts=[];for(const s of sessions){const hash=createHash('sha256');let bytes=0;for await(const chunk of createReadStream(s.path)){bytes+=chunk.length;if(bytes>256*1024*1024)throw Error('DiagnosticJournalExceeded');hash.update(chunk);}artifacts.push({path:s.path,bytes,sha256:hash.digest('hex')});}const report={...coverage.report(),artifacts};await writeFile(resolve(directory,'audit.json'),JSON.stringify(report,null,2));return report;},
+  async finish(){await close();const artifacts=[];for(const s of journals){const hash=createHash('sha256');let bytes=0;for await(const chunk of createReadStream(s.path)){bytes+=chunk.length;if(bytes>256*1024*1024)throw Error('DiagnosticJournalExceeded');hash.update(chunk);}artifacts.push({path:s.path,bytes,sha256:hash.digest('hex')});}const report={...coverage.report(),artifacts};await writeFile(resolve(directory,'audit.json'),JSON.stringify(report,null,2));return report;},
  };
 }
 
