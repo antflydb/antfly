@@ -704,8 +704,9 @@ fn testBuffer(buffer: capi.Buffer) []const u8 {
 }
 
 fn modelInstalled(owner: []const u8, prefix: []const u8) bool {
-    const home = std.mem.span(std.c.getenv("HOME") orelse return false);
-    const owner_dir = std.fs.path.join(std.testing.allocator, &.{ home, ".antfly", "inference", "models", owner }) catch return false;
+    const models = @import("antfly_inference_runtime_paths").defaultModelsDirForDataDirAlloc(std.testing.allocator, "") catch return false;
+    defer std.testing.allocator.free(models);
+    const owner_dir = std.fs.path.join(std.testing.allocator, &.{ models, owner }) catch return false;
     defer std.testing.allocator.free(owner_dir);
     var dir = std.Io.Dir.cwd().openDir(std.testing.io, owner_dir, .{ .iterate = true }) catch return false;
     defer dir.close(std.testing.io);
@@ -844,7 +845,7 @@ test "capi inference lists models and reports route errors with the runtime JSON
 
 // Needs the model pulled locally (`antfly inference pull
 // Qwen/Qwen3-Embedding-0.6B-GGUF`); skipped otherwise so it never downloads.
-test "capi inference embeds text with a local model" {
+test "capi local model embeds text" {
     if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
     if (!modelInstalled("Qwen", "Qwen3-Embedding-0.6B-GGUF")) return error.SkipZigTest;
     var handle: ?*anyopaque = null;
@@ -866,7 +867,7 @@ test "capi inference embeds text with a local model" {
 
 // Needs the model pulled locally (`antfly inference pull
 // cross-encoder/ms-marco-MiniLM-L6-v2`); skipped otherwise.
-test "capi inference reranks documents with a local model" {
+test "capi local model reranks documents" {
     if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
     if (!modelInstalled("cross-encoder", "ms-marco-MiniLM-L6-v2")) return error.SkipZigTest;
     var handle: ?*anyopaque = null;
@@ -902,7 +903,7 @@ test "capi inference chunks text without a model" {
     try std.testing.expect(parsed.value.object.get("data").?.array.items.len > 0);
 }
 
-test "capi inference generates text with a local model and rejects streaming" {
+test "capi inference legacy generation rejects streaming without a model" {
     if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
     var handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(null, &handle));
@@ -913,10 +914,14 @@ test "capi inference generates text with a local model and rejects streaming" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_generate_json(handle, testSlice(stream_request), &streamed));
     defer db.antfly_buffer_free(&streamed);
     try std.testing.expect(std.mem.indexOf(u8, testBuffer(streamed), "STREAMING_UNSUPPORTED") != null);
+}
 
-    // Needs the model pulled locally (`antfly inference pull
-    // ggml-org/gemma-4-e2b-it-gguf`); skipped otherwise.
+test "capi local model generates and streams text" {
+    if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
     if (!modelInstalled("ggml-org", "gemma-4-e2b-it-gguf")) return error.SkipZigTest;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(null, &handle));
+    defer antfly_inference_close(handle);
     var out: capi.Buffer = .{};
     const request = "{\"model\":\"ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: ready\"}],\"max_tokens\":8,\"stream\":false}";
     const code = antfly_inference_generate_json(handle, testSlice(request), &out);

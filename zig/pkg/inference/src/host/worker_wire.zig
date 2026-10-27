@@ -276,7 +276,16 @@ pub const Http = struct {
     headers: []const Header,
     params: []const Header,
     has_body: bool,
+    stream_body: bool = false,
 };
+
+pub const native_checkpoint_upload_limit: usize = 2 * 1024 * 1024 * 1024 + 2 * 1024 * 1024 + 128;
+
+pub fn nativeCheckpointResume(method: http.HttpMethod, path: []const u8) bool {
+    return method == .post and (std.mem.eql(u8, path, bridge.ai_api_prefix ++ "/generate/context/resume") or
+        std.mem.eql(u8, path, bridge.public_api_prefix ++ "/generate/context/resume"));
+}
+
 pub const HttpResponse = struct { status: u16, headers: []const Header };
 pub const Reservation = struct { lease: usize = 0, amounts: bridge.AdmissionAmounts };
 pub const Observation = struct { key: usize, previous: u64, next: u64 };
@@ -398,3 +407,12 @@ test "inference worker typed numeric responses preserve ownership under allocati
 }
 
 pub const DocumentStoreRequest = struct { capability: [16]u8, metadata: []const u8 };
+test "native checkpoint worker streaming stays limited to exact POST resume routes" {
+    inline for (.{ bridge.ai_api_prefix, bridge.public_api_prefix }) |prefix| {
+        try std.testing.expect(nativeCheckpointResume(.post, prefix ++ "/generate/context/resume"));
+        try std.testing.expect(!nativeCheckpointResume(.get, prefix ++ "/generate/context/resume"));
+        try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/resume/"));
+        try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/checkpoint"));
+        try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/chat/completions"));
+    }
+}

@@ -40,7 +40,7 @@ const schema_registry_mod = @import("schema_registry.zig");
 const relational_index_catalog_mod = @import("relational_index_catalog.zig");
 const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
 const table_catalog_mod = @import("table_catalog.zig");
-const public_schema_json_key = "\x00\x00__metadata__:schema_json";
+const public_schema_json_key = internal_keys.public_schema_json_key;
 const shard_mod = @import("../shard.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const ttl_mod = @import("../ttl.zig");
@@ -1378,8 +1378,17 @@ pub const DBCore = struct {
                 // their public contract arrives from metadata during startup.
                 // Bind additive derivation only when that validator is present.
                 const candidate = schema_registry_mod.SchemaView{ .epoch = prepared.epoch.? };
-                if (!prepared.same_version_layout_matches and candidate.validator() != null)
-                    prepared.same_version_layout_matches = try schema_mod.schemasEqualForPublicBinding(self.alloc, view.tableSchema().*, table_schema);
+                if (!prepared.same_version_layout_matches and candidate.validator() != null) {
+                    if (try schema_mod.matchesExcludedSourceEpoch(self.alloc, view.tableSchema().*, table_schema)) {
+                        prepared.same_version_layout_matches = true;
+                        // Owner configuration is an idempotent binding to the
+                        // stored epoch. Preserve its exact ASCH bytes; never
+                        // write the newer lowering under the same version.
+                        const preserved = try self.alloc.dupe(u8, base_encoded);
+                        self.alloc.free(prepared.encoded);
+                        prepared.encoded = preserved;
+                    } else prepared.same_version_layout_matches = try schema_mod.schemasEqualForPublicBinding(self.alloc, view.tableSchema().*, table_schema);
+                }
                 prepared.legacy_public_binding = prepared.same_version_layout_matches and
                     view.tableSchema().decoded_format_version == 12 and view.validator() == null and candidate.validator() != null;
             }

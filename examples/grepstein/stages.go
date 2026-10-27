@@ -104,10 +104,11 @@ func enrichCmd(args []string) error {
 	endpoint := f.String("url", DefaultAntflyURL, "Antfly API")
 	table := f.String("table", "grepstein_corpus", "Corpus table")
 	stage := f.String("stage", "semantic", "semantic or graph (then run graph to materialize extracted units)")
-	model := f.String("embedding-model", DefaultEmbeddingModel, "Registered embedding model (512 dimensions)")
+	model := f.String("embedding-model", DefaultEmbeddingModel, fmt.Sprintf("Registered embedding model (%d dimensions)", DefaultEmbeddingDims))
 	embedderPath := f.String("embedder-config", "", "Native embedder JSON including provider, model, project/location and dimension")
 	extractor := f.String("extractor-model", DefaultAutographModel, "Registered GLiNER model")
 	inference := f.String("inference-url", "", "Server-reachable inference root")
+	inferenceSecret := f.String("inference-secret", "", "Server keystore key name for the selected inference endpoint")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
@@ -118,7 +119,7 @@ func enrichCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	indexes, err := corpusIndexes(*model, *extractor, *inference, "", *stage == "graph", *stage == "semantic", embedder)
+	indexes, err := corpusIndexes(*model, *extractor, *inference, "", *stage == "graph", *stage == "semantic", corpusIndexOptions{Embedder: embedder, InferenceSecret: *inferenceSecret})
 	if err != nil {
 		return err
 	}

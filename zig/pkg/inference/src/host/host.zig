@@ -3210,7 +3210,10 @@ fn localModelCapabilitiesInScope(
             try result.accepted_mime_types.add(mime_type);
         }
     }
-    if (task == .embed) result.model_aware_chunking_v1 = true;
+    if (task == .embed) {
+        result.model_aware_chunking_v1 = true;
+        result.dense_output = if (manifest.denseEmbeddingOutput()) |shape| .{ .native_dimensions = shape.native_dimensions, .minimum_dimensions = shape.minimum_dimensions } else null;
+    }
     if (task == .embed or task == .generate) {
         // Identity inspection reads the receipt/manifest, never model weights.
         // Prefer the immutable loaded generation if it already exists.
@@ -3218,6 +3221,7 @@ fn localModelCapabilitiesInScope(
             var loaded = cached;
             defer loaded.release();
             result.model_revision = loaded.get().resolution_revision;
+            if (task == .embed) result.dense_output = if (loaded.get().manifest.denseEmbeddingOutput()) |shape| .{ .native_dimensions = shape.native_dimensions, .minimum_dimensions = shape.minimum_dimensions } else null;
             if (result.model_revision == null and task == .generate) result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         } else {
             result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
@@ -3891,4 +3895,15 @@ test "standalone inference host placement keeps embedded policy local" {
     try std.testing.expectEqual(@as(u64, 0), diagnostic.denied_count);
     context.runtime_config_json = .init("{\"process_isolation\":false}");
     try std.testing.expectError(error.UnknownField, linkedInferenceCreate(&context));
+}
+
+test "native checkpoint route manifest preserves binary upload and export streaming" {
+    inline for (.{ inference.server.ai_api_prefix, inference.server.public_api_prefix }) |prefix| {
+        const prepare = routeMetadata(.post, prefix ++ "/generate/context/checkpoint");
+        try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, prepare.request_body);
+        try std.testing.expect(prepare.streaming_response);
+        const resume_request = routeMetadata(.post, prefix ++ "/generate/context/resume");
+        try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, resume_request.request_body);
+        try std.testing.expect(resume_request.streaming_response);
+    }
 }

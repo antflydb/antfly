@@ -429,7 +429,7 @@ const RowPolicyOutputCheckpoint = struct {
     }
 };
 const default_visibility_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
-const public_schema_json_key = "\x00\x00__metadata__:schema_json";
+const public_schema_json_key = @import("../internal_keys.zig").public_schema_json_key;
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 // Legacy singleton keys remain readable for crash recovery across upgrades.
 const replication_batch_outbox_key = durable_outbox.replication_batch_outbox_key;
@@ -598,7 +598,8 @@ pub const OpenOptions = struct {
         degree_canary,
     };
 
-    /// External owners drive historical index work outside their capture fence.
+    /// External owners drive historical index work, including derived replay,
+    /// outside their capture fence. Opening retains the durable replay debt.
     defer_index_backfill_on_open: bool = false,
     table_storage: ?table_storage_mod.Settings = null,
     open_mode: OpenOptions.OpenMode = .writer,
@@ -4383,7 +4384,7 @@ pub const DB = struct {
                     try db.core.store.delete(graph_edge_ttl_due_rebuild_marker);
                 }
             }
-            if (opts.open_mode.allowsReplay()) {
+            if (opts.open_mode.allowsReplay() and !opts.defer_index_backfill_on_open) {
                 const replay_started_ns = monotonicTimeNs();
                 replayPendingDerivedBatches(&db, null, null, .{}) catch |err| switch (err) {
                     error.ArtifactRepairRequired => {},
@@ -12096,7 +12097,7 @@ pub const DB = struct {
         for (state.entries.items) |entry| {
             var unavailable = indexRepairIntentBlocksService(entry.intent);
             if (!unavailable) {
-                if (entry.intent.trigger == .incomplete_bulk_publish) {
+                if ((entry.intent.trigger == .incomplete_bulk_publish or entry.intent.trigger == .text_projection_upgrade)) {
                     const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.intent.index_name);
                     unavailable = checkpoint.status != .clean or checkpoint.config_hash != entry.intent.config_hash;
                 }
@@ -12180,7 +12181,7 @@ pub const DB = struct {
             }
             return;
         }
-        if (!unavailable and intent.trigger == .incomplete_bulk_publish) {
+        if (!unavailable and (intent.trigger == .incomplete_bulk_publish or intent.trigger == .text_projection_upgrade)) {
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, index_name);
             unavailable = checkpoint.status != .clean or checkpoint.config_hash != intent.config_hash;
         }
@@ -12637,7 +12638,7 @@ pub const DB = struct {
         // admission; the ordinary replay-repair exception is not authority.
         if (intent.work_class == .initial_build) return intent.phase != .cleanup;
         return switch (intent.trigger) {
-            .incomplete_bulk_publish => intent.phase != .cleanup,
+            .incomplete_bulk_publish, .text_projection_upgrade => intent.phase != .cleanup,
             // Only an operator-requested rebuild starts from a generation that
             // is still proven healthy. Coverage mismatch or missing proof is
             // fail-closed until replacement validation publishes cleanup.
@@ -13900,7 +13901,7 @@ pub const DB = struct {
             .operator_generation_rebuild, .operator_generation_validation, .storage_format_migration, .artifact_baseline_adoption => 0,
             .artifact_coverage_mismatch, .replay_artifact_unavailable => 1,
             .artifact_counter_missing => 2,
-            .incomplete_bulk_publish, .root_generation_rebuild, .projection_generation_invalid, .catalog_admission => 3,
+            .incomplete_bulk_publish, .text_projection_upgrade, .root_generation_rebuild, .projection_generation_invalid, .catalog_admission => 3,
         };
     }
 
@@ -14975,10 +14976,20 @@ pub const DB = struct {
                 },
                 .rebuild_from_artifacts => {},
             }
-            // Both allowlisted publication failures are currently HBC dense
-            // index failures. Do not let future reuse of either error name
-            // silently broaden automatic reconstruction.
-            if (cfg.kind != .dense_vector) {
+            // Re-audit the exact producer/kind pair before admitting durable
+            // mutation work. A verified text projection upgrade uses the same
+            // leader-owned shadow generation machinery as dense recovery.
+            const failure = self.core.index_manager.failedIndexLoadSnapshot(cfg.name) orelse {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            };
+            if (!failure.token.eql(candidate.token)) {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            }
+            if (!index_manager_mod.IndexManager.automaticLoadRebuildSupported(cfg.kind, failure.err_name)) {
                 result.terminal += 1;
                 candidate.classified = true;
                 continue;
@@ -15001,6 +15012,7 @@ pub const DB = struct {
                 .root_generation = state_identity.root_generation,
                 .index_name = index_name,
                 .kind = cfg.kind,
+                .trigger = if (cfg.kind == .full_text) .text_projection_upgrade else .incomplete_bulk_publish,
                 .config_hash = types.indexConfigHash(cfg),
                 .detected_sequence = target_sequence,
                 .target_sequence = target_sequence,
@@ -15483,12 +15495,12 @@ pub const DB = struct {
                 return result;
             }
         }
-        // Only startup discovery creates incomplete_bulk_publish intents, so
+        // Only startup discovery creates publication/projection-upgrade intents, so
         // this durable provenance is the authority to reclaim quarantine
         // ownership. Operator and generation-health intents may coexist with
         // retry/manual load failures but must not be reclassified as automatic
         // destructive recovery merely because they share an index name.
-        if (entry.intent.trigger == .incomplete_bulk_publish and
+        if ((entry.intent.trigger == .incomplete_bulk_publish or entry.intent.trigger == .text_projection_upgrade) and
             entry.intent.phase != .rolling_back)
         {
             // Retryable terminal phases release their quarantine claim so an
@@ -26725,7 +26737,7 @@ pub const DB = struct {
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
                 try @import("artifact_producer_provenance.zig").stageIndexed(txn, guard.command, guard.proof, guard.position, guard.document_references);
-                try publication.stageArtifactRevisions(txn, guard.command, guard.position);
+                try publication.stageArtifactRevisions(alloc, txn, guard.command, guard.position);
                 if (guard.command.producer_kind == .resolver) try @import("artifact_publication_resolution.zig").stageHandoff(alloc, txn, guard.command);
                 try DB.completeArtifactUpload(txn, guard.upload, .{ .term = guard.position.raft.term, .index = guard.position.raft.index });
                 try guard.db.stageRestoreStagingReplicationOutbox(txn, guard.replication_payload);
@@ -36407,6 +36419,7 @@ pub const DB = struct {
             item.repair_degraded = false;
         } else switch (intent.trigger) {
             .incomplete_bulk_publish,
+            .text_projection_upgrade,
             .root_generation_rebuild,
             .projection_generation_invalid,
             .operator_generation_validation,
@@ -64426,7 +64439,9 @@ fn expectTestRelationalIndexRow(db: *DB, document: []const u8, json: []const u8,
 }
 
 test "relational rows snapshot streams flushed companion families without point probes" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var tmp = try TestDirectory.init("relational-primary-stream");
     defer tmp.cleanup();
     {
@@ -66691,7 +66706,9 @@ test "relational columnar missing bootstrap checkpoint cannot claim complete cov
 }
 
 test "relational columnar byte costing retains wide clean rows and switches for dense replacement" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -67407,7 +67424,9 @@ test "relational columnar prepared ownership aggregates and aborts atomically" {
 }
 
 test "relational columnar production LSM staging snapshot benchmark" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     defer lsm_backend_mod.Backend.test_deep_mutable_snapshots = false;
@@ -68006,7 +68025,9 @@ fn testRelationalCleanupBackend(backend: PrimaryBackend) !void {
 }
 
 test "relational columnar delete waves coalesce adjacent underfilled ranges" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -68158,7 +68179,9 @@ test "relational columnar clean coalescing preserves typed cells without primary
 }
 
 test "relational columnar deleted insertion burst has bounded cleanup and complete coverage" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -72894,7 +72917,9 @@ test "db resolved doc filter normalizes doc keys before composing native ids" {
 }
 
 test "db search structured expansion filters cancel inside dictionary scans" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var directory = try TestDirectory.init("db");
     defer directory.cleanup();
     var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false });
@@ -79162,7 +79187,9 @@ test "db rewriteEntityEdges clears acknowledged replication outbox and retains f
 }
 
 test "db rewriteEntityEdges indexes a multi-owner mutation in linear work" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var directory = try TestDirectory.init("entity-rewrite-many-owners");
     defer directory.cleanup();
     var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
@@ -81135,6 +81162,10 @@ test "db enrichments precomputes generated enrichments into the committed batch"
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
+        // Inspect the foreground transaction and its exact first watermark.
+        // Independent replay may legitimately publish another observation.
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),
@@ -81351,70 +81382,7 @@ test "db derived target advance does not skip unseen matching replay records" {
     ));
 }
 
-const TestAssetProducer = struct {
-    calls: usize = 0,
-    generator_calls: usize = 0,
-    reader_calls: usize = 0,
-    transcriber_calls: usize = 0,
-    extractor_calls: usize = 0,
-    reader_output: ?[]const u8 = null,
-    transcriber_output: ?[]const u8 = null,
-    extractor_output: ?[]const u8 = null,
-
-    fn producer(self: *@This()) asset_producer_mod.Producer {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .produce = produce,
-                .invocation_memory_for_requests = invocationMemory,
-            },
-        };
-    }
-
-    fn invocationMemory(
-        _: *anyopaque,
-        _: Allocator,
-        _: []const asset_producer_mod.Request,
-    ) !inference_work.InvocationMemoryPlan {
-        return .{
-            .attachment_transport = .data_uri,
-            .fixed_bytes = 16 << 20,
-            .allocator_limit_bytes = 16 << 20,
-            .max_result_bytes_per_item = 8 << 20,
-            .max_result_bytes = 8 << 20,
-        };
-    }
-
-    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.calls += 1;
-        switch (request.producer_type) {
-            .copy => {},
-            .document_extraction => {},
-            .decision => {},
-            .generator => self.generator_calls += 1,
-            .reader => self.reader_calls += 1,
-            .transcriber => self.transcriber_calls += 1,
-            .extractor => self.extractor_calls += 1,
-        }
-        if (request.producer_type == .extractor) {
-            if (self.extractor_output) |output| return try alloc.dupe(u8, output);
-            return try std.fmt.allocPrint(alloc, "{{\"relations\":[{{\"type\":\"mentions\",\"target\":{{\"document_id\":{f}}}}}]}}", .{std.json.fmt(request.source_text, .{})});
-        }
-        if (request.producer_type == .reader) {
-            if (self.reader_output) |output| return try alloc.dupe(u8, output);
-            if (std.mem.eql(u8, request.content_type, "application/json")) {
-                const text = try std.fmt.allocPrint(alloc, "reader:{s}", .{request.source_text});
-                defer alloc.free(text);
-                return try std.json.Stringify.valueAlloc(alloc, .{.{ .text = text }}, .{});
-            }
-        }
-        if (request.producer_type == .transcriber) {
-            if (self.transcriber_output) |output| return try alloc.dupe(u8, output);
-        }
-        return try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(request.producer_type), request.source_text });
-    }
-};
+const TestAssetProducer = @import("test_support.zig").TestAssetProducer;
 
 fn jsonTestNumber(value: std.json.Value) f64 {
     return switch (value) {
@@ -109596,6 +109564,81 @@ test "db completed managed admission emits an initial build clear edge" {
     try std.testing.expectEqual(IndexRepairAdmission.serviceable, hook.admission.?);
 }
 
+test "db managed admission cannot deadlock replay coverage deletion" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("coverage-catalog-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copied\"}]}" });
+    const manager = db.core.index_manager;
+    // Retain the current plan without filling the single-flight cache. Replay
+    // must use this plan even when a new admission makes the cache cold.
+    manager.invalidateWritePlanSnapshot();
+    var plan = try manager.writePlanSnapshotAlloc(a);
+    defer plan.deinit();
+    var guard = try manager.lockManagedIndexApply(.{ .name = "text", .kind = .full_text });
+    defer guard.unlock();
+    const State = struct {
+        db: *DB,
+        plan: *const index_manager_mod.IndexManager.WritePlanSnapshot,
+        cancel: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        deletion_error: ?anyerror = null,
+        writer_error: ?anyerror = null,
+        fn write(self: *@This()) void {
+            self.db.core.index_manager.catalog_mutex.lockExclusiveIo(std.testing.io, @as(?types.CancellationToken, types.CancellationToken.fromAtomic(&self.cancel))) catch |err| {
+                self.writer_error = err;
+                return;
+            };
+            self.db.core.index_manager.catalog_mutex.unlockExclusive();
+        }
+        fn erase(self: *@This()) void {
+            defer self.done.store(true, .release);
+            local_mutation.deleteDerivedCoverageForDocKeysWithPlan(std.testing.allocator, self.db.core.store, self.db.core.index_manager, "text", &.{"doc"}, self.plan) catch |err| {
+                self.deletion_error = err;
+            };
+        }
+    };
+    var state = State{ .db = &db, .plan = &plan };
+    const writer = try std.Thread.spawn(.{}, State.write, .{&state});
+    var writer_joined = false;
+    defer if (!writer_joined) {
+        state.cancel.store(true, .release);
+        writer.join();
+    };
+    const catalog = &manager.catalog_mutex;
+    const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (catalog.exclusive_waiters.load(.acquire) == 0 and monotonicTimeNs() < deadline)
+        @import("antfly_platform").time.yieldNow();
+    try std.testing.expect(catalog.exclusive_waiters.load(.acquire) != 0);
+    const deletion = try std.Thread.spawn(.{}, State.erase, .{&state});
+    var deletion_joined = false;
+    defer if (!deletion_joined) {
+        state.cancel.store(true, .release);
+        deletion.join();
+    };
+    while (!state.done.load(.acquire) and catalog.shared_waiters.load(.acquire) == 0 and monotonicTimeNs() < deadline)
+        @import("antfly_platform").time.yieldNow();
+    const nested = catalog.shared_waiters.load(.acquire) != 0;
+    const completed_without_canceling_writer = state.done.load(.acquire);
+    // Rescue the old nested-acquisition path so a regression fails promptly
+    // and joins both threads instead of hanging the unit process.
+    state.cancel.store(true, .release);
+    writer.join();
+    writer_joined = true;
+    deletion.join();
+    deletion_joined = true;
+    try std.testing.expect(!nested and completed_without_canceling_writer);
+    try std.testing.expectEqual(@as(?anyerror, null), state.deletion_error);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), state.writer_error);
+}
+
 test "db managed admission rejects regressed identity evidence" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -112520,7 +112563,8 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
     try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ 1, 1, 0 });
     // A no-op replay callback may leave its last cut coalesced. The recurring
     // owner must flush that cut as well as retry the lifecycle certificate.
-    try db.async_context.applied_sequence_coalescer.note(alloc, config.name, applied);
+    // Pending keys are retained and later freed by the async owner.
+    try db.async_context.applied_sequence_coalescer.note(db.async_context.alloc, config.name, applied);
     try std.testing.expectEqual(@as(usize, 1), db.async_context.applied_sequence_coalescer.pending.count());
     const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
     while (true) {
@@ -117247,7 +117291,9 @@ test "db graph index reloads on reopen for neighbor queries with durable lsm pri
 }
 
 test "db graph reverse rebuild resumes after interrupted reopen" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -118356,6 +118402,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     // boundary and producer assistance are deterministic.
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
+        .start_optional_runtime_workers = false,
     });
     defer db.close();
 
@@ -118382,6 +118429,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         _ = try db.indexTextKernelDocuments("ft_v1", &docs);
     }
 
+    // Disabling derived workers alone does not stop optional merge workers.
+    // This fixture owns the scheduler directly until its explicit runtimes start.
+    if (db.text_merge_runtime) |automatic| try std.testing.expect(!automatic.isStarted());
     const before = db.core.index_manager.textMergeStatsSnapshot();
     try std.testing.expect(before.pending_segments > 8);
 
@@ -118389,7 +118439,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var held_task = (try resources.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
     var held_task_active = true;
     defer if (held_task_active) {
+        resources.apply_mutex.lockExclusive();
         resources.index_manager.cancelTextMergeTask(&held_task);
+        resources.apply_mutex.unlockExclusive();
         held_task.deinit(resources.index_manager.alloc);
     };
 
@@ -118436,7 +118488,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     byte_permit.release();
     byte_only_runtime.deinit();
 
+    resources.apply_mutex.lockExclusive();
     resources.index_manager.cancelTextMergeTask(&held_task);
+    resources.apply_mutex.unlockExclusive();
     held_task.deinit(resources.index_manager.alloc);
     held_task_active = false;
 
@@ -118457,6 +118511,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
 
     const outcome = runtime.applyBackpressure();
     try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.drained, outcome);
+    // Retire the worker before comparing two separately acquired snapshots;
+    // crossing the low watermark does not promise the scheduler stays idle.
+    _ = runtime.stop();
 
     const after = runtime.stats();
     try std.testing.expect(after.pending_segments <= 4);
@@ -118603,7 +118660,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     // process-wide byte dimension. A younger request for another index must
     // not consume the remaining bytes merely because the older waiter is also
     // blocked on its index-local segment ceiling.
-    const mixed_byte_limit = resources.index_manager.textMergeStatsSnapshot().pending_bytes +| 100;
+    const mixed_byte_limit = runtime.stats().pending_bytes +| 100;
     var mixed_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
         alloc,
         resources.index_manager,
@@ -122552,10 +122609,12 @@ test "db field selection plan only enables chunk special field for explicit incl
     try std.testing.expect(!none.special.all_chunks);
     try std.testing.expect(!none.special.all_embeddings);
 
-    const artifacts_none = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts.body_chunks_v1.items.0.value"}, false);
-    try std.testing.expect(!artifacts_none.special.all_artifacts);
-    try std.testing.expect(!artifacts_none.special.all_chunks);
-    try std.testing.expect(!artifacts_none.special.all_embeddings);
+    // Named artifact projections request hydration directly. The legacy
+    // chunk/embedding aliases still require their explicit include-all form.
+    const artifacts_nested = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts.body_chunks_v1.items.0.value"}, false);
+    try std.testing.expect(artifacts_nested.special.all_artifacts);
+    try std.testing.expect(!artifacts_nested.special.all_chunks);
+    try std.testing.expect(!artifacts_nested.special.all_embeddings);
 
     const artifacts_plain = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts"}, false);
     try std.testing.expect(artifacts_plain.special.all_artifacts);
@@ -136610,7 +136669,9 @@ test "db transaction integrity contention precedes stale claim semantics" {
 const replicationCommitContext = local_mutation.replicationCommitContext;
 
 test "db graph endpoint cleanup pages are replicated bounded and restartable" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var directory = try TestDirectory.init("endpoint-cleanup-pages");
     defer directory.cleanup();
     var follower_directory = try TestDirectory.init("endpoint-cleanup-follower");
@@ -138492,7 +138553,9 @@ test "db graph fact generated projection wakes endpoint context" {
 }
 
 test "db graph fact refresh bounds artifact work within one large record" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var tmp = try TestDirectory.init("review-large-record-refresh");
     defer tmp.cleanup();
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
@@ -140170,7 +140233,9 @@ test "capi resolver replacement resumes checkpoints while writes continue" {
 }
 
 test "capi resolver replacement fenced tail advances gaps over 1024" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var directory = try TestDirectory.init("replacement-tail");
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
@@ -140464,7 +140529,9 @@ test "capi resolver replacement wait cannot acknowledge provisional catalog entr
 
 test "capi resolver replacement crash boundaries recover atomic ownership" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     const io = std.testing.io;
     const options: OpenOptions = .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false };
     if (std.c.getenv("ANTFLY_REPLACEMENT_CRASH_PATH")) |path| {
@@ -140530,6 +140597,7 @@ test "capi resolver replacement crash boundaries recover atomic ownership" {
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         try env.put("TZ", "UTC0");
+        if (checked_allocator.traces) try env.put("ANTFLY_TEST_ALLOCATOR_TRACES", "1");
         try env.put("ANTFLY_REPLACEMENT_CRASH_PATH", directory.path());
         try env.put("ANTFLY_REPLACEMENT_CRASH_STAGE", stage);
         var child = try std.process.spawn(io, .{ .argv = &.{ executable, "--test-filter", "capi resolver replacement crash boundaries recover atomic ownership" }, .environ_map = &env });
@@ -142749,8 +142817,12 @@ test "lite external dense dimension replacement keeps writes available (#1216)" 
     try db.batch(.{ .writes = &old_writes });
     try db.runUntilIdle();
     try std.testing.expect(try db.deleteIndex("img"));
-    var pages: usize = 0;
-    while (try db.advanceGeneratedArtifactCleanupPage("img") != .idle) : (pages += 1) try std.testing.expect(pages < 10_000);
+    // Deletion schedules cleanup on the durable owner. Join that owner before
+    // reusing the name: a nonblocking .busy response is lease contention, not
+    // another page of work, and tight polling can exhaust an arbitrary budget
+    // while the finalizer is still checkpointing on a loaded test host.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    try std.testing.expectEqual(DB.GeneratedArtifactCleanupAdvanceResult.idle, try db.advanceGeneratedArtifactCleanupPage("img"));
     const repair = try db.admitManagedIndex(.{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":4,\"external\":true}" });
     // Admission must not block either vector or ordinary writes while its
     // new generation is still rebuilding from retained authored artifacts.

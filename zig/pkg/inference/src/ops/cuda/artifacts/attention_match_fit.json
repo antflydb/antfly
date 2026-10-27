@@ -1,0 +1,31 @@
+{
+  "source_sha256": "75220bc6ac4e58fa691fab6e46c086ca015c79773441368689112f99463a3166",
+  "artifact_sha256": "ddb1e877e7fdcfccb01a7fa442faf59adcab8b998f5a91ba1d5809cb109c6035",
+  "compiler": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Fri_May_08_10:53:34_AM_PDT_2026\nCuda compilation tools, release 13.2, V13.2.86\nBuild cuda_13.2.r13.2/compiler.37953736_0",
+  "flags": [
+    "-O3",
+    "-std=c++17",
+    "-x",
+    "cu",
+    "-include",
+    "cuda_runtime.h",
+    "--fatbin",
+    "-gencode=arch=compute_75,code=sm_75",
+    "-gencode=arch=compute_80,code=sm_80",
+    "-gencode=arch=compute_89,code=sm_89",
+    "-gencode=arch=compute_90,code=sm_90",
+    "-gencode=arch=compute_100,code=sm_100",
+    "-gencode=arch=compute_110,code=sm_110",
+    "-gencode=arch=compute_120,code=sm_120"
+  ],
+  "architectures": [
+    75,
+    80,
+    89,
+    90,
+    100,
+    110,
+    120
+  ],
+  "purpose": "native KV fitting; compilation is not serving qualification"
+}

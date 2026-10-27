@@ -26585,12 +26585,13 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         \\{"bool":{"must_not":[{"term":{"customer":"bob"}}]}}
     )).?;
     defer exclusion_only_resolved.deinit(idx.alloc);
+    // Complete visibility may be streamed into a bitmap. Keep the ordinal
+    // fast-path contract without requiring its flat representation.
     switch (exclusion_only_resolved.include) {
-        .ordinals => |ordinals| {
-            try std.testing.expectEqual(@as(usize, 3), ordinals.len);
-            try std.testing.expect(containsOrdinal(ordinals, 1));
-            try std.testing.expect(containsOrdinal(ordinals, 2));
-            try std.testing.expect(containsOrdinal(ordinals, 3));
+        .ordinals, .ordinal_bitmap => {
+            try std.testing.expectEqual(@as(?usize, 3), exclusion_only_resolved.include.estimatedCardinality());
+            for ([_]doc_set.DocOrdinal{ 1, 2, 3 }) |ordinal|
+                try std.testing.expect(exclusion_only_resolved.include.containsOrdinal(ordinal));
         },
         .all => {},
         else => return error.ExpectedOrdinalDocSet,

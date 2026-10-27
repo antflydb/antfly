@@ -34,6 +34,34 @@ const ForwardControl = struct {
     stream: http.StreamSink = .{},
     stream_started: bool = false,
     body_source: http.RequestBodySource = .{},
+    borrowed_body: ?[]const u8 = null,
+    body_offset: usize = 0,
+    stream_body: bool = false,
+
+    fn readNativeBody(raw: ?*anyopaque, destination: []u8) !usize {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try check(self);
+        if (!self.stream_body) return error.BodySourceUnavailable;
+        if (destination.len == 0) return 0;
+        // Permit one extra byte only to distinguish EOF from an over-limit
+        // source. The request-scoped reader is joined before its owner exits.
+        const capacity = @min(destination.len, wire.native_checkpoint_upload_limit - self.body_offset + 1);
+        const count = if (self.borrowed_body) |body| borrowed: {
+            const n = @min(capacity, body.len - self.body_offset);
+            @memcpy(destination[0..n], body[self.body_offset..][0..n]);
+            break :borrowed n;
+        } else streamed: {
+            const read = self.body_source.read orelse break :streamed @as(usize, 0);
+            var n: usize = 0;
+            try callbackResult(read(self.body_source.context, destination.ptr, capacity, &n));
+            break :streamed n;
+        };
+        if (count > capacity) return error.InvalidBodyReadCount;
+        if (count > wire.native_checkpoint_upload_limit - self.body_offset) return error.BodyTooLarge;
+        self.body_offset += count;
+        try check(self);
+        return count;
+    }
 
     fn check(raw: ?*anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -73,7 +101,7 @@ const ForwardControl = struct {
         return count;
     }
     fn view(self: *@This()) rpc.Control {
-        return .{ .ptr = self, .check = check, .event = event, .read_body = if (self.body_source.read != null) readBody else null };
+        return .{ .ptr = self, .check = check, .event = event, .read_body = if (self.stream_body) readNativeBody else if (self.body_source.read != null) readBody else null };
     }
 };
 
@@ -130,11 +158,20 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
     // than retaining every decoded frame in the request arena.
     var control = ForwardControl{ .alloc = client.alloc, .cancellation = context.cancellation, .stream = context.stream, .body_source = context.body_source };
     try ForwardControl.check(&control);
+    const stream_body = wire.nativeCheckpointResume(context.request.method, route) and
+        wire.nativeCheckpointResume(context.request.method, context.request.path.slice());
     var body = context.request.body;
     const streaming_body = context.body_source.streaming != 0 and context.body_source.read != null and
         std.mem.endsWith(u8, context.request.path.slice(), "/stream") and
         std.mem.indexOf(u8, context.request.path.slice(), "/transcription/sessions/") != null;
-    if (!streaming_body and body.slice() == null) if (context.body_source.read_all) |read| {
+    if (stream_body) {
+        if (body.slice() == null and context.body_source.read == null and context.body_source.read_all != null)
+            return error.StreamingUnavailable;
+        control.stream_body = true;
+        control.body_source = context.body_source;
+        control.borrowed_body = body.slice();
+        body = .{};
+    } else if (!streaming_body and body.slice() == null) if (context.body_source.read_all) |read| {
         try callbackResult(read(context.body_source.context, &body));
     };
     const headers = try alloc.alloc(wire.Header, context.request.headers_len);
@@ -154,6 +191,7 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
         .headers = headers,
         .params = params,
         .has_body = body.slice() != null,
+        .stream_body = stream_body,
         .streaming_body = streaming_body,
     }, .{});
     const result = client.invoke(.http, data, body.slice() orelse "", control.view()) catch |err| {
@@ -625,6 +663,44 @@ const Worker = struct {
     }
 };
 
+const NativeHttpBody = struct {
+    request: *rpc.Request,
+    buffer: [rpc.max_frame_bytes]u8 = undefined,
+    offset: usize = 0,
+    len: usize = 0,
+    received: usize = 0,
+    failed: ?http.CallbackStatus = null,
+
+    fn read(raw: ?*anyopaque, destination: [*]u8, capacity: usize, out_count: *usize) callconv(.c) http.CallbackStatus {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return .failed));
+        out_count.* = 0;
+        if (self.failed) |failure| return failure;
+        if (self.request.cancelled.load(.acquire)) return .canceled;
+        if (capacity == 0) return .ok;
+        if (self.offset == self.len) {
+            self.len = self.request.readBody(&self.buffer) catch |err| {
+                self.failed = switch (err) {
+                    error.Cancelled, error.Canceled => .canceled,
+                    error.Timeout => .timeout,
+                    else => .failed,
+                };
+                return self.failed.?;
+            };
+            self.offset = 0;
+            if (self.len > wire.native_checkpoint_upload_limit - self.received) {
+                self.failed = .body_too_large;
+                return .body_too_large;
+            }
+            self.received += self.len;
+        }
+        const count = @min(capacity, self.len - self.offset);
+        @memcpy(destination[0..count], self.buffer[self.offset..][0..count]);
+        self.offset += count;
+        out_count.* = count;
+        return .ok;
+    }
+};
+
 const Child = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -750,6 +826,10 @@ const Child = struct {
             },
             .http => {
                 const incoming = try std.json.parseFromSliceLeaky(wire.Http, arena, envelope.options, .{});
+                if (incoming.stream_body and (incoming.has_body or envelope.data.len != 0 or
+                    !wire.nativeCheckpointResume(incoming.method, incoming.route) or
+                    !wire.nativeCheckpointResume(incoming.method, incoming.path))) return error.InvalidInput;
+                var streamed_body: NativeHttpBody = .{ .request = request };
                 // Route identity, not an ordinal: replacing the executable
                 // must never redirect a request to a different handler.
                 const route_handle = found: {
@@ -785,7 +865,7 @@ const Child = struct {
                     .request = &view,
                     .document_store = if (documents) |binding| binding.view() else .{},
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
-                    .body_source = if (incoming.streaming_body) .{ .context = request, .streaming = 1, .read = readBody, .read_all = readAllBody } else .{},
+                    .body_source = if (incoming.stream_body) .{ .context = &streamed_body, .read = NativeHttpBody.read, .streaming = 1 } else if (incoming.streaming_body) .{ .context = request, .streaming = 1, .read = readBody, .read_all = readAllBody } else .{},
                     .stream = .{ .context = request, .start = streamStart, .write = streamWrite, .close = streamClose },
                     .out_response_handle = &response_handle,
                     .out_response = &response,
@@ -1269,4 +1349,134 @@ test "inference worker document capabilities revoke new borrows while preserving
     try std.testing.expectEqual(@as(usize, 1), owner.references);
     Owner.release(&owner);
     try std.testing.expectEqual(@as(usize, 0), owner.references);
+}
+
+test "native checkpoint worker upload honors cancellation counts and cumulative ceiling" {
+    const Source = struct {
+        calls: usize = 0,
+        fail: http.CallbackStatus = .ok,
+        oversized: bool = false,
+        fn read(raw: ?*anyopaque, destination: [*]u8, capacity: usize, count: *usize) callconv(.c) http.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.fail != .ok) return self.fail;
+            count.* = if (self.oversized) capacity + 1 else @min(capacity, 7);
+            if (!self.oversized) @memset(destination[0..count.*], 42);
+            return .ok;
+        }
+        fn canceled(_: ?*const anyopaque) callconv(.c) u8 {
+            return 1;
+        }
+    };
+    var source: Source = .{};
+    var control: ForwardControl = .{ .alloc = std.testing.allocator, .cancellation = .{}, .stream_body = true, .body_source = .{ .context = &source, .read = Source.read, .streaming = 1 } };
+    var buffer: [10]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 7), try control.view().read_body.?(&control, &buffer));
+    source.oversized = true;
+    try std.testing.expectError(error.InvalidBodyReadCount, control.view().read_body.?(&control, &buffer));
+    try std.testing.expectEqual(@as(usize, 7), control.body_offset);
+    source.oversized = false;
+    control.body_offset = wire.native_checkpoint_upload_limit;
+    try std.testing.expectError(error.BodyTooLarge, control.view().read_body.?(&control, &buffer));
+    control.body_offset = 0;
+    source.fail = .timeout;
+    try std.testing.expectError(error.Timeout, control.view().read_body.?(&control, &buffer));
+    control.cancellation = .{ .is_cancelled = Source.canceled };
+    const calls = source.calls;
+    try std.testing.expectError(error.Cancelled, control.view().read_body.?(&control, &buffer));
+    try std.testing.expectEqual(calls, source.calls);
+    control.cancellation = .{};
+    control.borrowed_body = "checkpoint";
+    try std.testing.expectEqual(@as(usize, 10), try control.view().read_body.?(&control, &buffer));
+    try std.testing.expectEqualStrings("checkpoint", &buffer);
+    try std.testing.expectEqual(@as(usize, 0), try control.view().read_body.?(&control, &buffer));
+    try std.testing.expectEqual(calls, source.calls);
+}
+
+test "inference worker checkpoint upload feeds incremental HTTP reads and recovers after cancellation" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const Fixture = struct {
+        parent: rpc.Endpoint = undefined,
+        child: rpc.Endpoint = undefined,
+        files: [4]std.Io.File = undefined,
+        remaining: usize = 0,
+        sent: usize = 0,
+        calls: usize = 0,
+        cancel_after: usize = std.math.maxInt(usize),
+        fn closed(_: *anyopaque) void {}
+        fn reject(_: *anyopaque, _: *rpc.Request) !rpc.OwnedPayload {
+            return error.UnexpectedRequest;
+        }
+        fn read(raw: ?*anyopaque, destination: [*]u8, capacity: usize, count: *usize) callconv(.c) http.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.calls >= self.cancel_after) return .canceled;
+            self.calls += 1;
+            const n = @min(self.remaining, capacity, if (self.calls == 2) @as(usize, 7) else capacity);
+            for (destination[0..n], 0..) |*byte, index| byte.* = @truncate((self.sent + index) *% 31);
+            count.* = n;
+            self.remaining -= n;
+            self.sent += n;
+            return .ok;
+        }
+        fn consume(_: *anyopaque, request: *rpc.Request) !rpc.OwnedPayload {
+            var body: NativeHttpBody = .{ .request = request };
+            var buffer: [4093]u8 = undefined;
+            var total: usize = 0;
+            while (true) {
+                const capacity: usize = if (total == 0) 1 else if (total == 1) 3 else buffer.len;
+                var n: usize = 0;
+                try callbackResult(NativeHttpBody.read(&body, &buffer, capacity, &n));
+                if (n == 0) break;
+                if (n > capacity) return error.InvalidBodyReadCount;
+                for (buffer[0..n], 0..) |byte, index|
+                    if (byte != @as(u8, @truncate((total + index) *% 31))) return error.BodyContentMismatch;
+                total += n;
+            }
+            var eof_count: usize = 99;
+            try callbackResult(NativeHttpBody.read(&body, &buffer, buffer.len, &eof_count));
+            if (eof_count != 0) return error.BodyContentAfterEof;
+            var result: [8]u8 = undefined;
+            std.mem.writeInt(u64, &result, total, .little);
+            return request.endpoint.copyPayload(.{ .body = &result });
+        }
+        fn reset(self: *@This(), bytes: usize, cancel_after: usize) void {
+            self.remaining = bytes;
+            self.sent = 0;
+            self.calls = 0;
+            self.cancel_after = cancel_after;
+        }
+        fn run(self: *@This()) !rpc.OwnedPayload {
+            var control: ForwardControl = .{
+                .alloc = std.testing.allocator,
+                .cancellation = .{},
+                .stream_body = true,
+                .body_source = .{ .context = self, .read = read, .streaming = 1 },
+            };
+            return self.parent.call(.{}, control.view());
+        }
+    };
+    var fixture: Fixture = .{};
+    const up = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    const down = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    for (up ++ down, &fixture.files) |fd, *file| file.* = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    defer for (fixture.files) |file| file.close(std.testing.io);
+    fixture.parent = .{ .alloc = std.testing.allocator, .io = std.testing.io, .input = fixture.files[0], .output = fixture.files[3], .context = &fixture, .handler = Fixture.reject, .on_closed = Fixture.closed, .next_id = 1 };
+    fixture.child = .{ .alloc = std.testing.allocator, .io = std.testing.io, .input = fixture.files[2], .output = fixture.files[1], .context = &fixture, .handler = Fixture.consume, .on_closed = Fixture.closed, .next_id = 2 };
+    try fixture.parent.start();
+    defer fixture.parent.deinit();
+    try fixture.child.start();
+    defer fixture.child.deinit();
+    fixture.reset(rpc.max_body_bytes + 19, std.math.maxInt(usize));
+    const large = try fixture.run();
+    defer large.deinit();
+    try std.testing.expectEqual(@as(u64, rpc.max_body_bytes + 19), std.mem.readInt(u64, large.view().body[0..8], .little));
+    try std.testing.expect(fixture.calls > 1024);
+    fixture.reset(1024 * 1024, 2);
+    try std.testing.expectError(error.Cancelled, fixture.run());
+    fixture.reset(100123, std.math.maxInt(usize));
+    const recovery = try fixture.run();
+    defer recovery.deinit();
+    try std.testing.expectEqual(@as(u64, 100123), std.mem.readInt(u64, recovery.view().body[0..8], .little));
+    try std.testing.expect(!fixture.parent.closed.load(.acquire));
+    try std.testing.expect(!fixture.child.closed.load(.acquire));
 }

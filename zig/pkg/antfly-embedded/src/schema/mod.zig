@@ -1148,6 +1148,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
     const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
     errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
+    var policy_schema: storage_schema.TableSchema = .{ .full_text_documents = full_text_documents };
+    try bindTextProjectionPolicies(alloc, &policy_schema, schema);
 
     const relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
     errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
@@ -1401,6 +1403,26 @@ fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.Dyn
             .analyzer = try alloc.dupe(u8, template.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
         },
     };
+}
+
+pub fn bindTextProjectionPolicies(alloc: std.mem.Allocator, runtime: *storage_schema.TableSchema, schema: ParsedTableSchema) !void {
+    if (runtime.full_text_documents.len <= 1) return;
+    for (@constCast(runtime.full_text_documents)) |*document| {
+        if (document.physical_exact_fields != null) continue;
+        const declaration = for (schema.document_schemas) |candidate| {
+            if (std.mem.eql(u8, candidate.name, document.name)) break candidate;
+        } else return error.InvalidSchemaUpdateRequest;
+        var fields: std.ArrayListUnmanaged(storage_schema.ExactField) = .empty;
+        errdefer {
+            freeRuntimeExactFieldItems(alloc, fields.items);
+            fields.deinit(alloc);
+        }
+        var paths: std.StringHashMapUnmanaged(usize) = .empty;
+        defer paths.deinit(alloc);
+        try appendRuntimeDocumentSchemaExactFields(alloc, &fields, &paths, declaration);
+        std.mem.sort(storage_schema.ExactField, fields.items, {}, exactFieldLessThan);
+        document.physical_exact_fields = try fields.toOwnedSlice(alloc);
+    }
 }
 
 fn deriveRuntimeExactDocumentFields(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.ExactField {
@@ -1891,6 +1913,7 @@ fn defaultDynamicTemplateAnalyzer(field_type: storage_schema.AntflyType) []const
 fn freeRuntimeFullTextDocuments(alloc: std.mem.Allocator, docs: []storage_schema.FullTextDocument) void {
     for (docs) |doc| {
         alloc.free(doc.name);
+        if (doc.physical_exact_fields) |fields| freeRuntimeExactFields(alloc, @constCast(fields));
         for (doc.fields) |field| {
             alloc.free(field.path);
             alloc.free(field.emitted_name);

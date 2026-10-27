@@ -939,6 +939,22 @@ from .inference_config import InferenceConfig
 from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
+from .inference_context_checkpoint import InferenceContextCheckpoint
+from .inference_context_checkpoint_version import InferenceContextCheckpointVersion
+from .inference_context_diagnostics import InferenceContextDiagnostics
+from .inference_context_diagnostics_kv_cache_mode import InferenceContextDiagnosticsKvCacheMode
+from .inference_context_diagnostics_kv_cache_version import InferenceContextDiagnosticsKvCacheVersion
+from .inference_context_diagnostics_policy import InferenceContextDiagnosticsPolicy
+from .inference_context_management import InferenceContextManagement
+from .inference_context_management_mode import InferenceContextManagementMode
+from .inference_context_prepare_request import InferenceContextPrepareRequest
+from .inference_context_prepare_request_mode import InferenceContextPrepareRequestMode
+from .inference_context_prepare_response import InferenceContextPrepareResponse
+from .inference_context_structured_memory import InferenceContextStructuredMemory
+from .inference_context_tool_evidence import InferenceContextToolEvidence
+from .inference_context_tool_result_outcome import InferenceContextToolResultOutcome
+from .inference_context_tool_result_outcome_disposition import InferenceContextToolResultOutcomeDisposition
+from .inference_context_unresolved_tool_call import InferenceContextUnresolvedToolCall
 from .inference_credentials import InferenceCredentials
 from .inference_decide_long_document import InferenceDecideLongDocument
 from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
@@ -1016,6 +1032,9 @@ from .inference_generate_usage import InferenceGenerateUsage
 from .inference_image_url import InferenceImageURL
 from .inference_image_url_content_part import InferenceImageURLContentPart
 from .inference_image_url_content_part_type import InferenceImageURLContentPartType
+from .inference_kv_cache_policy import InferenceKvCachePolicy
+from .inference_kv_cache_policy_mode import InferenceKvCachePolicyMode
+from .inference_kv_cache_policy_version import InferenceKvCachePolicyVersion
 from .inference_level import InferenceLevel
 from .inference_media_content_part import InferenceMediaContentPart
 from .inference_media_content_part_type import InferenceMediaContentPartType
@@ -1023,6 +1042,7 @@ from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+from .inference_model_info_dense_output import InferenceModelInfoDenseOutput
 from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_instance import InferenceModelInstance
@@ -1918,6 +1938,7 @@ from .phrase_query import PhraseQuery
 from .predicate_decision_question import PredicateDecisionQuestion
 from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
+from .prepare_native_kv_checkpoint_x_antfly_kv_encoding import PrepareNativeKvCheckpointXAntflyKVEncoding
 from .prior_artifact_context import PriorArtifactContext
 from .provenance_decision import ProvenanceDecision
 from .provenance_decision_configuration import ProvenanceDecisionConfiguration
@@ -3383,6 +3404,22 @@ __all__ = (
     "InferenceConnection",
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
+    "InferenceContextCheckpoint",
+    "InferenceContextCheckpointVersion",
+    "InferenceContextDiagnostics",
+    "InferenceContextDiagnosticsKvCacheMode",
+    "InferenceContextDiagnosticsKvCacheVersion",
+    "InferenceContextDiagnosticsPolicy",
+    "InferenceContextManagement",
+    "InferenceContextManagementMode",
+    "InferenceContextPrepareRequest",
+    "InferenceContextPrepareRequestMode",
+    "InferenceContextPrepareResponse",
+    "InferenceContextStructuredMemory",
+    "InferenceContextToolEvidence",
+    "InferenceContextToolResultOutcome",
+    "InferenceContextToolResultOutcomeDisposition",
+    "InferenceContextUnresolvedToolCall",
     "InferenceCredentials",
     "InferenceDecideLongDocument",
     "InferenceDecideLongDocumentMode",
@@ -3460,6 +3497,9 @@ __all__ = (
     "InferenceImageURL",
     "InferenceImageURLContentPart",
     "InferenceImageURLContentPartType",
+    "InferenceKvCachePolicy",
+    "InferenceKvCachePolicyMode",
+    "InferenceKvCachePolicyVersion",
     "InferenceLevel",
     "InferenceMediaContentPart",
     "InferenceMediaContentPartType",
@@ -3467,6 +3507,7 @@ __all__ = (
     "InferenceModelFormat",
     "InferenceModelInfo",
     "InferenceModelInfoChunkingLimits",
+    "InferenceModelInfoDenseOutput",
     "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
     "InferenceModelInstance",
@@ -4146,6 +4187,7 @@ __all__ = (
     "PredicateDecisionQuestion",
     "PredicateDecisionQuestionType",
     "PrefixQuery",
+    "PrepareNativeKvCheckpointXAntflyKVEncoding",
     "PriorArtifactContext",
     "ProvenanceDecision",
     "ProvenanceDecisionConfiguration",

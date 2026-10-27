@@ -135,7 +135,7 @@ def link_macho(args: argparse.Namespace) -> None:
         str(args.output),
         "-force_load",
         str(args.archive),
-        *[str(path) for path in getattr(args, "object", [])],
+        *map(str, getattr(args, "objects", ())),
         *link_args,
         "-lSystem",
     ]
@@ -145,8 +145,6 @@ def link_macho(args: argparse.Namespace) -> None:
         command.extend(["-map", str(args.map)])
     for name in args.exports.read_text().splitlines():
         command.extend(["-u", name])
-    if link_map := getattr(args, "map", None):
-        command.extend(["-map", str(link_map)])
     subprocess.run(command, check=True)
 
 
@@ -231,7 +229,14 @@ def main() -> None:
     link.add_argument("--arch", choices=["arm64", "x86_64"], required=True)
     link.add_argument("--exports", type=Path, required=True)
     link.add_argument("--archive", type=Path, required=True)
-    link.add_argument("--object", type=Path, action="append", default=[])
+    link.add_argument(
+        "--object",
+        dest="objects",
+        type=Path,
+        action="append",
+        default=[],
+        help="Final-image input not bundled in an archive; may be repeated",
+    )
     link.add_argument("--output", type=Path, required=True)
     link.add_argument("--map", type=Path)
     link.add_argument("link_args", nargs=argparse.REMAINDER)

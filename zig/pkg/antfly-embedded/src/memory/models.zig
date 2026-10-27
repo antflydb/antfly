@@ -96,6 +96,7 @@ pub const Bridge = struct {
         inline for (@typeInfo(t.Models).@"struct".field_names) |field| if (@field(config.models, field)) |model| {
             needs_inference = needs_inference or std.mem.eql(u8, model.revision, "current");
         };
+        if (config.models.embedder) |model| needs_inference = needs_inference or model.dimensions == null;
         if (!needs_inference) return self.qualifyInner(a, config, resolve_current);
         try self.before();
         const result = self.qualifyInner(a, config, resolve_current);
@@ -118,14 +119,26 @@ pub const Bridge = struct {
             }
         }
         const current_embedder = if (models.embedder) |model| std.mem.eql(u8, model.revision, "current") else false;
-        if (config.features.semantic_recall or config.semantic_discovery.enabled or current_embedder) {
+        const unresolved_dimensions = if (models.embedder) |model| model.dimensions == null else false;
+        if (config.features.semantic_recall or config.semantic_discovery.enabled or current_embedder or unresolved_dimensions) {
             const model = models.embedder orelse return error.MemoryModelRequired;
             if (!std.mem.eql(u8, model.provider, "external")) {
-                var embedding_runtime = try self.embedder(self.alloc, model);
-                defer embedding_runtime.deinit();
-                const capabilities = try embedding_runtime.denseInterface().capabilities(self.alloc, "memory");
-                models.embedder = try qualifiedModel(a, model, capabilities.model_revision, resolve_current);
-            } else if (current_embedder) return error.MemoryModelRevisionUnavailable;
+                const json = try std.json.Stringify.valueAlloc(self.alloc, .{ .provider = model.provider, .model = model.model }, .{});
+                defer self.alloc.free(json);
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, json, .{});
+                defer parsed.deinit();
+                const capabilities = try managed.denseModelCapabilities(self.alloc, parsed.value, self.embedding_options);
+                var pinned = try qualifiedModel(a, model, capabilities.model_revision, resolve_current);
+                if (capabilities.dense_output) |shape| {
+                    const dimensions = model.dimensions orelse shape.native_dimensions;
+                    if (dimensions > 65536 or !shape.accepts(dimensions)) return error.MemoryEmbeddingDimensionsUnsupported;
+                    pinned.dimensions = dimensions;
+                } else if (model.dimensions == null) return error.MemoryEmbeddingDimensionsRequired;
+                models.embedder = pinned;
+            } else {
+                if (model.dimensions == null) return error.MemoryEmbeddingDimensionsRequired;
+                if (current_embedder) return error.MemoryModelRevisionUnavailable;
+            }
         }
         return models;
     }
@@ -364,6 +377,8 @@ test "capi native memory embedder current pins capability digest without embeddi
     const work = @import("antfly_inference_work");
     const Provider = struct {
         digest: [32]u8 = @splat(7),
+        shape: ?work.DenseEmbeddingOutput = .{ .native_dimensions = 768, .minimum_dimensions = 1 },
+        calls: usize = 0,
         fn dense(_: *anyopaque, _: A, _: []const u8, _: []const []const u8) ![][]f32 {
             return error.MemoryCapabilityUnavailable;
         }
@@ -372,7 +387,8 @@ test "capi native memory embedder current pins capability digest without embeddi
         }
         fn capabilities(ptr: *anyopaque, _: A, _: []const u8, task: work.Task) !work.InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return .{ .task = task, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .item, .output = .embedding, .model_revision = self.digest };
+            self.calls += 1;
+            return .{ .dense_output = self.shape, .task = task, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .item, .output = .embedding, .model_revision = self.digest };
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -380,10 +396,31 @@ test "capi native memory embedder current pins capability digest without embeddi
     const a = arena.allocator();
     var provider: Provider = .{};
     var bridge: Bridge = .{ .base = undefined, .alloc = a, .embedding_options = .{ .io = std.testing.io, .antfly_provider = .{ .ptr = &provider, .embed_dense_texts = Provider.dense, .embed_sparse_texts = Provider.sparse, .model_capabilities = Provider.capabilities } } };
-    var config: t.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = .{ .provider = "antfly", .model = "local-model", .revision = "current", .dimensions = 3 } } };
+    var config: t.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = .{ .provider = "antfly", .model = "local-model", .revision = "current" } } };
     config.models = try Bridge.qualify(&bridge, a, config);
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(provider.digest, .lower), config.models.embedder.?.revision);
+    try std.testing.expectEqual(@as(?u32, 768), config.models.embedder.?.dimensions);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
     try Bridge.validate(&bridge, config);
+    // Explicit Matryoshka widths survive admission. Unsupported widths fail
+    // before embedding, and pinned configurations never adopt changed geometry.
+    inline for (.{ 128, 256, 512 }) |dimensions| {
+        var explicit = config;
+        explicit.models.embedder.?.dimensions = dimensions;
+        const pinned = try Bridge.qualify(&bridge, a, explicit);
+        try std.testing.expectEqual(@as(?u32, dimensions), pinned.embedder.?.dimensions);
+    }
+    var invalid = config;
+    invalid.models.embedder.?.dimensions = 769;
+    try std.testing.expectError(error.MemoryEmbeddingDimensionsUnsupported, Bridge.qualify(&bridge, a, invalid));
+    provider.shape = null;
+    // Old/external catalogs still support explicitly pinned widths.
+    try Bridge.validate(&bridge, config);
+    var omitted = config;
+    omitted.models.embedder.?.dimensions = null;
+    try std.testing.expectError(error.MemoryEmbeddingDimensionsRequired, Bridge.qualify(&bridge, a, omitted));
+    provider.shape = .{ .native_dimensions = 256, .minimum_dimensions = 1 };
+    try std.testing.expectError(error.MemoryEmbeddingDimensionsUnsupported, Bridge.validate(&bridge, config));
     provider.digest = @splat(8);
     try std.testing.expectError(error.MemoryModelRevisionMismatch, Bridge.validate(&bridge, config));
 }

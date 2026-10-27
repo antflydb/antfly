@@ -81,6 +81,8 @@ pub const Parser = struct {
     max_headers: usize = 100,
     max_body_size: usize = 100 * 1024 * 1024, // 100 MB
     request_body_limit_context: ?*anyopaque = null,
+    /// Returns the final server-authorized limit for this route. A larger
+    /// limit is usable only when its body streams instead of being buffered.
     request_body_limit_resolver: ?*const fn (*anyopaque, types.Method, []const u8) ?usize = null,
     request_body_streaming_context: ?*anyopaque = null,
     request_body_streaming_resolver: ?*const fn (*anyopaque, types.Method, []const u8, ?[]const u8) bool = null,
@@ -460,6 +462,17 @@ pub const Parser = struct {
             return;
         }
 
+        if (self.mode == .request and !self.headers_only and
+            (self.chunked or (self.content_length != null and self.content_length.? > 0)))
+        {
+            if (self.request_body_streaming_resolver) |resolve| {
+                if (self.request_body_streaming_context) |context| {
+                    if (self.method) |method| if (self.path) |path| {
+                        self.headers_only = resolve(context, method, path, self.headers.get("content-type"));
+                    };
+                }
+            }
+        }
         self.message_body_size_limit = self.max_body_size;
         if (self.mode == .request) {
             if (self.request_body_limit_resolver) |resolve| {
@@ -467,9 +480,7 @@ pub const Parser = struct {
                     if (self.method) |method| {
                         if (self.path) |path| {
                             if (resolve(context, method, path)) |route_limit| {
-                                // The server resolves buffered limits against its global ceiling;
-                                // explicitly raw streams have a separate wire-byte ceiling.
-                                self.message_body_size_limit = route_limit;
+                                self.message_body_size_limit = if (self.headers_only) route_limit else @min(self.max_body_size, route_limit);
                             }
                         }
                     }
@@ -487,17 +498,6 @@ pub const Parser = struct {
                 self.state = .err;
                 self.error_reason = .body_too_large;
                 return;
-            }
-        }
-        if (self.mode == .request and !self.headers_only and
-            (self.chunked or (self.content_length != null and self.content_length.? > 0)))
-        {
-            if (self.request_body_streaming_resolver) |resolve| {
-                if (self.request_body_streaming_context) |context| {
-                    if (self.method) |method| if (self.path) |path| {
-                        self.headers_only = resolve(context, method, path, self.headers.get("content-type"));
-                    };
-                }
             }
         }
 

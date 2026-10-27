@@ -86,6 +86,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     defer @import("antfly_platform").finalizeMacosSdk(b);
     defer @import("build_support/embedded/source_owner.zig").finalize(b);
     const shared = @import("build_support/antfly/dependencies.zig").create(b, @This()) orelse return null;
+    @import("build_support/antfly/test_partitions.zig").setMemoryProfile(b, .{
+        .native_darwin_cpu_debug = shared.native_cpu_debug_test_profile,
+    });
     const api_bench_standalone = shared.api_bench_standalone;
     const conformance_fetch = shared.conformance_fetch;
     const conformance_fixtures = shared.conformance_fixtures;
@@ -487,8 +490,15 @@ pub fn create(b: *std.Build) ?Artifacts {
     const decisions_test_module = b.createModule(.{ .root_source_file = b.path("lib/decisions/root.zig"), .target = target, .optimize = optimize });
     decisions_test_module.addImport("antfly_cloudflare", b.modules.get("antfly_cloudflare").?);
     decisions_test_module.addImport("antfly_structured", b.modules.get("antfly_structured").?);
-    const decisions_tests = b.addTest(.{ .root_module = decisions_test_module });
-    const run_decisions_tests = b.addRunArtifact(decisions_tests);
+    const decisions_tests = b.addTest(.{
+        .root_module = decisions_test_module,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_decisions_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, decisions_tests);
+    // Grep owns the standalone shared evidence wire tests in the aggregate.
+    // The focused decisions target retains its complete imported inventory.
+    const run_decisions_unit_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, decisions_tests);
+    run_decisions_unit_tests.addArgs(&.{ "--skip-test-filter", "^evidence.test." });
     b.step("lib-decisions-test", "Run shared decision wire and generated contract tests").dependOn(&run_decisions_tests.step);
 
     const cloudflare_test_module = b.createModule(.{ .root_source_file = b.path("lib/cloudflare/root.zig"), .target = target, .optimize = optimize });
@@ -858,7 +868,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_lib_generating_tests.step);
     lib_test_step.dependOn(&run_structured_tests.step);
     lib_test_step.dependOn(&run_group_source_tests.step);
-    lib_test_step.dependOn(&run_decisions_tests.step);
+    lib_test_step.dependOn(&run_decisions_unit_tests.step);
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);

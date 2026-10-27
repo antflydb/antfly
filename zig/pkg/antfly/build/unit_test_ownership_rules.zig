@@ -17,16 +17,19 @@
 // before/after these rules and rejects both lost coverage and repeated names.
 // Implementation rules use `.test.` where possible to retain reachability
 // anchors; whole module families stay with their explicit collection owner.
+const names = @import("test_owner_names.zig");
+
 pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
+        .artifact = names.root_unit,
         .selection = "compiled CHECK",
         .skip = &.{
             "api.runtime_status.consumerTests.Suite.test.",
             "api.http_server.test.authoritative catalog mutation boundaries reject orphaned semantic producers",
             "api.indexes.consumerTests.Suite.test.actionable repair remains visible while retained generation stays queryable",
             "api.indexes.consumerTests.Suite.test.complete partial embeddings coverage is ready after active generation proof",
+            "api.indexes.consumerTests.Suite.test.external embeddings index readiness does not require table doc coverage",
             "api.indexes.consumerTests.Suite.test.managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
             "api.indexes.consumerTests.Suite.test.missing target observation preserves serving snapshot and blocks only completion",
             "api.indexes.consumerTests.Suite.test.partial coverage embeddings readiness counts skipped source units",
@@ -145,6 +148,17 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "storage-kernel query request preserves final projection while raw retrieval defers it",
         .skip = &.{
+            // Shared provider/configuration and storage primitives retain their
+            // dedicated owners; HTTP ingress contracts remain in this suite.
+            "common.config.test.",
+            "common.inference_gateway.test.",
+            "common.inference_stream.test.",
+            "common.inference_telemetry.test.",
+            "generating.mod.test.provider registry gateway",
+            "memory.models.test.capi native memory embedder current pins capability digest without embedding",
+            "memory.models.test.capi native memory model admission resolves current only before durable pinning",
+            "storage.db.query.search_exec.test.native memory bounded exact-ID hydration never scans and respects generation expiry dedup and bounds",
+            "usermgr.user_manager.test.native memory curator permission is read-capable without arbitrary write or admin",
             // Public API parity owns these complete SQL helper namespaces.
             "api.sql_catalog.test.",
             "api.sql_session_overlay.test.",
@@ -187,7 +201,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/api_storage_authority_test_root.zig",
-        .artifact = "test",
+        .artifact = names.api_storage_authority,
         .selection = "public table backup and restore require named connections",
         .skip = &.{
             "api.http_server.test.api http server lists cluster backups through public route",
@@ -300,7 +314,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/capi_test_root.zig",
-        .artifact = "test",
+        .artifact = names.capi_contract,
         .selection = "issue1015",
         .skip = &.{
             // C ABI regressions borrow the implementation; storage owns its tests.
@@ -345,6 +359,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "storage.resource_manager.test.",
             "storage.rowsource.external.test.",
             "storage.rowsource.identity.test.",
+            "storage.rowsource.logical.test.",
             "sql.disk_rows.test.",
         },
     },

@@ -113,7 +113,17 @@ pub fn versionedCatalog(a: Allocator, data: []const u8, version: u32) ![]u8 {
     return try std.json.Stringify.valueAlloc(a, parsed.value, .{});
 }
 
+/// Physical envelope shape is part of the authenticated catalog identity.
+pub const CatalogEncoding = struct {
+    minimum_reader_version: u32,
+    projection_dictionary: bool,
+};
+
 pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
+    return (try catalogEncoding(a, data)).minimum_reader_version;
+}
+
+pub fn catalogEncoding(a: Allocator, data: []const u8) !CatalogEncoding {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
     defer parsed.deinit();
     const rows = try catalogRows(parsed.value);
@@ -146,7 +156,10 @@ pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
             if (entry.object.contains(field)) required = @max(required, 2);
         }
     }
-    return required;
+    return .{
+        .minimum_reader_version = required,
+        .projection_dictionary = parsed.value == .object and parsed.value.object.contains("projections"),
+    };
 }
 
 pub fn readMinimumReaderVersion(txn: anytype, supported: u32) !u32 {
@@ -764,6 +777,13 @@ pub fn serializeCatalog(alloc: Allocator, resolvers: []const ResolverConfig) ![]
 const StoredProjection = struct { merges: []const resolver_lib.KeyAlias, curation_json: []const u8 };
 
 pub fn serializeCatalogWithMinimumVersion(alloc: Allocator, resolvers: []const ResolverConfig, minimum: u32) ![]u8 {
+    return serializeCatalogWithEncoding(alloc, resolvers, .{ .minimum_reader_version = minimum, .projection_dictionary = true });
+}
+
+/// Preserve an optional empty dictionary when reproducing a loaded envelope.
+/// A nonempty dictionary is always emitted for its referenced projections.
+pub fn serializeCatalogWithEncoding(alloc: Allocator, resolvers: []const ResolverConfig, encoding: CatalogEncoding) ![]u8 {
+    const minimum = encoding.minimum_reader_version;
     if (minimum == 0 or minimum > supported_reader_version) return error.UnsupportedResolverCatalogVersion;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -793,6 +813,8 @@ pub fn serializeCatalogWithMinimumVersion(alloc: Allocator, resolvers: []const R
     const encoded_rows = try std.json.Stringify.valueAlloc(a, std.json.Value{ .array = rows }, .{});
     const version = @max(minimum, try catalogReaderVersion(a, encoded_rows));
     if (version == 1) return alloc.dupe(u8, encoded_rows);
+    if (projections.count() == 0 and !encoding.projection_dictionary)
+        return std.json.Stringify.valueAlloc(alloc, .{ .version = version, .resolvers = std.json.Value{ .array = rows } }, .{});
     var dictionary: std.json.ObjectMap = .empty;
     for (projections.keys(), projections.values()) |id, encoded| try dictionary.put(a, id, try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
     return std.json.Stringify.valueAlloc(alloc, .{ .version = version, .resolvers = std.json.Value{ .array = rows }, .projections = std.json.Value{ .object = dictionary } }, .{});
@@ -1407,4 +1429,20 @@ test "resolver catalog shares immutable native policy in memory and after reopen
     }
     // No JSON input can manufacture a runtime ownership reference.
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(ResolverConfig, a, "{\"name\":\"r\",\"table\":\"t\",\"source_artifact\":\"s\",\"resolution_artifact\":\"o\",\"key_template\":\"{{_key}}\",\"shared_projection\":{}}", .{}));
+}
+
+test "resolver catalog encoding preserves optional empty projection dictionaries" {
+    const a = std.testing.allocator;
+    for ([_]u32{ 2, 3, 4 }) |version| {
+        inline for ([_]bool{ false, true }) |dictionary| {
+            const data = try std.fmt.allocPrint(a, if (dictionary) "{{\"version\":{d},\"resolvers\":[],\"projections\":{{}}}}" else "{{\"version\":{d},\"resolvers\":[]}}", .{version});
+            defer a.free(data);
+            const encoding = try catalogEncoding(a, data);
+            try std.testing.expectEqual(version, encoding.minimum_reader_version);
+            try std.testing.expectEqual(dictionary, encoding.projection_dictionary);
+            const encoded = try serializeCatalogWithEncoding(a, &.{}, encoding);
+            defer a.free(encoded);
+            try std.testing.expectEqualStrings(data, encoded);
+        }
+    }
 }

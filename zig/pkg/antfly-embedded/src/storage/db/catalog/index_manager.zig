@@ -1361,6 +1361,7 @@ pub const IndexManager = struct {
     /// Exact persisted envelope requirement, independent of temporary reader
     /// reservations and parent/child feature-epoch aggregation.
     resolver_catalog_format_version: std.atomic.Value(u32) = .init(1),
+    resolver_catalog_projection_dictionary: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
@@ -3346,6 +3347,31 @@ pub const IndexManager = struct {
             .manager = self,
             .mutex = mutex,
         };
+    }
+
+    pub const ManagedIndexApplyPlan = struct {
+        guard: ManagedIndexApplyGuard,
+        snapshot: WritePlanSnapshotView,
+        pub fn unlock(self: *@This()) void {
+            self.guard.unlock();
+            self.snapshot.release();
+        }
+    };
+
+    /// Build/pin before entering catalog admission. A cold snapshot needs a
+    /// catalog reader and cannot be acquired recursively behind a writer.
+    pub fn lockManagedIndexApplyWithPlan(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyPlan {
+        while (true) {
+            var snapshot = try self.acquireWritePlanSnapshot();
+            var guard = self.lockManagedIndexApply(index_ref) catch |err| {
+                snapshot.release();
+                return err;
+            };
+            if (snapshot.generation() == self.writePlanGeneration())
+                return .{ .guard = guard, .snapshot = snapshot };
+            guard.unlock();
+            snapshot.release();
+        }
     }
 
     pub fn lockVectorIndexApply(self: *IndexManager, index_name: []const u8) !ManagedIndexApplyGuard {
@@ -7270,7 +7296,8 @@ pub const IndexManager = struct {
     /// must never become permission to delete or replace an index root.
     pub fn loadFailureRecoveryAction(err_name: []const u8) IndexLoadRecoveryAction {
         if (std.mem.eql(u8, err_name, "IncompleteBulkPublish") or
-            std.mem.eql(u8, err_name, "MissingPostingCheckpoint"))
+            std.mem.eql(u8, err_name, "MissingPostingCheckpoint") or
+            std.mem.eql(u8, err_name, "TextProjectionUpgradeRequired"))
         {
             return .rebuild_from_artifacts;
         }
@@ -7286,10 +7313,18 @@ pub const IndexManager = struct {
         // the HBC dense implementation. Keep the queue classification as
         // narrow as the execution allowlist so an unfamiliar future producer
         // cannot create an endlessly runnable automatic-repair entry.
-        if (action == .rebuild_from_artifacts and cfg.kind != .dense_vector) {
+        if (action == .rebuild_from_artifacts and !automaticLoadRebuildSupported(cfg.kind, err_name)) {
             return .manual_intervention;
         }
         return action;
+    }
+
+    pub fn automaticLoadRebuildSupported(kind: types.IndexKind, err_name: []const u8) bool {
+        return switch (kind) {
+            .dense_vector => std.mem.eql(u8, err_name, "IncompleteBulkPublish") or std.mem.eql(u8, err_name, "MissingPostingCheckpoint"),
+            .full_text => std.mem.eql(u8, err_name, "TextProjectionUpgradeRequired"),
+            else => false,
+        };
     }
 
     fn failedIndexLoadActionQueue(self: *IndexManager, action: IndexLoadRecoveryAction) *FailedIndexLoadActionQueue {
@@ -13274,6 +13309,14 @@ pub const IndexManager = struct {
             result.appendAssumeCapacity(try ResolverConfig.clone(alloc, cfg));
         }
         return result.toOwnedSlice(alloc);
+    }
+
+    /// Maintenance admission only needs to know whether definitions exist.
+    /// Retired definitions can still own projection cleanup obligations.
+    pub fn hasResolverDefinitions(self: *IndexManager) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.resolvers.items.len != 0 or self.retired_resolvers.items.len != 0;
     }
 
     /// Admission needs static policy and generation identities, never a copy of
@@ -22335,7 +22378,13 @@ pub const IndexManager = struct {
                     cfg,
                     runtime_schema,
                 );
-                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, read_only) catch |err| {
+                const historical_projection = [_]TextProjectionProvenance{
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 0),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 1),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 2),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 3),
+                };
+                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, historical_projection, read_only) catch |err| {
                     std.log.warn("full_text open failed step=projection_provenance name={s} err={s}", .{
                         cfg.name,
                         @errorName(err),
@@ -23058,7 +23107,11 @@ pub const IndexManager = struct {
     /// and publication of the returned reader/envelope stamp.
     pub fn alignRowDerivedArtifactCatalogNoLock(self: *IndexManager, txn: anytype, expected: @import("../artifact_inventory.zig").Catalogs, configs: []const types.IndexConfig) !CatalogReaderStamp {
         if (self.count() != configs.len or self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len != configs.len or self.resolvers.items.len != 0 or self.failed_index_loads.count() != 0) return error.ArtifactCatalogDrift;
-        const desired_format = if (expected.resolvers.len == 0) 1 else try resolver_catalog.catalogReaderVersion(self.alloc, expected.resolvers);
+        const desired_encoding: resolver_catalog.CatalogEncoding = if (expected.resolvers.len == 0)
+            .{ .minimum_reader_version = 1, .projection_dictionary = false }
+        else
+            try resolver_catalog.catalogEncoding(self.alloc, expected.resolvers);
+        const desired_format = desired_encoding.minimum_reader_version;
         const current_reader = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
         const current_resolvers = txn.get(resolver_catalog_key) catch |err| switch (err) {
             error.NotFound => "[]",
@@ -23078,7 +23131,7 @@ pub const IndexManager = struct {
         } else {
             // Retired definitions remain part of the durable identity. This
             // path may align their envelope, never replace unloaded contracts.
-            const loaded = try resolver_catalog.serializeCatalogWithMinimumVersion(self.alloc, self.retired_resolvers.items, desired_format);
+            const loaded = try resolver_catalog.serializeCatalogWithEncoding(self.alloc, self.retired_resolvers.items, desired_encoding);
             defer self.alloc.free(loaded);
             if (!std.mem.eql(u8, expected.resolvers, loaded)) return error.ArtifactCatalogDrift;
         }
@@ -23139,7 +23192,7 @@ pub const IndexManager = struct {
             };
         }
         try @import("../artifact_inventory.zig").refresh(txn);
-        return .{ .reader = reader_version, .format = desired_format };
+        return .{ .reader = reader_version, .format = desired_format, .projection_dictionary = desired_encoding.projection_dictionary };
     }
 
     pub fn matchesArtifactInventory(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
@@ -23715,11 +23768,12 @@ pub const IndexManager = struct {
         self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
     }
 
-    const CatalogReaderStamp = struct { reader: u32, format: u32 };
+    const CatalogReaderStamp = struct { reader: u32, format: u32, projection_dictionary: bool };
 
     /// Publish only after durability, while retaining the catalog publication fence.
     pub fn publishCatalogReaderStamp(self: *IndexManager, stamp: CatalogReaderStamp) void {
         self.resolver_catalog_format_version.store(stamp.format, .release);
+        self.resolver_catalog_projection_dictionary.store(stamp.projection_dictionary, .release);
         self.minimum_reader_version.store(stamp.reader, .release);
     }
 
@@ -23772,7 +23826,8 @@ pub const IndexManager = struct {
         // manager's catalog mutation. Such a durable increase is permanent;
         // the old envelope already accounts for the reservation's own fence.
         const independently_raised = if (current > prior_format) current else 1;
-        const authoritative = @max(independently_raised, @max(graph_version, @max(producer_version, @max(baseline, try resolver_catalog.catalogReaderVersion(self.alloc, catalog)))));
+        const encoding = try resolver_catalog.catalogEncoding(self.alloc, catalog);
+        const authoritative = @max(independently_raised, @max(graph_version, @max(producer_version, @max(baseline, encoding.minimum_reader_version))));
         var pending_version: u32 = 1;
         {
             var cursor = try txn.openCursor();
@@ -23795,7 +23850,7 @@ pub const IndexManager = struct {
         // Pre-epoch libraries ignore minimum_reader_version, but their strict
         // array parser rejects a versioned resolver envelope. Publish both
         // fences atomically; restore the plain array when the last shadow ends.
-        const catalog_version = try resolver_catalog.catalogReaderVersion(self.alloc, catalog);
+        const catalog_version = encoding.minimum_reader_version;
         const fenced_catalog = if ((pending and catalog_version == 1) or (version >= resolver_catalog.graph_expiration_namespace_reader_version and catalog_version < version))
             try resolver_catalog.versionedCatalog(self.alloc, catalog, version)
         else
@@ -23821,7 +23876,9 @@ pub const IndexManager = struct {
         if (pending) {
             try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(@max(authoritative, if (upgraded) version else 1)));
         } else if (baseline_raw != null) try txn.delete(replacement_reader_base_key);
-        return .{ .reader = version, .format = if (fenced_catalog != null or upgraded) version else catalog_version };
+        // versionedCatalog changes only the reader fence: it preserves an
+        // object's dictionary and wraps a legacy array without inventing one.
+        return .{ .reader = version, .format = if (fenced_catalog != null or upgraded) version else catalog_version, .projection_dictionary = encoding.projection_dictionary };
     }
 
     /// Permanent requirements exclude a temporary reservation fence. Parent
@@ -23867,6 +23924,7 @@ pub const IndexManager = struct {
         if (fenced != null) try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(required));
         const version = @max(current, required);
         try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(version));
+        var encoding: ?resolver_catalog.CatalogEncoding = null;
         if (version >= resolver_catalog.graph_expiration_namespace_reader_version) {
             const catalog = txn.get(resolver_catalog_key) catch |err| switch (err) {
                 error.NotFound => "[]",
@@ -23874,13 +23932,15 @@ pub const IndexManager = struct {
             };
             const fenced_catalog = try resolver_catalog.versionedCatalog(self.alloc, catalog, version);
             defer self.alloc.free(fenced_catalog);
+            encoding = try resolver_catalog.catalogEncoding(self.alloc, fenced_catalog);
             try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, fenced_catalog);
             try txn.put(resolver_catalog_key, fenced_catalog);
             try @import("../artifact_inventory.zig").refresh(&txn);
         }
         try txn.commit();
         if (version >= resolver_catalog.graph_expiration_namespace_reader_version) {
-            self.resolver_catalog_format_version.store(version, .release);
+            self.resolver_catalog_format_version.store(encoding.?.minimum_reader_version, .release);
+            self.resolver_catalog_projection_dictionary.store(encoding.?.projection_dictionary, .release);
             self.invalidateWritePlanSnapshot();
         }
         self.minimum_reader_version.store(version, .release);
@@ -23897,14 +23957,16 @@ pub const IndexManager = struct {
         const data = txn.get(resolver_catalog_key) catch |err| switch (err) {
             error.NotFound => {
                 self.resolver_catalog_format_version.store(1, .release);
+                self.resolver_catalog_projection_dictionary.store(false, .release);
                 return;
             },
             else => return err,
         };
 
-        const format = try resolver_catalog.catalogReaderVersion(self.alloc, data);
-        self.resolver_catalog_format_version.store(format, .release);
-        self.minimum_reader_version.store(@max(stamped_version, format), .release);
+        const encoding = try resolver_catalog.catalogEncoding(self.alloc, data);
+        self.resolver_catalog_format_version.store(encoding.minimum_reader_version, .release);
+        self.resolver_catalog_projection_dictionary.store(encoding.projection_dictionary, .release);
+        self.minimum_reader_version.store(@max(stamped_version, encoding.minimum_reader_version), .release);
         const configs = try resolver_catalog.deserializeCatalog(self.alloc, data);
         defer {
             for (configs) |*cfg| cfg.deinit(self.alloc);
@@ -23975,7 +24037,10 @@ pub const IndexManager = struct {
     fn serializeResolverDefinitions(self: *const IndexManager, alloc: Allocator) ![]u8 {
         const definitions = try self.resolverDefinitionsAlloc(alloc);
         defer alloc.free(definitions);
-        return resolver_catalog.serializeCatalogWithMinimumVersion(alloc, definitions, self.resolver_catalog_format_version.load(.acquire));
+        return resolver_catalog.serializeCatalogWithEncoding(alloc, definitions, .{
+            .minimum_reader_version = self.resolver_catalog_format_version.load(.acquire),
+            .projection_dictionary = self.resolver_catalog_projection_dictionary.load(.acquire),
+        });
     }
 
     /// Mutation stamping derives permanent requirements from definitions and
@@ -37033,6 +37098,9 @@ const TextProjectionProvenance = struct {
     // Semantic revisions belong to durable generation identity, independently
     // of public schema versions and the metadata codec's envelope version.
     fn fromRuntimeSchemaRevision(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32) !TextProjectionProvenance {
+        return fromRuntimeSchemaSemantics(alloc, cfg, schema, named_autocomplete_revision, 4);
+    }
+    fn fromRuntimeSchemaSemantics(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32, exclusion_revision: u32) !TextProjectionProvenance {
         // Field-selective projection uses the second semantic witness. Give
         // only those generations a new durable witness so an
         // existing whole-document posting set cannot be interpreted as if it
@@ -37052,6 +37120,58 @@ const TextProjectionProvenance = struct {
             std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
             std.mem.writeInt(u32, witness[8..12], named_autocomplete_revision, .little);
             schema_fingerprint = std.hash.Wyhash.hash(0x4154414e414c595a, &witness);
+        }
+        if (exclusion_revision != 0 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| for (value.exact_fields) |root| {
+                if (root.mapping.do_index or !std.mem.eql(u8, root.field, root.source_field)) continue;
+                const source = for (value.full_text_documents) |document| {
+                    if (for (document.fields) |field| {
+                        if (std.mem.eql(u8, field.path, root.source_field)) break true;
+                    } else false) break true;
+                } else false;
+                const subfields = for (value.exact_fields) |field| {
+                    if (field.mapping.do_index and !std.mem.eql(u8, field.field, field.source_field) and std.mem.eql(u8, field.source_field, root.source_field)) break true;
+                } else false;
+                if (!source and !subfields) continue;
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], 1, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
+                break;
+            };
+        }
+        if (exclusion_revision >= 2 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| if (schema_mod.hasHistoricalDeclaredTextExclusions(value)) {
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], 2, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
+            };
+        }
+        if (exclusion_revision >= 3 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| if (schema_mod.hasCrossDocumentTextExclusions(value)) {
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], 3, .little);
+                var policy = std.hash.Wyhash.init(0x4146444953580003);
+                policy.update(&witness);
+                for (value.full_text_documents) |document| {
+                    const bytes = try std.json.Stringify.valueAlloc(alloc, .{ .name = document.name, .rules = document.physical_exact_fields }, .{});
+                    defer alloc.free(bytes);
+                    policy.update(bytes);
+                }
+                schema_fingerprint = policy.final();
+            };
+        }
+        if (exclusion_revision >= 4) {
+            if (schema) |value| for (value.index_sort) |field| {
+                const mapping = schema_mod.resolveDeclaredFieldType(value, field.field) orelse continue;
+                if (mapping.missing_null_policy != .nulls_ordered) continue;
+                var witness: [8]u8 = undefined;
+                std.mem.writeInt(u64, &witness, schema_fingerprint, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x41464e554c4c0002, &witness);
+                break;
+            };
         }
         return .{
             .coverage_generation = coverageGenerationForConfig(cfg),
@@ -37152,6 +37272,7 @@ fn ensureTextProjectionProvenance(
     alloc: Allocator,
     persistent: *persistent_mod.PersistentIndex,
     expected: TextProjectionProvenance,
+    historical: [4]TextProjectionProvenance,
     read_only: bool,
 ) !void {
     const encoded = try persistent.readGenerationMetadataAlloc(
@@ -37163,6 +37284,11 @@ fn ensureTextProjectionProvenance(
     if (persisted != null and persisted.?.eql(expected)) return;
 
     if (persistent.hasPhysicalSegments()) {
+        // Only the exact prior projection witness authorizes an automatic
+        // private replacement. Unknown drift remains manual repair debt.
+        if (persisted) |witness| for (historical) |prior| {
+            if (!prior.eql(expected) and witness.eql(prior)) return error.TextProjectionUpgradeRequired;
+        };
         // There is no trustworthy upgrade witness for legacy postings. Keep
         // the configured index visible through load status, but do not attach
         // analyzers that may interpret its postings under different semantics.
@@ -37298,6 +37424,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
                 const missing_null_policy: schema_mod.MissingNullPolicy = if (version >= 3) blk_policy: {
                     const value: schema_mod.MissingNullPolicy = switch (data[pos]) {
                         0 => .missing_rejected,
+                        1 => .nulls_ordered,
                         else => return error.InvalidIndexCatalog,
                     };
                     pos += 1;
@@ -49748,6 +49875,47 @@ test "ordered artifact inventory TTL replacement retains temporary envelope with
     }
 }
 
+test "loaded resolver envelopes preserve inventory and completion identity with optional dictionaries" {
+    const a = std.testing.allocator;
+    const inventory = @import("../artifact_inventory.zig");
+    for ([_]bool{ false, true }) |dictionary| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+        defer a.free(path);
+        var store = try docstore_mod.DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        const index_data = try serializeCatalog(a, &manager);
+        defer a.free(index_data);
+        const resolver_data = if (dictionary) "{\"version\":4,\"resolvers\":[],\"projections\":{}}" else "{\"version\":4,\"resolvers\":[]}";
+        var runtime_store = try initRuntimeStore(a, &store);
+        defer runtime_store.deinit();
+        {
+            var txn = try runtime_store.store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(index_catalog_key, index_data);
+            try txn.put(enrichment_catalog_key, "[]");
+            try txn.put(resolver_catalog_key, resolver_data);
+            try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(4));
+            try inventory.refresh(&txn);
+            try txn.commit();
+        }
+        try manager.loadResolverCatalog(&store);
+        var read = try runtime_store.store.beginRead();
+        defer read.abort();
+        _ = try inventory.local(&read);
+        const catalogs = try inventory.catalogs(&read);
+        try std.testing.expectEqualStrings(resolver_data, catalogs.resolvers);
+        try std.testing.expect(try manager.matchesArtifactInventory(catalogs));
+        var snapshot = try manager.acquireWritePlanSnapshot();
+        defer snapshot.release();
+        try std.testing.expect(snapshot.plan().matchesArtifactInventory(catalogs));
+        try std.testing.expectEqual(catalogs.digest(), snapshot.plan().completion_plan.?.catalog);
+    }
+}
+
 fn canonicalEnrichmentPart(alloc: Allocator, value: anytype) ![]u8 {
     const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
     defer alloc.free(bytes);
@@ -49941,6 +50109,119 @@ test "index_manager bounded native prepared text publication spills before admis
     std.debug.print("PREPARED_TEXT_SPILL documents={d} peak_bytes={d}\n", .{ documents, stats.peak_bytes });
 }
 
+test "logical query excluded source upgrade fences historical physical postings" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const schema: schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" }} }},
+        .exact_fields = &.{.{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } }},
+    };
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 3 };
+    const historical = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 0);
+    const current = try TextProjectionProvenance.fromRuntimeSchema(a, config, schema);
+    try std.testing.expect(!historical.eql(current));
+    // Released logical epochs include the source. Produce pre-upgrade postings
+    // with the old physical policy, then restore the unchanged logical schema.
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    {
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        const entry = manager.textIndexEntry(config.name).?;
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = true;
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"payload\":\"quasar\"}" }});
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = false;
+        var lease = try entry.persistent.snapshot().leaseSegment(0);
+        defer lease.deinit();
+        var inverted = (try lease.entry.reader.invertedIndexScoped(a, "payload")).?;
+        defer inverted.deinit();
+        try std.testing.expect(try inverted.lookup("quasar") != null);
+        try saveTextProjectionProvenance(&entry.persistent, a, historical);
+    }
+    {
+        var reopened = try IndexManager.init(a, path);
+        defer reopened.deinit();
+        reopened.updateRange(.{ .start = "", .end = "" });
+        try reopened.load(&store);
+        try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+        try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
+    }
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.manual_intervention, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionProvenanceMismatch"));
+    const rebuilt_path = try std.fmt.allocPrint(a, "{s}/rebuilt", .{path});
+    defer a.free(rebuilt_path);
+    var rebuilt = try IndexManager.init(a, rebuilt_path);
+    defer rebuilt.deinit();
+    rebuilt.updateRange(.{ .start = "", .end = "" });
+    try rebuilt.registerReplacementIndex(&store, config);
+    try rebuilt.indexBatch(&store, &.{.{ .key = "old", .value = "{\"payload\":\"quasar\"}" }});
+    var lease = try rebuilt.textIndexEntry(config.name).?.persistent.snapshot().leaseSegment(0);
+    defer lease.deinit();
+    try std.testing.expect((try lease.entry.reader.invertedIndex("payload")) == null);
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, null, 2, 0)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, null)));
+}
+
+test "logical query projection upgrade is discovered by the admitted owner turn" {
+    const a = std.testing.allocator;
+    const DB = @import("../selected_root.zig").db.DB;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projection-owner", .{tmp.sub_path});
+    defer a.free(path);
+    const schema: schema_mod.TableSchema = .{
+        .version = 1,
+        .default_type = "doc",
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+            .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+            .{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" },
+        } }},
+        .exact_fields = &.{.{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } }},
+    };
+    const cfg: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const docs = &.{types.BatchWrite{ .key = "one", .value = "{\"body\":\"quasar\",\"payload\":\"secretpayload\"}" }};
+    {
+        var db = try DB.open(a, path, .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchema(schema);
+        try db.addIndex(cfg);
+        // Drain the live producer before manually simulating historical bytes.
+        try db.batch(.{ .writes = docs, .sync_level = .full_index });
+        const entry = db.core.index_manager.textIndexEntry(cfg.name).?;
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = true;
+        try db.core.index_manager.indexBatch(db.core.store, docs);
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = false;
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, schema, 2, 0));
+    }
+    var db = try DB.open(a, path, .{ .start_optional_runtimes = false });
+    defer db.close();
+    const owner = @import("antfly_source_root").antfly_sources.local_write;
+    const observed = try owner.repairStorageKernelOwnerDb(a, &db, null, false, .{});
+    try std.testing.expectEqual(@as(usize, 1), observed.repair_remaining);
+    try std.testing.expectEqual(@as(usize, 0), (try db.indexRepairIntentSummary(a)).runnable);
+    var completed = false;
+    for (0..64) |_| {
+        const result = try owner.repairStorageKernelOwnerDb(a, &db, null, true, .{});
+        if (result.state == .complete) {
+            completed = true;
+            break;
+        }
+    }
+    try std.testing.expect(completed);
+    const entry = db.core.index_manager.textIndexEntry(cfg.name).?;
+    var lease = try entry.persistent.snapshot().leaseSegment(0);
+    defer lease.deinit();
+    try std.testing.expect((try lease.entry.reader.invertedIndex("body")) != null);
+    try std.testing.expect((try lease.entry.reader.invertedIndex("payload")) == null);
+}
+
 test "model aware media generated dependencies order chunks vectors labels and transcript text" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -50033,4 +50314,101 @@ test "capi resolver reservation removal preserves independently raised native ep
     defer read.abort();
     try std.testing.expectEqual(required, try resolver_catalog.readMinimumReaderVersion(&read, required));
     try std.testing.expectEqual(required, try resolver_catalog.catalogReaderVersion(a, try read.get(resolver_catalog_key)));
+}
+
+test "logical query dynamic template projection upgrades only exact affected witnesses" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const fields = [_]schema_mod.FullTextField{
+        .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+        .{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" },
+    };
+    const schema: schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &fields }},
+        .exact_fields = &.{.{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } }},
+        .dynamic_templates = &.{.{ .name = "numbers", .match_pattern = "*", .match_mapping_type = "number", .mapping = .{ .field_type = .numeric, .do_index = false } }},
+    };
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const prior = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 1);
+    const legacy = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 0);
+    const current = try TextProjectionProvenance.fromRuntimeSchema(a, config, schema);
+    try std.testing.expect(!prior.eql(current) and !legacy.eql(prior));
+    var unaffected = schema;
+    unaffected.dynamic_templates = &.{};
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, unaffected, 2, 1)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, unaffected)));
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    {
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        const entry = manager.textIndexEntry(config.name).?;
+        const document = &@constCast(entry.runtime_schema.?.full_text_documents)[0];
+        const original = document.fields;
+        document.fields = &.{};
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"body\":\"zebrafish\",\"payload\":\"stored-only\"}" }});
+        document.fields = original;
+        var lease = try entry.persistent.snapshot().leaseSegment(0);
+        defer lease.deinit();
+        try std.testing.expect((try lease.entry.reader.invertedIndex("body")) == null);
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, entry.runtime_schema, 2, 1));
+    }
+    var reopened = try IndexManager.init(a, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+    try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
+}
+
+test "logical query nullable ordering projection upgrades only exact affected witnesses" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const schema: schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }},
+        .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .keyword, .sortable = true, .missing_null_policy = .nulls_ordered } }},
+        .index_sort = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+    };
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const prior = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 3);
+    try std.testing.expect(!prior.eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, schema)));
+    var unaffected = schema;
+    unaffected.index_sort = &.{};
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, unaffected, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, unaffected)));
+    var selected = config;
+    selected.config_json = "{\"field\":\"body\"}";
+    try std.testing.expect(!(try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, selected, schema, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, selected, schema)));
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, selected, unaffected, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, selected, unaffected)));
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    {
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"body\":\"quasar\",\"rank\":[\"z\"]}" }});
+        const entry = manager.textIndexEntry(config.name).?;
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, entry.runtime_schema, 2, 3));
+    }
+    var reopened = try IndexManager.init(a, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+    try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
 }

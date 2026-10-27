@@ -48,6 +48,11 @@ func validateCorpusEmbedder(config map[string]any) error {
 		return fmt.Errorf("embedder config must be an object")
 	}
 	for _, key := range []string{"api_key", "bearer_token", "access_token", "credentials", "credentials_json", "credentials_path", "headers"} {
+		if key == "api_key" {
+			if value, ok := config[key].(string); ok && corpusSecretReference(value) {
+				continue
+			}
+		}
 		if _, present := config[key]; present {
 			return fmt.Errorf("embedder config must use server-managed credentials or ADC, not %s", key)
 		}
@@ -93,4 +98,41 @@ func corpusEmbeddingDimensions(config map[string]any) int {
 		}
 	}
 	return 0
+}
+
+func corpusSecretReference(value string) bool {
+	if !strings.HasPrefix(value, "${secret:") || !strings.HasSuffix(value, "}") {
+		return false
+	}
+	key := strings.TrimSuffix(strings.TrimPrefix(value, "${secret:"), "}")
+	if key == "" {
+		return false
+	}
+	for _, c := range key {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._-/", c)) {
+			return false
+		}
+	}
+	return true
+}
+
+func validateCorpusInferenceEndpoint(config map[string]any, endpoint string) error {
+	expected, err := inferenceMLBaseURL(endpoint)
+	if err != nil {
+		return err
+	}
+	for _, key := range []string{"api_url", "url"} {
+		if config[key] == nil {
+			continue
+		}
+		raw, ok := config[key].(string)
+		if !ok {
+			return fmt.Errorf("inference endpoint must be a URL")
+		}
+		actual, err := inferenceMLBaseURL(raw)
+		if err != nil || actual != expected {
+			return fmt.Errorf("inference-secret cannot be bound to a profile with a different inference endpoint")
+		}
+	}
+	return nil
 }

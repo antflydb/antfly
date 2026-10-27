@@ -96,6 +96,8 @@ pub const index_sort_field = "\x00__antfly_index_sort";
 pub const doc_key_range_field = "\x00__antfly_doc_key_range";
 
 pub const SegmentIndexSortField = struct {
+    /// Full producer traversal proves absent typed values are semantic nulls.
+    nulls_complete: bool = false,
     field: []const u8,
     desc: bool = false,
 
@@ -106,6 +108,7 @@ pub const SegmentIndexSortField = struct {
 };
 
 pub const SegmentIndexSortBoundValue = union(enum) {
+    null_value,
     datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
@@ -2077,6 +2080,29 @@ pub const SegmentReader = struct {
         return try decodeIndexSortMetadataAlloc(alloc, section);
     }
 
+    pub fn provesNullIndexSortField(self: *const SegmentReader, name: []const u8) !bool {
+        const bytes = (try self.getSection(index_sort_field, .index_sort)) orelse return false;
+        if (bytes.len < 3 or (bytes[0] != 1 and bytes[0] != 2)) return error.InvalidSegment;
+        const count = std.mem.readInt(u16, bytes[1..3], .big);
+        var pos: usize = 3;
+        var found = false;
+        for (0..count) |_| {
+            if (pos > bytes.len or bytes.len - pos < 3) return error.InvalidSegment;
+            const flags = bytes[pos];
+            if (flags > (if (bytes[0] == 1) @as(u8, 1) else 3)) return error.InvalidSegment;
+            const length = std.mem.readInt(u16, bytes[pos + 1 ..][0..2], .big);
+            pos += 3;
+            if (length == 0 or length > bytes.len - pos) return error.InvalidSegment;
+            if (std.mem.eql(u8, bytes[pos..][0..length], name)) found = flags & 2 != 0;
+            pos += length;
+        }
+        if (pos != bytes.len) return error.InvalidSegment;
+        return found;
+    }
+    pub fn nullSortValue(self: *const SegmentReader, field: []const u8) !SegmentSortValue {
+        if (!try self.provesNullIndexSortField(field)) return error.InvalidSegment;
+        return .null_value;
+    }
     pub fn indexSortBoundsAlloc(self: *const SegmentReader, alloc: Allocator) !?SegmentIndexSortBounds {
         const section = (try self.getSection(index_sort_field, .index_sort_bounds)) orelse return null;
         return try decodeIndexSortBoundsMetadataAlloc(alloc, section);
@@ -2730,11 +2756,19 @@ pub const MergeScratchOptions = struct {
     external_sort_fan_in: usize = 4,
 };
 
+/// Borrowed observer receives authenticated source coordinates in output order.
+/// It owns no payload and can build lineage without an inverse permutation.
+pub const MergeProvenance = struct {
+    ptr: *anyopaque,
+    emit: *const fn (*anyopaque, usize, u32, u32, u32) anyerror!void,
+};
+
 pub const MergeOptions = struct {
     /// Explicitly sort physical inputs that do not advertise the requested
     /// index order. Value domains and source payloads are still validated.
     input_order: enum { index_sorted, arbitrary } = .index_sorted,
     source_map: ?*MergeSourceMap = null,
+    provenance: ?MergeProvenance = null,
     scratch: ?MergeScratchOptions = null,
     index_sort: []const SegmentIndexSortField = &.{},
 };
@@ -2745,6 +2779,7 @@ const MergeDocRef = struct {
 };
 
 const SegmentSortValue = union(enum) {
+    null_value,
     datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
@@ -2773,10 +2808,12 @@ const SegmentSortValueTag = enum {
     bytes_val,
     id,
     numeric_val,
+    null_value,
 };
 
 fn segmentSortValueTag(value: SegmentSortValue) SegmentSortValueTag {
     return switch (value) {
+        .null_value => .null_value,
         .datetime_ns => .datetime_ns,
         .u64_val => .u64_val,
         .i64_val => .i64_val,
@@ -3106,6 +3143,9 @@ const SortedPreparation = struct {
     statistics: []SortedInputStatistics,
     spans: SortedSourceSpans,
     fn init(alloc: Allocator, records: SortedRecords, inputs: []const MergeInput) !@This() {
+        return initWithProvenance(alloc, records, inputs, null);
+    }
+    fn initWithProvenance(alloc: Allocator, records: SortedRecords, inputs: []const MergeInput, observer: ?MergeProvenance) !@This() {
         const stats = try alloc.alloc(SortedInputStatistics, inputs.len);
         errdefer alloc.free(stats);
         @memset(stats, .{});
@@ -3131,11 +3171,15 @@ const SortedPreparation = struct {
                     span.count += 1;
                     continue;
                 }
+                if (observer) |provenance| try provenance.emit(provenance.ptr, span.input, span.first, span.count, @intCast(span.output_start));
                 try spans.append(span.*);
             }
             pending = .{ .output_start = output_start, .input = std.math.cast(u32, ref.input_idx) orelse return error.InvalidSegment, .first = ref.doc_id, .count = 1 };
         }
-        if (pending) |span| try spans.append(span);
+        if (pending) |span| {
+            if (observer) |provenance| try provenance.emit(provenance.ptr, span.input, span.first, span.count, @intCast(span.output_start));
+            try spans.append(span);
+        }
         if (spans.run) |run| try run.seal(0);
         return .{ .statistics = stats, .spans = spans };
     }
@@ -3429,11 +3473,21 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
             try buildSortedMergePlanWithScratch(alloc, inputs, options.index_sort, options.scratch);
         defer plan.deinit(alloc);
         if (hasLiveTypedField(inputs, null)) {
-            const prepared = try SortedPreparation.init(alloc, plan.ordered(), inputs);
+            const prepared = try SortedPreparation.initWithProvenance(alloc, plan.ordered(), inputs, options.provenance);
             plan.statistics = prepared.statistics;
             plan.spans = prepared.spans;
         }
         try writeSortedMergedSegmentToSink(alloc, sink, inputs, options.index_sort, &plan);
+        // Typed merges already emitted coalesced provenance during preparation.
+        // Source-only merges retain their allocation-free traversal.
+        if (plan.statistics == null) if (options.provenance) |observer| {
+            var iterator = plan.ordered().iterator();
+            var output_doc: u32 = 0;
+            while (try iterator.next()) |record| {
+                try observer.emit(observer.ptr, record.ref.input_idx, record.ref.doc_id, 1, output_doc);
+                output_doc += 1;
+            }
+        };
         if (options.source_map) |map| {
             if (plan.file) |file| {
                 try map.adoptFile(file);
@@ -3450,13 +3504,14 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
         return;
     }
     try writeAppendMergedSegmentToSink(alloc, sink, inputs, doc_counts, rank_maps);
-    if (options.source_map) |map| {
+    if (options.source_map != null or options.provenance != null) {
         var output_doc: u32 = 0;
         for (inputs, 0..) |input, input_idx| {
             var live = LiveDocs.init(&input, 0, input.reader.doc_count);
             while (live.next()) |source_doc| {
                 const count: u32 = @intCast(live.end - source_doc);
-                try map.recordRange(input_idx, source_doc, count, output_doc);
+                if (options.source_map) |map| try map.recordRange(input_idx, source_doc, count, output_doc);
+                if (options.provenance) |observer| try observer.emit(observer.ptr, input_idx, source_doc, count, output_doc);
                 output_doc += count;
                 live.seekForward(live.end);
             }
@@ -3486,6 +3541,9 @@ pub fn commonIndexSortForMergeInputsAlloc(alloc: Allocator, inputs: []const Merg
             freeIndexSortFields(alloc, common);
             return &.{};
         }
+        // Ordering and semantic NULL coverage are separate proofs. Append
+        // preserves only the coverage attested by every live input.
+        for (common, fields) |*field, input_field| field.nulls_complete = field.nulls_complete and input_field.nulls_complete;
     }
     if (!found_live_segment) {
         freeIndexSortFields(alloc, common);
@@ -3512,6 +3570,7 @@ fn cloneIndexSortFieldsAlloc(alloc: Allocator, fields: []const SegmentIndexSortF
         cloned[i] = .{
             .field = try alloc.dupe(u8, field.field),
             .desc = field.desc,
+            .nulls_complete = field.nulls_complete,
         };
         initialized += 1;
     }
@@ -3525,6 +3584,41 @@ fn indexSortFieldsEqual(a: []const SegmentIndexSortField, b: []const SegmentInde
         if (!std.mem.eql(u8, field.field, b[i].field)) return false;
     }
     return true;
+}
+
+const AppendSortProof = struct { fields: []const SegmentIndexSortField, bounds: SegmentIndexSortBounds };
+
+/// Concatenation preserves source ordinals. Keep physical-order evidence only
+/// when every live input attests the same order and its full bounds are disjoint
+/// in that order. Deleted endpoints conservatively widen these bounds.
+fn appendSortProofAlloc(a: Allocator, inputs: []const MergeInput) !?AppendSortProof {
+    const fields = try commonIndexSortForMergeInputsAlloc(a, inputs);
+    if (fields.len == 0) return null;
+    var first: ?SegmentIndexSortBounds = null;
+    var previous: ?SegmentIndexSortBounds = null;
+    for (inputs) |input| {
+        if (!inputHasLiveDocs(input)) continue;
+        const bounds = (try input.reader.indexSortBoundsAlloc(a)) orelse return null;
+        if (bounds.first.len != fields.len or bounds.last.len != fields.len) return error.InvalidSegment;
+        if (previous) |prior| {
+            for (prior.last, bounds.first, fields) |left, right, field| {
+                if (left != .null_value and right != .null_value and std.meta.activeTag(left) != std.meta.activeTag(right)) return null;
+                const order = if (right == .null_value) (if (left == .null_value) std.math.Order.eq else .gt) else switch (left) {
+                    .null_value => .lt,
+                    .bytes_val => |v| std.mem.order(u8, v, right.bytes_val),
+                    .id => |v| std.mem.order(u8, v, right.id),
+                    .bool_val => |v| std.math.order(@intFromBool(v), @intFromBool(right.bool_val)),
+                    inline else => |v, tag| std.math.order(v, @field(right, @tagName(tag))),
+                };
+                if (order == .eq) continue;
+                if (if (field.desc) order == .lt else order == .gt) return null;
+                break;
+            }
+        }
+        if (first == null) first = bounds;
+        previous = bounds;
+    }
+    return if (first != null) .{ .fields = fields, .bounds = .{ .first = first.?.first, .last = previous.?.last } } else null;
 }
 
 fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_counts: []const u32, rank_maps: []const inverted.RankDocMap) !void {
@@ -3652,6 +3746,20 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         try built_fields.append(alloc, built_field);
     }
 
+    var ordering_arena = std.heap.ArenaAllocator.init(alloc);
+    defer ordering_arena.deinit();
+    if (try appendSortProofAlloc(ordering_arena.allocator(), inputs)) |proof| {
+        var field = BuiltField{ .name = index_sort_field };
+        errdefer field.deinit(alloc);
+        const metadata = try encodeIndexSortMetadataAlloc(alloc, proof.fields);
+        defer alloc.free(metadata);
+        const bounds = try encodeIndexSortBoundsMetadataAlloc(alloc, proof.bounds);
+        defer alloc.free(bounds);
+        try appendBuiltSection(alloc, sink, &field, .index_sort, metadata);
+        try appendBuiltSection(alloc, sink, &field, .index_sort_bounds, bounds);
+        try built_fields.append(alloc, field);
+    }
+
     const directory = try writePageDirectory(sink);
     const sections_index_offset: u64 = @intCast(sink.len());
     try writePageDirectoryDescriptor(sink, directory);
@@ -3761,7 +3869,7 @@ fn writeSortedMergedSegmentToSink(
         try built_fields.append(alloc, built_field);
     }
 
-    const index_sort_data = try encodeIndexSortMetadataAlloc(alloc, index_sort);
+    const index_sort_data = try encodeIndexSortMetadataCompleteAlloc(alloc, index_sort);
     defer alloc.free(index_sort_data);
     {
         var sort_field = BuiltField{ .name = index_sort_field };
@@ -4640,6 +4748,10 @@ const ExternalCoordinateSort = struct {
                 if (offset >= bytes.len) return error.InvalidSegment;
                 const tag = std.enums.fromInt(SegmentSortValueTag, bytes[offset]) orelse return error.InvalidSegment;
                 offset += 1;
+                if (tag == .null_value) {
+                    key.* = .null_value;
+                    continue;
+                }
                 if (tag == .bool_val) {
                     if (offset >= bytes.len or bytes[offset] > 1) return error.InvalidSegment;
                     key.* = .{ .bool_val = bytes[offset] != 0 };
@@ -4678,7 +4790,7 @@ const ExternalCoordinateSort = struct {
                         offset += size;
                         break :blk if (tag == .id) .{ .id = payload } else .{ .bytes_val = payload };
                     },
-                    .bool_val, .datetime_ns => unreachable,
+                    .bool_val, .datetime_ns, .null_value => unreachable,
                 };
             }
             if (offset != bytes.len) return error.InvalidSegment;
@@ -4692,6 +4804,7 @@ const ExternalCoordinateSort = struct {
             .datetime_ns => 17,
             .bool_val => 2,
             .numeric_val => 10,
+            .null_value => 1,
             .bytes_val => |v| 9 + v.len,
             .id => |v| 9 + v.len,
             else => 9,
@@ -4703,6 +4816,7 @@ const ExternalCoordinateSort = struct {
         try self.spool.appendSlice(&header);
         for (record.keys) |key| {
             try self.spool.appendSlice(&.{@backingInt(segmentSortValueTag(key))});
+            if (key == .null_value) continue;
             if (key == .bool_val) {
                 try self.spool.appendSlice(&.{@intFromBool(key.bool_val)});
                 continue;
@@ -4732,7 +4846,7 @@ const ExternalCoordinateSort = struct {
                         .f64_val => |n| @bitCast(n),
                     };
                 },
-                .bool_val, .datetime_ns => unreachable,
+                .bool_val, .datetime_ns, .null_value => unreachable,
             };
             var encoded: [8]u8 = undefined;
             std.mem.writeInt(u64, &encoded, value, .little);
@@ -5056,6 +5170,7 @@ fn buildStreamingSortedMergePlanWithScratch(alloc: Allocator, inputs: []const Me
 fn validateSortKeyDomains(keys: []const SegmentSortValue, expected: []?SegmentSortValueTag) !void {
     if (keys.len != expected.len) return error.InvalidSegment;
     for (keys, expected) |key, *domain| {
+        if (key == .null_value) continue;
         const tag = segmentSortValueTag(key);
         if (domain.*) |existing| {
             if (existing != tag) return error.InvalidSegment;
@@ -5125,7 +5240,7 @@ const StreamingSortReads = struct {
     fn key(self: *StreamingSortReads, payload_alloc: Allocator, ref: MergeDocRef, field: []const u8) !SegmentSortValue {
         const input = self.inputs[ref.input_idx];
         if (std.mem.eql(u8, field, "_id")) return loadSegmentSortKeyAlloc(payload_alloc, self.reads, input.reader, ref.doc_id, field);
-        const reader = (try self.reads.get(input.reader, field)) orelse return error.UnsupportedTypedDocValues;
+        const reader = (try self.reads.get(input.reader, field)) orelse return input.reader.nullSortValue(field);
         const live = @as(usize, input.reader.doc_count) -| if (input.deleted) |deleted| deleted.cardinality() else 0;
         if (live <= reader.num_chunks) return loadSegmentSortKeyAlloc(payload_alloc, self.reads, input.reader, ref.doc_id, field);
         var found: ?*Entry = null;
@@ -5142,8 +5257,8 @@ const StreamingSortReads = struct {
             found = &self.entries.items[self.entries.items.len - 1];
         }
         const entry = found.?;
-        while (entry.current == null or entry.current.?.doc_id < ref.doc_id) entry.current = (try segmentSortDocValue(entry.cursor.next())) orelse return error.InvalidSegment;
-        if (entry.current.?.doc_id != ref.doc_id) return error.InvalidSegment;
+        while (entry.current == null or entry.current.?.doc_id < ref.doc_id) entry.current = (try segmentSortDocValue(entry.cursor.next())) orelse return input.reader.nullSortValue(field);
+        if (entry.current.?.doc_id != ref.doc_id) return input.reader.nullSortValue(field);
         return switch (entry.current.?.value) {
             .datetime_ns => |ns| .{ .datetime_ns = ns },
             .u64_val => |v| .{ .numeric_val = .{ .u64_val = v } },
@@ -5193,25 +5308,25 @@ fn loadSegmentSortKeyAlloc(
     field: []const u8,
 ) !SegmentSortValue {
     if (std.mem.eql(u8, field, "_id")) {
-        return .{ .id = (try reader.storedIdAlloc(alloc, doc_id)) orelse return error.InvalidSegment };
+        return .{ .id = (try reader.storedIdAlloc(alloc, doc_id)) orelse return reader.nullSortValue(field) };
     }
-    const dv_reader = (try reads.get(reader, field)) orelse return error.UnsupportedTypedDocValues;
+    const dv_reader = (try reads.get(reader, field)) orelse return reader.nullSortValue(field);
     return switch (dv_reader.value_type) {
-        .datetime_ns => .{ .datetime_ns = (try segmentSortDocValue(dv_reader.getDateTimeNs(doc_id))) orelse return error.InvalidSegment },
+        .datetime_ns => .{ .datetime_ns = (try segmentSortDocValue(dv_reader.getDateTimeNs(doc_id))) orelse return reader.nullSortValue(field) },
         // Normalize legacy scalar numeric columns into the exact tagged
         // domain before comparing sort keys. This keeps sorted compaction
         // valid across an on-disk format rollout without rounding integers.
-        .u64_val => .{ .numeric_val = .{ .u64_val = (try segmentSortDocValue(dv_reader.getU64(doc_id))) orelse return error.InvalidSegment } },
-        .i64_val => .{ .numeric_val = .{ .i64_val = (try segmentSortDocValue(dv_reader.getI64(doc_id))) orelse return error.InvalidSegment } },
+        .u64_val => .{ .numeric_val = .{ .u64_val = (try segmentSortDocValue(dv_reader.getU64(doc_id))) orelse return reader.nullSortValue(field) } },
+        .i64_val => .{ .numeric_val = .{ .i64_val = (try segmentSortDocValue(dv_reader.getI64(doc_id))) orelse return reader.nullSortValue(field) } },
         .f64_val => blk: {
-            const value = (try segmentSortDocValue(dv_reader.getF64(doc_id))) orelse return error.InvalidSegment;
+            const value = (try segmentSortDocValue(dv_reader.getF64(doc_id))) orelse return reader.nullSortValue(field);
             if (!std.math.isFinite(value)) return error.InvalidSegment;
             break :blk .{ .numeric_val = .{ .f64_val = value } };
         },
-        .bool_val => .{ .bool_val = (try segmentSortDocValue(dv_reader.getBool(doc_id))) orelse return error.InvalidSegment },
-        .bytes_val => .{ .bytes_val = (try segmentSortDocValue(dv_reader.getBytesAllocWithAllocator(alloc, doc_id))) orelse return error.InvalidSegment },
+        .bool_val => .{ .bool_val = (try segmentSortDocValue(dv_reader.getBool(doc_id))) orelse return reader.nullSortValue(field) },
+        .bytes_val => .{ .bytes_val = (try segmentSortDocValue(dv_reader.getBytesAllocWithAllocator(alloc, doc_id))) orelse return reader.nullSortValue(field) },
         .geo_point => return error.UnsupportedTypedDocValues,
-        .numeric_val => .{ .numeric_val = (try segmentSortDocValue(dv_reader.getNumeric(doc_id))) orelse return error.InvalidSegment },
+        .numeric_val => .{ .numeric_val = (try segmentSortDocValue(dv_reader.getNumeric(doc_id))) orelse return reader.nullSortValue(field) },
     };
 }
 
@@ -5233,7 +5348,9 @@ fn sortedMergeRecordLessThan(index_sort: []const SegmentIndexSortField, a: Sorte
 }
 
 fn compareSegmentSortValues(a: SegmentSortValue, b: SegmentSortValue) std.math.Order {
+    if (b == .null_value) return if (a == .null_value) .eq else .gt;
     return switch (a) {
+        .null_value => .lt,
         .datetime_ns => |av| if (b == .datetime_ns) std.math.order(av, b.datetime_ns) else .lt,
         .u64_val => |av| switch (b) {
             .u64_val => |bv| std.math.order(av, bv),
@@ -5307,6 +5424,7 @@ fn segmentBoundValuesFromSortValuesAlloc(
 
 fn segmentBoundValueFromSortValueAlloc(alloc: Allocator, value: SegmentSortValue) !SegmentIndexSortBoundValue {
     return switch (value) {
+        .null_value => .null_value,
         .datetime_ns => |ns| .{ .datetime_ns = ns },
         .u64_val => |v| .{ .u64_val = v },
         .i64_val => |v| .{ .i64_val = v },
@@ -5914,9 +6032,15 @@ fn writeMergedDocOrdinals(alloc: Allocator, sink: *SegmentSink, inputs: []const 
     return true;
 }
 
-const index_sort_metadata_version: u8 = 1;
+const index_sort_metadata_version: u8 = 2;
 const index_sort_bounds_metadata_version: u8 = 1;
 
+fn encodeIndexSortMetadataCompleteAlloc(a: Allocator, fields: []const SegmentIndexSortField) ![]u8 {
+    const annotated = try a.dupe(SegmentIndexSortField, fields);
+    defer a.free(annotated);
+    for (annotated) |*field| field.nulls_complete = true;
+    return encodeIndexSortMetadataAlloc(a, annotated);
+}
 fn encodeIndexSortMetadataAlloc(alloc: Allocator, fields: []const SegmentIndexSortField) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -5924,7 +6048,7 @@ fn encodeIndexSortMetadataAlloc(alloc: Allocator, fields: []const SegmentIndexSo
     try appendU16BE(alloc, &out, @intCast(fields.len));
     for (fields) |field| {
         if (field.field.len == 0 or field.field.len > std.math.maxInt(u16)) return error.InvalidSegment;
-        try out.append(alloc, if (field.desc) 1 else 0);
+        try out.append(alloc, @as(u8, if (field.desc) 1 else 0) | @as(u8, if (field.nulls_complete) 2 else 0));
         try appendU16BE(alloc, &out, @intCast(field.field.len));
         try out.appendSlice(alloc, field.field);
     }
@@ -5933,7 +6057,7 @@ fn encodeIndexSortMetadataAlloc(alloc: Allocator, fields: []const SegmentIndexSo
 
 fn decodeIndexSortMetadataAlloc(alloc: Allocator, data: []const u8) ![]SegmentIndexSortField {
     if (data.len < 3) return error.InvalidSegment;
-    if (data[0] != index_sort_metadata_version) return error.UnsupportedVersion;
+    if (data[0] != 1 and data[0] != index_sort_metadata_version) return error.UnsupportedVersion;
     var pos: usize = 1;
     const field_count = std.mem.readInt(u16, data[pos..][0..2], .big);
     pos += 2;
@@ -5945,16 +6069,15 @@ fn decodeIndexSortMetadataAlloc(alloc: Allocator, data: []const u8) ![]SegmentIn
     }
     for (0..field_count) |i| {
         if (pos + 3 > data.len) return error.InvalidSegment;
-        const desc = switch (data[pos]) {
-            0 => false,
-            1 => true,
-            else => return error.InvalidSegment,
-        };
+        const flags = data[pos];
+        if (flags > (if (data[0] == 1) @as(u8, 1) else 3)) return error.InvalidSegment;
+        const desc = flags & 1 != 0;
         pos += 1;
         const name_len = std.mem.readInt(u16, data[pos..][0..2], .big);
         pos += 2;
         if (name_len == 0 or pos + name_len > data.len) return error.InvalidSegment;
         fields[i] = .{
+            .nulls_complete = flags & 2 != 0,
             .field = try alloc.dupe(u8, data[pos..][0..name_len]),
             .desc = desc,
         };
@@ -5983,6 +6106,7 @@ fn encodeIndexSortBoundTuple(
 ) !void {
     for (values) |value| {
         switch (value) {
+            .null_value => try out.append(alloc, 7),
             .datetime_ns => |v| {
                 try out.append(alloc, 6);
                 var bytes: [16]u8 = undefined;
@@ -6062,6 +6186,7 @@ fn decodeIndexSortBoundTupleAlloc(
         const tag = data[pos.*];
         pos.* += 1;
         values[i] = switch (tag) {
+            7 => .null_value,
             0 => blk: {
                 if (pos.* + 8 > data.len) return error.InvalidSegment;
                 const value = std.mem.readInt(u64, data[pos.*..][0..8], .big);
@@ -12429,4 +12554,161 @@ test "postings run read cache preserves four warm pages under tight budgets" {
         }
         try std.testing.expectEqual(@as(usize, 0), budget.live);
     }
+}
+
+test "observed physical ordering survives append compaction only for monotone bounds" {
+    const a = std.testing.allocator;
+    const intro = @import("introducer.zig");
+    const fields = [_]SegmentIndexSortField{ .{ .field = "rank" }, .{ .field = "_id" } };
+    const first = try intro.buildSegmentFromTextWithAnalysisOptions(a, &.{
+        .{ .id = "a", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "b", .stored_data = "{\"rank\":3}", .text_fields = &.{} },
+    }, &@import("search/analysis.zig").default_analyzer, .{}, .{ .index_sort = &fields });
+    defer a.free(first);
+    const second = try intro.buildSegmentFromTextWithAnalysisOptions(a, &.{
+        .{ .id = "c", .stored_data = "{\"rank\":4}", .text_fields = &.{} },
+        .{ .id = "d", .stored_data = "{\"rank\":6}", .text_fields = &.{} },
+    }, &@import("search/analysis.zig").default_analyzer, .{}, .{ .index_sort = &fields });
+    defer a.free(second);
+    for (0..2) |reverse| {
+        const merged = try mergeSegments(a, if (reverse == 0) &.{ first, second } else &.{ second, first });
+        defer a.free(merged);
+        var reader = try SegmentReader.init(a, merged);
+        defer reader.deinit();
+        const order = try reader.indexSortFieldsAlloc(a);
+        defer if (order) |owned| freeIndexSortFields(a, owned);
+        try std.testing.expectEqual(reverse == 0, order != null);
+        try std.testing.expectEqualStrings(if (reverse == 0) "a" else "c", (try reader.storedDoc(0)).?.id);
+        if (reverse == 0) {
+            var bounds = (try reader.indexSortBoundsAlloc(a)).?;
+            defer bounds.deinit(a);
+            try std.testing.expectEqual(@as(f64, 1), bounds.first[0].f64_val);
+            try std.testing.expectEqual(@as(f64, 6), bounds.last[0].f64_val);
+        }
+    }
+}
+
+test "observed physical ordering append intersects semantic NULL completeness" {
+    const a = std.testing.allocator;
+    for (0..4) |proofs| {
+        var bytes: [2][]u8 = undefined;
+        var readers: [2]SegmentReader = undefined;
+        var opened: usize = 0;
+        defer for (0..opened) |i| {
+            readers[i].deinit();
+            a.free(bytes[i]);
+        };
+        for (0..2) |i| {
+            var writer = SegmentWriter.init(a);
+            defer writer.deinit();
+            try writer.addStoredDoc(if (i == 0) "a" else "b", if (i == 0) "{\"rank\":42}" else "{\"rank\":43}");
+            const complete = proofs & (@as(usize, 1) << @intCast(i)) != 0;
+            if (i == 1 or complete) {
+                var values = typed_dv.TypedDocValuesWriter.init(a, .i64_val, 1024);
+                defer values.deinit();
+                try values.add(0, .{ .i64_val = @intCast(42 + i) });
+                const data = try values.build();
+                defer a.free(data);
+                try writer.addSection(try writer.addField("rank"), .typed_doc_values, data);
+            }
+            var endpoint = [_]SegmentIndexSortBoundValue{ .{ .i64_val = @intCast(42 + i) }, .{ .id = if (i == 0) "a" else "b" } };
+            try writer.addIndexSortMetadataWithBounds(&.{ .{ .field = "rank", .nulls_complete = complete }, .{ .field = "_id", .nulls_complete = true } }, .{ .first = &endpoint, .last = &endpoint });
+            bytes[i] = try writer.build();
+            readers[i] = try SegmentReader.init(a, bytes[i]);
+            opened += 1;
+            try std.testing.expectEqual(complete, try readers[i].provesNullIndexSortField("rank"));
+        }
+        const merged = try mergeSegmentInputs(a, &.{ .{ .reader = &readers[0] }, .{ .reader = &readers[1] } });
+        defer a.free(merged);
+        var result = try SegmentReader.init(a, merged);
+        defer result.deinit();
+        // Endpoint order says nothing about an unproven typed gap: rank=42
+        // in stored source must not acquire a semantic NULL witness on append.
+        try std.testing.expectEqual(proofs == 3, try result.provesNullIndexSortField("rank"));
+        try std.testing.expect(try result.provesNullIndexSortField("_id"));
+        var values = (try result.typedDocValuesScoped(a, "rank")).?;
+        defer values.deinit();
+        try std.testing.expectEqual(if (proofs & 1 != 0) @as(?i64, 42) else null, try values.getI64(0));
+    }
+}
+
+test "public ordering seeks complete ties nullable sorted merge preserves sparse values through spill" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const intro = @import("introducer.zig");
+    const fields = [_]SegmentIndexSortField{ .{ .field = "rank" }, .{ .field = "_id" } };
+    var readers: [2]SegmentReader = undefined;
+    var sources: [2][]u8 = undefined;
+    var opened: usize = 0;
+    defer for (0..opened) |i| {
+        readers[i].deinit();
+        a.free(sources[i]);
+    };
+    for (0..2) |source| {
+        const docs = try out.alloc(intro.TextDocument, 64);
+        for (docs, 0..) |*doc, i| doc.* = .{ .id = try std.fmt.allocPrint(out, "source-{d}-row-{d:0>3}", .{ source, i }), .stored_data = if (i < 32) "{\"rank\":null}" else try std.fmt.allocPrint(out, "{{\"rank\":{d}}}", .{source * 64 + i - 32}), .text_fields = &.{} };
+        sources[source] = try intro.buildSegmentFromTextWithAnalysisOptions(a, docs, &@import("search/analysis.zig").default_analyzer, .{}, .{ .index_sort = &fields });
+        readers[source] = try SegmentReader.init(a, sources[source]);
+        opened += 1;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    const inputs = [_]MergeInput{ .{ .reader = &readers[0] }, .{ .reader = &readers[1] } };
+    for ([_]bool{ false, true }) |spill| {
+        const bytes = try mergeSegmentInputsWithOptions(a, &inputs, .{ .input_order = .arbitrary, .index_sort = &fields, .scratch = if (spill) .{ .io = std.testing.io, .directory = directory, .in_memory_plan_bytes = 0, .external_sort_chunk_documents = 3 } else null });
+        defer a.free(bytes);
+        var reader = try SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(u32, 128), reader.doc_count);
+        try std.testing.expect(try reader.provesNullIndexSortField("rank"));
+        var values = (try reader.typedDocValuesScoped(a, "rank")).?;
+        defer values.deinit();
+        for (0..128) |i| {
+            const value = try values.getF64(@intCast(i));
+            if (i < 64) try std.testing.expect(value == null) else try std.testing.expectEqual(@as(?f64, @floatFromInt(if (i < 96) i - 64 else i - 32)), value);
+        }
+        var bounds = (try reader.indexSortBoundsAlloc(a)).?;
+        defer bounds.deinit(a);
+        try std.testing.expect(bounds.first[0] == .null_value);
+        try std.testing.expectEqual(@as(f64, 95), bounds.last[0].f64_val);
+    }
+}
+
+test "merge provenance fuses typed preparation and coalesces contiguous source runs" {
+    const a = std.testing.allocator;
+    const Observe = struct {
+        calls: usize = 0,
+        rows: u32 = 0,
+        fail: bool = false,
+        fn emit(raw: *anyopaque, input: usize, source: u32, count: u32, output: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail and self.calls == 1) return error.Canceled;
+            try std.testing.expectEqual(self.rows, output);
+            try std.testing.expectEqual(@as(u32, 256), count);
+            try std.testing.expectEqual(self.calls % 2, input);
+            try std.testing.expectEqual(@as(u32, @intCast(self.calls / 2 * 256)), source);
+            self.calls += 1;
+            self.rows += count;
+        }
+    };
+    // Preparation reads only the already-authenticated input document counts.
+    var readers: [2]SegmentReader = undefined;
+    for (&readers) |*reader| reader.doc_count = 4096;
+    const inputs = [_]MergeInput{ .{ .reader = &readers[0] }, .{ .reader = &readers[1] } };
+    const records = try a.alloc(SortedMergeDoc, 8192);
+    defer a.free(records);
+    for (records, 0..) |*record, i| record.* = .{ .ref = .{ .input_idx = i / 256 % 2, .doc_id = @intCast(i / 512 * 256 + i % 256) } };
+    var observed: Observe = .{};
+    var prepared = try SortedPreparation.initWithProvenance(a, asSortedRecords(records), &inputs, .{ .ptr = &observed, .emit = Observe.emit });
+    defer prepared.deinit(a);
+    try std.testing.expectEqual(@as(usize, 32), observed.calls);
+    try std.testing.expectEqual(@as(u32, 8192), observed.rows);
+    try std.testing.expectEqual(@as(usize, 32), prepared.spans.count);
+    std.debug.print("MERGE_PROVENANCE rows=8192 prior_point_callbacks=8192 fused_range_callbacks={d} extra_plan_passes=0\n", .{observed.calls});
+    var failed: Observe = .{ .fail = true };
+    try std.testing.expectError(error.Canceled, SortedPreparation.initWithProvenance(a, asSortedRecords(records), &inputs, .{ .ptr = &failed, .emit = Observe.emit }));
 }

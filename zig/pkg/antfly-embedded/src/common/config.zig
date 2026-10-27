@@ -1618,7 +1618,7 @@ test "common config native artifact storage is independent and capability scoped
         defer alloc.free(json);
         try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, json));
     }
-    const read_only = try std.fmt.allocPrint(alloc, template, .{ "{\"connection\":\"artifacts\",\"bucket\":\"artifact-bucket\",\"prefix\":\"cluster/native-lake-indexes\"}", "lake_read" });
+    const read_only = try std.fmt.allocPrint(alloc, template, .{ "{\"connection\":\"artifacts\",\"bucket\":\"artifact-bucket\",\"prefix\":\"cluster/native-lake-indexes\"}", "lake.read" });
     defer alloc.free(read_only);
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, read_only));
 }
@@ -4136,4 +4136,23 @@ test "public inference deadlines validate server policy and bounded caller metad
         \\{"public_inference":{"max_timeout_ms":-1}}
         ,
     }) |body| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, body));
+}
+
+test "external lake connection capabilities preserve explicit workflow names" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"connections":{"source":{"kind":"external_io","capabilities":["lake.read","lake.write","read","write","restore.read"],"external_io":{"protocol":"filesystem","root":"/tmp/lake"}}}}
+    ;
+    var cfg = try Config.parseFromSlice(a, raw);
+    defer cfg.deinit();
+    const caps = cfg.connections.get("source").?.capabilities;
+    for (caps, [_][]const u8{ "lake.read", "lake.write", "read", "write", "restore.read" }) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
+    const Fault = struct {
+        fn run(out: std.mem.Allocator, input: []const u8) !void {
+            var config = try Config.parseFromSlice(out, input);
+            defer config.deinit();
+            try std.testing.expectEqualStrings("lake.read", config.connections.get("source").?.capabilities[0]);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fault.run, .{raw});
 }

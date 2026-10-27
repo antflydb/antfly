@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "definition": {
+    "schema": {
+      "storage_mode": "relational",
+      "base_source": {
+        "kind": "external",
+        "table_id": "archive-qualification",
+        "format": "parquet",
+        "object_mutability": "immutable",
+        "uri": "file:///replace-with-frozen-source/snapshot.parquet-manifest.json"
+      }
+    }
+  },
+  "indexes": {},
+  "cases": [
+    {
+      "name": "archive_count",
+      "statement": "SELECT count(*) FROM archive_qualification"
+    }
+  ]
+}

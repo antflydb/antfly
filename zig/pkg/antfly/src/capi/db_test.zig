@@ -713,6 +713,40 @@ fn liteLocalEmbeddingModelAvailable(alloc: Allocator) bool {
 // small local embedding model being present under
 // ~/.antfly/inference/models, so this never requires a network call and
 // never fails a machine that has not pulled the model.
+// A scheduler turn may perform only bounded recovery or visit an unrelated
+// namespace. Stop at the requested phase, rather than assuming the first turn
+// reaches provider work or draining away the publication interleaving under test.
+fn MaintenancePhaseDriver(comptime Owner: type) type {
+    return struct {
+        owner: Owner,
+        started: *std.Io.Event,
+        failure: ?anyerror = null,
+        failed: std.atomic.Value(bool) = .init(false),
+        fn advance(self: *@This()) !void {
+            for (0..256) |_| {
+                const pending = try self.owner.maintenanceTurnForTest();
+                if (self.started.isSet()) return;
+                if (!pending) return error.TestMaintenancePhaseNotReached;
+            }
+            return error.TestMaintenancePhaseNotReached;
+        }
+        fn run(self: *@This()) void {
+            self.advance() catch |err| {
+                self.failure = err;
+                self.failed.store(true, .release);
+                self.started.set(shared.handleLockIo());
+            };
+        }
+        fn result(self: *@This()) !void {
+            if (self.failed.load(.acquire)) return self.failure.?;
+        }
+        fn wait(self: *@This()) !void {
+            try self.started.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            try self.result();
+        }
+    };
+}
+
 test "storage-owner reverse callbacks preserve semantic error identity" {
     try std.testing.expectError(
         error.WouldBlock,
@@ -2722,12 +2756,23 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
     defer freeRawBuffer(concurrent_status.ptr, concurrent_status.len);
     try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
-    // Every fresh Lite database now carries the default full-text index,
-    // whose maintenance for the writes above runs in the background. Bring
-    // that work to idle before the vacuum and the physical-tail probes that
-    // follow: the online vacuum waits its turn for the writer slot, but the
-    // junk bytes appended below are only a stable tail if no later
-    // checkpoint extends the file past them.
+    // The remaining probes inject bytes outside the storage API. Debt being
+    // idle is not writer quiescence: a later maintenance checkpoint may still
+    // extend the file and consume the artificial tail between the two copies.
+    // Join this fixture's automatic worker, then drain explicitly before
+    // vacuuming. Keep all native behavior above and every physical-tail,
+    // snapshot, retained-reader and vacuum assertion below.
+    const snapshot_owner = blk: {
+        const guard = public.enterHandle(src_handle, .exclusive).?;
+        defer guard.leave();
+        const owner = guard.connection.?.owner;
+        owner.stopping.store(true, .release);
+        break :blk owner;
+    };
+    snapshot_owner.wake.set(shared.handleLockIo());
+    if (snapshot_owner.worker) |worker| worker.join();
+    snapshot_owner.worker = null;
+    snapshot_owner.stopping.store(false, .release);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(src_handle));
     var online_vacuum: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_vacuum_json(src_handle, &online_vacuum));
@@ -4528,7 +4573,7 @@ test "capi lite defaults embedded generation budgets when no override is given" 
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"scratch_budget_mb\":0") == null);
 }
 
-test "capi lite drains an antfly embedder with no api_url through the embedded inference provider" {
+test "capi local model drains a Lite embedder through the embedded inference provider" {
     if (!capi_build_options.inference_enabled) return error.SkipZigTest;
     if (!lite_backend.capabilitiesForProfile(.native).local_inference_runtime) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -4984,18 +5029,14 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .write });
             connection.maintenance_pending = true;
         }
-        const Background = struct {
-            fn run(c: @TypeOf(connection)) void {
-                _ = c.maintenanceTurnForTest() catch {};
-            }
-        };
-        const background = try std.Thread.spawn(.{}, Background.run, .{connection});
+        var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started };
+        const background = try std.Thread.spawn(.{}, @TypeOf(driver).run, .{&driver});
         var background_joined = false;
         defer if (!background_joined) {
             gate.allowed.set(shared.handleLockIo());
             background.join();
         };
-        try gate.started.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try driver.wait();
         const Foreground = struct {
             handle: ?*anyopaque,
             source_changed: bool,
@@ -5074,6 +5115,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
         writer.join();
         writer_joined = true;
         background_joined = true;
+        try driver.result();
         try std.testing.expect(completed_while_embedding);
         try std.testing.expectEqual(capi.ErrorCode.ok, foreground.status);
         // Publication uses the current owner and validates only its actual inputs.
@@ -5152,6 +5194,51 @@ fn sqlSessionStatement(handle: ?*anyopaque, session_id: u64, statement: []const 
     try std.testing.expectEqual(capi.ErrorCode.ok, status);
 }
 
+test "capi SQL conflict owner probes leave unrelated namespaces unopened" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-conflict-point-catalog");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE target(id TEXT PRIMARY KEY)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE unrelated(id TEXT PRIMARY KEY)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE plain(body TEXT)");
+    try sqlFkRecoveryStatement(handle, "INSERT INTO target(id) VALUES ('existing')");
+    try sqlRefreshCleanGeneration(handle);
+    const guard = public.enterHandle(handle, .exclusive).?;
+    defer guard.leave();
+    const root = guard.handle;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sql = @import("antfly_local_sources").capi_sql;
+    var adapter = sql.Adapter(antfly){ .handle = root, .db = &root.db, .table_name = "default" };
+    const backend = adapter.backend();
+    const table = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "target" }, .write);
+    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), arena.allocator(), table, .{ .columns = &.{"id"} }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), owners.len);
+    try std.testing.expectEqual(@as(usize, 1), root.embedded_tables.count());
+    try std.testing.expect(root.embedded_tables.contains("target"));
+    try std.testing.expect(!root.embedded_tables_discovered);
+    var selected = sql.Adapter(antfly){ .handle = root, .db = &root.embedded_tables.get("target").?.db, .table_name = "target" };
+    const metadata = try selected.localCatalog(arena.allocator(), table.schema_version);
+    try std.testing.expectEqual(@as(usize, 3), metadata.table.len);
+    try std.testing.expectEqual(@as(usize, 1), root.embedded_tables.count());
+    try std.testing.expect(!root.embedded_tables_discovered);
+    _ = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "plain" }, .write);
+    var plain = sql.Adapter(antfly){ .handle = root, .db = &root.embedded_tables.get("plain").?.db, .table_name = "plain" };
+    try std.testing.expect(try plain.localRequiresCoordination());
+    try std.testing.expectEqual(@as(usize, 2), root.embedded_tables.count());
+    try std.testing.expect(!root.embedded_tables.contains("unrelated"));
+}
+
 test "capi SQL refreshed generations retain complete FK catalogs and unqualified indexes" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-refreshed-integrity");
@@ -5178,11 +5265,12 @@ test "capi SQL refreshed generations retain complete FK catalogs and unqualified
     try sqlSessionStatement(handle, session, "DELETE FROM child WHERE id IN (SELECT id FROM child WHERE parent_id='p' ORDER BY id DESC OFFSET 8)");
     try sqlRefreshCleanGeneration(handle);
     try sqlSessionStatement(handle, session, "COMMIT");
-    // Discovery is cached per generation, independently of durable recovery.
+    // Integrity uses the full schema catalog without constructing every
+    // namespace runtime merely to discover inbound constraints.
     {
         const guard = public.enterHandle(handle, .exclusive).?;
         defer guard.leave();
-        try std.testing.expect(guard.handle.embedded_tables_discovered);
+        try std.testing.expect(!guard.handle.embedded_tables_discovered);
         try std.testing.expectEqual(@as(usize, 2), guard.handle.embedded_tables.count());
         try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_ddl_recovery_scans);
     }
@@ -5214,13 +5302,20 @@ test "capi SQL refreshed generations retain complete FK catalogs and unqualified
             var failing = std.testing.FailingAllocator.init(original_alloc, .{ .fail_index = 0 });
             root.alloc = failing.allocator();
             defer root.alloc = original_alloc;
-            try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(arena.allocator(), view.version()));
+            // Metadata enumeration succeeds even when opening a provider is
+            // unavailable. Referencing that owner still fails closed.
+            const metadata = try adapter.localCatalog(arena.allocator(), view.version());
+            try std.testing.expectEqual(@as(usize, 2), metadata.table.len);
+            const backend = adapter.backend();
+            try std.testing.expectError(error.OutOfMemory, backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "parent" }, .read));
             try std.testing.expectEqual(@as(usize, 1), root.embedded_table_errors.count());
         }
+        const backend = adapter.backend();
+        _ = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "parent" }, .read);
         const recovered = try adapter.localCatalog(arena.allocator(), view.version());
         try std.testing.expectEqual(@as(usize, 2), recovered.table.len);
         try std.testing.expectEqual(@as(usize, 0), root.embedded_table_errors.count());
-        try std.testing.expect(root.embedded_tables_discovered);
+        try std.testing.expect(!root.embedded_tables_discovered);
         try std.testing.expectEqual(@as(u64, 0), root.sql_ddl_recovery_scans);
     }
     try sqlRefreshCleanGeneration(handle);
@@ -5325,7 +5420,8 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
     const alloc = std.testing.allocator;
     const Store = @import("antfly_local_sources").storage_lite_docstore.Store;
     for ([_]bool{ false, true }) |independent| {
-        for ([_]Store.MaintenancePhase{ .assessment, .copy }) |phase| {
+        for ([_]Store.MaintenancePhase{ .assessment, .copy, .verification }) |phase| {
+            if (phase == .verification and !independent) continue;
             const Gate = struct {
                 phase: Store.MaintenancePhase,
                 started: std.Io.Event = .unset,
@@ -5382,21 +5478,21 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
                 store.maintenance_policy.options.minimum_reclaim_bytes = 4096;
                 store.maintenance_policy.next_assessment_size = 0;
                 store.test_maintenance_hook = .{ .ptr = &gate, .notify = Gate.notify };
+                if (phase == .verification) {
+                    store.file.free_pages_verified = false;
+                    guard.connection.?.owner.maintenance_pending = true;
+                }
                 break :blk guard.connection.?.owner;
             };
-            const Background = struct {
-                fn run(c: @TypeOf(connection)) void {
-                    _ = c.maintenanceTurnForTest() catch {};
-                }
-            };
+            var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started };
             const before_capture = connection.current.?;
-            const background = try std.Thread.spawn(.{}, Background.run, .{connection});
+            const background = try std.Thread.spawn(.{}, @TypeOf(driver).run, .{&driver});
             var joined = false;
             defer if (!joined) {
                 gate.allowed.set(shared.handleLockIo());
                 background.join();
             };
-            try gate.started.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            try driver.wait();
             // Capture after any short orphan/retirement publication preceding
             // the parked scan. Computation itself must not retire this runtime.
             const foreground_root = if (independent) blk: {
@@ -5427,6 +5523,7 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
             writer.join();
             background.join();
             joined = true;
+            try driver.result();
             try std.testing.expect(completed);
             try std.testing.expectEqual(capi.ErrorCode.ok, foreground.status);
             const guard = public.enterHandle(handle, .exclusive).?;
@@ -5689,18 +5786,14 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
             maintenance_owner.test_after_capture = .{ .ptr = &gate, .notify = Gate.notify };
             break :blk maintenance_owner;
         };
-        const Background = struct {
-            fn run(o: @TypeOf(owner)) void {
-                _ = o.maintenanceTurnForTest() catch {};
-            }
-        };
-        const background = try std.Thread.spawn(.{}, Background.run, .{owner});
+        var driver: MaintenancePhaseDriver(@TypeOf(owner)) = .{ .owner = owner, .started = &gate.started };
+        const background = try std.Thread.spawn(.{}, @TypeOf(driver).run, .{&driver});
         var joined = false;
         defer if (!joined) {
             gate.allowed.set(shared.handleLockIo());
             background.join();
         };
-        try gate.started.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try driver.wait();
         for (0..8) |i| {
             if (mode != .bookkeeping) {
                 const statement = try std.fmt.allocPrint(alloc, "INSERT INTO \"default\" (_id,body) VALUES ('other{d}','unrelated')", .{i});
@@ -5729,6 +5822,7 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
         gate.allowed.set(shared.handleLockIo());
         background.join();
         joined = true;
+        try driver.result();
         owner.test_after_capture = null;
         if (index_changed) {
             try std.testing.expectEqual(error.EnrichmentWaitCanceled, gate.publication_error orelse return error.TestExpectedCancellation);
@@ -5864,6 +5958,7 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
             }
         }
         const Probe = struct {
+            captured: std.Io.Event = .unset,
             handle: ?*anyopaque,
             mode: Mode,
             source: []const u8,
@@ -5872,6 +5967,7 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
             failure: ?anyerror = null,
             fn notify(ptr: *anyopaque, root: *shared.Handle) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.captured.set(shared.handleLockIo());
                 self.run(root) catch |err| {
                     self.failure = err;
                 };
@@ -5940,7 +6036,8 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
         var probe: Probe = .{ .handle = handle, .mode = mode, .source = source, .out = out };
         owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
         owner.maintenance_pending = true;
-        _ = try owner.maintenanceTurnForTest();
+        var driver: MaintenancePhaseDriver(@TypeOf(owner)) = .{ .owner = owner, .started = &probe.captured };
+        try driver.advance();
         owner.test_after_capture = null;
         if (probe.failure) |err| return err;
         try std.testing.expectEqual(mode != .unchanged and mode != .unrelated and mode != .mixed and mode != .repeated, probe.rejection != null);
@@ -5979,12 +6076,14 @@ test "capi SQL maintenance advances every captured full text prefix during stead
         try guard.handle.db.batch(.{ .writes = &.{.{ .key = "original", .value = "{\"body\":\"needle\"}" }}, .sync_level = .write });
     }
     const Append = struct {
+        captured: std.Io.Event = .unset,
         handle: ?*anyopaque,
         count: usize = 0,
         target: u64 = 0,
         failure: ?anyerror = null,
         fn notify(ptr: *anyopaque, root: *shared.Handle) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captured.set(shared.handleLockIo());
             self.target = root.db.core.nextDerivedSequence();
             self.append() catch |err| {
                 self.failure = err;
@@ -6004,7 +6103,9 @@ test "capi SQL maintenance advances every captured full text prefix during stead
     defer owner.test_after_capture = null;
     for (0..4) |_| {
         owner.maintenance_pending = true;
-        _ = try owner.maintenanceTurnForTest();
+        append.captured.reset();
+        var driver: MaintenancePhaseDriver(@TypeOf(owner)) = .{ .owner = owner, .started = &append.captured };
+        try driver.advance();
         if (append.failure) |err| return err;
         // A foreground append moves the tip in every turn. Inspect durable
         // coverage before another maintenance turn or any search/idle drain.
@@ -6052,6 +6153,11 @@ test "capi SQL missing namespace forces coordinated catalog validation" {
     try guard.handle.embedded_table_errors.put(guard.handle.alloc, "broken", "InvalidSchema");
     try std.testing.expect(try adapter.localRequiresCoordination());
     try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(alloc, 1));
+    // A named namespace with missing declarations is equally unavailable;
+    // metadata-only discovery must not silently discard possible constraints.
+    const name = try guard.handle.alloc.dupe(u8, "broken");
+    try guard.handle.embedded_table_records.putNoClobber(guard.handle.alloc, name, 2);
+    try std.testing.expect(try adapter.localRequiresCoordination());
 }
 
 test "capi SQL maintenance capture queues after bounded foreground contention" {
@@ -6467,6 +6573,158 @@ test "capi native resolver maintenance retries transient inference and survives 
     try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
 }
 
+test "capi native foreground reuses free pages during a captured worker turn" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-captured-reuse");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+        const large: [32768]u8 = @splat('x');
+        for (0..16) |_| try file.putCatalogRecord("test/free-pool", &large);
+        try file.deleteCatalogRecord("test/free-pool");
+        _ = try file.reclaimPages(4096);
+        try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 16);
+        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"captured\"}" }}, .sync_level = .write });
+        owner.maintenance_pending = true;
+    }
+    const Fixture = struct {
+        handle: ?*anyopaque,
+        ran: bool = false,
+        failure: ?anyerror = null,
+        fn check(self: *@This()) !void {
+            const guard = public.enterHandle(self.handle, .exclusive).?;
+            defer guard.leave();
+            const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+            const before = (try file.allocatorStats()).?.reused_pages;
+            for (0..4) |i| try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = if (i % 2 == 0) "{\"body\":\"concurrent-a\"}" else "{\"body\":\"concurrent-b\"}" }}, .sync_level = .write });
+            try std.testing.expect((try file.allocatorStats()).?.reused_pages > before);
+        }
+        fn notify(raw: *anyopaque, snapshot: *shared.Handle) void {
+            if (!snapshot.db_live) return;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ran = true;
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var fixture = Fixture{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &fixture, .notify = Fixture.notify };
+    defer owner.test_after_capture = null;
+    _ = try owner.maintenanceTurnForTest();
+    if (fixture.failure) |err| return err;
+    try std.testing.expect(fixture.ran);
+}
+
+test "capi SQL native maintenance carries orphan sweep progress across replay snapshots" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = shared.handleLockIo();
+    const Native = lite_backend.native.NativeFile;
+    var directory = try TestDirectory.init("capi-native-orphan-progress");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    const MovingTip = struct {
+        handle: ?*anyopaque,
+        status: capi.ErrorCode = .ok,
+        fn notify(ptr: *anyopaque, _: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var response: capi.Buffer = .{};
+            self.status = antfly_db_batch_json(self.handle, .fromSlice("{\"inserts\":{\"concurrent\":{\"body\":\"advances the captured tip\"}},\"sync_level\":\"write\"}"), &response);
+            freeRawBuffer(response.ptr, response.len);
+        }
+    };
+    var moving_tip = MovingTip{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &moving_tip, .notify = MovingTip.notify };
+    defer owner.test_after_capture = null;
+    var markers: std.ArrayList(std.Io.File) = .empty;
+    defer {
+        for (markers.items) |file| file.close(io);
+        markers.deinit(a);
+    }
+    // One full bounded page of live leases precedes an abandoned lease.
+    // Restarting the cursor on every changed checkpoint never reaches it.
+    for (0..65) |i| {
+        const id = try std.fmt.allocPrint(a, "{x:0>32}", .{i});
+        defer a.free(id);
+        const key = try std.mem.concat(a, u8, &.{ Native.artifact_lease_key_prefix, id });
+        defer a.free(key);
+        if (i < 64) {
+            const marker_path = try std.fmt.allocPrint(a, "{s}/.aflite-lease-{s}", .{ std.fs.path.dirname(path).?, id });
+            defer a.free(marker_path);
+            const file = try std.Io.Dir.cwd().createFile(io, marker_path, .{ .read = true, .exclusive = true, .lock = .exclusive });
+            errdefer file.close(io);
+            try markers.append(a, file);
+        }
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try guard.handle.owned_lite_backend.?.native_docstore.?.file.putCatalogRecord(key, "retained");
+    }
+    for (0..8) |i| {
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const value = try std.fmt.allocPrint(a, "{{\"turn\":{d}}}", .{i});
+            defer a.free(value);
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .write });
+            owner.maintenance_pending = true;
+        }
+        _ = try owner.maintenanceTurnForTest();
+        try std.testing.expectEqual(capi.ErrorCode.ok, moving_tip.status);
+    }
+    const guard = public.enterHandle(handle, .exclusive).?;
+    defer guard.leave();
+    const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+    const orphan = try std.fmt.allocPrint(a, "{s}{x:0>32}", .{ Native.artifact_lease_key_prefix, @as(usize, 64) });
+    defer a.free(orphan);
+    try std.testing.expectEqual(@as(?[]u8, null), try file.getCatalogRecordAlloc(a, orphan));
+    const retained = (try file.getCatalogRecordAlloc(a, Native.artifact_lease_key_prefix ++ "00000000000000000000000000000000")).?;
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("retained", retained);
+}
+
 test "capi SQL idle native maintenance avoids runtime construction and resumes work" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -6517,7 +6775,21 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
     }
     // Finish any initial reclamation. Later idle polls must reuse the physical
     // store and must neither open a DB runtime nor refresh the foreground DB.
-    for (0..64) |_| if (!try owner.maintenanceTurnForTest()) break;
+    var settled = false;
+    for (0..64) |_| if (!try owner.maintenanceTurnForTest()) {
+        settled = true;
+        break;
+    };
+    if (!settled) {
+        const debts = try owner.current.?.db.listDerivedReplayDebt(a);
+        defer {
+            for (debts) |*debt| debt.deinit(a);
+            a.free(debts);
+        }
+        const manager = owner.current.?.db.core.index_manager;
+        std.debug.print("idle maintenance did not settle: debt={f} lsm_hint={d} lsm_score={d} stats={f}\n", .{ std.json.fmt(debts, .{}), manager.lsmMaintenanceDebtHint(), manager.lsmMaintenanceScore(), std.json.fmt(owner.publication_stats, .{}) });
+    }
+    try std.testing.expect(settled);
     owner.wake.reset();
     const opens = owner.test_runtime_snapshot_opens;
     const settled_replay_sequence = owner.current.?.db.core.nextDerivedSequence();
@@ -6552,7 +6824,8 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         );
         try guard.handle.db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
         try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"indexed after idle\"}" }}, .sync_level = .write });
-        owner.maintenance_pending = true;
+        // No notification: an external owner must discover ordinary index
+        // replay debt after reopen, without relying on a generated producer.
     }
     for (0..64) |_| if (!try owner.maintenanceTurnForTest()) break;
     try std.testing.expect(owner.test_runtime_snapshot_opens > opens);
@@ -6660,6 +6933,26 @@ test "capi lite inference service survives foreground and maintenance snapshots"
     // provider calls. Hold one admitted borrower across every refresh/close.
     var provider_borrow = try service.lifetime.acquire();
     defer provider_borrow.deinit();
+    const Capture = struct {
+        event: std.Io.Event = .unset,
+        service: @TypeOf(service),
+        failure: ?anyerror = null,
+        fn inspect(self: *@This(), snapshot: *shared.Handle) !void {
+            try std.testing.expectEqual(@as(@TypeOf(snapshot.lite_inference), self.service), snapshot.lite_inference);
+            try std.testing.expectEqual(@as(usize, 2), self.service.references.load(.acquire));
+        }
+        fn notify(raw: *anyopaque, snapshot: *shared.Handle) void {
+            if (!snapshot.db_live) return;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect(snapshot) catch |err| {
+                self.failure = err;
+            };
+            self.event.set(shared.handleLockIo());
+        }
+    };
+    var capture: Capture = .{ .service = service };
+    owner.test_after_capture = .{ .ptr = &capture, .notify = Capture.notify };
+    defer owner.test_after_capture = null;
     for (0..4) |i| {
         const statement = try std.fmt.allocPrint(a, "INSERT INTO docs(id,body) VALUES ('{d}','body')", .{i});
         defer a.free(statement);
@@ -6677,8 +6970,14 @@ test "capi lite inference service survives foreground and maintenance snapshots"
         }
         owner.collectRetired();
         owner.maintenance_pending = true;
-        _ = try owner.maintenanceTurnForTest();
-        try std.testing.expectEqual(service, owner.maintenance_snapshot.?.lite_inference.?);
+        capture.event.reset();
+        var driver: MaintenancePhaseDriver(@TypeOf(owner)) = .{ .owner = owner, .started = &capture.event };
+        try driver.advance();
+        if (capture.failure) |err| return err;
+        // Closing the captured DB releases its input fences, while the
+        // reusable maintenance handle retains its shared inference service.
+        const snapshot = owner.maintenance_snapshot orelse return error.TestExpectedMaintenanceSnapshot;
+        try std.testing.expectEqual(@as(@TypeOf(snapshot.lite_inference), service), snapshot.lite_inference);
         try std.testing.expectEqual(service, owner.current.?.lite_inference.?);
         try std.testing.expectEqual(@as(usize, 2), service.references.load(.acquire));
     }
@@ -6853,7 +7152,10 @@ test "capi lite inference failed open drains the configured generation before re
     const root = try public.openLiteHandleAllocWithRuntime(a, path, options, true, shared.handleLockIo(), null);
     defer shared.closeHandle(root);
     const service = root.lite_inference.?;
-    try root.db.core.store.put("\x00antfly/embedded/tables/v1", "{");
+    // The logical directory writer rejects malformed catalogs while
+    // synchronizing consumers. Inject corruption below that admission guard.
+    try std.testing.expectError(error.UnexpectedEndOfInput, root.db.core.store.put("\x00antfly/embedded/tables/v1", "{"));
+    try root.owned_lite_backend.?.native_docstore.?.file.putDocument("\x00antfly/embedded/tables/v1", "{");
     const references = service.references.load(.acquire);
     // Catalog discovery fails after managed producers have been reconfigured
     // on the new DB copy and the service reference has been retained.

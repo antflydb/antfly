@@ -187,7 +187,9 @@ pub const Cache = struct {
         Sha256.hash(bytes, &digest, .{});
         if (bytes.len != ref.bytes or !std.mem.eql(u8, &digest, &ref.digest)) return error.ArtifactIntegrityMismatch;
         if (self.room(bytes.len)) |index| {
-            self.slots[index] = .{ .ref = ref, .bytes = try self.alloc.dupe(u8, bytes), .used = self.clock };
+            // Finish fallible ownership acquisition before publishing a live slot.
+            const retained = try self.alloc.dupe(u8, bytes);
+            self.slots[index] = .{ .ref = ref, .bytes = retained, .used = self.clock };
             self.bytes += bytes.len;
         }
         return bytes;
@@ -230,7 +232,8 @@ pub const Cache = struct {
             // Oversized/legacy decoded shapes can still reuse authenticated
             // encoded bytes. This fallback never increases the cache budget.
             if (self.room(original.bytes.len)) |encoded| {
-                self.slots[encoded] = .{ .ref = ref, .bytes = try self.alloc.dupe(u8, original.bytes), .used = self.clock };
+                const retained = try self.alloc.dupe(u8, original.bytes);
+                self.slots[encoded] = .{ .ref = ref, .bytes = retained, .used = self.clock };
                 self.bytes += original.bytes.len;
             }
             return original;
@@ -1763,6 +1766,8 @@ pub const Cursor = struct {
     upper: ?[]const u8,
     lower: []const u8 = "",
     reverse: bool = false,
+    /// Optional operation-owned rejection from authenticated child aggregates.
+    pruning: ?struct { ptr: *anyopaque, keep: *const fn (*anyopaque, []const u8) anyerror!bool } = null,
 
     const Frame = struct { page: Page, next: usize, end: ?[]const u8 };
     pub const Record = struct { key: []const u8, value: []const u8 };
@@ -1828,6 +1833,7 @@ pub const Cursor = struct {
             frame.next -= 1;
             const entry = frame.page.entries[frame.next];
             if (entry.child) |child_ptr| {
+                if (self.pruning) |prune| if (!try prune.keep(prune.ptr, entry.aggregate)) continue;
                 const child = child_ptr.*;
                 const end = if (frame.next + 1 < frame.page.entries.len) frame.page.entries[frame.next + 1].key else frame.end;
                 try self.descendReverse(child, null, entry.key, end);
@@ -1980,6 +1986,7 @@ pub const Cursor = struct {
             };
             frame.next += 1;
             if (entry.child) |child_ptr| {
+                if (self.pruning) |prune| if (!try prune.keep(prune.ptr, entry.aggregate)) continue;
                 const child = child_ptr.*;
                 const end = if (frame.next < frame.page.entries.len) frame.page.entries[frame.next].key else frame.end;
                 try self.descend(child, "", entry.key, end);
@@ -3780,6 +3787,42 @@ test "external lake decoded operation cache pins leases bounds eviction and chec
         }
     };
     try std.testing.checkAllAllocationFailures(a, Failure.run, .{ memory.store(), first, second });
+}
+
+test "external lake cache admission failures leave no published slot" {
+    const a = std.testing.allocator;
+    var memory: testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    var builder: SortedBuilder = .{ .alloc = a, .store = memory.store() };
+    defer builder.deinit();
+    try builder.add("a", "one");
+    const root = (try builder.finish()).?;
+    for ([_]bool{ false, true }) |decoded| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var cache: Cache = .{ .alloc = failing.allocator(), .underlying = memory.store(), .decoded = decoded };
+        defer cache.deinit();
+        if (decoded) {
+            // The decoded shape cannot fit, but its encoded fallback can. The
+            // input belongs to the caller; adopt must release it on failure.
+            const input = try readPage(a, memory.store(), root);
+            try std.testing.expect(input.retainedBytes() > input.bytes.len);
+            cache.max_bytes = input.bytes.len;
+            try std.testing.expectError(error.OutOfMemory, cache.adopt(a, root, input));
+        } else {
+            const store_ = cache.store();
+            try std.testing.expectError(error.OutOfMemory, store_.get(store_.ptr, a, root));
+        }
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+        for (cache.slots) |slot| try std.testing.expect(slot == null);
+        // A failed admission must leave the cache usable, not merely safe to
+        // destroy. The allocator fails only at its selected allocation index.
+        failing.fail_index = std.math.maxInt(usize);
+        const store_ = cache.store();
+        const bytes = try store_.get(store_.ptr, a, root);
+        defer a.free(bytes);
+        try std.testing.expectEqual(@as(usize, root.bytes), cache.bytes);
+    }
 }
 
 test "external lake compact decoded pages keep encoded fallback bounded and unwind every allocation" {

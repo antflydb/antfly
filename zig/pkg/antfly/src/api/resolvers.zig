@@ -205,6 +205,13 @@ const Sample = struct {
 fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool) !Sample {
     return sampleForReplay(server, a, snapshot, table, request, probe_owners, null);
 }
+fn sampleDefinitions(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, definitions: []const Config) !Sample {
+    var required: std.ArrayListUnmanaged(ReplayRequirement) = .empty;
+    for (definitions) |cfg| if (!cfg.retired) {
+        try required.append(a, .{ .target = .fromConfig(cfg), .revision = cfg.curation_revision, .floor = null });
+    };
+    return sampleForRequirements(server, a, snapshot, table, request, true, required.items);
+}
 fn sampleForReplay(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool, required: ?ReplayRequirement) !Sample {
     return sampleForRequirements(server, a, snapshot, table, request, probe_owners, if (required) |value| &.{value} else &.{});
 }
@@ -483,7 +490,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
         return entityOperation(server, alloc, a, &snapshot, table, op, key, body, request, adoption_revision, null);
     const all = if (page) |value| value.configs orelse try configs(a, value.executionIndexes()) else try configs(a, table.indexes_json);
     if (op == .list) {
-        const observation = try sample(server, a, &snapshot, table, request, true);
+        const observation = try sampleDefinitions(server, a, &snapshot, table, request, all);
         var out = std.json.Array.init(a);
         for (all) |cfg| try out.append(try summary(a, table, cfg, observation));
         return response(alloc, 200, .{ .resolvers = std.json.Value{ .array = out } });
@@ -500,7 +507,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     switch (op) {
         .reviews, .review => return reviewsOperation(server, alloc, a, &snapshot, table, cfg, op, key, body, query, request),
         .resolve => return resolveQuery(server, alloc, a, table, all, cfg, body, request),
-        .get => return response(alloc, 200, try summary(a, table, cfg, try sample(server, a, &snapshot, table, request, true))),
+        .get => return response(alloc, 200, try summary(a, table, cfg, try sampleDefinitions(server, a, &snapshot, table, request, &.{cfg}))),
         .redirects => {
             const state = try resolver.curation.parseState(a, cfg.curation_json);
             return response(alloc, 200, .{ .redirects = try resolver.curation.redirectsWithOrigins(a, try cfg.effectiveAliasesAlloc(a), state, cfg.merges), .distinct = state.distinct, .revision = cfg.curation_revision });
@@ -1126,7 +1133,10 @@ fn observeConsumers(server: anytype, a: std.mem.Allocator, consumers: []const En
                 self.failure = error.DeadlineExceeded;
                 return;
             }
-            var bounded = context;
+            var bounded = context.platformDeadline() catch |err| {
+                self.failure = err;
+                return;
+            };
             if (requested_wait != null) bounded.deadline_ns = @min(bounded.deadline_ns orelse std.math.maxInt(u64), end);
             self.progress = observeReplayTargetsMode(srv, scratch, self.table, targets, if (requested_wait != null) .{ .timeout_ms = @intCast(remaining) } else null, bounded, true) catch |err| {
                 self.failure = err;
@@ -1543,6 +1553,7 @@ test "resolver curation progress probes an idle heartbeat below an accepted jour
         alloc: std.mem.Allocator,
         probes: usize = 0,
         local_resolution: u64 = 4,
+        owner_revision: u64 = 0,
         pub fn localTableRuntimeStatusesWithSnapshot(self: *@This(), _: []const u8, _: anytype) !?runtime_status.LocalTableRuntimeStatuses {
             var row: runtime_status.LocalTableRuntimeStatus = .{ .group_id = 7, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{} };
             row.stats.resolution = .{ .enabled = true, .target_sequence = self.local_resolution, .applied_sequence = self.local_resolution };
@@ -1559,7 +1570,7 @@ test "resolver curation progress probes an idle heartbeat below an accepted jour
                 .name = "concepts",
                 .config_generation = 1,
                 .effective_generation = 1,
-                .curation_revision = 0,
+                .curation_revision = self.owner_revision,
                 .backfill_pending = false,
                 .resolution = .{ .enabled = true, .target_sequence = 5, .applied_sequence = 5 },
                 .promotion = .{ .enabled = true, .target_sequence = 5, .applied_sequence = 5 },
@@ -1587,6 +1598,15 @@ test "resolver curation progress probes an idle heartbeat below an accepted jour
     promoted.promote = true;
     _ = try sampleForReplay(&server, a, &snapshot, &table, .{}, true, .{ .target = promoted, .revision = 0, .floor = .{ .group = 7, .sequence = 5 } });
     try std.testing.expectEqual(@as(usize, 2), server.probes);
+    // Compact source metadata need not change when destination-owned policy
+    // advances. A fresh, idle heartbeat below the hydrated definition still
+    // requires one authoritative owner probe for GET/list progress.
+    var definition = (try configs(a, table.indexes_json))[0];
+    definition.curation_revision = 4;
+    server.owner_revision = 4;
+    const authoritative = try sampleDefinitions(&server, a, &snapshot, &table, .{}, &.{definition});
+    try std.testing.expectEqual(@as(usize, 3), server.probes);
+    try std.testing.expect((try authoritative.progress(a, .fromConfig(definition), 4)).applied);
 }
 
 test "resolver curation HTTP queue capacity reserves both metadata CAS definitions" {
@@ -1849,4 +1869,23 @@ test "resolver curation progress observes source tables with bounded parallel ow
     try std.testing.expectEqual(@as(usize, 32), server.source.reads.load(.monotonic));
     try std.testing.expect(server.maximum.load(.monotonic) > 1 and server.maximum.load(.monotonic) <= 16);
     try std.testing.expectEqual(@as(usize, 0), server.active.load(.monotonic));
+    // The ingress executor may use a different awake-clock origin. Clamp
+    // namespace waits only after translating that budget to platform time.
+    const OffsetClock = struct {
+        fn now(data: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            var stamp = std.testing.io.vtable.now(data, clock);
+            stamp.nanoseconds += 1_000_000_000 * @as(i96, std.time.ns_per_s);
+            return stamp;
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.now = OffsetClock.now;
+    const shifted = std.Io{ .userdata = io.userdata, .vtable = &vtable };
+    const shifted_now: u64 = @intCast(std.Io.Clock.awake.now(shifted).nanoseconds);
+    const observed = try observeConsumers(&server, a, consumers, namespaces, .{ .timeout_ms = 1000 }, .{
+        .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
+        .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&shifted),
+        .deadline_ns = shifted_now + 10 * std.time.ns_per_s,
+    });
+    for (observed) |value| try std.testing.expect(value.applied);
 }
