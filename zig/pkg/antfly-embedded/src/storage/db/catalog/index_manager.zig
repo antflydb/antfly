@@ -12991,6 +12991,23 @@ pub const IndexManager = struct {
         const identity = try std.json.Stringify.valueAlloc(scratch.allocator(), .{ table, template }, .{});
         return if (self.resolver_namespace_lookup.?.slots.get(identity)) |slots| slots.items else &.{};
     }
+    pub fn resolverNamespaceAdmissionIdentities(self: *IndexManager, a: Allocator, table: []const u8, template: []const u8) ![]ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slots = try self.resolverNamespaceSlots(table, template);
+        var result: std.ArrayList(ResolverConfig) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(a);
+            result.deinit(a);
+        }
+        for (slots) |slot| {
+            if (slot.retired) continue;
+            var cfg = try self.cloneResolverAdmissionIdentity(a, self.resolvers.items[slot.index]);
+            errdefer cfg.deinit(a);
+            try result.append(a, cfg);
+        }
+        return result.toOwnedSlice(a);
+    }
     pub fn resolverNamespaceObservation(self: *IndexManager, a: Allocator, table: []const u8, template: []const u8) !?resolver_catalog.ResolverObservation {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
@@ -13635,6 +13652,9 @@ pub const IndexManager = struct {
         try self.ensureResolverLookup();
         const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
         const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        return try self.cloneResolverAdmissionIdentity(alloc, cfg);
+    }
+    fn cloneResolverAdmissionIdentity(self: *IndexManager, alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
         var descriptor = resolver_catalog.ResolverAdmission.fromConfig(cfg, true);
         // Namespace projection clocks advance independently of static source
         // definitions. Cache content identity until catalog publication, never

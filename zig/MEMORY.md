@@ -2649,3 +2649,13 @@ not exclude a group from rebuilding, and private owners remain separate. The
 atomic belief rebuild and reconciliation. Collection no longer performs one
 whole-group traversal for every dependency. Pairwise belief reconciliation retains
 its existing semantics and work limits.
+
+Native resolver candidate-policy reads scope distinct-pin discovery by requested
+root. Uncurated profiles use direct component seeks; owner-materialized curated
+profiles use graph-fenced durable membership postings. The shared reader does not
+rebuild a global pin projection when a cache entry exceeds its budget. Native
+owner turns publish and retire bounded pages, and a changed graph immediately
+excludes its previous postings. Metadata replay and Lite maintenance finish that
+work before marking the source binding applied. Existing full-path, visibility,
+head and final-grant fences remain independent. Legacy curated profiles keep exact
+fallback results while their owner generation is incomplete.

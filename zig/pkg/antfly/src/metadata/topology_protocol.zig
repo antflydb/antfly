@@ -90,11 +90,12 @@ const std = @import("std");
 /// Version 57 projects configured negatives with qualified profile identities.
 /// Version 58 fences render and resolve with distinct execution dependency scopes.
 /// Version 59 combines replicated document jobs with resolver advancement tag 80.
-pub const current_version: u16 = 59;
+/// Version 60 backfills and maintains root-scoped resolver pin projections.
+pub const current_version: u16 = 60;
 pub const job_state_version: u16 = 59;
 pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 59;
+pub const resolver_namespaces_version: u16 = 60;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

@@ -45,14 +45,14 @@ pub fn validateWork(a: A, key: []const u8, work: Work) !void {
     if (work.table.len == 0 or work.key_template.len == 0 or std.mem.indexOfScalar(u8, work.table, 0) != null or std.mem.indexOfScalar(u8, work.key_template, 0) != null) return error.InvalidMetadataBatch;
     if (work.namespace_curation_table_id == 0 and (work.namespace_curation_generation != 0 or work.namespace_curation_missing)) return error.InvalidMetadataBatch;
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ work.table, work.key_template }, .{}), &digest, .{});
+    @import("antfly_hash").Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ work.table, work.key_template }, .{}), &digest, .{});
     const expected = try std.mem.concat(a, u8, &.{ work_prefix, &std.fmt.bytesToHex(digest, .lower) });
     if (!std.mem.eql(u8, key, expected)) return error.InvalidMetadataBatch;
 }
 
-fn enqueue(a: A, txn: anytype, source_prefix: []const u8, work: Work) !void {
+pub fn enqueue(a: A, txn: anytype, source_prefix: []const u8, work: Work) !void {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ work.table, work.key_template }, .{}), &digest, .{});
+    @import("antfly_hash").Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ work.table, work.key_template }, .{}), &digest, .{});
     const key = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ source_prefix, work_prefix, std.fmt.bytesToHex(digest, .lower) });
     var desired = work;
     if (work.namespace_curation_table_id == 0) {
@@ -62,8 +62,8 @@ fn enqueue(a: A, txn: anytype, source_prefix: []const u8, work: Work) !void {
         } else |err| if (err != error.NotFound) return err;
     }
     try txn.put(key, try std.json.Stringify.valueAlloc(a, desired, .{}));
-    try txn.put("\x00\x00__metadata__:minimum_reader_version", "20");
-    if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "20");
+    try txn.put("\x00\x00__metadata__:minimum_reader_version", "21");
+    if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "21");
 }
 pub fn invalidateTarget(a: A, txn: anytype, table: []const u8, template: ?[]const u8) !void {
     const target = if (template) |value| try namespacePrefix(a, table, value) else try targetPrefix(a, table);
@@ -130,12 +130,12 @@ fn definitions(a: A, raw: []const u8) ![]Definition {
 }
 pub fn targetPrefix(a: A, table: []const u8) ![]u8 {
     var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(table, &hash, .{});
+    @import("antfly_hash").Sha256.hash(table, &hash, .{});
     return std.fmt.allocPrint(a, "{s}{s}/", .{ prefix, std.fmt.bytesToHex(hash, .lower) });
 }
 pub fn namespacePrefix(a: A, table: []const u8, template: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ table, template }, .{}), &digest, .{});
+    @import("antfly_hash").Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ table, template }, .{}), &digest, .{});
     return std.fmt.allocPrint(a, "{s}{s}/", .{ namespace_prefix, std.fmt.bytesToHex(digest, .lower) });
 }
 pub fn profileRoot(a: A, table: []const u8, template: []const u8) ![]const u8 {
@@ -149,7 +149,7 @@ fn sameProfile(a: A, x: Definition, y: Definition) !bool {
 }
 fn namespaceBindingKey(a: A, source: []const u8, cfg: Definition) ![]u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ source, cfg.name }, .{}), &digest, .{});
+    @import("antfly_hash").Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ source, cfg.name }, .{}), &digest, .{});
     return std.fmt.allocPrint(a, "{s}{s}", .{ try namespacePrefix(a, cfg.table, cfg.key_template), std.fmt.bytesToHex(digest, .lower) });
 }
 const routes = @import("../db/resolver_namespace_routes.zig");
@@ -170,7 +170,7 @@ pub fn matchingNamespacePrefixes(a: A, txn: anytype, table: []const u8, key: []c
 }
 fn bindingKey(a: A, source: []const u8, cfg: Definition) ![]u8 {
     var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ source, cfg.name }, .{}), &hash, .{});
+    @import("antfly_hash").Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ source, cfg.name }, .{}), &hash, .{});
     return std.fmt.allocPrint(a, "{s}{s}", .{ try targetPrefix(a, cfg.table), std.fmt.bytesToHex(hash, .lower) });
 }
 fn writeBinding(a: A, txn: anytype, source_prefix: []const u8, cfg: Definition, name: []const u8, id: u64) !void {
@@ -229,8 +229,8 @@ pub fn synchronize(a: A, txn: anytype, source_prefix: []const u8, before: ?[]con
     if (txn.get(marker)) |_| {
         // Existing handles may predate bootstrap's in-memory reader floor.
         // Every subsequent catalog write keeps the durable floor monotonic.
-        try txn.put("\x00\x00__metadata__:minimum_reader_version", "20");
-        if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "20");
+        try txn.put("\x00\x00__metadata__:minimum_reader_version", "21");
+        if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "21");
     } else |err| if (err != error.NotFound) return err;
     const old = if (before) |raw| try definitions(a, raw) else &.{};
     const next = if (after) |raw| try definitions(a, raw) else &.{};
@@ -319,7 +319,7 @@ pub fn bootstrap(a: A, txn: anytype) !void {
                 try enqueue(a, txn, source, .{ .table = binding.table, .key_template = binding.key_template, .namespace_curation_table_id = binding.namespace_curation_table_id, .namespace_curation_generation = binding.namespace_curation_generation, .namespace_curation_missing = binding.namespace_curation_missing });
                 binding_row = try nextEntry(&cursor);
             }
-            try txn.put("\x00\x00__metadata__:minimum_reader_version", "20");
+            try txn.put("\x00\x00__metadata__:minimum_reader_version", "21");
             try txn.put(marker, "1");
             break :blk "1";
         },

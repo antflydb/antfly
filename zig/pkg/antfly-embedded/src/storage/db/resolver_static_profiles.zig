@@ -36,7 +36,7 @@ pub const Definition = struct {
     }
 };
 const Head = struct { refs: u64, key_template: []const u8 };
-const Summary = struct { profiles: u64 = 0 };
+const Summary = struct { profiles: u64 = 0, epoch: u64 = 0 };
 const Edge = struct { profile: []const u8, key: []const u8, target: []const u8 };
 fn headKey(a: A, root: []const u8, id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{s}profile/{s}", .{ root, id });
@@ -82,6 +82,7 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
         const summary_raw = txn.get(summary_key) catch |err| if (err == error.NotFound) null else return err;
         var summary: Summary = if (summary_raw) |raw| try std.json.parseFromSliceLeaky(Summary, a, raw, .{}) else .{};
         summary.profiles = if (head.refs == 0) try std.math.sub(u64, summary.profiles, 1) else try std.math.add(u64, summary.profiles, 1);
+        summary.epoch = try std.math.add(u64, summary.epoch, 1);
         try txn.put(summary_key, try std.json.Stringify.valueAlloc(a, summary, .{}));
         const definition_key = try std.fmt.allocPrint(a, "{s}definition/{s}", .{ root, id });
         if (head.refs == 0) try txn.delete(definition_key) else try txn.put(definition_key, try std.json.Stringify.valueAlloc(a, definition, .{}));
@@ -201,7 +202,17 @@ pub const QueryReader = struct {
     profile: []const u8,
     indexed: bool = false,
     pub fn lookup(self: *QueryReader) records.AliasLookup {
-        return .{ .ptr = self, .expand = expand, .node = if (self.indexed) node else null, .seek_node = if (self.indexed) seekNode else null };
+        return .{ .ptr = self, .expand = expand, .node = if (self.indexed) node else null, .seek_node = if (self.indexed) seekNode else null, .profile_active = profileActive, .profile_epoch = profileEpoch };
+    }
+    fn profileActive(ptr: *anyopaque, a: A, id: []const u8) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const raw = (try self.backend.get(self.backend.ptr, a, try headKey(a, self.root, id))) orelse return false;
+        return (try std.json.parseFromSliceLeaky(Head, a, raw, .{})).refs != 0;
+    }
+    fn profileEpoch(ptr: *anyopaque, a: A) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const raw = (try self.backend.get(self.backend.ptr, a, try std.mem.concat(a, u8, &.{ self.root, "summary" }))) orelse return 0;
+        return (try std.json.parseFromSliceLeaky(Summary, a, raw, .{})).epoch;
     }
     /// Only the admitted profile's exact negatives for the returned forward
     /// frontier and mention texts. No directory scans or full-policy cache.

@@ -2709,20 +2709,60 @@ boundaries worth canonicalizing. The same join handles alternating configured
 and native edges, removed configured aliases and native-only pin branches.
 Ordinary native overrides with zero pin weight do not participate.
 
-An optional immutable projection maps effective roots to those pin-bearing
-boundaries. Its identity includes the immutable profile and native graph
-fingerprint; redirect, removed-alias and distinct edits fence it immediately,
-while text-only edits can reuse it. A bounded, separately owned path memo keeps
-converging paths shared without retaining per-posting cursor scratch. Cache
-admission failure executes the identical sparse-index join in reusable scratch,
-retaining only matching boundaries in the request. Work on a cold or uncached
-projection follows sparse pin postings and their forward paths, rather than all
-native overrides or all profile aliases. A large number of pin-bearing boundaries
-can still require a correspondingly large join; cache capacity affects latency,
-not the result or unselected-row retention.
+Uncurated graphs seek each requested static component directly, then intersect
+only that component's nodes with native pin weights. They never build a
+profile-wide pin projection. Curated graphs use destination-owned durable
+`query-pins-v1/<namespace>/<profile>/member/<root>/<boundary>` postings. A
+`state` row binds complete membership to the immutable profile identity and
+native graph fingerprint. Reads seek the requested roots' posting prefixes
+before following their pin-bearing native branches. No cache lease or entry-size
+budget participates in this ready path.
 
-The 10,000-override regression checks cold, warm, uncached and changed-graph
-execution with an actual incident distinct pair. An independent full-composition
-reference checks 1,024 seed queries over randomized acyclic graphs, including
-alternating native/configured paths and removed aliases. No durable key or wire
-change is required: both routed and embedded adapters use this shared reader.
+Only owner maintenance builds membership. A turn reads at most 128 native
+pin-count postings and publishes at most 129 member/state writes in the same
+native transaction. Cursor/path scratch and path-compression memo have separate
+bounded ownership. Redirect, removed-alias and distinct edits change the graph
+fingerprint and immediately exclude the previous generation. A replacement
+first clears its old members in bounded pages, then builds new postings; only
+the final page publishes readiness. Text-only edits reuse the same graph cut.
+A profile enrollment epoch also drives bounded retirement cleanup, so replacing
+immutable profiles does not accumulate their obsolete membership generations.
+Namespace retirement uses the existing bounded native-prefix cleanup.
+
+Metadata namespace replay advances these pages before acknowledging a source
+binding. Partial work yields to pending sibling namespaces and retains each
+namespace's source cursor and dirty state. Bootstrap v13 discovers historical
+curated profiles even in an idle catalog. Already-certified v12 declaration,
+consumer and profile proofs remain usable during this backfill; pin readiness
+is a separate graph-specific watermark. Metadata topology version 60 gates the
+new durable owner work. Lite maintenance uses the same generation builder under
+its destination writer grant, retains the source work item until complete, and
+preserves ready postings on reopen. Historical Lite sources enroll their scopes
+in the existing fair work queue; partial pin pages advance its observation cursor
+without deleting the pending work. Scoped admission identities reuse cached
+profile hashes and avoid cloning unrelated alias declarations. The physical
+profile-enrollment cut is revalidated after writer admission before member or
+retirement publication. Lite reader version 21 fences the additional
+native records and enrollment epochs. An existing ready directory needs only
+a reader-floor update, not a wholesale rebuild; read-only files do not attempt
+that update. Source documents, native heads and final authorization keep their
+independent live fences.
+
+Legacy or not-yet-materialized curated profiles retain the exact bounded-scratch
+sparse-join fallback until owner work completes. Foreground reads never publish
+projections or advance backfill. Ready root postings make read work proportional
+to requested roots and their returned boundaries, even when the complete profile
+would exceed the former 1 MiB route-cache entry limit.
+
+The 6,000-component regression uses 128-byte root suffixes, real native profile
+indexes and a storage-style ordered cursor. It checks repeated uncurated reads,
+curated owner publication, head invalidation, changed roots, unmerge and retired
+profile cleanup, keeping reads below 24 storage scans and request arenas below
+128 KiB. Owner turns remain bounded independently of the total projection size.
+The component probe reports 6 scans without overrides and 4 scans with ready
+curated membership at both 1,000 and 6,000 components. The 10,000-override
+regression remains bounded. The independent full-composition reference checks
+1,024 seed queries over randomized acyclic graphs, exercising both durable
+membership and exact legacy fallback across alternating paths and removed aliases.
+Metadata replay and Lite reopen tests verify the service adapters use this shared
+contract.

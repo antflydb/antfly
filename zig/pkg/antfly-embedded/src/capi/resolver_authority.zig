@@ -52,10 +52,18 @@ fn ensureConsumerIndex(root: *h.Handle, a: A) !void {
             defer read.abort();
             break :blk if (read.get(directory.marker)) |_| true else |err| if (err == error.NotFound) false else return err;
         };
-        if (!ready) {
+        if (ready and physical.?.read_only) return;
+        const floor_ready = blk: {
+            var read = try physical.?.beginRead();
+            defer read.abort();
+            const raw = read.get(catalog.minimum_reader_key) catch |err| if (err == error.NotFound) break :blk false else return err;
+            break :blk (std.fmt.parseInt(u32, raw, 10) catch return error.InvalidCatalogRecord) >= catalog.resolver_pin_index_reader_version;
+        };
+        if (!ready or !floor_ready) {
             var write = try physical.?.beginWrite();
             errdefer write.abort();
             try directory.bootstrap(a, &write);
+            try write.put(catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_pin_index_reader_version));
             try write.commit();
             root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_pin_index_reader_version, .release);
         }
@@ -739,9 +747,93 @@ fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection 
 /// Build one current namespace outside writer leases and publish all local
 /// consumers atomically. Missing/recreated destinations retract old projections
 /// immediately, independent of physical cleanup of the retired authority.
+const query_pins_owner_marker = prefix ++ "query-pins-owner-enrolled-v1";
+fn queryPinsWorkPossible(database: *h.db_mod.DB, a: A) !bool {
+    if (!database.core.index_manager.hasResolverDefinitions()) return false;
+    _ = database.core.store.get(a, query_pins_owner_marker) catch |err| return if (err == error.NotFound) true else err;
+    return false;
+}
+fn enrollQueryPinWork(database: *h.db_mod.DB, a: A) !void {
+    const jobs = @import("../storage/lite/resolver_consumers.zig");
+    const configs = try database.core.index_manager.listResolverIdentities(a);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var lease = try database.local_execution.row_policy_gate.enterRaw();
+    defer lease.release();
+    var write = try database.core.store.beginWriteTxn();
+    errdefer write.abort();
+    for (configs) |cfg| {
+        if (cfg.retired) continue;
+        const identity = try json(a, .{ cfg.table, cfg.key_template });
+        if ((try seen.getOrPut(a, identity)).found_existing) continue;
+        try jobs.enqueue(a, &write, "", .{ .table = cfg.table, .key_template = cfg.key_template });
+    }
+    var bridge: Bridge = .{ .txn = &write };
+    try bridge.backendPut(a, query_pins_owner_marker, "1");
+    try commitCurationTxn(a, &bridge, &write, &lease);
+}
+fn yieldQueryPinWork(database: *h.db_mod.DB, a: A, key: []const u8) !void {
+    var lease = try database.local_execution.row_policy_gate.enterRaw();
+    defer lease.release();
+    var write = try database.core.store.beginWriteTxn();
+    errdefer write.abort();
+    var bridge: Bridge = .{ .txn = &write };
+    try bridge.backendPut(a, @import("../storage/lite/resolver_consumers.zig").cursor_key, key);
+    try commitCurationTxn(a, &bridge, &write, &lease);
+}
+/// The native destination owns the derived rows; the immutable profile snapshot
+/// comes from the shared directory. Each publication holds the destination's
+/// ordinary writer grant and leaves the source job outstanding until complete.
+fn advanceSourceQueryPins(root: *h.Handle, database: *h.db_mod.DB, a: A, target: []const u8, template: []const u8) !bool {
+    const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
+    const file = physical orelse return true;
+    for (try database.core.index_manager.resolverNamespaceAdmissionIdentities(a, target, template)) |cfg| {
+        const destination = tables.get(root, cfg.table) catch |err| if (err == error.UndefinedTable) continue else return err;
+        var read = try file.beginRead();
+        defer read.abort();
+        const profile_root = try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, cfg.table, cfg.key_template);
+        const id = cfg.admission_profile;
+        if (id.len != 64) return error.InvalidCatalogRecord;
+        if (!try native.static_profiles.queryReferenceActive(a, &read, profile_root, id, cfg.key_template) or !try native.static_profiles.queryNodesReady(a, &read, profile_root, id)) continue;
+        var directory: native.static_profiles.ReadTransaction(@TypeOf(read)) = .{ .txn = &read };
+        var reader: native.static_profiles.QueryReader = .{ .backend = directory.backend(), .root = profile_root, .profile = id, .indexed = true };
+        {
+            var probe = try destination.core.store.beginReadTxn();
+            defer probe.abort();
+            var bridge: Bridge = .{ .txn = &probe };
+            if (try bridge.store(a, prefix).queryPinsIndexed(cfg.key_template, id) and try bridge.store(a, prefix).queryPinsCleanupCurrent(cfg.key_template, reader.lookup())) continue;
+        }
+        var lease = try destination.local_execution.row_policy_gate.enterRaw();
+        defer lease.release();
+        var write = try destination.core.store.beginWriteTxn();
+        errdefer write.abort();
+        // The directory read preceded writer admission. Revalidate its active
+        // profile set at the current physical cut before publishing any GC or
+        // members; a concurrent source edit must not retire a newly live index.
+        const summary_key = try std.mem.concat(a, u8, &.{ profile_root, "summary" });
+        const captured_summary = read.get(summary_key) catch |err| return if (err == error.NotFound) error.EnrichmentSourceChanged else err;
+        var current = try file.beginRead();
+        defer current.abort();
+        const current_summary = current.get(summary_key) catch |err| return if (err == error.NotFound) error.EnrichmentSourceChanged else err;
+        if (!std.mem.eql(u8, captured_summary, current_summary)) return error.EnrichmentSourceChanged;
+        var bridge: Bridge = .{ .txn = &write };
+        const complete = try bridge.store(a, prefix).advanceQueryPins(cfg.key_template, id, reader.lookup(), 128);
+        try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_pin_index_reader_version));
+        try commitCurationTxn(a, &bridge, &write, &lease);
+        destination.core.index_manager.minimum_reader_version.store(catalog.resolver_pin_index_reader_version, .release);
+        if (!complete) return false;
+    }
+    return true;
+}
+
 pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
     if (physical == null) return legacyPullProjection(root, database, a);
+    if (try queryPinsWorkPossible(database, a)) {
+        try ensureConsumerIndex(root, a);
+        try enrollQueryPinWork(database, a);
+        // Enrolling an idle upgrade must not consume the namespace's fair
+        // replay turn or let a continuously dirty neighbor block other work.
+    }
     if (try ownershipWorkPossible(database, a)) {
         var lease = try database.local_execution.row_policy_gate.enterRaw();
         defer lease.release();
@@ -791,6 +883,10 @@ pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
         try database.completeResolverProjectionWork(row.key);
         return true;
     };
+    if (!desired.missing and !try advanceSourceQueryPins(root, database, a, cfg.table, cfg.key_template)) {
+        try yieldQueryPinWork(database, a, row.key);
+        return true;
+    }
     var namespace: policy.Namespace = .{ .key_template = cfg.key_template, .revision = desired.revision };
     if (!desired.missing) {
         var read = try desired.destination.?.core.store.beginReadTxn();
@@ -1191,6 +1287,7 @@ fn ownershipWorkPossible(database: *h.db_mod.DB, a: A) !bool {
 pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
     if (physical != null) {
+        if (try queryPinsWorkPossible(database, a)) return true;
         if (try ownershipWorkPossible(database, a)) return true;
         if (!try projectionWorkPossible(database, a)) return false;
         if (database.core.index_manager.hasResolverDefinitions()) try ensureConsumerIndex(root, a);
@@ -1271,7 +1368,7 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"pin_distinct\":true}"), &out));
     api.antfly_buffer_free(&out);
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
-    try std.testing.expectEqualStrings("20", try root.db.core.store.get(a, catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings("21", try root.db.core.store.get(a, catalog.minimum_reader_key));
 }
 
 test "capi resolver curation static directory fences consumers enrolled after discovery" {
@@ -1750,4 +1847,48 @@ test "capi resolver curation schema captures reuse owner proofs across large unr
     try std.testing.expectEqualSlices(u8, &updated.digest, &reopened.digest);
     try std.testing.expect(updated.instance != reopened.instance);
     std.debug.print("OWNER SCHEMA PROOF templates=1000 bytes=20000000 warm_captures=1000 scratch_bytes=0 content_and_incarnation=fenced\n", .{});
+}
+
+test "capi resolver curation owner materializes graph fenced root pins and reopens without cache preparation" {
+    const api = @import("db.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-root-pin-owner");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    var root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    var handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    try tables.create(root, "entities", "{}", false);
+    const cfg: h.db_mod.ResolverConfig = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .promote = false, .aliases = &.{.{ .key = "entity/alias", .target = "entity/root" }} };
+    try root.db.addResolver(cfg);
+    const id = try (native.static_profiles.Definition{ .key_template = cfg.key_template, .aliases = cfg.aliases }).identity(a);
+    _ = try entity(root, a, "entities", "entity/native", .{ .action = .merge, .into = "entity/root" }, .{});
+    _ = try entity(root, a, "entities", "entity/root", .{ .action = .distinct, .into = "entity/other" }, .{});
+    for (0..3) |phase| {
+        if (phase == 2) _ = try entity(root, a, "entities", "entity/native", .{ .action = .unmerge }, .{});
+        if (phase == 1) {
+            api.antfly_db_close(handle);
+            root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null);
+            handle = try api.publishHandle(root);
+        }
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+        const destination = try tables.get(root, "entities");
+        var read = try destination.core.store.beginReadTxn();
+        defer read.abort();
+        var bridge: Bridge = .{ .txn = &read };
+        const authority = bridge.store(a, prefix);
+        try std.testing.expect(try authority.queryPinsIndexed(cfg.key_template, id));
+        const file = root.owned_lite_backend.?.native_docstore.?;
+        var physical = try file.beginRead();
+        defer physical.abort();
+        var directory: native.static_profiles.ReadTransaction(@TypeOf(physical)) = .{ .txn = &physical };
+        var reader: native.static_profiles.QueryReader = .{ .backend = directory.backend(), .root = try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, cfg.table, cfg.key_template), .profile = id, .indexed = true };
+        const prepared = (try authority.prepareQuery(cfg.key_template, .{ .id = id, .lookup = reader.lookup() }, true)).?;
+        defer prepared.release();
+        const page = try authority.queryExecutionPrepared(prepared, &.{"entity/root"}, &.{}, true);
+        try std.testing.expectEqual(@as(usize, 1), page.namespace.state.distinct.len);
+        try std.testing.expectEqualStrings("21", try root.db.core.store.get(a, catalog.minimum_reader_key));
+    }
 }
