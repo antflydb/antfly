@@ -563,6 +563,21 @@ test "lite allocator proof read window coalesces IO and still rejects corrupt va
     if (physical * 8 >= logical) std.debug.print("allocator proof backing reads={d} logical pages={d}\n", .{ physical, logical });
     try std.testing.expect(physical * 8 < logical);
     try std.testing.expect(file.allocator_proof_window == null);
+    {
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 4, .hard_limit_bytes = 8 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        const previous = file.page_cache.resource_manager;
+        file.page_cache.resource_manager = &manager;
+        defer file.page_cache.resource_manager = previous;
+        // Less than one page of optional scratch admission must fall back to
+        // ordinary reads, with the same complete proof and no reservation leak.
+        file.test_backing_read_calls.store(0, .monotonic);
+        try std.testing.expectEqual(@as(u64, 32), try file.validateIndexedAllocator(checkpoint, state, null));
+        try std.testing.expect(file.test_backing_read_calls.load(.monotonic) > physical);
+        try std.testing.expect(file.allocator_proof_window == null);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
+    }
 
     const reference = (try file.lookupDocumentIndexPage(checkpoint, "value-0000")).?;
     const raw_record = try file.readPageAlloc(a, reference);
