@@ -38,6 +38,18 @@ pub const HostBuffer = struct {
         return .{ .ptr = ptr, .len = len };
     }
 
+    /// Admitted owners must keep both their pointer and reservation when the
+    /// driver cannot confirm a physical free. The ordinary compatibility API
+    /// below remains unchanged for existing unadmitted callers.
+    pub fn freeChecked(self: *HostBuffer, ctx: *context_mod.CudaContext) driver_mod.Error!void {
+        if (self.ptr) |ptr| {
+            try ctx.makeCurrent();
+            const free_host = ctx.driver.fns.cuMemFreeHost orelse return error.CudaSymbolMissing;
+            if (free_host(ptr) != driver_mod.CUDA_SUCCESS) return error.CudaDriverError;
+            self.* = .{};
+        }
+    }
+
     pub fn free(self: *HostBuffer, ctx: *context_mod.CudaContext) void {
         if (self.ptr) |ptr| {
             ctx.makeCurrent() catch {};
