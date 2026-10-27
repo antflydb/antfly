@@ -6358,6 +6358,56 @@ test "capi SQL runtime refresh fences serving inputs while reusing lease and sha
     }
 }
 
+test "capi graph replacement retains indexed serving edges across deferred reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-replacement-visible-reopen");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    // A manual owner makes the source visibility and unfinished replacement
+    // deterministic, rather than racing a background replay or using sleeps.
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"old","kind":"graph","edge_types":[{"name":"links","field":"links"}]}
+    )));
+    var inserted: capi.Buffer = .{};
+    // No-gap replacement preserves the old generation's visible contents.
+    // A write-only receipt does not establish that those contents are indexed.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .fromSlice(
+        \\{"inserts":{"a":{"links":["b"]},"b":{}},"sync_level":"full_index"}
+    ), &inserted));
+    freeRawBuffer(inserted.ptr, inserted.len);
+    antfly_db_close(handle);
+    handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","kind":"graph","replaces":"old","edge_types":[{"name":"links","field":"links"}]}
+    )));
+    {
+        const guard = public.enterHandle(handle, .read).?;
+        defer guard.leave();
+        try std.testing.expect(guard.handle.database().core.index_manager.get("old") != null);
+        try std.testing.expect(guard.handle.database().core.index_manager.get("new") == null);
+    }
+    var response: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(handle, .fromSlice(
+        \\{"graph_queries":{"q":{"index":"old","traverse":{"start":{"keys":["a"]},"direction":"out","edge_types":["links"],"max_depth":1,"limit":10}}},"limit":1}
+    ), &response));
+    defer freeRawBuffer(response.ptr, response.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.ptr.?[0..response.len], .{});
+    defer parsed.deinit();
+    const nodes = parsed.value.object.get("responses").?.array.items[0].object.get("graph_results").?.object.get("q").?.object.get("nodes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), nodes.len);
+    try std.testing.expectEqualStrings("b", nodes[0].object.get("key").?.string);
+}
+
 test "capi native replacement wait observes its background owner without rebuilding" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
