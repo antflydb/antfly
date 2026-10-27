@@ -113,6 +113,61 @@ pub fn Features(comptime Hooks: type) type {
             };
         }
 
+        /// Keep the selected default when unset. Zero explicitly disables
+        /// chunking; valid positive values retain the operator's bound. This
+        /// value is shared by admission estimation and the execution pipeline.
+        pub fn withPreparedPrefillChunkOverride(self: @This(), text: ?[]const u8) @This() {
+            if (!self.prepared) return self;
+            const configured = text orelse return self;
+            const rows = std.fmt.parseInt(u16, configured, 10) catch return self;
+            if (rows != 0 and (rows < 64 or rows > 1024)) return self;
+            var result = self;
+            result.prepared_prefill_chunk_rows = rows;
+            return result;
+        }
+
+        /// Batch sizes are bounded operator controls, resolved once for the
+        /// same configuration used by admission, brokers, and the decoder.
+        pub fn withBatchOverrides(self: @This(), vision: ?[]const u8, prefill: ?[]const u8, max_vision: u8, max_prefill: u8) @This() {
+            if (!self.prepared) return self;
+            const vision_cap = std.math.clamp(max_vision, 1, 16);
+            const prefill_cap = std.math.clamp(max_prefill, 1, 16);
+            var result = self;
+            result.vision_batch_items = @min(result.vision_batch_items, vision_cap);
+            result.packed_prefill_items = @min(result.packed_prefill_items, prefill_cap);
+            if (vision) |text| if (std.fmt.parseInt(u8, text, 10)) |items| {
+                if (items >= 1 and items <= 16) result.vision_batch_items = @min(items, vision_cap);
+            } else |_| {};
+            if (prefill) |text| if (std.fmt.parseInt(u8, text, 10)) |items| {
+                if (items >= 1 and items <= 16) result.packed_prefill_items = @min(items, prefill_cap);
+            } else |_| {};
+            return result;
+        }
+
+        /// The existing operator limit bounds leader fairness. It does not
+        /// prevent compatible prefills from filling a decode-led step.
+        pub fn withDecodeStreakOverride(self: @This(), text: ?[]const u8) @This() {
+            if (!self.prepared) return self;
+            const configured = text orelse return self;
+            const turns = std.fmt.parseInt(u8, configured, 10) catch return self;
+            if (turns > 16) return self;
+            var result = self;
+            result.prefill_decode_streak = turns;
+            return result;
+        }
+
+        /// Explicit CUDA token chaining uses the existing bounded operator
+        /// switch; the selected profile stays unchanged when it is disabled.
+        pub fn withCudaTokenBurstOverride(self: @This(), enabled: bool, width_text: ?[]const u8) @This() {
+            if (!self.prepared) return self;
+            var result = self;
+            result.gpu_token_burst = enabled;
+            if (width_text) |text| if (std.fmt.parseInt(u8, text, 10)) |width| {
+                if (width >= 2 and width <= 8) result.gpu_token_burst_width = width;
+            } else |_| {};
+            return result;
+        }
+
         pub fn fromEnvironment() @This() {
             // Without a model and backend there is no qualified epoch profile.
             return .{};
@@ -134,6 +189,13 @@ pub fn Features(comptime Hooks: type) type {
             if (!platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_PREPARED_DECODE", true) or restricted_metal_mode)
                 return forProfile(.conservative, cfg, 1);
             var result = forProfile(profile, cfg, Hooks.effectiveLightOnReadRows());
+            if (backend == .cuda) {
+                result = result.withCudaTokenBurstOverride(platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"), platform.env.getenv("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"));
+                result = result.withDecodeStreakOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_DECODE_STREAK"));
+                result = result.withPreparedPrefillChunkOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS"));
+                const wide = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES");
+                result = result.withBatchOverrides(platform.env.getenv("ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS"), platform.env.getenv("ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS"), if (wide) 16 else 8, if (wide) 16 else 4);
+            }
             if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK"))
                 result.vision_workspace_cache = false;
             return result;
@@ -244,4 +306,76 @@ test "LightOnOCR3 selected reader profiles retain admission ownership row caps a
         try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
         try std.testing.expectEqual(@as(u16, if (profile == .cuda_lighton4b) 256 else 0), selected.prepared_prefill_chunk_rows);
     }
+}
+
+test "LightOnOCR3 CUDA reader prefix limit honors explicit zero and valid operator bounds" {
+    const F = Features(struct {});
+    const defaults = F.forProfile(.cuda_lighton4b, .{}, 128);
+    try std.testing.expectEqual(@as(u16, 256), defaults.prepared_prefill_chunk_rows);
+    try std.testing.expectEqualDeep(defaults, defaults.withPreparedPrefillChunkOverride(null));
+    for ([_][]const u8{ "0", "64", "128", "256", "1024" }, [_]u16{ 0, 64, 128, 256, 1024 }) |text, rows| {
+        var resolved = defaults.withPreparedPrefillChunkOverride(text);
+        try std.testing.expectEqual(rows, resolved.prepared_prefill_chunk_rows);
+        resolved.prepared_prefill_chunk_rows = defaults.prepared_prefill_chunk_rows;
+        try std.testing.expectEqualDeep(defaults, resolved);
+    }
+    for ([_][]const u8{ "", "invalid", "63", "1025", "65536" }) |text|
+        try std.testing.expectEqualDeep(defaults, defaults.withPreparedPrefillChunkOverride(text));
+    const fallback = F.forProfile(.conservative, .{}, 1);
+    try std.testing.expectEqualDeep(fallback, fallback.withPreparedPrefillChunkOverride("128"));
+}
+
+test "LightOnOCR3 CUDA reader batch overrides preserve operator bounds and backend ceilings" {
+    const F = Features(struct {});
+    const defaults = F.forProfile(.cuda_lighton4b, .{}, 128);
+    try std.testing.expectEqualDeep(defaults, defaults.withBatchOverrides(null, null, 16, 16));
+    var selected = defaults.withBatchOverrides("4", "8", 16, 16);
+    try std.testing.expectEqual(@as(u8, 4), selected.vision_batch_items);
+    try std.testing.expectEqual(@as(u8, 8), selected.packed_prefill_items);
+    selected.vision_batch_items = defaults.vision_batch_items;
+    selected.packed_prefill_items = defaults.packed_prefill_items;
+    try std.testing.expectEqualDeep(defaults, selected);
+    const bounded = defaults.withBatchOverrides("16", "16", 8, 4);
+    try std.testing.expectEqual(@as(u8, 8), bounded.vision_batch_items);
+    try std.testing.expectEqual(@as(u8, 4), bounded.packed_prefill_items);
+    const lowered = defaults.withBatchOverrides("1", "2", 16, 16);
+    try std.testing.expectEqual(@as(u8, 1), lowered.vision_batch_items);
+    try std.testing.expectEqual(@as(u8, 2), lowered.packed_prefill_items);
+    for ([_][]const u8{ "0", "17", "invalid", "256" }) |text|
+        try std.testing.expectEqualDeep(defaults, defaults.withBatchOverrides(text, text, 16, 16));
+    const narrow = F.forProfile(.cuda_lighton08, .{}, 64).withBatchOverrides(null, null, 8, 4);
+    try std.testing.expectEqual(@as(u8, 4), narrow.packed_prefill_items);
+    const fallback = F.forProfile(.conservative, .{}, 1);
+    try std.testing.expectEqualDeep(fallback, fallback.withBatchOverrides("16", "16", 16, 16));
+}
+
+test "LightOnOCR3 CUDA prefill fairness limit preserves selected defaults and operator bounds" {
+    const F = Features(struct {});
+    const selected = F.forProfile(.cuda_lighton4b, .{}, 128);
+    try std.testing.expectEqualDeep(selected, selected.withDecodeStreakOverride(null));
+    for ([_]u8{ 0, 1, 4, 8, 16 }) |turns| {
+        var text: [3]u8 = undefined;
+        const value = try std.fmt.bufPrint(&text, "{d}", .{turns});
+        var resolved = selected.withDecodeStreakOverride(value);
+        try std.testing.expectEqual(turns, resolved.prefill_decode_streak);
+        resolved.prefill_decode_streak = selected.prefill_decode_streak;
+        try std.testing.expectEqualDeep(selected, resolved);
+    }
+    for ([_][]const u8{ "", "-1", "17", "256", "junk" }) |text| try std.testing.expectEqualDeep(selected, selected.withDecodeStreakOverride(text));
+    const fallback = F.forProfile(.conservative, .{}, 1);
+    try std.testing.expectEqualDeep(fallback, fallback.withDecodeStreakOverride("8"));
+}
+
+test "LightOnOCR3 CUDA token chaining opt in shares bounded admission configuration" {
+    const F = Features(struct {});
+    const selected = F.forProfile(.cuda_lighton4b, .{}, 128);
+    try std.testing.expectEqualDeep(selected, selected.withCudaTokenBurstOverride(false, null));
+    const burst = selected.withCudaTokenBurstOverride(true, "8");
+    try std.testing.expect(burst.gpu_token_burst);
+    try std.testing.expectEqual(@as(u8, 8), burst.gpu_token_burst_width);
+    try std.testing.expect(burst.auxiliaryAmounts().backend_scratch_bytes > selected.auxiliaryAmounts().backend_scratch_bytes);
+    try std.testing.expect(burst.auxiliaryAmounts().host_scratch_bytes > selected.auxiliaryAmounts().host_scratch_bytes);
+    for ([_][]const u8{ "", "-1", "1", "9", "256", "junk" }) |text| try std.testing.expectEqualDeep(selected.withCudaTokenBurstOverride(true, null), selected.withCudaTokenBurstOverride(true, text));
+    const fallback = F.forProfile(.conservative, .{}, 1);
+    try std.testing.expectEqualDeep(fallback, fallback.withCudaTokenBurstOverride(true, "8"));
 }

@@ -2175,6 +2175,12 @@ fn assembleVisualPromptTensor(cb: *const ComputeBackend, allocator: std.mem.Allo
 }
 
 fn addInterpolatedPositionsTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, weights: *WeightCache, input: CT, cfg: Config, geometry: Geometry) !CT {
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda and cfg.is_qwen35 and weights.source == .resident) {
+            const table = try weights.weight("v.position_embd.weight");
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionPositions(cb, input, table, geometry.grid_x, geometry.grid_y, cfg.spatial_merge, cfg.image_size / cfg.patch_size, cfg.vision_hidden)) |positioned| return positioned;
+        }
+    }
     const positions = try allocator.alloc(f32, geometry.patchCount() * cfg.vision_hidden);
     defer allocator.free(positions);
     @memset(positions, 0);
@@ -3070,4 +3076,71 @@ test "LightOnOCR3 CUDA vision block activation follows checkpoint tanh GELU inde
     const expected = try cb.toFloat32(exact, a);
     defer a.free(expected);
     try std.testing.expectEqualSlices(f32, expected, result);
+}
+
+test "LightOnOCR3 CUDA learned positions preserve host interpolation merge order and resident transfers" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+    const tensor_mod = @import("../backends/tensor.zig");
+    const a = std.testing.allocator;
+    for ([_]usize{ 768, 1024 }) |dim| for ([_]bool{ false, true }) |bf16| {
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+        compute.capability_profile = .lightonocr3;
+        const cb = compute.computeBackend();
+        const values = try a.alloc(f32, 48 * 48 * dim);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 41)) - 20)) / 32;
+        const shape = [_]i64{ 48 * 48, @intCast(dim) };
+        const name = "model.visual.pos_embed.weight";
+        if (bf16) {
+            const bits = try a.alloc(u16, values.len);
+            defer a.free(bits);
+            for (values, bits) |value, *b| b.* = @intCast(@as(u32, @bitCast(value)) >> 16);
+            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(bits), .dtype = .bf16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+            try compute.insertBf16WeightFromTensor(try a.dupe(u8, name), &tensor);
+        } else {
+            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(values), .dtype = .f32, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+            try compute.insertWeightFromTensor(try a.dupe(u8, name), &tensor);
+        }
+        const cfg = Config{ .text_hidden = 1024, .vision_hidden = dim, .intermediate = dim * 4, .block_count = 1, .head_count = dim / 64, .image_size = 48, .patch_size = 1, .spatial_merge = 2, .layer_norm_eps = 1e-5, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .is_qwen35 = true };
+        var weights = WeightCache.initResident(a, &cb, cfg);
+        defer weights.deinit();
+        // Independent host reference uses exactly the existing projector.
+        weights.position_f32 = try a.dupe(f32, values);
+        for ([_][2]usize{ .{ 2, 2 }, .{ 34, 50 }, .{ 128, 128 } }) |grid| {
+            const geometry = Geometry{ .width = grid[0], .height = grid[1], .grid_x = grid[0], .grid_y = grid[1], .merged_x = grid[0] / 2, .merged_y = grid[1] / 2 };
+            const input_values = try a.alloc(f32, geometry.patchCount() * dim);
+            defer a.free(input_values);
+            for (input_values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 13) % 37)) - 18)) / 128;
+            const input = try cb.fromFloat32Shape(input_values, &.{ @intCast(geometry.patchCount()), @intCast(dim) });
+            defer cb.free(input);
+            const expected = try a.dupe(f32, input_values);
+            defer a.free(expected);
+            try addInterpolatedPositions(&weights, expected, cfg, geometry);
+            const before = compute.stats;
+            const positioned = try addInterpolatedPositionsTensor(&cb, a, &weights, input, cfg, geometry);
+            defer cb.free(positioned);
+            try std.testing.expectEqual(before.h2d_bytes, compute.stats.h2d_bytes);
+            try std.testing.expectEqual(before.d2h_bytes, compute.stats.d2h_bytes);
+            const actual = try cb.toFloat32(positioned, a);
+            defer a.free(actual);
+            for (expected, actual) |e, value| try std.testing.expectApproxEqAbs(e, value, 1e-6);
+            const unchanged = try cb.toFloat32(input, a);
+            defer a.free(unchanged);
+            try std.testing.expectEqualSlices(f32, input_values, unchanged);
+            const table = try weights.weight("v.position_embd.weight");
+            const table_values = try cb.toFloat32(table, a);
+            defer a.free(table_values);
+            try std.testing.expectEqualSlices(f32, values, table_values);
+            const launches = compute.ctx.stats.kernel_launches;
+            try std.testing.expect(try CudaCompute.lightOnVisionPositions(&cb, input, table, 1, 2, 2, 48, dim) == null);
+            compute.resident_training_cache = true;
+            try std.testing.expect(try CudaCompute.lightOnVisionPositions(&cb, input, table, grid[0], grid[1], 2, 48, dim) == null);
+            compute.resident_training_cache = false;
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+        try std.testing.expectEqual(@as(usize, 3), compute.lighton_vision_fused.position_calls);
+    };
 }

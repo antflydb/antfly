@@ -182,10 +182,18 @@ rows use recurrent and attention packets of at most 64. Client concurrency,
 admitted live pages and physical GPU rows remain separate limits.
 
 The experimental `--decode-graph` switch replays two dependent decode tokens
-inside the reader epoch. Qualified cohorts contain 2–64 pages; larger cohorts
-use the existing packed path. It retains the precision of the selected profile
+inside the reader epoch. It supports 2–64 pages, or up to 128 when the
+physical-128 reader mode is enabled. Eligibility and available memory determine
+whether a claim replays a graph. It retains the precision of the selected profile
 and independently admits graph metadata and scratch under operator limits.
 Benchmark with `--require-lighton-model-graph` to require actual replay.
+
+CUDA also supports opt-in token chaining for pure decode cohorts through 128
+pages. Set `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST=1` and
+`ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH=4` before launching the profile. Widths
+2–8 queue dependent tokens between host reads, bounded by each page's original
+generation budget. F32 decode and recurrent state remain unchanged. The native
+benchmark's `--require-cuda-token-burst` requires actual requested-width execution.
 
 The optional `--bf16-prefill-ffn` switch uses BF16 FFN intermediates for larger
 prefills. On SM12.1, `--bf16-recurrent-prefill LIBRARY` also selects a native BF16
@@ -207,6 +215,20 @@ python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton08 \
   -- ./antfly standalone
 ```
 
+The SM12.1 library can also include optional paged prefill attention:
+
+```bash
+python3 zig/pkg/inference/scripts/lightonocr3/build_cuda_prefill_attention.py \
+  --recurrent-library zig/pkg/inference/zig-out/lib/lighton-prefill/libantfly_lighton_prefill.so \
+  --output-dir zig/pkg/inference/zig-out/lib/lighton-attention
+```
+
+Select the resulting `lighton-attention/libantfly_lighton_prefill.so` with the
+same `--bf16-recurrent-prefill` option. Keep all three generated shared libraries
+together. This extension uses F16 query/KV operands and F32 attention output for
+eligible prefills. Its device workspace and bounded pinned metadata ring are
+admitted independently. Decode and recurrent state retain F32 precision.
+
 Python is needed for building and qualification; serving loads the native shared
 library. The build manifest records the pinned source, the native page-pointer
 layout patch and generated artifacts. The kernel updates each owned F32 state
@@ -217,20 +239,22 @@ option remains opt-in while an older rare output mismatch is investigated.
 
 ## Performance and verification
 
-Historical shared-machine results are summarized below. They qualify the named
-builds and three synthetic fixtures, not broad document accuracy or an SLO.
+The table combines archived Metal/Florence qualifications with the latest
+LightOn CUDA measurements. Each qualifies the named build and three synthetic
+fixtures, not broad document accuracy or an SLO.
 
 | Hardware / model | Native pages/s | Reference pages/s |
 | --- | ---: | ---: |
 | M4 Max, LightOn 0.8B | 4.725–4.736 | vLLM 4.097–4.102 |
 | M4 Max, LightOn 4B | 1.210–1.211 | vLLM 1.1517–1.1518 |
 | M4 Max, Florence | 5.306–5.309 | MLX proxy 5.131–5.138 |
-| DGX Spark, LightOn 0.8B, partial BF16 prefill FFN | 9.613–9.975 | vLLM 14.569 |
-| DGX Spark, LightOn 4B, partial BF16 prefill FFN | 3.421–3.427 | vLLM 4.630 |
+| DGX Spark, LightOn 0.8B, optional prefill | 10.4189–10.4775 | vLLM 14.3396–14.3595 |
+| DGX Spark, LightOn 4B, optional prefill/attention | 3.6641–3.6663 | vLLM 4.6163–4.6200 |
 | DGX Spark, Florence FP16 | 25.347–25.758 | vLLM 25.340–25.348 |
 
-The Metal comparisons are paired. CUDA results are separate capacity screens;
-LightOn CUDA parity remains outstanding. Metal Florence uses Q4_K weights and
+The Metal comparisons are paired. Latest LightOn CUDA runs use 256 warmup
+requests and two 256-request measurements, with four-token chains for 0.8B and
+two-token graphs for 4B. LightOn CUDA parity remains outstanding. Metal Florence uses Q4_K weights and
 an F16 encoder versus an FP16 MLX proxy. Encoded-image, decoded-image and HTTP
 frontends have different overheads. These are not fully precision-matched runs.
 

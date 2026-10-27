@@ -23,6 +23,7 @@ const memory = @import("../../runtime/tier/memory.zig");
 
 pub const Module = struct {
     library: std.DynLib,
+    attention: ?@import("lighton_prefill_attention.zig").Module = null,
     workspace: *const fn (*const anyopaque) callconv(.c) usize,
     execute: *const fn (*const anyopaque, driver.CUdeviceptr, usize, c_int, driver.CUstream) callconv(.c) c_int,
     scratch: buffer.DeviceBuffer = .{},
@@ -37,12 +38,18 @@ pub const Module = struct {
         if (abi() != (@as(u64, 1) << 32 | 2408)) return error.LightOnPrefillAbiMismatch;
         return .{
             .library = library,
+            .attention = try @import("lighton_prefill_attention.zig").Module.init(&library),
             .workspace = library.lookup(*const fn (*const anyopaque) callconv(.c) usize, "antfly_lighton_prefill_workspace") orelse return error.LightOnPrefillAbiMismatch,
             .execute = library.lookup(*const fn (*const anyopaque, driver.CUdeviceptr, usize, c_int, driver.CUstream) callconv(.c) c_int, "antfly_lighton_prefill_execute") orelse return error.LightOnPrefillAbiMismatch,
         };
     }
 
     pub fn clearWorkspace(self: *Module, ctx: *context.CudaContext) !void {
+        if (self.attention) |*attention| try attention.clear(ctx);
+        try self.clearRecurrentWorkspace(ctx);
+    }
+
+    fn clearRecurrentWorkspace(self: *Module, ctx: *context.CudaContext) !void {
         if (self.scratch.ptr != 0) {
             try ctx.synchronize();
             self.scratch.free(ctx);
@@ -56,7 +63,7 @@ pub const Module = struct {
     pub fn reserve(self: *Module, ctx: *context.CudaContext, bytes: usize) !buffer.DeviceBuffer {
         if (bytes == 0) return .{};
         if (self.scratch.len >= bytes) return self.scratch;
-        try self.clearWorkspace(ctx);
+        try self.clearRecurrentWorkspace(ctx);
         var lease: ?memory.AdmissionLease = null;
         if (ctx.video_cache_budget.admission) |policy| {
             lease = try policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = bytes }, policy.check_live_memory);

@@ -44,24 +44,38 @@ rare CUDA Florence receipt mismatch is not definitively root-caused.
 
 ## CUDA follow-up qualification
 
-The bounded two-token decoder graph has fresh DGX Spark qualification for both
-LightOn models with default decode, optional BF16 prefill FFN, and optional BF16
-recurrent prefill. Every timed output agrees with native serial decoding and the
-fresh vLLM reference's normalized content on all three fixtures. The six 64-page
-runs require positive model-graph replay counters. The CUDA regression groups
-pass (240 selected: 226 passed, 14 backend skips; wide group: 76 selected,
-75 passed, one skip), including independent admission, ownership and state checks.
-These are functional checks, not a sustained vLLM parity result.
+The latest DGX Spark GB10 comparison uses 256 warmup requests and two
+256-request measurements, 128 physical native slots and at most 128 active vLLM
+sequences. Every native output matches native serial bytes and the complete
+normalized vLLM content on the three fixtures. Both profiles retain F32 decode
+and recurrent state, with optional BF16 FFN/recurrent prefill; 4B also uses the
+optional F16-query/F32-output paged prefill attention.
 
-Use `cuda_ocr_profile.py --decode-graph` and the native harness's
-`--require-lighton-model-graph`. Graph rows follow stable sequence IDs and both
-output columns return to the scheduler's original claim order. The public
-attention verifier also checks repeated two-token replay, reset, complete KV
-contents and unused slots with the original F32 threshold. The
-[follow-up archive manifest](followup.json) records the immutable evidence URI,
-object generation and SHA-256. Its 80 files include the exact frozen binary,
-source, commands, six reports, reference outputs and per-file checksums; ambient
-authentication and session variables are excluded.
+| Model | Native pages/s | vLLM pages/s | Required actual execution |
+| --- | ---: | ---: | --- |
+| LightOn 0.8B | 10.4775 / 10.4189 | 14.3595 / 14.3396 | Wide four-token chains in each round |
+| LightOn 4B | 3.6663 / 3.6641 | 4.6163 / 4.6200 | Wide model-graph replay in each round |
+
+The 0.8B profile uses vision/prefix limits 16/16; 4B uses 8/16 and prefix
+chunks of 256 rows. Operator byte limits are unchanged. The 4B four-token chain
+passes output qualification but gives no meaningful throughput improvement and
+is not selected by this table. These comparisons do not establish CUDA parity
+or broad OCR accuracy. Fresh Florence and Metal whole-model qualification after
+cleanup remains outstanding.
+
+All 44 frozen build187 runtime files match commit `bfd1738430`. CUDA broad
+regression: 248 selected, 234 passed, 14 backend skips. Wide group: 84 selected,
+83 passed, one skip. Independent packet, admission, numerical and ownership
+checks pass with their original tolerances. Default-F32 whole-model checks on
+both models also preserve exact independent baseline bytes; their contended
+rates are excluded from performance conclusions.
+
+The [latest archive manifest](followup.json) records the immutable URI, object
+generation, SHA-256 and 108 files. It retains exact frozen binaries and source,
+public scripts and fixtures, sanitized commands/settings, full native/reference
+reports, native-library artifacts and Florence regression evidence. Every member
+has a verified SHA-256; the uploaded object's size and MD5 were also checked.
+The [earlier 64-page functional bundle](followup-736f721b59.json) remains available.
 
 ## Reproduce
 
@@ -81,6 +95,14 @@ the user guide. Build a ReleaseFast inference test executable with Zig 0.17 and
   `check_cuda_bf16_prefill.py` checks its output/state against the independent
   FlashInfer wrapper, short-prefix histories, read-only inputs, canaries and
   insufficient scratch. Default F32 checks retain their original tolerances.
+- `build_cuda_prefill_attention.py` builds the optional SM12.1 F16-query,
+  F32-output paged prefill extension beside a selected recurrent library.
+  `check_cuda_prefill_attention.cpp` includes its native-only build command and
+  independently checks causal addressing, permuted physical pages, plan reuse,
+  overwritten CPU metadata, workspace bounds and input/output canaries. These
+  constructed checks do not constitute a general accuracy evaluation.
+- `verify_cuda_florence.sh --schedule-stress` adds the F64 cross-attention oracle
+  with delayed warp scheduling, preserving the original numerical tolerance.
 - `verify_cuda_{recurrent,attention,activations,vision,florence}.sh` reproduce the
   independent numerical, state, read-only and allocation-canary checks.
 - `check_metal_{projections,vision,prefill_attention}.m` retain independent Metal
