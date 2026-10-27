@@ -3613,7 +3613,7 @@ const Parser = struct {
             if (options.force_quote_all or options.force_quote_columns.len != 0) return self.fail(error.UnsupportedSqlShape, "FORCE_QUOTE is only valid for COPY TO");
             const columns = try self.alloc.alloc([]const u8, query.columns.len);
             for (columns, query.columns) |*out, projection| out.* = projection.field;
-            return .{ .copy_from = .{ .table = query.table.?, .columns = columns, .options = options } };
+            return .{ .copy_from = .{ .table = query.table.?, .columns = columns, .options = options, .predicate = try self.where() } };
         }
         return .{ .copy_to = .{ .query = query, .options = options, .implicit_columns = implicit_columns } };
     }

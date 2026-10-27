@@ -165,6 +165,9 @@ pub const Session = struct {
     mutation_ack_pending: bool = false,
     discard_after_reply: bool = false,
     copy_running: bool = false,
+    copy_source_statement: ?[]const u8 = null,
+    copy_source_inputs: []const @import("antfly_local_sources").sql_parameter_frame.Input = &.{},
+    copy_source_descriptors: []const backend.Parameter = &.{},
     copy_instant: ?@import("antfly_local_sources").sql_catalog.Clock.Instant = null,
     discard_copy_data: bool = false,
     copy_sync_received: bool = false,
@@ -391,6 +394,9 @@ pub const Session = struct {
             .scratch_allocator = self.alloc,
             .parameters = parameters,
             .statement_instant = if (self.copy_running) self.copy_instant else null,
+            .copy_source_statement = if (self.copy_running) self.copy_source_statement else null,
+            .copy_source_inputs = if (self.copy_running) self.copy_source_inputs else &.{},
+            .copy_source_descriptors = if (self.copy_running) self.copy_source_descriptors else &.{},
             .parameter_types = types,
             .database = self.database,
             .namespace = self.request_namespace orelse self.effectiveNamespace(),
@@ -920,7 +926,7 @@ pub const Session = struct {
                     if (commands.isCopy(statement)) {
                         const description = try self.describeTyped(arena.allocator(), statement, &.{}, &.{});
                         if (description.copy_in != null) {
-                            try self.copyIn(arena.allocator(), description);
+                            try self.copyIn(arena.allocator(), description, &.{}, null);
                             self.copy_sync_received = false;
                             if (self.status == .idle) self.clearPortals();
                             try self.ready();
@@ -1161,7 +1167,7 @@ pub const Session = struct {
                     portal.description = try self.rebindCached(portal.arena.allocator(), portal.statement, portal.description);
                     portal.stream_opened = true;
                     if (portal.description.copy_in != null) {
-                        try self.copyIn(portal.arena.allocator(), portal.description);
+                        try self.copyIn(portal.arena.allocator(), portal.description, portal.parameters, portal.parameter_cells);
                         portal.stream_complete = true;
                         portal.failed = false;
                         if (self.copy_sync_received) {
@@ -1788,8 +1794,19 @@ pub const Session = struct {
         }
     };
 
-    fn copyIn(self: *Session, a: std.mem.Allocator, description: backend.Description) !void {
+    fn copyIn(self: *Session, a: std.mem.Allocator, description: backend.Description, source_parameters: []const std.json.Value, source_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum) !void {
         const input = description.copy_in orelse return error.InvalidResult;
+        if (source_parameters.len != description.parameter_descriptors.len) return error.SqlUndefinedCopyParameter;
+        const filter_inputs = try a.alloc(@import("antfly_local_sources").sql_parameter_frame.Input, source_parameters.len);
+        for (filter_inputs, source_parameters, 0..) |*out, value, i| out.* = .{ .datum = if (source_cells) |cells| cells[i] else @import("antfly_local_sources").sql_scalar.Datum.fromJson(value) };
+        self.copy_source_statement = input.source_statement;
+        self.copy_source_descriptors = description.parameter_descriptors;
+        self.copy_source_inputs = filter_inputs;
+        defer {
+            self.copy_source_statement = null;
+            self.copy_source_inputs = &.{};
+            self.copy_source_descriptors = &.{};
+        }
         const width = input.columns.len;
         if (width == 0 or width > self.limits.columns or width > self.limits.parameters) return error.ProgramLimitExceeded;
         if (self.status == .failed) return error.InFailedSqlTransaction;
@@ -2083,8 +2100,8 @@ pub const Session = struct {
             self.admission_started = true;
             var result = try self.session.executeCells(a, sql.written(), self.parameters.items, self.types.items, self.descriptors.items, self.cells.items, null, self.description.binding_guard, self.description.setting_epoch);
             defer result.deinit();
-            if (result.transaction_status != .in_transaction or result.rows_affected != self.count) return error.InvalidResult;
-            self.total = std.math.add(u64, self.total, self.count) catch return error.ProgramLimitExceeded;
+            if (result.transaction_status != .in_transaction or result.rows_affected > self.count or (input.source_statement == null and result.rows_affected != self.count)) return error.InvalidResult;
+            self.total = std.math.add(u64, self.total, result.rows_affected) catch return error.ProgramLimitExceeded;
             self.count = 0;
             self.bytes = 0;
             self.defaults.clearRetainingCapacity();

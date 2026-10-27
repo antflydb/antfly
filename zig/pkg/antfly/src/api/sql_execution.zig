@@ -212,6 +212,7 @@ const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.
 pub const Adapter = struct {
     /// COPY input retains ordinary write authority but cannot target active RLS.
     copy_input: bool = false,
+    copy_filter: ?catalog.CopyFilter = null,
     statement_instant: ?catalog.Clock.Instant = null,
     lake_visibility: enum { committed, accepted } = .committed,
     read_requirements: @import("antfly_local_sources").sql_read_requirements.Requirements = .{},
@@ -801,7 +802,7 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
+        return .{ .copy_filter = self.copy_filter, .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -960,6 +961,7 @@ pub const Adapter = struct {
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
+        binding.schema_json = definition.schema_json;
         if (binding.external_base_source != null and action != .read and action != .admin) return error.ExternalLakeReadOnly;
         if (binding.external_base_source != null) binding.external_indexes = .{
             .catalog_json = definition.lake_index_catalog_json,
@@ -2225,9 +2227,11 @@ pub const Adapter = struct {
         view: @import("antfly_local_sources").api_table_read_source.RelationalReadView,
         filter: ?@import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter = null,
         allocator: std.mem.Allocator,
+        validator: ?@import("sql_schema_cache.zig").Cache.ValidatorLease = null,
 
         fn prepare(raw: *anyopaque, alloc: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.validator != null) return self.normalizeLocal(alloc, input, false);
             var stateful = false;
             for (self.table.columns) |column| stateful = stateful or column.sequence_default != null;
             if (!stateful) return self.normalize(alloc, input);
@@ -2259,6 +2263,40 @@ pub const Adapter = struct {
             }
             return result;
         }
+        fn candidates(raw: *anyopaque, alloc: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.table.schema_json.len == 0) return error.UnsupportedSqlExecution;
+            if (self.validator == null) self.validator = try self.adapter.server.sql_schema_cache.pinValidator(self.adapter.server.sqlPlanCacheIo(), alloc, self.table.schema_json);
+            if (self.validator.?.validator().schema.version != self.table.schema_version) return error.CatalogGenerationChanged;
+            const owned = try alloc.dupe(catalog.Mutation, input);
+            for (owned) |*mutation| if (mutation.row) |row| {
+                const value = try @import("antfly_local_sources").sql_operators.cloneDatum(alloc, .json(row));
+                if (value.value != .object) return error.InvalidSqlBackendResponse;
+                mutation.row = value.value;
+            };
+            return self.normalizeLocal(alloc, owned, true);
+        }
+        fn normalizeLocal(self: *@This(), alloc: std.mem.Allocator, input: []const catalog.Mutation, candidate: bool) ![]const catalog.Mutation {
+            try self.adapter.context.ensureActive();
+            const io = self.adapter.server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
+            const validator = self.validator.?.validator().forPreparation(.{ .io = io, .sequences = self.adapter.context.column_sequences, .sequence_scope = .{ .table_id = self.table.id, .schema_version = self.table.schema_version, .storage_name = self.table.physical_name }, .transaction_start = if (self.adapter.context.sql_transaction_micros) |micros| .{ .micros = micros } else null });
+            const result = try alloc.dupe(catalog.Mutation, input);
+            for (result) |*mutation| if (mutation.row) |*row| {
+                if (!candidate and self.table.storage_mode == .document) for (self.table.columns) |column| {
+                    if (!column.document_null_is_absent) continue;
+                    const value = if (column.document_path.len != 0) @import("antfly_local_sources").sql_document_path.get(row.*, column.document_path) else row.object.get(column.path);
+                    if (value == null or value.? != .null) continue;
+                    const explicit = for (mutation.json_null_fields) |field| {
+                        if (std.mem.eql(u8, column.path, field)) break true;
+                    } else false;
+                    if (!explicit) try column.assignStorageValue(alloc, &row.object, .null, true);
+                };
+                const nulls = if (candidate) try validator.prepareCandidateValueWithNulls(alloc, row, mutation.json_null_fields) else try validator.prepareSelectedValueWithNulls(alloc, row, mutation.json_null_fields);
+                mutation.json_null_fields = nulls.fields;
+                if (!candidate) if (self.filter) |*filter| if (!try filter.matchesJson(alloc, mutation.key, row.*)) return error.Forbidden;
+            };
+            return result;
+        }
         fn normalize(self: *@This(), alloc: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
             const images = @import("antfly_local_sources").sql_mutation_images;
             const writes = try images.writes(db_types.BatchWrite, alloc, input);
@@ -2276,6 +2314,7 @@ pub const Adapter = struct {
         }
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.validator) |*validator| validator.deinit();
             self.view.deinit();
             if (self.filter) |*filter| filter.deinit();
             self.allocator.destroy(self);
@@ -2315,7 +2354,7 @@ pub const Adapter = struct {
         if (require_visible) if (mandatory_filter) |json| {
             owner.filter = try @import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter.init(alloc, json);
         };
-        return .{ .ptr = owner, .prepare = MutationPreparation.prepare, .finish = MutationPreparation.finish, .close = MutationPreparation.close };
+        return .{ .ptr = owner, .candidates = MutationPreparation.candidates, .prepare = MutationPreparation.prepare, .finish = MutationPreparation.finish, .close = MutationPreparation.close };
     }
     fn prepareMutationsWithVisibility(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, require_visible: bool) ![]const catalog.Mutation {
         const key = for (input) |mutation| {

@@ -9411,8 +9411,25 @@
     },
     {
       "id": "sql-0380",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original COPY WHERE runs through authenticated pgwire and native distributed transactions. Shared immutable schema preparation applies typed defaults before filtering and generated values, NOT NULL and CHECK only to selected rows. Independent PostgreSQL fixtures cover complete typed postimages, omitted defaults, separate prepared numeric/NULL parameters, rejected-row sequence effects and late atomic failures. Native owners verify row versions/content digests, active-RLS denial, write authority and cold restart; no rewritten original or metadata-only credit.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_input_integration_test.zig",
+          "test": "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+          "gate": "sql-copy-input-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_input_integration_test.zig",
+          "test": "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+          "gate": "sql-copy-input-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/pgwire/protocol_test.zig",
+          "test": "pgwire COPY prepared predicate arguments remain separate from imported row arguments",
+          "gate": "sql-copy-input-protocol-debug"
+        }
+      ]
     },
     {
       "id": "sql-0381",

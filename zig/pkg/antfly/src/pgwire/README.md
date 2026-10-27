@@ -158,7 +158,10 @@ writes. Normal row filters, owner proofs and transaction checks remain active.
 ON_ERROR IGNORE skips conversion failures, including numeric-modifier overflow;
 it never skips malformed framing, missing defaults, encoding, constraint,
 authority or commit errors. Exceeding REJECT_LIMIT rolls back the whole COPY.
-WHERE and FREEZE are not activated by this implementation. COPY requires the wire streaming
+WHERE evaluates typed candidates after defaults and before generated values and
+constraints. Prepared predicate arguments stay separate from imported row cells.
+Generated-column references, aggregates, windows and subqueries are rejected.
+FREEZE remains unavailable. COPY requires the wire streaming
 protocol; the ordinary JSON SQL endpoint cannot carry an input stream.
 
 ## COPY output

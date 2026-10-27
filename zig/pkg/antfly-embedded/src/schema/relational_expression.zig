@@ -37,6 +37,8 @@ pub const max_allocated_bytes = 4 * max_output_bytes;
 
 /// One invocation can span several immutable plans. Work/cancellation remain
 /// sticky across nodes and bindings, independently of retained-byte admission.
+pub const PreparationPhase = enum { complete, candidate, selected };
+
 pub const PreparationRuntime = struct {
     io: std.Io,
     uuid_clock: ?*@import("../common/uuid.zig").Version7Clock = null,
@@ -4313,6 +4315,10 @@ pub const Set = struct {
     }
 
     pub fn applyValuesWithExecution(self: *const Set, execution: *Execution, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool) !void {
+        return self.applyValuesPhase(execution, values, present, defaults, default_mask, .complete);
+    }
+
+    fn applyValuesPhase(self: *const Set, execution: *Execution, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool, phase: PreparationPhase) !void {
         if (values.len != self.table.relational_columns.len or present.len != values.len or (default_mask != null and default_mask.?.len != values.len)) return error.InvalidRelationalExpressionInput;
         // Base assignments must cross the target domain before any generated
         // expression reads them. Ignore submitted generated fields and keep
@@ -4323,6 +4329,7 @@ pub const Set = struct {
         }
         for (self.order) |index| {
             const binding = &self.bindings[index];
+            if (phase == .candidate and binding.generated) continue;
             if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence or (default_mask != null and !default_mask.?[binding.ordinal]))) continue;
             values[binding.ordinal] = try self.normalizeBinding(execution, binding.ordinal, try binding.evaluate(execution, values, self.table.relational_columns[binding.ordinal].name));
             present[binding.ordinal] = true;
@@ -4353,6 +4360,10 @@ pub const Set = struct {
     }
 
     pub fn applyTypedJsonWithExecution(self: *const Set, execution: *Execution, document: *std.json.Value, roots: *@import("../sql/row_value.zig").JsonRow, nulls: *@import("../sql/row_value.zig").JsonNulls) !void {
+        return self.applyTypedJsonPhase(execution, document, roots, nulls, .complete);
+    }
+
+    pub fn applyTypedJsonPhase(self: *const Set, execution: *Execution, document: *std.json.Value, roots: *@import("../sql/row_value.zig").JsonRow, nulls: *@import("../sql/row_value.zig").JsonNulls, phase: PreparationPhase) !void {
         execution.numeric.charge(0) catch |err| return executionFailure(err);
         if (roots.context != &execution.numeric or nulls.context != &execution.numeric or
             roots.admission == null or nulls.admission == null or
@@ -4370,7 +4381,7 @@ pub const Set = struct {
         defer alloc.free(present);
         execution.bytes.* -= staging_bytes;
         try self.readValues(execution, document.*, values, present, true, roots, nulls);
-        try self.applyValuesWithExecution(execution, values, present, .apply_to_absent, null);
+        try self.applyValuesPhase(execution, values, present, if (phase == .selected) .preserve_absence else .apply_to_absent, null, phase);
         for (self.modifier_ordinals) |ordinal| {
             if (self.generated_columns[ordinal]) continue;
             const column = self.table.relational_columns[ordinal];
@@ -4382,6 +4393,7 @@ pub const Set = struct {
             };
         }
         for (self.bindings) |binding| {
+            if ((phase == .candidate and binding.generated) or (phase == .selected and !binding.generated)) continue;
             const name = self.table.relational_columns[binding.ordinal].name;
             if (!binding.generated and document.object.contains(name)) continue;
             const value = values[binding.ordinal];

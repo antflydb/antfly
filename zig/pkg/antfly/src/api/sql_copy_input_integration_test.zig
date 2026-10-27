@@ -26,12 +26,14 @@ const Entry = struct {
     id: []const u8,
     sql: []const u8,
     format: []const u8,
+    parameters: []const ?[]const u8 = &.{},
+    reject_before_data: bool = false,
     hex: []const u8,
     tag: []const u8,
     output: Result,
     faults: []const struct { name: []const u8, hex: []const u8, sqlstate: []const u8 },
 };
-const Reference = struct { create: []const u8, read: []const u8, entries: []const Entry, advanced: []const Entry, removed_oids: struct { id: []const u8, sql: []const u8, sqlstate: []const u8 }, identity: struct { create: []const u8, copy: []const u8, hex: []const u8, fault_hex: []const u8, fault_sqlstate: []const u8, after_hex: []const u8, output: Result }, rls_sqlstate: []const u8 };
+const Reference = struct { create: []const u8, read: []const u8, entries: []const Entry, advanced: []const Entry, predicates: []const Entry, predicate_errors: []const struct { sql: []const u8, sqlstate: []const u8 }, removed_oids: struct { id: []const u8, sql: []const u8, sqlstate: []const u8 }, identity: struct { create: []const u8, copy: []const u8, hex: []const u8, filter_sql: []const u8, filter_hex: []const u8, fault_hex: []const u8, fault_sqlstate: []const u8, after_hex: []const u8, output: Result }, rls_sqlstate: []const u8 };
 const bytes = @embedFile("../pgwire/fixtures/copy_input_reference.json");
 
 fn command(ctx: *fixture.Context, sql: []const u8) !void {
@@ -65,11 +67,32 @@ const Campaign = struct {
         if (rollback) try frames.frame(&input.writer, 'Q', "BEGIN\x00");
         const statement = try std.fmt.allocPrint(a, "{s}\x00", .{entry.sql});
         defer a.free(statement);
-        try frames.frame(&input.writer, 'Q', statement);
+        if (entry.parameters.len == 0) try frames.frame(&input.writer, 'Q', statement) else {
+            var body: std.Io.Writer.Allocating = .init(a);
+            defer body.deinit();
+            try body.writer.writeByte(0);
+            try body.writer.writeAll(statement);
+            try body.writer.writeInt(u16, 0, .big);
+            try frames.frame(&input.writer, 'P', body.written());
+            body.writer.end = 0;
+            try body.writer.writeAll("\x00\x00");
+            try body.writer.writeInt(u16, 0, .big);
+            try body.writer.writeInt(u16, @intCast(entry.parameters.len), .big);
+            for (entry.parameters) |parameter| {
+                if (parameter) |value| {
+                    try body.writer.writeInt(i32, @intCast(value.len), .big);
+                    try body.writer.writeAll(value);
+                } else try body.writer.writeInt(i32, -1, .big);
+            }
+            try body.writer.writeInt(u16, 0, .big);
+            try frames.frame(&input.writer, 'B', body.written());
+            try frames.frame(&input.writer, 'E', "\x00\x00\x00\x00\x00");
+            try frames.frame(&input.writer, 'S', "");
+        }
         const payload = try a.alloc(u8, hex.len / 2);
         defer a.free(payload);
         _ = try std.fmt.hexToBytes(payload, hex);
-        const early = reader_only or (expected != null and (std.mem.eql(u8, expected.?, "0A000") or std.mem.eql(u8, expected.?, "42601")));
+        const early = entry.reject_before_data or reader_only or (expected != null and (std.mem.eql(u8, expected.?, "0A000") or std.mem.eql(u8, expected.?, "42601")));
         if (!early) {
             var offset: usize = 0;
             while (offset < payload.len) {
@@ -142,6 +165,9 @@ const Campaign = struct {
         const serving = try fixture.waitServingSchema(ctx, "usage_records", 0);
         try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
         try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "usage_records");
+        var probe = self.reference.predicates[0];
+        probe.tag = "COPY 1";
+        try copy(ctx, probe, "302c6163746976650a", null, false, false, false);
         for (self.reference.entries) |entry| {
             try command(ctx, "DELETE FROM usage_records");
             try copy(ctx, entry, entry.hex, null, false, false, false);
@@ -180,6 +206,21 @@ const Campaign = struct {
                 try self.unchanged(ctx);
             }
         }
+        for (self.reference.predicates) |entry| {
+            try command(ctx, "DELETE FROM usage_records");
+            try copy(ctx, entry, entry.hex, null, false, false, false);
+            try self.capture(ctx, entry);
+            for (entry.faults) |fault| {
+                errdefer std.debug.print("COPY predicate={s} fault={s}\n", .{ entry.id, fault.name });
+                try copy(ctx, entry, fault.hex, fault.sqlstate, false, false, false);
+                try self.unchanged(ctx);
+            }
+        }
+        for (self.reference.predicate_errors) |failure| {
+            const entry: Entry = .{ .id = "predicate-rejection", .sql = failure.sql, .format = "text", .hex = "", .tag = "", .output = self.reference.predicates[0].output, .faults = &.{}, .reject_before_data = true };
+            try copy(ctx, entry, "", failure.sqlstate, false, false, false);
+            try self.unchanged(ctx);
+        }
         const removed = self.reference.removed_oids;
         const invalid: Entry = .{ .id = removed.id, .sql = removed.sql, .format = "csv", .hex = "", .tag = "", .output = self.reference.advanced[0].output, .faults = &.{} };
         try copy(ctx, invalid, "", removed.sqlstate, false, false, false);
@@ -196,6 +237,8 @@ const Campaign = struct {
         try copy(ctx, identity_entry, "6e6578740a", null, false, false, false);
         try copy(ctx, identity_entry, identity.fault_hex, identity.fault_sqlstate, false, false, false);
         try copy(ctx, identity_entry, identity.after_hex, null, false, false, false);
+        identity_entry.sql = identity.filter_sql;
+        try copy(ctx, identity_entry, identity.filter_hex, null, false, false, false);
         try self.checkIdentity(ctx);
         try command(ctx, "CREATE TABLE copy_rls(id BIGINT PRIMARY KEY,status TEXT)");
         const rls_owner = try fixture.waitServingSchema(ctx, "copy_rls", 0);
@@ -205,6 +248,8 @@ const Campaign = struct {
         try command(ctx, "ALTER TABLE copy_rls ENABLE ROW LEVEL SECURITY");
         _ = try @import("sql_policy_lifecycle_integration_test.zig").waitPublication(ctx, rls_owner.table_id, .active, 0);
         identity_entry.sql = "COPY copy_rls FROM STDIN";
+        try copy(ctx, identity_entry, "", self.reference.rls_sqlstate, false, false, false);
+        identity_entry.sql = "COPY copy_rls FROM STDIN WHERE FALSE";
         try copy(ctx, identity_entry, "", self.reference.rls_sqlstate, false, false, false);
         try self.baseline.?.fingerprints(ctx, .mutated);
     }
@@ -222,14 +267,14 @@ const Campaign = struct {
         try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "usage_records");
         try self.baseline.?.verify(ctx, true);
         try self.checkIdentity(ctx);
-        const entry = self.reference.advanced[self.reference.advanced.len - 1];
+        const entry = self.reference.predicates[self.reference.predicates.len - 1];
         try copy(ctx, entry, entry.faults[0].hex, "23505", false, false, false);
         try self.unchanged(ctx);
     }
 };
 
 test "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners" {
-    // sql-0370, sql-0371, sql-0379; sql-0381 rejects the removed OIDS option.
+    // sql-0370, sql-0371, sql-0379, sql-0380; sql-0381 rejects the removed OIDS option.
     // No statement rewriting or metadata-only credit.
     const a = std.testing.allocator;
     const reference = try std.json.parseFromSlice(Reference, a, bytes, .{ .ignore_unknown_fields = true });
@@ -240,6 +285,8 @@ test "mounted SQL original COPY input preserves PostgreSQL atomic batches constr
         const original = try corpus.get(entry.id);
         try std.testing.expectEqualStrings(original.sql, entry.sql);
     }
+    const predicate_original = try corpus.get(reference.value.predicates[0].id);
+    try std.testing.expectEqualStrings(predicate_original.sql, reference.value.predicates[0].sql);
     const removed = try corpus.get(reference.value.removed_oids.id);
     try std.testing.expectEqualStrings(removed.sql, reference.value.removed_oids.sql);
     var retained: std.heap.ArenaAllocator = .init(a);

@@ -418,6 +418,7 @@ pub const Table = struct {
             return parts.next() == null and std.mem.eql(u8, first, self.database) and std.mem.eql(u8, second, self.namespace) and std.mem.eql(u8, third, self.name);
         }
     };
+    schema_json: []const u8 = "",
     id: u64,
     physical_name: []const u8,
     schema_version: u32,
@@ -1478,16 +1479,25 @@ pub const ReadRelation = union(enum) {
 /// cut while preparing rows, and releases it before writer admission. Stateful
 /// defaults can be evaluated row by row without repeated remote opens.
 pub const MutationPreparation = struct {
+    candidates: ?*const fn (*anyopaque, std.mem.Allocator, []const Mutation) anyerror![]const Mutation = null,
     ptr: *anyopaque,
     prepare: *const fn (*anyopaque, std.mem.Allocator, []const Mutation) anyerror![]const Mutation,
     finish: *const fn (*anyopaque, std.mem.Allocator) anyerror!void,
     close: *const fn (*anyopaque) void,
 };
 
+pub const CopyFilter = struct {
+    predicate: *const ast.Predicate,
+    parameter_count: usize = 0,
+    descriptors: []const @import("scalar.zig").Type = &.{},
+    inputs: []const @import("parameter_frame.zig").Input = &.{},
+};
+
 pub const Backend = struct {
     pub const PreparedRead = struct { name: ast.Name, relation: ReadRelation };
     /// Private resolver namespace. Distinct delegated view contexts must not
     /// share name bindings even when their SQL references have the same text.
+    copy_filter: ?CopyFilter = null,
     binding_scope: usize = 0,
     prepared_read: ?*const PreparedRead = null,
     /// Trusted execution source and authorized durable transaction start.

@@ -60,6 +60,7 @@ const Mock = struct {
     cursor_readable: bool = true,
     copy_out: ?@import("copy_out.zig").Options = null,
     copy_in: ?@import("copy_out.zig").Options = null,
+    copy_predicate: bool = false,
     copy_staged: usize = 0,
     copy_committed: usize = 0,
     copy_sum: i64 = 0,
@@ -257,7 +258,7 @@ const Mock = struct {
         if (self.stream_definitions) |columns| if (std.mem.startsWith(u8, request.statement, "SELECT")) return .{ .columns = columns, .cursor_readable = self.cursor_readable };
         if (self.json_null_results) return .{ .columns = &.{.{ .name = "j", .type = .json }} };
         if (self.array_results) return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }} };
-        if (self.copy_in) |options| if (@import("session_commands.zig").isCopy(request.statement)) return .{ .copy_in = .{ .table = .{ .table = "t" }, .columns = self.stream_definitions orelse &.{.{ .name = "n", .type = .integer }}, .options = options }, .binding_guard = "immutable-catalog-binding" };
+        if (self.copy_in) |options| if (@import("session_commands.zig").isCopy(request.statement)) return .{ .parameter_types = if (self.copy_predicate) &.{.integer} else &.{}, .parameter_descriptors = if (self.copy_predicate) &.{.{ .kind = .integer, .element_type = .int64 }} else &.{}, .copy_in = .{ .source_statement = if (self.copy_predicate) "COPY t FROM STDIN WHERE n > $1" else null, .table = .{ .table = "t" }, .columns = self.stream_definitions orelse &.{.{ .name = "n", .type = .integer }}, .options = options }, .binding_guard = "immutable-catalog-binding" };
         return .{ .cursor_readable = self.cursor_readable, .copy_out = self.copy_out, .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
@@ -311,6 +312,12 @@ const Mock = struct {
             try std.testing.expectEqualStrings("immutable-catalog-binding", request.binding_guard.?);
             try std.testing.expect(request.parameters.len <= 128);
             try std.testing.expectEqual(request.parameters.len, request.parameter_cells.?.len);
+            if (self.copy_predicate) {
+                try std.testing.expectEqualStrings("COPY t FROM STDIN WHERE n > $1", request.copy_source_statement.?);
+                try std.testing.expectEqual(@as(usize, 1), request.copy_source_inputs.len);
+                try std.testing.expectEqual(@as(i64, 10), request.copy_source_inputs[0].datum.value.integer);
+                try std.testing.expectEqual(@as(usize, 1), request.copy_source_descriptors.len);
+            }
             self.copy_batches += 1;
             if (self.copy_batch_error) |err| return err;
             for (request.parameter_cells.?) |cell| {
@@ -3355,4 +3362,27 @@ test "pgwire COPY input preserves earlier native error ordering without retrying
         try std.testing.expect(std.mem.indexOf(u8, output.written(), @import("antfly_local_sources").sql_errors.describe(failure).code) != null);
         try std.testing.expect(std.mem.indexOf(u8, output.written(), "22P04") == null);
     };
+}
+
+test "pgwire COPY prepared predicate arguments remain separate from imported row arguments" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "COPY t FROM STDIN WHERE n > $1", true);
+    try bind(&input.writer, "p", "q", 10);
+    try execute(&input.writer, "p", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'd', "11\n12\n");
+    try frame(&input.writer, 'c', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .copy_in = .{}, .copy_predicate = true, .native_parameters = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(a, output.written());
+    defer a.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(i64, 23), mock.copy_sum);
+    try std.testing.expectEqual(@as(usize, 2), mock.copy_committed);
+    try std.testing.expectEqual(@as(usize, 1), mock.copy_batches);
 }

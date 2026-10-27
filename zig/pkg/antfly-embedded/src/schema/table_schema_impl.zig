@@ -1328,6 +1328,11 @@ pub fn prepareTypedDocumentWithNulls(owned_alloc: std.mem.Allocator, scratch: st
 }
 
 pub fn prepareTypedDocumentWithRuntime(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool, runtime: ?@import("relational_expression.zig").PreparationRuntime) !PreparedJsonNulls {
+    return prepareTypedDocumentPhase(owned_alloc, scratch, schema, value, physical_fields, compiled, json_null_fields, preserve, runtime, .complete);
+}
+
+pub fn prepareTypedDocumentPhase(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool, runtime: ?@import("relational_expression.zig").PreparationRuntime, phase: @import("relational_expression.zig").PreparationPhase) !PreparedJsonNulls {
+    if (preserve and phase != .complete) return error.InvalidBatchRequest;
     try compiled.requireSchema(schema);
     if (value.* != .object) return error.InvalidBatchRequest;
     const expressions_module = @import("relational_expression.zig");
@@ -1367,7 +1372,7 @@ pub fn prepareTypedDocumentWithRuntime(owned_alloc: std.mem.Allocator, scratch: 
     };
     // A present document JSON null is already a complete datum. Unlike an
     // AROW cell it needs no transport-side SQL-null marker to authenticate it.
-    if (hasDocumentExpressions(schema)) {
+    if (phase == .complete and hasDocumentExpressions(schema)) {
         if (compiled.expressions) |program| for (program.table.relational_columns) |column| {
             if (!column.is_json) continue;
             if (value.object.get(column.name)) |datum| if (datum == .null and !try nulls.contains(column.name)) try nulls.import(&.{column.name});
@@ -1376,8 +1381,8 @@ pub fn prepareTypedDocumentWithRuntime(owned_alloc: std.mem.Allocator, scratch: 
     if (!preserve) {
         try compiled.normalizeSql(&execution, value, false, .base);
         if (compiled.expressions) |expressions| {
-            try expressions.applyTypedJsonWithExecution(&execution, value, &roots, &nulls);
-            try compiled.normalizeSql(&execution, value, false, .derived);
+            try expressions.applyTypedJsonPhase(&execution, value, &roots, &nulls, phase);
+            if (phase != .candidate) try compiled.normalizeSql(&execution, value, false, .derived);
         }
     }
     const names = nulls.snapshot() catch |err| return switch (err) {
@@ -1401,7 +1406,13 @@ pub fn prepareTypedDocumentWithRuntime(owned_alloc: std.mem.Allocator, scratch: 
         if (compiled.expressions) |expressions|
             try expressions.verifyTypedJsonWithExecution(&execution, value.*, names);
     }
-    try validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, pointers, true, &execution, &nulls);
+    if (phase == .selected) if (document_schema) |document| for (document.required_fields) |name| {
+        const property = compiled.findProperty(document.properties, name) orelse return error.InvalidBatchRequest;
+        if (property.allows_null) continue;
+        const cell = value.object.get(name);
+        if (cell == null or (cell.? == .null and !try nulls.contains(name))) return error.SqlNotNullViolation;
+    };
+    if (phase != .candidate) try validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, pointers, true, &execution, &nulls);
     var output_bytes = std.math.mul(usize, names.len, @sizeOf([]const u8)) catch return execution.limit();
     for (names) |name| output_bytes = std.math.add(usize, output_bytes, name.len) catch return execution.limit();
     if (output_bytes > budget) return execution.limit();

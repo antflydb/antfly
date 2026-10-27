@@ -1606,6 +1606,21 @@ pub const Context = struct {
             if (std.mem.eql(u8, name, "_id")) key_index = i;
             for (statement.columns[0..i]) |previous| if (std.mem.eql(u8, previous, name)) return error.DuplicateColumn;
         }
+        const filter = self.binding.copy_filter;
+        var filter_frame: ?@import("bound_scalars.zig").Prepared = if (filter) |*bound| try bound.prepareParameters(self.arena, (self.backend.copy_filter orelse return error.InvalidSqlBackendResponse).inputs, .{ .bytes = self.limits.retained_bytes }) else null;
+        defer if (filter_frame) |*prepared| prepared.deinit();
+        const filter_images: ?ReturningImages = if (filter) |bound| blk: {
+            const fields = try self.arena.alloc([]const u8, bound.required.len);
+            for (fields, bound.required) |*name, ordinal| name.* = bound.columns[ordinal].name;
+            var images = try ReturningImages.initAtVersion(self.arena, table_def, fields, self.backend.write_version);
+            // Candidates are typed but have not crossed row constraints. A
+            // NULL required input may be excluded by WHERE before NOT NULL.
+            const candidate_columns = try self.arena.dupe(catalog.Column, images.projection.columns);
+            for (candidate_columns) |*column| column.nullable = true;
+            images.projection.columns = candidate_columns;
+            break :blk images;
+        } else null;
+        var selected: std.ArrayList(catalog.Mutation) = .empty;
         const mutations = try self.arena.alloc(catalog.Mutation, statement.rows.len);
         var keys: std.StringHashMapUnmanaged(void) = .empty;
         var retained: usize = 0;
@@ -1628,14 +1643,16 @@ pub const Context = struct {
                 const key = try clone(self.arena, key_datum.value);
                 if (key_datum.sql_null or key != .string or key.string.len == 0) return error.SqlRowIdentityRequired;
                 if (!std.unicode.utf8ValidateSlice(key.string)) return error.SqlTypeMismatch;
-                if ((try keys.getOrPut(self.arena, key.string)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return @import("conflict.zig").duplicateRowError(statement.conflict);
+                if (filter == null and (try keys.getOrPut(self.arena, key.string)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return @import("conflict.zig").duplicateRowError(statement.conflict);
                 var object: std.json.ObjectMap = .empty;
                 var json_null_fields: std.ArrayList([]const u8) = .empty;
                 for (columns, row, 0..) |column, item, i| {
                     if (key_index != null and i == key_index.?) continue;
                     if (statement.isDefault(row_index, i) or statement.ignoresIdentity(column)) continue;
                     const datum = try self.insertValue(item, column, row_index, i, page.values[row_index - first][i]);
-                    const typed = try self.storageDatumTyped(datum, column, column.element_type);
+                    var assignment_column = column;
+                    if (filter != null) assignment_column.nullable = true;
+                    const typed = try self.storageDatumTyped(datum, assignment_column, column.element_type);
                     if (table_def.isDocumentRoot(column.name)) {
                         if (datum.sql_null or typed != .object) return error.SqlTypeMismatch;
                         object = typed.object;
@@ -1644,14 +1661,29 @@ pub const Context = struct {
                     }
                     const json_null = column.type == .json and typed == .null and !datum.sql_null;
                     if (json_null) try json_null_fields.append(self.arena, column.path);
-                    try column.assignStorageValue(self.arena, &object, typed, datum.sql_null);
+                    try column.assignStorageValue(self.arena, &object, typed, datum.sql_null and filter == null);
                 }
                 const document: Json = .{ .object = object };
                 retained = std.math.add(usize, retained, jsonSize(document) + key.string.len) catch return error.SqlProgramLimitExceeded;
                 if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
-                try self.validateInsertRequired(table_def, object);
+                if (filter == null) try self.validateInsertRequired(table_def, object);
                 mutation.* = .{ .key = key.string, .expected_version = 0, .unique_absence = true, .row = document, .json_null_fields = json_null_fields.items };
-                if (stateful_defaults) {
+                if (filter != null) {
+                    if (preparation == null) preparation = try (self.backend.vtable.open_mutation_preparation orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.arena, table_def, mutation.key, table_def.storage_mode == .document);
+                    const owner = preparation.?;
+                    const candidates = try (owner.candidates orelse return error.UnsupportedSqlExecution)(owner.ptr, self.arena, mutations[row_index .. row_index + 1]);
+                    if (candidates.len != 1) return error.InvalidSqlBackendResponse;
+                    const image = try filter_images.?.row(page_arena.allocator(), candidates[0], mutation.*);
+                    const cells = try filter.?.cells(page_arena.allocator(), image);
+                    const predicate = filter_frame.?.predicate orelse return error.InvalidSqlBackendResponse;
+                    const matched = try @import("decision_eval.zig").evaluatePreparedWithLimits(page_arena.allocator(), self.backend.decision_provider, predicate, cells, @import("decision_eval.zig").limitsFor(self.backend));
+                    if (matched.sql_null or (matched.value == .bool and !matched.value.bool)) continue;
+                    if (matched.value != .bool) return error.SqlTypeMismatch;
+                    if ((try keys.getOrPut(self.arena, key.string)).found_existing) return error.UniqueConstraintViolation;
+                    const normalized = try owner.prepare(owner.ptr, self.arena, candidates);
+                    if (normalized.len != 1) return error.InvalidSqlBackendResponse;
+                    try selected.append(self.arena, normalized[0]);
+                } else if (stateful_defaults) {
                     if (preparation == null) preparation = try (self.backend.vtable.open_mutation_preparation orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.arena, table_def, mutation.key, statement.returning != null or statement.conflict != null or table_def.storage_mode == .document);
                     const owner = preparation.?;
                     const normalized = try owner.prepare(owner.ptr, self.arena, mutations[row_index .. row_index + 1]);
@@ -1667,8 +1699,9 @@ pub const Context = struct {
             owner.close(owner.ptr);
             preparation = null;
         }
-        const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table_def, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations, &.{}) else mutations;
-        return self.commitMutationsInner(table_def, resolved, "INSERT", statement.returning, stateful_defaults and statement.conflict == null);
+        const effective = if (filter != null) selected.items else mutations;
+        const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table_def, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, effective, &.{}) else effective;
+        return self.commitMutationsInner(table_def, resolved, "INSERT", statement.returning, filter != null or (stateful_defaults and statement.conflict == null));
     }
 
     fn insertSelect(self: Context, statement: ast.Insert, source: ast.Select) !Output {

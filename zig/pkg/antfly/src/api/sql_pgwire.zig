@@ -992,6 +992,10 @@ const Job = struct {
     fn run(self: *Job) void {
         defer self.done.set(self.request.io);
         self.runInner() catch |err| {
+            if (@import("builtin").is_test and self.request.copy_source_statement != null and std.mem.eql(u8, execution.diagnostic(err).code, "XX000")) {
+                std.debug.print("COPY predicate execution failed: {s}\n", .{@errorName(err)});
+                if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            }
             if (self.request.diagnostics) |diagnostic| if (diagnostic.code == null) {
                 if (self.compile_diagnostic_valid) {
                     const safe = execution.diagnostic(err);
@@ -1020,7 +1024,20 @@ const Job = struct {
             return err;
         };
         defer lease.release(self.adapter.server.sqlPlanCacheIo());
-        const compiled = lease.compiled();
+        var effective = lease.compiled().*;
+        var source_lease: ?@TypeOf(lease) = null;
+        defer if (source_lease) |*source| source.release(self.adapter.server.sqlPlanCacheIo());
+        var copy_filter: ?catalog.CopyFilter = null;
+        if (effective.statement == .insert) if (self.request.copy_source_statement) |source_sql| {
+            if (!self.request.copy_input) return error.Forbidden;
+            source_lease = try self.adapter.server.sqlPlanCache().acquire(self.adapter.server.sqlPlanCacheIo(), .{ .statement = source_sql, .principal = self.credential.principal, .database = self.request.database orelse "default", .namespace = self.request.namespace orelse "public" }, &self.compile_diagnostic);
+            const source = source_lease.?.compiled();
+            if (source.statement != .copy_from or source.statement.copy_from.predicate == null or !sameCopyTarget(effective.statement.insert.table, source.statement.copy_from.table)) return error.InvalidSqlParameters;
+            copy_filter = .{ .predicate = source.statement.copy_from.predicate.?, .parameter_count = source.parameter_count, .descriptors = self.request.copy_source_descriptors, .inputs = self.request.copy_source_inputs };
+            effective.uses_current_setting = effective.uses_current_setting or source.uses_current_setting;
+            effective.uses_sequences = effective.uses_sequences or source.uses_sequences;
+        };
+        const compiled = &effective;
         const write = self.kind == .execute and switch (compiled.statement) {
             .select, .explain, .copy_to, .copy_from => false,
             .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => true,
@@ -1035,6 +1052,7 @@ const Job = struct {
         const context = try authority.context();
         var native_adapter = execution.Adapter{
             .copy_input = self.request.copy_input or compiled.statement == .copy_from,
+            .copy_filter = copy_filter,
             .statement_instant = self.request.statement_instant,
             .sequence_state = self.request.sequence_state,
             .server = server,
@@ -1081,8 +1099,13 @@ const Job = struct {
             var describe_backend = guarded.backend();
             describe_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
             if (compiled.uses_current_setting) describe_backend.setting_capture = native_adapter.settingCapture();
+            if (compiled.statement == .copy_from and self.request.parameter_descriptors.len == 0 and hints.len != 0) {
+                const descriptors = try self.alloc.alloc(wire.Parameter, hints.len);
+                for (descriptors, hints) |*out, hint| out.* = .{ .kind = hint };
+                describe_backend.parameter_descriptor_hints = descriptors;
+            }
             const copy_input = if (compiled.statement == .copy_from) try describe_sql.copyWrite(self.alloc, describe_backend, compiled) else null;
-            var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, if (copy_input) |input| input.binding_backend else describe_backend, if (copy_input) |*input| &input.compiled else compiled, hints);
+            var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, if (copy_input) |input| input.binding_backend else describe_backend, if (copy_input) |*input| &input.compiled else compiled, if (copy_input != null) &.{} else hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
             for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
@@ -1098,13 +1121,16 @@ const Job = struct {
                 }
                 break :blk selected;
             } else null;
+            const filter_descriptors: []const wire.Parameter = if (description.binding.copy_filter) |filter| try self.alloc.dupe(wire.Parameter, filter.parameter_descriptors) else &.{};
+            const filter_types = try self.alloc.alloc(wire.Type, filter_descriptors.len);
+            for (filter_descriptors, filter_types) |descriptor, *out| out.* = if (descriptor.kind) |kind| try wireType(kind) else .unknown;
             self.description = .{
                 .cursor_readable = compiled.statement == .select,
                 .copy_out = if (compiled.statement == .copy_to) try compiled.statement.copy_to.options.clone(self.alloc) else null,
-                .copy_in = if (copy_columns) |selected| .{ .table = try cloneName(self.alloc, compiled.statement.copy_from.table), .columns = selected, .options = try compiled.statement.copy_from.options.clone(self.alloc) } else null,
+                .copy_in = if (copy_columns) |selected| .{ .source_statement = if (compiled.statement.copy_from.predicate != null) try self.alloc.dupe(u8, self.request.statement) else null, .table = try cloneName(self.alloc, compiled.statement.copy_from.table), .columns = selected, .options = try compiled.statement.copy_from.options.clone(self.alloc) } else null,
                 .columns = columns,
-                .parameter_types = if (copy_input != null) &.{} else parameter_types,
-                .parameter_descriptors = if (copy_input != null) &.{} else try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
+                .parameter_types = if (copy_input != null) filter_types else parameter_types,
+                .parameter_descriptors = if (copy_input != null) filter_descriptors else try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
                 .binding_guard = if (hasViewBindings(captured_bindings.items)) try encodeViewBindings(self.alloc, captured_bindings.items) else try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
                 .setting_epoch = if (description.settings) |view| view.epoch else null,
             };
@@ -1579,6 +1605,11 @@ const GuardedCatalog = struct {
         guard: *GuardedCatalog,
         table: catalog.Table,
         inner: catalog.MutationPreparation,
+        fn candidates(raw: *anyopaque, a: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.guard.checkWrite(self.table);
+            return (self.inner.candidates orelse return error.UnsupportedSqlExecution)(self.inner.ptr, a, input);
+        }
         fn prepare(raw: *anyopaque, a: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.guard.checkWrite(self.table);
@@ -1603,7 +1634,7 @@ const GuardedCatalog = struct {
         errdefer a.destroy(owner);
         const inner = try open(self.native.ptr, a, table, key, require_visible);
         owner.* = .{ .allocator = a, .guard = self, .table = table, .inner = inner };
-        return .{ .ptr = owner, .prepare = MutationPreparation.prepare, .finish = MutationPreparation.finish, .close = MutationPreparation.close };
+        return .{ .ptr = owner, .candidates = if (inner.candidates != null) MutationPreparation.candidates else null, .prepare = MutationPreparation.prepare, .finish = MutationPreparation.finish, .close = MutationPreparation.close };
     }
 
     const StatementRead = struct {
@@ -1748,6 +1779,17 @@ fn viewBindings(a: std.mem.Allocator, guard: ?[]const u8) !?[]const @import("sql
         }
     }
     return bindings;
+}
+
+fn sameCopyTarget(a: ast.Name, b: ast.Name) bool {
+    if (!std.mem.eql(u8, a.table, b.table)) return false;
+    inline for (.{ "database", "namespace" }) |field| {
+        const left = @field(a, field);
+        const right = @field(b, field);
+        if ((left == null) != (right == null)) return false;
+        if (left) |name| if (!std.mem.eql(u8, name, right.?)) return false;
+    }
+    return true;
 }
 
 fn cloneName(a: std.mem.Allocator, name: ast.Name) !ast.Name {
@@ -2350,6 +2392,7 @@ test "SQL pgwire retained mutation preparation fences write authority cancellati
     const Native = struct {
         opens: usize = 0,
         prepares: usize = 0,
+        candidate_calls: usize = 0,
         finishes: usize = 0,
         closes: usize = 0,
         fn checkpoint(_: *anyopaque) !void {}
@@ -2357,7 +2400,12 @@ test "SQL pgwire retained mutation preparation fences write authority cancellati
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(!require_visible);
             self.opens += 1;
-            return .{ .ptr = self, .prepare = prepare, .finish = finish, .close = close };
+            return .{ .ptr = self, .candidates = candidates, .prepare = prepare, .finish = finish, .close = close };
+        }
+        fn candidates(raw: *anyopaque, _: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.candidate_calls += 1;
+            return input;
         }
         fn prepare(raw: *anyopaque, _: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -2387,15 +2435,18 @@ test "SQL pgwire retained mutation preparation fences write authority cancellati
     {
         const preparation = try open(backend.ptr, a, table, "key", false);
         defer preparation.close(preparation.ptr);
+        _ = try preparation.candidates.?(preparation.ptr, a, &.{});
         _ = try preparation.prepare(preparation.ptr, a, &.{});
         try preparation.finish(preparation.ptr, a);
         try manager.removePermissionFromUser("writer", "docs", .table);
+        try std.testing.expectError(error.Forbidden, preparation.candidates.?(preparation.ptr, a, &.{}));
         try std.testing.expectError(error.Forbidden, preparation.prepare(preparation.ptr, a, &.{}));
         try std.testing.expectError(error.Forbidden, preparation.finish(preparation.ptr, a));
         try std.testing.expectError(error.Forbidden, open(backend.ptr, a, table, "key", false));
         canceled.store(true, .release);
         try std.testing.expectError(error.QueryCanceled, preparation.prepare(preparation.ptr, a, &.{}));
         try std.testing.expectEqual(@as(usize, 1), native_owner.opens);
+        try std.testing.expectEqual(@as(usize, 1), native_owner.candidate_calls);
         try std.testing.expectEqual(@as(usize, 1), native_owner.prepares);
         try std.testing.expectEqual(@as(usize, 1), native_owner.finishes);
         // Cleanup remains permitted after cancellation and authority revocation.

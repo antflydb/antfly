@@ -296,6 +296,21 @@ pub const CompiledTableValidator = struct {
         return prepared;
     }
 
+    /// Owned candidate DOM: input domains and defaults, before generated
+    /// values and constraints. The caller must finalize every retained row.
+    pub fn prepareCandidateValueWithNulls(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8) !impl.PreparedJsonNulls {
+        try self.canonicalizeUuid(alloc, value);
+        const result = try impl.prepareTypedDocumentPhase(alloc, alloc, self.schema, value, self.physical_fields, &self.execution, json_null_fields, false, self.preparation_runtime, .candidate);
+        errdefer result.deinit(alloc);
+        try self.canonicalizeUuid(alloc, value);
+        return result;
+    }
+
+    /// Finalize a typed candidate without reapplying omitted defaults.
+    pub fn prepareSelectedValueWithNulls(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8) !impl.PreparedJsonNulls {
+        return impl.prepareTypedDocumentPhase(alloc, alloc, self.schema, value, self.physical_fields, &self.execution, json_null_fields, false, self.preparation_runtime, .selected);
+    }
+
     fn canonicalizeUuid(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
         if (value.* != .object) return;
         for (self.uuid_columns) |name| {
@@ -4556,5 +4571,38 @@ test "document generated dependencies require persisted sources and unwind rejec
             try Run.run(a, bytes);
             try std.testing.checkAllAllocationFailures(a, Run.run, .{bytes});
         }
+    }
+}
+
+test "SQL COPY candidates defer generated NOT NULL and CHECK while selected rows finalize strictly" {
+    const a = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var create = try @import("../sql/compiler.zig").compile(a, "CREATE TABLE t(id BIGINT NOT NULL,n BIGINT DEFAULT 7,g BIGINT GENERATED ALWAYS AS (10 / (n - 7)) STORED,CHECK(n > 0))", .{});
+    defer create.deinit();
+    const json = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, create.statement.create_table);
+    defer a.free(json);
+    for ([_][]const u8{ "relational", "document" }) |mode| {
+        var declaration = try std.json.parseFromSliceLeaky(std.json.Value, owned, json, .{});
+        try declaration.object.put(owned, "storage_mode", .{ .string = mode });
+        const current = try std.json.Stringify.valueAlloc(a, declaration, .{});
+        defer a.free(current);
+        var validator = try CompiledTableValidator.init(a, current);
+        defer validator.deinit(a);
+        var candidate: std.json.Value = .{ .object = .empty };
+        const nulls = try validator.prepareCandidateValueWithNulls(owned, &candidate, &.{});
+        try std.testing.expectEqual(@as(i64, 7), candidate.object.get("n").?.integer);
+        try std.testing.expect(!candidate.object.contains("g"));
+        try std.testing.expect(!candidate.object.contains("id"));
+        try candidate.object.put(owned, "n", .{ .integer = 8 });
+        try std.testing.expectError(error.SqlNotNullViolation, validator.prepareSelectedValueWithNulls(owned, &candidate, nulls.fields));
+        try candidate.object.put(owned, "id", .{ .integer = 1 });
+        _ = try validator.prepareSelectedValueWithNulls(owned, &candidate, nulls.fields);
+        try std.testing.expectEqual(@as(i64, 10), candidate.object.get("g").?.integer);
+        // Selection must not reapply a removed/null default.
+        _ = candidate.object.orderedRemove("n");
+        _ = try validator.prepareSelectedValueWithNulls(owned, &candidate, &.{});
+        try std.testing.expect(!candidate.object.contains("n"));
     }
 }

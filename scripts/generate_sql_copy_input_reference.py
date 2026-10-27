@@ -208,6 +208,117 @@ def reference():
                     "faults": faults,
                 }
             )
+        predicates = []
+        original_where = inventory["sql-0380"]
+        for case_id, sql, parameters in [
+            (original_where["id"], original_where["sql"], []),
+            (
+                "copy-where-defaults",
+                "COPY usage_records(id,status) FROM STDIN (FORMAT csv) WHERE amount = 3.50 AND status <> 'blocked'",
+                [],
+            ),
+            (
+                "copy-where-null-parameter",
+                "COPY usage_records(id,status) FROM STDIN (FORMAT csv) WHERE id >= $1 AND status = 'active' AND amount > $2",
+                ["128", None],
+            ),
+            (
+                "copy-where-parameters",
+                "COPY usage_records(id,status) FROM STDIN (FORMAT csv) WHERE id >= $1 AND status = 'active' AND amount > $2",
+                ["128", "3.4999"],
+            ),
+        ]:
+            db.execute("DELETE FROM usage_records")
+            data = payload(
+                [
+                    (i, ["active", "inactive", "blocked", None][i % 4])
+                    for i in range(260)
+                ]
+                + [(None, "blocked")],
+                "csv",
+            )
+            wire_sql = sql
+            for index in range(len(parameters)):
+                wire_sql = wire_sql.replace("$" + str(index + 1), "%s")
+            with db.cursor() as cursor:
+                with cursor.copy(
+                    wire_sql, tuple(parameters) if parameters else None
+                ) as stream:
+                    stream.write(data)
+                tag = cursor.statusmessage
+            expected = state()
+            prefix = [(1000 + i, "active") for i in range(128)]
+            duplicate = expected["rows"][0][0] if expected["rows"] else None
+            faults = []
+            cases = [
+                (
+                    "duplicate",
+                    payload(prefix + [(duplicate, "active")], "csv"),
+                    "23505",
+                ),
+                (
+                    "bad_type_even_when_excluded",
+                    payload(prefix, "csv") + b"not-an-integer,blocked\n",
+                    "22P02",
+                ),
+                ("framing", payload(prefix, "csv") + b"2000,active,extra\n", "22P04"),
+            ]
+            if duplicate is None:
+                cases = [entry for entry in cases if entry[0] != "duplicate"]
+            if not parameters:
+                cases.append(
+                    (
+                        "selected_not_null",
+                        payload(prefix + [(None, "active")], "csv"),
+                        "23502",
+                    )
+                )
+            for name, broken, code in cases:
+                try:
+                    with db.transaction():
+                        with db.cursor().copy(
+                            wire_sql, tuple(parameters) if parameters else None
+                        ) as stream:
+                            stream.write(broken)
+                except psycopg.Error as error:
+                    if error.sqlstate != code:
+                        raise
+                else:
+                    raise AssertionError((case_id, name, "accepted"))
+                if state() != expected:
+                    raise AssertionError((case_id, name, "partial import"))
+                faults.append({"name": name, "hex": broken.hex(), "sqlstate": code})
+            predicates.append(
+                {
+                    "id": case_id,
+                    "sql": sql,
+                    "format": "csv",
+                    "parameters": parameters,
+                    "hex": data.hex(),
+                    "tag": tag,
+                    "output": expected,
+                    "faults": faults,
+                }
+            )
+        predicate_errors = []
+        for sql, code in [
+            (
+                "COPY usage_records(id,status) FROM STDIN WHERE normalized = 'active'",
+                "42P10",
+            ),
+            ("COPY usage_records(id,status) FROM STDIN WHERE count(*) > 0", "42803"),
+            ("COPY usage_records(id,status) FROM STDIN WHERE (SELECT true)", "0A000"),
+        ]:
+            try:
+                with db.transaction():
+                    with db.cursor().copy(sql) as stream:
+                        stream.write(b"")
+            except psycopg.Error as error:
+                if error.sqlstate != code:
+                    raise
+            else:
+                raise AssertionError((sql, "forbidden COPY predicate admitted"))
+            predicate_errors.append({"sql": sql, "sqlstate": code})
         invalid = inventory["sql-0381"]
         for invalid_id in ["sql-0381", "sql-0382"]:
             original = inventory[invalid_id]
@@ -290,9 +401,15 @@ def reference():
             raise AssertionError("malformed identity COPY admitted")
         with db.cursor().copy("COPY copy_identity(status) FROM STDIN") as stream:
             stream.write(b"after_failure\n")
+        identity_filter_sql = "COPY copy_identity(status) FROM STDIN WHERE id % 2 = 0"
+        identity_filter = b"excluded_by_default_id\nretained_by_default_id\n"
+        with db.cursor().copy(identity_filter_sql) as stream:
+            stream.write(identity_filter)
         identity = {
             "create": identity_create,
             "copy": identity_copy,
+            "filter_sql": identity_filter_sql,
+            "filter_hex": identity_filter.hex(),
             "fault_hex": identity_fault.hex(),
             "fault_sqlstate": "22P04",
             "after_hex": b"after_failure\n".hex(),
@@ -327,6 +444,8 @@ def reference():
         "read": READ,
         "entries": entries,
         "advanced": advanced,
+        "predicates": predicates,
+        "predicate_errors": predicate_errors,
         "option_checks": option_checks,
         "removed_oids": {
             "id": invalid["id"],
@@ -348,7 +467,9 @@ def main():
         if json.loads(args.check.read_text()) != result:
             raise SystemExit("COPY input PostgreSQL witness drift")
         print(
-            "verified three original COPY input codecs, advanced input profiles, 28 atomic-failure postimages and 21 option contracts"
+            f"verified three original COPY input codecs, {len(result['predicates'])} WHERE profiles, "
+            f"{sum(len(e['faults']) for e in result['entries'] + result['advanced'] + result['predicates'])} atomic-failure postimages "
+            f"and {len(result['option_checks'])} option contracts"
         )
     elif args.output:
         args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")

@@ -2,7 +2,7 @@
 
 The PostgreSQL wire listener admits text, CSV and binary `COPY FROM STDIN`
 through the existing SQL transaction and native mutation graph. This closes the
-unchanged originals `sql-0370`, `sql-0371` and `sql-0379`; the immutable original
+unchanged originals `sql-0370`, `sql-0371`, `sql-0379` and `sql-0380`; the immutable original
 inventory and SQL text are unchanged.
 
 ## Ownership and execution
@@ -68,6 +68,30 @@ explicit limit diagnostic. Default verbosity reports a skipped-row summary;
 verbose also reports input row ordinals, and silent suppresses those notices.
 Notices never include raw input values.
 
+## Predicate preparation
+
+COPY WHERE uses the shared schema preparation program in two phases. Candidate
+preparation applies input domains and omitted defaults, including identity and
+sequence defaults. A bound typed predicate evaluates only its required fields.
+Candidates may still contain NULL in required columns; excluded rows do not run
+generated expressions, NOT NULL or CHECK constraints. Selected rows finalize
+through that same program without applying defaults again, then enter the
+ordinary atomic mutation path. Sequence effects from excluded rows are retained.
+The shared phases support both relational and document schemas.
+
+Prepared COPY predicates own a parameter frame separate from each batch's input
+row parameters. Descriptor inference and NULL/numeric provenance remain intact;
+comparison parameters do not inherit a stored column's numeric precision/scale.
+Generated-column references, aggregates, windows and subqueries are rejected at
+description rather than after accepting the upload. Active RLS still rejects
+COPY even when the predicate is FALSE.
+
+One immutable validator lease spans each batch. Validators and layouts share the
+existing bounded, content-addressed schema cache; schema churn cannot evict a
+leased program. A warm lookup requires no request allocation. Candidate
+preparation performs no metadata RPC per row; the retained preparation owner,
+final schema fence and ordinary commit guards retain authority and integrity.
+
 ## Failure and policy behavior
 
 On a framing/conversion failure, earlier accepted buffered rows are validated
@@ -126,17 +150,13 @@ Observed local times were approximately 12–25 ms per codec. These measure the
 framing decoder, not end-to-end ingestion throughput. A separate structural
 assertion verifies that 300 input rows use three mutation batches.
 
-COPY WHERE and FREEZE remain unactivated, including the exact all-options
-original that requests FREEZE. Server-file/PROGRAM execution and non-UTF8
-encodings are not provided. This cohort does not claim those original cases or
-unrestricted transaction sizes, and it does not complete SQL parity.
+COPY WHERE is verified against four PostgreSQL profiles, including the exact
+original, omitted defaults, prepared numeric/NULL parameters, excluded invalid
+constraints and sequence effects. The native campaign also checks unchanged
+postimages after predicate/type/framing/constraint failures and cold replay.
 
-WHERE requires a shared candidate-preparation boundary: apply typed input and
-omitted/stateful defaults first, evaluate the predicate with the captured clock,
-then apply generated values and constraints only to retained candidates. It
-must support predicates on omitted defaulted columns, preserve sequence effects
-for excluded rows and reject generated-column references. Filtering already
-validated mutations or limiting predicates to supplied fields would violate
-that contract. FREEZE additionally needs proof of creation/truncation in the
-current subtransaction and compatible snapshot ownership; it cannot be accepted
-as an unchecked transport option.
+FREEZE remains unactivated, including the exact all-options original that
+requests it. It needs proof of creation/truncation in the current subtransaction
+and compatible snapshot ownership; it cannot be accepted as an unchecked
+transport option. Server-file/PROGRAM execution and non-UTF8 encodings are not
+provided. This work does not complete SQL parity.

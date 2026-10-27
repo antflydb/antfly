@@ -2475,7 +2475,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     view_domain_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-view-domain-lifecycle-test", "Verify exact view domains and immutable envelope identity across owner recovery")
         .dependOn(&view_domain_run.step);
-    const copy_input_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners", "SQL pgwire retained mutation preparation" });
+    const copy_input_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners", "SQL pgwire retained mutation preparation", "SQL schema cache COPY validator leases" });
     copy_input_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-copy-input-lifecycle-test", "Verify atomic COPY input through authenticated native transactions and cold owners").dependOn(&copy_input_run.step);
     const cursor_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original binary cursor preserves PostgreSQL scroll hold formats and cold owners"});

@@ -111,6 +111,7 @@ pub fn scanOrder(a: std.mem.Allocator, binding: BoundStatement, statement: ast.S
     return result;
 }
 pub const BoundStatement = struct {
+    copy_filter: ?bound_scalars.Bound = null,
     parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
     parameter_descriptors: []const @import("scalar.zig").Type = &.{},
     joined_mutation: ?*const @import("joined_mutation.zig").Bound = null,
@@ -255,7 +256,57 @@ fn typedValuesSource(allocator: std.mem.Allocator, source: *const ast.Select, in
 pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
     const result = try bindInternal(allocator, backend, compiled, explicit_parameter_types);
     for (result.columns) |column| if (column.type == .array and column.element_type == null) return error.SqlTypeMismatch;
-    return result;
+    var bound = result;
+    if (backend.copy_filter) |source| {
+        if (compiled.statement != .insert) return error.UnsupportedSqlExecution;
+        const table = result.table orelse return error.InvalidSqlBackendResponse;
+        const expression = try bound_scalars.predicateScalar(allocator, table, source.predicate);
+        try validateCopyExpression(expression, 0);
+        const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(allocator, source.parameter_count);
+        invocation.sequence_resolver = backend.sequence_resolver;
+        try invocation.mergeInferred(source.descriptors);
+        const types = try allocator.alloc(?ast.ColumnType, source.parameter_count);
+        for (types, invocation.descriptors) |*kind, descriptor| kind.* = descriptor.kind;
+        // COPY filters candidates, never a native scan. Force a typed residual
+        // even when an ordinary DELETE could use a complete storage seek.
+        const residual = try allocator.create(ast.Predicate);
+        residual.* = .{ .scalar = expression };
+        var filter = try bound_scalars.bindWithInvocation(allocator, table, .{ .delete = .{ .table = compiled.statement.insert.table, .predicate = residual } }, types, backend.settings_view, &.{}, invocation);
+        for (filter.required) |ordinal| if (ordinal < table.columns.len and table.columns[ordinal].generated) return error.SqlCopyGeneratedReference;
+        filter.parameter_descriptors = invocation.descriptors;
+        bound.copy_filter = filter;
+    }
+    return bound;
+}
+
+fn validateCopyExpression(expression: *const ast.Scalar, depth: usize) !void {
+    if (depth > 64) return error.SqlProgramLimitExceeded;
+    switch (expression.*) {
+        .call => |call| {
+            if (call.subquery != null) return error.UnsupportedSqlShape;
+            if (call.window != null) return error.SqlWindowingError;
+            if (@import("aggregate_binding.zig").aggregateKind(call.name) != null or call.star or call.distinct or call.within_group != null or call.filter != null) return error.SqlGroupingError;
+            for (call.args) |arg| try validateCopyExpression(arg, depth + 1);
+        },
+        .unary => |node| try validateCopyExpression(node.operand, depth + 1),
+        .binary => |node| {
+            try validateCopyExpression(node.left, depth + 1);
+            try validateCopyExpression(node.right, depth + 1);
+        },
+        .cast => |node| try validateCopyExpression(node.operand, depth + 1),
+        .case_when => |node| {
+            for (node.branches) |branch| {
+                try validateCopyExpression(branch.condition, depth + 1);
+                try validateCopyExpression(branch.value, depth + 1);
+            }
+            if (node.otherwise) |value| try validateCopyExpression(value, depth + 1);
+        },
+        .in_list => |node| {
+            try validateCopyExpression(node.operand, depth + 1);
+            for (node.values) |value| try validateCopyExpression(value, depth + 1);
+        },
+        else => {},
+    }
 }
 
 /// Bind COPY input with ordinary INSERT authority and assignment inference.
@@ -276,7 +327,11 @@ pub fn copyWrite(allocator: std.mem.Allocator, backend: catalog.Backend, compile
     var lowered = compiled.*;
     lowered.parameter_count = @intCast(row.len);
     lowered.statement = .{ .insert = .{ .table = input.table, .columns = try names.toOwnedSlice(allocator), .rows = rows, .overriding = .system } };
-    return .{ .compiled = lowered, .binding_backend = adapter.iface() };
+    var binding_backend = adapter.iface();
+    binding_backend.copy_filter = if (input.predicate) |predicate| .{ .predicate = predicate, .parameter_count = compiled.parameter_count, .descriptors = backend.parameter_descriptor_hints } else null;
+    binding_backend.parameter_descriptor_hints = &.{};
+    binding_backend.parameter_fallback_types = &.{};
+    return .{ .compiled = lowered, .binding_backend = binding_backend };
 }
 
 // Description-only INSERT binding may reuse exactly the authorized target.
@@ -1824,5 +1879,50 @@ test "SQL COPY input pins write-only description without granting reads or mutat
         try std.testing.expectEqual(.system, input.compiled.statement.insert.overriding);
         try std.testing.expectError(error.UnsupportedSqlExecution, input.binding_backend.vtable.resolve(input.binding_backend.ptr, a, .{ .table = "t" }, .read));
         try std.testing.expectError(error.UnsupportedSqlExecution, input.binding_backend.vtable.resolve(input.binding_backend.ptr, a, .{ .table = "different" }, .write));
+    }
+}
+
+test "SQL COPY predicate binding separates input row parameters from filter parameters and rejects generated references" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
+            try std.testing.expectEqual(catalog.Action.write, action);
+            return .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .integer, .element_type = .int64 },
+                .{ .name = "n", .path = "n", .type = .integer, .element_type = .int64, .defaulted = true },
+                .{ .name = "g", .path = "g", .type = .integer, .element_type = .int64, .generated = true },
+            } };
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn generate(_: *anyopaque, _: std.mem.Allocator) ![]const u8 {
+            return error.UnexpectedIdentityEffect;
+        }
+    };
+    const backend: catalog.Backend = .{ .ptr = undefined, .vtable = &.{ .resolve = Fixture.resolve, .checkpoint = Fixture.checkpoint, .scan = undefined, .mutate = undefined, .generate_row_id = Fixture.generate } };
+    {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        var compiled = try compiler.compile(a, "COPY t(id) FROM STDIN WHERE n > $1", .{});
+        defer compiled.deinit();
+        const input = try copyWrite(arena.allocator(), backend, &compiled);
+        var description = try describe(a, input.binding_backend, &input.compiled, &.{});
+        defer description.deinit();
+        try std.testing.expectEqual(@as(usize, 1), description.binding.parameter_descriptors.len);
+        const filter = description.binding.copy_filter.?;
+        try std.testing.expectEqual(@as(usize, 1), filter.parameter_descriptors.len);
+        try std.testing.expectEqual(@as(?ast.ColumnType, .integer), filter.parameter_descriptors[0].kind);
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), filter.parameter_descriptors[0].element_type);
+    }
+    for ([_]struct { sql: []const u8, failure: anyerror }{
+        .{ .sql = "COPY t(id) FROM STDIN WHERE g > 0", .failure = error.SqlCopyGeneratedReference },
+        .{ .sql = "COPY t(id) FROM STDIN WHERE count(*) > 0", .failure = error.SqlGroupingError },
+        .{ .sql = "COPY t(id) FROM STDIN WHERE (SELECT true)", .failure = error.UnsupportedSqlShape },
+    }) |entry| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        var compiled = try compiler.compile(a, entry.sql, .{});
+        defer compiled.deinit();
+        const input = try copyWrite(arena.allocator(), backend, &compiled);
+        try std.testing.expectError(entry.failure, describe(a, input.binding_backend, &input.compiled, &.{}));
     }
 }

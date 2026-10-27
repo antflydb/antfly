@@ -47,6 +47,9 @@ pub const Request = struct {
     statement: []const u8,
     /// Internal ingress intent: preserve PostgreSQL COPY/RLS admission on every batch.
     copy_input: bool = false,
+    copy_source_statement: ?[]const u8 = null,
+    copy_source_inputs: []const @import("antfly_local_sources").sql_parameter_frame.Input = &.{},
+    copy_source_descriptors: []const Parameter = &.{},
     statement_instant: ?@import("antfly_local_sources").sql_catalog.Clock.Instant = null,
     /// Reclaiming allocator sharing the connection cap. Result envelopes use
     /// the describe/execute arena; backend-owned execution scratch/results can
@@ -131,6 +134,7 @@ pub const Description = struct {
 };
 
 pub const CopyInput = struct {
+    source_statement: ?[]const u8 = null,
     table: @import("antfly_local_sources").sql_ast.Name,
     columns: []const Column,
     options: @import("antfly_local_sources").sql_ast.CopyOptions,

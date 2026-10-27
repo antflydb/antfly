@@ -35,7 +35,10 @@ const Layout = struct {
         return .{ .id = id, .physical_name = physical_name, .schema_version = self.version, .storage_mode = self.storage_mode, .version_field = self.version_field, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .index_definitions = self.index_definitions, .constraints = self.constraints };
     }
 };
+const Kind = enum { layout, validator };
 const Entry = struct {
+    kind: Kind,
+    validator: ?schema.CompiledTableValidator = null,
     digest: [32]u8,
     budget: Budget,
     arena: std.heap.ArenaAllocator,
@@ -67,6 +70,7 @@ pub const Cache = struct {
         self.* = undefined;
     }
     fn destroy(self: *Cache, entry: *Entry) void {
+        if (entry.validator) |*validator| validator.deinit(entry.arena.allocator());
         entry.arena.deinit();
         std.debug.assert(entry.budget.live == 0);
         self.allocator.destroy(entry);
@@ -76,7 +80,7 @@ pub const Cache = struct {
     }
     fn resolveWithEntryLimit(self: *Cache, io: std.Io, alloc: std.mem.Allocator, json: []const u8, id: u64, physical_name: []const u8, requested_limit: usize) !catalog.Table {
         const limit = @min(entry_budget, requested_limit);
-        const cached = if (json.len <= limit) self.acquire(io, alloc, json, limit) catch |err| switch (err) {
+        const cached = if (json.len <= limit) self.acquire(io, alloc, json, limit, .layout) catch |err| switch (err) {
             error.SchemaCacheEntryTooLarge => null,
             else => return err,
         } else null;
@@ -119,7 +123,44 @@ pub const Cache = struct {
         }
         return .{ .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .storage_mode = entry.layout.storage_mode, .version_field = if (entry.layout.version_field) |field| try alloc.dupe(u8, field) else null, .columns = columns, .indexes = indexes, .index_definitions = definitions, .constraints = constraints };
     }
-    fn acquire(self: *Cache, io: std.Io, scratch: std.mem.Allocator, json: []const u8, limit: usize) !*Entry {
+    pub const ValidatorLease = struct {
+        cache: *Cache,
+        io: std.Io,
+        entry: ?*Entry = null,
+        standalone: ?*schema.CompiledTableValidator = null,
+        allocator: std.mem.Allocator,
+        pub fn validator(self: @This()) schema.CompiledTableValidator {
+            return if (self.entry) |entry| entry.validator.? else self.standalone.?.*;
+        }
+        pub fn deinit(self: *@This()) void {
+            if (self.entry) |entry| {
+                self.cache.mutex.lockUncancelable(self.io);
+                std.debug.assert(entry.refs != 0);
+                entry.refs -= 1;
+                self.cache.mutex.unlock(self.io);
+            } else if (self.standalone) |value| {
+                value.deinit(self.allocator);
+                self.allocator.destroy(value);
+            }
+            self.* = undefined;
+        }
+    };
+
+    /// Layouts and validators share one bounded content-addressed LRU. A lease
+    /// pins an immutable validation program through preparation and filtering.
+    pub fn pinValidator(self: *Cache, io: std.Io, alloc: std.mem.Allocator, json: []const u8) !ValidatorLease {
+        const entry = if (json.len <= entry_budget) self.acquire(io, alloc, json, entry_budget, .validator) catch |err| switch (err) {
+            error.SchemaCacheEntryTooLarge => null,
+            else => return err,
+        } else null;
+        if (entry) |value| return .{ .cache = self, .io = io, .entry = value, .allocator = alloc };
+        const value = try alloc.create(schema.CompiledTableValidator);
+        errdefer alloc.destroy(value);
+        value.* = try schema.CompiledTableValidator.init(alloc, json);
+        return .{ .cache = self, .io = io, .standalone = value, .allocator = alloc };
+    }
+
+    fn acquire(self: *Cache, io: std.Io, scratch: std.mem.Allocator, json: []const u8, limit: usize, kind: Kind) !*Entry {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(json, &digest, .{});
         try self.mutex.lock(io);
@@ -130,7 +171,7 @@ pub const Cache = struct {
         for (&self.slots, 0..) |*slot, index| {
             if (slot.building) continue;
             if (slot.entry) |entry| {
-                if (std.mem.eql(u8, &digest, &entry.digest)) {
+                if (entry.kind == kind and std.mem.eql(u8, &digest, &entry.digest)) {
                     entry.refs += 1;
                     entry.used = self.clock;
                     return entry;
@@ -154,10 +195,17 @@ pub const Cache = struct {
         if (victim) |old| self.destroy(old);
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
-        entry.* = .{ .digest = digest, .budget = .{ .backing = self.allocator, .limit = limit }, .arena = undefined };
+        entry.* = .{ .kind = kind, .digest = digest, .budget = .{ .backing = self.allocator, .limit = limit }, .arena = undefined };
         entry.arena = std.heap.ArenaAllocator.init(entry.budget.allocator());
         errdefer entry.arena.deinit();
-        derive(&entry.layout, json, scratch, entry.arena.allocator()) catch |err| {
+        const built = switch (kind) {
+            .layout => derive(&entry.layout, json, scratch, entry.arena.allocator()),
+            .validator => blk: {
+                entry.validator = schema.CompiledTableValidator.init(entry.arena.allocator(), json) catch |err| break :blk @as(anyerror!void, err);
+                break :blk @as(anyerror!void, {});
+            },
+        };
+        built catch |err| {
             if (err == error.OutOfMemory and entry.budget.exhausted) return error.SchemaCacheEntryTooLarge;
             return err;
         };
@@ -167,7 +215,7 @@ pub const Cache = struct {
         // Concurrent requests may derive the same content. Publish one entry;
         // destroy the loser before releasing its reserved slot.
         for (self.slots) |slot| if (slot.entry) |winner| {
-            if (std.mem.eql(u8, &digest, &winner.digest)) {
+            if (winner.kind == kind and std.mem.eql(u8, &digest, &winner.digest)) {
                 winner.refs += 1;
                 winner.used = self.clock;
                 self.mutex.unlock(io);
@@ -598,4 +646,26 @@ test "external lake SQL schema cache separates wide source derivation scratch fr
         };
         try std.testing.expectEqual(@as(usize, 1), entries);
     }
+}
+
+test "SQL schema cache COPY validator leases pin immutable programs through schema cache churn" {
+    const a = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    var cache: Cache = .init(a);
+    defer cache.deinit();
+    const json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\",\"x-antfly-sql-type\":\"int64\"}},\"additionalProperties\":false}}}}";
+    var pinned = try cache.pinValidator(std.testing.io, a, json);
+    defer pinned.deinit();
+    const pointer = pinned.entry.?;
+    for (2..40) |version| {
+        const current = try std.fmt.allocPrint(arena.allocator(), "{{\"version\":{d},\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"n\":{{\"type\":\"integer\",\"x-antfly-sql-type\":\"int64\"}}}},\"additionalProperties\":false}}}}}}}}", .{version});
+        _ = try cache.resolve(std.testing.io, arena.allocator(), current, 7, "physical");
+    }
+    try std.testing.expectEqual(@as(u32, 1), pinned.validator().schema.version);
+    var empty: std.heap.FixedBufferAllocator = .init(&.{});
+    var second = try cache.pinValidator(std.testing.io, empty.allocator(), json);
+    defer second.deinit();
+    try std.testing.expect(second.entry.? == pointer);
+    try std.testing.expectEqual(@as(usize, 2), pointer.refs);
 }
