@@ -37,9 +37,9 @@ Both Metal models defer paged-attention completion within the active
 decoder frame, avoiding a GPU wait at every full-attention layer. The rollback
 is `TERMITE_METAL_DISABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED=1`.
 
-On M4 Max, both projection paths use SIMD reductions for single-token
-projections, including the small recurrent gates, and fuses FFN gate/up
-projection with SiLU. Its wide decode and attention-head RMS normalizations
+On M4 Max and M5 Pro, both projection paths use SIMD reductions for single-token
+projections, including the small recurrent gates, and fuse FFN gate/up
+projection with SiLU. Their wide decode and attention-head RMS normalizations
 also use parallel F32 reductions instead of scanning each row in one lane.
 Eligible multi-token projections use Metal 4 TensorOps
 on macOS 26.1 or newer. Unsupported shapes, alignment, or shader availability
@@ -115,11 +115,23 @@ short prefixes, grouped heads, continued decoding, reset, and zero core
 readbacks against the CPU reference.
 
 Metal batches decoder commands across layers and vision commands within each
-block. The M4 Max also enables vectorized BF16 weight loads for the qualified
-0.8B and 4B text/vision projection shapes; activations and accumulation remain F32.
+block. The M4 Max and M5 Pro also enable vectorized BF16 weight loads for the
+qualified 0.8B and 4B text/vision projection shapes; activations and accumulation remain F32.
 Other shapes retain the existing dispatch. The CPU fallback uses vectorized
 recurrence and activations. Measure release-build latency on deployment
 hardware before setting an SLO; this does not qualify CUDA or vLLM throughput.
+
+The Metal `/read` throughput profile requires
+`ANTFLY_LIGHTONOCR3_THROUGHPUT=1`,
+`ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE=1`, and
+`ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET=1`. It keeps the configured row and
+memory limits. LightOn's M5 Pro qualification is model-scoped; hardware defaults
+for other models retain their existing device gates.
+
+Qualified LightOn decode also enables prepared frames and bounded frame overlap.
+`TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME=1` restores normal frame preparation;
+`TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME=1` disables overlap and selects
+the conservative reader profile.
 
 Run the focused tests from `zig/` with the repository's Zig 0.17 toolchain:
 

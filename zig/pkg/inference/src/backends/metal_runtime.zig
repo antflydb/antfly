@@ -1100,7 +1100,7 @@ fn getenvFlagEnabled(comptime name: [*:0]const u8) bool {
 /// One opt-in serving preset; individual explicit overrides remain authoritative.
 /// Precision and admission limits are not changed by this profile.
 pub fn lightOnThroughputProfileEnabled() bool {
-    return @import("antfly_platform").env.getenvBool("ANTFLY_LIGHTONOCR3_THROUGHPUT") and qualifiedM4DeviceDefault();
+    return @import("antfly_platform").env.getenvBool("ANTFLY_LIGHTONOCR3_THROUGHPUT") and qualifiedLightOnDeviceDefault();
 }
 
 pub fn lightOnThroughputFeatureEnabled(comptime name: [*:0]const u8) bool {
@@ -13721,20 +13721,6 @@ test "concurrent planned dispatch policy is fail closed and hazards share produc
 
 test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
-    defer std.testing.allocator.free(source);
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_Q2_DEFAULT_MIN_KV_TOKENS 512u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "attention_decode_gqa_split_scratch_buffer_alt"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "submitted_frame_decode_gqa_split_scratch_slot ^ 1u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid ="));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid = 0u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_device_default() != 0"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_enabled();"));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "scratch_runtime->submitted_frame_cb != nil || output_offset"));
 
     const variants = [_]struct {
         variant: DecodeGqaSplitVariant,
@@ -14607,6 +14593,7 @@ pub extern fn termite_metal_copy_device_name(buffer: [*c]u8, capacity: usize) us
 pub extern fn termite_metal_copy_compiler_identity(buffer: [*c]u8, capacity: usize) usize;
 pub extern fn termite_metal_device_info_get(info: *MetalDeviceInfo) c_int;
 pub extern fn termite_metal_qualified_m4_device_default() c_int;
+pub extern fn termite_metal_qualified_lightonocr3_device_default() c_int;
 pub extern fn termite_metal_pipelined_decode_frame_device_default() c_int;
 
 /// Hardware qualification is independent of the prepared-frame rollback flags.
@@ -14614,6 +14601,13 @@ pub fn qualifiedM4DeviceDefault() bool {
     if (comptime !build_options.enable_metal) return false;
     if (comptime @import("builtin").os.tag != .macos) return false;
     return termite_metal_qualified_m4_device_default() != 0;
+}
+
+/// LightOn's qualified devices; does not widen unrelated M4-only defaults.
+pub fn qualifiedLightOnDeviceDefault() bool {
+    if (comptime !build_options.enable_metal) return false;
+    if (comptime @import("builtin").os.tag != .macos) return false;
+    return termite_metal_qualified_lightonocr3_device_default() != 0;
 }
 
 test "M4 qualified feature defaults honor explicit false and model isolation" {

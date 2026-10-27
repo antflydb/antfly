@@ -347,6 +347,7 @@ static void termite_metal_jit_exact_pipeline_entry_copy(
 
 static bool termite_metal_env_flag_enabled(const char *value);
 int termite_metal_qualified_m4_device_default(void);
+int termite_metal_qualified_lightonocr3_device_default(void);
 
 // Mirrors zig/lib/platform/src/env.zig getenvBoolDefault: unset -> default,
 // empty/"0"/"false"/"no"/"off" -> false, any other value -> true (the same
@@ -367,7 +368,7 @@ static BOOL termite_metal_lightonocr3_profile_feature_enabled(const char *name) 
     const char *value = getenv(name);
     if (value != NULL) return termite_metal_env_flag_enabled(value);
     return termite_metal_env_flag_enabled(getenv("ANTFLY_LIGHTONOCR3_THROUGHPUT")) &&
-        termite_metal_qualified_m4_device_default() != 0;
+        termite_metal_qualified_lightonocr3_device_default() != 0;
 }
 
 static BOOL termite_metal_generated_quant_disabled(void) {
@@ -17862,21 +17863,22 @@ static size_t termite_metal_decode_gqa_split_effective_default_min_kv_tokens(
 
 int termite_metal_pipelined_decode_frame_device_default(void);
 
-static bool termite_metal_pipelined_decode_frame_enabled(void) {
+static bool termite_metal_pipelined_decode_frame_enabled(termite_metal_decode_runtime *runtime) {
     if (termite_metal_env_flag_truthy(
             getenv("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"))) return false;
     return termite_metal_env_flag_truthy(
                getenv("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME")) ||
         termite_metal_a4b_high_memory_fast_path_enabled() ||
-        termite_metal_pipelined_decode_frame_device_default() != 0;
+        termite_metal_pipelined_decode_frame_device_default() != 0 ||
+        (runtime != NULL && runtime->lightonocr3_projections_enabled);
 }
 
-static bool termite_metal_a4b_decode_gqa_split_frame_scratch_enabled(void) {
+static bool termite_metal_a4b_decode_gqa_split_frame_scratch_enabled(termite_metal_decode_runtime *runtime) {
     if (termite_metal_env_flag_truthy(
             getenv("TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"))) return false;
     return termite_metal_env_flag_truthy(
                getenv("TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH")) ||
-        termite_metal_pipelined_decode_frame_enabled();
+        termite_metal_pipelined_decode_frame_enabled(runtime);
 }
 
 static bool termite_metal_a4b_decode_gqa_split_enabled(void) {
@@ -26657,6 +26659,26 @@ int termite_metal_qualified_m4_device_default(void) {
     return qualified;
 }
 
+// LightOn qualification is model-scoped; unrelated M4-only rollouts stay put.
+static bool termite_metal_lightonocr3_device_qualified(id<MTLDevice> device, uint16_t family) {
+    return device != nil &&
+        ((family == 9u && [device.name isEqualToString:@"Apple M4 Max"]) ||
+         (family == 10u && [device.name isEqualToString:@"Apple M5 Pro"]));
+}
+
+int termite_metal_qualified_lightonocr3_device_default(void) {
+    static int qualified = 0;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        @autoreleasepool {
+            id<MTLDevice> device = termite_metal_shared_device();
+            qualified = termite_metal_qualified_m4_device_default() != 0 ||
+                termite_metal_lightonocr3_device_qualified(device, termite_metal_device_apple_gpu_family(device));
+        }
+    });
+    return qualified;
+}
+
 // Pipelined decode frames default on only where the fast prepared frame is
 // qualified: the overlap win was validated on that command-buffer path, and
 // the shared qualification keeps one rollback story per device class.
@@ -26943,7 +26965,7 @@ int termite_metal_decode_runtime_lighton_attention_batch_begin(
     termite_metal_decode_runtime *runtime) {
   if (runtime == NULL || runtime->active_frame_cb == nil ||
       runtime->lighton_attention_batch != NULL ||
-      !termite_metal_qualified_m4_device_default())
+      !termite_metal_qualified_lightonocr3_device_default())
     return -1;
   const size_t bank = runtime->active_frame_decode_gqa_split_scratch_slot & 1u;
   if (runtime->lighton_attention_batch_scratch[bank] == nil) {
@@ -27460,7 +27482,7 @@ static bool termite_metal_decode_gqa_split_eligible(
     if (strict_failure_out != NULL) *strict_failure_out = false;
     if (runtime == NULL) return false;
     const bool lightonocr3_shape = runtime->qwen35_ocr_vector_loads_enabled &&
-        termite_metal_qualified_m4_device_default() && q_len == 1u &&
+        termite_metal_qualified_lightonocr3_device_default() && q_len == 1u &&
         head_dim == 256u && sliding_window == 0u &&
         ((num_heads == 8u && num_kv_heads == 2u) || (num_heads == 16u && num_kv_heads == 4u));
     size_t min_kv_tokens = runtime->decode_gqa_split_min_kv_explicit
@@ -30270,7 +30292,7 @@ static bool termite_metal_a4b_simd4_rms_norm_rows_preferred(
 void termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(termite_metal_decode_runtime *runtime, int enabled) {
     if (runtime == NULL) return;
     runtime->qwen35_ocr_vector_loads_enabled = enabled != 0 &&
-        [runtime->device.name isEqualToString:@"Apple M4 Max"];
+        termite_metal_lightonocr3_device_qualified(runtime->device, runtime->apple_gpu_family);
 }
 
 int termite_metal_decode_runtime_lightonocr3_batch_projection_available(termite_metal_decode_runtime *runtime, size_t rows, size_t in_dim) {
@@ -30380,7 +30402,23 @@ void termite_metal_decode_runtime_set_lightonocr3_projections(termite_metal_deco
     if (runtime == NULL)
         return;
     runtime->lightonocr3_projections_enabled =
-        enabled != 0 && [runtime->device.name isEqualToString:@"Apple M4 Max"];
+        enabled != 0 && termite_metal_lightonocr3_device_qualified(runtime->device, runtime->apple_gpu_family);
+    runtime->fast_prepared_frame_enabled =
+        termite_metal_fast_prepared_frame_enabled_for_device(runtime->device, runtime->apple_gpu_family) ||
+        (runtime->lightonocr3_projections_enabled &&
+         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME")));
+    runtime->decode_gqa_split_frame_scratch_enabled =
+        termite_metal_a4b_decode_gqa_split_frame_scratch_enabled(runtime);
+    // Model selection follows runtime construction. LightOn overlap needs
+    // a second scratch bank even when the generic device default is serial.
+    if (runtime->lightonocr3_projections_enabled &&
+        runtime->decode_gqa_split_frame_scratch_enabled &&
+        runtime->attention_decode_gqa_split_scratch_buffer != nil &&
+        runtime->attention_decode_gqa_split_scratch_buffer_alt == nil) {
+        runtime->attention_decode_gqa_split_scratch_buffer_alt =
+            antfly_observe_metal_buffer([runtime->device newBufferWithLength:runtime->attention_decode_gqa_split_scratch_capacity
+                                                                  options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+    }
     if (runtime->lightonocr3_projections_enabled) termite_metal_initialize_lightonocr3_recurrent(runtime);
     if (runtime->lightonocr3_projections_enabled &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS")) &&
@@ -31051,7 +31089,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
                 ? runtime->decode_gqa_split_min_kv_override
                 : TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS;
         runtime->decode_gqa_split_frame_scratch_enabled =
-            termite_metal_a4b_decode_gqa_split_frame_scratch_enabled();
+            termite_metal_a4b_decode_gqa_split_frame_scratch_enabled(runtime);
         runtime->trace_decode_gqa_split_schedule = termite_metal_env_flag_enabled(
             getenv("TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE"));
         bool decode_gqa_split_swa_override_valid = true;
@@ -31558,7 +31596,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->linear_bf16_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_bf16_1x_reduce");
         runtime->lightonocr3_gemv_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_gemv_vec4");
         runtime->lightonocr3_gemv_rows2_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_gemv_vec4_rows2");
-        if ([device.name isEqualToString:@"Apple M4 Max"]) {
+        if (termite_metal_lightonocr3_device_qualified(device, runtime->apple_gpu_family)) {
             for(size_t b=0;b<2;b++) {
                 runtime->lightonocr3_local_gate_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_gate_vec%zu_16_2",b+2]);
                 runtime->lightonocr3_local_down_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_proj_vec%zu_32_4",b+2]);
@@ -38690,7 +38728,7 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
             if (encoder == nil) return -12;
         }
         const bool batch_argmax = rows >= 2 && rows <= 64 && out_dim == 248320u &&
-            runtime->lightonocr3_projections_enabled && termite_metal_qualified_m4_device_default() != 0 &&
+            runtime->lightonocr3_projections_enabled && termite_metal_qualified_lightonocr3_device_default() != 0 &&
             termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_BATCH_ARGMAX")) &&
             runtime->lighton_batch_argmax_partials_pipeline != nil &&
             runtime->lighton_batch_argmax_reduce_pipeline != nil &&
@@ -51388,7 +51426,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
     // completed, so the runtime-owned route and MoE scratch buffers remain
     // command-queue ordered. Keep every other dual-frame use fail-closed.
     if (runtime->active_frame_cb == nil ||
-        (runtime->submitted_frame_cb != nil && !termite_metal_pipelined_decode_frame_enabled())) return -3;
+        (runtime->submitted_frame_cb != nil && !termite_metal_pipelined_decode_frame_enabled(runtime))) return -3;
     if (rows != 1 || hidden_size == 0 || hidden_size > UINT32_MAX ||
         inter_size == 0 || inter_size > UINT32_MAX || num_experts == 0 || num_experts > UINT32_MAX ||
         top_k == 0 || top_k > 8u || top_k > num_experts ||
@@ -52152,7 +52190,7 @@ static int termite_metal_decode_runtime_select_moe_routes_device_impl(
         top_k == 0 || top_k > 8 || top_k > num_experts) return -3;
     if (no_host_output &&
         (runtime->active_frame_cb == nil ||
-         (runtime->submitted_frame_cb != nil && !termite_metal_pipelined_decode_frame_enabled()))) return -3;
+         (runtime->submitted_frame_cb != nil && !termite_metal_pipelined_decode_frame_enabled(runtime)))) return -3;
     if (optimistic &&
         (rows != 1 ||
          runtime->moe_checkpoint_layer_miss_buffer == nil ||
@@ -71075,7 +71113,7 @@ static int termite_metal_decode_runtime_begin_frame_internal(
     if (runtime->active_frame_cb != nil) return -3;
     termite_metal_decode_runtime_reset_a4b_concurrent_ffn_scope(runtime);
     runtime->a4b_route_slots_fold_valid = 0u;
-    if (runtime->submitted_frame_cb != nil && !runtime->whisper_pipelined_frames && !termite_metal_pipelined_decode_frame_enabled()) return -4;
+    if (runtime->submitted_frame_cb != nil && !runtime->whisper_pipelined_frames && !termite_metal_pipelined_decode_frame_enabled(runtime)) return -4;
     if (runtime->submitted_frame_cb != nil && !runtime->whisper_pipelined_frames && runtime->pipelined_decode_frame_reported == 0) {
         fprintf(
             stderr,
@@ -75727,7 +75765,7 @@ size_t termite_metal_buffer_allocated_size(void *handle) {
 }
 
 int termite_metal_decode_runtime_stream_frames_available(termite_metal_decode_runtime *runtime) {
-    return runtime != NULL && termite_metal_pipelined_decode_frame_enabled() &&
+    return runtime != NULL && termite_metal_pipelined_decode_frame_enabled(runtime) &&
         runtime->decode_gqa_split_frame_scratch_enabled &&
         runtime->attention_decode_gqa_split_scratch_buffer != nil &&
         runtime->attention_decode_gqa_split_scratch_buffer_alt != nil;
