@@ -3282,3 +3282,11 @@ schedules, signed-extrema oracle coverage and fixed performance comparisons.
 integer-dot owner with preserved result and instruction policies, signed-byte
 oracles, native and non-SDOT performance matrices, and retained compiler and
 performance findings from rejected prototypes.
+
+### AE native CPU Q4/Q5 panel accumulation
+
+[The AE outcome register](unified-execution-ae-outcomes.md) records one native
+panel16 accumulation owner across direct and cached MR1/MR2/MR4/MR8 entries,
+including generated cached-result wrappers. It separates maintained and
+generated reductions, independent oracles, native/non-SDOT timing, unchanged
+machine-code controls and explicitly changed projection resource bounds.

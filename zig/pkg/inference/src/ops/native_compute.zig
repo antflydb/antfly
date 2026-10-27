@@ -30841,32 +30841,69 @@ inline fn dotQ4Q5KPreparedQ8KPanel8MR2(q8_block_r0: []const u8, q8_block_r1: []c
     return .{ .r0 = f32x8ToArray(acc0), .r1 = f32x8ToArray(acc1) };
 }
 
+const Q4Q5PanelCache = enum { direct, sums, sums_and_scales };
+
+inline fn Q4Q5PanelDotResult(comptime mr: usize) type {
+    return if (mr == 1) I32x8 else if (mr == 2) DotI8I8Block8MR2RowsVec else DotI8I8Block8MR4RowsVec;
+}
+
+inline fn q4q5PanelDotRows(comptime mr: usize, comptime contiguous: bool, inputs: [mr]*const [32]u8, values: *const [8 * 32]u8) Q4Q5PanelDotResult(mr) {
+    if (comptime mr == 1) return dotI8I8Block8ContiguousVec(inputs[0], values);
+    if (comptime contiguous) {
+        if (comptime mr == 2) return dotI8I8Block8MR2RowsContiguousVec(inputs[0], inputs[1], values);
+        return dotI8I8Block8MR4RowsContiguousVec(inputs[0], inputs[1], inputs[2], inputs[3], values);
+    }
+    var w: [8]*const [32]u8 = undefined;
+    inline for (0..8) |col| w[col] = values[col * 32 ..][0..32];
+    if (comptime mr == 2) return dotI8I8Block8MR2RowsVec(inputs[0], inputs[1], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    return dotI8I8Block8MR4RowsVec(inputs[0], inputs[1], inputs[2], inputs[3], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+}
+
+/// Preserve per-subblock dot order, coefficient loads and low-before-high stores.
+inline fn q4q5Panel16Accumulate(comptime mr: usize, comptime cache: Q4Q5PanelCache, comptime contiguous: bool, inputs: [mr][]const u8, cached_sums: [mr]*const [8]F32x8, cached_scales: [mr]F32x8, panel: []const u8, accumulators: [2][mr]*F32x8) void {
+    comptime std.debug.assert(mr == 1 or mr == 2 or mr == 4 or mr == 8);
+    inline for (inputs) |input| std.debug.assert(input.len == 292);
+    std.debug.assert(panel.len == prepared_k_panel16_block_bytes);
+    var scales: [mr]F32x8 = undefined;
+    inline for (0..mr) |row| scales[row] = if (cache == .sums_and_scales) cached_scales[row] else @as(F32x8, @splat(readF32Le(inputs[row][0..4])));
+    const tile_rows = @min(mr, 4);
+    const fields = [_][]const u8{ "r0", "r1", "r2", "r3" };
+    for (0..8) |sub| {
+        const base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;
+        var dots: [mr / tile_rows][2]Q4Q5PanelDotResult(tile_rows) = undefined;
+        inline for (0..mr / tile_rows) |tile| {
+            var q: [tile_rows]*const [32]u8 = undefined;
+            inline for (0..tile_rows) |row| q[row] = inputs[tile * tile_rows + row][4 + sub * 32 ..][0..32];
+            dots[tile][0] = q4q5PanelDotRows(tile_rows, contiguous, q, panel[base..][0 .. 8 * 32]);
+            dots[tile][1] = q4q5PanelDotRows(tile_rows, contiguous, q, panel[base + 8 * 32 ..][0 .. 8 * 32]);
+        }
+        const dsc = .{
+            readF32x8Le(panel[prepared_k_panel16_dsc_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]),
+            readF32x8Le(panel[prepared_k_panel16_dsc_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]),
+        };
+        const dmn = .{
+            readF32x8Le(panel[prepared_k_panel16_dmn_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]),
+            readF32x8Le(panel[prepared_k_panel16_dmn_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]),
+        };
+        var sums: [mr]F32x8 = undefined;
+        if (comptime cache == .direct) inline for (0..mr) |row| {
+            sums[row] = @splat(@as(f32, @floatFromInt(q8KBlockSum(inputs[row], sub))));
+        };
+        inline for (0..2) |half| inline for (0..mr) |row| {
+            const dot = if (tile_rows == 1) dots[0][half] else @field(dots[row / tile_rows][half], fields[row % tile_rows]);
+            const sum = if (cache == .direct) sums[row] else cached_sums[row].*[sub];
+            accumulators[half][row].* += scales[row] * (dsc[half] * @as(F32x8, @floatFromInt(dot)) - dmn[half] * sum);
+        };
+    }
+}
+
 inline fn accumulateQ4Q5KPreparedQ8KPanel16MR1Block(
     q8_block: []const u8,
     panel_block: []const u8,
     acc_lo: *F32x8,
     acc_hi: *F32x8,
 ) void {
-    std.debug.assert(q8_block.len == 292);
-    std.debug.assert(panel_block.len == prepared_k_panel16_block_bytes);
-
-    const qx = q8_block[4..260];
-    const x_scale: F32x8 = @splat(readF32Le(q8_block[0..4]));
-    for (0..8) |sub| {
-        const q_off = sub * 32;
-        const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;
-        const values_lo = panel_block[values_base..][0 .. 8 * 32];
-        const values_hi = panel_block[values_base + 8 * 32 ..][0 .. 8 * 32];
-        const dots_lo = dotI8I8Block8ContiguousVec(qx[q_off..][0..32], values_lo);
-        const dots_hi = dotI8I8Block8ContiguousVec(qx[q_off..][0..32], values_hi);
-        const dsc_lo = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dsc_hi = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const dmn_lo = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dmn_hi = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const activation_sum: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block, sub))));
-        acc_lo.* += x_scale * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo)) - dmn_lo * activation_sum);
-        acc_hi.* += x_scale * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi)) - dmn_hi * activation_sum);
-    }
+    q4q5Panel16Accumulate(1, .direct, true, .{q8_block}, undefined, undefined, panel_block, .{ .{acc_lo}, .{acc_hi} });
 }
 
 inline fn accumulateQ4Q5KPreparedQ8KPanel16MR1BlockPreparedSums(
@@ -30876,25 +30913,7 @@ inline fn accumulateQ4Q5KPreparedQ8KPanel16MR1BlockPreparedSums(
     acc_lo: *F32x8,
     acc_hi: *F32x8,
 ) void {
-    std.debug.assert(q8_block.len == 292);
-    std.debug.assert(panel_block.len == prepared_k_panel16_block_bytes);
-
-    const qx = q8_block[4..260];
-    const x_scale: F32x8 = @splat(readF32Le(q8_block[0..4]));
-    for (0..8) |sub| {
-        const q_off = sub * 32;
-        const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;
-        const values_lo = panel_block[values_base..][0 .. 8 * 32];
-        const values_hi = panel_block[values_base + 8 * 32 ..][0 .. 8 * 32];
-        const dots_lo = dotI8I8Block8ContiguousVec(qx[q_off..][0..32], values_lo);
-        const dots_hi = dotI8I8Block8ContiguousVec(qx[q_off..][0..32], values_hi);
-        const dsc_lo = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dsc_hi = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const dmn_lo = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dmn_hi = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        acc_lo.* += x_scale * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo)) - dmn_lo * activation_sum[sub]);
-        acc_hi.* += x_scale * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi)) - dmn_hi * activation_sum[sub]);
-    }
+    q4q5Panel16Accumulate(1, .sums, true, .{q8_block}, .{activation_sum}, undefined, panel_block, .{ .{acc_lo}, .{acc_hi} });
 }
 
 inline fn accumulateQ4Q5KPreparedQ8KPanel16MR2Block(
@@ -30906,46 +30925,7 @@ inline fn accumulateQ4Q5KPreparedQ8KPanel16MR2Block(
     acc1_lo: *F32x8,
     acc1_hi: *F32x8,
 ) void {
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    std.debug.assert(panel_block.len == prepared_k_panel16_block_bytes);
-
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const x_scale0: F32x8 = @splat(readF32Le(q8_block_r0[0..4]));
-    const x_scale1: F32x8 = @splat(readF32Le(q8_block_r1[0..4]));
-    for (0..8) |sub| {
-        const q_off = sub * 32;
-        const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;
-        const w0 = panel_block[values_base..][0..32];
-        const w1 = panel_block[values_base + 32 ..][0..32];
-        const w2 = panel_block[values_base + 2 * 32 ..][0..32];
-        const w3 = panel_block[values_base + 3 * 32 ..][0..32];
-        const w4 = panel_block[values_base + 4 * 32 ..][0..32];
-        const w5 = panel_block[values_base + 5 * 32 ..][0..32];
-        const w6 = panel_block[values_base + 6 * 32 ..][0..32];
-        const w7 = panel_block[values_base + 7 * 32 ..][0..32];
-        const w8 = panel_block[values_base + 8 * 32 ..][0..32];
-        const w9 = panel_block[values_base + 9 * 32 ..][0..32];
-        const w10 = panel_block[values_base + 10 * 32 ..][0..32];
-        const w11 = panel_block[values_base + 11 * 32 ..][0..32];
-        const w12 = panel_block[values_base + 12 * 32 ..][0..32];
-        const w13 = panel_block[values_base + 13 * 32 ..][0..32];
-        const w14 = panel_block[values_base + 14 * 32 ..][0..32];
-        const w15 = panel_block[values_base + 15 * 32 ..][0..32];
-        const dots_lo = dotI8I8Block8MR2RowsVec(qx0[q_off..][0..32], qx1[q_off..][0..32], w0, w1, w2, w3, w4, w5, w6, w7);
-        const dots_hi = dotI8I8Block8MR2RowsVec(qx0[q_off..][0..32], qx1[q_off..][0..32], w8, w9, w10, w11, w12, w13, w14, w15);
-        const dsc_lo = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dsc_hi = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const dmn_lo = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dmn_hi = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const activation_sum0: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r0, sub))));
-        const activation_sum1: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r1, sub))));
-        acc0_lo.* += x_scale0 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r0)) - dmn_lo * activation_sum0);
-        acc1_lo.* += x_scale1 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r1)) - dmn_lo * activation_sum1);
-        acc0_hi.* += x_scale0 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r0)) - dmn_hi * activation_sum0);
-        acc1_hi.* += x_scale1 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r1)) - dmn_hi * activation_sum1);
-    }
+    q4q5Panel16Accumulate(2, .direct, false, .{ q8_block_r0, q8_block_r1 }, undefined, undefined, panel_block, .{ .{ acc0_lo, acc1_lo }, .{ acc0_hi, acc1_hi } });
 }
 
 inline fn accumulateQ4Q5KPreparedQ8KPanel16MR2BlockPreparedSums(
@@ -30959,30 +30939,7 @@ inline fn accumulateQ4Q5KPreparedQ8KPanel16MR2BlockPreparedSums(
     acc1_lo: *F32x8,
     acc1_hi: *F32x8,
 ) void {
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    std.debug.assert(panel_block.len == prepared_k_panel16_block_bytes);
-
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const x_scale0: F32x8 = @splat(readF32Le(q8_block_r0[0..4]));
-    const x_scale1: F32x8 = @splat(readF32Le(q8_block_r1[0..4]));
-    for (0..8) |sub| {
-        const q_off = sub * 32;
-        const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;
-        const values_lo = panel_block[values_base..][0 .. 8 * 32];
-        const values_hi = panel_block[values_base + 8 * 32 ..][0 .. 8 * 32];
-        const dots_lo = dotI8I8Block8MR2RowsContiguousVec(qx0[q_off..][0..32], qx1[q_off..][0..32], values_lo);
-        const dots_hi = dotI8I8Block8MR2RowsContiguousVec(qx0[q_off..][0..32], qx1[q_off..][0..32], values_hi);
-        const dsc_lo = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dsc_hi = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const dmn_lo = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dmn_hi = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        acc0_lo.* += x_scale0 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r0)) - dmn_lo * activation_sum0[sub]);
-        acc1_lo.* += x_scale1 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r1)) - dmn_lo * activation_sum1[sub]);
-        acc0_hi.* += x_scale0 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r0)) - dmn_hi * activation_sum0[sub]);
-        acc1_hi.* += x_scale1 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r1)) - dmn_hi * activation_sum1[sub]);
-    }
+    q4q5Panel16Accumulate(2, .sums, true, .{ q8_block_r0, q8_block_r1 }, .{ activation_sum0, activation_sum1 }, undefined, panel_block, .{ .{ acc0_lo, acc1_lo }, .{ acc0_hi, acc1_hi } });
 }
 
 inline fn accumulateQ4Q5KPreparedQ8KPanel16MR4Block(
@@ -31000,58 +30957,7 @@ inline fn accumulateQ4Q5KPreparedQ8KPanel16MR4Block(
     acc3_lo: *F32x8,
     acc3_hi: *F32x8,
 ) void {
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    std.debug.assert(q8_block_r2.len == 292);
-    std.debug.assert(q8_block_r3.len == 292);
-    std.debug.assert(panel_block.len == prepared_k_panel16_block_bytes);
-
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const qx2 = q8_block_r2[4..260];
-    const qx3 = q8_block_r3[4..260];
-    const x_scale0: F32x8 = @splat(readF32Le(q8_block_r0[0..4]));
-    const x_scale1: F32x8 = @splat(readF32Le(q8_block_r1[0..4]));
-    const x_scale2: F32x8 = @splat(readF32Le(q8_block_r2[0..4]));
-    const x_scale3: F32x8 = @splat(readF32Le(q8_block_r3[0..4]));
-    for (0..8) |sub| {
-        const q_off = sub * 32;
-        const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;
-        const w0 = panel_block[values_base..][0..32];
-        const w1 = panel_block[values_base + 32 ..][0..32];
-        const w2 = panel_block[values_base + 2 * 32 ..][0..32];
-        const w3 = panel_block[values_base + 3 * 32 ..][0..32];
-        const w4 = panel_block[values_base + 4 * 32 ..][0..32];
-        const w5 = panel_block[values_base + 5 * 32 ..][0..32];
-        const w6 = panel_block[values_base + 6 * 32 ..][0..32];
-        const w7 = panel_block[values_base + 7 * 32 ..][0..32];
-        const w8 = panel_block[values_base + 8 * 32 ..][0..32];
-        const w9 = panel_block[values_base + 9 * 32 ..][0..32];
-        const w10 = panel_block[values_base + 10 * 32 ..][0..32];
-        const w11 = panel_block[values_base + 11 * 32 ..][0..32];
-        const w12 = panel_block[values_base + 12 * 32 ..][0..32];
-        const w13 = panel_block[values_base + 13 * 32 ..][0..32];
-        const w14 = panel_block[values_base + 14 * 32 ..][0..32];
-        const w15 = panel_block[values_base + 15 * 32 ..][0..32];
-        const dots_lo = dotI8I8Block8MR4RowsVec(qx0[q_off..][0..32], qx1[q_off..][0..32], qx2[q_off..][0..32], qx3[q_off..][0..32], w0, w1, w2, w3, w4, w5, w6, w7);
-        const dots_hi = dotI8I8Block8MR4RowsVec(qx0[q_off..][0..32], qx1[q_off..][0..32], qx2[q_off..][0..32], qx3[q_off..][0..32], w8, w9, w10, w11, w12, w13, w14, w15);
-        const dsc_lo = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dsc_hi = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const dmn_lo = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dmn_hi = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const activation_sum0: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r0, sub))));
-        const activation_sum1: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r1, sub))));
-        const activation_sum2: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r2, sub))));
-        const activation_sum3: F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum(q8_block_r3, sub))));
-        acc0_lo.* += x_scale0 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r0)) - dmn_lo * activation_sum0);
-        acc1_lo.* += x_scale1 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r1)) - dmn_lo * activation_sum1);
-        acc2_lo.* += x_scale2 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r2)) - dmn_lo * activation_sum2);
-        acc3_lo.* += x_scale3 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r3)) - dmn_lo * activation_sum3);
-        acc0_hi.* += x_scale0 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r0)) - dmn_hi * activation_sum0);
-        acc1_hi.* += x_scale1 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r1)) - dmn_hi * activation_sum1);
-        acc2_hi.* += x_scale2 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r2)) - dmn_hi * activation_sum2);
-        acc3_hi.* += x_scale3 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r3)) - dmn_hi * activation_sum3);
-    }
+    q4q5Panel16Accumulate(4, .direct, false, .{ q8_block_r0, q8_block_r1, q8_block_r2, q8_block_r3 }, undefined, undefined, panel_block, .{ .{ acc0_lo, acc1_lo, acc2_lo, acc3_lo }, .{ acc0_hi, acc1_hi, acc2_hi, acc3_hi } });
 }
 
 inline fn accumulateQ4Q5KPreparedQ8KPanel16MR4BlockPreparedSums(
@@ -31077,40 +30983,7 @@ inline fn accumulateQ4Q5KPreparedQ8KPanel16MR4BlockPreparedSums(
     acc3_lo: *F32x8,
     acc3_hi: *F32x8,
 ) void {
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    std.debug.assert(q8_block_r2.len == 292);
-    std.debug.assert(q8_block_r3.len == 292);
-    std.debug.assert(panel_block.len == prepared_k_panel16_block_bytes);
-
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const qx2 = q8_block_r2[4..260];
-    const qx3 = q8_block_r3[4..260];
-    for (0..8) |sub| {
-        const q_off = sub * 32;
-        const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;
-        const values_lo = panel_block[values_base..][0 .. 8 * 32];
-        const values_hi = panel_block[values_base + 8 * 32 ..][0 .. 8 * 32];
-        const qsub0 = qx0[q_off..][0..32];
-        const qsub1 = qx1[q_off..][0..32];
-        const qsub2 = qx2[q_off..][0..32];
-        const qsub3 = qx3[q_off..][0..32];
-        const dots_lo = dotI8I8Block8MR4RowsContiguousVec(qsub0, qsub1, qsub2, qsub3, values_lo);
-        const dots_hi = dotI8I8Block8MR4RowsContiguousVec(qsub0, qsub1, qsub2, qsub3, values_hi);
-        const dsc_lo = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dsc_hi = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const dmn_lo = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dmn_hi = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        acc0_lo.* += x_scale0 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r0)) - dmn_lo * activation_sum0[sub]);
-        acc1_lo.* += x_scale1 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r1)) - dmn_lo * activation_sum1[sub]);
-        acc2_lo.* += x_scale2 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r2)) - dmn_lo * activation_sum2[sub]);
-        acc3_lo.* += x_scale3 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r3)) - dmn_lo * activation_sum3[sub]);
-        acc0_hi.* += x_scale0 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r0)) - dmn_hi * activation_sum0[sub]);
-        acc1_hi.* += x_scale1 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r1)) - dmn_hi * activation_sum1[sub]);
-        acc2_hi.* += x_scale2 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r2)) - dmn_hi * activation_sum2[sub]);
-        acc3_hi.* += x_scale3 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r3)) - dmn_hi * activation_sum3[sub]);
-    }
+    q4q5Panel16Accumulate(4, .sums_and_scales, true, .{ q8_block_r0, q8_block_r1, q8_block_r2, q8_block_r3 }, .{ activation_sum0, activation_sum1, activation_sum2, activation_sum3 }, .{ x_scale0, x_scale1, x_scale2, x_scale3 }, panel_block, .{ .{ acc0_lo, acc1_lo, acc2_lo, acc3_lo }, .{ acc0_hi, acc1_hi, acc2_hi, acc3_hi } });
 }
 
 inline fn accumulateQ4Q5KPreparedQ8KPanel16MR8BlockPreparedSums(
@@ -31121,57 +30994,12 @@ inline fn accumulateQ4Q5KPreparedQ8KPanel16MR8BlockPreparedSums(
     acc_lo: *[8]F32x8,
     acc_hi: *[8]F32x8,
 ) void {
+    var outputs: [2][8]*F32x8 = undefined;
     inline for (0..8) |row| {
-        std.debug.assert(q8_blocks[row].len == 292);
+        outputs[0][row] = &acc_lo.*[row];
+        outputs[1][row] = &acc_hi.*[row];
     }
-    std.debug.assert(panel_block.len == prepared_k_panel16_block_bytes);
-
-    const qx0 = q8_blocks[0][4..260];
-    const qx1 = q8_blocks[1][4..260];
-    const qx2 = q8_blocks[2][4..260];
-    const qx3 = q8_blocks[3][4..260];
-    const qx4 = q8_blocks[4][4..260];
-    const qx5 = q8_blocks[5][4..260];
-    const qx6 = q8_blocks[6][4..260];
-    const qx7 = q8_blocks[7][4..260];
-    for (0..8) |sub| {
-        const q_off = sub * 32;
-        const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;
-        const values_lo = panel_block[values_base..][0 .. 8 * 32];
-        const values_hi = panel_block[values_base + 8 * 32 ..][0 .. 8 * 32];
-        const qsub0 = qx0[q_off..][0..32];
-        const qsub1 = qx1[q_off..][0..32];
-        const qsub2 = qx2[q_off..][0..32];
-        const qsub3 = qx3[q_off..][0..32];
-        const qsub4 = qx4[q_off..][0..32];
-        const qsub5 = qx5[q_off..][0..32];
-        const qsub6 = qx6[q_off..][0..32];
-        const qsub7 = qx7[q_off..][0..32];
-        const dots_lo_0123 = dotI8I8Block8MR4RowsContiguousVec(qsub0, qsub1, qsub2, qsub3, values_lo);
-        const dots_hi_0123 = dotI8I8Block8MR4RowsContiguousVec(qsub0, qsub1, qsub2, qsub3, values_hi);
-        const dots_lo_4567 = dotI8I8Block8MR4RowsContiguousVec(qsub4, qsub5, qsub6, qsub7, values_lo);
-        const dots_hi_4567 = dotI8I8Block8MR4RowsContiguousVec(qsub4, qsub5, qsub6, qsub7, values_hi);
-        const dsc_lo = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dsc_hi = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const dmn_lo = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dmn_hi = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        acc_lo.*[0] += x_scales[0] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_0123.r0)) - dmn_lo * activation_sums[0].*[sub]);
-        acc_lo.*[1] += x_scales[1] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_0123.r1)) - dmn_lo * activation_sums[1].*[sub]);
-        acc_lo.*[2] += x_scales[2] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_0123.r2)) - dmn_lo * activation_sums[2].*[sub]);
-        acc_lo.*[3] += x_scales[3] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_0123.r3)) - dmn_lo * activation_sums[3].*[sub]);
-        acc_lo.*[4] += x_scales[4] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_4567.r0)) - dmn_lo * activation_sums[4].*[sub]);
-        acc_lo.*[5] += x_scales[5] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_4567.r1)) - dmn_lo * activation_sums[5].*[sub]);
-        acc_lo.*[6] += x_scales[6] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_4567.r2)) - dmn_lo * activation_sums[6].*[sub]);
-        acc_lo.*[7] += x_scales[7] * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo_4567.r3)) - dmn_lo * activation_sums[7].*[sub]);
-        acc_hi.*[0] += x_scales[0] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_0123.r0)) - dmn_hi * activation_sums[0].*[sub]);
-        acc_hi.*[1] += x_scales[1] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_0123.r1)) - dmn_hi * activation_sums[1].*[sub]);
-        acc_hi.*[2] += x_scales[2] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_0123.r2)) - dmn_hi * activation_sums[2].*[sub]);
-        acc_hi.*[3] += x_scales[3] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_0123.r3)) - dmn_hi * activation_sums[3].*[sub]);
-        acc_hi.*[4] += x_scales[4] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_4567.r0)) - dmn_hi * activation_sums[4].*[sub]);
-        acc_hi.*[5] += x_scales[5] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_4567.r1)) - dmn_hi * activation_sums[5].*[sub]);
-        acc_hi.*[6] += x_scales[6] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_4567.r2)) - dmn_hi * activation_sums[6].*[sub]);
-        acc_hi.*[7] += x_scales[7] * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi_4567.r3)) - dmn_hi * activation_sums[7].*[sub]);
-    }
+    q4q5Panel16Accumulate(8, .sums_and_scales, true, q8_blocks, activation_sums, x_scales, panel_block, outputs);
 }
 
 inline fn dotQ4Q5KPreparedQ8KPanel16MR2PreparedSums(
@@ -31182,47 +31010,23 @@ inline fn dotQ4Q5KPreparedQ8KPanel16MR2PreparedSums(
     panel_block: []const u8,
 ) Panel16MR2Sums {
     // quant-kernel-codegen:begin CPU panel dot dotQ4Q5KPreparedQ8KPanel16MR2PreparedSums
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    std.debug.assert(panel_block.len == prepared_k_panel16_block_bytes);
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const x_scale0: F32x8 = @splat(readF32Le(q8_block_r0[0..4]));
-    const x_scale1: F32x8 = @splat(readF32Le(q8_block_r1[0..4]));
     var acc0_lo: F32x8 = @splat(0.0);
     var acc0_hi: F32x8 = @splat(0.0);
     var acc1_lo: F32x8 = @splat(0.0);
     var acc1_hi: F32x8 = @splat(0.0);
-    for (0..8) |sub| {
-        const q_off = sub * 32;
-        const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;
-        const w0 = panel_block[values_base..][0..32];
-        const w1 = panel_block[values_base + 32 ..][0..32];
-        const w2 = panel_block[values_base + 2 * 32 ..][0..32];
-        const w3 = panel_block[values_base + 3 * 32 ..][0..32];
-        const w4 = panel_block[values_base + 4 * 32 ..][0..32];
-        const w5 = panel_block[values_base + 5 * 32 ..][0..32];
-        const w6 = panel_block[values_base + 6 * 32 ..][0..32];
-        const w7 = panel_block[values_base + 7 * 32 ..][0..32];
-        const w8 = panel_block[values_base + 8 * 32 ..][0..32];
-        const w9 = panel_block[values_base + 9 * 32 ..][0..32];
-        const w10 = panel_block[values_base + 10 * 32 ..][0..32];
-        const w11 = panel_block[values_base + 11 * 32 ..][0..32];
-        const w12 = panel_block[values_base + 12 * 32 ..][0..32];
-        const w13 = panel_block[values_base + 13 * 32 ..][0..32];
-        const w14 = panel_block[values_base + 14 * 32 ..][0..32];
-        const w15 = panel_block[values_base + 15 * 32 ..][0..32];
-        const dots_lo = dotI8I8Block8MR2RowsVec(qx0[q_off..][0..32], qx1[q_off..][0..32], w0, w1, w2, w3, w4, w5, w6, w7);
-        const dots_hi = dotI8I8Block8MR2RowsVec(qx0[q_off..][0..32], qx1[q_off..][0..32], w8, w9, w10, w11, w12, w13, w14, w15);
-        const dsc_lo = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dsc_hi = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const dmn_lo = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dmn_hi = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        acc0_lo += x_scale0 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r0)) - dmn_lo * activation_sum0[sub]);
-        acc1_lo += x_scale1 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r1)) - dmn_lo * activation_sum1[sub]);
-        acc0_hi += x_scale0 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r0)) - dmn_hi * activation_sum0[sub]);
-        acc1_hi += x_scale1 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r1)) - dmn_hi * activation_sum1[sub]);
-    }
+    q4q5Panel16Accumulate(2, .sums, false, .{ q8_block_r0, q8_block_r1 }, .{
+        activation_sum0,
+        activation_sum1,
+    }, undefined, panel_block, .{
+        .{
+            &acc0_lo,
+            &acc1_lo,
+        },
+        .{
+            &acc0_hi,
+            &acc1_hi,
+        },
+    });
     var r0: [16]f32 = undefined;
     var r1: [16]f32 = undefined;
     const r0_lo = f32x8ToArray(acc0_lo);
@@ -31251,19 +31055,6 @@ inline fn dotQ4Q5KPreparedQ8KPanel16MR4PreparedSums(
     panel_block: []const u8,
 ) Panel16MR4Sums {
     // quant-kernel-codegen:begin CPU panel dot dotQ4Q5KPreparedQ8KPanel16MR4PreparedSums
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    std.debug.assert(q8_block_r2.len == 292);
-    std.debug.assert(q8_block_r3.len == 292);
-    std.debug.assert(panel_block.len == prepared_k_panel16_block_bytes);
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const qx2 = q8_block_r2[4..260];
-    const qx3 = q8_block_r3[4..260];
-    const x_scale0: F32x8 = @splat(readF32Le(q8_block_r0[0..4]));
-    const x_scale1: F32x8 = @splat(readF32Le(q8_block_r1[0..4]));
-    const x_scale2: F32x8 = @splat(readF32Le(q8_block_r2[0..4]));
-    const x_scale3: F32x8 = @splat(readF32Le(q8_block_r3[0..4]));
     var acc0_lo: F32x8 = @splat(0.0);
     var acc0_hi: F32x8 = @splat(0.0);
     var acc1_lo: F32x8 = @splat(0.0);
@@ -31272,40 +31063,25 @@ inline fn dotQ4Q5KPreparedQ8KPanel16MR4PreparedSums(
     var acc2_hi: F32x8 = @splat(0.0);
     var acc3_lo: F32x8 = @splat(0.0);
     var acc3_hi: F32x8 = @splat(0.0);
-    for (0..8) |sub| {
-        const q_off = sub * 32;
-        const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;
-        const w0 = panel_block[values_base..][0..32];
-        const w1 = panel_block[values_base + 32 ..][0..32];
-        const w2 = panel_block[values_base + 2 * 32 ..][0..32];
-        const w3 = panel_block[values_base + 3 * 32 ..][0..32];
-        const w4 = panel_block[values_base + 4 * 32 ..][0..32];
-        const w5 = panel_block[values_base + 5 * 32 ..][0..32];
-        const w6 = panel_block[values_base + 6 * 32 ..][0..32];
-        const w7 = panel_block[values_base + 7 * 32 ..][0..32];
-        const w8 = panel_block[values_base + 8 * 32 ..][0..32];
-        const w9 = panel_block[values_base + 9 * 32 ..][0..32];
-        const w10 = panel_block[values_base + 10 * 32 ..][0..32];
-        const w11 = panel_block[values_base + 11 * 32 ..][0..32];
-        const w12 = panel_block[values_base + 12 * 32 ..][0..32];
-        const w13 = panel_block[values_base + 13 * 32 ..][0..32];
-        const w14 = panel_block[values_base + 14 * 32 ..][0..32];
-        const w15 = panel_block[values_base + 15 * 32 ..][0..32];
-        const dots_lo = dotI8I8Block8MR4RowsVec(qx0[q_off..][0..32], qx1[q_off..][0..32], qx2[q_off..][0..32], qx3[q_off..][0..32], w0, w1, w2, w3, w4, w5, w6, w7);
-        const dots_hi = dotI8I8Block8MR4RowsVec(qx0[q_off..][0..32], qx1[q_off..][0..32], qx2[q_off..][0..32], qx3[q_off..][0..32], w8, w9, w10, w11, w12, w13, w14, w15);
-        const dsc_lo = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dsc_hi = readF32x8Le(panel_block[prepared_k_panel16_dsc_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        const dmn_lo = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + sub * prepared_k_panel16_nr * 4 ..][0..32]);
-        const dmn_hi = readF32x8Le(panel_block[prepared_k_panel16_dmn_offset + (sub * prepared_k_panel16_nr + 8) * 4 ..][0..32]);
-        acc0_lo += x_scale0 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r0)) - dmn_lo * activation_sum0[sub]);
-        acc1_lo += x_scale1 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r1)) - dmn_lo * activation_sum1[sub]);
-        acc2_lo += x_scale2 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r2)) - dmn_lo * activation_sum2[sub]);
-        acc3_lo += x_scale3 * (dsc_lo * @as(F32x8, @floatFromInt(dots_lo.r3)) - dmn_lo * activation_sum3[sub]);
-        acc0_hi += x_scale0 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r0)) - dmn_hi * activation_sum0[sub]);
-        acc1_hi += x_scale1 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r1)) - dmn_hi * activation_sum1[sub]);
-        acc2_hi += x_scale2 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r2)) - dmn_hi * activation_sum2[sub]);
-        acc3_hi += x_scale3 * (dsc_hi * @as(F32x8, @floatFromInt(dots_hi.r3)) - dmn_hi * activation_sum3[sub]);
-    }
+    q4q5Panel16Accumulate(4, .sums, false, .{ q8_block_r0, q8_block_r1, q8_block_r2, q8_block_r3 }, .{
+        activation_sum0,
+        activation_sum1,
+        activation_sum2,
+        activation_sum3,
+    }, undefined, panel_block, .{
+        .{
+            &acc0_lo,
+            &acc1_lo,
+            &acc2_lo,
+            &acc3_lo,
+        },
+        .{
+            &acc0_hi,
+            &acc1_hi,
+            &acc2_hi,
+            &acc3_hi,
+        },
+    });
     var r0: [16]f32 = undefined;
     var r1: [16]f32 = undefined;
     var r2: [16]f32 = undefined;
@@ -51533,6 +51309,150 @@ test "integer tile owners independent oracle and benchmark" {
             for (&samples) |*sample| sample.* = state.measure(profile);
             std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
             std.debug.print("integer_tile profile={d} mr={d} nc={d} bytes={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=20001\n", .{ profile, p.mr, p.nc, p.bytes, @as(f64, @floatFromInt(samples[10])) / 20001.0, @as(f64, @floatFromInt(samples[19])) / 20001.0, samples[10], samples[19] });
+        }
+    }
+}
+
+test "Q4Q5 panel accumulation independent oracle and benchmark" {
+    @setEvalBranchQuota(500_000);
+    const profiles = .{
+        .{ .mr = 1, .cached = false, .external = false, .result = false },
+        .{ .mr = 1, .cached = true, .external = false, .result = false },
+        .{ .mr = 2, .cached = false, .external = false, .result = false },
+        .{ .mr = 2, .cached = true, .external = false, .result = false },
+        .{ .mr = 4, .cached = false, .external = false, .result = false },
+        .{ .mr = 4, .cached = true, .external = true, .result = false },
+        .{ .mr = 8, .cached = true, .external = true, .result = false },
+        .{ .mr = 2, .cached = true, .external = false, .result = true },
+        .{ .mr = 4, .cached = true, .external = false, .result = true },
+    };
+    const State = struct {
+        inputs: [8][292]u8 align(64) = @splat(@splat(0)),
+        panel: [prepared_k_panel16_block_bytes]u8 align(64) = @splat(0),
+        sums: [8][8]F32x8 align(64) = undefined,
+        scales: [8]F32x8 align(64) = undefined,
+        fn bias(half: usize, row: usize, lane: usize) f32 {
+            return @as(f32, @floatFromInt(@as(i32, @intCast((half * 3 + row * 5 + lane) % 9)) - 4)) * 0.125;
+        }
+        fn initialize(self: *@This(), seed: usize) void {
+            for (&self.inputs, 0..) |*input, row| {
+                const scale: f32 = if ((seed + row) % 2 == 0) 0.125 else -0.25;
+                std.mem.writeInt(u32, input[0..4], @bitCast(scale), .little);
+                for (0..256) |i| {
+                    const value: i8 = if (seed == 0) 0 else if (seed == 1) (if ((i + row) % 2 == 0) -128 else 127) else @intCast(@as(i32, @intCast((i * 17 + row * 37 + seed * 11) % 256)) - 128);
+                    input[4 + i] = @bitCast(value);
+                }
+                for (0..16) |group| {
+                    var sum: i16 = 0;
+                    for (0..16) |i| sum += @as(i8, @bitCast(input[4 + group * 16 + i]));
+                    std.mem.writeInt(i16, input[260 + group * 2 ..][0..2], sum, .little);
+                }
+                inline for (0..8) |lane| self.scales[row][lane] = if (seed == 3) (if (lane % 2 == 0) 0.125 else -0.25) else scale;
+                for (0..8) |sub| {
+                    var sum: i32 = 0;
+                    for (0..32) |i| sum += @as(i8, @bitCast(input[4 + sub * 32 + i]));
+                    inline for (0..8) |lane| self.sums[row][sub][lane] = @floatFromInt(sum + (if (seed == 3) @as(i32, lane) - 3 else 0));
+                }
+            }
+            for (0..8) |sub| for (0..16) |col| {
+                const dsc: f32 = if ((sub + col + seed) % 2 == 0) 0.015625 else -0.0078125;
+                const dmn: f32 = if ((sub + col + seed) % 3 == 0) 0.00390625 else -0.001953125;
+                std.mem.writeInt(u32, self.panel[prepared_k_panel16_dsc_offset + (sub * 16 + col) * 4 ..][0..4], @bitCast(dsc), .little);
+                std.mem.writeInt(u32, self.panel[prepared_k_panel16_dmn_offset + (sub * 16 + col) * 4 ..][0..4], @bitCast(dmn), .little);
+                for (0..32) |i| self.panel[prepared_k_panel16_values_offset + (sub * 16 + col) * 32 + i] = @intCast((i * 7 + sub * 11 + col * 13 + seed * 17) % (if (seed % 2 == 0) @as(usize, 16) else 32));
+            };
+        }
+        noinline fn run(self: *@This(), comptime profile: usize) [2][profiles[profile].mr]F32x8 {
+            const mr = profiles[profile].mr;
+            var acc: [2][mr]F32x8 = undefined;
+            inline for (0..2) |half| inline for (0..mr) |row| inline for (0..8) |lane| {
+                acc[half][row][lane] = bias(half, row, lane);
+            };
+            if (comptime profile == 0) accumulateQ4Q5KPreparedQ8KPanel16MR1Block(&self.inputs[0], &self.panel, &acc[0][0], &acc[1][0]);
+            if (comptime profile == 1) accumulateQ4Q5KPreparedQ8KPanel16MR1BlockPreparedSums(&self.inputs[0], &self.sums[0], &self.panel, &acc[0][0], &acc[1][0]);
+            if (comptime profile == 2) accumulateQ4Q5KPreparedQ8KPanel16MR2Block(&self.inputs[0], &self.inputs[1], &self.panel, &acc[0][0], &acc[1][0], &acc[0][1], &acc[1][1]);
+            if (comptime profile == 3) accumulateQ4Q5KPreparedQ8KPanel16MR2BlockPreparedSums(&self.inputs[0], &self.inputs[1], &self.sums[0], &self.sums[1], &self.panel, &acc[0][0], &acc[1][0], &acc[0][1], &acc[1][1]);
+            if (comptime profile == 4) accumulateQ4Q5KPreparedQ8KPanel16MR4Block(&self.inputs[0], &self.inputs[1], &self.inputs[2], &self.inputs[3], &self.panel, &acc[0][0], &acc[1][0], &acc[0][1], &acc[1][1], &acc[0][2], &acc[1][2], &acc[0][3], &acc[1][3]);
+            if (comptime profile == 5) accumulateQ4Q5KPreparedQ8KPanel16MR4BlockPreparedSums(&self.inputs[0], &self.inputs[1], &self.inputs[2], &self.inputs[3], &self.sums[0], &self.sums[1], &self.sums[2], &self.sums[3], self.scales[0], self.scales[1], self.scales[2], self.scales[3], &self.panel, &acc[0][0], &acc[1][0], &acc[0][1], &acc[1][1], &acc[0][2], &acc[1][2], &acc[0][3], &acc[1][3]);
+            if (comptime profile == 6) accumulateQ4Q5KPreparedQ8KPanel16MR8BlockPreparedSums(.{ &self.inputs[0], &self.inputs[1], &self.inputs[2], &self.inputs[3], &self.inputs[4], &self.inputs[5], &self.inputs[6], &self.inputs[7] }, .{ &self.sums[0], &self.sums[1], &self.sums[2], &self.sums[3], &self.sums[4], &self.sums[5], &self.sums[6], &self.sums[7] }, self.scales, &self.panel, &acc[0], &acc[1]);
+            if (comptime profile == 7) {
+                const values = dotQ4Q5KPreparedQ8KPanel16MR2PreparedSums(&self.inputs[0], &self.inputs[1], &self.sums[0], &self.sums[1], &self.panel);
+                inline for (0..8) |lane| {
+                    acc[0][0][lane] = values.r0[lane];
+                    acc[1][0][lane] = values.r0[lane + 8];
+                }
+                inline for (0..8) |lane| {
+                    acc[0][1][lane] = values.r1[lane];
+                    acc[1][1][lane] = values.r1[lane + 8];
+                }
+            }
+            if (comptime profile == 8) {
+                const values = dotQ4Q5KPreparedQ8KPanel16MR4PreparedSums(&self.inputs[0], &self.inputs[1], &self.inputs[2], &self.inputs[3], &self.sums[0], &self.sums[1], &self.sums[2], &self.sums[3], &self.panel);
+                inline for (0..8) |lane| {
+                    acc[0][0][lane] = values.r0[lane];
+                    acc[1][0][lane] = values.r0[lane + 8];
+                }
+                inline for (0..8) |lane| {
+                    acc[0][1][lane] = values.r1[lane];
+                    acc[1][1][lane] = values.r1[lane + 8];
+                }
+                inline for (0..8) |lane| {
+                    acc[0][2][lane] = values.r2[lane];
+                    acc[1][2][lane] = values.r2[lane + 8];
+                }
+                inline for (0..8) |lane| {
+                    acc[0][3][lane] = values.r3[lane];
+                    acc[1][3][lane] = values.r3[lane + 8];
+                }
+            }
+            return acc;
+        }
+        noinline fn measure(self: *@This(), comptime profile: usize) u64 {
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (0..1001) |_| {
+                self.inputs[0][3] ^= 0x80;
+                self.scales[0] = -self.scales[0];
+                std.mem.doNotOptimizeAway(self.run(profile));
+            }
+            return @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds - start);
+        }
+    };
+    var state: State = .{};
+    for (0..4) |seed| {
+        state.initialize(seed);
+        inline for (0..profiles.len) |profile| {
+            const p = profiles[profile];
+            const output = state.run(profile);
+            for (0..2) |half| for (0..p.mr) |row| for (0..8) |lane| {
+                const col = half * 8 + lane;
+                var expected: f64 = if (p.result) 0 else State.bias(half, row, lane);
+                const scale: f64 = if (p.external) f32x8ToArray(state.scales[row])[lane] else readF32Le(state.inputs[row][0..4]);
+                for (0..8) |sub| {
+                    var dot: i64 = 0;
+                    var input_sum: i32 = 0;
+                    for (0..32) |i| {
+                        const input: i8 = @bitCast(state.inputs[row][4 + sub * 32 + i]);
+                        dot += @as(i64, input) * @as(i64, @as(i8, @bitCast(state.panel[prepared_k_panel16_values_offset + (sub * 16 + col) * 32 + i])));
+                        input_sum += input;
+                    }
+                    const sum: f64 = if (p.cached) f32x8ToArray(state.sums[row][sub])[lane] else @floatFromInt(input_sum);
+                    const dsc: f64 = readF32Le(state.panel[prepared_k_panel16_dsc_offset + (sub * 16 + col) * 4 ..][0..4]);
+                    const dmn: f64 = readF32Le(state.panel[prepared_k_panel16_dmn_offset + (sub * 16 + col) * 4 ..][0..4]);
+                    expected += scale * (dsc * @as(f64, @floatFromInt(dot)) - dmn * sum);
+                }
+                const want: f32 = @floatCast(expected);
+                try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(f32x8ToArray(output[half][row])[lane])));
+            };
+        }
+    }
+    if (platform.env.getenvBool("ANTFLY_PANEL_ACC_BENCH")) {
+        state.initialize(2);
+        inline for (0..profiles.len) |profile| {
+            for (0..10) |_| _ = state.measure(profile);
+            var samples: [21]u64 = undefined;
+            for (&samples) |*sample| sample.* = state.measure(profile);
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            std.debug.print("panel_acc profile={d} mr={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=1001\n", .{ profile, profiles[profile].mr, @as(f64, @floatFromInt(samples[10])) / 1001.0, @as(f64, @floatFromInt(samples[19])) / 1001.0, samples[10], samples[19] });
         }
     }
 }
