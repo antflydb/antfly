@@ -10375,6 +10375,36 @@ pub const DataServer = struct {
         }
     }
 
+    fn lsmMaintenanceCanceled(raw: ?*const anyopaque) callconv(.c) u8 {
+        const self: *const DataServer = @ptrCast(@alignCast(raw.?));
+        return @intFromBool(self.lsm_maintenance_stop.load(.acquire));
+    }
+
+    fn runLifetimeCheckedLsmMaintenanceRound(self: *DataServer, fair_turn_eligible: bool, entered: *bool) !antfly.public_api.ProvisionedTableWriteSource.LsmMaintenanceRoundResult {
+        entered.* = false;
+        const io = self.maintenance_worker_lease.?.io();
+        // The legacy physical step can hold guards for an unbounded duration.
+        // Do not hold a shared CPU slot around it until the retained driver
+        // provides safe suspension boundaries. Original lifetime still fences
+        // selection and new physical work, and cannot release work before join.
+        var pass = try status_refresh_execution.Pass.init(
+            null,
+            &io,
+            platform_time.monotonicNs() +| status_refresh_execution.budget_ns,
+            .{ .context = self, .is_cancelled = lsmMaintenanceCanceled },
+        );
+        defer pass.deinit(); // Only after synchronous storage physically returns.
+        entered.* = true;
+        const lifetime = pass.lifetime();
+        const source = self.liveRuntimeWriteSource();
+        const best_effort = !fair_turn_eligible or source.lsmMaintenanceScoreBestEffort() < lsm_maintenance_fair_turn_score;
+        try pass.checkLifetime();
+        return if (best_effort)
+            source.runLsmMaintenanceRoundBestEffortDetailedWithLifetime(&lifetime)
+        else
+            source.runLsmMaintenanceRoundDetailedWithLifetime(&lifetime);
+    }
+
     fn lsmMaintenanceWorkerMain(self: *DataServer) void {
         var consecutive_lock_deferrals: usize = 0;
         while (!self.lsm_maintenance_stop.load(.acquire)) {
@@ -10453,12 +10483,20 @@ pub const DataServer = struct {
                     _ = self.lsm_maintenance_failed.fetchAdd(1, .monotonic);
                     break;
                 };
-                const force_fair_turn = consecutive_lock_deferrals >= lsm_maintenance_fair_turn_deferrals and
-                    live_write_source.lsmMaintenanceScoreBestEffort() >= lsm_maintenance_fair_turn_score;
-                const maintenance = (if (force_fair_turn)
-                    live_write_source.runLsmMaintenanceRoundDetailed()
-                else
-                    live_write_source.runLsmMaintenanceRoundBestEffortDetailed()) catch |err| {
+                const force_fair_turn = consecutive_lock_deferrals >= lsm_maintenance_fair_turn_deferrals;
+                var entered = false;
+                const maintenance = self.runLifetimeCheckedLsmMaintenanceRound(force_fair_turn, &entered) catch |err| {
+                    // A call may commit physical work before a late lifetime
+                    // rejection. Invalidate observations before retrying; never
+                    // infer that an error means storage was unchanged.
+                    if (entered) {
+                        self.invalidateAllRuntimeStatusDiskUsageCacheEntries();
+                        self.runtime_status_dirty.store(true, .release);
+                        self.markStoreStatusDirtyImmediate();
+                    }
+                    self.lsm_maintenance_selection_pending.store(true, .release);
+                    self.deferLsmMaintenance(self.backgroundMonotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                    if (self.lsm_maintenance_stop.load(.acquire)) break;
                     switch (err) {
                         error.ReadOnly,
                         error.FileNotFound,
@@ -10540,7 +10578,7 @@ pub const DataServer = struct {
             // query that visits them. Drain a bounded amount of that repair
             // work alongside the regular LSM maintenance.
             const posting_now_ns = self.backgroundMonotonicNs();
-            if (self.densePostingMaintenanceDue(posting_now_ns)) {
+            if (!self.lsm_maintenance_stop.load(.acquire) and self.densePostingMaintenanceDue(posting_now_ns)) {
                 const posting = live_write_source.runDensePostingMaintenanceRoundBestEffort() catch |err| blk: {
                     std.log.warn("dense posting refresh deferred: {}", .{err});
                     break :blk @import("antfly_local_sources").storage_posting_refresh_progress.Progress{ .pending = true };
@@ -45840,7 +45878,7 @@ fn consumerTests() type {
                 }
                 server.write_source.storage_maintenance_source = source.maintenanceSource();
                 server.vector_block_maintenance_next_eligible_ns.store(std.math.maxInt(u64), .release);
-                server.dense_posting_maintenance_next_eligible_ns.store(std.math.maxInt(u64), .release);
+                server.dense_posting_maintenance_next_eligible_ns.store(if (scenario == .shutdown) 0 else std.math.maxInt(u64), .release);
                 const io = try server.ensureBackgroundWorkerIo(.maintenance);
                 server.lsm_maintenance_wake.store(true, .release);
                 var task = try io.concurrent(DataServer.lsmMaintenanceWorkerMain, .{&server});
@@ -45866,14 +45904,18 @@ fn consumerTests() type {
                 // empty windows exhaust one wake budget; the next wake must reach
                 // the due owner without rescanning any preceding registry entry.
                 for (probes, entries, 0..) |probe, entry, i| {
-                    const inspected = scenario != .shutdown or i < width;
+                    const inspected = scenario != .shutdown or i == 0;
                     try std.testing.expectEqual(@as(usize, @intFromBool(inspected)), probe.inspections);
+                    try std.testing.expectEqual(probe.inspections + probe.steps, probe.controlled_calls);
+                    try std.testing.expectEqual(@as(usize, 0), probe.unexpected_actions);
                     try std.testing.expectEqual(@as(usize, @intFromBool(scenario != .shutdown and i == count - 1)), probe.steps);
                     try std.testing.expectEqual(@as(usize, 0), entry.active_users);
                 }
                 try std.testing.expectEqual(@as(u64, if (scenario == .shutdown) 1 else 2), server.lsm_maintenance_started.load(.acquire));
-                try std.testing.expectEqual(@as(u64, @intFromBool(scenario == .step_error)), server.lsm_maintenance_failed.load(.acquire));
-                try std.testing.expectEqual(scenario != .due, server.lsm_maintenance_selection_pending.load(.acquire));
+                try std.testing.expectEqual(@as(u64, 0), server.lsm_maintenance_failed.load(.acquire));
+                try std.testing.expect(server.lsm_maintenance_selection_pending.load(.acquire));
+                try std.testing.expect(server.runtime_status_dirty.load(.acquire));
+                try std.testing.expect(server.runtime_status_disk_usage_invalidation_generation.load(.acquire) > 0);
                 try std.testing.expectEqual(@as(u64, 0), server.provisioned_storage.resource_manager.sliceStats(.lsm_compaction_work).used_bytes);
                 try std.testing.expect(!server.lsm_maintenance_active.load(.acquire));
                 try std.testing.expect(!source.lsm_selection_claim.load(.acquire));

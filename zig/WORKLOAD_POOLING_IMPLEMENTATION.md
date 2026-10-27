@@ -29715,3 +29715,27 @@ Earlier v1-v3 runs are diagnostic; v2 exposed a test-helper shadowing error.
 Frozen v4 receipts and the final seven-file source archive supply the evidence.
 This remains a prerequisite for normal retained driver adoption; the full goal
 is not complete and no broader defaults are enabled.
+
+
+## Normal LSM worker original lifetime (2026-10-27)
+
+Each DataServer LSM round now owns one shutdown/deadline restriction through
+selection, the write facade, the existing native maintenance request, DB mutation
+boundaries, index selection, and primary/text/dense backend entry. Checks under
+guards never yield CPU. Physical work and unlock reclamation finish before late
+rejection retires that scope; potentially changed status is invalidated before
+retry. Shutdown interrupts selection and prevents new posting work afterward.
+
+Focused verification uses the real worker and registry with mocked physical owner
+replies (`antfly-data-maintenance-selection-test`), actual LSM flush/publication/
+reopen over MemoryStorage with early and late rejection
+(`antfly-maintenance-original-lifetime-test`), and native maintenance entrypoint
+analysis (`antfly-retained-read-provider-check`). These are separate coverage
+layers, not end-to-end compiled-owner durability qualification.
+
+The default worker deliberately does not hold a shared CPU slot around legacy
+physical work: those guarded steps are not yet bounded or safely suspendable.
+Shared CPU activation, retained physical jobs, bounded lock waits, independently
+funded opening/retirement, other maintenance lanes, and mixed-protocol overload/
+session verification remain required. The same maintenance integration milestone
+and full goal remain open.

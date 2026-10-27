@@ -1315,6 +1315,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .ptr = self,
             .vtable = &.{
                 .run_lsm_round = runLsmMaintenanceRound,
+                .run_lsm_round_with_lifetime = runLsmMaintenanceRoundWithLifetime,
                 .run_dense_posting_round = runDensePostingMaintenanceRound,
                 .publish_dense_checkpoints = publishDenseCheckpoints,
                 .run_vector_block_round = runVectorBlockRound,
@@ -3181,6 +3182,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         ptr: *anyopaque,
         best_effort: bool,
     ) !storage_maintenance_source.RoundResult {
+        return runLsmMaintenanceRoundWithLifetime(ptr, best_effort, null);
+    }
+
+    fn runLsmMaintenanceRoundWithLifetime(
+        ptr: *anyopaque,
+        best_effort: bool,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !storage_maintenance_source.RoundResult {
+        if (lifetime) |original| try original.checkpoint();
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         // Serialize only inspection/selection. A slow storage step never owns
         // this claim, so another round can select an unrelated owner.
@@ -3194,11 +3204,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         var selected_candidate: ?@import("maintenance_selection.zig").Policy.Candidate = null;
         while (self.nextMaintenanceLease(&cursor, selection.limit, best_effort, true)) |borrowed| {
             var lease = borrowed;
-            const status = lease.owner().maintenance(
+            const status = lease.owner().maintenanceWithLifetime(
                 lease.entry.table_name,
                 if (best_effort) .inspect_best_effort else .inspect,
+                lifetime,
             ) catch |err| {
                 lease.deinit();
+                if (lifetime) |original| try original.checkpoint();
                 if (best_effort) continue;
                 return err;
             };
@@ -3213,6 +3225,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 selected_candidate = candidate;
             } else lease.deinit();
         }
+        if (lifetime) |original| try original.checkpoint();
         if (selected == null) return .{ .selection_pending = selection.more or cursor < selection.limit };
         if (!self.selectRetainedMaintenanceLease(&selected.?, selection, best_effort)) return .{ .selection_pending = true };
         var lease = selected.?;
@@ -3220,9 +3233,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         self.lsm_selection_claim.store(false, .release);
         selecting = false;
-        const result = try lease.owner().maintenance(
+        const result = try lease.owner().maintenanceWithLifetime(
             lease.entry.table_name,
             if (best_effort) .lsm_step_best_effort else .lsm_step,
+            lifetime,
         );
         return .{
             .progressed = result.progressed != 0,

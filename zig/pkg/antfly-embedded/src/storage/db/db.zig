@@ -7126,26 +7126,43 @@ pub const DB = struct {
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStep", .{self});
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        return try self.runLsmMaintenanceStepWithReplicationMutationHeld();
+        return self.runLsmMaintenanceStepWithLifetime(null);
     }
 
-    fn runLsmMaintenanceStepWithReplicationMutationHeld(self: *DB) !bool {
+    pub fn runLsmMaintenanceStepWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (comptime storage_engine.enabled) {
+            // This API belongs to the physical native owner. The old engine
+            // vtable cannot borrow a restriction; never silently discard one.
+            if (lifetime != null) return error.ExecutionWaitUnsupported;
+            return self.runLsmMaintenanceStep();
+        }
+        try @import("../../common/seed_snapshot_lifetime.zig").checkpoint(lifetime);
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try @import("../../common/seed_snapshot_lifetime.zig").checkpoint(lifetime);
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
-        return self.runLsmMaintenanceStepAdmitted(&snapshot_replay);
+        return self.runLsmMaintenanceStepAdmittedWithLifetime(&snapshot_replay, lifetime);
     }
 
     fn runLsmMaintenanceStepAdmitted(self: *DB, snapshot_replay: *const snapshot_admission_mod.SnapshotAdmission.MutationLease) !bool {
+        return self.runLsmMaintenanceStepAdmittedWithLifetime(snapshot_replay, null);
+    }
+
+    fn runLsmMaintenanceStepAdmittedWithLifetime(self: *DB, snapshot_replay: *const snapshot_admission_mod.SnapshotAdmission.MutationLease, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         std.debug.assert(snapshot_replay.active and snapshot_replay.admission == self.core.snapshot_replay_admission);
+        const original = @import("../../common/seed_snapshot_lifetime.zig");
+        try original.checkpoint(lifetime);
         if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
-        if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
+        try original.checkpoint(lifetime);
+        if (try self.core.index_manager.runLsmObsoleteReclaimDueWithLifetime(lifetime)) return true;
+        try original.checkpoint(lifetime);
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
-            if (try self.core.primary_store_owner.runLsmMaintenanceStep()) return true;
+            if (try self.core.primary_store_owner.runLsmMaintenanceStepWithLifetime(lifetime)) return true;
         }
 
+        try original.checkpoint(lifetime);
         const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
         const index_score = self.core.index_manager.lsmMaintenanceScore();
         if (primary_score == 0 and index_score == 0) {
@@ -7153,30 +7170,49 @@ pub const DB = struct {
             self.core.index_manager.refreshLsmMaintenanceDebtHint();
             return try self.runSourcePinCleanupStep();
         }
+        try original.checkpoint(lifetime);
         if (primary_score >= index_score) {
-            return try self.core.primary_store_owner.runLsmMaintenanceStep();
+            return try self.core.primary_store_owner.runLsmMaintenanceStepWithLifetime(lifetime);
         }
-        return try self.core.index_manager.runLsmMaintenanceStep();
+        return try self.core.index_manager.runLsmMaintenanceStepWithLifetime(lifetime);
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStepBestEffort", .{self});
+        return self.runLsmMaintenanceStepBestEffortWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepBestEffortWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (comptime storage_engine.enabled) {
+            // This API belongs to the physical native owner. The old engine
+            // vtable cannot borrow a restriction; never silently discard one.
+            if (lifetime != null) return error.ExecutionWaitUnsupported;
+            return self.runLsmMaintenanceStepBestEffort();
+        }
+        const original = @import("../../common/seed_snapshot_lifetime.zig");
+        try original.checkpoint(lifetime);
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
+        try original.checkpoint(lifetime);
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
+        try original.checkpoint(lifetime);
         if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
-        if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
+        try original.checkpoint(lifetime);
+        if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffortWithLifetime(lifetime)) return true;
+        try original.checkpoint(lifetime);
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
-            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
+            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffortWithLifetime(lifetime)) return true;
         }
 
+        try original.checkpoint(lifetime);
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
         if (primary_score > 0) {
-            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
+            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffortWithLifetime(lifetime)) return true;
         }
-        if (try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
+        try original.checkpoint(lifetime);
+        if (try self.core.index_manager.runLsmMaintenanceStepBestEffortWithLifetime(lifetime)) return true;
         if (primary_score > 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         }

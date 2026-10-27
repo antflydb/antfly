@@ -1602,7 +1602,9 @@ pub const MaintenanceRequest = extern struct {
     deadline_ns: u64 = 0,
     snapshot_token: BorrowedBytes = .{},
     destination_root: BorrowedBytes = .{},
-    /// Synchronous borrowed runtime_runnable_abi.Reentry lifetime check.
+    /// Synchronous borrowed runtime_runnable_abi.Reentry lifetime check for
+    /// inspection and maintenance. Non-yielding: storage guards may be held.
+    /// Refusal never retires accepted physical work before it joins.
     /// Never serialized or retained beyond this maintenance invocation.
     lifetime_check: ?*const anyopaque = null,
 };

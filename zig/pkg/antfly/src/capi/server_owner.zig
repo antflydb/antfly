@@ -6587,14 +6587,17 @@ pub fn storageOwnerMaintenance(
     const action = std.enums.fromInt(kernel_owner_abi.MaintenanceAction, request.action) orelse
         return .invalid_argument;
 
+    const lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry = if (request.lifetime_check) |raw| @ptrCast(@alignCast(raw)) else null;
+    if (lifetime) |original| original.checkpoint() catch |err| return storageOwnerStatusFromError(err);
+
     switch (action) {
         .inspect, .inspect_best_effort => {},
         .lsm_step => {
-            out_result.progressed = @intFromBool(handle.db.runLsmMaintenanceStep() catch |err|
+            out_result.progressed = @intFromBool(handle.db.runLsmMaintenanceStepWithLifetime(lifetime) catch |err|
                 return storageOwnerStatusFromError(err));
         },
         .lsm_step_best_effort => {
-            out_result.progressed = @intFromBool(handle.db.runLsmMaintenanceStepBestEffort() catch |err|
+            out_result.progressed = @intFromBool(handle.db.runLsmMaintenanceStepBestEffortWithLifetime(lifetime) catch |err|
                 return storageOwnerStatusFromError(err));
         },
         .dense_posting_idle => {
@@ -6646,7 +6649,6 @@ pub fn storageOwnerMaintenance(
         },
         .prepare_ha_seed_snapshot => {
             if (request.deadline_ns == 0) return .invalid_argument;
-            const lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry = if (request.lifetime_check) |raw| @ptrCast(@alignCast(raw)) else null;
             handle.db.drainSnapshotMaintenanceWithLifetime(request.deadline_ns, lifetime) catch |err| {
                 std.log.warn("storage owner HA seed preparation failed err={s}", .{@errorName(err)});
                 return storageOwnerStatusFromError(err);
@@ -6665,6 +6667,7 @@ pub fn storageOwnerMaintenance(
         out_result.has_next_wake_delay = 1;
         out_result.next_wake_delay_ns = delay_ns;
     }
+    if (lifetime) |original| original.checkpoint() catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
 

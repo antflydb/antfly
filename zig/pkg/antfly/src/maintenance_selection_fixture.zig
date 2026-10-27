@@ -23,6 +23,8 @@ pub const Probe = struct {
     due: bool = false,
     fail_step: bool = false,
     inspections: usize = 0,
+    controlled_calls: usize = 0,
+    unexpected_actions: usize = 0,
     steps: usize = 0,
 };
 const abi = @import("kernel_owner_abi");
@@ -30,6 +32,11 @@ pub fn maintenance(raw: ?*anyopaque, request: *const abi.MaintenanceRequest, out
     if (request.version != abi.abi_version) return .invalid_abi;
     const probe: *Probe = @ptrCast(@alignCast(raw orelse return .invalid_argument));
     out.* = .{};
+    if (request.lifetime_check) |raw_lifetime| {
+        const lifetime: *const @import("antfly_runtime_abi").runnable_abi.Reentry = @ptrCast(@alignCast(raw_lifetime));
+        lifetime.checkpoint() catch return .busy;
+        probe.controlled_calls += 1;
+    }
     switch (@as(abi.MaintenanceAction, @fromBackingInt(@intCast(request.action)))) {
         .inspect, .inspect_best_effort => {
             probe.inspections += 1;
@@ -43,7 +50,10 @@ pub fn maintenance(raw: ?*anyopaque, request: *const abi.MaintenanceRequest, out
             if (probe.step_hook) |hook| hook(probe.hook_ctx);
             if (probe.fail_step) return .busy;
         },
-        else => return .invalid_argument,
+        else => {
+            probe.unexpected_actions += 1;
+            return .invalid_argument;
+        },
     }
     return .ok;
 }

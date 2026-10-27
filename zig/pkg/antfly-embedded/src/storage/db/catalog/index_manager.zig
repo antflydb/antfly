@@ -10105,25 +10105,27 @@ pub const IndexManager = struct {
         );
     }
 
-    fn runLsmObsoleteReclaimDueUnlocked(self: *IndexManager, comptime best_effort: bool) !bool {
+    fn runLsmObsoleteReclaimDueUnlocked(self: *IndexManager, comptime best_effort: bool, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         for (self.text_indexes.items) |*entry| {
+            if (lifetime) |original| try original.checkpoint();
             if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                 if (delay_ns == 0) {
                     const progressed = if (best_effort)
-                        try entry.persistent.runLsmMaintenanceStepBestEffort()
+                        try entry.persistent.runLsmMaintenanceStepBestEffortWithLifetime(lifetime)
                     else
-                        try entry.persistent.runLsmMaintenanceStep();
+                        try entry.persistent.runLsmMaintenanceStepWithLifetime(lifetime);
                     if (progressed) return true;
                 }
             }
         }
         for (self.dense_indexes.items) |*entry| {
+            if (lifetime) |original| try original.checkpoint();
             if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                 if (delay_ns == 0) {
                     const progressed = if (best_effort)
-                        try entry.index.runLsmMaintenanceStepBestEffort()
+                        try entry.index.runLsmMaintenanceStepBestEffortWithLifetime(lifetime)
                     else
-                        try entry.index.runLsmMaintenanceStep();
+                        try entry.index.runLsmMaintenanceStepWithLifetime(lifetime);
                     if (progressed) return true;
                 }
             }
@@ -10132,18 +10134,33 @@ pub const IndexManager = struct {
     }
 
     pub fn runLsmObsoleteReclaimDue(self: *IndexManager) !bool {
+        return self.runLsmObsoleteReclaimDueWithLifetime(null);
+    }
+
+    pub fn runLsmObsoleteReclaimDueWithLifetime(self: *IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        return try self.runLsmObsoleteReclaimDueUnlocked(false);
+        return try self.runLsmObsoleteReclaimDueUnlocked(false, lifetime);
     }
 
     pub fn runLsmObsoleteReclaimDueBestEffort(self: *IndexManager) !bool {
+        return self.runLsmObsoleteReclaimDueBestEffortWithLifetime(null);
+    }
+
+    pub fn runLsmObsoleteReclaimDueBestEffortWithLifetime(self: *IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         if (!self.catalog_mutex.tryLockShared()) return false;
         defer self.catalog_mutex.unlockShared();
-        return try self.runLsmObsoleteReclaimDueUnlocked(true);
+        return try self.runLsmObsoleteReclaimDueUnlocked(true, lifetime);
     }
 
     pub fn runLsmMaintenanceStep(self: *IndexManager) !bool {
+        return self.runLsmMaintenanceStepWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepWithLifetime(self: *IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
 
@@ -10152,6 +10169,7 @@ pub const IndexManager = struct {
         var best_score: u64 = 0;
 
         for (self.text_indexes.items, 0..) |*entry, i| {
+            if (lifetime) |original| try original.checkpoint();
             const score = entry.persistent.lsmMaintenanceScore();
             if (score > best_score) {
                 best_score = score;
@@ -10160,6 +10178,7 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
+            if (lifetime) |original| try original.checkpoint();
             const score = entry.index.lsmMaintenanceScore();
             if (score > best_score) {
                 best_score = score;
@@ -10168,15 +10187,21 @@ pub const IndexManager = struct {
             }
         }
 
+        if (lifetime) |original| try original.checkpoint();
         if (best_score == 0) return false;
         return switch (best_kind) {
             .none => false,
-            .text => try self.text_indexes.items[best_index].persistent.runLsmMaintenanceStep(),
-            .dense => try self.dense_indexes.items[best_index].index.runLsmMaintenanceStep(),
+            .text => try self.text_indexes.items[best_index].persistent.runLsmMaintenanceStepWithLifetime(lifetime),
+            .dense => try self.dense_indexes.items[best_index].index.runLsmMaintenanceStepWithLifetime(lifetime),
         };
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *IndexManager) !bool {
+        return self.runLsmMaintenanceStepBestEffortWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepBestEffortWithLifetime(self: *IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         if (!self.catalog_mutex.tryLockShared()) return false;
         defer self.catalog_mutex.unlockShared();
 
@@ -10185,6 +10210,7 @@ pub const IndexManager = struct {
         var best_score: u64 = 0;
 
         for (self.text_indexes.items, 0..) |*entry, i| {
+            if (lifetime) |original| try original.checkpoint();
             const raw_score = entry.persistent.lsmMaintenanceDebtHint();
             const score = if (raw_score != 0) raw_score else if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
             if (score > best_score) {
@@ -10194,6 +10220,7 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
+            if (lifetime) |original| try original.checkpoint();
             const raw_score = entry.index.lsmMaintenanceDebtHint();
             const score = if (raw_score != 0) raw_score else if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
             if (score > best_score) {
@@ -10203,11 +10230,12 @@ pub const IndexManager = struct {
             }
         }
 
+        if (lifetime) |original| try original.checkpoint();
         if (best_score == 0) return false;
         return switch (best_kind) {
             .none => false,
-            .text => try self.text_indexes.items[best_index].persistent.runLsmMaintenanceStepBestEffort(),
-            .dense => try self.dense_indexes.items[best_index].index.runLsmMaintenanceStepBestEffort(),
+            .text => try self.text_indexes.items[best_index].persistent.runLsmMaintenanceStepBestEffortWithLifetime(lifetime),
+            .dense => try self.dense_indexes.items[best_index].index.runLsmMaintenanceStepBestEffortWithLifetime(lifetime),
         };
     }
 

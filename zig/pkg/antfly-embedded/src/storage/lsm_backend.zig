@@ -4145,9 +4145,22 @@ pub const Backend = struct {
     }
 
     pub fn runMaintenanceStep(self: *Backend) !bool {
-        const locked = runtime_mod.lockBackend(Backend, self);
-        defer runtime_mod.unlockBackend(Backend, self, locked);
-        return try self.runMaintenanceStepLocked(false);
+        return self.runMaintenanceStepWithLifetime(null);
+    }
+
+    /// Restriction checks never release CPU while caller/storage guards live.
+    /// Once a physical step starts it joins, including durable publication and
+    /// unlock reclamation, before a late original-lifetime error is exposed.
+    pub fn runMaintenanceStepWithLifetime(self: *Backend, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
+        const progressed = blk: {
+            const locked = runtime_mod.lockBackend(Backend, self);
+            defer runtime_mod.unlockBackend(Backend, self, locked);
+            if (lifetime) |original| try original.checkpoint();
+            break :blk try self.runMaintenanceStepLocked(false);
+        };
+        if (lifetime) |original| try original.checkpoint();
+        return progressed;
     }
 
     /// An explicitly requested rewrite must make progress under sustained
@@ -4160,9 +4173,22 @@ pub const Backend = struct {
     }
 
     pub fn runMaintenanceStepBestEffort(self: *Backend) !bool {
-        if (!self.mu.tryLock()) return false;
-        defer self.unlockWithReclamation();
-        return try self.runMaintenanceStepLocked(false);
+        return self.runMaintenanceStepBestEffortWithLifetime(null);
+    }
+
+    /// Restriction checks never release CPU while caller/storage guards live.
+    /// Once a physical step starts it joins, including durable publication and
+    /// unlock reclamation, before a late original-lifetime error is exposed.
+    pub fn runMaintenanceStepBestEffortWithLifetime(self: *Backend, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
+        const progressed = blk: {
+            if (!self.mu.tryLock()) return false;
+            defer self.unlockWithReclamation();
+            if (lifetime) |original| try original.checkpoint();
+            break :blk try self.runMaintenanceStepLocked(false);
+        };
+        if (lifetime) |original| try original.checkpoint();
+        return progressed;
     }
 
     pub fn makeWalCheckpointRetryDueForTest(self: *Backend) void {
@@ -33415,4 +33441,66 @@ test "controlled physical sync registered entry accounting token cannot perform 
 test "controlled physical sync registered entry account allocation failure preserves caller source and registered host authority" {
     const F = RegisteredDirectoryEntryFixture;
     for ([_]bool{ false, true }) |shared| _ = try F.exercise(.account_oom, null, shared, false);
+}
+
+test "maintenance original lifetime joins durable flush before late cancellation and remains reusable" {
+    const runtime = @import("antfly_runtime_abi");
+    const Check = struct {
+        calls: usize = 0,
+        reject_at: usize = 0,
+        cause: anyerror,
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.reject_at != 0 and self.calls >= self.reject_at)
+                return runtime.error_abi.statusFromError(self.cause);
+            return .ok;
+        }
+    };
+    inline for (.{ false, true }) |best_effort| {
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded }) |cause| {
+            var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer storage.deinit();
+            const path = "/maintenance-original-lifetime";
+            {
+                var backend = try Backend.open(std.testing.allocator, path, .{
+                    .storage = storage.storage(),
+                    .flush_threshold = 1,
+                    .defer_flush_on_commit = true,
+                });
+                defer backend.close();
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{}, "key", "durable value");
+                try txn.commit();
+                try std.testing.expectEqual(@as(u64, 1), backend.snapshotMaintenanceStats().immutable_memtables);
+                var check: Check = .{ .reject_at = 2, .cause = cause };
+                const lifetime: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+                const run = if (best_effort) Backend.runMaintenanceStepBestEffortWithLifetime else Backend.runMaintenanceStepWithLifetime;
+                // A rejection after acquiring the actual backend guard starts
+                // no flush and releases the guard before reporting failure.
+                try std.testing.expectError(cause, run(&backend, &lifetime));
+                try std.testing.expect(backend.mu.tryLock());
+                backend.mu.unlock();
+                try std.testing.expectEqual(@as(u64, 1), backend.snapshotMaintenanceStats().immutable_memtables);
+                try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().total_runs);
+                check.calls = 0;
+                check.reject_at = 3;
+                // Late rejection follows physical flush, durable publication,
+                // and guard cleanup. It must never roll the completed work back.
+                try std.testing.expectError(cause, run(&backend, &lifetime));
+                const physical = backend.snapshotMaintenanceStats();
+                try std.testing.expectEqual(@as(u64, 0), physical.immutable_memtables);
+                try std.testing.expect(physical.total_runs > 0);
+                check.reject_at = 0;
+                _ = try run(&backend, &lifetime);
+            }
+            var reopened = try Backend.open(std.testing.allocator, path, .{ .storage = storage.storage() });
+            defer reopened.close();
+            try std.testing.expect(reopened.snapshotMaintenanceStats().total_runs > 0);
+            var read = try reopened.beginRead();
+            defer read.abort();
+            try std.testing.expectEqualStrings("durable value", try read.get(.{}, "key"));
+        }
+    }
 }

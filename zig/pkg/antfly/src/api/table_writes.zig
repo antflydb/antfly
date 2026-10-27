@@ -15036,9 +15036,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn runLsmMaintenanceRoundDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
+        return self.runLsmMaintenanceRoundDetailedWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceRoundDetailedWithLifetime(self: *ProvisionedTableWriteSource, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !LsmMaintenanceRoundResult {
+        if (lifetime) |original| try original.checkpoint();
         if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return .{};
-            const result = try maintenance_source.runLsmRound(false);
+            const result = try maintenance_source.runLsmRoundWithLifetime(false, lifetime);
             return .{ .progressed = result.progressed, .group_id = result.group_id, .selection_pending = result.selection_pending };
         }
         var primary_only = false;
@@ -15054,6 +15059,7 @@ pub const ProvisionedTableWriteSource = struct {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
             leased.deinit(release_alloc);
         }
+        if (lifetime) |original| try original.checkpoint();
         const maintenance_table_name = if (leased.entry) |entry| entry.table_name else null;
         const progressed = if (primary_only)
             try leased.db.runPrimaryLsmMaintenanceStep()
@@ -15066,6 +15072,7 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
         }
+        if (lifetime) |original| try original.checkpoint();
         return .{
             .progressed = progressed,
             .group_id = if (leased.entry) |entry| entry.group_id else null,
@@ -15077,9 +15084,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn runLsmMaintenanceRoundBestEffortDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
+        return self.runLsmMaintenanceRoundBestEffortDetailedWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceRoundBestEffortDetailedWithLifetime(self: *ProvisionedTableWriteSource, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !LsmMaintenanceRoundResult {
+        if (lifetime) |original| try original.checkpoint();
         if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return .{};
-            const result = try maintenance_source.runLsmRound(true);
+            const result = try maintenance_source.runLsmRoundWithLifetime(true, lifetime);
             return .{ .progressed = result.progressed, .group_id = result.group_id, .selection_pending = result.selection_pending };
         }
         if (!self.local_db_mutex.tryLock()) return .{};
@@ -15095,6 +15107,7 @@ pub const ProvisionedTableWriteSource = struct {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
             leased.deinit(release_alloc);
         }
+        if (lifetime) |original| try original.checkpoint();
         const maintenance_table_name = if (leased.entry) |entry| entry.table_name else null;
         const progressed = if (primary_only)
             try leased.db.runPrimaryLsmMaintenanceStepBestEffort()
@@ -15107,6 +15120,7 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
         }
+        if (lifetime) |original| try original.checkpoint();
         return .{
             .progressed = progressed,
             .group_id = if (leased.entry) |entry| entry.group_id else null,

@@ -6047,13 +6047,23 @@ pub const HBCIndex = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *HBCIndex) !bool {
+        return self.runLsmMaintenanceStepWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepWithLifetime(self: *HBCIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         return switch (self.env_owner) {
-            .lsm => |handle| try handle.backend.runMaintenanceStep(),
+            .lsm => |handle| try handle.backend.runMaintenanceStepWithLifetime(lifetime),
             .native => false,
         };
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *HBCIndex) !bool {
+        return self.runLsmMaintenanceStepBestEffortWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepBestEffortWithLifetime(self: *HBCIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         return switch (self.env_owner) {
             .lsm => |handle| blk: {
                 // An open HBC publication session suppresses compaction and
@@ -6066,7 +6076,7 @@ pub const HBCIndex = struct {
                         false;
                     if (!due) break :blk false;
                 }
-                break :blk try handle.backend.runMaintenanceStepBestEffort();
+                break :blk try handle.backend.runMaintenanceStepBestEffortWithLifetime(lifetime);
             },
             .native => false,
         };

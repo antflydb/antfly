@@ -1188,16 +1188,28 @@ pub const Owner = struct {
         table_name: []const u8,
         action: abi.MaintenanceAction,
     ) !abi.MaintenanceResult {
+        return self.maintenanceWithLifetime(table_name, action, null);
+    }
+
+    pub fn maintenanceWithLifetime(
+        self: *Owner,
+        table_name: []const u8,
+        action: abi.MaintenanceAction,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !abi.MaintenanceResult {
+        if (lifetime) |original| try original.checkpoint();
         var result: abi.MaintenanceResult = .{};
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
             &.{
                 .action = @backingInt(action),
                 .table_name = .fromSlice(table_name),
+                .lifetime_check = lifetime,
             },
             &result,
         ));
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        if (lifetime) |original| try original.checkpoint();
         return result;
     }
 

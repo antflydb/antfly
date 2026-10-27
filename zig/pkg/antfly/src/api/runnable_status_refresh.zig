@@ -89,6 +89,17 @@ pub const Pass = struct {
         try self.checkLifetime();
     }
 
+    /// Non-yielding restriction for synchronous storage calls holding guards.
+    pub fn lifetime(self: *const Pass) abi.Reentry {
+        return .{ .context = @ptrCast(@constCast(self)), .check = checkOriginalLifetime };
+    }
+
+    fn checkOriginalLifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+        const self: *const Pass = @ptrCast(@alignCast(raw));
+        self.checkLifetime() catch |cause| return runtime.error_abi.statusFromError(cause);
+        return .ok;
+    }
+
     /// Borrow only while this exact pass remains alive at its current address.
     /// The scope and its payload stay on the synchronous caller's stack; a
     /// retained storage continuation must never retain either of them.

@@ -17,6 +17,8 @@
 //! code schedules whole maintenance quanta through this interface and never
 //! imports the DB, LSM, or index maintenance implementations.
 
+const Reentry = @import("antfly_runtime_abi").runnable_abi.Reentry;
+
 pub const PostingRefreshProgress = @import("antfly_local_sources").storage_posting_refresh_progress.Progress;
 
 pub const RoundResult = struct {
@@ -39,6 +41,7 @@ pub const Source = struct {
 
     pub const VTable = struct {
         run_lsm_round: *const fn (*anyopaque, bool) anyerror!RoundResult,
+        run_lsm_round_with_lifetime: ?*const fn (*anyopaque, bool, ?*const Reentry) anyerror!RoundResult = null,
         run_dense_posting_round: *const fn (*anyopaque) anyerror!PostingRefreshProgress,
         publish_dense_checkpoints: *const fn (*anyopaque) anyerror!@import("antfly_local_sources").storage_db_types.NativePublicationResult,
         run_vector_block_round: *const fn (*anyopaque) anyerror!usize,
@@ -48,6 +51,16 @@ pub const Source = struct {
 
     pub fn runLsmRound(self: Source, best_effort: bool) !RoundResult {
         return try self.vtable.run_lsm_round(self.ptr, best_effort);
+    }
+
+    pub fn runLsmRoundWithLifetime(self: Source, best_effort: bool, lifetime: ?*const Reentry) !RoundResult {
+        if (lifetime) |original| try original.checkpoint();
+        const result = if (self.vtable.run_lsm_round_with_lifetime) |controlled|
+            try controlled(self.ptr, best_effort, lifetime)
+        else
+            try self.runLsmRound(best_effort);
+        if (lifetime) |original| try original.checkpoint();
+        return result;
     }
 
     pub fn runDensePostingRound(self: Source) !PostingRefreshProgress {

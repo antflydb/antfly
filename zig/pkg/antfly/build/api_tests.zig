@@ -4770,6 +4770,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-storage-read-admission-test", "Require physical LSM and Lite original read admission and cursor cleanup")
         .dependOn(&storage_read_admission_run.step);
 
+    const maintenance_lifetime_tests = b.addTest(.{
+        .name = "maintenance-original-lifetime-tests",
+        .root_module = storage_read_admission_root,
+        .filters = &.{"maintenance original lifetime"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const maintenance_lifetime_run = b.addRunArtifact(maintenance_lifetime_tests);
+    maintenance_lifetime_run.addArg("--require-no-skips");
+    b.step("antfly-maintenance-original-lifetime-test", "Verify original lifetime rejection around physical flush, publication, cleanup and reopen")
+        .dependOn(&maintenance_lifetime_run.step);
+
     const lite_recovery_capture_tests = b.addTest(.{
         .name = "lite-recovery-capture-tests",
         .root_module = storage_read_admission_root,

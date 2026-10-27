@@ -1783,3 +1783,14 @@ Native/storage-owner ABIs are 149/209; durable formats are unchanged. This
 supplies a required lifetime join for the retained scheduler driver. Funded
 opening, normal admission forwarding/driver adoption and full overload, session
 and remote qualification remain open. The full goal remains active.
+
+
+### Default LSM worker original lifetime (2026-10-27)
+
+The normal DataServer LSM worker now forwards its original shutdown/deadline
+restriction through selection and native primary/text/dense LSM maintenance.
+Physical work joins before late rejection retires that scope. Shared CPU admission
+is withheld until the retained physical driver supplies safe bounded suspension;
+wrapping an unbounded guarded legacy step would delay foreground work. That
+integration milestone, other maintenance lanes and whole-path overload/session
+verification remain open. The full design is not complete.

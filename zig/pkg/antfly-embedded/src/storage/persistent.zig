@@ -1042,17 +1042,17 @@ const MainStoreOwner = union(enum) {
         };
     }
 
-    fn runLsmMaintenanceStep(self: *MainStoreOwner) !bool {
+    fn runLsmMaintenanceStepWithLifetime(self: *MainStoreOwner, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         return switch (self.*) {
             .mem => false,
-            .lsm => |*handle| try handle.backend.runMaintenanceStep(),
+            .lsm => |*handle| try handle.backend.runMaintenanceStepWithLifetime(lifetime),
         };
     }
 
-    fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner) !bool {
+    fn runLsmMaintenanceStepBestEffortWithLifetime(self: *MainStoreOwner, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         return switch (self.*) {
             .mem => false,
-            .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffort(),
+            .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffortWithLifetime(lifetime),
         };
     }
 
@@ -2091,15 +2091,25 @@ pub const PersistentIndex = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *PersistentIndex) !bool {
+        return self.runLsmMaintenanceStepWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepWithLifetime(self: *PersistentIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         self.lockStorage();
         defer self.unlockStorage();
-        return try self.main_store_owner.runLsmMaintenanceStep();
+        return try self.main_store_owner.runLsmMaintenanceStepWithLifetime(lifetime);
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *PersistentIndex) !bool {
+        return self.runLsmMaintenanceStepBestEffortWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepBestEffortWithLifetime(self: *PersistentIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         self.lockStorage();
         defer self.unlockStorage();
-        return try self.main_store_owner.runLsmMaintenanceStepBestEffort();
+        return try self.main_store_owner.runLsmMaintenanceStepBestEffortWithLifetime(lifetime);
     }
 
     /// Index a pre-built segment (WAL-protected, durable after return).

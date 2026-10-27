@@ -316,9 +316,14 @@ pub const PrimaryStoreOwner = union(enum) {
     }
 
     pub fn runLsmMaintenanceStep(self: *PrimaryStoreOwner) !bool {
+        return self.runLsmMaintenanceStepWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepWithLifetime(self: *PrimaryStoreOwner, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         return switch (self.*) {
             .none, .mem => false,
-            .lsm => |owner| try owner.handle.backend.runMaintenanceStep(),
+            .lsm => |owner| try owner.handle.backend.runMaintenanceStepWithLifetime(lifetime),
         };
     }
 
@@ -330,9 +335,14 @@ pub const PrimaryStoreOwner = union(enum) {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *PrimaryStoreOwner) !bool {
+        return self.runLsmMaintenanceStepBestEffortWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepBestEffortWithLifetime(self: *PrimaryStoreOwner, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         return switch (self.*) {
             .none, .mem => false,
-            .lsm => |owner| try owner.handle.backend.runMaintenanceStepBestEffort(),
+            .lsm => |owner| try owner.handle.backend.runMaintenanceStepBestEffortWithLifetime(lifetime),
         };
     }
 };
