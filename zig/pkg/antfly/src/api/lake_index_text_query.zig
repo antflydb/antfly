@@ -2021,6 +2021,9 @@ const Execution = struct {
                 }
             }
         }
+        // A text-driven plan must not enumerate a broad metadata selection
+        // after declining the ordered driver. Native filters still apply.
+        if (attempt.prefer_text_candidates and native_window) return null;
         const pack_proof_mod = @import("lake_index_pack_proof.zig");
         var pack_proof: ?*pack_proof_mod = null;
         defer if (pack_proof) |proof| proof.deinit();
@@ -2039,7 +2042,7 @@ const Execution = struct {
                 else => return err,
             };
         }
-        const predicate_selection = if ((!stream_predicate or self.relocated()) and req.filter_query_json.len != 0)
+        const predicate_selection = if (!attempt.prefer_text_candidates and (!stream_predicate or self.relocated()) and req.filter_query_json.len != 0)
             self.predicatePacks(root, cached, cancellation, req.filter_query_json, packSelectionLimit(req)) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded => null,
                 else => return err,
@@ -2287,7 +2290,8 @@ const Execution = struct {
             total +|= page.total_hits;
             for (page.hits) |hit| {
                 const ordinal = std.math.add(u64, window.doc_offset, hit.native_text_doc_id orelse return error.InvalidNativeLakeTextCorpus) catch return error.InvalidNativeLakeTextCorpus;
-                const location = if (self.use_stored_highlights) try storedTextLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, window.identities, hit.native_text_doc_id.?) else null;
+                const native_delivery = self.overlay == null and !recent_window and self.storedDeliveryUseful(if (child.delivery_pin) |*pin| pin else null);
+                const location = if (self.use_stored_highlights or native_delivery) try storedTextLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, window.identities, hit.native_text_doc_id.?) else null;
                 const identities: ?*const @import("lake_index_text_predicate.zig").Identities = if (ordering == null and !recent_window) archive: {
                     const pin = child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus;
                     break :archive @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
@@ -2325,7 +2329,9 @@ const Execution = struct {
         if (sorted_reader) |value| if (value.pruned) {
             relation = .gte;
         };
-        var result: types.SearchResult = .{ .alloc = a, .hits = try winners.finishLocated(paging.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena), .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
+        var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
+        errdefer result.deinit();
+        try self.finishPagedWinners(&result, &winners, paging.offset, selected.name, false);
         if (req.profile) {
             result.sort_profile = profiled.sort_profile orelse .{};
             result.sort_profile_storage = profiled.sort_profile_storage;
@@ -2557,7 +2563,10 @@ const Execution = struct {
         defer if (prepared) |held| held.deinit();
         if (prepared) |held| if (held.plan.?.exactMetadataCount()) |count| {
             const goal = @as(usize, req.offset) +| req.limit;
-            if (!local.storage_db_query_search_exec.preferOrderedCandidates(count, root.collection.?.documents, goal)) return null;
+            if (!local.storage_db_query_search_exec.preferOrderedCandidates(count, root.collection.?.documents, goal)) {
+                attempt.prefer_text_candidates = true;
+                return null;
+            }
         };
         var predicate = (try @import("lake_index_sql_rows.zig").tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc, .filter_query_json = req.filter_query_json })) orelse return null;
         defer predicate.deinit();
@@ -2687,35 +2696,42 @@ const Execution = struct {
         // Publish borrowed highlight keys only after every other allocation has
         // succeeded; an optional-plan fallback must leave no dangling keys.
         const native_delivery = if (retained_pack) |pack| winners.restoreNativeDocuments(pack) else false;
-        var located: @import("lake_text_delivery.zig").Locations = .empty;
-        defer located.deinit(self.arena);
-        result.hits = try winners.finishLocated(paging.offset, if (self.use_stored_highlights or !native_delivery) &located else null, self.arena);
-        var delivery_locations: @import("lake_text_delivery.zig").Locations = .empty;
-        defer delivery_locations.deinit(self.arena);
-        const grouped_delivery = !native_delivery and result.hits.len != 0 and located.count() == result.hits.len;
-        if (grouped_delivery) {
-            try delivery_locations.ensureUnusedCapacity(self.arena, std.math.cast(u32, located.count()) orelse return error.QueryCandidateBudgetExceeded);
-            for (result.hits) |hit| {
-                // Postprocessors can retire/reorder hits. These keys belong to
-                // the request owner, independently of result-body movement.
-                const key = try self.arena.dupe(u8, hit.id);
-                delivery_locations.putAssumeCapacity(key, located.get(hit.id).?);
-            }
-        }
-        if (self.use_stored_highlights) try self.highlight_locations.ensureUnusedCapacity(self.arena, std.math.cast(u32, located.count()) orelse return error.QueryCandidateBudgetExceeded);
-        // All fallible preparation finishes before publishing either map.
-        if (self.use_stored_highlights) {
-            var entries = located.iterator();
-            while (entries.next()) |entry| self.highlight_locations.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
-        }
-        self.delivery_locations.deinit(self.arena);
-        self.delivery_locations = delivery_locations;
-        delivery_locations = .empty;
-        self.delivery_index = if (grouped_delivery) name else null;
+        try self.finishPagedWinners(&result, &winners, paging.offset, name, native_delivery);
         if (self.delivery_pin) |*old| old.deinit();
         self.delivery_pin = if (native_delivery) retained_delivery else null;
         if (native_delivery) retained_delivery = null;
         return result;
+    }
+    fn finishPagedWinners(self: *Execution, result: *types.SearchResult, winners: *PagedWinners, offset: usize, name: []const u8, native_delivery: bool) !void {
+        const delivery = @import("lake_text_delivery.zig");
+        var located: delivery.Locations = .empty;
+        defer located.deinit(self.arena);
+        result.hits = try winners.finishLocated(offset, if (self.use_stored_highlights or (!native_delivery and self.overlay == null)) &located else null, self.arena);
+        const grouped = !native_delivery and self.overlay == null and result.hits.len != 0 and located.count() == result.hits.len;
+        var owned: delivery.Locations = .empty;
+        defer owned.deinit(self.arena);
+        if (grouped or self.use_stored_highlights) {
+            try owned.ensureUnusedCapacity(self.arena, std.math.cast(u32, located.count()) orelse return error.QueryCandidateBudgetExceeded);
+            for (result.hits) |hit| if (located.get(hit.id)) |location| {
+                // Result transforms may retire/reorder hits. Request-owned keys
+                // keep both delivery and highlight evidence independent of that.
+                owned.putAssumeCapacity(try self.arena.dupe(u8, hit.id), location);
+            };
+        }
+        if (self.use_stored_highlights) try self.highlight_locations.ensureUnusedCapacity(self.arena, std.math.cast(u32, owned.count()) orelse return error.QueryCandidateBudgetExceeded);
+        // No fallible work remains after either map becomes visible.
+        if (self.use_stored_highlights) {
+            var entries = owned.iterator();
+            while (entries.next()) |entry| self.highlight_locations.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        self.delivery_locations.deinit(self.arena);
+        self.delivery_locations = if (grouped) owned else .empty;
+        if (grouped) owned = .empty;
+        self.delivery_index = if (grouped) name else null;
+        if (!native_delivery) {
+            if (self.delivery_pin) |*pin| pin.deinit();
+            self.delivery_pin = null;
+        }
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);
@@ -4494,6 +4510,7 @@ const OrderedAttempt = struct {
     elapsed_us: u64 = 0,
     scanned: u64 = 0,
     attempted: bool = false,
+    prefer_text_candidates: bool = false,
     fn init(a: A, enabled: bool) OrderedAttempt {
         return .{ .held = .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, .enabled = enabled };
     }
@@ -5542,4 +5559,41 @@ test "external lake bounded window profiles cost declines retain preparation tim
     try std.testing.expectEqualStrings("text_postings", result.sort_profile.?.candidate_source);
     try std.testing.expectEqual(@as(u64, 0), result.sort_profile.?.ordered_scanned_count);
     try std.testing.expectEqual(@as(u64, 300), result.sort_profile.?.total_us);
+}
+
+test "external lake bounded window profiles final locators survive result retirement and allocation faults" {
+    const Run = struct {
+        fn run(a: A) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var execution: Execution = undefined;
+            execution.arena = arena.allocator();
+            execution.overlay = null;
+            execution.use_stored_highlights = true;
+            execution.highlight_locations = .empty;
+            execution.delivery_locations = .empty;
+            execution.delivery_index = null;
+            execution.delivery_pin = null;
+            var winners = PagedWinners.init(std.testing.allocator, 2);
+            defer winners.deinit();
+            var ids = [_][1]u8{ .{'a'}, .{'b'} };
+            try winners.addLocated(.{ .id = &ids[0], .score = 2 }, 0, .{ .segment = @splat(1), .document = 7 });
+            try winners.addLocated(.{ .id = &ids[1], .score = 1 }, 1, .{ .segment = @splat(2), .document = 9 });
+            var result: types.SearchResult = .{ .alloc = std.testing.allocator, .hits = &.{}, .total_hits = 2 };
+            {
+                defer result.deinit();
+                execution.finishPagedWinners(&result, &winners, 0, "text", false) catch |err| {
+                    try std.testing.expect(execution.delivery_index == null);
+                    try std.testing.expectEqual(@as(u32, 0), execution.highlight_locations.count());
+                    return err;
+                };
+            }
+            try std.testing.expectEqual(@as(u32, 7), execution.delivery_locations.get("a").?.document);
+            try std.testing.expectEqual(@as(u32, 9), execution.highlight_locations.get("b").?.document);
+            try std.testing.expectEqualStrings("text", execution.delivery_index.?);
+        }
+    };
+    try Run.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
 }

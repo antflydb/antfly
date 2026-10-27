@@ -1367,6 +1367,10 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
                                 }
                             ],
                         }
+                        if case == "metadata_selective":
+                            request["filter_query"] = {
+                                "range": {"path": "/bucket", "gte": 0}
+                            }
                         actual = client.query({"request": request})
                         assert [
                             h["_source"]["id"] for h in actual["hits"]["hits"]
@@ -1488,45 +1492,55 @@ def test_ordered_native_delivery_spans_packs_without_parquet_payloads(
                 for restarted in (False, True):
                     if restarted:
                         server.restart()
-                    for highlights in (False, True):
-                        request = {
-                            "full_text_search": {
-                                "conjuncts": [
-                                    {"match": "common", "field": "body"},
-                                    {"match": "needle", "field": "body"},
-                                ]
-                            },
-                            "fields": ["id"] if highlights else ["id", "body"],
-                            "order_by": [{"field": "bucket"}],
-                            "limit": 24,
-                            "profile": True,
-                        }
-                        if highlights:
-                            request["highlight"] = {"fields": ["body"]}
-                        before = client.metrics()
-                        result = client.query({"request": request})
-                        after = client.metrics()
-                        hits = result["hits"]["hits"]
-                        assert [hit["_source"]["id"] for hit in hits] == list(range(24))
-                        assert (
-                            result["profile"]["sort"]["selection_reason"]
-                            == "bounded_ordered_lake_index"
-                        )
-                        assert (
-                            after["antfly_lake_query_hydration_native_calls_total"]
-                            - before["antfly_lake_query_hydration_native_calls_total"]
-                            >= 2
-                        )
-                        assert (
-                            after["antfly_lake_query_hydration_source_calls_total"]
-                            == before["antfly_lake_query_hydration_source_calls_total"]
-                        )
-                        for hit in hits:
+                    for ordered in (True, False):
+                        for highlights in (False, True):
+                            request = {
+                                "full_text_search": {
+                                    "conjuncts": [
+                                        {"match": "common", "field": "body"},
+                                        {"match": "needle", "field": "body"},
+                                    ]
+                                },
+                                "fields": ["id"] if highlights else ["id", "body"],
+                                "order_by": [{"field": "bucket"}],
+                                "limit": 24,
+                                "profile": True,
+                            }
+                            if not ordered:
+                                request.pop("order_by")
                             if highlights:
-                                assert set(hit["_source"]) == {"id"}
-                                assert hit["_highlights"]["body"]
-                            else:
-                                assert hit["_source"]["body"] == "common needle"
+                                request["highlight"] = {"fields": ["body"]}
+                            before = client.metrics()
+                            result = client.query({"request": request})
+                            after = client.metrics()
+                            hits = result["hits"]["hits"]
+                            assert [hit["_source"]["id"] for hit in hits] == list(
+                                range(24)
+                            )
+                            if ordered:
+                                assert (
+                                    result["profile"]["sort"]["selection_reason"]
+                                    == "bounded_ordered_lake_index"
+                                )
+                            assert (
+                                after["antfly_lake_query_hydration_native_calls_total"]
+                                - before[
+                                    "antfly_lake_query_hydration_native_calls_total"
+                                ]
+                                >= 2
+                            )
+                            assert (
+                                after["antfly_lake_query_hydration_source_calls_total"]
+                                == before[
+                                    "antfly_lake_query_hydration_source_calls_total"
+                                ]
+                            )
+                            for hit in hits:
+                                if highlights:
+                                    assert set(hit["_source"]) == {"id"}
+                                    assert hit["_highlights"]["body"]
+                                else:
+                                    assert hit["_source"]["body"] == "common needle"
             finally:
                 unavailable.rename(parquet_object)
         finally:
