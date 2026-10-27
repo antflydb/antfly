@@ -5243,59 +5243,91 @@ test "capi native idle maintenance verifies allocator outside connection and wri
     const a = std.testing.allocator;
     const native = @import("antfly_local_sources").storage_lite_native;
     inline for (.{ false, true }) |cancel| {
-        var directory = try TestDirectory.init("capi-allocator-proof-gates");
-        defer directory.cleanup();
-        const path = try tempTestAflitePath(a, directory.path(), "database");
-        defer a.free(path);
-        defer cleanupTestFile(path);
-        var options: capi.OpenOptions = .{};
-        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
-        options.storage_kind = capi.storage_kind_lite;
-        options.profile = capi.profile_hosted;
-        var handle: ?*anyopaque = null;
-        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
-        defer antfly_db_close(handle);
-        const owner = blk: {
-            const guard = public.enterHandle(handle, .exclusive).?;
-            defer guard.leave();
-            guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
-            break :blk guard.connection.?.owner;
-        };
-        const Owner = @TypeOf(owner.*);
-        const Probe = struct {
-            owner: *Owner,
-            calls: usize = 0,
-            failure: ?anyerror = null,
-            fn notify(ptr: *anyopaque, _: *native.NativeFile) void {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                self.calls += 1;
-                if (!self.owner.gate.mutex.tryLock()) {
-                    self.failure = error.TestUnexpectedResult;
-                    return;
+        inline for (.{ false, true }) |replace| {
+            var directory = try TestDirectory.init("capi-allocator-proof-gates");
+            defer directory.cleanup();
+            const path = try tempTestAflitePath(a, directory.path(), "database");
+            defer a.free(path);
+            defer cleanupTestFile(path);
+            var options: capi.OpenOptions = .{};
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+            options.storage_kind = capi.storage_kind_lite;
+            options.profile = capi.profile_hosted;
+            var handle: ?*anyopaque = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+            defer antfly_db_close(handle);
+            const marker_path = try std.fmt.allocPrint(a, "{s}/.aflite-lease-0123456789abcdef0123456789abcdef", .{std.fs.path.dirname(path).?});
+            defer a.free(marker_path);
+            const marker = try std.Io.Dir.cwd().createFile(shared.handleLockIo(), marker_path, .{});
+            marker.close(shared.handleLockIo());
+            const owner = blk: {
+                const guard = public.enterHandle(handle, .exclusive).?;
+                defer guard.leave();
+                guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+                break :blk guard.connection.?.owner;
+            };
+            const Owner = @TypeOf(owner.*);
+            const Probe = struct {
+                owner: *Owner,
+                calls: usize = 0,
+                failure: ?anyerror = null,
+                fn notify(ptr: *anyopaque, _: *native.NativeFile) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.inspect() catch |err| {
+                        self.failure = err;
+                    };
                 }
-                self.owner.gate.mutex.unlock(shared.handleLockIo());
-                var lease = native.lockWriterPathWithIo(std.testing.allocator, shared.handleLockIo(), self.owner.path) catch |err| {
-                    self.failure = err;
-                    return;
-                };
-                lease.close();
-                if (cancel) self.owner.verification_cancel.request();
+                fn inspect(self: *@This()) !void {
+                    self.calls += 1;
+                    if (!self.owner.gate.mutex.tryLock()) return error.TestUnexpectedResult;
+                    defer self.owner.gate.mutex.unlock(shared.handleLockIo());
+                    var lease = try native.lockWriterPathWithIo(std.testing.allocator, shared.handleLockIo(), self.owner.path);
+                    defer lease.close();
+                    if (replace) {
+                        const previous = self.owner.current.?;
+                        {
+                            // Model a captured mutating runtime forcing refresh.
+                            // The independent proof must keep its borrowed owner
+                            // alive even after the mutating capture is released.
+                            previous.maintenance_references += 1;
+                            defer previous.maintenance_references -= 1;
+                            try std.testing.expect(try self.owner.refresh() != previous);
+                        }
+                        self.owner.collectRetired();
+                        try std.testing.expectEqual(@as(usize, 1), self.owner.retired.items.len);
+                    }
+                    if (!replace) {
+                        const file = &self.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+                        file.defer_allocator_verification = true;
+                        defer file.defer_allocator_verification = false;
+                        const current = self.owner.current.?;
+                        try file.putCatalogRecord("proof/local-append", "foreground progress");
+                        try std.testing.expect(try self.owner.refresh() == current);
+                        try std.testing.expect(!file.free_pages_verified);
+                    }
+                    if (cancel) self.owner.verification_cancel.request();
+                }
+            };
+            var probe: Probe = .{ .owner = owner };
+            owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
+            defer owner.test_after_allocator_capture = null;
+            if (cancel) {
+                try std.testing.expectError(error.MaintenanceCanceled, owner.maintenanceTurnForTest());
+            } else {
+                try std.testing.expect(try owner.maintenanceTurnForTest());
             }
-        };
-        var probe: Probe = .{ .owner = owner };
-        owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
-        defer owner.test_after_allocator_capture = null;
-        if (cancel) {
-            try std.testing.expectError(error.MaintenanceCanceled, owner.maintenanceTurnForTest());
-        } else {
-            try std.testing.expect(try owner.maintenanceTurnForTest());
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(shared.handleLockIo(), marker_path, .{}));
+            if (probe.failure) |err| return err;
+            try std.testing.expectEqual(@as(usize, 1), probe.calls);
+            // Completion must release the retired proof owner before another API call.
+            try std.testing.expectEqual(@as(usize, 0), owner.retired.items.len);
+            const guard = public.enterHandle(handle, .read).?;
+            defer guard.leave();
+            // A foreign reopen breaks lineage; locally authored appends preserve it.
+            if (!replace) try std.testing.expectEqual(!cancel, guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+            try std.testing.expectEqual(@as(usize, 0), guard.handle.maintenance_references);
+            try std.testing.expectEqual(@as(usize, 0), guard.handle.allocator_verification_references);
         }
-        if (probe.failure) |err| return err;
-        try std.testing.expectEqual(@as(usize, 1), probe.calls);
-        const guard = public.enterHandle(handle, .read).?;
-        defer guard.leave();
-        try std.testing.expectEqual(!cancel, guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
-        try std.testing.expectEqual(@as(usize, 0), guard.handle.maintenance_references);
     }
 }
 
@@ -5536,14 +5568,21 @@ test "capi SQL recovery stays clean across row writes reads and cursors" {
 test "capi SQL reclamation assessment and copy release the foreground gate" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
+    const native = @import("antfly_local_sources").storage_lite_native;
     const Store = @import("antfly_local_sources").storage_lite_docstore.Store;
     for ([_]bool{ false, true }) |independent| {
         for ([_]Store.MaintenancePhase{ .assessment, .copy, .verification }) |phase| {
-            if (phase == .verification and !independent) continue;
             const Gate = struct {
                 phase: Store.MaintenancePhase,
+                failure: ?anyerror = null,
                 started: std.Io.Event = .unset,
                 allowed: std.Io.Event = .unset,
+                fn allocatorCaptured(ptr: *anyopaque, _: *native.NativeFile) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    notify(ptr, .verification) catch |err| {
+                        self.failure = err;
+                    };
+                }
                 fn notify(ptr: *anyopaque, current: Store.MaintenancePhase) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (current != self.phase) return;
@@ -5595,13 +5634,16 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
                 store.maintenance_policy.options.assessment_bytes = 4096;
                 store.maintenance_policy.options.minimum_reclaim_bytes = 4096;
                 store.maintenance_policy.next_assessment_size = 0;
-                store.test_maintenance_hook = .{ .ptr = &gate, .notify = Gate.notify };
+                if (phase != .verification) store.test_maintenance_hook = .{ .ptr = &gate, .notify = Gate.notify };
                 if (phase == .verification) {
                     store.file.free_pages_verified = false;
                     guard.connection.?.owner.maintenance_pending = true;
+                    // Verification now runs at the owner capture boundary.
+                    guard.connection.?.owner.test_after_allocator_capture = .{ .ptr = &gate, .notify = Gate.allocatorCaptured };
                 }
                 break :blk guard.connection.?.owner;
             };
+            defer connection.test_after_allocator_capture = null;
             var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started };
             const before_capture = connection.current.?;
             const background = try std.Thread.spawn(.{}, @TypeOf(driver).run, .{&driver});
@@ -5642,6 +5684,7 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
             background.join();
             joined = true;
             try driver.result();
+            if (gate.failure) |err| return err;
             try std.testing.expect(completed);
             try std.testing.expectEqual(capi.ErrorCode.ok, foreground.status);
             const guard = public.enterHandle(handle, .exclusive).?;
@@ -6739,6 +6782,223 @@ test "capi native resolver maintenance retries transient inference and survives 
     if (stats.promotion.catch_up_required) std.debug.print("resolver reopen stats={f} publications={f}\n", .{ std.json.fmt(stats, .{}), std.json.fmt(owner.publication_stats, .{}) });
     try std.testing.expect(!stats.promotion.catch_up_required);
     try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
+}
+
+test "capi native bounded admission coalesces allocator proof outside publication gates" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-capacity-proof");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    var second: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &second));
+    defer antfly_db_close(second);
+    var limit: u64 = 0;
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const store = guard.handle.owned_lite_backend.?.native_docstore.?;
+        const file = &store.file;
+        try file.completeAllocatorVerification();
+        const large: [32768]u8 = @splat('v');
+        var keys: [32][32]u8 = undefined;
+        var batch: [32]lite_backend.native.CatalogMutation = undefined;
+        for (&batch, &keys, 0..) |*mutation, *key, i| mutation.* = .{ .key = try std.fmt.bufPrint(key, "test/free-{d}", .{i}), .value = &large };
+        try file.putCatalogBatch(&batch);
+        for (&batch) |*mutation| mutation.* = .{ .key = mutation.key, .is_delete = true };
+        try file.putCatalogBatch(&batch);
+        for (0..8) |_| _ = try file.reclaimPages(4096);
+        try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 64);
+        limit = (try file.file.stat(file.runtime())).size;
+        store.maintenance_policy.options.max_storage_bytes = limit;
+        file.max_file_bytes = limit;
+        file.free_pages_verified = false;
+        owner.maintenance_storage_pending = true;
+    }
+    const Probe = struct {
+        owner: @TypeOf(owner),
+        path: []const u8,
+        second: ?*anyopaque,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        worker: ?std.Thread = null,
+        worker_failure: ?anyerror = null,
+        waiting: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        fn write(self: *@This()) !void {
+            const guard = public.enterHandle(self.second, .exclusive).?;
+            defer guard.leave();
+            try std.testing.expect(guard.entry_error == null);
+            try std.testing.expect(guard.connection.?.owner == self.owner);
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = "second", .value = "{\"body\":\"waits for reader teardown\"}" }}, .sync_level = .write });
+        }
+        fn run(self: *@This()) void {
+            self.write() catch |err| {
+                self.worker_failure = err;
+            };
+            self.done.store(true, .release);
+        }
+        fn onWait(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waiting.store(true, .release);
+        }
+        fn check(self: *@This(), reader: *lite_backend.native.NativeFile) !void {
+            try std.testing.expect(self.owner.gate.mutex.tryLock());
+            self.owner.gate.mutex.unlock(shared.handleLockIo());
+            var lease = try lite_backend.native.lockWriterPathWithIo(a, shared.handleLockIo(), self.path);
+            lease.close();
+            // The worker yields to the admission proof instead of duplicating
+            // its graph walk or waiting for it while holding the owner gate.
+            for (0..2) |_| try std.testing.expect(try self.owner.maintenanceTurnForTest());
+            try std.testing.expect(!self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+            const cursor = self.owner.maintenance_table_cursor;
+            self.owner.maintenance_table_cursor = 1;
+            defer self.owner.maintenance_table_cursor = cursor;
+            try std.testing.expect(self.owner.maintenanceWaitMillisForTest(true) >= 100);
+            try std.testing.expectEqual(@as(usize, 1), self.calls);
+            // Reproduce the interval after publishing verification but before
+            // closing its reader. The second connection must still queue off
+            // the publication gates, rather than fail to reuse at the cap.
+            try reader.completeAllocatorVerification();
+            self.owner.gate.mutex.lockUncancelable(shared.handleLockIo());
+            {
+                defer self.owner.gate.mutex.unlock(shared.handleLockIo());
+                var publication = try lite_backend.native.lockWriterPathWithIo(a, shared.handleLockIo(), self.path);
+                defer publication.close();
+                try self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(reader);
+            }
+            self.worker = try std.Thread.spawn(.{}, run, .{self});
+            const io = shared.handleLockIo();
+            const deadline = std.Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s;
+            while (!self.waiting.load(.acquire) and !self.done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.CapacityWaitTimeout;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(self.waiting.load(.acquire));
+            try std.testing.expect(!self.done.load(.acquire));
+            try std.testing.expect(self.owner.gate.mutex.tryLock());
+            self.owner.gate.mutex.unlock(io);
+            var available = try lite_backend.native.lockWriterPathWithIo(a, io, self.path);
+            available.close();
+        }
+        fn notify(raw: *anyopaque, reader: *lite_backend.native.NativeFile) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.check(reader) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var probe = Probe{ .owner = owner, .path = path, .second = second };
+    defer if (probe.worker) |worker| worker.join();
+    owner.test_capacity_wait = .{ .ptr = &probe, .notify = Probe.onWait };
+    defer owner.test_capacity_wait = null;
+    owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_after_allocator_capture = null;
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+        try std.testing.expect(file.free_pages_verified);
+        const reused = (try file.allocatorStats()).?.reused_pages;
+        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"reuses capacity\"}" }}, .sync_level = .write });
+        try std.testing.expect((try file.allocatorStats()).?.reused_pages > reused);
+        try std.testing.expect((try file.file.stat(file.runtime())).size <= limit);
+        try std.testing.expect((try file.check()).valid);
+    }
+    if (probe.worker) |worker| {
+        worker.join();
+        probe.worker = null;
+    }
+    if (probe.failure) |err| return err;
+    if (probe.worker_failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    // Completion restores immediate progress between namespaces, rather than
+    // charging every table another wait quantum.
+    const cursor = owner.maintenance_table_cursor;
+    owner.maintenance_table_cursor = 1;
+    defer owner.maintenance_table_cursor = cursor;
+    try std.testing.expectEqual(@as(i64, 0), owner.maintenanceWaitMillisForTest(true));
+}
+
+test "capi native close certifies allocator before the next process opens sources" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-certified-reopen");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    for (0..3) |process| {
+        var handle: ?*anyopaque = null;
+        const result = if (process == 0) antfly_db_create_with_options(path, &options, &handle) else antfly_db_open_with_options(path, &options, &handle);
+        try std.testing.expectEqual(capi.ErrorCode.ok, result);
+        defer if (handle != null) antfly_db_close(handle);
+        const owner = blk: {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            break :blk guard.connection.?.owner;
+        };
+        owner.stopping.store(true, .release);
+        owner.wake.set(shared.handleLockIo());
+        owner.worker.?.join();
+        owner.worker = null;
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+            if (process == 0) try file.completeAllocatorVerification() else try std.testing.expect(file.free_pages_verified);
+            const reused = (try file.allocatorStats()).?.reused_pages;
+            const large: [32768]u8 = @splat('x');
+            for (0..12) |_| try file.putCatalogRecord("test/free-pool", &large);
+            try file.deleteCatalogRecord("test/free-pool");
+            _ = try file.reclaimPages(4096);
+            if (process != 0) try std.testing.expect((try file.allocatorStats()).?.reused_pages > reused);
+            try std.testing.expect((try file.check()).valid);
+            try std.testing.expect(file.free_pages_verified);
+        }
+        // Exercise the certificate with real managed SQL index sources too;
+        // opening their read leases must preserve inherited verification.
+        if (process == 0) try sqlFkRecoveryStatement(handle, "CREATE TABLE certified(n BIGINT PRIMARY KEY)");
+        var statement: [160]u8 = undefined;
+        try sqlFkRecoveryStatement(handle, try std.fmt.bufPrint(&statement, "INSERT INTO certified(_id,n) VALUES ('row-{d}',{d})", .{ process, process }));
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+            try std.testing.expect(file.free_pages_verified);
+            try std.testing.expect((try file.check()).valid);
+        }
+        antfly_db_close(handle);
+        handle = null;
+        var probe = try lite_backend.native.NativeFile.openWithIo(a, shared.handleLockIo(), path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        try std.testing.expect(try probe.inheritAllocatorCertificate());
+    }
 }
 
 test "capi native foreground reuses free pages during a captured worker turn" {

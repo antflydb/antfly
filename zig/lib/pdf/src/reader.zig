@@ -31950,7 +31950,11 @@ test "document PDF annotation coverage is bounded and prevents incomplete native
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
+    // Exercise ordinary allocator remaps, then enumerate failures with stable
+    // allocate/copy/free growth: SafeAllocator remapping depends on address
+    // layout and otherwise changes the allocation count between iterations.
+    try Case.check(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
 }
 
 test "document text bounds use transformed font metrics and leave unsupported geometry unknown" {
