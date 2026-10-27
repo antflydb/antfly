@@ -1402,22 +1402,22 @@ const Execution = struct {
         if (stored_fields.len != 0) {
             const started = @import("antfly_platform").time.monotonicNs();
             defer self.server.lake_query_metrics.record(.hydration_native, started);
-            var offset: usize = 0;
-            while (offset < values.len) {
-                try self.context.ensureActive();
-                const end = @min(values.len, offset + projection.Hydrator.batch_limit);
-                var docs: [projection.Hydrator.batch_limit]u32 = undefined;
-                var native_keys: [projection.Hydrator.batch_limit][]const u8 = undefined;
-                var scratch = std.heap.ArenaAllocator.init(a);
-                defer scratch.deinit();
-                for (offset..end, 0..) |position, i| {
-                    const hit = hits.at(position);
-                    docs[i] = hit.native_text_doc_id.?;
-                    native_keys[i] = try nativeKey(self, scratch.allocator(), hit.id);
+            const Rows = struct {
+                owner: *Execution,
+                hits: @import("lake_text_delivery.zig").Selection,
+                fn doc(raw: *anyopaque, i: usize) u32 {
+                    return @as(*@This(), @ptrCast(@alignCast(raw))).hits.at(i).native_text_doc_id.?;
                 }
-                try hydrator.appendBatch(a, pin.?.snapshot, docs[0 .. end - offset], native_keys[0 .. end - offset], stored_fields, values[offset..end]);
-                offset = end;
-            }
+                fn key(raw: *anyopaque, alloc: A, i: usize) ![]const u8 {
+                    const rows: *@This() = @ptrCast(@alignCast(raw));
+                    return nativeKey(rows.owner, alloc, rows.hits.at(i).id);
+                }
+                fn check(raw: *anyopaque) !void {
+                    try @as(*@This(), @ptrCast(@alignCast(raw))).owner.context.ensureActive();
+                }
+            };
+            var rows: Rows = .{ .owner = self, .hits = hits };
+            try hydrator.appendRows(a, pin.?.snapshot, .{ .ptr = &rows, .len = hits.len(), .document = Rows.doc, .key = Rows.key, .checkpoint = Rows.check }, stored_fields, values);
         }
         for (values, 0..) |*value, index| {
             const hit = hits.at(index);

@@ -91,9 +91,7 @@ pub fn acquireInterpretedBounded(comptime T: type, cached: artifacts.CachedRead,
 pub fn acquireRequiredInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize) !Owned(T) {
     return acquireInterpretedBoundedInner(T, cached, store, ref, cancellation, interpretation, arguments, load, limit, null, error.SqlMemoryLimitExceeded);
 }
-fn acquireInterpretedBoundedInner(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T, decline_error: ?anyerror) !Owned(T) {
-    try cached.context.ensureActive();
-    try cancellation.check();
+fn interpretedKey(comptime T: type, cached: artifacts.CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef, interpretation: []const u8, limit: ?usize) ![32]u8 {
     var key = try cacheKey(T, cached, ref);
     if (interpretation.len != 0) {
         var hash = std.crypto.hash.Blake3.init(.{});
@@ -101,14 +99,28 @@ fn acquireInterpretedBoundedInner(comptime T: type, cached: artifacts.CachedRead
         hash.update(interpretation);
         hash.final(&key);
     }
-    if (fallback != null or decline_error != null) {
+    if (limit) |bounded| {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update(&key);
         var encoded_limit: [8]u8 = undefined;
-        std.mem.writeInt(u64, &encoded_limit, limit, .little);
+        std.mem.writeInt(u64, &encoded_limit, bounded, .little);
         hash.update(&encoded_limit);
         hash.final(&key);
     }
+    return key;
+}
+pub fn residentRequiredInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, limit: usize) !bool {
+    try token.check();
+    try cached.context.ensureActive();
+    const held = cached.cache.decoded.lookup(try interpretedKey(T, cached, ref, interpretation, limit)) orelse return false;
+    defer held.release();
+    try cached.context.ensureActive();
+    return true;
+}
+fn acquireInterpretedBoundedInner(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T, decline_error: ?anyerror) !Owned(T) {
+    try cached.context.ensureActive();
+    try cancellation.check();
+    const key = try interpretedKey(T, cached, ref, interpretation, if (fallback != null or decline_error != null) limit else null);
     var loader = struct {
         store: stores.ArtifactStore,
         ref: local.serverless_manifest_artifact_ref.ArtifactRef,

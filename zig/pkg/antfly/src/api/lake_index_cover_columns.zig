@@ -21,6 +21,7 @@ const tree = @import("../serverless/graph_segment/page_tree.zig");
 const stores = @import("../serverless/artifacts/store.zig");
 const artifacts = @import("lake_index_aggregate_artifact.zig");
 const metadata = @import("lake_index_decoded_metadata.zig");
+const ranges = @import("lake_artifact_ranges.zig");
 const A = std.mem.Allocator;
 const Token = @import("antfly_cancellation").CancellationToken;
 const Block = local.sql_spill.ColumnarBlock;
@@ -150,9 +151,12 @@ pub const Loaded = struct {
     hashed: bool,
     leases: std.ArrayList(metadata.Owned(Block)) = .empty,
     directory: ?metadata.Owned(Directory) = null,
+    wires: std.ArrayList([]u8) = .empty,
     pub fn deinit(self: *@This()) void {
         for (self.leases.items) |owned| owned.release();
         self.leases.deinit(self.a);
+        for (self.wires.items) |bytes| local.sql_memory_budget.reclaimingAllocator(self.a).free(bytes);
+        self.wires.deinit(self.a);
         if (self.directory) |owned| owned.release();
         if (self.scratch_owner) |owner| {
             owner.deinit();
@@ -178,6 +182,9 @@ pub const Loaded = struct {
         if (!std.mem.eql(u8, &actual, &expected)) return error.InvalidNativeLakeRowIndex;
     }
 };
+fn interpretation(buffer: []u8, section: Section) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "cover-stripe-v1:{d}:{d}:{s}", .{ section.offset, section.bytes, std.fmt.bytesToHex(section.digest, .lower) });
+}
 /// The returned projected block uses SQL-null placeholders for omitted columns.
 /// Consumers must request every projection/predicate dependency before loading.
 pub fn load(backing: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns: []const usize, width: usize, token: Token, cached: ?artifacts.CachedRead, limit: usize, reads: *u64, prepared: ?Prepared) !Loaded {
@@ -243,43 +250,77 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
     var ordinals: []const u64 = &.{};
     var identity_keys: []const Column = &.{};
     var live: usize = if (result.directory) |owned| owned.lease.item.budget.live else 0;
-    for (directory.sections, 0..) |section, index| {
-        if (index != 0 and std.mem.indexOfScalar(usize, columns, index - 1) == null) continue;
-        try token.check();
-        try stores.chargeReadBudget(reads, section.bytes);
-        const Loader = struct {
-            fn decode(out: A, source: stores.ArtifactStore, reference: local.serverless_manifest_artifact_ref.ArtifactRef, cancel: Token, caching: ?artifacts.CachedRead, stripe: Section) !Block {
-                const bytes = try artifacts.readColumnRange(out, source, .{ .artifact_id = reference.artifact_id, .checksum = reference.checksum, .byte_len = reference.byte_len }, stripe.offset, stripe.bytes, stripe.digest, cancel, caching);
-                return local.sql_spill.decodeColumnarBlockInArena(out, bytes, artifacts.max_block_bytes);
+    var selected: std.ArrayList(usize) = .empty;
+    for (directory.sections, 0..) |_, index| {
+        if (index == 0 or std.mem.indexOfScalar(usize, columns, index - 1) != null) try selected.append(a, index);
+    }
+    const reference: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .ordered_row_index, .artifact_id = directory.pack.artifact_id, .checksum = directory.pack.checksum, .byte_len = directory.pack.byte_len };
+    const Charge = struct {
+        fn charge(raw: *anyopaque, bytes: u64) !void {
+            try stores.chargeReadBudget(@ptrCast(@alignCast(raw)), bytes);
+        }
+    };
+    var begin: usize = 0;
+    while (begin < selected.items.len) {
+        const end = @min(selected.items.len, begin + ranges.max_batch);
+        var units: [ranges.max_batch]ranges.Unit = undefined;
+        var cold: [ranges.max_batch]?usize = @splat(null);
+        var count: usize = 0;
+        var admitted: u64 = 0;
+        for (selected.items[begin..end], 0..) |index, position| {
+            const section = directory.sections[index];
+            try token.check();
+            try stores.chargeReadBudget(reads, section.bytes);
+            admitted += section.bytes;
+            if (cached) |cache| {
+                var buffer: [160]u8 = undefined;
+                if (try metadata.residentRequiredInterpretedBounded(Block, cache, reference, token, try interpretation(&buffer, section), limit)) continue;
             }
-        };
-        const reference: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .ordered_row_index, .artifact_id = directory.pack.artifact_id, .checksum = directory.pack.checksum, .byte_len = directory.pack.byte_len };
-        const block = if (cached) |cache| blk: {
-            var interpretation: [160]u8 = undefined;
-            const tag = try std.fmt.bufPrint(&interpretation, "cover-stripe-v1:{d}:{d}:{s}", .{ section.offset, section.bytes, std.fmt.bytesToHex(section.digest, .lower) });
-            const Adapter = struct {
-                fn decode(out: A, source: stores.ArtifactStore, reference_: local.serverless_manifest_artifact_ref.ArtifactRef, cancel: Token, caching: artifacts.CachedRead, stripe: Section) !Block {
-                    return Loader.decode(out, source, reference_, cancel, caching, stripe);
+            cold[position] = count;
+            units[count] = .{ .object = directory.pack, .offset = section.offset, .bytes = section.bytes, .digest = section.digest };
+            count += 1;
+        }
+        // Exact adjacency avoids reading omitted columns or charging gaps. Raw
+        // transport storage is reclaimed after this wave; cache units stay stripes.
+        var wire = try ranges.load(local.sql_memory_budget.reclaimingAllocator(a), store, units[0..count], token, cached, .{ .ptr = &admitted, .charge = Charge.charge }, .{ .max_range = artifacts.max_block_bytes });
+        defer wire.deinit();
+        for (selected.items[begin..end], 0..) |index, position| {
+            const section = directory.sections[index];
+            const bytes = if (cold[position]) |slot| wire.values[slot] else null;
+            const Loader = struct {
+                const Arguments = struct { stripe: Section, encoded: ?[]const u8 };
+                fn decode(out: A, source: stores.ArtifactStore, ref_: local.serverless_manifest_artifact_ref.ArtifactRef, cancel: Token, caching: artifacts.CachedRead, arguments: Arguments) !Block {
+                    const data = if (arguments.encoded) |encoded| try out.dupe(u8, encoded) else try artifacts.readColumnRange(out, source, .{ .artifact_id = ref_.artifact_id, .checksum = ref_.checksum, .byte_len = ref_.byte_len }, arguments.stripe.offset, arguments.stripe.bytes, arguments.stripe.digest, cancel, caching);
+                    return local.sql_spill.decodeColumnarBlockInArena(out, data, artifacts.max_block_bytes);
                 }
             };
-            const owned = try metadata.acquireRequiredInterpretedBounded(Block, cache, store, reference, token, tag, section, Adapter.decode, limit);
-            var transfer = false;
-            defer if (!transfer) owned.release();
-            live = std.math.add(usize, live, owned.lease.item.budget.live) catch return error.SqlMemoryLimitExceeded;
-            if (live > limit) return error.SqlMemoryLimitExceeded;
-            try result.leases.append(a, owned);
-            transfer = true;
-            break :blk owned.value.*;
-        } else try Loader.decode(a, store, reference, token, null, section);
-        if (block.count() != directory.rows) return error.InvalidNativeLakeRowIndex;
-        if (index == 0) {
-            if (block.values.len != 0 or block.keys.len != 2) return error.InvalidNativeLakeRowIndex;
-            ordinals = block.ordinals;
-            identity_keys = block.keys;
-        } else {
-            if (block.values.len != 1 or block.keys.len != 0 or !std.mem.eql(u64, block.ordinals, ordinals)) return error.InvalidNativeLakeRowIndex;
-            values[index - 1] = block.values[0];
+            const block = if (cached) |cache| blk: {
+                var buffer: [160]u8 = undefined;
+                const owned = try metadata.acquireRequiredInterpretedBounded(Block, cache, store, reference, token, try interpretation(&buffer, section), Loader.Arguments{ .stripe = section, .encoded = bytes }, Loader.decode, limit);
+                var transfer = false;
+                defer if (!transfer) owned.release();
+                live = std.math.add(usize, live, owned.lease.item.budget.live) catch return error.SqlMemoryLimitExceeded;
+                if (live > limit) return error.SqlMemoryLimitExceeded;
+                try result.leases.append(a, owned);
+                transfer = true;
+                break :blk owned.value.*;
+            } else blk: {
+                const slot = cold[position].?;
+                try result.wires.append(a, wire.values[slot].?);
+                wire.values[slot] = null;
+                break :blk try local.sql_spill.decodeColumnarBlockInArena(a, bytes.?, artifacts.max_block_bytes);
+            };
+            if (block.count() != directory.rows) return error.InvalidNativeLakeRowIndex;
+            if (index == 0) {
+                if (block.values.len != 0 or block.keys.len != 2) return error.InvalidNativeLakeRowIndex;
+                ordinals = block.ordinals;
+                identity_keys = block.keys;
+            } else {
+                if (block.values.len != 1 or block.keys.len != 0 or !std.mem.eql(u64, block.ordinals, ordinals)) return error.InvalidNativeLakeRowIndex;
+                values[index - 1] = block.values[0];
+            }
         }
+        begin = end;
     }
     result.block = .{ .values = values, .keys = identity_keys, .ordinals = ordinals };
     return result;
@@ -312,6 +353,23 @@ test "external lake bounded window profiles covering stripes prune wide columns 
     var writes: u64 = 0;
     const ref = try publish(a, store, scope, &rows, .none, &writes);
     defer a.free(ref.artifact_id);
+    const Probe = struct {
+        var active: *@This() = undefined;
+        original: *const stores.ArtifactStore.VTable,
+        calls: usize = 0,
+        max_length: usize = 0,
+        fn get(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, cancel: Token) ![]u8 {
+            const self = active;
+            self.calls += 1;
+            self.max_length = @max(self.max_length, length);
+            return if (self.original.get_range_alloc_with_cancellation) |read| read(raw, alloc, id, offset, length, cancel) else self.original.get_range_alloc(raw, alloc, id, offset, length);
+        }
+    };
+    var probe: Probe = .{ .original = store.vtable };
+    Probe.active = &probe;
+    var traced = store.vtable.*;
+    traced.get_range_alloc_with_cancellation = Probe.get;
+    store.vtable = &traced;
     const Load = struct {
         fn run(backing: A, backend: stores.ArtifactStore, reference: Ref) !void {
             var reads: u64 = 64 * 1024;
@@ -331,6 +389,27 @@ test "external lake bounded window profiles covering stripes prune wide columns 
         }
     };
     try Load.run(a, store, ref);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(probe.max_length < 16 * 1024);
+    std.debug.print("COVER_RANGE requests_before=3 requests_after={d} selected_max_range={d}\n", .{ probe.calls, probe.max_length });
+    {
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        cache.max_entries = 0;
+        cache.physical.max_entries = 0;
+        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(9), .context = .{ .io = std.testing.io } };
+        var allowance: u64 = 64 * 1024;
+        var first = try load(a, store, ref, true, &.{ 0, 1 }, 3, .none, cached, 256 * 1024, &allowance, null);
+        first.deinit();
+        try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+        try std.testing.expectEqual(@as(usize, 0), cache.physical.entries.count());
+        const before = probe.calls;
+        var second = try load(a, store, ref, true, &.{ 0, 1 }, 3, .none, cached, 256 * 1024, &allowance, null);
+        defer second.deinit();
+        try std.testing.expectEqual(before, probe.calls);
+        try std.testing.expectEqual(@as(i64, 9007199254740993), (try second.block.cell(0, 1)).value.integer);
+        std.debug.print("COVER_RANGE decoded_warm_raw_cache_empty_requests=0\n", .{});
+    }
     try std.testing.checkAllAllocationFailures(a, Load.run, .{ store, ref });
     var reads: u64 = 4 * 1024 * 1024;
     if (load(a, store, ref, true, &.{ 0, 1, 2 }, 3, .none, null, 256 * 1024, &reads, null)) |value| {
