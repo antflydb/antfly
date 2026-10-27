@@ -627,6 +627,26 @@ pub const EmbeddingPipeline = struct {
             self.last_input_tokens +|= result.input_tokens;
             return result.vector;
         };
+        if (self.session.backend() == .cuda and input.content.len == 1 and input.content[0] == .text) {
+            // Flat mixed batches also pass their text rows through this
+            // dispatcher. Keep their prefix and length-bounded text admission.
+            const vectors = try self.embedUnscoped(&.{input.content[0].text});
+            defer allocator.free(vectors);
+            return vectors[0];
+        }
+        if (self.session.backend() == .cuda and input.content.len == 1 and input.content[0] == .audio) {
+            const clip = input.content[0].audio;
+            const grouped = @import("embedding_gemma2.zig");
+            // Pure audio, like pure image, has no task prefix.
+            const result = grouped.embed(allocator, self.session, self.tok, .{
+                .content = &.{.{ .audio = clip.bytes }},
+            }, .{ .max_tokens = self.config.max_length, .audio_decode_options = clip.decode_options, .max_audio_decode_working_bytes = self.config.max_audio_decode_working_bytes }, self.execution_lock, self.execution_control) catch |err| return switch (err) {
+                error.EmbeddingInputTooLong => error.EmbeddingSequenceTooLong,
+                else => err,
+            };
+            self.last_input_tokens +|= result.input_tokens;
+            return result.vector;
+        }
         if (self.config.resident_image_handoff and self.session.backend() == .cuda and
             input.content.len == 1 and input.content[0] == .image)
         {
@@ -5037,4 +5057,61 @@ test "embedding cohorts let a query run before the bulk call finishes" {
     try std.testing.expectEqualSlices(usize, &.{ 4, 1, 4, 1 }, &probe.batches);
     for (rows, 1..) |row, i| try std.testing.expectEqual(@as(f32, @floatFromInt(i)), row[0]);
     try std.testing.expectEqual(@as(usize, 9), pipeline.last_input_tokens);
+}
+
+test "embeddinggemma2 CUDA flat audio and mixed batch dispatch fit production admission" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const model = @import("antfly_platform").env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const tokenizer_path = try std.fs.path.join(a, &.{ model, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const tokenizer_bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);
+    defer a.free(tokenizer_bytes);
+    const hf = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer hf.deinitSelf();
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var session = try session_factory.createCudaSession(a, model);
+    defer session.close();
+    const MiB = 1024 * 1024;
+    const limits = memory.Limits{ .host_limit_bytes = 1536 * MiB, .backend_limit_bytes = 4608 * MiB, .combined_limit_bytes = 6144 * MiB, .scratch_limit_bytes = 768 * MiB };
+    var weights = try controller.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 3195 * MiB }, false);
+    defer weights.release();
+    session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 512 * MiB, .model_profile = .{ .hidden_size = 512, .embedding_gemma2_cuda = true }, .check_live_memory = false };
+    var pipeline = EmbeddingPipeline.init(a, session, hf.tokenizer(), .{
+        .resident_embedding_gemma2 = true,
+        .max_length = 8192,
+        .strict_max_length = true,
+        .trim_padding_to_batch_max = true,
+        .text_prefix = try @import("../architectures/embedding_gemma2.zig").taskPrefix("CLUSTERING"),
+    });
+    // This offline GPU test deliberately runs without a serving supervisor.
+    pipeline.execution_control = .{ .native_call_policy = .in_process };
+    const samples: [16000]f32 = @splat(0.25);
+    const wav = try audio.wav.encodeMono(a, &samples, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    defer a.free(wav);
+    const text = "Group this short audio clip.";
+    const expected_text = try pipeline.embed(&.{text});
+    defer freeEmbeddingSlices(a, expected_text);
+    const expected_audio = try @import("embedding_gemma2.zig").embed(a, session, hf.tokenizer(), .{ .content = &.{.{ .audio = wav }} }, .{}, null, pipeline.execution_control);
+    defer a.free(expected_audio.vector);
+
+    // Exercise the public flat-audio entrypoint, not just its budget helper.
+    const flat = try pipeline.embedEncodedAudio(&.{.{ .bytes = wav, .decode_options = .{ .mime_hint = "audio/wav" } }});
+    defer freeEmbeddingSlices(a, flat);
+    try std.testing.expectEqual(@as(usize, 1), flat.len);
+    try std.testing.expectEqual(@as(usize, 768), flat[0].len);
+    for (expected_audio.vector, flat[0]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+
+    // Flat mixed HTTP inputs reach embedContent with one part per row. Both
+    // the text row and audio row must avoid the legacy 1536 MiB reservation.
+    const mixed = try pipeline.embedContent(&.{ .{ .content = &.{.{ .text = text }} }, .{ .content = &.{.{ .audio = .{ .bytes = wav, .decode_options = .{ .mime_hint = "audio/wav" } } }} } });
+    defer freeEmbeddingSlices(a, mixed);
+    try std.testing.expectEqual(@as(usize, 2), mixed.len);
+    for ([_][]const f32{ expected_text[0], expected_audio.vector }, mixed) |expected, actual| {
+        try std.testing.expectEqual(@as(usize, 768), actual.len);
+        for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
+    }
+    try std.testing.expect(pipeline.last_input_tokens > expected_audio.input_tokens);
 }
