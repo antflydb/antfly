@@ -523,6 +523,8 @@ def run(args, model, label, mode, concurrency, output):
                 "ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PARALLEL_PREFIX",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_PREFIX",
+                "ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY",
+                "ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PREFIX_SHARED_QK",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_STATE_POOL",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_SHARED_RECURRENT_WEIGHTS",
@@ -627,6 +629,24 @@ def run(args, model, label, mode, concurrency, output):
                 prior_snapshots = re.findall(snapshot_pattern, pieces[0])
                 previous_snapshots = int(prior_snapshots[-1]) if prior_snapshots else 0
                 for sample, section in zip(result["policy_rounds"], sections):
+                    replay_rows = [
+                        int(v)
+                        for v in re.findall(
+                            r"LIGHTONOCR3 cuda_model_graph_first_replay_rows=(\d+)",
+                            section,
+                        )
+                    ]
+                    sample["model_graph_replay_cohort_rows"] = sorted(set(replay_rows))
+                    sample["model_graph_first_replay_events"] = len(replay_rows)
+                    sample["model_graph_max_replay_rows"] = max(replay_rows, default=0)
+                    if args.require_lighton_model_graph and not replay_rows:
+                        result["status"] = "missing_timed_model_graph_replay"
+                    if (
+                        args.require_lighton_model_graph
+                        and args.physical128
+                        and max(replay_rows, default=0) <= 64
+                    ):
+                        result["status"] = "missing_timed_wide_model_graph_replay"
                     sample["vision_batch_sizes"] = sorted(
                         {
                             int(v)
@@ -696,7 +716,11 @@ def run(args, model, label, mode, concurrency, output):
                         or sample["packed_max_query_rows"] > 4096
                     ):
                         result["status"] = "missing_timed_wide_packed_prefill"
-                    if args.require_physical128 and sample["packed_max_items"] <= 64:
+                    sample["physical_max_items"] = max(
+                        sample["packed_max_items"],
+                        sample["model_graph_max_replay_rows"],
+                    )
+                    if args.require_physical128 and sample["physical_max_items"] <= 64:
                         result["status"] = "missing_timed_physical128_steps"
                     sample["packed_input_frames"] = sum(
                         int(value)
@@ -707,6 +731,8 @@ def run(args, model, label, mode, concurrency, output):
                     for counter in [
                         "packed_gpu_decode_rows",
                         "packed_cpu_logit_rows",
+                        "packed_gpu_prefill_rows",
+                        "packed_skipped_prefix_heads",
                         "packed_standalone_wide_heads",
                     ]:
                         sample[counter] = sum(
@@ -764,6 +790,9 @@ def run(args, model, label, mode, concurrency, output):
                         sum(starts for starts, _, _ in chunk_progress)
                         if chunk_progress
                         else sample["packed_prefill_chunks"]
+                    )
+                    sample["prepared_prefill_chunk_rows_observed"] = sorted(
+                        {rows for _, _, rows in chunk_progress}
                     )
                     sample["prepared_prefill_chunk_rows"] = (
                         args.prepared_prefill_chunk_rows
@@ -957,6 +986,33 @@ def run(args, model, label, mode, concurrency, output):
                         result["status"] = "missing_timed_phase_parking"
                     if args.executor_tail and not sample["executor_tail_steps"]:
                         result["status"] = "missing_timed_executor_tail"
+                    cuda_bursts = [
+                        (int(rows), int(steps))
+                        for rows, steps in re.findall(
+                            r"LIGHTONOCR3 cuda_token_burst_rows=(\d+) steps=(\d+)",
+                            section,
+                        )
+                    ]
+                    sample["cuda_token_burst_cohort_rows"] = sorted(
+                        {rows for rows, _ in cuda_bursts}
+                    )
+                    sample["cuda_token_burst_widths"] = sorted(
+                        {steps for _, steps in cuda_bursts}
+                    )
+                    if args.require_cuda_token_burst:
+                        if not cuda_bursts:
+                            result["status"] = "missing_timed_cuda_token_burst"
+                        elif args.physical128 and not any(
+                            rows > 64 for rows, _ in cuda_bursts
+                        ):
+                            result["status"] = "missing_timed_wide_cuda_token_burst"
+                        elif (
+                            max(steps for _, steps in cuda_bursts)
+                            < args.gpu_token_burst_width
+                        ):
+                            result["status"] = (
+                                "missing_timed_requested_cuda_burst_width"
+                            )
                     sample["packed_core_rows_observed"] = sorted(
                         {
                             int(row)
@@ -1267,6 +1323,16 @@ def run(args, model, label, mode, concurrency, output):
                 args.require_cuda_token_burst,
             ),
             (
+                "cuda_model_graph_replays",
+                "lighton_model_graph",
+                args.require_lighton_model_graph,
+            ),
+            (
+                "cuda_bf16_recurrent_prefill_calls",
+                "lighton_bf16_recurrent_prefill",
+                args.require_lighton_bf16_recurrent_prefill,
+            ),
+            (
                 "cuda_bf16_prefill_ffn_calls",
                 "lighton_bf16_prefill_ffn",
                 args.require_lighton_bf16_prefill_ffn,
@@ -1404,6 +1470,16 @@ def run(args, model, label, mode, concurrency, output):
                 int(groups) * ((int(prefill) + int(decode) + 63) // 64)
                 for (prefill, decode, _), (groups, _) in zip(claims, callbacks)
             )
+            # Graph replay skips host recording counters. Warm/learn/capture
+            # records carry their independently checked two-step packet count.
+            graph_recorded_packets = sum(
+                int(v)
+                for v in re.findall(
+                    r"LIGHTONOCR3 cuda_model_graph_recorded_ragged_packets=(\d+)", text
+                )
+            )
+            expected_packets += graph_recorded_packets
+            result["cuda_graph_recorded_ragged_packets"] = graph_recorded_packets
             actual_packets = result["lighton_ragged_recurrent_calls"]
             result["cuda_ragged_expected_packets"] = expected_packets
             result["cuda_ragged_observed_packets"] = actual_packets
@@ -1442,6 +1518,10 @@ def run(args, model, label, mode, concurrency, output):
         result["ocr_pinned_input_wraps"] = sum(int(w) for _, w in pinned_inputs)
         if args.require_ocr_pinned_inputs and not result["ocr_pinned_input_uploads"]:
             result["status"] = "missing_ocr_pinned_inputs"
+        result["cuda_vision_position_calls"] = sum(
+            int(n)
+            for n in re.findall(r"LIGHTONOCR3 cuda_vision_position_calls=(\d+)", text)
+        )
         metadata = re.findall(
             r"OCR_CUDA pinned_metadata_uploads=(\d+) mrope_cache_hits=(\d+) mrope_cache_uploads=(\d+)",
             text,
@@ -1913,6 +1993,8 @@ def main():
     )
     parser.add_argument("--require-lighton-fused-vision-mlp", action="store_true")
     parser.add_argument("--require-lighton-bf16-prefill-ffn", action="store_true")
+    parser.add_argument("--require-lighton-bf16-recurrent-prefill", action="store_true")
+    parser.add_argument("--require-lighton-model-graph", action="store_true")
     parser.add_argument("--require-wide-packed-prefill", action="store_true")
     parser.add_argument("--require-lighton-norm-weight-cache", action="store_true")
     parser.add_argument("--require-florence-bart-ffn", action="store_true")
@@ -2380,6 +2462,13 @@ def main():
         "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
         "results": [],
     }
+    prefill_library = os.environ.get("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY")
+    if prefill_library:
+        report["bf16_recurrent_prefill_library"] = {
+            "path": str(Path(prefill_library).resolve()),
+            "sha256": digest(Path(prefill_library)),
+            "precision": "BF16 recurrent prefill operands/output; F32 state and decode",
+        }
     if build is not None:
         report["worktree_runtime_commit"] = report["runtime_commit"]
         report["worktree_runtime_source_diff_sha256"] = report[
