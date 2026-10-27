@@ -34393,7 +34393,7 @@ test "LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves s
                     }
                     // Every dependent embedding ran without downloading IDs.
                     try std.testing.expectEqual(before, compute.stats.d2h_bytes);
-                    var got: [8 * 64]u32 = undefined;
+                    var got: [8 * 128]u32 = undefined;
                     try std.testing.expectError(error.InvalidShape, burst.read(got[0..0]));
                     try burst.read(got[0 .. steps * rows]);
                     try std.testing.expectEqual(syncs + 1, compute.stats.download_syncs);
