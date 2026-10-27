@@ -1205,3 +1205,9 @@ The independent final evaluator streams and verifies the eight completed
 journals' canonical execution paths, exact lengths and SHA-256 digests. Missing,
 changed, duplicate or substituted artifacts fail closed. Journal finalization and
 verification use bounded chunks and a 256 MiB per-stream size ceiling.
+
+
+A native deadline/cancellation can leave non-cancelable binding I/O beyond the
+journal's observation window. Qualification conservatively rejects a population
+with either native failure code, even if an HTTP retry succeeds. It never infers
+a safe late settlement merely because the tail capture has ended.

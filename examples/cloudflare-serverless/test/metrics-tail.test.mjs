@@ -39,6 +39,7 @@ test('live diagnostic coverage preserves connection gaps and requires all eight 
  assert.equal(coverage.report().passed,true);coverage.lost('baseline','reader');coverage.connected('baseline','reader');assert.equal(coverage.report().passed,false);
  const cpu=new DiagnosticCoverage([{id:'baseline'},{id:'candidate'}]);for(const run of['baseline','candidate'])for(const role of['app','writer','reader','builder'])cpu.connected(run,role);cpu.observe('candidate','builder',{outcome:'exceededCpu'});assert.equal(cpu.report().passed,false);
  const truncated=sanitizeTailEvent({outcome:'ok',logs:Array.from({length:257},(_,i)=>({message:[i===256?'SQLITE_NOMEM':'ordinary output']}))});assert.equal(truncated.truncated,true);const lost=new DiagnosticCoverage([{id:'baseline'},{id:'candidate'}]);for(const run of['baseline','candidate'])for(const role of['app','writer','reader','builder'])lost.connected(run,role);lost.observe('candidate','app',truncated);assert.equal(lost.report().passed,false);
+ const pending=new DiagnosticCoverage([{id:'baseline'},{id:'candidate'}]);for(const run of['baseline','candidate'])for(const role of['app','writer','reader','builder'])pending.connected(run,role);pending.observe('candidate','writer',{logs:[{message:[JSON.stringify({event:'antfly.coordinator',failure_code:'DeadlineExceeded'})]}]});assert.equal(pending.report().passed,false);
 });
 
 test('completed live diagnostic evidence rejects altered missing or substituted journals',async()=>{
