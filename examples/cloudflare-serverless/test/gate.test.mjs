@@ -223,6 +223,17 @@ test('cold attempts never retry transport or backpressure and warm recovery reta
  let calls=0;const warm=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async()=>++calls===1?Response.json({error:'SQLITE_NOMEM'},{status:503}):Response.json({count:'512'},{headers:{'X-Antfly-Version':version}})});assert.equal((await warm.call('a',{op:'count'},'read')).sample.attempts,2);assert.equal(warm.resourceErrors.length,1);
 });
 
+test('constructor reset replay preserves stable warm identities and excludes cold or unsafe requests',async()=>{
+ const version='01234567-0123-4567-89ab-0123456789ab',error='A call to blockConcurrencyWhile() in a Durable Object waited for too long. The call was canceled and the Durable Object was reset.';
+ for(const input of [{op:'count'},{op:'mutate',operation_id:'same-committed-receipt',mutations:[]}]){
+  const bodies=[],client=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async(url,request)=>{bodies.push(request.body);return bodies.length===1?Response.json({error},{status:409}):Response.json({committed:true,visibility:'receipt-0000000000000001'},{headers:{'X-Antfly-Version':version}});}});
+  const {sample,value}=await client.call('a',input,'read',{scheduled:Date.now()-40});assert.equal(sample.attempts,2);assert.ok(sample.ms>=280);assert.deepEqual(bodies,[JSON.stringify(input),JSON.stringify(input)]);assert.equal(value.visibility,'receipt-0000000000000001');assert.equal(client.errors.length,0);assert.equal(client.report().transport_policy.constructor_reset_replay,'idempotent-warm-only');
+ }
+ for(const [input,phase,message]of [[{op:'count'},'cold',error],[{op:'mutate'},'write',error],[{op:'compact'},'compact',error],[{op:'count'},'read','unknown constructor failure'],[{op:'count'},'read',error+' OutOfMemory']]){
+  let calls=0;const client=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async()=>{calls++;return Response.json({error:message},{status:409});}});await assert.rejects(client.call('a',input,phase),/HTTP 409/);assert.equal(calls,1);assert.equal(client.errors.length,1);assert.equal(client.resourceErrors.length,message.includes('OutOfMemory')?1:0);
+ }
+});
+
 
 test('Queue metrics overload uses bounded logical retries while unknown failures remain fatal',async()=>{
  const{qualificationQueueMetrics}=await import('../qualification/physical-epochs.mjs');let calls=0;

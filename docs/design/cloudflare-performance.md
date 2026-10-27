@@ -1076,3 +1076,21 @@ no request handles or credentials are retained. Numeric metrics expose each
 partition's charged bytes. A deterministic churn test retains the data hit while
 bounding both partitions; another test prevents cross-bucket manifest reuse.
 These are bounded cache properties, not a claimed live latency pass.
+
+## Warm observer proof overlap
+
+The app's local observer still authenticates current committed metadata for
+every admission. A previously authenticated cursor identifies the checkpoint,
+its epoch seal and its next tail slot. Their GETs now start together, using the
+existing bounded proof prefetch before unowned recovery follows the result.
+Native recovery chooses the checkpoint/epoch and validates the contiguous log;
+speculative responses cannot override it. A newer checkpoint can make the old
+epoch reads unused. Their two operations and 32 KiB reservation stay charged
+to the same request budget, and all results are discarded after that admission.
+No mutable result or negative observation enters the shared immutable cache.
+
+A suspended-checkpoint fixture checks that the seal and tail requests begin
+before checkpoint completion. It then commits a new value after the prior
+negative probes, advances the checkpoint, replaces the owner and checks each
+fresh observed value. This removes a serialized storage wave on warm observers;
+the live gate must establish the end-to-end benefit.

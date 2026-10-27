@@ -18,7 +18,8 @@ import{assertGateRun}from'./gate-scope.mjs';
 import{verifySealedRun}from'./gate-provenance.mjs';
 import {readFile} from 'node:fs/promises';
 // Keep connections across the fixed 30-second arrivals, identically for both sides.
-const transportPolicy=Object.freeze({keep_alive_ms:60000,max_connections:128});
+const transportPolicy=Object.freeze({keep_alive_ms:60000,max_connections:128,constructor_reset_replay:'idempotent-warm-only'});
+const constructorReset='A call to blockConcurrencyWhile() in a Durable Object waited for too long. The call was canceled and the Durable Object was reset.';
 const dispatcher=new Agent({connections:transportPolicy.max_connections,keepAliveTimeout:transportPolicy.keep_alive_ms,keepAliveMaxTimeout:transportPolicy.keep_alive_ms});
 const pooledFetch=(url,options)=>globalThis.fetch(url,{...options,dispatcher});
 // Replaying an acknowledged setup is safe only before any workload mutation.
@@ -48,7 +49,7 @@ export class GateClient {
    let response,body;try{transportAttempts++;response=await this.fetch(new URL(path,this.run.origin),{method:'POST',headers:{Authorization:'Bearer '+this.token,'Content-Type':'application/json','X-Antfly-Tenant':tenant,'X-Antfly-Physical-Epoch':String(epoch)},body:JSON.stringify(input),signal:AbortSignal.any([this.abortController.signal,AbortSignal.timeout(Math.max(1,Math.min(35000,scheduled+60000-Date.now())))])});
    body=await response.text();}catch(error){lastTransportError=error;if(!this.abortController.signal.aborted&&phase!=="cold"&&idempotent&&networkFailure(error)){await new Promise(r=>setTimeout(r,250));continue;}throw error;}let value;try{value=JSON.parse(body);}catch{throw Error('non-JSON response: '+response.status);}
    last=value;if(/OutOfMemory|SQLITE_NOMEM|MemoryLimitExceeded/.test(value.error??''))this.resourceErrors.push({phase,error:value.error});
-   if(phase!=="cold"&&(response.status===503||response.status===409&&/WorkLeaseLost|WalCommitContended|PublicationConflict|PreconditionFailed/.test(value.error??''))){await new Promise(r=>setTimeout(r,250));continue;}
+   if(phase!=="cold"&&(response.status===503||response.status===409&&(/WorkLeaseLost|WalCommitContended|PublicationConflict|PreconditionFailed/.test(value.error??'')||idempotent&&value.error===constructorReset))){await new Promise(r=>setTimeout(r,250));continue;}
    if(!response.ok)throw Error('HTTP '+response.status+': '+(value.error??'unknown'));
    const version=response.headers.get('X-Antfly-Version');if(version!==this.run.version)throw Error('mixed version: '+version);
    const finished=Date.now(),sample={tenant,phase,op:input.op??path,ms:finished-scheduled,scheduled_at:scheduled,started_at:started,finished_at:finished,scheduling_delay_ms:Math.max(0,started-scheduled),execution_ms:finished-started,attempts:transportAttempts,version,epoch};this.samples.push(sample);return{value,sample};

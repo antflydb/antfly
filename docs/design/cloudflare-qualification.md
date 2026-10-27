@@ -1681,10 +1681,10 @@ The merged lake targets pass 236 tests with one skipped. A refreshed 50,000-
 document workload completes ingestion/publication, cold scalar/vector/sparse
 reads, warm reads, updates, deletion and compaction on the rebuilt module. Its
 sampled peak linear memory is 27,525,120 bytes and working memory 11,788,282 bytes.
-That first scale run uses the non-inline WAL profile; a separately named run
-validates the deployment's inline profile. The inline-WAL 1,000-document reindex
-workload also completes. These are local capacity checks, not live latency or
-whole-isolate memory measurements.
+Both non-inline and deployment-matching inline WAL profiles complete all nine
+stages with those sampled peaks. The inline-WAL 1,000-document reindex workload
+also completes all ten stages. These are local capacity checks, not live latency
+or whole-isolate memory measurements.
 
 Latest main was subsequently merged through `9ace47d363` in `583fe1863b`. The
 new macOS precision probe passes; the Worker and serverless runtime source is
@@ -1695,3 +1695,23 @@ control-2 DLQ jobs were replayed with their original bodies/identities before
 exact-lease acknowledgement; a subsequent empty pull was recorded and its
 temporary consumer removed. The new live trials must finish independently
 before any gate result can be claimed.
+
+The rebuilt candidate's first full pair-3 comparison was stopped after a
+recorded control write returned HTTP 409: Cloudflare reset its Durable Object
+when `blockConcurrencyWhile()` exceeded the platform limit. The original report
+was archived before interruption annotation; the candidate had no final request
+or resource errors at that checkpoint. No cold epoch ran. This remains failed
+evidence, including all observed startup and retry latency.
+
+The shared driver now recognizes only that exact constructor-reset response as
+recoverable for warm read-only operations and mutations with a stable operation
+ID. It reuses the original input within the unchanged twenty-attempt/sixty-second
+budget, and records all elapsed time and actual attempts. Cold requests,
+identity-free mutations, compaction, unknown errors and reset messages carrying
+resource errors remain fatal. This changes neither control native artifacts nor
+its initialization, algorithms, limits or gate thresholds. Regression cases
+cover replayed receipts, unsafe and cold exclusions, unknown errors and retained
+resource failures. Candidate warm observers also overlap their initial proof
+reads; those changes require a new sealed candidate and independent live run.
+The updated candidate and driver pass 228 Node checks and 15 persisted Worker
+checks. Native modules are unchanged from the merged-source scale runs.

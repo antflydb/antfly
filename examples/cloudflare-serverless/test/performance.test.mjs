@@ -494,6 +494,19 @@ test("warm unowned observations prefetch authenticated tails across owner and ep
  const replacement=new R2CoordinatorStore(module,bucket,'warm-observer-tail',{clock:()=>now});await replacement.transaction(tx=>tx.put('value',81));assert.equal(await observer.readOnly(tx=>tx.get('value')),81);await assert.rejects(writer.readOnly(tx=>tx.get('value')),/ImmutableLogFenced/);
 });
 
+test('warm unowned proof reads overlap checkpoint and tail without reusing negative results',async()=>{
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket});let now=Date.now(),hold=false,release,started;
+ const writer=new R2CoordinatorStore(module,bucket,'parallel-observer-proof',{clock:()=>now});await writer.transaction(tx=>tx.put('value',1));
+ const starts=[],held=new Promise(r=>release=r),entered=new Promise(r=>started=r);
+ const observer=new R2CoordinatorStore(module,bucket,'parallel-observer-proof',{clock:()=>now,transport:async(request,body)=>{if(request.op!=='get')throw Error('observer wrote');starts.push(request.key);if(hold&&request.key.endsWith('/CHECKPOINT')){started();await held;}return raw(request,body);}});
+ assert.equal(await observer.readOnly(tx=>tx.get('value')),1);starts.length=0;hold=true;
+ const reading=observer.readOnly(tx=>tx.get('value'));await entered;await new Promise(r=>setTimeout(r,0));
+ try{assert.ok(starts.some(k=>k.endsWith('/SEALED')),'seal probe must start before checkpoint completes');assert.ok(starts.some(k=>/\/[0-9]{20}\.json$/.test(k)),'tail probe must start before checkpoint completes');}finally{hold=false;release();}
+ assert.equal(await reading,1);await writer.transaction(tx=>tx.put('value',2));assert.equal(await observer.readOnly(tx=>tx.get('value')),2,'negative probes must not survive another request');
+ now+=1001;await writer.checkpointHint();assert.equal(await observer.readOnly(tx=>tx.get('value')),2,'advanced checkpoint remains authoritative');
+ const replacement=new R2CoordinatorStore(module,bucket,'parallel-observer-proof',{clock:()=>now});await replacement.transaction(tx=>tx.put('value',3));assert.equal(await observer.readOnly(tx=>tx.get('value')),3,'native recovery follows a replaced owner');assert.equal(observer.acquired,false);
+});
+
 test("point reads keep stable bounded placement across app isolate restarts",async()=>{
  const{readerSlot}=await import('../runtime-routing.mjs');for(const slots of[1,2,3,4]){const seen=new Set();for(let i=0;i<512;i++){const input={op:'lookup',doc_id:'gate/'+i},slot=readerSlot(input,slots,i);assert.ok(slot>=0&&slot<slots);assert.equal(readerSlot(input,slots,0),slot);assert.equal(readerSlot(input,slots,123456),slot);seen.add(slot);}assert.equal(seen.size,slots);}
  for(let i=0;i<512;i+=2)assert.notEqual(readerSlot({op:'lookup',doc_id:'gate/'+i},2),readerSlot({op:'lookup',doc_id:'gate/'+(i+1)},2));assert.equal(readerSlot({op:'count'},2,3),1);assert.equal(readerSlot({op:'lookup',doc_id:'😀/é'},4),readerSlot({op:'lookup',doc_id:'😀/é'},4,9));

@@ -132,17 +132,21 @@ export class R2CoordinatorStore {
     const cached=this.cache.wrap(this.remoteCache(instrumentTransport(this.rawTransport,physical),{budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}}),`coordinator/${this.namespace}`);
     const raw=(request,body)=>{onAdmission?.();return cached(request,body);};
     const guarded=async(request,body)=>{if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");return raw(request,body);};
-    let transport;
-    if(owned&&captured&&this.base){
+    let transport,proofTransport=guarded;
+    if(captured&&this.base){
       const epoch=hex(captured.epoch),keys=[this.base+"/CHECKPOINT",`${this.base}/epochs/${epoch}/SEALED`,`${this.base}/epochs/${epoch}/${String(captured.next).padStart(20,"0")}.json`];let prefetched;
       reserve(2,32768);
-      transport=async(request,body)=>{
+      proofTransport=async(request,body)=>{
         if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");
         if(request.key===keys[0]&&!prefetched){const results=await Promise.all(keys.map(key=>raw({...request,key,max_response_bytes:16384},new Uint8Array()).then(value=>({value}),error=>({error}))));prefetched=new Map(keys.map((key,i)=>[key,results[i]]));}
         if(prefetched?.has(request.key)){const result=prefetched.get(request.key);prefetched.delete(request.key);if(result.error)throw result.error;return result.value;}
         return raw(request,body);
       };
-    }else transport=recoveryReadAhead(guarded,{window:this.recoveryWindow||1,initialWindow:1,reserve,cursor:captured,followSeals:!owned});
+    }
+    // An authenticated warm cursor identifies the three initial proof keys.
+    // Fetch them in one wave; native recovery still selects and validates the
+    // checkpoint/epoch, and unused speculation remains charged to this call.
+    transport=owned&&captured&&this.base?proofTransport:recoveryReadAhead(proofTransport,{window:this.recoveryWindow||1,initialWindow:1,reserve,cursor:captured,followSeals:!owned});
     const native=(state,coordinate)=>{
       if(usedOperations>=254||usedBytes>=8*1024*1024)throw Error("ReadSnapshotNeedsAdmission");
       return this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,fairKey:this.namespace,priority,onStage:sample=>{if(sample.name==="kernel_queue")onAdmission?.();},deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,...sample});}catch{}}});
