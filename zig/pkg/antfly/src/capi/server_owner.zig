@@ -1941,6 +1941,20 @@ pub fn metadataApplyStoreProjection(
             const input_request = std.json.parseFromSliceLeaky(contract.CatalogProjectionRequest, a, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
             const group_id = request.group_id;
             switch (input_request) {
+                .job_state_get => |key| {
+                    const value = handle.store.getJobState(alloc, group_id, key) catch |err| break :blk storageOwnerStatusFromError(err);
+                    out_json.* = if (value) |bytes| .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) } else .{};
+                    break :blk .ok;
+                },
+                .job_state_scan => |after| {
+                    const bytes = handle.store.scanJobState(alloc, group_id, after) catch |err| break :blk storageOwnerStatusFromError(err);
+                    out_json.* = .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) };
+                    break :blk .ok;
+                },
+                .job_owner_count => |owner| {
+                    const value = handle.store.getJobOwnerCount(a, group_id, owner) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .read_store => |input| {
                     const value = handle.store.readStore(a, group_id, input.store_id, input.reports) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

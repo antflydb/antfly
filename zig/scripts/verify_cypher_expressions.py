@@ -10,6 +10,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from cypher_qualification_retry import retry_allowed
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -30,7 +32,15 @@ def main():
     filtered = graph + "_predicate"
     checks = 0
 
-    def call(path, body=None, *, method="POST", status=None, retry_aborted=False):
+    def call(
+        path,
+        body=None,
+        *,
+        method="POST",
+        status=None,
+        retry_aborted=False,
+        read_only=False,
+    ):
         request = urllib.request.Request(
             args.url.rstrip("/") + "/db/v1" + path,
             data=None if body is None else json.dumps(body).encode(),
@@ -40,11 +50,20 @@ def main():
             },
             method=method,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=40) as response:
-                code, raw = response.status, response.read()
-        except urllib.error.HTTPError as error:
-            code, raw = error.code, error.read()
+        for attempt in range(40):
+            try:
+                with urllib.request.urlopen(request, timeout=40) as response:
+                    code, raw = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                code, raw = error.code, error.read()
+            if (
+                attempt < 39
+                and status != code
+                and retry_allowed(code, raw, path=path, body=body, read_only=read_only)
+            ):
+                time.sleep(0.25)
+                continue
+            break
 
         def retryable_setup(code, raw):
             if code not in (409, 503):
@@ -225,6 +244,7 @@ def main():
             {
                 "statement": f"SELECT g.id FROM GRAPH_TABLE({graph} MATCH (n IS Document) COLUMNS(n.id AS id,n.title AS title)) g WHERE g.title ~ '^A'"
             },
+            read_only=True,
         )
         assert sql["rows"] == [["a"]], sql
         checks += 1
@@ -262,6 +282,7 @@ def main():
             {
                 "statement": f"SELECT g.title FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE lower(n.title)='école' COLUMNS(upper(n.title) AS title)) g"
             },
+            read_only=True,
         )
         assert sql["rows"] == [["ÉCOLE"]], sql
         checks += 1
@@ -338,6 +359,7 @@ def main():
             {
                 "statement": f"SELECT g.value,g.text FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='a' COLUMNS(toInteger('9007199254740993.0') AS value,toString(1.0) AS text)) g"
             },
+            read_only=True,
         )
         assert sql["rows"] == [["9007199254740993", "1.0"]], sql
         checks += 1
@@ -356,6 +378,7 @@ def main():
                 {
                     "statement": f"SELECT g.x || '!' FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='a' COLUMNS({expression} AS x)) g"
                 },
+                read_only=True,
             )
             assert sql["rows"] == [[expected]], sql
             checks += 1
@@ -364,6 +387,7 @@ def main():
             {
                 "statement": f"SELECT g.x + 1 FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='a' COLUMNS(abs(-2) AS x,toBoolean('true') AS ok)) g WHERE g.ok"
             },
+            read_only=True,
         )
         assert sql["rows"] == [["3"]], sql
         checks += 1
@@ -394,6 +418,7 @@ def main():
             {
                 "statement": f"SELECT g.x || '!' FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='a' COLUMNS('row-'+n.rank AS x,toBoolean(n.rank) AS ok)) g WHERE g.ok"
             },
+            read_only=True,
         )
         assert sql["rows"] == [["row-1!"]], sql
         checks += 1
@@ -436,6 +461,7 @@ def main():
                 {
                     "statement": f"SELECT g.id FROM GRAPH_TABLE({filtered} MATCH (n IS D) COLUMNS(n.id AS id)) g"
                 },
+                read_only=True,
             )
             assert result["rows"] == [["predicate"]], result
             checks += 1

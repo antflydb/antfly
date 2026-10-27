@@ -144,7 +144,7 @@ test "parallel search redistributes quotas charges retries and bounds retained m
     const Fixture = struct {
         activity: Activity,
         owners: [128]Owner = undefined,
-        mode: enum { normal, anchors, work, fatal, revoked, memory, serial },
+        mode: enum { normal, anchors, work, fatal, revoked, memory, serial, sequential, local },
         revoked: std.atomic.Value(bool) = .init(false),
         payload: [4096]u8 = @splat('x'),
         const ThisFixture = @This();
@@ -198,19 +198,19 @@ test "parallel search redistributes quotas charges retries and bounds retained m
     const io = threaded.io();
     for (std.enums.values(@FieldType(Fixture, "mode"))) |mode| {
         var f: Fixture = .{ .activity = .{ .io = io }, .mode = mode };
-        const count: usize = if (mode == .normal) 128 else 8;
+        const count: usize = if (mode == .normal or mode == .sequential or mode == .local) 128 else 8;
         var targets: [128]d.Target = undefined;
         var snapshots: [128]d.Snapshot = undefined;
         for (f.owners[0..count], targets[0..count], snapshots[0..count], 0..) |*owner, *target, *snapshot, i| {
             owner.* = .{ .f = &f, .index = i };
-            target.* = .{ .table = "docs", .table_id = 1, .group_id = i + 1 };
+            target.* = .{ .parallel = mode != .local, .table = "docs", .table_id = 1, .group_id = i + 1 };
             snapshot.* = .{ .backend = owner.backend(), .ptr = owner, .validate = Fixture.Owner.check, .close = undefined };
         }
-        var read: d.ReadSet = .{ .a = std.testing.allocator, .targets = targets[0..count], .snapshots = snapshots[0..count], .independent_validations = &.{}, .source = .{ .ptr = &f, .checkpoint = Fixture.check, .admit = undefined, .capture = undefined, .fanout_io = if (mode == .serial) null else io, .fanout_width = 4 } };
+        var read: d.ReadSet = .{ .a = std.testing.allocator, .targets = targets[0..count], .snapshots = snapshots[0..count], .independent_validations = &.{}, .source = .{ .ptr = &f, .checkpoint = Fixture.check, .admit = undefined, .capture = undefined, .fanout_io = if (mode == .serial or mode == .sequential) null else io, .fanout_width = 4 } };
         var memory: @import("budget.zig") = .{ .backing = std.testing.allocator, .limit = if (mode == .memory) 16 << 10 else 512 << 10 };
         var arena = std.heap.ArenaAllocator.init(memory.allocator());
         defer arena.deinit();
-        var meter: b.Meter = .{ .a = arena.allocator(), .backend = read.backend(), .limit = if (mode == .normal) 100_000 else if (mode == .serial) 1000 else 8192 };
+        var meter: b.Meter = .{ .a = arena.allocator(), .backend = read.backend(), .limit = if (mode == .normal or mode == .sequential or mode == .local) 100_000 else if (mode == .serial) 1000 else 8192 };
         const backend = read.backend();
         backend.vtable.set_work.?(backend.ptr, meter.work());
         const parameters = v.Value{ .map = &.{.{ .name = "limit", .value = .{ .integer = 2 } }} };
@@ -236,7 +236,7 @@ test "parallel search redistributes quotas charges retries and bounds retained m
         try std.testing.expect(memory.peak < 256 << 10);
         try std.testing.expectEqual(@as(usize, 0), f.activity.active.load(.monotonic));
         try std.testing.expect(f.activity.peak.load(.monotonic) <= 4);
-        if (mode != .serial) try std.testing.expect(f.activity.peak.load(.monotonic) > 1);
+        if (mode == .serial or mode == .sequential or mode == .local) try std.testing.expectEqual(@as(usize, 1), f.activity.peak.load(.monotonic)) else try std.testing.expect(f.activity.peak.load(.monotonic) > 1);
     }
 }
 
@@ -276,4 +276,183 @@ test "native group cancellation drains started workers and cleanup still release
     @import("fanout.zig").finish(io, 2, 8, &runtime, Runtime.worker);
     try std.testing.expectEqual(@as(usize, 8), runtime.calls.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 4), runtime.awaits);
+}
+
+test "bounded owner reads preserve ordering routing quotas and controller affinity" {
+    const Fixture = struct {
+        activity: Activity,
+        controller: std.Thread.Id,
+        mode: enum { normal, work, anchors, fatal, revoked, deadline, canceled, malformed, overlap, decline, empty, memory },
+        owners: [12]Owner = undefined,
+        stop: std.atomic.Value(bool) = .init(false),
+        const ThisFixture = @This();
+        const Owner = struct {
+            f: *ThisFixture,
+            index: usize,
+            key: [8]u8 = undefined,
+            work: ?b.Work = null,
+            lookups: usize = 0,
+            heads: usize = 0,
+            fn checkThread(self: *@This()) void {
+                if (self.index % 2 == 0) std.testing.expectEqual(self.f.controller, std.Thread.getCurrentId()) catch @panic("local read moved across threads");
+            }
+            fn check(ptr: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.checkThread();
+                try ThisFixture.check(self.f);
+            }
+            fn configure(ptr: *anyopaque, work: ?b.Work) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.checkThread();
+                self.work = work;
+            }
+            fn enter(self: *@This()) !void {
+                self.checkThread();
+                try self.f.activity.enter();
+            }
+            fn demand(self: *@This()) !void {
+                if (self.index == 1) switch (self.f.mode) {
+                    .fatal => return error.Forbidden,
+                    .revoked, .deadline, .canceled => self.f.stop.store(true, .release),
+                    .memory => {},
+                    else => {},
+                };
+                const units: usize = if (self.index == 1 and self.f.mode == .work) 5000 else 1;
+                for (0..units) |_| if (self.work) |work| try work.charge(work.ptr, 1);
+            }
+            fn node(self: *@This(), a: A, key: []const u8, score: usize) !*const v.Node {
+                if (self.index == 1 and self.f.mode == .memory) _ = try a.alloc(u8, 1 << 20);
+                const out = try a.create(v.Node);
+                const fields = try a.alloc(v.Entry, 1);
+                fields[0] = .{ .name = "score", .value = .{ .integer = @intCast(score) } };
+                out.* = .{ .identity = .{ .table = if (self.f.mode == .malformed) "wrong" else "docs", .key = try a.dupe(u8, key) }, .properties = fields };
+                return out;
+            }
+            fn getMany(ptr: *anyopaque, a: A, ids: []const v.Identity) ![]const ?*const v.Node {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.lookups += 1;
+                try self.enter();
+                defer self.f.activity.leave();
+                try self.demand();
+                const out = try a.alloc(?*const v.Node, ids.len);
+                @memset(out, null);
+                const key = if (self.f.mode == .overlap) "k00" else self.key[0..3];
+                for (ids, out) |id, *item| if (std.mem.eql(u8, id.key, key)) {
+                    item.* = try self.node(a, key, self.index);
+                };
+                return out;
+            }
+            fn ordered(ptr: *anyopaque, a: A, _: []const u8, _: []const b.PropertyFilter, _: []const b.PropertyOrder, after: ?[]const u8, limit: usize, maximum: usize) !?b.Page(*const v.Node) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try self.enter();
+                defer self.f.activity.leave();
+                if (limit == 0) {
+                    if (self.f.mode == .decline and self.index == 1) return null;
+                    return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .next = "0", .exact_keys = true };
+                }
+                self.heads += 1;
+                try self.demand();
+                const start = if (after) |bytes| try std.fmt.parseInt(usize, bytes, 10) else 0;
+                if (self.f.mode == .empty and self.index == 1 and start == 0) return .{ .items = &.{}, .examined = 1, .next = "1", .exact_keys = true };
+                const examined: usize = if (self.f.mode == .anchors and self.index == 1 and start == 0) 1800 else 1;
+                if (maximum < examined) return error.CypherAnchorBudgetExceeded;
+                const items = try a.alloc(*const v.Node, 1);
+                const key = try std.fmt.allocPrint(a, "k{d:0>2}-{d}", .{ self.index, start });
+                items[0] = try self.node(a, key, self.index * 100 + start);
+                const cursors = try a.alloc(?[]const u8, 1);
+                cursors[0] = if (start == 0) "1" else null;
+                return .{ .items = items, .cursors = cursors, .examined = examined, .next = cursors[0], .exact_keys = true };
+            }
+            fn backend(self: *@This()) b.Backend {
+                return .{ .ptr = self, .vtable = &.{ .bind = undefined, .checkpoint = @This().check, .scan = undefined, .get = undefined, .expand = undefined, .get_many = getMany, .scan_ordered = ordered, .set_work = configure } };
+            }
+        };
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.stop.load(.acquire)) return switch (self.mode) {
+                .deadline => error.DeadlineExceeded,
+                .canceled => error.Canceled,
+                else => error.Forbidden,
+            };
+        }
+    };
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    for (std.enums.values(@FieldType(Fixture, "mode"))) |mode| for ([_]bool{ false, true }) |ordered| {
+        if ((mode == .decline or mode == .anchors or mode == .empty) and !ordered) continue;
+        if (mode == .overlap and ordered) continue;
+        var f: Fixture = .{ .activity = .{ .io = io }, .controller = std.Thread.getCurrentId(), .mode = mode };
+        var targets: [12]d.Target = undefined;
+        var snapshots: [12]d.Snapshot = undefined;
+        var ids: [12]v.Identity = undefined;
+        var ranges: [12][1]d.KeyRange = undefined;
+        for (&f.owners, &targets, &snapshots, &ids, 0..) |*owner, *target, *snapshot, *id, i| {
+            owner.* = .{ .f = &f, .index = i };
+            const key = try std.fmt.bufPrint(&owner.key, "k{d:0>2}", .{i});
+            id.* = .{ .table = "docs", .key = key };
+            target.* = .{ .parallel = i % 2 != 0, .table = "docs", .table_id = 1, .group_id = i + 1 };
+            snapshot.* = .{ .backend = owner.backend(), .ptr = owner, .validate = Fixture.Owner.check, .close = undefined };
+        }
+        if (mode != .overlap) for (&targets, &ranges, 0..) |*target, *range, i| {
+            range.* = .{.{ .start = ids[i].key, .end = if (i + 1 < ids.len) ids[i + 1].key else null }};
+            target.ranges = range;
+        };
+        var read: d.ReadSet = .{ .a = std.testing.allocator, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &f, .checkpoint = Fixture.check, .admit = undefined, .capture = undefined, .fanout_io = io, .fanout_width = 4 } };
+        var memory: @import("budget.zig") = .{ .backing = std.testing.allocator, .limit = 512 << 10 };
+        var arena = std.heap.ArenaAllocator.init(memory.allocator());
+        defer arena.deinit();
+        const a = arena.allocator();
+        const backend = read.backend();
+        var meter: b.Meter = .{ .a = a, .backend = backend, .limit = 100_000 };
+        // A work-skewed owner must fail a 1/5 reservation and succeed with the
+        // unused whole-wave budget; copying and the failed attempt stay charged.
+        if (mode == .work) meter.limit = 20_000;
+        backend.vtable.set_work.?(backend.ptr, meter.work());
+        const expected: ?anyerror = switch (mode) {
+            .fatal, .revoked => error.Forbidden,
+            .deadline => error.DeadlineExceeded,
+            .canceled => error.Canceled,
+            .malformed => error.CypherInvalidBackendPage,
+            .overlap => error.CypherOverlappingOwners,
+            .memory => error.CypherMemoryBudgetExceeded,
+            else => null,
+        };
+        if (ordered) {
+            const result = backend.vtable.scan_ordered.?(backend.ptr, a, "docs", &.{}, &.{.{ .property = "score" }}, null, 5, 4096);
+            if (expected) |err| try std.testing.expectError(err, result) else {
+                const page = try result;
+                if (mode == .decline) try std.testing.expect(page == null) else {
+                    try std.testing.expectEqual(@as(usize, 5), page.?.items.len);
+                    try std.testing.expectEqual(@as(i128, 0), page.?.items[0].properties[0].value.integer);
+                    try std.testing.expect(page.?.examined.? <= 4096);
+                    if (mode == .anchors) try std.testing.expect(page.?.examined.? >= 2824);
+                    if (mode == .normal) {
+                        var after = page.?.next;
+                        var emitted: usize = 5;
+                        while (after) |cursor| {
+                            const next = (try backend.vtable.scan_ordered.?(backend.ptr, a, "docs", &.{}, &.{.{ .property = "score" }}, cursor, 5, 4096)).?;
+                            for (next.items) |node| {
+                                try std.testing.expectEqual(@as(i128, @intCast(emitted / 2 * 100 + emitted % 2)), node.properties[0].value.integer);
+                                emitted += 1;
+                            }
+                            after = next.next;
+                        }
+                        try std.testing.expectEqual(@as(usize, 24), emitted);
+                    }
+                }
+            }
+        } else {
+            const result = backend.vtable.get_many.?(backend.ptr, a, &ids);
+            if (expected) |err| try std.testing.expectError(err, result) else {
+                for (try result, 0..) |node, i| try std.testing.expectEqual(@as(i128, @intCast(i)), node.?.properties[0].value.integer);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), f.activity.active.load(.monotonic));
+        try std.testing.expect(f.activity.peak.load(.monotonic) > 1);
+        try std.testing.expect(f.activity.peak.load(.monotonic) <= 4);
+        try std.testing.expect(meter.units <= meter.limit);
+        if (mode == .work) try std.testing.expect(meter.units > 9000);
+        for (f.owners) |owner| try std.testing.expectEqual(meter.work().ptr, owner.work.?.ptr);
+    };
 }

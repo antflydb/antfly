@@ -977,6 +977,26 @@ pub const RaftApplyStore = struct {
         return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_job_value, .group_id = group_id, .key = .fromSlice(key) });
     }
 
+    // Job values are opaque bytes; the kernel returns them directly rather
+    // than encoding ciphertext or checkpoints as JSON strings a second time.
+    fn jobStateBytes(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: contract.CatalogProjectionRequest) !?[]u8 {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        var response: abi.OwnedBytes = .{};
+        try statusToError(abi.antfly_metadata_apply_store_projection(self.handle, &.{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(encoded) }, &response));
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return if (response.len == 0) null else try alloc.dupe(u8, response.slice());
+    }
+    pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
+        return self.jobStateBytes(alloc, group_id, .{ .job_state_get = key });
+    }
+    pub fn scanJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8) ![]u8 {
+        return (try self.jobStateBytes(alloc, group_id, .{ .job_state_scan = after })) orelse error.StorageKernelFailure;
+    }
+    pub fn getJobOwnerCount(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, owner: []const u8) !u64 {
+        return self.catalogProjection(u64, alloc, group_id, .{ .job_owner_count = owner });
+    }
+
     pub fn freeRestoreJobRows(_: *RaftApplyStore, alloc: std.mem.Allocator, rows: []RestoreJobRow) void {
         for (rows) |row| {
             alloc.free(row.key);

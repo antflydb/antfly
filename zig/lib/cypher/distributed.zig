@@ -279,6 +279,183 @@ pub const ReadSet = struct {
         return .{ .items = page.items, .examined = page.examined, .unfiltered = page.unfiltered, .next = try self.next(a, table, position, page.next) };
     }
     const OrderedPosition = @import("cursor_trace.zig").Position;
+    // Remote reads share scheduling, scratch ownership and quota admission.
+    // A wave joins before its results are copied or any arena is reclaimed.
+    const ReadJob = struct {
+        owner: usize,
+        operation: union(enum) {
+            ordered: struct { table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8 = null, limit: usize = 0 },
+            get_many: []const v.Identity,
+        },
+        arena: std.heap.ArenaAllocator = undefined,
+        meter: ?b.Meter = null,
+        maximum: usize = 0,
+        page: ?b.Page(*const v.Node) = null,
+        nodes: []const ?*const v.Node = &.{},
+        err: ?anyerror = null,
+        fn invoke(self: *@This(), read: *ReadSet) !void {
+            const owner = read.snapshots[self.owner].backend;
+            const a = self.arena.allocator();
+            switch (self.operation) {
+                .ordered => |input| self.page = try (owner.vtable.scan_ordered orelse return error.CypherInvalidBackendPage)(owner.ptr, a, input.table, input.filters, input.order, input.after, input.limit, self.maximum),
+                .get_many => |ids| self.nodes = if (owner.vtable.get_many) |batch| try batch(owner.ptr, a, ids) else blk: {
+                    const nodes = try a.alloc(?*const v.Node, ids.len);
+                    for (ids, nodes) |id, *node| node.* = try owner.vtable.get(owner.ptr, a, id);
+                    break :blk nodes;
+                },
+            }
+        }
+    };
+    const ReadWave = struct {
+        read: *ReadSet,
+        shared: fanout.Allocator,
+        jobs: [16]ReadJob = undefined,
+        count: usize = 0,
+        initialized: usize = 0,
+        examined: usize = 0,
+        fn deinit(self: *@This()) void {
+            for (self.jobs[0..self.initialized]) |*job| job.arena.deinit();
+        }
+        fn movable(self: *@This(), index: usize) bool {
+            return self.read.targets[self.jobs[index].owner].parallel;
+        }
+        fn call(self: *@This(), index: usize) void {
+            const job = &self.jobs[index];
+            const owner = self.read.snapshots[job.owner].backend;
+            if (job.meter) |*meter| owner.vtable.set_work.?(owner.ptr, meter.work());
+            defer if (job.meter != null) owner.vtable.set_work.?(owner.ptr, self.read.work);
+            job.invoke(self.read) catch |err| {
+                job.err = err;
+            };
+        }
+        fn usage(job: ReadJob) !usize {
+            if (job.operation != .ordered) return 0;
+            const input = job.operation.ordered;
+            if (job.page) |page| {
+                const used = page.examined orelse page.items.len;
+                if (page.items.len > input.limit or used < page.items.len or used > job.maximum) return error.CypherInvalidBackendPage;
+                return used;
+            }
+            // A failed private/custom read without candidate progress consumes
+            // its reservation. Replaying it can never refund physical work.
+            return if (job.err != null and input.limit != 0) job.maximum else 0;
+        }
+        fn run(self: *@This(), maximum: usize) !void {
+            const remaining = if (self.read.work) |work| if (work.remaining) |left| left(work.ptr) else null else null;
+            for (self.jobs[0..self.count]) |*job| {
+                job.arena = .init(self.shared.allocator());
+                self.initialized += 1;
+                job.maximum = maximum / self.count;
+                if (remaining) |left| if (self.read.snapshots[job.owner].backend.vtable.set_work != null) {
+                    job.meter = .{ .a = job.arena.allocator(), .backend = self.read.snapshots[job.owner].backend, .limit = if (self.count == 1) left else left / (self.count + 1) };
+                };
+            }
+            const canceled = fanout.selected(self.read.source.fanout_io, self.read.source.fanout_width, self.count, self, call, movable, false);
+            for (self.jobs[0..self.count]) |job| {
+                if (job.meter) |meter| if (self.read.work) |work| try work.charge(work.ptr, meter.units);
+                self.examined += try usage(job);
+            }
+            if (canceled) return error.Canceled;
+            try checkpoint(self.read);
+            for (self.jobs[0..self.count]) |job| if (job.err) |err| {
+                if (err == error.OutOfMemory) {
+                    if (self.shared.quota_exhausted.load(.acquire)) return error.CypherMemoryBudgetExceeded;
+                    return err;
+                }
+                if (err != error.CypherStateBudgetExceeded and err != error.CypherAnchorBudgetExceeded) return err;
+            };
+            for (self.jobs[0..self.count]) |*job| if (job.err) |err| {
+                if (self.count == 1) return err;
+                if (self.read.work) |work| if (work.remaining) |left| if (left(work.ptr) == 0) return err;
+                if (job.operation == .ordered and job.operation.ordered.limit != 0 and self.examined == maximum) return err;
+                // Retry a skewed reservation once, after every started read has
+                // joined and been charged. The unsuccessful scratch is dead.
+                _ = job.arena.reset(.free_all);
+                job.meter = null;
+                job.err = null;
+                job.maximum = maximum - self.examined;
+                job.invoke(self.read) catch |retry_error| {
+                    job.err = retry_error;
+                    self.examined += try usage(job.*);
+                    return retry_error;
+                };
+                self.examined += try usage(job.*);
+            };
+        }
+    };
+    fn readWidth(self: *ReadSet, owners: []const usize, maximum: ?usize) usize {
+        if (self.source.fanout_io == null or self.source.fanout_width <= 1) return 1;
+        var width = @min(16, self.source.fanout_width, owners.len);
+        if (self.work) |work| {
+            const left = work.remaining orelse return 1;
+            width = @min(width, left(work.ptr) / 256);
+        }
+        if (maximum) |limit| width = @min(width, limit / 64);
+        // Local capabilities keep controller-thread affinity; custom backends
+        // without isolated work counters also retain sequential admission.
+        var eligible: usize = 0;
+        for (owners[0..width]) |owner| {
+            if (!self.targets[owner].parallel or (self.work != null and self.snapshots[owner].backend.vtable.set_work == null)) break;
+            eligible += 1;
+        }
+        return @max(1, eligible);
+    }
+    fn readOwners(self: *ReadSet, a: A, table: ?[]const u8) ![]usize {
+        var result: std.ArrayList(usize) = .empty;
+        for ([_]bool{ true, false }) |movable| for (self.targets, 0..) |target, index| {
+            if (table) |name| if (!std.mem.eql(u8, target.table, name)) continue;
+            const eligible = target.parallel and (self.work == null or self.snapshots[index].backend.vtable.set_work != null);
+            if (eligible == movable) try result.append(a, index);
+        };
+        return result.toOwnedSlice(a);
+    }
+    fn cloneOrderedPage(a: A, page: b.Page(*const v.Node), work: ?b.Work) !b.Page(*const v.Node) {
+        const nodes = try a.alloc(*const v.Node, page.items.len);
+        for (page.items, nodes) |node, *out| {
+            if (work) |meter| try meter.value(meter.ptr, .{ .node = node });
+            out.* = (try (v.Value{ .node = node }).clone(a)).node;
+        }
+        const cursors = if (page.cursors) |positions| blk: {
+            const copy = try a.alloc(?[]const u8, positions.len);
+            for (positions, copy) |position, *out| out.* = if (position) |bytes| try a.dupe(u8, bytes) else null;
+            break :blk copy;
+        } else null;
+        return .{ .items = nodes, .cursors = cursors, .cursor_trace = if (page.cursor_trace) |trace| try trace.clone(a) else null, .next = if (page.next) |bytes| try a.dupe(u8, bytes) else null, .examined = page.examined, .stable_ties = page.stable_ties, .exact_keys = page.exact_keys, .encounter_owners = if (page.encounter_owners) |owners| try a.dupe(usize, owners) else null };
+    }
+    fn orderedProofs(self: *ReadSet, a: A, table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder) !?[]OrderedPosition {
+        const owners = try self.readOwners(a, table);
+        const positions = try a.alloc(OrderedPosition, owners.len);
+        var lookup: [1024]usize = undefined;
+        var index: usize = 0;
+        for (self.targets, 0..) |target, owner| if (std.mem.eql(u8, target.table, table)) {
+            lookup[owner] = index;
+            index += 1;
+        };
+        var start: usize = 0;
+        while (start < owners.len) {
+            const width = self.readWidth(owners[start..], null);
+            if (width == 1) {
+                const owner = owners[start];
+                const owner_backend = self.snapshots[owner].backend;
+                const read = owner_backend.vtable.scan_ordered orelse return null;
+                const proof = (try read(owner_backend.ptr, a, table, filters, order, null, 0, 0)) orelse return null;
+                if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
+                positions[lookup[owner]] = .{ .exact_keys = proof.exact_keys, .coarse = !proof.stable_ties, .owner = owner, .after = proof.next, .batched = proof.cursors != null or proof.cursor_trace != null };
+            } else {
+                var wave: ReadWave = .{ .read = self, .shared = .{ .backing = b.reclaimingAllocator(a), .io = self.source.fanout_io.? }, .count = width };
+                defer wave.deinit();
+                for (wave.jobs[0..width], owners[start..][0..width]) |*job, owner| job.* = .{ .owner = owner, .operation = .{ .ordered = .{ .table = table, .filters = filters, .order = order } } };
+                try wave.run(0);
+                for (wave.jobs[0..width]) |job| {
+                    const proof = job.page orelse return null;
+                    if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
+                    positions[lookup[job.owner]] = .{ .exact_keys = proof.exact_keys, .coarse = !proof.stable_ties, .owner = job.owner, .after = try a.dupe(u8, proof.next.?), .batched = proof.cursors != null or proof.cursor_trace != null };
+                }
+            }
+            start += width;
+        }
+        return positions;
+    }
     const OrderedHead = struct { node: *const v.Node, after: ?[]const u8 };
     const OrderedSlot = struct {
         position: OrderedPosition,
@@ -313,6 +490,49 @@ pub const ReadSet = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.read_set.work) |work| try work.charge(work.ptr, amount);
         }
+        fn prime(self: *@This(), temporary: A, slots: []OrderedSlot) !void {
+            const read = self.read_set;
+            const candidates = try read.readOwners(temporary, self.table);
+            var lookup: [1024]usize = undefined;
+            for (slots, 0..) |slot, index| lookup[slot.position.owner] = index;
+            var active: usize = 0;
+            for (candidates) |owner| if (!slots[lookup[owner]].position.finished) {
+                candidates[active] = owner;
+                active += 1;
+            };
+            const owners = candidates[0..active];
+            var start: usize = 0;
+            while (start < owners.len) {
+                const width = read.readWidth(owners[start..], self.max_examined - self.examined);
+                if (width == 1) {
+                    try self.fetch(&slots[lookup[owners[start]]]);
+                } else {
+                    var wave: ReadWave = .{ .read = read, .shared = .{ .backing = b.reclaimingAllocator(self.a), .io = read.source.fanout_io.? }, .count = width };
+                    defer wave.deinit();
+                    for (wave.jobs[0..width], owners[start..][0..width]) |*job, owner| {
+                        const slot = slots[lookup[owner]];
+                        job.* = .{ .owner = owner, .operation = .{ .ordered = .{ .table = self.table, .filters = self.filters, .order = self.order, .after = slot.position.after, .limit = if (slot.position.finished) 0 else 1 } } };
+                    }
+                    try wave.run(self.max_examined - self.examined);
+                    var returned: usize = 0;
+                    for (wave.jobs[0..width]) |job| {
+                        const page = job.page orelse return error.CypherInvalidBackendPage;
+                        returned += page.examined orelse page.items.len;
+                    }
+                    // Failed reservations and retries remain physical reads.
+                    self.examined += wave.examined - returned;
+                    for (wave.jobs[0..width]) |job| {
+                        const slot = &slots[lookup[job.owner]];
+                        if (slot.position.finished) continue;
+                        const page = try cloneOrderedPage(self.a, job.page.?, read.work);
+                        slot.primed = true;
+                        try self.receive(slot, page, 1);
+                    }
+                    for (wave.jobs[0..width]) |job| try self.fetch(&slots[lookup[job.owner]]);
+                }
+                start += width;
+            }
+        }
         fn fetch(self: *@This(), slot: *OrderedSlot) !void {
             const owner = self.read_set.snapshots[slot.position.owner].backend;
             const read = owner.vtable.scan_ordered orelse return error.CypherInvalidBackendPage;
@@ -334,34 +554,37 @@ pub const ReadSet = struct {
                 const count = if (slot.position.batched and slot.primed) @max(1, @min(self.quantum, self.demand)) else 1;
                 const page = (try read(owner.ptr, self.a, self.table, self.filters, self.order, slot.position.after, count, self.max_examined - self.examined)) orelse return error.CypherInvalidBackendPage;
                 slot.primed = true;
-                if ((page.stable_ties == slot.position.coarse or page.exact_keys != slot.position.exact_keys)) return error.CypherInvalidBackendPage;
-                const examined = page.examined orelse page.items.len;
-                if (page.items.len > count or examined < page.items.len or examined > self.max_examined - self.examined) return error.CypherInvalidBackendPage;
-                self.examined += examined;
-                if (page.items.len != 0) {
-                    for (page.items) |node| if (!std.mem.eql(u8, node.identity.table, self.table)) return error.CypherInvalidBackendPage;
-                    if (page.cursors) |positions| {
-                        if (positions.len != page.items.len or (positions[positions.len - 1] == null and page.next != null)) return error.CypherInvalidBackendPage;
-                        for (positions[0 .. positions.len - 1]) |position| if (position == null) return error.CypherInvalidBackendPage;
-                    } else if (page.cursor_trace == null and page.items.len > 1) return error.CypherInvalidBackendPage;
-                    if (page.cursor_trace) |trace| {
-                        if (page.cursors != null) return error.CypherInvalidBackendPage;
-                        try trace.validate(page.items.len);
-                    }
-                    slot.buffer = page.items;
-                    slot.cursors = page.cursors;
-                    slot.trace = page.cursor_trace;
-                    slot.consumed = 0;
-                    slot.offset = 0;
-                    slot.next = page.next;
-                    continue;
-                }
-                if (page.next == null) slot.position.finished = true else {
-                    if (slot.position.after) |before| if (std.mem.eql(u8, before, page.next.?)) return error.CypherInvalidBackendPage;
-                    slot.position.after = page.next;
-                }
+                try self.receive(slot, page, count);
             }
             slot.head = null;
+        }
+        fn receive(self: *@This(), slot: *OrderedSlot, page: b.Page(*const v.Node), count: usize) !void {
+            if ((page.stable_ties == slot.position.coarse or page.exact_keys != slot.position.exact_keys)) return error.CypherInvalidBackendPage;
+            const examined = page.examined orelse page.items.len;
+            if (page.items.len > count or examined < page.items.len or examined > self.max_examined - self.examined) return error.CypherInvalidBackendPage;
+            self.examined += examined;
+            if (page.items.len != 0) {
+                for (page.items) |node| if (!std.mem.eql(u8, node.identity.table, self.table)) return error.CypherInvalidBackendPage;
+                if (page.cursors) |positions| {
+                    if (positions.len != page.items.len or (positions[positions.len - 1] == null and page.next != null)) return error.CypherInvalidBackendPage;
+                    for (positions[0 .. positions.len - 1]) |position| if (position == null) return error.CypherInvalidBackendPage;
+                } else if (page.cursor_trace == null and page.items.len > 1) return error.CypherInvalidBackendPage;
+                if (page.cursor_trace) |trace| {
+                    if (page.cursors != null) return error.CypherInvalidBackendPage;
+                    try trace.validate(page.items.len);
+                }
+                slot.buffer = page.items;
+                slot.cursors = page.cursors;
+                slot.trace = page.cursor_trace;
+                slot.consumed = 0;
+                slot.offset = 0;
+                slot.next = page.next;
+                return;
+            }
+            if (page.next == null) slot.position.finished = true else {
+                if (slot.position.after) |before| if (std.mem.eql(u8, before, page.next.?)) return error.CypherInvalidBackendPage;
+                slot.position.after = page.next;
+            }
         }
         fn less(self: *@This(), work: *@import("value_work.zig").Work, slots: []const OrderedSlot, left: usize, right: usize) !bool {
             try charge(self, 1);
@@ -433,13 +656,7 @@ pub const ReadSet = struct {
             const saved = try std.json.parseFromSliceLeaky([]const OrderedPosition, temporary, bytes, .{});
             try positions.appendSlice(temporary, saved);
         } else {
-            for (self.targets, self.snapshots, 0..) |target, snapshot, owner| {
-                if (!std.mem.eql(u8, target.table, table)) continue;
-                const read = snapshot.backend.vtable.scan_ordered orelse return null;
-                const proof = (try read(snapshot.backend.ptr, temporary, table, filters, order, null, 0, 0)) orelse return null;
-                if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
-                try positions.append(temporary, .{ .exact_keys = proof.exact_keys, .coarse = !proof.stable_ties, .owner = owner, .after = proof.next, .batched = proof.cursors != null or proof.cursor_trace != null });
-            }
+            try positions.appendSlice(temporary, (try self.orderedProofs(temporary, table, filters, order)) orelse return null);
         }
         var count: usize = 0;
         for (self.targets, 0..) |target, owner| if (std.mem.eql(u8, target.table, table)) {
@@ -458,9 +675,9 @@ pub const ReadSet = struct {
         var heap: std.ArrayList(usize) = .empty;
         var merge: OrderedMerge = .{ .read_set = self, .a = a, .table = table, .filters = filters, .order = order, .max_examined = max_examined, .quantum = if (max_examined > limit *| 2 +| count) @max(1, @min(64, limit / count)) else 1, .demand = limit };
         var work: @import("value_work.zig").Work = .{ .a = temporary, .ptr = &merge, .charge = OrderedMerge.charge };
-        for (slots, positions.items, 0..) |*slot, position, index| {
-            slot.* = .{ .position = position };
-            try merge.fetch(slot);
+        for (slots, positions.items) |*slot, position| slot.* = .{ .position = position };
+        try merge.prime(temporary, slots);
+        for (slots, 0..) |slot, index| {
             if (slot.head != null) try heap.append(temporary, index);
         }
         var parent = heap.items.len / 2;
@@ -561,31 +778,64 @@ pub const ReadSet = struct {
         try checkpoint(ptr);
         const result = try a.alloc(?*const v.Node, identities.len);
         @memset(result, null);
-        for (self.targets, self.snapshots) |target, snapshot| {
+        var inventory = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer inventory.deinit();
+        const candidates = try self.readOwners(inventory.allocator(), null);
+        var found: usize = 0;
+        for (candidates) |owner| {
+            const matches = for (identities) |identity| {
+                if (self.targets[owner].owns(identity)) break true;
+            } else false;
+            if (matches) {
+                candidates[found] = owner;
+                found += 1;
+            }
+        }
+        const owners = candidates[0..found];
+        var start: usize = 0;
+        while (start < owners.len) {
+            try checkpoint(ptr);
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
             defer scratch.deinit();
             const temporary = scratch.allocator();
-            var selected: std.ArrayList(v.Identity) = .empty;
-            var positions: std.ArrayList(usize) = .empty;
-            for (identities, 0..) |identity, index| if (target.owns(identity)) {
-                try selected.append(temporary, identity);
-                try positions.append(temporary, index);
-            };
-            if (selected.items.len == 0) continue;
-            const owner = snapshot.backend;
-            const nodes = if (owner.vtable.get_many) |batch| try batch(owner.ptr, temporary, selected.items) else blk: {
-                const fetched = try temporary.alloc(?*const v.Node, selected.items.len);
-                for (selected.items, fetched) |identity, *node| node.* = try owner.vtable.get(owner.ptr, temporary, identity);
-                break :blk fetched;
-            };
-            if (nodes.len != positions.items.len) return error.CypherInvalidBackendPage;
-            for (nodes, positions.items) |node, index| if (node) |value| {
-                if (result[index] != null) return error.CypherOverlappingOwners;
-                result[index] = (try (v.Value{ .node = value }).clone(a)).node;
-            };
+            const width = self.readWidth(owners[start..], null);
+            var selected: [16][]const v.Identity = undefined;
+            var positions: [16][]const usize = undefined;
+            for (owners[start..][0..width], 0..) |owner, offset| {
+                var ids: std.ArrayList(v.Identity) = .empty;
+                var indices: std.ArrayList(usize) = .empty;
+                for (identities, 0..) |identity, index| if (self.targets[owner].owns(identity)) {
+                    try ids.append(temporary, identity);
+                    try indices.append(temporary, index);
+                };
+                selected[offset] = ids.items;
+                positions[offset] = indices.items;
+            }
+            if (width == 1) {
+                var job: ReadJob = .{ .owner = owners[start], .operation = .{ .get_many = selected[0] }, .arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a)) };
+                defer job.arena.deinit();
+                try job.invoke(self);
+                try self.mergeNodes(a, result, selected[0], positions[0], job.nodes);
+            } else {
+                var wave: ReadWave = .{ .read = self, .shared = .{ .backing = b.reclaimingAllocator(a), .io = self.source.fanout_io.? }, .count = width };
+                defer wave.deinit();
+                for (wave.jobs[0..width], owners[start..][0..width], selected[0..width]) |*job, owner, ids| job.* = .{ .owner = owner, .operation = .{ .get_many = ids } };
+                try wave.run(0);
+                for (wave.jobs[0..width], selected[0..width], positions[0..width]) |job, ids, indices| try self.mergeNodes(a, result, ids, indices, job.nodes);
+            }
+            start += width;
         }
         try checkpoint(ptr);
         return result;
+    }
+    fn mergeNodes(self: *ReadSet, a: A, result: []?*const v.Node, ids: []const v.Identity, positions: []const usize, nodes: []const ?*const v.Node) !void {
+        if (nodes.len != ids.len) return error.CypherInvalidBackendPage;
+        for (nodes, ids, positions) |node, identity, index| if (node) |value| {
+            if (!value.identity.eql(identity)) return error.CypherInvalidBackendPage;
+            if (result[index] != null) return error.CypherOverlappingOwners;
+            if (self.work) |work| try work.value(work.ptr, .{ .node = value });
+            result[index] = (try (v.Value{ .node = value }).clone(a)).node;
+        };
     }
     fn expand(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identity: v.Identity, direction: ast.Direction, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
         const self = cast(ptr);
@@ -757,6 +1007,17 @@ pub const ReadSet = struct {
             try merge.add(seed);
         }
     }
+    fn searchOne(self: *ReadSet, a: A, owner: b.Backend, table: []const u8, input: b.SearchInput, merge: *SearchMerge) !b.SearchPage {
+        _ = self;
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const callback = owner.vtable.search orelse return error.CypherSearchUnavailable;
+        const page = try callback(owner.ptr, scratch.allocator(), table, input);
+        if (page.examined > input.max_examined) return error.CypherAnchorBudgetExceeded;
+        try absorb(merge, page, table);
+        try merge.promote();
+        return .{ .seeds = &.{}, .examined = page.examined, .approximate = page.approximate };
+    }
     fn searchConcurrent(self: *ReadSet, a: A, table: []const u8, input: b.SearchInput, merge: *SearchMerge) !b.SearchPage {
         const io = self.source.fanout_io.?;
         var matching: std.ArrayList(usize) = .empty;
@@ -788,19 +1049,17 @@ pub const ReadSet = struct {
             }
             if (count <= 1) {
                 const owner = self.snapshots[matching.items[start]].backend;
-                const callback = owner.vtable.search orelse return error.CypherSearchUnavailable;
                 var demand = input;
                 demand.max_examined = input.max_examined -| examined;
                 var usage: b.SearchUsage = .{};
                 demand.usage = &usage;
-                const page = callback(owner.ptr, a, table, demand) catch |err| {
+                const page = self.searchOne(a, owner, table, demand, merge) catch |err| {
                     examined += @min(demand.max_examined, usage.examined orelse demand.max_examined);
                     return err;
                 };
                 if (page.examined > demand.max_examined) return error.CypherAnchorBudgetExceeded;
                 examined += page.examined;
                 approximate = approximate or page.approximate;
-                try absorb(merge, page, table);
                 start += 1;
                 continue;
             }
@@ -896,24 +1155,17 @@ pub const ReadSet = struct {
             found = true;
             searched_owners += 1;
             try checkpoint(ptr);
-            const callback = snapshot.backend.vtable.search orelse return error.CypherSearchUnavailable;
             var demand = input;
             demand.max_examined = input.max_examined -| examined;
             var usage: b.SearchUsage = .{};
             demand.usage = &usage;
-            const page = callback(snapshot.backend.ptr, a, table, demand) catch |err| {
+            const page = self.searchOne(a, snapshot.backend, table, demand, &merge) catch |err| {
                 examined += @min(demand.max_examined, usage.examined orelse demand.max_examined);
                 return err;
             };
             if (page.examined > demand.max_examined) return error.CypherAnchorBudgetExceeded;
             examined += page.examined;
             approximate = approximate or page.approximate;
-            const seeds = page.seeds;
-            if (seeds.len > limit) return error.CypherInvalidSearchResult;
-            for (seeds) |seed| {
-                if (!std.math.isFinite(seed.score) or !std.mem.eql(u8, seed.node.identity.table, table)) return error.CypherInvalidSearchResult;
-                try merge.add(seed);
-            }
         }
         if (!found) return error.UndefinedGraphTable;
         try checkpoint(ptr);

@@ -24,6 +24,35 @@ const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
+test "opaque owner policy receipt controls retain verifier configuration" {
+    const a = std.testing.allocator;
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    for ([_]bool{ false, true }) |configured| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(path);
+        var owner = try client.Owner.open(.{
+            .context = context.handle,
+            .path = .fromSlice(path),
+            .table_name = .fromSlice("rows"),
+            .group_id = 72,
+            .has_identity_namespace = 1,
+            .identity_table_id = 7,
+            .identity_shard_id = 72,
+            .identity_range_id = 272,
+            .row_policy_authority_secret = .fromSlice(if (configured) "01234567890123456789012345678901" else ""),
+            .row_policy_authority_issuer = .fromSlice(if (configured) "test-policy-owner" else ""),
+        });
+        defer owner.deinit();
+        try std.testing.expectError(if (configured) error.NotFound else error.RowPolicyAuthenticationRequired, owner.lookupJson("rows",
+            \\{"key":"","row_policy_receipt":{"generation":1,"phase":"pending_install"}}
+        ));
+    }
+}
+
 test "opaque owner retained relational read crosses checked archive boundary" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4512,4 +4541,39 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
+}
+
+test "opaque metadata job projections retain binary checkpoints and authoritative quotas" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    const jobs = @import("../metadata/job_state.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    try std.testing.expect((try store.getJobState(a, group, "documents/missing")) == null);
+    try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, group, "alice"));
+    const checkpoint = "\xff\x00\x80checkpoint";
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = "checkpoints/opaque", .expected_hash = "", .value = checkpoint } });
+    const binary = (try store.getJobState(a, group, "checkpoints/opaque")).?;
+    defer a.free(binary);
+    const queued = "{\"owner\":\"alice\",\"state\":\"queued\"}";
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = "documents/native", .expected_hash = "", .value = queued } });
+    try std.testing.expectEqual(@as(u64, 1), try store.getJobOwnerCount(a, group, "alice"));
+    const page_bytes = try store.scanJobState(a, group, null);
+    defer a.free(page_bytes);
+    var page = try std.json.parseFromSlice(jobs.Page, a, page_bytes, .{ .allocate = .alloc_always });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
+    try std.testing.expectEqualStrings("documents/native", page.value.rows[0].key);
+    try std.testing.expectEqualStrings(queued, page.value.rows[0].value);
+    try std.testing.expectEqualSlices(u8, checkpoint, binary);
+    const hash = jobs.digest(queued);
+    const finished = "{\"owner\":\"alice\",\"state\":\"succeeded\"}";
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = "documents/native", .expected_hash = &hash, .value = finished } });
+    try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, group, "alice"));
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, store.getJobState(a, group, "../outside"));
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, group, "../outside"));
 }

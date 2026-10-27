@@ -3865,3 +3865,104 @@ both ordered indexes before its fully indexed 64,000-row ingestion, avoiding
 an unrelated late-backfill race. Its nine-/32-alternative queries retain the
 strict 64-anchor ceiling and at-most-16-scans assertion. An isolated
 authenticated 64,000-row probe returns the same top ten using 12 scans.
+
+Ordered capability probes and initial one-row owner heads now use bounded
+remote read waves. The coordinator preserves catalog owner positions when
+collecting replies, so sorting, ties and nested continuations retain their
+original semantics. Already-finished owners are omitted on resume. Later
+refills still follow the winning stream and the consumer's remaining demand.
+Cross-owner get-many uses the same wave admission, with per-owner identities
+and original output positions; identity validation and overlap rejection run
+before accepted values enter the result. Local capabilities stay on the
+controller thread, including when routing interleaves local and remote owners.
+
+Read waves have independent arenas and work counters, disjoint candidate
+reservations, and coordinator headroom. Tight ceilings and backends without
+isolated counters use sequential admission. Every started read joins before
+results are combined or scratch is released. Work-limited private ordered
+and batched reads return consumed work over RPC; authority is rechecked before
+returning a budget failure. Failed reads without candidate progress consume
+their entire candidate reservation. A skewed reservation can retry once with
+the unused whole-wave capacity; no work or candidate admission is refunded.
+Fatal errors, cancellation and quota failures drain the started wave.
+
+Sequential search, local-owner search and the one-owner fallback within a
+remote search now reclaim each owner page after promoting only surviving
+top-k entries. Owner value accounting also reclaims its transient metadata
+cache instead of retaining it in the statement arena. This bounds payload
+retention independently of the number of owner pages even when parallel
+execution is unavailable or a small quota selects the sequential path.
+
+This integration merges origin/main at 9ace47d36392. Metadata protocol 45
+fences durable document job state and transaction sessions, whose independent
+branches had both used version 43. Runtime semantic-detail ABI 2 combines
+the document/inference and graph inventories while preserving their common
+prefix and testing the new extension boundary explicitly.
+The complete main inventory precedes the graph extension: all 826 semantic
+detail identifiers, 15 behavior codes and 78 metadata transition identifiers
+match origin/main. Golden tests cover the endpoint at 781, document details
+at 782 through 825, and the graph extension beginning at 826.
+The metadata command frames preserve main's durable job tag 79 and assign
+transaction sessions tag 80, with an encoder/decoder regression for both.
+
+The same injected-five-millisecond probes now measure get-many for 8/16/64
+owners at 6/12/57 ms, versus 50/95/390 ms before. Ordered first-page startup
+is 12/25/109 ms versus 97/195/778 ms. These isolate scheduling and assert equal
+results; they do not measure production storage or network latency. With one
+4 KiB candidate per owner and a top-two result, sequential search peak memory
+for 8/32/128/512 owners is 41/38/41/42 KB (decimal), versus approximately
+79/207/605/2,420 KB before. The 128-owner query now succeeds under a 256 KiB
+ceiling in both sequential and parallel modes.
+
+The merged native metadata facade now exposes job lookup, paged scans and
+per-owner counts through the compiled kernel projection channel. Checkpoint
+and scan buffers transfer as owned opaque bytes, preserving binary values
+and avoiding a second JSON encoding. A real compiled-owner regression covers
+binary checkpoints, scheduled rows, quota transitions and invalid cursors.
+Private failure ABI 67 appends InvalidDocumentCheckpoint and TooManyActiveJobs
+as identities 903 and 904 without changing earlier status values. This keeps
+expected document-job errors
+distinct across the kernel boundary rather than classifying them as defects.
+
+Retained-read ingress converts its clock-labelled transport deadline to the
+native platform clock before binding an owner route fence. This preserves the
+remaining budget across different clock epochs, including Darwin's awake and
+monotonic clocks, rather than rejecting fresh graph admission as expired.
+The regression uses distinct clock epochs and rejects an expired transport
+budget.
+
+SQL also preserves replicated owner-read admission failures as retryable
+SQLSTATE 53300/HTTP 503 rather than internal XX000 errors. The diagnostic
+regression covers unavailable reads, leadership changes and read-index
+timeouts while preserving authorization, cancellation and unknown-write
+outcomes. The authenticated verifier can restart explicitly read-only, idle SQL statements on retryable
+53300 admission failures or 40001 snapshot restarts; mutation requests never
+opt into that retry path.
+The six qualification campaigns share a retry guard with three contract tests
+covering nonadmission, stateless SQL reads, active transactions, malformed
+responses and unknown mutation outcomes. Explicitly expected failures remain
+observable by their assertions.
+The policy verifier separately retries only explicit write nonadmission;
+admitted writes resolve their durable receipts. Its four replicated postimage
+checks pass, and a compiled-owner regression verifies that receipt probes
+require configured authority. The mutation campaign allows 300 seconds for
+32 checks and two independently bounded 60-second index-generation waits.
+
+Qualification passes 484 native Cypher cases, 42 runtime error ABI cases,
+nine private failure-identity cases, nine standalone SQL diagnostic cases,
+and 1,310 SQL cases across both partitions (24 build/run steps). All 1,156
+public Cypher/performance cases pass against the final shared library in one
+complete run, including both storage modes and the membership, search,
+SQL GRAPH_TABLE and quota regressions. The combined metadata, private
+transport, retained-cut and graph-authority qualification passes 100 steps,
+including 10 transport cases and three durable metadata cases. Two focused
+compiled-owner runs each pass all 56 steps, covering binary job projections,
+quota transitions, typed errors and policy verifier configuration. The
+execution-budget gate passes all 67 steps and 14 cases. The final shared
+library passes all 50 build/export steps, with exactly 137 public functions
+and no internal exports; the production server/library/export build passes
+all 88 steps. Generated Go SDK tests and the merged workbench build pass.
+Authenticated qualification passes all 10 selected cases across the suite
+and replicated-owner rerun. The latter completes all six campaigns, durable
+receipt reads from every metadata replica, metadata-leader loss, duplicate
+request-ID rejection across graphs, and receipt reads after node restart.

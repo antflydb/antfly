@@ -47,7 +47,7 @@ pub const Request = struct {
     include_relationships: bool = false,
 };
 pub const Projection = struct { node: ?*const v.Node, relationships: []const *const v.Relationship = &.{} };
-const Reply = struct { search_failure: ?enum { work, anchors } = null, exact_keys: bool = false, stable_ties: bool = true, encounter_owners: ?[]const usize = null, cursors: ?[]const ?[]const u8 = null, cursor_trace: ?b.CursorTrace = null, ordered: bool = false, estimate: ?usize = null, population: ?u64 = null, unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
+const Reply = struct { read_failure: ?enum { work, anchors } = null, search_failure: ?enum { work, anchors } = null, exact_keys: bool = false, stable_ties: bool = true, encounter_owners: ?[]const usize = null, cursors: ?[]const ?[]const u8 = null, cursor_trace: ?b.CursorTrace = null, ordered: bool = false, estimate: ?usize = null, population: ?u64 = null, unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
 pub const Channel = struct { ptr: *anyopaque, call: *const fn (*anyopaque, A, []const u8) anyerror![]u8, checkpoint: ?*const fn (*anyopaque) anyerror!void = null };
 pub const Version = struct { incarnation: u64, revision: u64 };
 pub const Client = struct {
@@ -84,6 +84,13 @@ pub const Client = struct {
         const reply = try std.json.parseFromSliceLeaky(Reply, a, response, .{ .allocate = .alloc_always });
         if (reply.work > bounded.max_work) return error.CypherInvalidBackendPage;
         if (self.work) |work| try work.charge(work.ptr, reply.work);
+        if (reply.read_failure) |failure| {
+            if ((request.operation != .scan_ordered and request.operation != .get_many) or reply.values.len != 0 or reply.next != null or reply.ordered or reply.cursors != null or reply.cursor_trace != null) return error.CypherInvalidBackendPage;
+            return switch (failure) {
+                .work => error.CypherStateBudgetExceeded,
+                .anchors => error.CypherAnchorBudgetExceeded,
+            };
+        }
         return reply;
     }
     fn bind(ptr: *anyopaque, _: A, graph: catalog.Graph) !void {
@@ -309,6 +316,15 @@ pub const Owner = struct {
         for (self.graph.labels) |label| if (std.mem.eql(u8, label.table, table)) return true;
         return false;
     }
+    fn readFailure(self: Owner, a: A, units: usize, err: anyerror) ![]u8 {
+        const failure: @typeInfo(@FieldType(Reply, "read_failure")).optional.child = switch (err) {
+            error.CypherStateBudgetExceeded => .work,
+            error.CypherAnchorBudgetExceeded => .anchors,
+            else => return err,
+        };
+        try self.backend.vtable.checkpoint(self.backend.ptr);
+        return std.json.Stringify.valueAlloc(a, .{ .read_failure = failure, .work = units }, .{});
+    }
     pub fn execute(self: Owner, a: A, body: []const u8) ![]u8 {
         if (body.len > 1 << 20) return error.CypherRequestTooLarge;
         var arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
@@ -362,7 +378,7 @@ pub const Owner = struct {
                 for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op };
                 const order = try scratch.alloc(b.PropertyOrder, request.order.len);
                 for (request.order, order) |input, *out| out.* = .{ .property = input.property, .descending = input.descending, .exclude_null = input.exclude_null, .after = if (input.after) |key| try v.Value.fromJson(scratch, key.value) else null };
-                const page = if (self.backend.vtable.scan_ordered) |read| try read(self.backend.ptr, scratch, request.table, filters, order, request.after, request.limit, request.max_examined) else null;
+                const page = if (self.backend.vtable.scan_ordered) |read| read(self.backend.ptr, scratch, request.table, filters, order, request.after, request.limit, request.max_examined) catch |err| return self.readFailure(a, meter.units, err) else null;
                 if (page) |ordered| {
                     for (ordered.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
                     return std.json.Stringify.valueAlloc(a, .{ .ordered = true, .stable_ties = ordered.stable_ties, .exact_keys = ordered.exact_keys, .encounter_owners = ordered.encounter_owners, .values = values.items, .cursors = ordered.cursors, .cursor_trace = ordered.cursor_trace, .next = ordered.next, .examined = ordered.examined, .work = meter.units }, .{});
@@ -388,12 +404,12 @@ pub const Owner = struct {
                 if (request.identities.len > 128) return error.CypherOwnerBudgetExceeded;
                 for (request.identities) |identity| if (!self.permitsTable(identity.table)) return error.Forbidden;
                 if (self.backend.vtable.get_many) |get_many| {
-                    const nodes = try get_many(self.backend.ptr, scratch, request.identities);
+                    const nodes = get_many(self.backend.ptr, scratch, request.identities) catch |err| return self.readFailure(a, meter.units, err);
                     if (nodes.len != request.identities.len) return error.CypherInvalidBackendPage;
                     for (nodes) |node| try values.append(scratch, .{ .value = if (node) |item| .{ .node = item } else .null });
                 } else for (request.identities) |identity| {
-                    try meter.work().charge(meter.work().ptr, 1);
-                    const node = try self.backend.vtable.get(self.backend.ptr, scratch, identity);
+                    meter.work().charge(meter.work().ptr, 1) catch |err| return self.readFailure(a, meter.units, err);
+                    const node = self.backend.vtable.get(self.backend.ptr, scratch, identity) catch |err| return self.readFailure(a, meter.units, err);
                     try values.append(scratch, .{ .value = if (node) |item| .{ .node = item } else .null });
                 }
             },
@@ -536,4 +552,57 @@ test "search quota failures return charged work and candidate progress through R
     try std.testing.expectEqual(@as(?usize, 3), usage.examined);
     fixture.revoked = true;
     try std.testing.expectError(error.Forbidden, client.backend().vtable.search.?(&client, std.testing.allocator, "docs", input));
+}
+
+test "ordered and batched read failures retain charged work over private RPC" {
+    const Fixture = struct {
+        work: ?b.Work = null,
+        revoke_on_failure: bool = false,
+        revoked: bool = false,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.revoked) return error.Forbidden;
+        }
+        fn configure(ptr: *anyopaque, work: ?b.Work) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.work = work;
+        }
+        fn consume(self: *@This()) !void {
+            defer if (self.revoke_on_failure) {
+                self.revoked = true;
+            };
+            for (0..8) |_| if (self.work) |work| try work.charge(work.ptr, 1);
+            return error.CypherAnchorBudgetExceeded;
+        }
+        fn ordered(ptr: *anyopaque, _: A, _: []const u8, _: []const b.PropertyFilter, _: []const b.PropertyOrder, _: ?[]const u8, _: usize, _: usize) !?b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.consume();
+            unreachable;
+        }
+        fn getMany(ptr: *anyopaque, _: A, _: []const v.Identity) ![]const ?*const v.Node {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.consume();
+            unreachable;
+        }
+        fn call(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
+            const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
+            const owner: Owner = .{ .backend = .{ .ptr = ptr, .vtable = &.{ .bind = undefined, .checkpoint = check, .scan = undefined, .get = undefined, .expand = undefined, .scan_ordered = ordered, .get_many = getMany, .set_work = configure } }, .graph = graph, .table = "docs" };
+            return owner.execute(a, body);
+        }
+    };
+    for ([_]bool{ false, true }) |ordered| {
+        var f: Fixture = .{};
+        const leaf: b.Backend = .{ .ptr = &f, .vtable = &.{ .bind = undefined, .checkpoint = Fixture.check, .scan = undefined, .get = undefined, .expand = undefined } };
+        var meter: b.Meter = .{ .a = std.testing.allocator, .backend = leaf, .limit = 5 };
+        var client: Client = .{ .channel = .{ .ptr = &f, .call = Fixture.call }, .incarnation = 1, .revision = 1, .work = meter.work() };
+        for ([_]usize{ 5, 20, 20 }) |limit| {
+            meter.limit = limit;
+            meter.units = 0;
+            const expected = if (f.revoke_on_failure) error.Forbidden else if (limit == 5) error.CypherStateBudgetExceeded else error.CypherAnchorBudgetExceeded;
+            const backend = client.backend();
+            if (ordered) try std.testing.expectError(expected, backend.vtable.scan_ordered.?(backend.ptr, std.testing.allocator, "docs", &.{}, &.{.{ .property = "score" }}, null, 1, 10)) else try std.testing.expectError(expected, backend.vtable.get_many.?(backend.ptr, std.testing.allocator, &.{.{ .table = "docs", .key = "n0" }}));
+            if (!f.revoke_on_failure) try std.testing.expectEqual(@as(usize, if (limit == 5) 5 else 8), meter.units);
+            if (limit == 20) f.revoke_on_failure = true;
+        }
+    }
 }

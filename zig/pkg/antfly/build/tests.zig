@@ -2107,6 +2107,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db graph search filters result nodes and hidden traversal intermediates",
         "internal transaction HTTP responses prove not-proposed only before decision",
         "internal transaction ingress establishes and validates pre-decision deadline",
+        "retained read ingress translates transport deadlines into the native owner clock",
         "internal read-index absence response requires typed native proof",
         "request admission bounds positive capacity and preserves unlimited mode",
         "request admission lease releases exactly once",
@@ -2232,7 +2233,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-native-query-repository-test", "Run native query checkpoint reuse, retention and executor ownership contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, native_query_repository_tests, native_query_repository_filters).step);
-    const execution_budget_filters = &.{ "internal transaction ingress establishes", "online merge ingress bounds", "public execution", "remote shard query phases propagate deadline and request cancellation", "remote scan fails closed without streaming and honors cancellation before transport", "table reads translate request deadlines into the routing clock" };
+    const execution_budget_filters = &.{ "internal transaction ingress establishes", "retained read ingress translates transport deadlines", "online merge ingress bounds", "public execution", "remote shard query phases propagate deadline and request cancellation", "remote scan fails closed without streaming and honors cancellation before transport", "table reads translate request deadlines into the routing clock" };
     const execution_budget_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = execution_budget_filters,

@@ -11,6 +11,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from cypher_qualification_retry import retry_allowed
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -27,7 +29,14 @@ def main():
     checks = 0
 
     def call(
-        method, path, body=None, *, credential=admin, status=None, retry_aborted=False
+        method,
+        path,
+        body=None,
+        *,
+        credential=admin,
+        status=None,
+        retry_aborted=False,
+        read_only=False,
     ):
         request = urllib.request.Request(
             args.url.rstrip("/")
@@ -41,11 +50,20 @@ def main():
             },
             method=method,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=40) as response:
-                code, raw = response.status, response.read()
-        except urllib.error.HTTPError as error:
-            code, raw = error.code, error.read()
+        for attempt in range(40):
+            try:
+                with urllib.request.urlopen(request, timeout=40) as response:
+                    code, raw = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                code, raw = error.code, error.read()
+            if (
+                attempt < 39
+                and status != code
+                and retry_allowed(code, raw, path=path, body=body, read_only=read_only)
+            ):
+                time.sleep(0.25)
+                continue
+            break
         if retry_aborted and code == 409 and raw == b"batch transaction conflicted":
             # This response is a definite prepare abort, never an unknown outcome.
             for _ in range(30):
@@ -119,7 +137,10 @@ def main():
         assert (
             len(
                 call(
-                    "POST", f"/sql/prepared/{prepared_id}/execute", {"parameters": []}
+                    "POST",
+                    f"/sql/prepared/{prepared_id}/execute",
+                    {"parameters": []},
+                    read_only=True,
                 )["rows"]
             )
             == 2

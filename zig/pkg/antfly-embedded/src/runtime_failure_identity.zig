@@ -30,6 +30,8 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
+    .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
     .{ .status = .grouped_source_owner_changed, .err = error.GroupedSourceOwnerChanged },
     .{ .status = .grouped_source_topology_unavailable, .err = error.GroupedSourceTopologyUnavailable },
     .{ .status = .apple_intelligence_provider_unavailable, .err = error.AppleIntelligenceProviderUnavailable },
@@ -1191,4 +1193,12 @@ test "logical value exact sort rejection survives both compiled query boundaries
         try std.testing.expectError(error.UnsupportedExactSort, statusToError(failure.status));
         try std.testing.expectEqualStrings("UnsupportedExactSort", failure.errorName());
     }
+}
+
+test "document job failures retain distinct semantic identities at the compiled boundary" {
+    try std.testing.expectEqual(@as(u32, 67), abi.abi_version);
+    try std.testing.expectEqual(@as(u32, 903), @backingInt(statusFromError(error.InvalidDocumentCheckpoint)));
+    try std.testing.expectEqual(@as(u32, 904), @backingInt(statusFromError(error.TooManyActiveJobs)));
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, statusToError(.invalid_document_checkpoint));
+    try std.testing.expectError(error.TooManyActiveJobs, statusToError(.too_many_active_jobs));
 }

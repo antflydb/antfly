@@ -10,11 +10,13 @@ import base64
 import concurrent.futures
 import json
 import os
-from pathlib import Path
 import time
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
+
+from cypher_qualification_retry import retry_allowed
 
 
 def main():
@@ -39,7 +41,15 @@ def main():
     reader_password = uuid.uuid4().hex
     checks = 0
 
-    def call(method, path, body=None, authenticated=True, status=None, credential=None):
+    def call(
+        method,
+        path,
+        body=None,
+        authenticated=True,
+        status=None,
+        credential=None,
+        read_only=False,
+    ):
         headers = {"Content-Type": "application/json"}
         if authenticated:
             headers["Authorization"] = (
@@ -61,11 +71,15 @@ def main():
                     code, content = response.status, response.read()
             except urllib.error.HTTPError as error:
                 code, content = error.code, error.read()
-            if code == 503 and attempt < 39 and status != 503:
-                failure = json.loads(content)
-                if failure.get("write_outcome") == "not_started":
-                    time.sleep(0.25)
-                    continue
+            if (
+                attempt < 39
+                and status != code
+                and retry_allowed(
+                    code, content, path=path, body=body, read_only=read_only
+                )
+            ):
+                time.sleep(0.25)
+                continue
             break
         assert (200 <= code < 300) if status is None else code == status, (
             method,
@@ -328,21 +342,24 @@ def main():
         checks += 1
         if not args.skip_sql:
             statement = f"SELECT g.id FROM GRAPH_TABLE({graph} MATCH (n IS Document) COLUMNS (n.id AS id)) AS g ORDER BY g.id"
-            response = call("POST", "/sql", {"statement": statement})
+            response = call("POST", "/sql", {"statement": statement}, read_only=True)
             assert response["rows"] == [["a"], ["b"], ["c"]]
             checks += 1
             parameterized = f"SELECT g.id FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id=$1 COLUMNS (n.id AS id)) AS g"
             response = call(
-                "POST", "/sql", {"statement": parameterized, "parameters": ["b"]}
+                "POST",
+                "/sql",
+                {"statement": parameterized, "parameters": ["b"]},
+                read_only=True,
             )
             assert response["rows"] == [["b"]]
             checks += 1
             joined = f"SELECT g.key, d._id FROM GRAPH_TABLE({graph} MATCH (n IS Document) COLUMNS (antfly.documentKey(n) AS key)) AS g JOIN {table} AS d ON d._id=g.key ORDER BY g.key"
-            response = call("POST", "/sql", {"statement": joined})
+            response = call("POST", "/sql", {"statement": joined}, read_only=True)
             assert response["rows"] == [["a", "a"], ["c", "c"], ["β", "β"]]
             checks += 1
             distinct = f"SELECT g.id,h.id FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='a' COLUMNS (n.id AS id)) g JOIN GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='b' COLUMNS (n.id AS id)) h ON true"
-            response = call("POST", "/sql", {"statement": distinct})
+            response = call("POST", "/sql", {"statement": distinct}, read_only=True)
             assert response["rows"] == [["a", "b"]]
             checks += 1
             call(
@@ -356,7 +373,7 @@ def main():
             )
             created_second_graph = True
             cross_graph = f"SELECT g.id,h.id FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='a' COLUMNS (n.id AS id)) g JOIN GRAPH_TABLE({second_graph} MATCH (n IS Document) COLUMNS (n.id AS id)) h ON true"
-            response = call("POST", "/sql", {"statement": cross_graph})
+            response = call("POST", "/sql", {"statement": cross_graph}, read_only=True)
             assert response["rows"] == [["a", "b"]]
             checks += 1
             response = call(
@@ -365,6 +382,7 @@ def main():
                 {
                     "statement": f"SELECT g.node FROM GRAPH_TABLE({graph} MATCH (n IS Document) COLUMNS (n AS node)) g LIMIT 1"
                 },
+                read_only=True,
             )
             assert response["rows"][0][0]["type"] == "node"
             checks += 1
@@ -376,6 +394,7 @@ def main():
                     "POST",
                     f"/sql/prepared/{prepared_id}/execute",
                     {"parameters": ["b"]},
+                    read_only=True,
                 )
                 assert response["rows"] == [["b"]]
                 checks += 1
@@ -427,7 +446,11 @@ def main():
         checks += 1
         if not args.skip_sql:
             response = call(
-                "POST", "/sql", {"statement": statement}, credential=credential
+                "POST",
+                "/sql",
+                {"statement": statement},
+                credential=credential,
+                read_only=True,
             )
             assert response["rows"] == [["a"], ["b"], ["c"]]
             checks += 1
@@ -597,6 +620,7 @@ def main():
                 {
                     "statement": f"SELECT g.id FROM GRAPH_TABLE({graph} MATCH (n IS Document) COLUMNS (n.id AS id)) g ORDER BY g.id"
                 },
+                read_only=True,
             )
             assert response["rows"] == [["a"], ["b"], ["c"]]
             checks += 3

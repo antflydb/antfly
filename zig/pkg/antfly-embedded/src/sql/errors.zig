@@ -235,7 +235,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlWriteConflict, error.PreparedReadSetChanged, error.VersionConflict, error.IntentConflict => .{ .code = "40001", .message = "The mutation conflicted with a concurrent change and was not committed.", .hint = "Read the current rows before retrying the complete statement.", .retryable = true },
         error.FileBusy, error.WouldBlock => .{ .code = "55P03", .message = "The database resource is temporarily locked.", .hint = "Retry the complete statement after the competing operation finishes.", .retryable = true },
         error.SqlWriteCapacityUnavailable, error.SqlPlanCacheBusy, error.Backpressured, error.DenseRepairBackpressure => .{ .code = "53300", .message = "SQL execution capacity is temporarily exhausted.", .hint = "Retry after a bounded delay; reduce concurrent requests.", .retryable = true },
-        error.SqlStatementReadUnavailable, error.EnrichmentRetryInProgress, error.CypherSnapshotNotReady, error.CypherSnapshotRequired => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
+        error.SqlStatementReadUnavailable, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.ReadIndexTimeout, error.EnrichmentRetryInProgress, error.CypherSnapshotNotReady, error.CypherSnapshotRequired => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
         error.RestoreValidationPending => .{ .code = "53300", .message = "The source owner is not ready to admit a schema rewrite.", .hint = "No rewrite job was admitted; wait for the table owner to become ready before retrying the DDL.", .retryable = true },
         error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary => .{ .code = "25006", .message = "This server is not accepting writes in its current standby or fencing state.", .hint = "Send the mutation to an active writable primary.", .retryable = false },
         error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown => .{ .code = "40003", .message = "The mutation outcome is unknown; it may already have committed.", .hint = "Do not replay the statement. Use its transaction receipt to reconcile the outcome.", .retryable = false },
@@ -292,6 +292,18 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         try std.testing.expect(value.hint != null);
         try std.testing.expect(std.mem.indexOf(u8, value.message, @errorName(case.err)) == null);
     }
+}
+
+test "SQL graph owner admission failures retain retryable read diagnostics" {
+    for ([_]anyerror{ error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.ReadIndexTimeout }) |failure| {
+        const diagnostic = describe(failure);
+        try std.testing.expectEqualStrings("53300", diagnostic.code);
+        try std.testing.expectEqual(@as(u16, 503), diagnostic.httpStatus());
+        try std.testing.expectEqual(@as(?bool, true), diagnostic.retryable);
+    }
+    try std.testing.expectEqualStrings("42501", describe(error.Forbidden).code);
+    try std.testing.expectEqualStrings("57014", describe(error.DeadlineExceeded).code);
+    try std.testing.expectEqual(@as(?bool, false), describe(error.SqlMutationOutcomeUnknown).retryable);
 }
 
 test "SQL FK decoder upgrade is definite nonadmission not an ambiguous DDL outcome" {

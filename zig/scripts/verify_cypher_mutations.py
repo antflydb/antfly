@@ -10,6 +10,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from cypher_qualification_retry import retry_allowed
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -39,27 +41,23 @@ def main():
                     code, content = response.status, response.read()
             except urllib.error.HTTPError as error:
                 code, content = error.code, error.read()
-            if (
-                code == 503
-                and attempt < 39
-                and json.loads(content).get("write_outcome") == "not_started"
-            ):
-                time.sleep(0.25)
-                continue
-            # Producer publication may invalidate a newly captured read cut.
-            # Restart only this complete, stateless read; never a write/page.
-            if (
-                code in (409, 503)
-                and attempt < 39
-                and status is None
+            # These SELECT fixtures are stateless; active transactions below
+            # explicitly roll back before their complete transaction is retried.
+            read_only = (
+                status is None
                 and path == "/sql"
-                and body is not None
+                and isinstance(body, dict)
                 and "session_id" not in body
                 and body.get("statement", "").lstrip().upper().startswith("SELECT ")
-                and json.loads(content).get("code") in ("40001", "53300")
-                and json.loads(content).get("retryable") is True
+            )
+            if (
+                attempt < 39
+                and status != code
+                and retry_allowed(
+                    code, content, path=path, body=body, read_only=read_only
+                )
             ):
-                time.sleep(0.1)
+                time.sleep(0.25)
                 continue
             break
         assert (200 <= code < 300) if status is None else code == status, (

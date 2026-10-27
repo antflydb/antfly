@@ -26196,7 +26196,8 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
-    apply_transaction_sessions = 79,
+    // Main already owns 79 for durable document job state.
+    apply_transaction_sessions = 80,
     apply_resolver_authority = 78,
     apply_relation_reconciliation = 76,
     mutate_lake_index_lifecycle = 75,
@@ -40799,4 +40800,24 @@ test "metadata durable job state keeps quotas and due indexes atomic and paged" 
     defer after.deinit();
     for (after.value.rows) |row| try std.testing.expect(!std.mem.eql(u8, row.key, "documents/bounded-0"));
     try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, "../bad-cursor"));
+}
+
+test "metadata durable job state and transaction sessions retain distinct command frames" {
+    const a = std.testing.allocator;
+    const record = try transaction_session_record.encode(a, .{ .changes = &.{.{ .key = "frame-check", .expected = null, .value = "session" }} });
+    defer a.free(record);
+    const transaction = try encodeTransitionCommand(a, .{ .apply_transaction_sessions = record });
+    defer a.free(transaction);
+    const job = try encodeTransitionCommand(a, .{ .compare_and_set_job_state = .{ .key = "documents/frame-check", .expected_hash = "", .value = "{\"owner\":\"alice\",\"state\":\"queued\"}" } });
+    defer a.free(job);
+    // Preserve main's durable job tag and give the graph branch's transaction
+    // journal its own frame, admitted only by the merged protocol floor.
+    try std.testing.expectEqual(@as(u8, 79), job[transition_magic.len]);
+    try std.testing.expectEqual(@as(u8, 80), transaction[transition_magic.len]);
+    var decoded_transaction = (try decodeTransitionCommand(a, transaction)).?;
+    defer decoded_transaction.deinit(a);
+    try std.testing.expectEqualStrings(record, decoded_transaction.apply_transaction_sessions);
+    var decoded_job = (try decodeTransitionCommand(a, job)).?;
+    defer decoded_job.deinit(a);
+    try std.testing.expectEqualStrings("documents/frame-check", decoded_job.compare_and_set_job_state.key);
 }

@@ -10,6 +10,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from cypher_qualification_retry import retry_allowed
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -24,7 +26,7 @@ def main():
     filtered = graph + "_filtered"
     created_table = created_graph = created_filtered = False
 
-    def call(path, body=None, method="POST", expected_status=None):
+    def call(path, body=None, method="POST", expected_status=None, read_only=False):
         request = urllib.request.Request(
             args.url.rstrip("/") + "/db/v1" + path,
             data=None if body is None else json.dumps(body).encode(),
@@ -40,13 +42,15 @@ def main():
                     status, content = response.status, response.read()
             except urllib.error.HTTPError as error:
                 status, content = error.code, error.read()
-            if status == 503 and attempt < 39:
-                failure = json.loads(content)
-                # A proven rejection before execution is safe to retry while a
-                # newly provisioned replicated owner elects its leader.
-                if failure.get("write_outcome") == "not_started":
-                    time.sleep(0.25)
-                    continue
+            if (
+                attempt < 39
+                and expected_status != status
+                and retry_allowed(
+                    status, content, path=path, body=body, read_only=read_only
+                )
+            ):
+                time.sleep(0.25)
+                continue
             break
         assert (
             status in (200, 201, 202, 204)
@@ -55,8 +59,8 @@ def main():
         ), (path, status, content.decode())
         return json.loads(content) if content else None
 
-    def sql(statement):
-        return call("/sql", {"statement": statement})
+    def sql(statement, *, read_only=False):
+        return call("/sql", {"statement": statement}, read_only=read_only)
 
     def query(statement):
         result = call(f"/graphs/{graph}/query", {"query": statement})
@@ -75,7 +79,7 @@ def main():
                 for value in expected
             ]
         ], returned
-        stored = sql(f"SELECT amount,total FROM {table}")
+        stored = sql(f"SELECT amount,total FROM {table}", read_only=True)
         assert stored["rows"] == [
             [None if value is None else str(value) for value in expected]
         ], (returned, stored)
@@ -94,10 +98,10 @@ def main():
             "CREATE (n:Document {amount:null}) RETURN n.amount,n.total", [None, None]
         )
         query("MATCH (n:Document) DELETE n")
-        assert sql(f"SELECT amount,total FROM {table}")["rows"] == []
+        assert sql(f"SELECT amount,total FROM {table}", read_only=True)["rows"] == []
         # Creating and deleting a new identity must not stage a durable delete.
         query("CREATE (n:Document) DELETE n")
-        assert sql(f"SELECT amount,total FROM {table}")["rows"] == []
+        assert sql(f"SELECT amount,total FROM {table}", read_only=True)["rows"] == []
         call(
             f"/graphs/{filtered}",
             {"labels": [{"name": "Document", "table": table, "where": {"total": 12}}]},
@@ -109,7 +113,9 @@ def main():
         ):
             result = call(f"/graphs/{filtered}/query", {"query": statement})
             assert [cell["value"] for cell in result["rows"][0]] == ["4", "12"], result
-            assert sql(f"SELECT amount,total FROM {table}")["rows"] == [["4", "12"]]
+            assert sql(f"SELECT amount,total FROM {table}", read_only=True)["rows"] == [
+                ["4", "12"]
+            ]
             query("MATCH (n:Document) DELETE n")
         for value in ("null", "7"):
             failure = call(
@@ -118,7 +124,9 @@ def main():
                 expected_status=400,
             )
             assert failure["code"] == "CypherLabelPredicateViolation", failure
-            assert sql(f"SELECT amount,total FROM {table}")["rows"] == []
+            assert (
+                sql(f"SELECT amount,total FROM {table}", read_only=True)["rows"] == []
+            )
         verify("CREATE (n:Document) RETURN n.amount,n.total", [4, 12])
         verify(
             "MATCH (n:Document) WITH n AS a,n AS b SET a.amount=7 RETURN b.amount,b.total",

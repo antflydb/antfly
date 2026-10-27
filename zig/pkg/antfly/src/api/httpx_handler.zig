@@ -3543,6 +3543,12 @@ pub const AntflyApiHandler = struct {
         return internalQueryResponse(ctx, &result);
     }
 
+    fn retainedReadContext(ctx: *httpx.Context) !operation_contract.RequestContext {
+        // Retained owner capabilities use platform-clock deadlines. Ingress
+        // deadlines use the transport's awake clock, whose epoch can differ.
+        return operationContext(ctx, null).platformDeadline();
+    }
+
     fn internalRetainedRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const rpc = @import("retained_read_rpc.zig");
         // Unlike legacy stateless internal reads, retained handles NEVER accept
@@ -3559,8 +3565,7 @@ pub const AntflyApiHandler = struct {
         var request_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 16 << 20 };
         var parsed = std.json.parseFromSlice(rpc.Request, request_budget.allocator(), body, .{ .parse_numbers = false }) catch return textResponse(ctx, 400, "invalid retained read request");
         defer parsed.deinit();
-        const request = operationContext(ctx, null);
-        try request.ensureActive();
+        const request = try retainedReadContext(ctx);
         var source = self.api_server.table_reads orelse return textResponse(ctx, 503, "retained read source unavailable");
         source.bindCatalogRouteFenceJson(ctx.allocator, request.catalog_route_fence_json, params.group_id, request.deadline_ns, request.cancellation) catch return textResponse(ctx, 400, "invalid catalog route fence");
         const route = source.route_fence orelse return textResponse(ctx, 400, "catalog route fence required");
@@ -11413,6 +11418,29 @@ test "online merge ingress bounds owner work using the transport clock" {
     defer public_ctx.deinit();
     AntflyApiHandler.establishInternalOnlineMergeDeadline(&public_ctx);
     try std.testing.expect(public_ctx.application_deadline_ns == null);
+}
+
+test "retained read ingress translates transport deadlines into the native owner clock" {
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    sim.monotonic_ns = 17 * std.time.ns_per_s;
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/internal/v1/groups/7/tables/docs/retained-read");
+    defer request.deinit();
+    try request.setHeader(metadata_api.catalog_route_fence_header, "{}");
+    try request.setHeader(metadata_api.catalog_route_deadline_ms_header, "250");
+    var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+    defer ctx.deinit();
+    AntflyApiHandler.establishCatalogRouteFenceDeadline(&ctx);
+    const before = platform_time.monotonicNs();
+    const native = try AntflyApiHandler.retainedReadContext(&ctx);
+    const after = platform_time.monotonicNs();
+    try std.testing.expect(native.deadline_io == null);
+    try std.testing.expect(native.deadline_ns.? >= before + 250 * std.time.ns_per_ms);
+    try std.testing.expect(native.deadline_ns.? <= after + 250 * std.time.ns_per_ms);
+    try native.ensureActive();
+    try std.testing.expectEqualStrings("{}", native.catalog_route_fence_json);
+    sim.monotonic_ns += 250 * std.time.ns_per_ms;
+    try std.testing.expectError(error.DeadlineExceeded, AntflyApiHandler.retainedReadContext(&ctx));
 }
 
 test "internal transaction ingress establishes and validates pre-decision deadline" {

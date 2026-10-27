@@ -894,6 +894,51 @@ pub const Detail = enum(c_int) {
     graph_start_identity_required,
     metadata_snapshot_head_mismatch,
     inference_endpoint_access_denied,
+    document_storage_not_configured,
+    document_run_busy,
+    document_run_exists,
+    document_run_expired,
+    document_run_lease_lost,
+    document_run_not_found,
+    document_run_retention_active,
+    document_run_terminal,
+    document_run_store_needs_recovery,
+    document_model_revision_mismatch,
+    document_budget_exhausted,
+    document_output_too_large,
+    document_stage_in_flight,
+    invalid_document_checkpoint,
+    too_many_active_jobs,
+    // Durable document policy must survive independently compiled runtimes.
+    invalid_document_source,
+    unsupported_document_format,
+    document_source_limit_exceeded,
+    document_page_limit_exceeded,
+    document_pixel_limit_exceeded,
+    document_media_type_mismatch,
+    invalid_document_selection,
+    duplicate_document_source,
+    document_unresolved,
+    document_capability_mismatch,
+    unsupported_document_request_field,
+    remote_document_model_denied,
+    cloudflare_credential_missing,
+    invalid_cloudflare_config,
+    unsupported_cloudflare_model,
+    unsupported_cloudflare_schema,
+    cloudflare_authentication_failed,
+    invalid_extractor_response,
+    unsupported_extraction_schema_version,
+    invalid_inference_request,
+    document_artifact_not_found,
+    document_artifact_expired,
+    cloudflare_rate_limited,
+    inference_upstream_rate_limited,
+    inference_capacity_unavailable,
+    inference_transport_unavailable,
+    cloudflare_inference_failed,
+    invalid_cloudflare_response,
+    document_token_limit_exceeded,
     // Append-only Cypher details preserve graph errors across owner callbacks.
     cypher_aggregate_scope,
     cypher_aggregate_wildcard,
@@ -975,51 +1020,6 @@ pub const Detail = enum(c_int) {
     missing_cypher_parameter,
     sql_write_capacity_unavailable,
     sql_statement_read_unavailable,
-    document_storage_not_configured,
-    document_run_busy,
-    document_run_exists,
-    document_run_expired,
-    document_run_lease_lost,
-    document_run_not_found,
-    document_run_retention_active,
-    document_run_terminal,
-    document_run_store_needs_recovery,
-    document_model_revision_mismatch,
-    document_budget_exhausted,
-    document_output_too_large,
-    document_stage_in_flight,
-    invalid_document_checkpoint,
-    too_many_active_jobs,
-    // Durable document policy must survive independently compiled runtimes.
-    invalid_document_source,
-    unsupported_document_format,
-    document_source_limit_exceeded,
-    document_page_limit_exceeded,
-    document_pixel_limit_exceeded,
-    document_media_type_mismatch,
-    invalid_document_selection,
-    duplicate_document_source,
-    document_unresolved,
-    document_capability_mismatch,
-    unsupported_document_request_field,
-    remote_document_model_denied,
-    cloudflare_credential_missing,
-    invalid_cloudflare_config,
-    unsupported_cloudflare_model,
-    unsupported_cloudflare_schema,
-    cloudflare_authentication_failed,
-    invalid_extractor_response,
-    unsupported_extraction_schema_version,
-    invalid_inference_request,
-    document_artifact_not_found,
-    document_artifact_expired,
-    cloudflare_rate_limited,
-    inference_upstream_rate_limited,
-    inference_capacity_unavailable,
-    inference_transport_unavailable,
-    cloudflare_inference_failed,
-    invalid_cloudflare_response,
-    document_token_limit_exceeded,
 };
 
 pub const Status = extern struct {
@@ -3383,7 +3383,8 @@ test "grouped and constrained producer failures preserve callback identity and b
     try std.testing.expectEqual(@backingInt(Code.unsupported), statusFromError(error.UnsupportedGeneratedExtractionSchema).code);
 }
 
-test "merged runtime error details preserve main wire identifiers" {
+test "merged runtime error details preserve the common prefix under ABI two" {
+    try std.testing.expectEqual(@as(u32, 2), abi_version);
     try std.testing.expectEqual(@as(c_int, 674), @backingInt(Detail.inference_worker_executable_not_configured));
     try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
     try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
@@ -3391,7 +3392,10 @@ test "merged runtime error details preserve main wire identifiers" {
     try std.testing.expectEqual(@as(c_int, 778), @backingInt(Detail.invalid_embedding_identity));
     try std.testing.expectEqual(@as(c_int, 779), @backingInt(Detail.graph_start_identity_required));
     try std.testing.expectEqual(@as(c_int, 780), @backingInt(Detail.metadata_snapshot_head_mismatch));
-    try std.testing.expectEqual(@as(c_int, 781), @backingInt(Detail.cypher_aggregate_scope));
+    try std.testing.expectEqual(@as(c_int, 781), @backingInt(Detail.inference_endpoint_access_denied));
+    try std.testing.expectEqual(@as(c_int, 782), @backingInt(Detail.document_storage_not_configured));
+    try std.testing.expectEqual(@as(c_int, 825), @backingInt(Detail.document_token_limit_exceeded));
+    try std.testing.expectEqual(@as(c_int, 826), @backingInt(Detail.cypher_aggregate_scope));
 }
 
 test "logical query work and scan policy failures retain their identities" {

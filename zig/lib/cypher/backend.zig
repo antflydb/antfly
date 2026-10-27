@@ -105,7 +105,11 @@ pub const Meter = struct {
     }
     fn value(ptr: *anyopaque, input: v.Value) !void {
         const self: *Meter = @ptrCast(@alignCast(ptr));
-        var evaluator: @import("value_work.zig").Work = .{ .a = self.a, .ptr = self, .charge = charge };
+        // Each callback creates a fresh metadata cache. Its entries describe
+        // borrowed owner values and must not accumulate in a caller arena.
+        var scratch = std.heap.ArenaAllocator.init(reclaimingAllocator(self.a));
+        defer scratch.deinit();
+        var evaluator: @import("value_work.zig").Work = .{ .a = scratch.allocator(), .ptr = self, .charge = charge };
         try evaluator.output(input);
     }
     fn remaining(ptr: *anyopaque) usize {
@@ -208,3 +212,21 @@ pub const Backend = struct {
         new_identity: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, bool) anyerror!v.Identity = null,
     };
 };
+
+test "owner value accounting reclaims metadata outside a retaining caller arena" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var memory: @import("budget.zig") = .{ .backing = std.testing.allocator, .limit = 16 << 10 };
+    var caller = std.heap.ArenaAllocator.init(memory.allocator());
+    defer caller.deinit();
+    var token: u8 = 0;
+    const owner: Backend = .{ .ptr = &token, .vtable = &.{ .bind = undefined, .checkpoint = Fixture.check, .scan = undefined, .get = undefined, .expand = undefined } };
+    var meter: Meter = .{ .a = caller.allocator(), .backend = owner };
+    const payload: [4096]u8 = @splat('x');
+    const node: v.Node = .{ .identity = .{ .table = "docs", .key = "n0" }, .properties = &.{.{ .name = "payload", .value = .{ .string = &payload } }} };
+    for (0..256) |_| try meter.work().value(meter.work().ptr, .{ .node = &node });
+    try std.testing.expect(meter.units > 256);
+    try std.testing.expectEqual(@as(usize, 0), memory.live);
+    try std.testing.expect(memory.peak < memory.limit);
+}

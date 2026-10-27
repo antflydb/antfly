@@ -259,6 +259,10 @@ def test_authenticated_cypher_across_replicated_owner_nodes(
         "verify_cypher_normalization.py",
         "verify_cypher_postimage_policy.py",
     ]:
+        # Mutations cover 32 checks and two independently bounded 60-second
+        # index-generation waits. Allow the full campaign to consume those
+        # budgets while retaining a bounded subprocess lifetime.
+        qualification_timeout = 300 if filename == "verify_cypher_mutations.py" else 180
         qualification = subprocess.run(
             [sys.executable, str(script.with_name(filename)), "--url", endpoint]
             + (["--distributed"] if filename == "verify_cypher_expressions.py" else []),
@@ -268,7 +272,7 @@ def test_authenticated_cypher_across_replicated_owner_nodes(
             },
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=qualification_timeout,
         )
         policy_diagnostics = []
         if (
@@ -409,11 +413,24 @@ def test_authenticated_cypher_across_replicated_owner_nodes(
             },
             method=method,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                code, content = response.status, response.read()
-        except urllib.error.HTTPError as error:
-            code, content = error.code, error.read()
+        for attempt in range(40):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    code, content = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                code, content = error.code, error.read()
+            # A failover can delay the new graph's owner admission. Only the
+            # explicit not-started response permits replay, including when the
+            # intended result is a duplicate-request rejection.
+            if (
+                code == 503
+                and code not in accepted
+                and attempt < 39
+                and json.loads(content).get("write_outcome") == "not_started"
+            ):
+                time.sleep(0.25)
+                continue
+            break
         assert code in accepted, (path, code, content.decode(), cluster.debug_logs())
         return json.loads(content) if content else None
 

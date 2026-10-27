@@ -10,6 +10,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from cypher_qualification_retry import retry_allowed
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -42,11 +44,20 @@ def main():
             },
             method=method,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=40) as response:
-                code, raw = response.status, response.read()
-        except urllib.error.HTTPError as error:
-            code, raw = error.code, error.read()
+        for attempt in range(40):
+            try:
+                with urllib.request.urlopen(request, timeout=40) as response:
+                    code, raw = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                code, raw = error.code, error.read()
+            if (
+                attempt < 39
+                and code not in accepted
+                and retry_allowed(code, raw, path=path, body=body)
+            ):
+                time.sleep(0.25)
+                continue
+            break
         if retry_aborted and code == 409 and raw == b"batch transaction conflicted":
             # Fresh owners can reject prepare while their routes converge.
             # Only the explicit noncommit response permits fixture replay.
