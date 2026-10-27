@@ -129,6 +129,11 @@ jobs:
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
   darwin:
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
     needs: approve
     if: contains(fromJSON(needs.approve.outputs.suites), 'darwin')
     uses: ./.github/workflows/diagnose-zig-arm64-bad-alloc.yml
@@ -139,6 +144,11 @@ jobs:
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
   linux-release:
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
     needs: approve
     if: contains(fromJSON(needs.approve.outputs.suites), 'linux-release')
     uses: ./.github/workflows/qualify-linux-release.yml

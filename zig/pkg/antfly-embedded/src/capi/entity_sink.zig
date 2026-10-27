@@ -2729,6 +2729,12 @@ test "capi resolver curation fair coalesced projection work survives a continuou
     }
     try root.db.addResolver(.{ .name = "unowned", .table = "entities", .source_artifact = "unowned", .resolution_artifact = "unowned-resolved", .key_template = "unowned/{{_key}}", .promote = false });
     const static_publications = root.db.core.index_manager.test_resolver_catalog_publications;
+    for (0..8) |i| {
+        const descriptor = (try root.db.core.index_manager.resolverStaticDescriptor(scratch, try std.fmt.allocPrint(scratch, "r-{d}", .{i}))).?;
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(scratch, "r-{d}", .{i}), descriptor.name);
+    }
+    const lookups = root.db.core.index_manager.test_resolver_lookup_builds;
+    const reservation_visits = root.db.core.index_manager.test_resolver_reservation_visits;
     for (0..12) |i| {
         const reverse = @import("../storage/lite/resolver_consumers.zig");
         reverse.test_binding_visits.store(0, .monotonic);
@@ -2754,6 +2760,8 @@ test "capi resolver curation fair coalesced projection work survives a continuou
     try std.testing.expect(!try authority.hasProjectionDebt(root, &root.db, scratch));
     try std.testing.expect(root.db.core.index_manager.getResolver("unowned").?.namespace_curation_generation > 0);
     try std.testing.expectEqual(static_publications, root.db.core.index_manager.test_resolver_catalog_publications);
+    try std.testing.expectEqual(lookups, root.db.core.index_manager.test_resolver_lookup_builds);
+    try std.testing.expectEqual(reservation_visits, root.db.core.index_manager.test_resolver_reservation_visits);
     const revision = root.db.core.index_manager.getResolver("r-0").?.namespace_curation_generation;
     api.antfly_db_close(handle);
     live = false;
@@ -2860,6 +2868,41 @@ test "capi resolver curation connection reads accepted policy and completes appl
     try std.testing.expect(result.value.object.get("applied").?.bool);
 }
 
+test "capi resolver curation query follows native merge unmerge and suppression before replay" {
+    const api = @import("db.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("query-current-curation");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const id = try api.publishHandle(root);
+    defer api.antfly_db_close(id);
+    try root.db.addResolver(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false });
+    // An unrelated artifact's destination is not a query dependency.
+    try root.db.addResolver(.{ .name = "unrelated", .table = "not-created", .source_artifact = "other", .resolution_artifact = "other-resolved", .key_template = "other/{{_key}}", .promote = false });
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    const request = "{\"extraction\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"a\"}]}}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(id, .fromSlice("default"), .fromSlice("concept/a"), .fromSlice("{\"into\":\"concept/b\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice(request), &out));
+    const merged = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+    try std.testing.expectEqualStrings("concept/b", merged.object.get("resolution").?.object.get("entities").?.array.items[0].object.get("doc_ref").?.object.get("key").?.string);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(id, .fromSlice("default"), .fromSlice("concept/a"), .fromSlice("{\"pin_distinct\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice(request), &out));
+    const unmerged = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+    try std.testing.expectEqualStrings("concept/a", unmerged.object.get("resolution").?.object.get("entities").?.array.items[0].object.get("doc_ref").?.object.get("key").?.string);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(id, .fromSlice("default"), .fromSlice("concept/a"), .fromSlice("{}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice(request), &out));
+    const suppressed = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    try std.testing.expectEqualStrings("suppressed", suppressed.object.get("resolution").?.object.get("entities").?.array.items[0].object.get("decision").?.string);
+}
+
 test "capi resolver curation plain admission preserves readers and recovers work without definitions" {
     const api = @import("db.zig");
     const authority = @import("resolver_authority.zig");
@@ -2909,4 +2952,8 @@ test "capi resolver curation plain admission preserves readers and recovers work
     try std.testing.expect(!try authority.hasProjectionDebt(root, &root.db, scratch));
     // Real projection metadata retains its durable feature fence after cleanup.
     try std.testing.expectEqual(catalog.resolver_projection_delta_reader_version, root.db.core.index_manager.minimum_reader_version.load(.acquire));
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualStrings("15", try read.get(catalog.minimum_reader_key));
+    try std.testing.expectError(error.NotFound, read.get(jobs.marker));
 }

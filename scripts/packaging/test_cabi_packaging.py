@@ -290,7 +290,13 @@ class CAbiPackagingTests(unittest.TestCase):
         )
         self.assertIn("permissions:\n  contents: read", artifact_build_workflow)
         self.assertNotIn("contents: write", artifact_build_workflow)
-        self.assertNotIn("id-token: write", artifact_build_workflow)
+        # Only archive builders need keyless, read-only dependency-mirror access.
+        before_archives, archives = artifact_build_workflow.split(
+            "\n  build-zig-runtime-archives:\n", 1
+        )
+        archives, after_archives = archives.split("\n  test-macos-homebrew:\n", 1)
+        self.assertNotIn("id-token: write", before_archives + after_archives)
+        self.assertEqual(archives.count("id-token: write"), 1)
         self.assertNotIn("environment:", artifact_build_workflow)
         self.assertNotIn("publish_objectstorage.py", artifact_build_workflow)
         self.assertNotIn("workflow_dispatch:", release_workflow)
