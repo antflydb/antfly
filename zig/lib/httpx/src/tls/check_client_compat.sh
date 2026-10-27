@@ -16,7 +16,7 @@
 set -eu
 
 root_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/../../../.." && pwd)
-std_dir=$(zig env | sed -n 's/^[[:space:]]*\.std_dir = "\([^"]*\)",$/\1/p')
+std_dir=$("${ZIG:-zig}" env | sed -n 's/^[[:space:]]*\.std_dir = "\([^"]*\)",$/\1/p')
 upstream="$std_dir/crypto/tls/Client.zig"
 compat="$root_dir/lib/httpx/src/tls/client_compat.zig"
 

@@ -45,7 +45,10 @@ class TestRunnerSelection(unittest.TestCase):
             'test "verbose logging" { std.testing.log_level = .debug; '
             'std.log.debug("visible debug", .{}); }\n'
             'test "timed body" { try std.testing.io.sleep(.fromMilliseconds(20), .awake); }\n'
-            'test "progress body" { try std.testing.io.sleep(.fromSeconds(2), .awake); }\n'
+            'test "progress body" { var token: [1]u8 = undefined; '
+            "const count = try std.Io.File.stdin().readStreaming(std.testing.io, &.{&token}); "
+            "try std.testing.expectEqual(@as(usize, 1), count); "
+            "try std.testing.expectEqual(@as(u8, 'r'), token[0]); }\n"
             'test "error logging" { std.log.err("visible error", .{}); }\n'
             'test "environment unavailable" { return error.SkipZigTest; }\n'
             'test "debug allocator policy" { '
@@ -157,20 +160,48 @@ class TestRunnerSelection(unittest.TestCase):
 
     def test_execution_budget_excludes_compilation_and_bounds_a_stuck_test(self):
         for limit, expected in ((20, 124), (5000, 0)):
-            result = subprocess.run(
+            progress_dir = Path(self.temp.name) / f"watchdog-{limit}"
+            progress_dir.mkdir(exist_ok=True)
+            process = subprocess.Popen(
                 [
                     str(self.binary),
                     "--test-filter",
                     "progress body",
                     f"--timeout-ms={limit}",
                 ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                capture_output=True,
-                timeout=7,
+                env={**os.environ, "ANTFLY_TEST_LOG_DIR": str(progress_dir)},
             )
-            self.assertEqual(result.returncode, expected, result.stderr)
-            if expected:
-                self.assertIn("test execution timed out", result.stderr)
+            try:
+                if expected:
+                    # Leave the release pipe open: only the watchdog can end
+                    # this blocked fixture, rather than a fixed sleep expiring.
+                    process.wait(timeout=7)
+                    _, stderr = process.communicate(timeout=1)
+                else:
+                    path = progress_dir / f"{self.progress_prefix}-{process.pid}.log"
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if path.exists() and "START\t" in path.read_text():
+                            break
+                        time.sleep(0.01)
+                    else:
+                        self.fail("watchdog fixture did not start")
+                    # Begin after START, when the watchdog is active. The
+                    # longer budget must survive beyond the 20 ms short case.
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        process.wait(timeout=0.1)
+                    _, stderr = process.communicate(input="r", timeout=7)
+                self.assertEqual(process.returncode, expected, stderr)
+                if expected:
+                    self.assertIn("test execution timed out", stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
 
     def test_timings_measure_body_and_cleanup(self):
         result = subprocess.run(
@@ -204,6 +235,7 @@ class TestRunnerSelection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             process = subprocess.Popen(
                 [str(self.binary), "--test-filter", "progress body"],
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env={**os.environ, "ANTFLY_TEST_LOG_DIR": directory},
@@ -222,7 +254,9 @@ class TestRunnerSelection(unittest.TestCase):
                 self.assertIn(f"ARG\t{self.binary}\n", progress)
                 self.assertIn("progress body", progress)
                 self.assertNotIn("DONE\t", progress)
-                _, stderr = process.communicate(timeout=5)
+                # Release only after observing flushed attribution from a
+                # still-running test. Slow hosts cannot outrun this handshake.
+                _, stderr = process.communicate(input=b"r", timeout=5)
                 self.assertEqual(process.returncode, 0, stderr.decode())
                 progress = path.read_text()
                 for phase in ("IO_DEINIT", "ALLOCATOR_DEINIT", "DONE"):
