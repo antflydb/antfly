@@ -3595,6 +3595,8 @@ test "SQL role defaults decoder admission gates raw proposals without widening l
 
 test "relational topology admission rejects lifecycle proposals before encoding with mixed resolver SQL decoder floors" {
     const protocol = metadata_topology_protocol;
+    const job: metadata_storage.TransitionCommand = .{ .compare_and_set_job_state = .{ .key = "documents/decoder", .expected_hash = "", .value = "{}" } };
+    try std.testing.expectEqual(protocol.job_state_version, transitionRequiredCoordinatedDecoderVersion(job));
     // Main's new resolver records must not be admitted by earlier SQL-only
     // profiles that reused main's resolver numbers for unrelated catalog work.
     try std.testing.expect(protocol.resolver_namespaces_version > protocol.sql_column_transform_version);
@@ -3637,6 +3639,7 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .compare_and_set_job_state) return metadata_topology_protocol.job_state_version;
     if (command == .apply_resolver_authority) return metadata_topology_protocol.resolver_records_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresResourceComments(command.apply_system_catalog)) return metadata_topology_protocol.sql_resource_comments_version;
     if (command == .apply_fk_generation_publication and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_generation_publication)) return metadata_topology_protocol.fk_historical_references_version;

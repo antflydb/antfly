@@ -133,7 +133,11 @@ const std = @import("std");
 /// Version 70 binds owned sequence defaults and table creation in one catalog transaction.
 /// Version 71 preserves exact SQL view temporal domains and dependency identities.
 /// Version 72 retains SQL DROP intent through native source/parent generation barriers.
-pub const current_version: u16 = 72;
+/// Version 73 combines durable document jobs and SQL index publication.
+/// Main owns command tag 79; the unreleased SQL index ACK moves to tag 89.
+/// Re-fence the complete index cohort so every admitted job can finish.
+pub const current_version: u16 = 73;
+pub const job_state_version: u16 = 73;
 pub const sql_drop_generation_version: u16 = 72;
 pub const sql_view_domains_version: u16 = 71;
 pub const sql_column_sequences_version: u16 = 70;
@@ -162,19 +166,19 @@ pub const sql_deferred_check_validation_version: u16 = 59;
 pub const initial_fk_checks_catalog_version: u16 = 59;
 pub const sql_row_policy_mutation_version: u16 = 58;
 pub const sql_view_catalog_version: u16 = 57;
-pub const index_publication_release_version: u16 = 56;
+pub const index_publication_release_version: u16 = 73;
 // One coordinated floor for this unreleased protocol. A cohort capable only
 // of an earlier partial stage must not admit work that it cannot finish.
-pub const index_publication_installation_version: u16 = 56;
-pub const index_publication_decision_version: u16 = 56;
-pub const index_publication_head_version: u16 = 56;
-pub const index_delivery_version: u16 = 56;
+pub const index_publication_installation_version: u16 = 73;
+pub const index_publication_decision_version: u16 = 73;
+pub const index_publication_head_version: u16 = 73;
+pub const index_delivery_version: u16 = 73;
 /// Metadata replicas must validate ASCH/reader profile 34 before admitting it.
 pub const clock_defaults_reader_version: u16 = 67;
 pub const schema_reader_publication_version: u16 = 41;
 pub const schema_reader_floor_version: u16 = 40;
 pub const schema_reader_capability_version: u16 = 39;
-pub const index_publication_admission_version: u16 = 38;
+pub const index_publication_admission_version: u16 = 73;
 pub const checks_catalog_identity_version: u16 = 37;
 /// Decoder floor for occupancy-capable reconciliation and name admission.
 pub const constraint_occupancy_version: u16 = 36;

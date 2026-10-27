@@ -25,6 +25,8 @@ class RerankerConfig:
 
     Attributes:
         provider (RerankerProvider): The reranking provider to use.
+        account_id (str | Unset):
+        gateway_id (str | Unset):
         rate_limit (RateLimitConfig | Unset): Outbound provider limits shared within one Antfly process by effective
             endpoint, operation, model, credential source, project and region/location.
             Conflicting policies for an active scope are rejected. These limits do
@@ -50,6 +52,8 @@ class RerankerConfig:
     """
 
     provider: RerankerProvider
+    account_id: str | Unset = UNSET
+    gateway_id: str | Unset = UNSET
     rate_limit: RateLimitConfig | Unset = UNSET
     field: str | Unset = UNSET
     template: str | Unset = UNSET
@@ -60,6 +64,10 @@ class RerankerConfig:
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
+
+        account_id = self.account_id
+
+        gateway_id = self.gateway_id
 
         rate_limit: dict[str, Any] | Unset = UNSET
         if not isinstance(self.rate_limit, Unset):
@@ -82,6 +90,10 @@ class RerankerConfig:
                 "provider": provider,
             }
         )
+        if account_id is not UNSET:
+            field_dict["account_id"] = account_id
+        if gateway_id is not UNSET:
+            field_dict["gateway_id"] = gateway_id
         if rate_limit is not UNSET:
             field_dict["rate_limit"] = rate_limit
         if field is not UNSET:
@@ -104,6 +116,10 @@ class RerankerConfig:
         d = dict(src_dict)
         provider = RerankerProvider(d.pop("provider"))
 
+        account_id = d.pop("account_id", UNSET)
+
+        gateway_id = d.pop("gateway_id", UNSET)
+
         _rate_limit = d.pop("rate_limit", UNSET)
         rate_limit: RateLimitConfig | Unset
         if isinstance(_rate_limit, Unset):
@@ -123,6 +139,8 @@ class RerankerConfig:
 
         reranker_config = cls(
             provider=provider,
+            account_id=account_id,
+            gateway_id=gateway_id,
             rate_limit=rate_limit,
             field=field,
             template=template,

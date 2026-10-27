@@ -56,6 +56,7 @@ pub const RequestContext = struct {
     deadline_ns: ?u64,
     cancellation: ?CancellationToken = null,
     progress: ?ProgressSink = null,
+    document_store: @import("antfly_runtime_abi").document_abi.View = .{},
     /// Notified immediately before request bytes may reach an upstream.
     /// A notification means the upstream outcome may be unknown on timeout.
     submission: ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } = null,

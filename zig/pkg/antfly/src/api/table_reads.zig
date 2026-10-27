@@ -562,6 +562,7 @@ pub const testing = if (builtin.is_test) struct {
 const ControlProvisionedTableReadCache = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -577,6 +578,7 @@ const PhysicalProvisionedTableReadCache = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -722,6 +724,7 @@ const PhysicalProvisionedTableReadCache = struct {
         errdefer self.alloc.destroy(runtime);
         runtime.* = reranking_runtime.Runtime.init(self.alloc, self.threaded.io());
         self.reranker_runtime = runtime;
+        self.provider_runtime = &runtime.providers;
         return runtime;
     }
 
@@ -771,6 +774,7 @@ const PhysicalProvisionedTableReadCache = struct {
             .backend_runtime = self.backend_runtime,
             .antfly_provider = providerWithCapabilityCache(self.antfly_provider, &@constCast(self).remote_capability_cache),
             .decision_registry = self.decision_registry,
+            .provider_runtime = self.provider_runtime,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -2450,6 +2454,7 @@ fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
 
 pub const BoundTableReadSource = struct {
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     table_name: []const u8,
     db: *db_mod.DB,
     reads: raft_mod.FeatureDBReads,
@@ -2966,6 +2971,7 @@ pub const BoundTableReadSource = struct {
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, .{
             .source_table = table_name,
             .decision_registry = self.decision_registry,
+            .provider_runtime = self.provider_runtime,
             .backend_runtime = self.db.backend_runtime,
         });
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
@@ -3310,6 +3316,7 @@ pub const ProvisionedTableReadSource = struct {
     hot_standby_read_gate: ?HotStandbyReadGate = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -3499,6 +3506,7 @@ pub const ProvisionedTableReadSource = struct {
         hosted.group_visible_root_generation = self.group_visible_root_generation;
         hosted.antfly_provider = self.antfly_provider;
         hosted.decision_registry = self.decision_registry;
+        hosted.provider_runtime = self.provider_runtime;
         hosted.inference_api_url = self.inference_api_url;
         hosted.secret_store = self.secret_store;
         hosted.remote_content = self.remote_content;
@@ -3545,6 +3553,15 @@ pub const ProvisionedTableReadSource = struct {
     ) *ProvisionedTableReadSource {
         self.antfly_provider = provider;
         if (self.cache) |cache| cache.antfly_provider = provider;
+        return self;
+    }
+
+    pub fn withDecisionRegistry(
+        self: *ProvisionedTableReadSource,
+        registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry,
+    ) *ProvisionedTableReadSource {
+        self.decision_registry = registry;
+        if (self.cache) |cache| cache.decision_registry = registry;
         return self;
     }
 
@@ -4390,6 +4407,7 @@ pub const ProvisionedTableReadSource = struct {
                 if (comptime control_only_storage_sources) null else if (self.cache) |cache| &cache.remote_capability_cache else null,
             ),
             .decision_registry = self.decision_registry,
+            .provider_runtime = self.provider_runtime,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -6416,6 +6434,7 @@ pub const HostedProvisionedTableReadSource = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -6485,6 +6504,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
     pub fn withRerankerRuntime(self: *HostedProvisionedTableReadSource, runtime: *reranking_runtime.Runtime) *HostedProvisionedTableReadSource {
         self.reranker_runtime = runtime;
+        self.provider_runtime = &runtime.providers;
         return self;
     }
 
@@ -6518,6 +6538,7 @@ pub const HostedProvisionedTableReadSource = struct {
             .backend_runtime = self.backend_runtime,
             .antfly_provider = providerWithCapabilityCache(self.antfly_provider, self.remote_capability_cache),
             .decision_registry = self.decision_registry,
+            .provider_runtime = self.provider_runtime,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,

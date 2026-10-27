@@ -4,6 +4,7 @@ from enum import StrEnum
 class EmbedderProvider(StrEnum):
     ANTFLY = "antfly"
     BEDROCK = "bedrock"
+    CLOUDFLARE = "cloudflare"
     COHERE = "cohere"
     GEMINI = "gemini"
     OLLAMA = "ollama"

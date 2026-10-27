@@ -1,0 +1,72 @@
+[
+  {
+    "model": "@cf/baai/bge-base-en-v1.5",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/bge-base-en-v1.5.json",
+    "sha256": "c1e96de7a5d94969c128234ec5dc267cdc6266fe59d439de20b465fc7b7df3c7"
+  },
+  {
+    "model": "@cf/baai/bge-reranker-base",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/bge-reranker-base.json",
+    "sha256": "7593fb52251126a6b38a0d4a2c0814459d742ed9f9b2dc2327ef3f201e4950c2"
+  },
+  {
+    "model": "@cf/cloudflare/clairic",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/clairic.json",
+    "sha256": "4ab4f2224d8b8881c41af63bab9bc98c4ae9ed04c7830265b55e8366a45bb23c"
+  },
+  {
+    "model": "@cf/cloudflare/clef",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/clef.json",
+    "sha256": "db0292c3b66712e25763500f172e97b11c047a38d07b3b9390a8f23b976aef84"
+  },
+  {
+    "model": "@cf/huggingface/distilbert-sst-2-int8",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/distilbert-sst-2-int8.json",
+    "sha256": "c7bbaf4c6d16c18b207b488777017d690cc3fc8249fcaaca4cd79c94f63ef03a"
+  },
+  {
+    "model": "@cf/meta/m2m100-1.2b",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/m2m100-1.2b.json",
+    "sha256": "80c5bd16a52168ce028d8d82bbe27f47f51c58d1ada96a1053b1c416a7897eb5"
+  },
+  {
+    "model": "@cf/openai/whisper-large-v3-turbo",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/whisper-large-v3-turbo.json",
+    "sha256": "c2b3992741ffd7e89fe6135f419e4b3638573901d8439266d1b05d18fec8c866"
+  },
+  {
+    "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/llama-3.3-70b-instruct-fp8-fast.json",
+    "sha256": "a6db9a568121c1e7d0720dcd66ddb41cc1f95f7ca1a7cd241547a8666df298b7"
+  },
+  {
+    "model": "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/mistral-small-3.1-24b-instruct.json",
+    "sha256": "c0853da780e8e4d440fce2affa4e21c0cc39b80901490af750c184c230b0bae1"
+  },
+  {
+    "model": "@cf/qwen/qwen3-30b-a3b-fp8",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/qwen3-30b-a3b-fp8.json",
+    "sha256": "abc8a86b5bb2f38a59a70f5600d4dfbb49dcce4fa842d3a663856936e2c38a81"
+  },
+  {
+    "model": "@cf/myshell-ai/melotts",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/melotts.json",
+    "sha256": "6f9ac76592da179caea73c58879dcd3061a4d77a46ed456fa31c1186e3859e62"
+  },
+  {
+    "model": "@cf/deepgram/aura-2-en",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/aura-2-en.json",
+    "sha256": "9973a19d9df39688433501f6c1921bbc7431a6b42567ef47ab6933d0f165d788"
+  },
+  {
+    "model": "@cf/qwen/qwen3-embedding-0.6b",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/qwen3-embedding-0.6b.json",
+    "sha256": "121ebfd6ff8f801a163991d36580fd87652cd65442715a78dfd900ee92e17ce2"
+  },
+  {
+    "model": "@cf/google/embeddinggemma-300m",
+    "url": "https://raw.githubusercontent.com/cloudflare/cloudflare-docs/production/src/content/workers-ai-models/embeddinggemma-300m.json",
+    "sha256": "e4587ebaf1208ef2f2b6b50f9ce02b160159d8a3f666c04f8425f4c61baa4a6f"
+  }
+]

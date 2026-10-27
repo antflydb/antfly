@@ -1029,6 +1029,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     };
     var progress_adapter = ProgressAdapter{ .view = context.progress };
     const execution_control = inference.InferenceExecutionControl{
+        .document_store = context.document_store,
         .deadline_ns = deadline_ns,
         // Give any model's current native call time to reach a safe boundary
         // before a cancelled request forces the supervisor to replace it.
@@ -1294,6 +1295,12 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             defer parsed.deinit();
             const result = try localModelCapabilities(&state.node, state.io, parsed.value.model, parsed.value.task);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .document_read, .document_extract => blk: {
+            break :blk if (operation == .document_read)
+                try state.node.readDocumentsJsonWithControl(alloc, request_json, execution_control)
+            else
+                try state.node.extractDocumentsJsonWithControl(alloc, request_json, execution_control);
         },
         .read_images => blk: {
             var parsed = try std.json.parseFromSlice(ReadImagesRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
@@ -1858,13 +1865,18 @@ pub fn linkedInferenceRegisterRoutesOnExcept(handle: *anyopaque, server: *httpx.
         try linkedInferenceRouteManifest(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .out_entries = &entries, .out_len = &length });
         for (state.route_manifest.items) |entry| {
             if (excludedRoute(entry.path.slice(), excluded)) continue;
-            try server.routeWithData(switch (entry.method) {
+            const method: httpx.Method = switch (entry.method) {
                 .get => .GET,
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
                 .patch => .PATCH,
-            }, entry.path.slice(), localInferenceHttpHandler, entry.route_handle);
+            };
+            if (entry.request_body == .streaming_raw) {
+                try server.routeStreamingRawWithData(method, entry.path.slice(), localInferenceHttpHandler, entry.route_handle);
+            } else {
+                try server.routeWithData(method, entry.path.slice(), localInferenceHttpHandler, entry.route_handle);
+            }
         }
         return;
     }
@@ -1963,6 +1975,7 @@ const RouteMetadata = struct {
 };
 
 fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
+    if (method == .post and (std.mem.endsWith(u8, path, "/read/execute") or std.mem.endsWith(u8, path, "/extract/execute"))) return .{ .request_body = .streaming_raw, .streaming_response = true };
     if (method == .post and std.mem.endsWith(u8, path, "/stream") and std.mem.indexOf(u8, path, "/transcription/sessions/") != null) return .{ .request_body = .streaming_raw, .streaming_response = true };
     const method_name = switch (method) {
         .get => "GET",
@@ -2016,6 +2029,14 @@ fn routeTemplateMatches(template: []const u8, registered: []const u8) bool {
     }
 }
 
+test "document execution manifests retain raw duplex body mode" {
+    for ([_][]const u8{ "/ai/v1/read/execute", "/ai/v1/extract/execute", "/api/v1/read/execute" }) |path| {
+        const metadata = routeMetadata(.post, path);
+        try std.testing.expectEqual(http_abi.RequestBodyMode.streaming_raw, metadata.request_body);
+        try std.testing.expect(metadata.streaming_response);
+    }
+}
+
 test "route templates match registered path-parameter patterns" {
     try std.testing.expect(routeTemplateMatches("/transcribe", "/transcribe"));
     try std.testing.expect(routeTemplateMatches("/transcription/sessions/{session_id}/audio", "/transcription/sessions/:session_id/audio"));
@@ -2048,13 +2069,18 @@ const DirectServer = struct {
         route.* = .{ .owner = self.owner, .handler = handler };
         try self.owner.routes.append(self.owner.alloc, route);
         errdefer _ = self.owner.routes.pop();
-        try self.server.routeWithData(switch (method) {
+        const http_method: httpx.Method = switch (method) {
             .get => .GET,
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
             .patch => .PATCH,
-        }, path, localInferenceHttpHandler, route);
+        };
+        if (routeMetadata(method, path).request_body == .streaming_raw) {
+            try self.server.routeStreamingRawWithData(http_method, path, localInferenceHttpHandler, route);
+        } else {
+            try self.server.routeWithData(http_method, path, localInferenceHttpHandler, route);
+        }
     }
 
     pub fn get(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
@@ -2160,6 +2186,7 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
     var http_context = httpx.Context.init(alloc, state.io, &http_request);
     defer http_context.deinit();
     http_context.params = params;
+    if (context.document_store.configured()) try http_context.setData("antfly.document_store", @ptrCast(@constCast(&context.document_store)), null);
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
     var response = if (state.worker) |worker| remote: {
         // Preserve admission-before-upload, including lazy streaming bodies.
@@ -3001,6 +3028,28 @@ fn localModelCapabilitiesInScope(
             .prompt_policy = .model_default,
             .borrowed_attachments = true,
         };
+    }
+    if (task == .read or task == .extract) {
+        if (try node.documentTaskLimits(node.allocator, model, task == .read)) |limits| {
+            const mimes = inference_work.MimeTypes{ .text_plain = task == .extract, .image_png = task == .read, .image_jpeg = task == .read, .image_webp = task == .read, .application_pdf = false };
+            return .{
+                .task = task,
+                .input_modalities = .{ .text = task == .extract, .image = task == .read, .document = false },
+                .accepted_mime_types = mimes,
+                .input_granularity = if (task == .read) .page else .item,
+                .batch = .{
+                    .mode = .serial_compatibility,
+                    .preferred_items = 1,
+                    .max_items = limits.max_sources,
+                    .max_encoded_media_bytes = limits.max_source_bytes,
+                    .max_decoded_pixels = @min(limits.max_total_pixels, inference.server.requestMediaMaxDecodedPixels(node, limits.max_sources)),
+                    .max_media_parts_per_item = 1,
+                },
+                .output = if (task == .read) .read_result else .extraction,
+                .prompt_policy = if (task == .read) .model_default else .structured_schema,
+                .borrowed_attachments = task == .read,
+            };
+        }
     }
     const scope = scope_override orelse switch (task) {
         .read => "readers",

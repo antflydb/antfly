@@ -1016,6 +1016,7 @@ const MetadataAdminMux = struct {
 
 fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs.ReplicatedPersistence {
     return restore_jobs.ReplicatedPersistence.fromLocal(svc, .{
+        .job_state = .{ .get = metadataJobStateGet, .scan = metadataJobStateScan, .cas = metadataJobStateCas },
         .delete_matching = metadataRestoreJobDeleteMatching,
         .create = metadataRestoreJobCreate,
         .create_with_staging = metadataRestoreJobCreateWithStaging,
@@ -2251,4 +2252,34 @@ test "metadata public api server carries auth and restore configuration" {
     defer std.testing.allocator.free(persisted);
     try std.testing.expectEqualStrings("{\"phase\":\"running\"}", persisted);
     try std.testing.expectError(error.NotLeader, metadataRestoreJobGet(server.svc, std.testing.allocator, logical_key));
+}
+
+fn metadataJobStateGet(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8) !?[]u8 {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    if (svc.localMetadataLeadershipTerm() == null) return error.NotLeader;
+    try svc.ensureLinearizableRead();
+    return (svc.projectedStore() orelse return error.MissingMetadataStore).getJobState(a, svc.metadata_group_id, key);
+}
+fn metadataJobStateScan(ptr: *anyopaque, a: std.mem.Allocator, after: ?[]const u8) ![]u8 {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    if (svc.localMetadataLeadershipTerm() == null) return error.NotLeader;
+    try svc.ensureLinearizableRead();
+    return (svc.projectedStore() orelse return error.MissingMetadataStore).scanJobState(a, svc.metadata_group_id, after);
+}
+fn metadataJobStateCas(ptr: *anyopaque, key: []const u8, expected: ?[]const u8, value: []const u8, term: u64) !bool {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    if (expected == null and std.mem.startsWith(u8, key, "documents/")) {
+        var scratch = std.heap.ArenaAllocator.init(svc.alloc);
+        defer scratch.deinit();
+        const state = try @import("job_state.zig").ownerState(scratch.allocator(), value);
+        const current = svc.projectedStore() orelse return error.MissingMetadataStore;
+        const existing = try current.getJobState(svc.alloc, svc.metadata_group_id, key);
+        defer if (existing) |bytes| svc.alloc.free(bytes);
+        if (existing == null and @import("job_state.zig").active(state) and try current.getJobOwnerCount(svc.alloc, svc.metadata_group_id, state.owner) >= @import("job_state.zig").max_active_per_owner) return error.TooManyActiveJobs;
+    }
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected orelse "", .value = value } }, term);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const current = (try store.getJobState(svc.alloc, svc.metadata_group_id, key)) orelse return false;
+    defer svc.alloc.free(current);
+    return std.mem.eql(u8, current, value);
 }
