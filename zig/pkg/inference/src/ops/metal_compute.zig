@@ -1453,7 +1453,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn reserveLightOnFrameArgmax(cb: *const ops.ComputeBackend, rows: usize, vocab: usize) bool {
         if (cb.kind() != .metal) return false;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        return self.lightonocr3_projections and metal_runtime_mod.qualifiedLightOnDeviceDefault() and
+        return self.lightonocr3_projections and metal_runtime_mod.appleSimdgroupDeviceDefault() and
             metal_runtime_mod.reserveArgmaxRows(self.provider_impl, rows, vocab);
     }
 
@@ -1549,7 +1549,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn beginOcrEncoderScope(cb: *const ops.ComputeBackend, stage: OcrEncoderStage) !bool {
         if (comptime !build_options.enable_metal) return false;
         if (cb.vtable.decoderRuntimeBeginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp or
-            cb.kind() != .metal or !metal_runtime_mod.qualifiedM4DeviceDefault() or
+            cb.kind() != .metal or !metal_runtime_mod.appleSimdgroupDeviceDefault() or
             !getenvBool("ANTFLY_OCR_ENCODER_SCOPES")) return false;
         const owned = try cb.decoderRuntimeBeginPlannedComputeScope();
         if (owned) {
@@ -1627,7 +1627,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return;
         }
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        if (enabled and (!self.lightonocr3_projections or !metal_runtime_mod.qualifiedLightOnDeviceDefault())) return error.UnsupportedVisionWorkspaceCache;
+        if (enabled and (!self.lightonocr3_projections or !metal_runtime_mod.appleSimdgroupDeviceDefault())) return error.UnsupportedVisionWorkspaceCache;
         if (metal_runtime_mod.termite_metal_decode_runtime_set_lighton_vision_workspace_cache(self.provider_impl.raw_decode_runtime, @intFromBool(enabled)) != 0) return error.VisionWorkspaceBusy;
     }
 
@@ -1697,7 +1697,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (cb.kind() != .metal) return error.RuntimeUnavailable;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.lighton_shared_core_weights.count() != 0) return error.InvalidBatchDecodeState;
-        self.lighton_shared_core_weights_enabled = enabled and self.lightonocr3_projections and metal_runtime_mod.qualifiedLightOnDeviceDefault();
+        self.lighton_shared_core_weights_enabled = enabled and self.lightonocr3_projections and metal_runtime_mod.appleSimdgroupDeviceDefault();
     }
 
     pub fn lightOnSharedCoreWeightStats(cb: *const ops.ComputeBackend) [3]usize {
@@ -1742,7 +1742,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn setLightOnBatchAttention(cb: *const ops.ComputeBackend, enabled: bool) !void {
         if (cb.kind() != .metal) return error.RuntimeUnavailable;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        self.lighton_batch_attention = enabled and self.lightonocr3_projections and metal_runtime_mod.qualifiedLightOnDeviceDefault();
+        self.lighton_batch_attention = enabled and self.lightonocr3_projections and metal_runtime_mod.appleSimdgroupDeviceDefault();
         metal_runtime_mod.termite_metal_decode_runtime_lighton_attention_batch_stats(self.provider_impl.raw_decode_runtime, &self.lighton_attention_batch_baseline);
     }
 
@@ -1801,7 +1801,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         if (layers > 16) return error.UnsupportedPrefillStream;
         if (layers != 0 and (!self.lightonocr3_projections or !self.lighton_shared_core_weights_enabled or
-            !self.lighton_activation_pool_enabled or !metal_runtime_mod.qualifiedLightOnDeviceDefault() or
+            !self.lighton_activation_pool_enabled or !metal_runtime_mod.appleSimdgroupDeviceDefault() or
             metal_runtime_mod.termite_metal_decode_runtime_stream_frames_available(self.provider_impl.raw_decode_runtime) == 0))
             return error.UnsupportedPrefillStream;
         if ((layers != 0 or self.lighton_prefill_stream_layers != 0) and
@@ -1837,7 +1837,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn setLightOnStreamFirstLayers(cb: *const ops.ComputeBackend, layers: u8) !void {
         if (cb.kind() != .metal) return error.RuntimeUnavailable;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        self.lighton_stream_first_layers = if (self.lightonocr3_projections and metal_runtime_mod.qualifiedLightOnDeviceDefault() and
+        self.lighton_stream_first_layers = if (self.lightonocr3_projections and metal_runtime_mod.appleSimdgroupDeviceDefault() and
             metal_runtime_mod.termite_metal_decode_runtime_stream_frames_available(self.provider_impl.raw_decode_runtime) != 0) @min(layers, 16) else 0;
     }
 
@@ -1858,7 +1858,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return;
         }
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        if (enabled and (!self.lightonocr3_projections or !metal_runtime_mod.qualifiedLightOnDeviceDefault() or
+        if (enabled and (!self.lightonocr3_projections or !metal_runtime_mod.appleSimdgroupDeviceDefault() or
             self.lighton_stream_first_layers == 0 or !self.lighton_batch_attention))
             return error.UnsupportedGpuGreedyStream;
         self.lighton_gpu_greedy_stream = enabled;
@@ -34571,7 +34571,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // existing serial planned scope through attention and FFN, retaining
         // the established barriers when concurrent dispatch is requested.
         const short_scope = request.rows >= 9 and request.rows <= 64 and
-            metal_runtime_mod.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS", true) and
+            metal_runtime_mod.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS", true) and
             !getenvBool("TERMITE_METAL_DISABLE_QWEN3_SMALL_ENCODER");
         const owns_short_scope = if (short_scope) try decoderRuntimeBeginPlannedComputeScopeOp(ctx) else false;
         defer if (owns_short_scope) decoderRuntimeEndPlannedComputeScopeOp(ctx);
@@ -40709,8 +40709,13 @@ test "metal_compute: native dense views compose across host and device consumers
 fn testNativeDenseMaterializationAllocationFailures(allocator: std.mem.Allocator) !void {
     const bytes = [_]u8{ 0x80, 0x3f, 0x00, 0x40 };
     const source = try testNativeDenseTensor(allocator, &bytes, .bf16, &.{2}, false);
-    var fake_ctx: u8 align(@alignOf(MetalCompute)) = 0;
-    defer MetalCompute.freeOp(&fake_ctx, source);
+    var store = testMetalWeightStoreInit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    var provider: MetalCompute.ProviderImpl = undefined;
+    provider.raw_decode_runtime = null;
+    var compute = MetalCompute{ .allocator = allocator, .data = &store, .provider_impl = &provider };
+    defer compute.deinitWeightCaches();
+    defer MetalCompute.freeOp(&compute, source);
     const values = try MetalCompute.hostSliceForBuf(MetalCompute.toBuf(source));
     try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, values);
 }
@@ -45446,10 +45451,15 @@ test "metal_compute: toFloat32 materializes zero-copy bf16 weights" {
         .native_dense_bytes = bytes[0..],
         .native_dense_dtype = .bf16,
     };
-    var fake_ctx: u8 align(@alignOf(MetalCompute)) = 0;
-    defer if (buf.native_dense_host_cache) |cache| MetalCompute.freeOp(&fake_ctx, cache);
+    var store = testMetalWeightStoreInit(std.testing.allocator);
+    defer store.lazy_weights.deinit(std.testing.allocator);
+    var provider: MetalCompute.ProviderImpl = undefined;
+    provider.raw_decode_runtime = null;
+    var compute = MetalCompute{ .allocator = std.testing.allocator, .data = &store, .provider_impl = &provider };
+    defer compute.deinitWeightCaches();
+    defer if (buf.native_dense_host_cache) |cache| MetalCompute.freeOp(&compute, cache);
 
-    const values = try MetalCompute.toFloat32Op(&fake_ctx, @ptrCast(&buf), std.testing.allocator);
+    const values = try MetalCompute.toFloat32Op(&compute, @ptrCast(&buf), std.testing.allocator);
     defer std.testing.allocator.free(values);
 
     try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.5, 0.5, 3.0 }, values);
@@ -49888,7 +49898,7 @@ test "LightOnOCR3 runtime-owned hidden storage never enters activation reuse" {
 
 test "LightOnOCR3 shared side weights retain immutable identities and bounded device ownership" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    if (!metal_runtime_mod.metalDeviceAvailable() or !metal_runtime_mod.qualifiedLightOnDeviceDefault()) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable() or !metal_runtime_mod.appleSimdgroupDeviceDefault()) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var store = testMetalWeightStoreInit(allocator);
     defer store.lazy_weights.deinit(allocator);

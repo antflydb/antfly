@@ -8448,8 +8448,8 @@ pub const Node = struct {
         const backend: runtime.kv.pool.BackendKind = if (model.session.backend() == .cuda) .cuda else .metal;
         cfg.qwen35_device_only_state = cfg.hasQwen35VisionArchitectureContract() and
             ((backend == .cuda and cudaLightOnBatchProfileEnabled()) or
-                (metal_runtime.qualifiedLightOnDeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE")));
-        cfg.qwen35_metal_resident_vision = metal_runtime.qualifiedLightOnDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
+                (metal_runtime.appleSimdgroupDeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE")));
+        cfg.qwen35_metal_resident_vision = metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
             qwen3vl_projector.supportsResidentVisionBudget(cfg) and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET");
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend);
         const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = prompt } } }};
@@ -8732,7 +8732,7 @@ pub const Node = struct {
         control: InferenceExecutionControl,
     ) ![]Qwen3VlReadResult {
         if ((model.session.backend() == .metal or (model.session.backend() == .cuda and cudaLightOnBatchProfileEnabled())) and
-            platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_CONTINUOUS", metal_runtime.qualifiedLightOnDeviceDefault()))
+            platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_CONTINUOUS", metal_runtime.appleSimdgroupDeviceDefault()))
             return self.readLightOnContinuousImages(allocator, model, model_path, images, prompt, max_tokens, control);
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
@@ -12847,7 +12847,7 @@ pub const Node = struct {
         // Copy the warm publication's small metadata while briefly pinning it.
         // Request validation never scans its GGUF tokenizer arrays, and the
         // failed runtime can be reclaimed before a recovery replacement loads.
-        const cached_manifest = if (metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
+        const cached_manifest = if (metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
             self.model_manager.copyCachedQwenEmbeddingManifest(ctx.allocator, model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err)
         else
@@ -28175,7 +28175,7 @@ fn lightOnPhysicalRowCeiling() usize {
         return 16;
     }
     if (!metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_WIDE_DECODE")) return 8;
-    if (metal_runtime.qualifiedLightOnDeviceDefault()) {
+    if (metal_runtime.appleSimdgroupDeviceDefault()) {
         if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL64")) return 64;
         if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL32")) return 32;
     }
@@ -28242,7 +28242,7 @@ test "LightOnOCR3 internal 128 row cohorts preserve public request and explicit 
 
 fn effectiveLightOnReadRows() usize {
     const ceiling = lightOnPhysicalRowCeiling();
-    return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_ROWS") orelse (if (ceiling >= 32 or cudaLightOnBatchProfileEnabled()) ceiling else if (metal_runtime.lightOnThroughputProfileEnabled()) @as(usize, 16) else if (metal_runtime.qualifiedLightOnDeviceDefault()) @as(usize, 8) else 4), 1), ceiling);
+    return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_ROWS") orelse (if (ceiling >= 32 or cudaLightOnBatchProfileEnabled()) ceiling else if (metal_runtime.lightOnThroughputProfileEnabled()) @as(usize, 16) else if (metal_runtime.appleSimdgroupDeviceDefault()) @as(usize, 8) else 4), 1), ceiling);
 }
 
 fn cudaLightOnBatchProfileEnabled() bool {
@@ -28266,7 +28266,7 @@ fn lightOnContinuousWorkerCount(images: usize) usize {
 /// the serialized provider. A short generic tensor window underfills readers
 /// on a busy CPU; retain that window for unqualified backends and explicit 0.
 fn nativeReadCollectionWaitUs(configured: u64, backend: backends_mod.BackendType) u64 {
-    const qualified_metal = backend == .metal and @import("../backends/metal_runtime.zig").qualifiedM4DeviceDefault();
+    const qualified_metal = backend == .metal and @import("../backends/metal_runtime.zig").appleSimdgroupDeviceDefault();
     return nativeReadCollectionWaitPolicy(configured, backend, qualified_metal, platform.env.getenvUsize("ANTFLY_FLORENCE2_BATCH_WAIT_US"));
 }
 
@@ -42299,7 +42299,7 @@ test "LightOnOCR3 logical64 isolates physical rows and bounds multi-image worker
     for (names[0..3]) |name| try std.testing.expectEqual(@as(c_int, 0), Env.setenv(name, "1", 1));
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[3], "32", 1));
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[4], "128", 1));
-    const eligible = metal_runtime.qualifiedLightOnDeviceDefault();
+    const eligible = metal_runtime.appleSimdgroupDeviceDefault();
     const window: usize = if (eligible) 64 else 32;
     try std.testing.expectEqual(window, effectiveLightOnReadWindow());
     try std.testing.expectEqual(window, lightOnContinuousWorkerCount(128));

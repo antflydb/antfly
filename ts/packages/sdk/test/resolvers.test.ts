@@ -103,3 +103,37 @@ it("supports absorbed suppression and scoped proposal acceptance while replay is
     "/databases/app/namespaces/private/tables/entities/curation/proposals/proposal%2Fone:accept"
   );
 });
+
+it("pages entity replay progress in default and explicit namespaces", async () => {
+  const calls: Request[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: Request) => {
+      calls.push(input);
+      return Response.json({
+        entity_table: "notes",
+        key: "concept/alpha",
+        catalog_revision: 7,
+        complete: false,
+        results: [],
+        next_cursor: "next",
+      });
+    })
+  );
+  const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+  const page = await client.entities.progress("notes", "concept/alpha", {
+    limit: 7,
+    cursor: "opaque-next",
+  });
+  expect(page.next_cursor).toBe("next");
+  await client.namespaceEntities.progress("app", "private", "notes", "concept/alpha", {
+    limit: 7,
+    cursor: "opaque-next",
+  });
+  expect(calls[0].url).toBe(
+    "https://antfly.test/db/v1/tables/notes/entities/concept%2Falpha/progress?limit=7&cursor=opaque-next"
+  );
+  expect(calls[1].url).toBe(
+    "https://antfly.test/db/v1/databases/app/namespaces/private/tables/notes/entities/concept%2Falpha/progress?limit=7&cursor=opaque-next"
+  );
+});

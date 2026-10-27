@@ -1100,18 +1100,18 @@ fn getenvFlagEnabled(comptime name: [*:0]const u8) bool {
 /// One opt-in serving preset; individual explicit overrides remain authoritative.
 /// Precision and admission limits are not changed by this profile.
 pub fn lightOnThroughputProfileEnabled() bool {
-    return @import("antfly_platform").env.getenvBool("ANTFLY_LIGHTONOCR3_THROUGHPUT") and qualifiedLightOnDeviceDefault();
+    return @import("antfly_platform").env.getenvBool("ANTFLY_LIGHTONOCR3_THROUGHPUT") and appleSimdgroupDeviceDefault();
 }
 
 pub fn lightOnThroughputFeatureEnabled(comptime name: [*:0]const u8) bool {
     return @import("antfly_platform").env.getenvBoolDefault(name, lightOnThroughputProfileEnabled());
 }
 
-pub fn qualifiedM4FeatureEnabled(comptime name: [*:0]const u8, default_eligible: bool) bool {
+pub fn appleSimdgroupFeatureEnabled(comptime name: [*:0]const u8, default_eligible: bool) bool {
     // HTTP admission can first read a flag from several concurrent callers.
     // Use the stateless parser here; the hardware decision is initialized once
     // in Metal. No mutable per-flag cache is needed on these serving paths.
-    return @import("antfly_platform").env.getenvBoolDefault(name, default_eligible and qualifiedM4DeviceDefault());
+    return @import("antfly_platform").env.getenvBoolDefault(name, default_eligible and appleSimdgroupDeviceDefault());
 }
 
 fn a4bHighMemoryFastPathEnabled() bool {
@@ -13488,7 +13488,7 @@ test "metal prefill direct KV is selected-only, bounded, rollback-safe, and coun
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "params.contiguous_blocks = 1u"));
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, "termite_metal_record_prefill_kv_route(runtime, use_prefill_direct_kv)"));
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "apple_gpu_family == 9u && [device.name hasPrefix:@\"Apple M4\"]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "[device supportsFamily:MTLGPUFamilyApple7]"));
     try std.testing.expect(std.mem.indexOf(u8, source, "TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD").? <
         std.mem.indexOf(u8, source, "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD").?);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD"));
@@ -13511,7 +13511,7 @@ test "metal prepared frame fast path is qualified, diagnosable, and shares lifec
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_FORCE_DIAGNOSTIC_COMMAND_BUFFERS"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "apple_gpu_family == 9u && [device.name hasPrefix:@\"Apple M4\"]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "[device supportsFamily:MTLGPUFamilyApple7]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "id<MTLCommandBuffer> command_buffer = [queue commandBuffer]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->workload_profile_active == 0"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->prepared_frame_diagnostics_forced = termite_metal_prepared_frame_diagnostics_enabled()"));
@@ -13612,7 +13612,7 @@ test "A4B exact-shape expert kernels have an umbrella gate and rollback" {
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint32_t route_values[8] = { 0u, 17u, 33u, 49u, 65u, 81u, 97u, 127u }"));
 }
 
-test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host dispatch" {
+test "metal Q4_0 MMV portfolio is Apple SIMD-group eligible, observable, and cloned into host dispatch" {
     const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
@@ -13627,13 +13627,13 @@ test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host
     }) |environment_name| {
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, environment_name));
     }
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const BOOL is_m4_gemma4_ffn = runtime->apple_m4_device"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const BOOL is_gemma4_ffn = runtime->apple_simdgroup_device"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "global_override != TERMITE_METAL_Q4_0_MMV_VARIANT_AUTO"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->q4_0_mmv_workload_variant_overrides[workload]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, ".q4_0_mmv_workload = TERMITE_METAL_Q4_0_MMV_WORKLOAD_ATTENTION"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, ".q4_0_mmv_workload = TERMITE_METAL_Q4_0_MMV_WORKLOAD_FFN_GATE_UP"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, ".q4_0_mmv_workload = TERMITE_METAL_Q4_0_MMV_WORKLOAD_FFN_DOWN"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.apple_m4_device = source_runtime->apple_m4_device"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.apple_simdgroup_device = source_runtime->apple_simdgroup_device"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sizeof(runtime.q4_0_mmv_workload_variant_overrides)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.q4_0_mmv_trace_emitted = source_runtime->q4_0_mmv_trace_emitted"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.q4_0_mmv_trace_workload_mask = source_runtime->q4_0_mmv_trace_workload_mask"));
@@ -13721,6 +13721,20 @@ test "concurrent planned dispatch policy is fail closed and hazards share produc
 
 test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_Q2_DEFAULT_MIN_KV_TOKENS 512u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "attention_decode_gqa_split_scratch_buffer_alt"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "submitted_frame_decode_gqa_split_scratch_slot ^ 1u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid ="));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid = 0u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_device_default() != 0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_enabled(runtime);"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "scratch_runtime->submitted_frame_cb != nil || output_offset"));
 
     const variants = [_]struct {
         variant: DecodeGqaSplitVariant,
@@ -14592,25 +14606,17 @@ pub extern fn termite_metal_device_available() c_int;
 pub extern fn termite_metal_copy_device_name(buffer: [*c]u8, capacity: usize) usize;
 pub extern fn termite_metal_copy_compiler_identity(buffer: [*c]u8, capacity: usize) usize;
 pub extern fn termite_metal_device_info_get(info: *MetalDeviceInfo) c_int;
-pub extern fn termite_metal_qualified_m4_device_default() c_int;
-pub extern fn termite_metal_qualified_lightonocr3_device_default() c_int;
+pub extern fn termite_metal_apple_simdgroup_device_default() c_int;
 pub extern fn termite_metal_pipelined_decode_frame_device_default() c_int;
 
 /// Hardware qualification is independent of the prepared-frame rollback flags.
-pub fn qualifiedM4DeviceDefault() bool {
+pub fn appleSimdgroupDeviceDefault() bool {
     if (comptime !build_options.enable_metal) return false;
     if (comptime @import("builtin").os.tag != .macos) return false;
-    return termite_metal_qualified_m4_device_default() != 0;
+    return termite_metal_apple_simdgroup_device_default() != 0;
 }
 
-/// LightOn's qualified devices; does not widen unrelated M4-only defaults.
-pub fn qualifiedLightOnDeviceDefault() bool {
-    if (comptime !build_options.enable_metal) return false;
-    if (comptime @import("builtin").os.tag != .macos) return false;
-    return termite_metal_qualified_lightonocr3_device_default() != 0;
-}
-
-test "M4 qualified feature defaults honor explicit false and model isolation" {
+test "Apple SIMD-group feature defaults honor explicit false and model isolation" {
     const builtin = @import("builtin");
     if (comptime !builtin.link_libc or (builtin.os.tag != .macos and builtin.os.tag != .linux)) return error.SkipZigTest;
     // Exercise the serving parser with isolated environment names.
@@ -14624,7 +14630,7 @@ test "M4 qualified feature defaults honor explicit false and model isolation" {
             _ = unsetenv(name);
         };
         try std.testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
-        try std.testing.expect(!qualifiedM4FeatureEnabled(name, true));
+        try std.testing.expect(!appleSimdgroupFeatureEnabled(name, true));
     }
     const enable = "TERMITE_METAL_TEST_M4_EXPLICIT_ENABLE";
     const old_enable = if (std.c.getenv(enable)) |v| try std.testing.allocator.dupeSentinel(u8, std.mem.span(v), 0) else null;
@@ -14635,7 +14641,7 @@ test "M4 qualified feature defaults honor explicit false and model isolation" {
         _ = unsetenv(enable);
     };
     try std.testing.expectEqual(@as(c_int, 0), setenv(enable, "1", 1));
-    try std.testing.expect(qualifiedM4FeatureEnabled(enable, false));
+    try std.testing.expect(appleSimdgroupFeatureEnabled(enable, false));
 
     const unset = "TERMITE_METAL_TEST_M4_UNSET";
     const old_unset = if (std.c.getenv(unset)) |v| try std.testing.allocator.dupeSentinel(u8, std.mem.span(v), 0) else null;
@@ -14646,12 +14652,12 @@ test "M4 qualified feature defaults honor explicit false and model isolation" {
         _ = unsetenv(unset);
     };
     try std.testing.expectEqual(@as(c_int, 0), unsetenv(unset));
-    try std.testing.expect(!qualifiedM4FeatureEnabled(unset, false));
-    try std.testing.expectEqual(qualifiedM4DeviceDefault(), qualifiedM4FeatureEnabled(unset, true));
+    try std.testing.expect(!appleSimdgroupFeatureEnabled(unset, false));
+    try std.testing.expectEqual(appleSimdgroupDeviceDefault(), appleSimdgroupFeatureEnabled(unset, true));
 }
 
 /// Device-qualified default for pipelined decode frames: true only where the
-/// fast prepared frame qualified (M4-family). Explicit enable/disable env
+/// fast prepared frame eligible (Apple7+). Explicit enable/disable env
 /// flags still take precedence.
 pub fn pipelinedDecodeFrameDeviceDefault() bool {
     if (comptime !build_options.enable_metal) return false;
@@ -47316,9 +47322,18 @@ test "metal native decoder runtime bf16 fused gate up preserves scalar FFN tails
     // production rollout. Enable BF16_VECTOR_LOADS and TRACE_DENSE_LINEAR_SHAPES
     // to qualify vector fusion at M64/M511, mixed tails and offset260 fallback.
     for ([_]Case{
-        .{ .rows = 32 },                      .{ .rows = 33 },                     .{ .rows = 64 },                                  .{ .rows = 65 },
-        .{ .rows = 128 },                     .{ .rows = 129 },                    .{ .rows = 511 },                                 .{ .rows = 64, .k = 128, .n = 128 },
-        .{ .rows = 511, .k = 128, .n = 128 }, .{ .rows = 65, .k = 132, .n = 133 }, .{ .rows = 64, .k = 128, .n = 128, .guard = 65 },
+        .{ .rows = 1, .k = 128, .n = 128 },
+        .{ .rows = 32 },
+        .{ .rows = 33 },
+        .{ .rows = 64 },
+        .{ .rows = 65 },
+        .{ .rows = 128 },
+        .{ .rows = 129 },
+        .{ .rows = 511 },
+        .{ .rows = 64, .k = 128, .n = 128 },
+        .{ .rows = 511, .k = 128, .n = 128 },
+        .{ .rows = 65, .k = 132, .n = 133 },
+        .{ .rows = 64, .k = 128, .n = 128, .guard = 65 },
     }) |case| {
         const rows = case.rows;
         const k = case.k;
@@ -47365,7 +47380,10 @@ test "metal native decoder runtime bf16 fused gate up preserves scalar FFN tails
         {
             try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_should_apply_bf16_gate_up(runtime, 0, 1, guard * 4, rows, k, n));
         }
-        for ([_]usize{ 0, 1, 31, std.math.maxInt(usize) }) |unsupported_rows| {
+        // The aligned single-row GEMV is supported independently of the
+        // tiled multi-row path. Unaligned tails still decline that route.
+        try std.testing.expectEqual(@as(c_int, if (k % 128 == 0 and n % 128 == 0) 1 else 0), termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, 1, k, n));
+        for ([_]usize{ 0, 31, std.math.maxInt(usize) }) |unsupported_rows| {
             try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, unsupported_rows, k, n));
         }
         try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, rows, k + 1, n));

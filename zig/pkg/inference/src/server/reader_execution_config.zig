@@ -178,7 +178,7 @@ pub fn Features(comptime Hooks: type) type {
         }
 
         pub fn resolve(cfg: gpt_model_mod.Config, backend: runtime.kv.pool.BackendKind) @This() {
-            const profile = selectProfile(cfg, backend, Hooks.cudaLightOnBatchProfileEnabled(), metal_runtime.qualifiedLightOnDeviceDefault(), metal_runtime.lightOnThroughputProfileEnabled());
+            const profile = selectProfile(cfg, backend, Hooks.cudaLightOnBatchProfileEnabled(), metal_runtime.appleSimdgroupDeviceDefault(), metal_runtime.lightOnThroughputProfileEnabled());
             // Profiling and concurrent planned dispatch do not share the
             // selected frame/lifetime contract. Fall back as one complete mode.
             const restricted_metal_mode = backend == .metal and

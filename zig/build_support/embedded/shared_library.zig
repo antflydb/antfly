@@ -386,6 +386,22 @@ pub fn nativeExecutableLink(b: *std.Build, object: *std.Build.Step.Compile, name
     link.addArg("--output");
     const binary = link.addOutputFileArg(name);
     link.addArg("--");
+    // Relocatable Mach-O entry objects localize bundled private runtime
+    // symbols. Keep the toolchain's runtimes in a separate archive so Debug
+    // checks in C/ObjC provider archives resolve at the final native link.
+    const runtime = b.addLibrary(.{
+        .name = "antfly-native-executable-runtime",
+        .root_module = b.createModule(.{
+            .root_source_file = std.Build.LazyPath.zig_lib.path(b, "ubsan_rt.zig"),
+            .target = object.root_module.resolved_target.?,
+            .optimize = .fast,
+            .link_libc = true,
+        }),
+        .use_llvm = true,
+    });
+    runtime.bundle_compiler_rt = true;
+    runtime.bundle_ubsan_rt = false; // The root already defines the handlers.
+    link.addFileArg(runtime.getEmittedBin());
     return .{ .link = link, .binary = binary };
 }
 
