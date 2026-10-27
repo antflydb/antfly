@@ -22,7 +22,8 @@ pub const drawingml_theme = @import("drawingml_theme.zig");
 pub const drawingml_text = @import("drawingml_text.zig");
 pub const drawingml_chart = @import("drawingml_chart.zig");
 pub const output = @import("output.zig");
-pub const fixtures = @import("fixtures.zig");
+const builtin = @import("builtin");
+pub const fixtures = if (builtin.is_test) @import("fixtures.zig") else struct {};
 
 test {
     _ = types;

@@ -2403,7 +2403,7 @@ const Execution = struct {
                 return position == docs.len;
             }
         };
-        const Entry = struct { id: [32]u8, bitmap: ?Bitmap = null, patterns: *Patterns, probe: ?*ProbeState = null, probe_declined: bool = false, used: u64 };
+        const Entry = struct { id: [32]u8, bitmap: ?Bitmap = null, patterns: *Patterns, probe: ?*ProbeState = null, probe_declined: bool = false, bitmap_declined: bool = false, used: u64 };
         budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator), .limit = 8 * 1024 * 1024 },
         entries: [4]?Entry = @splat(null),
         tick: u64 = 0,
@@ -2480,6 +2480,7 @@ const Execution = struct {
         }
         fn get(self: *@This(), id: [32]u8, snapshot: *const local.index.IndexSnapshot, plan: *const local.search_search.TextNavigationPlan, token: @import("antfly_cancellation").CancellationToken) !?*const Bitmap {
             const held = (try self.admitEntry(id, token)) orelse return null;
+            if (held.bitmap_declined) return null;
             if (held.bitmap == null) {
                 const protected = for (&self.entries, 0..) |*slot, i| {
                     if (slot.*) |*entry| if (entry == held) break i;
@@ -2490,6 +2491,9 @@ const Execution = struct {
                         // Previous children have joined. Reclaim their optional
                         // state before abandoning reuse for the current pack.
                         if (self.evictExcept(protected)) continue;
+                        // A pack that cannot fit even after eviction should not
+                        // repeat a failed full bitmap build on every tiny page.
+                        held.bitmap_declined = true;
                         return null;
                     };
                     self.builds += 1;
@@ -5545,6 +5549,15 @@ test "external lake bounded window profiles bitmap admission evicts older packs 
     try std.testing.expect(next != null);
     try std.testing.expect(memo.entries[0] == null);
     try std.testing.expect(memo.entries[1].?.bitmap != null);
+    memo.entries[1].?.bitmap.?.deinit();
+    memo.entries[1].?.bitmap = null;
+    {
+        const pressure = try memo.budget.allocator().alloc(u8, memo.budget.limit - memo.budget.live);
+        defer memo.budget.allocator().free(pressure);
+        try std.testing.expect((try memo.get(@splat(2), pin.snapshot, plan, .none)) == null);
+    }
+    try std.testing.expect(memo.entries[1].?.bitmap_declined);
+    try std.testing.expect((try memo.get(@splat(2), pin.snapshot, plan, .none)) == null);
 }
 
 test "external lake bounded window profiles cost declines retain preparation time without claiming ordered traversal" {

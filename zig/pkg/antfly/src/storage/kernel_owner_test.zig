@@ -4483,4 +4483,13 @@ test "metadata durable job facade preserves state owner counts and bounded scan 
     try std.testing.expectEqualStrings("documents/example", page.value.rows[0].key);
     try std.testing.expectEqualStrings(queued, page.value.rows[0].value);
     try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, "../bad"));
+    const limit = @import("../metadata/job_state.zig").max_active_per_owner;
+    for (1..limit) |i| {
+        const key = try std.fmt.allocPrint(a, "documents/example-{d}", .{i});
+        defer a.free(key);
+        try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = "", .value = queued } });
+    }
+    try std.testing.expectEqual(limit, try store.getJobOwnerCount(a, 41, "alice"));
+    try std.testing.expectError(error.TooManyActiveJobs, store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = "documents/over-quota", .expected_hash = "", .value = queued } }));
+    try std.testing.expect((try store.getJobState(a, 41, "documents/over-quota")) == null);
 }
