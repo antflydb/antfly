@@ -41358,11 +41358,12 @@ pub const DB = struct {
             projection = try @import("document_query.zig").SpanProjectionPlan.init(alloc, projection_opts);
             if (projection) |*plan| request.document_projection_plan = .{ .plan = plan, .fields = req.fields, .include_all_fields = req.include_all_fields };
         }
-        const conditional_source = @import("../../api/source_projection.zig").storageEligible(req);
+        const conditional_source = @import("../../api/field_projection.zig").storageEligible(req) and
+            (if (self.core.schema) |current| current.external_base_source == null and current.storage_mode != .relational else true);
         if (conditional_source) request.include_stored = false;
         var result = try self.searchLockedWithExecutionContextRaw(alloc, request, exec_ctx, externalize_artifact_ids, dense_profile_sink);
         errdefer result.deinit();
-        if (conditional_source) try self.hydrateConditionalSource(alloc, req, &result);
+        if (conditional_source) try self.hydrateFieldProjection(alloc, req, &result);
         if (req.profile and req.value_search_work == null) {
             result.value_search_profile_json = try value_work.profileAlloc(alloc);
         }
@@ -41370,97 +41371,60 @@ pub const DB = struct {
         return result;
     }
 
-    /// Runs before releasing search's publication/apply lease. Each bounded
-    /// window pins one read transaction and releases per-row scopes promptly.
-    /// Identities and ordinary source fields share the same revision.
-    fn hydrateConditionalSource(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
-        const protocol = @import("../../api/source_projection.zig");
+    /// Final scalar projection shares one pinned transaction per bounded window.
+    fn hydrateFieldProjection(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
+        const protocol = @import("../../api/field_projection.zig");
         var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer arena.deinit();
-        const temp = arena.allocator();
-        const parsed = try std.json.parseFromSliceLeaky(protocol.Request, temp, req.source_projection_json, .{});
-        const prepared = try protocol.Prepared.init(temp, parsed);
+        var plan = try protocol.decode(arena.allocator(), req.field_projection_json);
+        defer plan.deinit();
         var schema = self.core.acquireSchemaView();
         defer if (schema) |*view| view.release();
         var start: usize = 0;
-        var certificate_hits: usize = 0;
-        var full_fallbacks: usize = 0;
+        var metadata_rows: usize = 0;
+        var fallback_rows: usize = 0;
         while (start < result.hits.len) {
             const end = @min(result.hits.len, start + 64);
             var window = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
             defer window.deinit();
+            const temp = window.allocator();
             var txn = try self.core.store.beginReadTxn();
             defer txn.abort();
-            const conditional_mod = @import("../conditional_source.zig");
-            var physical_keys: [64][]const u8 = undefined;
+            const conditional = @import("../conditional_source.zig");
+            var keys: [64][]const u8 = undefined;
             var ids: [64][]const u8 = undefined;
-            var repairs: [64]bool = @splat(false);
-            var conditional_rows: ?[]?conditional_mod.Result = null;
-            defer if (conditional_rows) |rows| {
-                for (rows) |row| if (row) |value| {
-                    alloc.free(value.source);
-                    alloc.free(value.identities);
-                };
-                alloc.free(rows);
-            };
-            const authenticated = self.core.store.valuesAreAuthenticated() and conditional_mod.exactSelectedValues(req.fields, parsed);
-            if (authenticated) {
-                try db_query_search.checkSearchRequestDeadline(req);
-                for (result.hits[start..end], 0..) |hit, i| {
-                    physical_keys[i] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, window.allocator(), hit.id, schema);
-                    ids[i] = hit.id;
-                }
-                var authorities: conditional_mod.Window = .{};
-                {
-                    var scope = try txn.openReadScope(window.allocator());
-                    defer scope.close();
-                    authorities = try conditional_mod.Window.prepare(window.allocator(), &scope, physical_keys[0 .. end - start], ids[0 .. end - start]);
-                    if (end - start == 1) {
-                        conditional_rows = try alloc.alloc(?conditional_mod.Result, 1);
-                        conditional_rows.?[0] = null;
-                        conditional_rows.?[0] = try conditional_mod.loadPrepared(alloc, window.allocator(), &scope, physical_keys[0], ids[0], req.fields, prepared, authorities.rows[0], &repairs[0]);
-                    }
-                }
-                const Guard = struct {
-                    fn check(raw: *const anyopaque) !void {
-                        const request: *const types.SearchRequest = @ptrCast(@alignCast(raw));
-                        try db_query_search.checkSearchRequestDeadline(request.*);
-                    }
-                };
-                if (end - start != 1) conditional_rows = try conditional_mod.loadPreparedWindow(alloc, window.allocator(), &txn, physical_keys[0 .. end - start], ids[0 .. end - start], req.fields, prepared, authorities.rows[0 .. end - start], repairs[0 .. end - start], .{ .ctx = &req, .run = Guard.check });
+            for (result.hits[start..end], 0..) |hit, i| {
+                keys[i] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, temp, hit.id, schema);
+                ids[i] = hit.id;
             }
-            var fallback_keys: [64][]const u8 = undefined;
-            var fallback_slots: [64]usize = undefined;
-            var count: usize = 0;
-            for (result.hits[start..end], start..) |*hit, i| {
-                try db_query_search.checkSearchRequestDeadline(req);
-                if (repairs[i - start]) self.document_authority_backfill_requested.store(true, .release);
-                if (conditional_rows) |rows| if (rows[i - start]) |value| {
-                    hit.clearSource(alloc);
-                    hit.stored_data = value.source;
-                    hit.source_projection_json = value.identities;
-                    hit.finalized_source = .{ .bytes = value.source };
-                    rows[i - start] = null;
-                    certificate_hits += 1;
-                    continue;
-                };
-                fallback_keys[count] = hit.id;
-                fallback_slots[count] = i;
-                full_fallbacks += 1;
-                count += 1;
+            var authorities: conditional.Window = .{};
+            if (self.core.store.valuesAreAuthenticated()) {
+                var scope = try txn.openReadScope(temp);
+                defer scope.close();
+                authorities = try conditional.Window.prepare(temp, &scope, keys[0 .. end - start], ids[0 .. end - start]);
             }
-            if (count != 0) {
-                const rows = try self.loadProjectedSearchDocumentMany(alloc, req, fallback_keys[0..count]);
-                defer freeOptionalOwnedBytes(alloc, rows);
-                for (rows, fallback_slots[0..count]) |*row, i| {
-                    result.hits[i].clearSource(alloc);
-                    result.hits[i].stored_data = row.*;
-                    row.* = null;
-                }
+            for (result.hits[start..end], 0..) |*hit, i| {
+                try db_query_search.checkSearchRequestDeadline(req);
+                var row_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+                defer row_arena.deinit();
+                const a = row_arena.allocator();
+                var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &txn, .physical = keys[i], .id = hit.id, .authority = authorities.rows[i], .req = req };
+                const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
+                const computed = try plan.evaluate(a, row.source(), previous, protocol.requestLimits(&req));
+                const encoded = try std.json.Stringify.valueAlloc(alloc, computed, .{});
+                errdefer alloc.free(encoded);
+                const source = try row.base(alloc);
+                if (row.metadata_hits != 0) metadata_rows += 1 else fallback_rows += 1;
+                hit.clearSource(alloc);
+                if (hit.computed_json) |bytes| alloc.free(bytes);
+                hit.computed_json = encoded;
+                hit.stored_data = source;
+                hit.finalized_source = .{ .bytes = source };
+                if (authorities.rows[i].repair) self.document_authority_backfill_requested.store(true, .release);
             }
             start = end;
         }
-        if (benchQueryProfileEnabled()) std.log.info("antfly_bench_conditional_source certificate_hits={d} full_fallbacks={d}", .{ certificate_hits, full_fallbacks });
+        if (benchQueryProfileEnabled()) std.log.info("antfly_bench_projection metadata_rows={d} fallback_rows={d}", .{ metadata_rows, fallback_rows });
     }
 
     fn attachDistributedDocumentAuthority(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
@@ -41474,6 +41438,15 @@ pub const DB = struct {
     fn attachDistributedDocumentAuthorityAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult, pinned: ?*docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !void {
         if (req.document_authority_mode == .none) return;
         if (req.document_output_allocator != null and req.document_authority_mode != .hydrate) return error.InvalidQueryRequest;
+        const scalar = @import("../../api/field_projection.zig");
+        var scalar_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer scalar_arena.deinit();
+        const native_json = if (schema_view) |view| view.tableSchema().storage_mode != .relational and view.tableSchema().external_base_source == null else true;
+        var scalar_plan: ?scalar.Plan = if (native_json and scalar.hydrationEligible(req)) try scalar.decode(scalar_arena.allocator(), req.field_projection_json) else null;
+        defer if (scalar_plan) |*plan| plan.deinit();
+        var scalar_authorities: @import("../conditional_source.zig").Window = .{};
+        var scalar_metadata_rows: usize = 0;
+        var scalar_fallback_rows: usize = 0;
         const lookup_opts: types.LookupOptions = .{ .output_exact = req.document_output_exact, .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields };
         var plans = try LookupProjectionPlans.init(alloc, lookup_opts);
         defer plans.deinit();
@@ -41517,6 +41490,7 @@ pub const DB = struct {
                 var scope = try read.?.openReadScope(@import("antfly_platform").allocator.reclaimingScratch(alloc));
                 defer scope.close();
                 try @import("../document_mutation_revision.zig").loadWindowWithRevisions(&scope, m, physical[0..count], ids[0..count], contents[0..count], versions[0..count], mutation_revisions[0..count]);
+                if (scalar_plan != null and self.core.store.valuesAreAuthenticated()) scalar_authorities = try @import("../conditional_source.zig").Window.prepare(m, &scope, physical[0..count], ids[0..count]);
             }
             if (req.cancellation) |token| try token.check();
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
@@ -41546,7 +41520,7 @@ pub const DB = struct {
             // Small pages stay in one round trip; large candidates travel
             // as proofs until their global window has been selected.
             const eager = req.document_authority_mode == .candidates and primary_bytes <= 8 * 1024 and primary_bytes <= 64 * 1024 -| eager_bytes;
-            if (raw_primary == null and (req.document_authority_mode == .hydrate or eager)) {
+            if (scalar_plan == null and raw_primary == null and (req.document_authority_mode == .hydrate or eager)) {
                 if (index >= primary_batch_end) {
                     const offset = index % 64;
                     const count = @min(@as(usize, 64) - offset, result.hits.len - index);
@@ -41570,7 +41544,19 @@ pub const DB = struct {
                     primary_window.get(&read.?, store_key, primary_bytes) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
             }
             if (!projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = projection_scratch.reset(.free_all);
-            var projected: ?types.LookupResult = if (req.document_authority_mode == .hydrate or eager)
+            var projected: ?types.LookupResult = if (scalar_plan) |*plan| lazy: {
+                const a = projection_scratch.allocator();
+                var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &read.?, .physical = store_key, .id = hit.id, .req = req, .authority = scalar_authorities.rows[index % 64], .full_bytes = raw_primary };
+                const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
+                const values = try plan.evaluate(a, row.source(), previous, scalar.requestLimits(&req));
+                const encoded = try std.json.Stringify.valueAlloc(alloc, values, .{});
+                errdefer alloc.free(encoded);
+                const source = try row.base(body_allocator);
+                if (hit.computed_json) |bytes| alloc.free(bytes);
+                hit.computed_json = encoded;
+                if (row.metadata_hits != 0) scalar_metadata_rows += 1 else scalar_fallback_rows += 1;
+                break :lazy .{ .json = source };
+            } else if (req.document_authority_mode == .hydrate or eager)
                 try self.lookupPrimarySnapshotWithPreparedProjection(projection_scratch.allocator(), body_allocator, hit.id, lookup_opts, &read.?, schema_view, raw_primary, version, &plans)
             else
                 null;
@@ -41600,6 +41586,7 @@ pub const DB = struct {
             hit.stored_data = document_bytes;
         }
         result.document_authority_version = 1;
+        if (scalar_plan != null and benchQueryProfileEnabled()) std.log.info("antfly_bench_projection metadata_rows={d} fallback_rows={d}", .{ scalar_metadata_rows, scalar_fallback_rows });
     }
 
     fn searchLockedWithExecutionContextRaw(

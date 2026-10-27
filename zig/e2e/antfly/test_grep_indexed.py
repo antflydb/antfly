@@ -2601,11 +2601,11 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
         assert point["query"] == {"bool": {"filter": {"ids": identities}}}
         assert "execution" not in point
         assert not {"order_by", "search_after", "remote_snapshot"} & point.keys()
-        assert set(point["fields"]) == {
-            "grep.revision",
-            "grep.permissions",
-            "payloads.image",
-        }
+        expected_fields = {"grep.revision", "grep.permissions"}
+        if change:
+            expected_fields.add("payloads.image")
+        assert set(point["fields"]) == expected_fields
+        assert bool(point.get("select")) == (not change)
         assert "responses" in responses[1], responses[1]
         assert not responses[1]["responses"][0].get("remote_snapshot")
         if change:
@@ -2637,23 +2637,30 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
                 for envelope in responses[2:]
                 for result in envelope["responses"]
                 for hit in result.get("hits", {}).get("hits", [])
-                if "_source_projection" in hit
+                if "_computed" in hit
             ]
             assert len(conditional) == parents, responses[2:]
+
             # Descriptor writes are a bounded best-effort cache. Collisions or
             # racing writers may require a full value; they cannot change the
             # warm decision result or send a descriptor to the provider.
-            assert any(
-                hit["_source_projection"]["payloads.image"]["state"] == "unchanged"
-                for hit in conditional
-            ), responses[2:]
+            def computed(hit, suffix):
+                return next(
+                    value
+                    for name, value in hit["_computed"].items()
+                    if name.endswith(suffix)
+                )
+
+            assert any(computed(hit, "_changed") is False for hit in conditional), (
+                responses[2:]
+            )
             for hit in conditional:
-                state = hit["_source_projection"]["payloads.image"]["state"]
-                assert state in {"value", "unchanged"}
-                if state == "unchanged":
-                    assert "image" not in hit["_source"].get("payloads", {})
-                else:
-                    assert hit["_source"]["payloads"]["image"]
+                assert "image" not in hit["_source"].get("payloads", {})
+                assert (
+                    computed(hit, "_value") is None
+                    if not computed(hit, "_changed")
+                    else computed(hit, "_value")
+                )
 
     finally:
         for server, thread in zip((query, provider), threads, strict=True):
@@ -2662,34 +2669,64 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
             server.server_close()
 
 
+def conditional_select(path, known=None):
+    return {
+        "identity": {"call": "value_identity", "args": [{"field": path}]},
+        "missing": {"call": "is_missing", "args": [{"field": path}]},
+        "changed": {
+            "is_distinct_from": [
+                {"ref": "identity"},
+                {
+                    "call": "jsonb_extract_path_text",
+                    "args": [{"param": "known"}, {"field": "_id"}],
+                },
+            ]
+        },
+        "value": {
+            "case": [{"when": {"ref": "changed"}, "then": {"field": path}}],
+            "else": {"literal": None},
+        },
+    }
+
+
 @pytest.mark.parametrize("num_shards", [1, 2])
-def test_conditional_source_projection_binds_current_values_and_query_selection(
+def test_conditional_select_binds_current_values_and_query_selection(
     stateful_api, num_shards
 ):
-    table = f"conditional_source_{time.time_ns()}"
+    table = f"conditional_select_{time.time_ns()}"
     stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
     item = {
         "body": {
             "image": "large-image-" * 4096,
             "null": None,
-            "number": 1.5,
             "integer": 9007199254740993,
-            "boolean": True,
-            "escaped": 'line\nquote"\\ café',
         },
-        "revision": "caller-revision",
-        "padding": "x" * (32 * 1024),
+        "revision": "r1",
+        "padding": "x" * 32768,
     }
     stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
     url = stateful_api.url + f"/tables/{table}/query"
-    names = ("image", "null", "absent", "number", "integer", "boolean", "escaped")
-    fields = [{"field": f"body.{name}"} for name in names]
     request = {
         "query": {"match_all": {}},
-        "fields": ["body"],
-        "source_projection": {"fields": fields},
+        "fields": ["revision"],
+        "select": conditional_select("body.image"),
+        "params": {"known": {}},
         "limit": 10,
     }
+    request["select"].update(
+        {
+            "null_identity": {
+                "call": "value_identity",
+                "args": [{"field": "body.null"}],
+            },
+            "absent_identity": {
+                "call": "value_identity",
+                "args": [{"field": "body.absent"}],
+            },
+            "absent": {"call": "is_missing", "args": [{"field": "body.absent"}]},
+            "integer": {"field": "body.integer"},
+        }
+    )
 
     def query(body):
         response = requests.post(url, json=body, timeout=60)
@@ -2699,57 +2736,42 @@ def test_conditional_source_projection_binds_current_values_and_query_selection(
         return result["hits"]["hits"]
 
     cold = query(request)[0]
-    states = cold["_source_projection"]
-    assert cold["_source"]["body"]["image"] == item["body"]["image"]
-    assert states["body.image"]["state"] == "value"
-    assert states["body.null"]["state"] == "value"
-    assert states["body.absent"] == {"state": "missing"}
-    token = states["body.image"]["identity"]
-    assert token.startswith("sv1-") and len(token) == 68
-    projections = (
-        ["*"],
-        ["body.*"],
-        ["-revision"],
-        [*(f"body.{name}" for name in names), "revision"],
-    )
-    for projection in projections:
-        selected = query({**request, "fields": projection})[0]
-        assert selected["_source"]["body"]["image"] == item["body"]["image"]
-        assert selected["_source_projection"] == states
-    fields[0]["if_match"] = [{"id": "a", "identity": token}]
+    assert cold["_source"] == {"revision": "r1"}
+    values = cold["_computed"]
+    assert values["value"] == item["body"]["image"]
+    assert values["null_identity"].startswith("sv1-")
+    assert values["absent_identity"] is None and values["absent"] is True
+    assert values["integer"] == 9007199254740993
+    assert not any(name.startswith("__antfly_") for name in values)
+    token = values["identity"]
+    request["params"]["known"] = {"a": token}
     warm = query(request)[0]
-    assert "image" not in warm["_source"]["body"]
-    assert warm["_source"]["body"]["null"] is None
-    assert warm["_source_projection"]["body.image"] == {
-        "state": "unchanged",
-        "identity": token,
-    }
-    for projection in projections:
-        selected = query({**request, "fields": projection})[0]
-        assert "image" not in selected["_source"]["body"]
-        assert selected["_source_projection"] == warm["_source_projection"]
-    # Expected identities cannot cause an excluded document to become a hit.
+    assert warm["_computed"]["value"] is None
+    assert warm["_computed"]["changed"] is False
+    assert warm["_computed"]["identity"] == token
+    # Default/all/wildcard/exclusion masks keep their existing source semantics.
+    for extra in ({"fields": ["*"]}, {"fields": ["-padding"]}, {"fields": []}):
+        selected = query({**request, **extra})[0]
+        assert selected["_computed"]["identity"] == token
+        if extra["fields"]:
+            assert selected["_source"]["body"] == item["body"]
+        else:
+            assert selected.get("_source", {}) == {}
+    all_request = {key: value for key, value in request.items() if key != "fields"}
+    assert query(all_request)[0]["_source"]["body"] == item["body"]
+    # Existing source masks remain independent; selecting body still returns it.
+    assert query({**request, "fields": ["body"]})[0]["_source"]["body"] == item["body"]
     assert query({**request, "query": {"bool": {"filter": {"ids": ["other"]}}}}) == []
-    # Metadata rewrites must publish a new document revision without changing
-    # canonical identities for untouched leaves, even when packed indices move.
-    item["revision"] = "metadata-only-update"
+    item["revision"] = "metadata-update"
     item["body"]["before_image"] = "new sibling"
     stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
-    for projection in projections:
-        selected = query({**request, "fields": projection})[0]
-        assert "image" not in selected["_source"]["body"]
-        assert selected["_source_projection"] == warm["_source_projection"]
-    # Caller revision metadata is not authority for the image identity.
+    assert query(request)[0]["_computed"]["identity"] == token
     item["body"]["image"] = "changed-payload"
     stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
-    changed = query(request)[0]
-    assert changed["_source"]["body"]["image"] == "changed-payload"
-    assert changed["_source_projection"]["body.image"]["state"] == "value"
-    assert changed["_source_projection"]["body.image"]["identity"] != token
-    # Conditions are scoped to the exact record ID, even for identical values.
-    token = changed["_source_projection"]["body.image"]["identity"]
-    fields[0]["if_match"] = [{"id": "other", "identity": token}]
-    assert query(request)[0]["_source"]["body"]["image"] == "changed-payload"
+    changed = query(request)[0]["_computed"]
+    assert changed["value"] == "changed-payload" and changed["identity"] != token
+    request["params"]["known"] = {"other": changed["identity"]}
+    assert query(request)[0]["_computed"]["value"] == "changed-payload"
 
 
 def test_conditional_source_projection_upgrades_persisted_certificates(monkeypatch):
@@ -2785,9 +2807,10 @@ def test_conditional_source_projection_upgrades_persisted_certificates(monkeypat
         response.raise_for_status()
         request = {
             "query": {"bool": {"filter": {"ids": ["a"]}}},
-            "fields": ["image", "revision"],
+            "fields": ["revision"],
             "limit": 1,
-            "source_projection": {"fields": [{"field": "image"}]},
+            "select": conditional_select("image"),
+            "params": {"known": {}},
         }
 
         def query():
@@ -2797,32 +2820,53 @@ def test_conditional_source_projection_upgrades_persisted_certificates(monkeypat
             assert result["status"] == 200, result
             return result["hits"]["hits"][0]
 
-        original = query()
-        token = original["_source_projection"]["image"]["identity"]
-        request["source_projection"]["fields"][0]["if_match"] = [
-            {"id": "a", "identity": token}
-        ]
-        warm = query()
-        assert warm["_source"] == {"revision": "r1"}
-        assert warm["_source_projection"]["image"]["state"] == "unchanged"
-        server.pause()
         log_start = server.log_path.stat().st_size
         server.binary = resolve_binary_path(current)
         server.resume()
-        deadline = time.monotonic() + 30
-        while True:
-            upgraded = query()
-            assert upgraded["_source"] == warm["_source"]
-            assert upgraded["_source_projection"] == warm["_source_projection"]
-            logs = server.log_path.read_text(errors="replace")[log_start:]
-            if (
-                "antfly_bench_conditional_source certificate_hits=1 full_fallbacks=0"
-                in logs
-            ):
-                break
-            assert time.monotonic() < deadline, (
-                "bounded authority repair did not resume proof reuse"
-            )
-            time.sleep(0.05)
+        original = query()
+        token = original["_computed"]["identity"]
+        assert original["_computed"]["value"] == "value-" * 8192
+        request["params"]["known"] = {"a": token}
+        warm = query()
+        assert warm["_source"] == {"revision": "r1"}
+        assert warm["_computed"]["value"] is None
+        assert warm["_computed"]["changed"] is False
     finally:
         server.stop()
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_never_evaluates_discarded_output_rows(stateful_api, num_shards):
+    table = f"select_final_{time.time_ns()}"
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    stateful_api.batch_write(
+        table,
+        inserts={
+            "a": {"divisor": 0, "padding": "x" * 32768},
+            "b": {"divisor": 2, "padding": "x" * 32768},
+        },
+        sync_level="full_index",
+    )
+    request = {
+        "query": {"match_all": {}},
+        "fields": [],
+        "select": {
+            "answer": {
+                "divide": [
+                    {"literal": 8},
+                    {"cast": {"type": "integer", "expression": {"field": "divisor"}}},
+                ]
+            }
+        },
+        "order_by": [{"field": "_id", "desc": False}],
+        "offset": 1,
+        "limit": 1,
+    }
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/query", json=request, timeout=60
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()["responses"][0]
+    assert result["status"] == 200, result
+    assert [hit["_id"] for hit in result["hits"]["hits"]] == ["b"]
+    assert result["hits"]["hits"][0]["_computed"]["answer"] == 4

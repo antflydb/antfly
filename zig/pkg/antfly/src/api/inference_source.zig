@@ -25,6 +25,7 @@ pub const Port = struct {
     /// Returned bytes belong to a. The host must recheck live table/row read
     /// permission, membership and the expected revision in the SAME query.
     lookup: *const fn (*anyopaque, A, Reference) anyerror![]const u8,
+    lookup_many: ?*const fn (*anyopaque, A, []const Reference) anyerror![]const []const u8 = null,
 };
 const Selected = struct { part: *V, reference: Reference };
 fn collect(a: A, value: V, selected: *std.ArrayList(Selected)) !void {
@@ -71,25 +72,41 @@ pub fn resolve(a: A, request: V, port: ?Port) !void {
     }
     // Validate all reference shapes and aggregate limits before reading any row.
     // Each unique source is fetched once; only this request shares its authority.
-    var resolved: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var unique: std.StringHashMapUnmanaged(usize) = .empty;
     defer {
-        var keys = resolved.keyIterator();
+        var keys = unique.keyIterator();
         while (keys.next()) |key| a.free(key.*);
-        resolved.deinit(a);
+        unique.deinit(a);
     }
-    for (selected.items) |item| {
+    var references: std.ArrayList(Reference) = .empty;
+    defer references.deinit(a);
+    const slots = try a.alloc(usize, selected.items.len);
+    defer a.free(slots);
+    for (selected.items, slots) |item, *slot| {
         const key = try std.json.Stringify.valueAlloc(a, item.reference, .{});
-        defer a.free(key);
-        const url = resolved.get(key) orelse lookup: {
-            const value = try authorized.lookup(authorized.ptr, a, item.reference);
-            try verify(a, item.reference, value);
-            const owned_key = try a.dupe(u8, key);
-            errdefer a.free(owned_key);
-            try resolved.put(a, owned_key, value);
-            break :lookup value;
-        };
+        if (unique.get(key)) |existing| {
+            a.free(key);
+            slot.* = existing;
+        } else {
+            slot.* = references.items.len;
+            unique.put(a, key, slot.*) catch |err| {
+                a.free(key);
+                return err;
+            };
+            try references.append(a, item.reference);
+        }
+    }
+    const urls = if (authorized.lookup_many) |batch| try batch(authorized.ptr, a, references.items) else sequential: {
+        const output = try a.alloc([]const u8, references.items.len);
+        for (references.items, output) |reference, *url| url.* = try authorized.lookup(authorized.ptr, a, reference);
+        break :sequential output;
+    };
+    if (urls.len != references.items.len) return error.InferenceSourceMismatch;
+    // Verify the complete batch before rewriting any evidence in the request.
+    for (references.items, urls) |reference, url| try verify(a, reference, url);
+    for (selected.items, slots) |item, slot| {
         _ = item.part.object.swapRemove("source");
-        try item.part.object.put(a, "image_url", .{ .string = url });
+        try item.part.object.put(a, "image_url", .{ .string = urls[slot] });
     }
     // Existing inline requests retain the same expanded transport limit. This
     // counting sink retains no image-sized body; only cold materialization pays
@@ -175,4 +192,122 @@ test "httpx inference gateway source references validate all locators before aut
     wrong = reference;
     wrong.field = "assets.*";
     try std.testing.expectError(error.InvalidInferenceSource, wrong.validate());
+}
+
+/// Only actual absence becomes 404. Preserve retryable table failures through
+/// the gateway instead of negatively caching a transient source lookup.
+pub fn checkStatus(status: i64) !void {
+    if (status >= 200 and status < 300) return;
+    return switch (status) {
+        401, 403 => error.Forbidden,
+        404 => error.InferenceSourceUnavailable,
+        429 => error.DecisionRateLimited,
+        408, 504 => error.Timeout,
+        500...503, 505...599 => error.InferenceUpstreamUnavailable,
+        else => error.InvalidInferenceSource,
+    };
+}
+pub const Group = struct {
+    references: std.ArrayList(usize) = .empty,
+    ids: std.ArrayList([]const u8) = .empty,
+    fields: std.ArrayList([]const u8) = .empty,
+    images: std.ArrayList([]const u8) = .empty,
+};
+fn add(a: A, list: *std.ArrayList([]const u8), field: []const u8) !void {
+    for (list.items) |existing| if (std.mem.eql(u8, existing, field)) return;
+    try list.append(a, field);
+}
+fn equalFields(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left) |field| {
+        const found = for (right) |other| {
+            if (std.mem.eql(u8, field, other)) break true;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
+}
+fn sameFilter(a: A, left: Reference, right: Reference) !bool {
+    if (!std.mem.eql(u8, left.table, right.table)) return false;
+    const l = try std.json.Stringify.valueAlloc(a, left.filter_query, .{});
+    defer a.free(l);
+    const r = try std.json.Stringify.valueAlloc(a, right.filter_query, .{});
+    defer a.free(r);
+    return std.mem.eql(u8, l, r);
+}
+/// First union fields within a parent, then batch parents with the SAME mask.
+/// Never form a Cartesian product of unrelated image selectors across rows.
+/// All storage belongs to the request arena; at most 32 references per query.
+pub fn groups(a: A, references: []const Reference) ![]Group {
+    var parents: std.ArrayList(Group) = .empty;
+    for (references, 0..) |reference, i| {
+        const slot = found: {
+            for (parents.items, 0..) |parent, j| {
+                const first = references[parent.references.items[0]];
+                if (parent.references.items.len < 32 and std.mem.eql(u8, first.document_id, reference.document_id) and try sameFilter(a, first, reference)) break :found j;
+            }
+            try parents.append(a, .{});
+            break :found parents.items.len - 1;
+        };
+        const parent = &parents.items[slot];
+        try parent.references.append(a, i);
+        try add(a, &parent.ids, reference.document_id);
+        try add(a, &parent.fields, reference.field);
+        try add(a, &parent.fields, reference.revision_field);
+        if (reference.permissions_field) |field| try add(a, &parent.fields, field);
+        try add(a, &parent.images, reference.field);
+    }
+    var output: std.ArrayList(Group) = .empty;
+    for (parents.items) |parent| {
+        const slot = found: {
+            for (output.items, 0..) |other, i| {
+                if (other.references.items.len + parent.references.items.len <= 32 and
+                    equalFields(other.fields.items, parent.fields.items) and equalFields(other.images.items, parent.images.items) and
+                    try sameFilter(a, references[other.references.items[0]], references[parent.references.items[0]])) break :found i;
+            }
+            try output.append(a, .{});
+            break :found output.items.len - 1;
+        };
+        const group = &output.items[slot];
+        if (group.fields.items.len == 0) {
+            group.fields = parent.fields;
+            group.images = parent.images;
+        }
+        try group.references.appendSlice(a, parent.references.items);
+        for (parent.ids.items) |id| try add(a, &group.ids, id);
+    }
+    return output.items;
+}
+
+test "httpx inference gateway preserves temporary source lookup failures" {
+    try checkStatus(200);
+    try std.testing.expectError(error.DecisionRateLimited, checkStatus(429));
+    try std.testing.expectError(error.InferenceUpstreamUnavailable, checkStatus(503));
+    try std.testing.expectError(error.Timeout, checkStatus(504));
+    try std.testing.expectError(error.InferenceSourceUnavailable, checkStatus(404));
+    try std.testing.expectError(error.Forbidden, checkStatus(403));
+}
+
+test "httpx inference gateway batches same parents and equal masks without Cartesian overfetch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base: Reference = .{ .table = "docs", .document_id = "a", .field = "images.one", .revision_field = "revision", .revision = "r1", .sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .mime_type = "image/png", .byte_length = 68, .max_pixels = 16 };
+    var second = base;
+    second.field = "images.two";
+    var third = base;
+    third.document_id = "b";
+    var fourth = second;
+    fourth.document_id = "b";
+    const combined = try groups(a, &.{ base, second, third, fourth });
+    try std.testing.expectEqual(@as(usize, 1), combined.len);
+    try std.testing.expectEqual(@as(usize, 2), combined[0].ids.items.len);
+    try std.testing.expectEqual(@as(usize, 3), combined[0].fields.items.len);
+    const separate = try groups(a, &.{ base, fourth });
+    try std.testing.expectEqual(@as(usize, 2), separate.len);
+    var limited: [65]Reference = @splat(base);
+    for (&limited, 0..) |*reference, i| reference.document_id = try std.fmt.allocPrint(a, "id-{d}", .{i});
+    const bounded = try groups(a, &limited);
+    try std.testing.expectEqual(@as(usize, 3), bounded.len);
+    for (bounded) |group| try std.testing.expect(group.references.items.len <= 32);
 }

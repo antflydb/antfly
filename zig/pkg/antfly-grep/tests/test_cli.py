@@ -213,14 +213,14 @@ class DecisionHandler(BaseHTTPRequestHandler):
         self.server.index_requests.append(
             (self.path, self.headers.get("Authorization"), body)
         )
-        asset_read = any(
+        asset_read = bool(body.get("select")) or any(
             field.startswith("payloads.") for field in body.get("fields", [])
         )
-        if (
-            body.get("source_projection")
-            and getattr(self.server, "source_projection_mode", None) == "reject"
+        if body.get("select") and getattr(self.server, "select_mode", None) in (
+            "reject",
+            "reject422",
         ):
-            self.send_response(400)
+            self.send_response(422 if self.server.select_mode == "reject422" else 400)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -360,46 +360,84 @@ class DecisionHandler(BaseHTTPRequestHandler):
                         parent = parent.setdefault(part, {})
                     parent[parts[-1]] = value
             returned = {**hit, "_source": selected}
-            if (
-                body.get("source_projection")
-                and getattr(self.server, "source_projection_mode", None) == "enabled"
+            if body.get("select") and getattr(self.server, "select_mode", None) in (
+                "enabled",
+                "partial",
             ):
-                states = {}
-                for entry in body["source_projection"]["fields"]:
-                    parts = entry["field"].split(".")
-                    parent = selected
-                    for part in parts[:-1]:
-                        parent = (
-                            parent.get(part, {}) if isinstance(parent, dict) else {}
+                computed = {}
+                missing = object()
+
+                def evaluate(expr):
+                    if "literal" in expr:
+                        return expr["literal"]
+                    if "field" in expr:
+                        if expr["field"] == "_id":
+                            return hit["_id"]
+                        value = hit["_source"]
+                        for part in expr["field"].split("."):
+                            value = (
+                                value.get(part, missing)
+                                if isinstance(value, dict)
+                                else missing
+                            )
+                        return value
+                    if "ref" in expr:
+                        return binding(expr["ref"])
+                    if "case" in expr:
+                        for branch in expr["case"]:
+                            if evaluate(branch["when"]) is True:
+                                return evaluate(branch["then"])
+                        return evaluate(expr.get("else", {"literal": None}))
+                    if "is_distinct_from" in expr:
+                        return evaluate(expr["is_distinct_from"][0]) != evaluate(
+                            expr["is_distinct_from"][1]
                         )
-                    if not isinstance(parent, dict) or parts[-1] not in parent:
-                        states[entry["field"]] = {"state": "missing"}
-                        continue
-                    canonical = json.dumps(
-                        parent[parts[-1]], ensure_ascii=False, separators=(",", ":")
-                    ).encode()
-                    identity = (
-                        "sv1-"
-                        + hashlib.sha256(
-                            b"antfly.source.value.v1\0" + canonical
-                        ).hexdigest()
-                    )
-                    unchanged = any(
-                        c["id"] == hit["_id"] and c["identity"] == identity
-                        for c in entry.get("if_match", [])
-                    )
-                    reference = entry.get("mode") == "identity"
-                    states[entry["field"]] = {
-                        "state": "reference"
-                        if reference
-                        else "unchanged"
-                        if unchanged
-                        else "value",
-                        "identity": identity,
+                    args = [evaluate(x) for x in expr["args"]]
+                    if expr["call"] == "is_missing":
+                        return args[0] is missing
+                    if expr["call"] == "jsonb_extract_path_text":
+                        value = args[0]
+                        for part in args[1:]:
+                            value = value.get(part) if isinstance(value, dict) else None
+                        return value
+                    if expr["call"] == "value_identity":
+                        if args[0] is missing:
+                            return None
+                        canonical = json.dumps(
+                            args[0], ensure_ascii=False, separators=(",", ":")
+                        ).encode()
+                        return (
+                            "sv1-"
+                            + hashlib.sha256(
+                                b"antfly.source.value.v1\0" + canonical
+                            ).hexdigest()
+                        )
+                    raise AssertionError(expr)
+
+                def binding(name):
+                    if name not in computed:
+                        computed[name] = evaluate(body["select"][name])
+                    return computed[name]
+
+                for name in body["select"]:
+                    binding(name)
+                returned["_computed"] = {
+                    key: None if value is missing else value
+                    for key, value in computed.items()
+                }
+                if self.server.select_mode == "partial":
+                    returned["_computed"] = {
+                        name: value
+                        for name, value in returned["_computed"].items()
+                        if not name.endswith("_value")
                     }
-                    if unchanged or reference:
-                        del parent[parts[-1]]
-                returned["_source_projection"] = states
+                self.server.projected_asset_bytes = getattr(
+                    self.server, "projected_asset_bytes", 0
+                ) + sum(
+                    len(value)
+                    for name, value in computed.items()
+                    if name.endswith("_value") and isinstance(value, str)
+                )
             if asset_read:
                 for field in body["fields"]:
                     if not field.startswith("payloads."):
@@ -2114,7 +2152,7 @@ class CliTests(unittest.TestCase):
         self.env["HOME"] = str(self.root)
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
         self.server.asset_mode = None
-        self.server.source_projection_mode = None
+        self.server.select_mode = None
         self.server.projected_asset_bytes = 0
         self.server.index_response_bytes = 0
         self.server.asset_blocked = threading.Event()
@@ -3715,7 +3753,9 @@ class CliTests(unittest.TestCase):
         fields = [body["fields"] for _, _, body in self.server.index_requests]
         self.assertNotIn("payloads.preview", fields[0])
         self.assertNotIn("grep.content", fields[0])
-        self.assertIn("payloads.preview", fields[1])
+        self.assertNotIn("payloads.preview", fields[1])
+        self.assertIn("select", self.server.index_requests[1][2])
+        self.assertIn("payloads.preview", fields[-1])
         for _, authorization, body in self.server.index_requests:
             self.assertEqual(authorization, "Bearer independent-table-token")
             self.assertEqual(body["filter_query"], {"ids": ["0"]})
@@ -4580,7 +4620,7 @@ class CliTests(unittest.TestCase):
         self,
     ):
         config = self.visual_parents(count=4, page_size=4, units=2)
-        self.server.source_projection_mode = "enabled"
+        self.server.select_mode = "enabled"
         args = [
             *self.decision_args(),
             "--media=images",
@@ -4633,9 +4673,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.server.projected_asset_bytes, 0)
         self.assertTrue(
             any(
-                field.get("mode") == "identity"
+                bool(query.get("select"))
+                and not any(name.endswith("_value") for name in query["select"])
                 for _, _, query in self.server.index_requests
-                for field in query.get("source_projection", {}).get("fields", [])
             )
         )
 
@@ -4643,7 +4683,7 @@ class CliTests(unittest.TestCase):
         self,
     ):
         config = self.visual_parents(count=8, page_size=4, units=2)
-        self.server.source_projection_mode = "enabled"
+        self.server.select_mode = "enabled"
         args = [
             *self.decision_args(),
             "--media=images",
@@ -4665,18 +4705,23 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(self.server.requests), provider_count)
 
         def evidence(result):
-            return [
+            records = [
                 json.loads(line)
                 for line in result.stdout.splitlines()
                 if json.loads(line)["type"] == "evidence"
             ]
 
+            # Every read reports its current observation time, including hits.
+            # Compare result content independently of crossing a clock second.
+            for record in records:
+                record["source"].pop("observed_at", None)
+            return records
+
         self.assertEqual(evidence(cold), evidence(warm))
         self.assertTrue(
             any(
-                entry.get("if_match")
+                "sv1-" in json.dumps(request.get("select", {}))
                 for _, _, request in self.server.index_requests
-                for entry in request.get("source_projection", {}).get("fields", [])
             )
         )
         descriptors = list(self.root.rglob("verified-image-v1-*.bin"))
@@ -4705,9 +4750,8 @@ class CliTests(unittest.TestCase):
         )
         self.assertFalse(
             any(
-                field.get("if_match")
+                "sv1-" in json.dumps(body.get("select", {}))
                 for _, _, body in changed_requests
-                for field in body.get("source_projection", {}).get("fields", [])
             )
         )
         # An unchanged caller manifest cannot hide a changed stored payload.
@@ -4724,15 +4768,13 @@ class CliTests(unittest.TestCase):
 
     def test_media_conditional_projection_falls_back_to_older_servers(self):
         config = self.visual_parents(count=2)
-        self.server.source_projection_mode = "reject"
+        self.server.select_mode = "reject"
         result = self.raw_cli(
             *self.decision_args(), "--media=images", "--json", "--table-config", config
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            sum(
-                "source_projection" in body for _, _, body in self.server.index_requests
-            ),
+            sum("select" in body for _, _, body in self.server.index_requests),
             1,
         )
         self.assertNotIn(b"leaked", result.stderr)
@@ -4750,6 +4792,33 @@ class CliTests(unittest.TestCase):
         self.assertIn(b"RequestBudgetExceeded", limited.stderr)
         self.assertEqual(len(self.server.index_requests), 2)
         self.assertEqual(len(self.server.requests), 0)
+
+    def test_media_projection_falls_back_on_partial_and_unsupported_output(self):
+        for mode in ("partial", "reject422"):
+            with self.subTest(mode=mode):
+                config = self.visual_parents(count=2)
+                self.server.select_mode = mode
+                self.server.index_requests.clear()
+                result = self.raw_cli(
+                    *self.decision_args(),
+                    "--media=images",
+                    "--json",
+                    "--table-config",
+                    config,
+                    "--cache-dir",
+                    self.root / mode,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    sum("select" in body for _, _, body in self.server.index_requests),
+                    1,
+                )
+                self.assertTrue(
+                    any(
+                        "payloads.preview" in body["fields"]
+                        for _, _, body in self.server.index_requests
+                    )
+                )
 
     def test_media_default_budget_overlaps_manifest_with_foreground(self):
         config = self.visual_parents(count=2, page_size=1)

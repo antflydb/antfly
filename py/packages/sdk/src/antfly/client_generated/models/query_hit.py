@@ -14,7 +14,6 @@ if TYPE_CHECKING:
     from ..models.query_hit_highlights import QueryHitHighlights
     from ..models.query_hit_index_scores import QueryHitIndexScores
     from ..models.query_hit_source import QueryHitSource
-    from ..models.query_hit_source_projection import QueryHitSourceProjection
     from ..models.query_score_details import QueryScoreDetails
 
 
@@ -38,8 +37,6 @@ class QueryHit:
         field_index_scores (QueryHitIndexScores | Unset): Scores partitioned by index when using RRF search.
         field_score_details (QueryScoreDetails | Unset): Optional score provenance for ranking features that changed the
             final hit score.
-        field_source_projection (QueryHitSourceProjection | Unset): Conditional source states keyed by exact logical
-            field path; returned only when source_projection was requested.
         field_source (QueryHitSource | Unset):
         hierarchy (QueryHitHierarchy | Unset):
         field_sort (list[Any] | Unset): Sort key values for this hit. Pass as search_after or search_before
@@ -62,7 +59,6 @@ class QueryHit:
     field_distance: float | Unset = UNSET
     field_index_scores: QueryHitIndexScores | Unset = UNSET
     field_score_details: QueryScoreDetails | Unset = UNSET
-    field_source_projection: QueryHitSourceProjection | Unset = UNSET
     field_source: QueryHitSource | Unset = UNSET
     hierarchy: QueryHitHierarchy | Unset = UNSET
     field_sort: list[Any] | Unset = UNSET
@@ -89,10 +85,6 @@ class QueryHit:
         field_score_details: dict[str, Any] | Unset = UNSET
         if not isinstance(self.field_score_details, Unset):
             field_score_details = self.field_score_details.to_dict()
-
-        field_source_projection: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.field_source_projection, Unset):
-            field_source_projection = self.field_source_projection.to_dict()
 
         field_source: dict[str, Any] | Unset = UNSET
         if not isinstance(self.field_source, Unset):
@@ -128,8 +120,6 @@ class QueryHit:
             field_dict["_index_scores"] = field_index_scores
         if field_score_details is not UNSET:
             field_dict["_score_details"] = field_score_details
-        if field_source_projection is not UNSET:
-            field_dict["_source_projection"] = field_source_projection
         if field_source is not UNSET:
             field_dict["_source"] = field_source
         if hierarchy is not UNSET:
@@ -148,7 +138,6 @@ class QueryHit:
         from ..models.query_hit_highlights import QueryHitHighlights
         from ..models.query_hit_index_scores import QueryHitIndexScores
         from ..models.query_hit_source import QueryHitSource
-        from ..models.query_hit_source_projection import QueryHitSourceProjection
         from ..models.query_score_details import QueryScoreDetails
 
         d = dict(src_dict)
@@ -181,13 +170,6 @@ class QueryHit:
         else:
             field_score_details = QueryScoreDetails.from_dict(_field_score_details)
 
-        _field_source_projection = d.pop("_source_projection", UNSET)
-        field_source_projection: QueryHitSourceProjection | Unset
-        if isinstance(_field_source_projection, Unset):
-            field_source_projection = UNSET
-        else:
-            field_source_projection = QueryHitSourceProjection.from_dict(_field_source_projection)
-
         _field_source = d.pop("_source", UNSET)
         field_source: QueryHitSource | Unset
         if isinstance(_field_source, Unset):
@@ -219,7 +201,6 @@ class QueryHit:
             field_distance=field_distance,
             field_index_scores=field_index_scores,
             field_score_details=field_score_details,
-            field_source_projection=field_source_projection,
             field_source=field_source,
             hierarchy=hierarchy,
             field_sort=field_sort,

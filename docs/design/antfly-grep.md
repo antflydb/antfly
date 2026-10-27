@@ -419,47 +419,83 @@ constrained Linux VM; it does not establish zero-cost execution. The later
 measures the rolling scheduler, shared admission and borrowed envelopes, including
 the sustained-image warm-latency/memory tradeoff.
 
-Warm scores require a fresh authorized query. The conditional source projection
-contract now permits a server to confirm previously validated image identities
-without transferring the image again. Manifest digests and caller revision fields
-are never identity authority. Missing or changed identities materialize and validate
-bytes; an unavailable score also materializes bytes before provider dispatch.
+Warm scores require a fresh authorized query. General scalar projection lets a
+server confirm previously validated image identities without transferring the
+image again. Manifest digests and caller revision fields are never authority.
+Missing or changed identities materialize and validate bytes; a score miss also
+materializes bytes before provider dispatch.
 
 ### Conditional source projection and future storage authorities
 
-The existing query API accepts an optional, general source delivery extension:
+The long-term public interface preserves `fields: string[]` as the source mask
+and adds a `select` map of named pure expressions. Source fields remain in
+`_source`; expressions appear in `_computed`. Existing typed SDK callers and
+wildcard/exclusion semantics remain compatible. A source field requested by
+`fields` is always returned: CASE never silently changes that mask. The earlier
+unreleased `source_projection` / `_source_projection` delivery protocol is
+removed rather than established as a second projection language.
 
 ```json
 {
   "query": {"bool": {"filter": {"ids": ["source-1"]}}},
-  "fields": ["grep.revision", "grep.permissions", "payloads.image"],
-  "source_projection": {
-    "fields": [{
-      "field": "payloads.image",
-      "if_match": [{"id": "source-1", "identity": "sv1-<64 lowercase hex characters>"}]
-    }]
+  "fields": ["grep.revision", "grep.permissions"],
+  "params": {"known": {"source-1": "sv1-<64 lowercase hex characters>"}},
+  "select": {
+    "identity": {"call": "value_identity", "args": [{"field": "payloads.image"}]},
+    "changed": {"is_distinct_from": [
+      {"ref": "identity"},
+      {"call": "jsonb_extract_path_text", "args": [{"param": "known"}, {"field": "_id"}]}
+    ]},
+    "image": {"case": [{
+      "when": {"ref": "changed"},
+      "then": {"field": "payloads.image"}
+    }], "else": {"literal": null}}
   }
 }
 ```
 
-Each hit's `_source_projection` maps exact logical paths to `{state, identity}`.
-`value` retains the selected value; `unchanged` omits only that value; `missing`
-has no identity. Stored null is a value, distinct from an absent path. Only an
-exact expected identity for the same record ID can cause omission. Conditions
-never authorize a read, bypass query filters, resurrect absent documents, or
-change source-dependent ranking, evaluation, highlighting or aggregation.
-Source-only match-all/ID retrieval can finalize conditional delivery at the
-storage owner, under the ordinary authorization and publication lease. A bounded
-window uses one read transaction and short-lived value scopes, pinning content,
-directory and certificates to the same read cut. The
-parser’s synthesized match-all text root for ID/filter buckets is membership
-scaffolding and remains eligible; named or scoring text searches are not. Queries
-with source-dependent operators retain complete worker values and finalize at
-the coordinator; column-backed sources retain that reference path. Ordinary
-projection masks, including `*`, nested wildcards and exclusions, determine
-whether an exact conditional path is selected. Requests allow 64 non-overlapping exact paths and 4,096 conditions
-in total. Duplicate IDs and overlapping paths are rejected. Conditions are
-indexed once per response; per-hit lookup is independent of the condition count.
+JSON expressions lower to the existing SQL scalar AST, binder and VM. CASE,
+casts, pure functions and three-valued conditions share SQL semantics; this is
+not a second evaluator. Dynamic document operands are jsonb; callers cast them
+explicitly for typed scalar functions. `literal` and `param` accept data, never
+SQL text. `ref` refers to a sibling expression; all dependencies are bound before
+execution, cycles and collisions with `evaluate.compute` are rejected. Pure
+projection does not change membership or ranking. AI/provider calls stay in
+`evaluate`; they cannot occur implicitly in `select`, including untaken branches.
+`value_identity` returns an opaque value identity for present null as well as
+other values. An absent path returns SQL NULL; `is_missing` distinguishes that
+from stored JSON null. Conditions never grant permissions or resurrect a row.
+
+Binding validates the entire expression graph, but a row's lazy column loader
+reads only executed branches. A matching identity does not load the image.
+Selecting the image through `fields` still loads it independently. Parameters
+are bounded to 1 MiB / 1,024 entries, selection to 64 named expressions, depth
+64 and 8,192 expression nodes. SQL VM work and output budgets still apply.
+
+Native output-only queries evaluate after retrieval under the publication lease.
+Each 64-row window pins a read transaction, batches authenticated content and
+identity metadata, and releases per-row scratch and read scopes. Identity and
+existence use exact current metadata when available; selected fields load through
+the ordinary verified logical range reader. Opaque, small, stale and unsupported
+layouts fall back safely. Source-dependent stages retain complete afterimages
+and project at final output; column providers use lazy selected-column access.
+Distributed retrieval selects the global page before scalar evaluation. Large
+selected rows evaluate lazily at the physical owner during retained-cut hydration;
+eager small rows and nondeferred/retained routes evaluate at the coordinator.
+Discarded candidates never evaluate faulting output expressions. Internal worker
+envelopes carry the original source mask separately from input dependencies. A request-bound internal receipt prevents repeated evaluation and
+never appears in the public `_computed` map. Older workers retain source values
+for coordinator evaluation; no public projection-state transport is required.
+
+Gateway table-image materialization uses ordinary authorized queries with the
+original ingress identity. Exact duplicate references share one request-local
+lookup. Images of a parent are unioned first; parents batch only when their
+field/image masks and filters match, at most 32 references per query. This avoids
+Cartesian projection overfetch. Every reference still checks live row permissions,
+revision, optional identity, byte length, digest, format and pixel bounds before
+any provider dispatch. One deadline covers all groups. Missing rows become 404;
+429, 503 and timeouts retain retryable gateway statuses. Source locators never
+reach providers, and aggregate image limits apply before lookup and after expansion.
 
 `sv1` is a versioned server-computed identity over the typed JSON value delivered
 by that authorized read cut. Hashing streams into SHA-256 without allocating an
@@ -485,42 +521,16 @@ numbers retain typed canonicalization. Both routes must produce identical sv1
 identities. Directory coverage and fallback admission remain unchanged.
 
 Eligible reads prepare at most 64 rows from one pinned transaction. One sorted,
-deduplicated batch loads content/revision/TTL metadata; a second loads required
-directories and certificates. Each directory is decoded once. Bounded owned
-metadata survives backend-buffer retirement; remaining field reads reuse the
-same proof/directory rather than fetching them again. Equal omission masks share
-logical range/full-value batches; no unrelated values are unioned. Additional
-materialized input is bounded to a conservative 1 MiB subwindow, with one large
-row allowed to make progress. Admission uses coalesced retained range bytes on
-range-capable backends and original row sizes on full-value adapters. Each
-subwindow owns a fresh read scope from the same transaction, releasing backend
-buffers and pins before the next subwindow. Singleton reads reuse their metadata
-scope directly. Deadline checks run during planning, before each
-subwindow and before each output row. Results return to their original slots,
-and partial failures release untransferred sources. Row reconstruction scratch
-is still recycled independently. This is request-local work reuse, not an authorization
-or cross-request snapshot cache. Unsupported parent masks bypass preparation;
-small/opaque/stale cases retain ordinary source delivery.
-
-Temporary reconstructed rows belong to each subwindow's reclaimable arena,
-including when the caller uses an arena for retained results. Full-layout rows
-borrow their final pinned read scope until projection finishes; reconstructed
-range results remain owned scratch. The ordinary owned-read API is unchanged.
-Only final source
-and identity bytes belong to the result allocator. The selector is compiled once
-per window; omission reconstruction uses small object overlays over borrowed
-spans, preserving proven ancestor objects and public field order without decoding
-retained payloads. The public wire encoder streams these sources through the same
-strict projection engine, removing private fields and rejecting duplicate keys.
-It does not construct an intermediate source DOM or encoded source copy.
-Strict preparation publishes a syntax receipt bounded to the immutable source
-extent. Emission can copy strings already spelled exactly as the default JSON
-encoder would produce, including canonical control escapes. Noncanonical Unicode,
-slash and control escapes retain decoding/normalization, as do numbers. This
-receipt never skips object-key checks or authorizes bytes from another source;
-foreign extents and unqualified input use the ordinary scanner. Source-derived
-hierarchy/mention metadata still receives the complete hit when main `_source`
-conversion is deferred to the span writer.
+deduplicated batch loads content/revision/TTL metadata; a second loads directories
+and certificates. Owned bounded metadata survives backend-buffer retirement.
+Per-row lazy reads reuse the same proof and directory; no cross-request snapshot
+or authorization cache is introduced. Final source and computed bytes belong to
+the result allocator. Native final source uses the strict projection engine and
+its immutable syntax receipt; unsupported source layouts retain ordinary strict
+normalization. Benchmark qualification must include cold and warm reads,
+metadata updates, full-source masks, row counts, output size, CPU and peak memory.
+Earlier source-delivery benchmark reports used the removed experimental protocol;
+they are historical measurements, not measurements of the select interface.
 
 Primary rewrites may reuse canonical leaf certificates from the same writer
 snapshot. The previous content proof must match the current mutation revision;
@@ -652,3 +662,35 @@ source-reference fixture and regenerating packaged tooling, its six failed
 cases all passed on the optimized recheck; two optional cases were skipped.
 This is split/correctness validation, not a new performance qualification or
 an independent Linux hardware result.
+
+### Conditional select qualification (2026-10-26)
+
+The general expression interface was qualified on macOS ARM64 (14 logical CPUs)
+with the native Debug binary `f8aae9f09f1a`, eight 256 KiB values, three alternating
+server rounds and five reads per phase. Both compared paths use the same binary,
+authorization, query membership, result values and SQL VM. The reference wraps
+its identity operand in pure JSON functions so it must read the current value;
+the direct operand can use the native certificate. Result digests are checked
+across variants and phases. These are warm-cache, shared-host measurements.
+
+| Delivery | Metadata-backed CPU / elapsed | Value-reading reference CPU / elapsed | Response |
+|---|---:|---:|---:|
+| Full values | 121.35 / 107.72 ms | 136.08 / 118.53 ms | 2,099,088 B |
+| Matching known identities | 8.42 / 8.17 ms | 52.33 / 44.54 ms | about 1,952 B |
+
+This fixture shows roughly 6.2× less CPU for matching identities and a smaller
+full-value CPU saving. Ordinary source delivery without expressions is a separate
+control: 24.92 ms CPU / 21.45 ms elapsed. General computed full-value delivery
+still incurs additional VM/JSON serialization work. This is not a universal
+speedup, zero-cost execution, a release throughput claim, or evidence for changing
+the document format. Reducing cold `_computed` serialization copies remains a
+measured future optimization; it must preserve strict JSON and expression semantics.
+
+The reproducible driver is `zig/e2e/antfly/bench_source_projection.py`; run with
+`--rounds 3 --queries-per-phase 5 --documents 8 --value-bytes 262144 --metadata-updates 2`. Raw reports and logs stay ignored under `output/`.
+Validation includes 157 native query/worker contracts, 17 source-identity/read
+contracts, gateway suites, 353 Python query round trips, the Go SDK suite, and
+291 CLI cases (two optional skips). Native indexed integration covers single-
+and multi-shard final-page evaluation, default/wildcard/exclusion source masks,
+NULL/missing, retained revisions, authorization and grouped image reads. Fixtures
+establish orchestration, not live-provider relevance or production Cloud ACL quality.

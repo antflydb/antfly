@@ -1238,6 +1238,10 @@ from .predicate_decision_question import PredicateDecisionQuestion
 from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
 from .prior_artifact_context import PriorArtifactContext
+from .projection_expression import ProjectionExpression
+from .projection_expression_case_item import ProjectionExpressionCaseItem
+from .projection_expression_cast import ProjectionExpressionCast
+from .projection_expression_cast_type import ProjectionExpressionCastType
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
@@ -1279,7 +1283,6 @@ from .query_hit_hierarchy_level import QueryHitHierarchyLevel
 from .query_hit_highlights import QueryHitHighlights
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
-from .query_hit_source_projection import QueryHitSourceProjection
 from .query_hits import QueryHits
 from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
@@ -1292,7 +1295,9 @@ from .query_request import QueryRequest
 from .query_request_aggregations import QueryRequestAggregations
 from .query_request_embeddings import QueryRequestEmbeddings
 from .query_request_foreign_sources import QueryRequestForeignSources
+from .query_request_params import QueryRequestParams
 from .query_request_query import QueryRequestQuery
+from .query_request_select import QueryRequestSelect
 from .query_responses import QueryResponses
 from .query_result import QueryResult
 from .query_result_base import QueryResultBase
@@ -1495,12 +1500,6 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
-from .source_projection import SourceProjection
-from .source_projection_field import SourceProjectionField
-from .source_projection_field_mode import SourceProjectionFieldMode
-from .source_value_condition import SourceValueCondition
-from .source_value_identity import SourceValueIdentity
-from .source_value_identity_state import SourceValueIdentityState
 from .sql_array_column_schema import SQLArrayColumnSchema
 from .sql_array_column_schema_type import SQLArrayColumnSchemaType
 from .sql_array_dimension import SQLArrayDimension
@@ -2936,6 +2935,10 @@ __all__ = (
     "PredicateDecisionQuestionType",
     "PrefixQuery",
     "PriorArtifactContext",
+    "ProjectionExpression",
+    "ProjectionExpressionCaseItem",
+    "ProjectionExpressionCast",
+    "ProjectionExpressionCastType",
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
@@ -2978,7 +2981,6 @@ __all__ = (
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",
-    "QueryHitSourceProjection",
     "QueryHitsTotal",
     "QueryHitsTotalRelation",
     "QueryProfile",
@@ -2990,7 +2992,9 @@ __all__ = (
     "QueryRequestAggregations",
     "QueryRequestEmbeddings",
     "QueryRequestForeignSources",
+    "QueryRequestParams",
     "QueryRequestQuery",
+    "QueryRequestSelect",
     "QueryResponses",
     "QueryResult",
     "QueryResultBase",
@@ -3193,12 +3197,6 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
-    "SourceProjection",
-    "SourceProjectionField",
-    "SourceProjectionFieldMode",
-    "SourceValueCondition",
-    "SourceValueIdentity",
-    "SourceValueIdentityState",
     "SQLArrayColumnSchema",
     "SQLArrayColumnSchemaType",
     "SQLArrayDimension",

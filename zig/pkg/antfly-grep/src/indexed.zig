@@ -20,9 +20,9 @@ const document = @import("document.zig");
 const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
 const descriptors = @import("image_descriptor.zig");
-const SourceCondition = struct { id: []const u8, identity: []const u8 };
-const SourceField = struct { field: []const u8, mode: ?enum { identity } = null, if_match: []const SourceCondition = &.{} };
-const SourceProjection = struct { fields: []const SourceField };
+const CachedIdentity = struct { id: []const u8, identity: []const u8 };
+const MediaField = struct { field: []const u8, mode: ?enum { identity } = null, if_match: []const CachedIdentity = &.{} };
+const MediaSelection = struct { fields: []const MediaField };
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
 pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
 pub const ValueVerification = struct {
@@ -469,7 +469,7 @@ fn sourceCacheScope(a: A, options: *const @import("options.zig").Options, config
 /// and verify identities before any score or descriptor reaches result output.
 fn plannedRecords(search: anytype, a: A, config: Config, table: Table, id: []const u8, parent: std.json.Value, path: []const u8, units: []const @import("antfly_source_evidence").Unit) ![16]?descriptors.Record {
     var out: [16]?descriptors.Record = @splat(null);
-    if (search.options.indexed_media_transport == .source or search.options.ask == null or search.options.model == null or !descriptors.enabled(search.options) or (search.shared_limits orelse &search.limits).source_projection_unsupported.load(.acquire)) return out;
+    if (search.options.indexed_media_transport == .source or search.options.ask == null or search.options.model == null or !descriptors.enabled(search.options) or (search.shared_limits orelse &search.limits).select_unsupported.load(.acquire)) return out;
     var arena = std.heap.ArenaAllocator.init(search.a);
     defer arena.deinit();
     const temp = arena.allocator();
@@ -661,9 +661,9 @@ fn prefetchAssets(search: anytype, pool: *@import("worker_pool.zig").Pool, http:
         try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{table.document_field}));
         try fields.appendSlice(a, shape);
         const encoded = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = ids.items } } }, .{});
-        var projected: std.ArrayList(SourceField) = .empty;
+        var projected: std.ArrayList(MediaField) = .empty;
         for (shape, 0..) |field, i| {
-            var conditions: std.ArrayList(SourceCondition) = .empty;
+            var conditions: std.ArrayList(CachedIdentity) = .empty;
             for (planned.items) |parent| if (parent.records[i]) |record| {
                 try conditions.append(a, .{ .id = parent.id, .identity = record.identity });
             };
@@ -671,7 +671,7 @@ fn prefetchAssets(search: anytype, pool: *@import("worker_pool.zig").Pool, http:
         }
         const job = &jobs[started];
         job.* = .{
-            .fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = group_config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false, .source_projection = if (search.options.indexed_media_transport == .source or descriptors.enabled(search.options)) .{ .fields = projected.items } else null },
+            .fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = group_config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false, .media_selection = if (search.options.indexed_media_transport == .source or descriptors.enabled(search.options)) .{ .fields = projected.items } else null },
             .size = ids.items.len,
             .shape = shape,
             .parents = planned.items,
@@ -698,6 +698,33 @@ fn prefetchAssets(search: anytype, pool: *@import("worker_pool.zig").Pool, http:
     }
     if (groups.items.len == 0) return null;
     return .{ .groups = groups.items, .covered_hits = covered_hits };
+}
+
+/// Stable internal aliases keep source paths separate from computed names.
+fn mediaAlias(a: A, path: []const u8, suffix: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(path, &digest, .{});
+    return std.fmt.allocPrint(a, "media_{s}_{s}", .{ std.fmt.bytesToHex(digest[0..8].*, .lower), suffix });
+}
+fn mediaSelect(a: A, media: MediaSelection) !std.json.Value {
+    const V = std.json.Value;
+    var selected: std.json.ObjectMap = .empty;
+    for (media.fields) |field| {
+        const path = try std.json.Stringify.valueAlloc(a, field.field, .{});
+        const identity_name = try mediaAlias(a, field.field, "identity");
+        const identity_ref = try std.json.Stringify.valueAlloc(a, identity_name, .{});
+        try selected.put(a, identity_name, try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"call\":\"value_identity\",\"args\":[{{\"field\":{s}}}]}}", .{path}), .{}));
+        try selected.put(a, try mediaAlias(a, field.field, "missing"), try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"call\":\"is_missing\",\"args\":[{{\"field\":{s}}}]}}", .{path}), .{}));
+        if (field.mode != null) continue;
+        var known: std.json.ObjectMap = .empty;
+        for (field.if_match) |condition| try known.put(a, condition.id, .{ .string = condition.identity });
+        const known_json = try std.json.Stringify.valueAlloc(a, V{ .object = known }, .{});
+        const changed_name = try mediaAlias(a, field.field, "changed");
+        try selected.put(a, changed_name, try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"is_distinct_from\":[{{\"ref\":{s}}},{{\"call\":\"jsonb_extract_path_text\",\"args\":[{{\"literal\":{s}}},{{\"field\":\"_id\"}}]}}]}}", .{ identity_ref, known_json }), .{}));
+        const changed_ref = try std.json.Stringify.valueAlloc(a, changed_name, .{});
+        try selected.put(a, try mediaAlias(a, field.field, "value"), try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"case\":[{{\"when\":{{\"ref\":{s}}},\"then\":{{\"field\":{s}}}}}],\"else\":{{\"literal\":null}}}}", .{ changed_ref, path }), .{}));
+    }
+    return .{ .object = selected };
 }
 
 const Page = struct {
@@ -731,7 +758,7 @@ const Fetch = struct {
     text_query: ?std.json.Value = null,
     fields: []const []const u8,
     ordered: bool = true,
-    source_projection: ?SourceProjection = null,
+    media_selection: ?MediaSelection = null,
     http: *httpx.Client,
     summary: struct { index_requests: usize = 0 } = .{},
     cancel: std.atomic.Value(bool) = .init(false),
@@ -825,8 +852,16 @@ const Fetch = struct {
             defer if (!retained) page.deinit(self.a);
             const a = page.arena.allocator();
             const memory = &page.memory;
-            const conditional = self.source_projection != null and !self.limits.source_projection_unsupported.load(.acquire);
-            const body = try std.json.Stringify.valueAlloc(a, .{ .source_projection = if (conditional) self.source_projection else null, .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const conditional = self.media_selection != null and !self.limits.select_unsupported.load(.acquire);
+            const selected = if (conditional) try mediaSelect(a, self.media_selection.?) else null;
+            var source_fields: std.ArrayList([]const u8) = .empty;
+            for (self.fields) |field| {
+                const computed = if (conditional) for (self.media_selection.?.fields) |image| {
+                    if (std.mem.eql(u8, field, image.field)) break true;
+                } else false else false;
+                if (!computed) try source_fields.append(a, field);
+            }
+            const body = try std.json.Stringify.valueAlloc(a, .{ .select = selected, .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = source_fields.items, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
             const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
             const headers: ?[]const [2][]const u8 = if (auth) |value| &.{ .{ "Authorization", value }, .{ "Content-Type", "application/json" } } else &.{.{ "Content-Type", "application/json" }};
             var attempt: usize = 0;
@@ -847,10 +882,10 @@ const Fetch = struct {
                 var transferred = false;
                 defer if (!transferred) response.deinit();
                 const status = response.status.code;
-                if (status == 400 and conditional) {
-                    // Older servers may reject an unknown extension. Retry the
-                    // ordinary projection once; conditions never alter filters.
-                    self.limits.source_projection_unsupported.store(true, .release);
+                if ((status == 400 or status == 422) and conditional) {
+                    // Older servers may reject unsupported expressions. Retry
+                    // ordinary source fields once without changing filters.
+                    self.limits.select_unsupported.store(true, .release);
                     continue :resize;
                 }
                 if (status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
@@ -890,9 +925,24 @@ const Fetch = struct {
                 const envelope = document.field(decoded.value, "responses") orelse return error.InvalidIndexResponse;
                 if (envelope != .array or envelope.array.items.len != 1) return error.InvalidIndexResponse;
                 const result_status = document.integer(document.field(envelope.array.items[0], "status")) orelse return error.InvalidIndexResponse;
-                if (result_status == 400 and conditional) {
-                    self.limits.source_projection_unsupported.store(true, .release);
+                if ((result_status == 400 or result_status == 422) and conditional) {
+                    self.limits.select_unsupported.store(true, .release);
                     continue :resize;
+                }
+                if (conditional and result_status >= 200 and result_status < 300) {
+                    const rows = document.at(envelope.array.items[0], "hits.hits");
+                    if (rows) |list| if (list == .array) for (list.array.items) |hit| {
+                        const computed = document.field(hit, "_computed");
+                        const complete = if (computed) |map| for (selected.?.object.keys()) |alias| {
+                            if (document.field(map, alias) == null) break false;
+                        } else true else false;
+                        if (!complete) {
+                            // Some older servers ignore unknown request members.
+                            // Never interpret absent CASE output as a cache hit.
+                            self.limits.select_unsupported.store(true, .release);
+                            continue :resize;
+                        }
+                    };
                 }
                 if (result_status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
                 if (result_status == 413 and page_size.* > 1) {
@@ -1160,7 +1210,7 @@ fn AssetResolver(comptime SearchType: type) type {
                 }
                 break :blk true;
             } else false;
-            var projected: std.ArrayList(SourceField) = .empty;
+            var projected: std.ArrayList(MediaField) = .empty;
             const records = if (!self.force_full and !borrowed) try plannedRecords(self.search, a, self.config, self.table, self.id, self.manifest, self.path, units) else @as([16]?descriptors.Record, @splat(null));
             for (fields.items[2..]) |field| {
                 var expected: ?[]const u8 = null;
@@ -1172,15 +1222,15 @@ fn AssetResolver(comptime SearchType: type) type {
                     }
                     expected = record.?.identity;
                 }
-                var conditions: []const SourceCondition = &.{};
+                var conditions: []const CachedIdentity = &.{};
                 if (expected) |identity| {
-                    const condition = try a.create(SourceCondition);
+                    const condition = try a.create(CachedIdentity);
                     condition.* = .{ .id = self.id, .identity = identity };
-                    conditions = @as(*[1]SourceCondition, @ptrCast(condition));
+                    conditions = @as(*[1]CachedIdentity, @ptrCast(condition));
                 }
                 try projected.append(a, .{ .field = field, .mode = if (self.search.options.indexed_media_transport == .source) .identity else null, .if_match = conditions });
             }
-            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false, .source_projection = if (self.search.options.indexed_media_transport == .source or descriptors.enabled(self.search.options)) .{ .fields = projected.items } else null };
+            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false, .media_selection = if (self.search.options.indexed_media_transport == .source or descriptors.enabled(self.search.options)) .{ .fields = projected.items } else null };
             defer self.search.summary.index_requests += fetch.summary.index_requests;
             // Point reads deliberately omit ordering/cursors. They reauthorize
             // current rows without creating a durable pagination snapshot.
@@ -1224,10 +1274,13 @@ fn AssetResolver(comptime SearchType: type) type {
                     item.* = .{ .image = image };
                     continue;
                 }
-                const projection = document.field(hit, "_source_projection");
-                const state = if (projection) |map| document.field(map, unit.asset.field) else null;
-                const state_name = if (state) |entry| (document.string(entry, "state") catch return error.InvalidEvidenceIdentity) else "";
-                const identity = if (state) |entry| (document.string(entry, "identity") catch "") else "";
+                const projection = document.field(hit, "_computed");
+                const alias = try mediaAlias(a, unit.asset.field, "identity");
+                const actual_identity = if (projection) |map| document.field(map, alias) else null;
+                const identity = if (actual_identity) |value| if (value == .string) value.string else "" else "";
+                const missing = if (projection) |map| document.field(map, try mediaAlias(a, unit.asset.field, "missing")) else null;
+                const changed = if (projection) |map| document.field(map, try mediaAlias(a, unit.asset.field, "changed")) else null;
+                const state_name: []const u8 = if (missing != null and missing.? == .bool and missing.?.bool) "missing" else if (self.search.options.indexed_media_transport == .source and actual_identity != null) "reference" else if (changed != null and changed.? == .bool) (if (changed.?.bool) "value" else "unchanged") else "";
                 if (self.search.options.indexed_media_transport == .source) {
                     if (std.mem.eql(u8, state_name, "missing")) continue;
                     if (!std.mem.eql(u8, state_name, "reference") or !descriptors.validIdentity(identity) or document.at(source, unit.asset.field) != null) return error.InvalidEvidenceIdentity;
@@ -1265,8 +1318,8 @@ fn AssetResolver(comptime SearchType: type) type {
                     item.* = .{ .image = record.image() };
                     continue;
                 }
-                if (projection == null) (self.search.shared_limits orelse &self.search.limits).source_projection_unsupported.store(true, .release);
-                const payload = document.at(source, unit.asset.field) orelse continue;
+                if (projection == null) (self.search.shared_limits orelse &self.search.limits).select_unsupported.store(true, .release);
+                const payload = if (projection) |map| document.field(map, try mediaAlias(a, unit.asset.field, "value")) orelse document.at(source, unit.asset.field) orelse continue else document.at(source, unit.asset.field) orelse continue;
                 if (payload != .string) {
                     item.* = .{ .failed = error.InvalidEvidenceAsset };
                     continue;

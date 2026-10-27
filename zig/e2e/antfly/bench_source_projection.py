@@ -30,7 +30,7 @@ from pathlib import Path
 import requests
 
 from conftest import StandaloneAntflyServer, find_free_port
-from test_grep_indexed import logical_process_reader
+from test_grep_indexed import logical_process_reader, conditional_select
 
 
 def file_info(path):
@@ -79,7 +79,11 @@ def measure(read, operation):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
-    parser.add_argument("--baseline", required=True, type=Path)
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="Optional comparison binary supporting select; defaults to candidate",
+    )
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument(
         "--queries-per-phase",
@@ -124,7 +128,10 @@ def main():
         parser.error(
             "1..64 documents, 16 KiB..1 MiB values and positive rounds required"
         )
-    binaries = {"baseline": args.baseline.resolve(), "candidate": args.binary.resolve()}
+    binaries = {
+        "baseline": (args.baseline or args.binary).resolve(),
+        "candidate": args.binary.resolve(),
+    }
 
     def document(i):
         workload = args.workload
@@ -218,17 +225,42 @@ def main():
                             "exclude": ["-padding"],
                         }[args.mask],
                         "limit": args.documents,
-                        "source_projection": {"fields": [{"field": "payload.large"}]},
+                        "select": conditional_select("payload.large"),
+                        "params": {"known": {}},
                     }
-                    for phase in ("ordinary", "full", "conditional"):
+                    for phase in (
+                        "ordinary",
+                        "reference_full",
+                        "full",
+                        "conditional",
+                        "reference",
+                    ):
                         if phase == "ordinary":
                             phase_request = {
                                 k: v
                                 for k, v in request.items()
-                                if k != "source_projection"
+                                if k not in ("select", "params")
                             }
                         else:
-                            phase_request = request
+                            phase_request = {
+                                **request,
+                                "fields": ["metadata.revision", "metadata.allowed"],
+                            }
+                        if phase in ("reference", "reference_full"):
+                            phase_request = copy.deepcopy(phase_request)
+                            phase_request["select"]["identity"]["args"][0] = {
+                                "call": "jsonb_extract_path",
+                                "args": [
+                                    {
+                                        "call": "jsonb_build_object",
+                                        "args": [
+                                            {"literal": "v"},
+                                            {"field": "payload.large"},
+                                        ],
+                                    },
+                                    {"literal": "v"},
+                                ],
+                            }
                         for query_id in range(args.queries_per_phase):
                             response, usage = measure(
                                 read,
@@ -241,28 +273,39 @@ def main():
                             hits = result["hits"]["hits"]
                             assert {h["_id"] for h in hits} == set(documents), result
                             evidence = sorted(
-                                (h["_id"], h["_source"], h.get("_source_projection"))
+                                (h["_id"], h["_source"], h.get("_computed"))
                                 for h in hits
                             )
                             digest = hashlib.sha256(
                                 json.dumps(evidence, sort_keys=True).encode()
                             ).hexdigest()
-                            assert output_hashes.setdefault(phase, digest) == digest, (
-                                "baseline/candidate source delivery differs"
-                            )
+                            assert (
+                                output_hashes.setdefault(
+                                    "conditional"
+                                    if phase == "reference"
+                                    else "full"
+                                    if phase == "reference_full"
+                                    else phase,
+                                    digest,
+                                )
+                                == digest
+                            ), "baseline/candidate source delivery differs"
                             for hit in hits:
                                 if phase != "ordinary":
-                                    state = hit["_source_projection"]["payload.large"]
-                                    assert state["state"] == (
-                                        "value" if phase == "full" else "unchanged"
-                                    ), hit
+                                    values = hit["_computed"]
+                                    assert values["changed"] == (
+                                        phase in ("full", "reference_full")
+                                    ), (phase, hit["_id"])
+                                    assert (values["value"] is not None) == (
+                                        phase in ("full", "reference_full")
+                                    ), (phase, hit["_id"])
                                 assert hit["_source"]["metadata"] == {
                                     "revision": "r1",
                                     "allowed": True,
                                 }
                                 assert (
                                     "large" in hit["_source"].get("payload", {})
-                                ) == (phase != "conditional")
+                                ) == (phase == "ordinary")
                             samples.append(
                                 {
                                     "variant": variant,
@@ -274,15 +317,10 @@ def main():
                             )
                         if phase != "full":
                             continue
-                        request["source_projection"]["fields"][0]["if_match"] = [
-                            {
-                                "id": h["_id"],
-                                "identity": h["_source_projection"]["payload.large"][
-                                    "identity"
-                                ],
-                            }
-                            for h in hits
-                        ]
+                        request["params"]["known"] = {
+                            h["_id"]: h["_computed"]["identity"] for h in hits
+                        }
+                    request["fields"] = ["metadata.revision", "metadata.allowed"]
                     # Keep metadata edits separate from the cold/ordinary/full
                     # controls. Reuse the same payload and vary only metadata;
                     # validate new revision delivery plus unchanged identities.
@@ -320,15 +358,12 @@ def main():
                             assert (
                                 hit["_source"]["metadata"]
                                 == updated[hit["_id"]]["metadata"]
-                            ), hit
-                            assert (
-                                hit["_source_projection"]["payload.large"]["state"]
-                                == "unchanged"
-                            ), hit
+                            ), hit["_id"]
+                            assert hit["_computed"]["changed"] is False, hit
                         digest = hashlib.sha256(
                             json.dumps(
                                 sorted(
-                                    (h["_id"], h["_source"], h["_source_projection"])
+                                    (h["_id"], h["_source"], h["_computed"])
                                     for h in changed_hits
                                 ),
                                 sort_keys=True,
@@ -342,7 +377,7 @@ def main():
                     counts = [
                         (int(a), int(b))
                         for a, b in re.findall(
-                            r"antfly_bench_conditional_source certificate_hits=(\d+) full_fallbacks=(\d+)",
+                            r"antfly_bench_projection metadata_rows=(\d+) fallback_rows=(\d+)",
                             logs,
                         )
                     ]
@@ -396,7 +431,9 @@ def main():
             "ingest",
             "ordinary",
             "full",
+            "reference_full",
             "conditional",
+            "reference",
             *(("metadata_update",) if args.metadata_updates else ()),
         ):
             selected = [

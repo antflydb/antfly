@@ -5056,9 +5056,9 @@ pub const ProvisionedTableReadSource = struct {
     /// under one read lease, before its captured generation is released.
     fn queryRequiresCoordinatorFinalization(req: db_mod.types.SearchRequest) bool {
         return req.evaluation_limit > 0 or req.reranker != null or req.pruner != null or
-            // Worker retrieval deliberately omits delivery conditions. Keep the
-            // final selected source at this coordinator even for one group.
-            req.source_projection_json.len != 0 or
+            // The coordinator verifies final scalar delivery receipts even
+            // when a physical owner already evaluated the pure projection.
+            req.field_projection_json.len != 0 or
             std.mem.indexOf(u8, req.aggregations_json, "\"algebraic_join\"") != null;
     }
 
@@ -9034,6 +9034,14 @@ fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, r
                     selected.stored_data = document.stored_data;
                     document.stored_data = null;
                 } else selected.stored_data = try alloc.dupe(u8, hit.stored_data.?);
+                if (hit.computed_json) |computed| {
+                    const bytes = if (slot.output_allocator != null) moved: {
+                        document.computed_json = null;
+                        break :moved computed;
+                    } else try alloc.dupe(u8, computed);
+                    if (selected.computed_json) |prior| alloc.free(prior);
+                    selected.computed_json = bytes;
+                }
                 alloc.destroy(selected.document_authority.?);
                 selected.document_authority = null;
             }
@@ -9055,6 +9063,9 @@ fn distributedSearchShardRequest(
         copy.include_stored = false;
         copy.document_authority_mode = .candidates;
     }
+    // Source-dependent stages retain full afterimages. Pure select runs only
+    // during hydration of the globally selected page, never on discarded hits.
+    if (!canDeferDistributedDocuments(req) or !@import("antfly_local_sources").api_query_contract.fieldProjectionStorageEligible(req)) copy.field_projection_json = "";
     copy.offset = 0;
     copy.limit = distributedSearchShardLimit(req);
     copy.distributed_text_stats = distributed_text_stats;
@@ -22347,7 +22358,7 @@ fn consumerTests() type {
         test "provisioned single-group queries retain coordinator-owned finalization" {
             try std.testing.expect(!ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{}));
             try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
-                .source_projection_json = "{\"fields\":[{\"field\":\"body\"}]}",
+                .field_projection_json = "{\"fields\":[{\"name\":\"body\",\"expression\":{\"field\":\"body\"}}]}",
             }));
             try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
                 .pruner = .{ .min_absolute_score = 10 },

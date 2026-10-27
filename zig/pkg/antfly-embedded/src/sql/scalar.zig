@@ -40,6 +40,8 @@ pub const Datum = struct {
     patterns: ?*PatternSet = null,
     value: Json = .null,
     sql_null: bool = true,
+    /// A missing JSON source member is distinct from a present JSON/SQL NULL.
+    missing: bool = false,
 
     pub fn fromJson(value: Json) Datum {
         return .{ .value = value, .sql_null = value == .null };
@@ -207,7 +209,15 @@ pub const BindLimits = struct {
 };
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
+pub const ColumnRead = enum { value, identity, missing };
+pub const ColumnLoader = struct {
+    context: *anyopaque,
+    read: *const fn (*anyopaque, Allocator, u32, ColumnRead) anyerror!Datum,
+};
 pub const EvalLimits = struct {
+    /// Optional pinned source access. The VM requests only executed branches;
+    /// identity/existence reads can use authenticated metadata without payloads.
+    column_loader: ?ColumnLoader = null,
     steps: usize = 65_536,
     pattern_steps: usize = 8 * 1024 * 1024,
     input_bytes: usize = @import("resource_limits.zig").default_memory_bytes,
@@ -224,7 +234,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -473,6 +483,13 @@ pub const Program = struct {
         const result = try context.runDatum(self.root, 0);
         _ = try context.validateJson(result.value, 0);
         return result;
+    }
+
+    /// Convert a result with the same typed JSON rules used by SQL's to_jsonb.
+    pub fn resultJson(self: *const Program, alloc: Allocator, value: Datum, limits: EvalLimits) !Json {
+        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+        if (value.array) |array| return @import("array_wire.zig").toJsonLeaky(alloc, array.*, .{ .values = .{ .bytes = limits.output_bytes }, .wire_bytes = limits.output_bytes });
+        return context.sqlJson(value, self.output_type);
     }
 
     fn preparedValues(self: *const Program) ?[]const Datum {
@@ -2030,6 +2047,7 @@ fn arity(function: Function, count: usize) !void {
         return;
     }
     const valid = switch (function) {
+        .value_identity, .is_missing => count == 1,
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
@@ -2242,6 +2260,10 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (function == .value_identity or function == .is_missing) {
+                    _ = try self.infer(call.args[0], depth + 1);
+                    break :blk .{ .kind = if (function == .value_identity) .string else .boolean, .element_type = if (function == .value_identity) .text else .boolean, .nullable = function == .value_identity };
+                }
                 if (function == .jsonb_extract_path or function == .jsonb_extract_path_text) {
                     for (call.args, 0..) |arg, i| {
                         const actual = try self.infer(arg, depth + 1);
@@ -2791,7 +2813,7 @@ const Binder = struct {
                         .date_part, .date_trunc => if (i == 0) .string else .datetime,
                         .to_timestamp => .number,
                         .concat => null,
-                        .to_jsonb, .jsonb_build_object => null,
+                        .to_jsonb, .jsonb_build_object, .value_identity, .is_missing => null,
                         .jsonb_extract_path_text, .jsonb_extract_path => if (i == 0) .json else .string,
                         else => kind.kind,
                     };
@@ -3199,7 +3221,9 @@ const Evaluator = struct {
                 if (instruction.type.kind == .json) break :blk Datum.json(value);
                 break :blk Datum.json(try self.convert(value, instruction.type.kind.?));
             },
-            .column => |ordinal| if (ordinal < self.cells.len) self.cells[ordinal] else return error.InvalidSqlBackendResponse,
+            .column => |ordinal| if (self.limits.column_loader) |loader|
+                try loader.read(loader.context, self.alloc, ordinal, .value)
+            else if (ordinal < self.cells.len) self.cells[ordinal] else return error.InvalidSqlBackendResponse,
             .cast => |cast| blk: {
                 if (cast.type == .array) if (self.program.constant_arrays.get(index)) |prepared| {
                     try self.charge(try prepared.retainedBytes());
@@ -3365,6 +3389,18 @@ const Evaluator = struct {
                     } });
                 }
                 switch (call.function) {
+                    .value_identity, .is_missing => {
+                        const operand = self.program.instructions[call.args[0]].operation;
+                        if (self.limits.column_loader) |loader| if (operand == .column) {
+                            break :blk try loader.read(loader.context, self.alloc, operand.column, if (call.function == .value_identity) .identity else .missing);
+                        };
+                        const value = try self.runDatum(call.args[0], depth + 1);
+                        if (call.function == .is_missing) break :blk Datum.json(.{ .bool = value.missing });
+                        if (value.missing) break :blk .{};
+                        const logical = if (value.sql_null) Json.null else if (value.array) |array| try @import("array_wire.zig").toJsonLeaky(self.alloc, array.*, .{ .values = .{ .bytes = self.limits.output_bytes }, .wire_bytes = self.limits.output_bytes }) else try self.sqlJson(value, self.program.instructions[call.args[0]].type);
+                        const token = try @import("../common/value_identity.zig").identity(logical);
+                        break :blk Datum.json(.{ .string = try self.alloc.dupe(u8, &token) });
+                    },
                     .array_append, .array_prepend, .array_cat => {
                         if (try self.fusedConcat(index, depth)) |value| break :blk value;
                         const left = try self.runDatum(call.args[0], depth + 1);
@@ -3760,7 +3796,9 @@ const Evaluator = struct {
         const instruction = self.program.instructions[index];
         return switch (instruction.operation) {
             .literal => |value| value,
-            .column => |ordinal| if (ordinal < self.cells.len) self.cells[ordinal].value else error.InvalidSqlBackendResponse,
+            .column => |ordinal| if (self.limits.column_loader) |loader|
+                (try loader.read(loader.context, self.alloc, ordinal, .value)).value
+            else if (ordinal < self.cells.len) self.cells[ordinal].value else error.InvalidSqlBackendResponse,
             .parameter => |slot| if (slot < self.parameters.len) try self.convert(self.parameters[slot], instruction.type.kind.?) else error.InvalidSqlParameters,
             .cast => |cast| try self.convert(try self.run(cast.operand, depth + 1), cast.type),
             .unary => |unary| blk: {

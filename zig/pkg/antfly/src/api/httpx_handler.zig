@@ -4299,7 +4299,7 @@ pub const AntflyApiHandler = struct {
         ctx: *httpx.Context,
         identity: ?AuthenticatedIdentity,
         fn port(self: *@This()) inference_gateway.source_media.Port {
-            return .{ .ptr = self, .lookup = lookup };
+            return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany };
         }
         fn at(value: std.json.Value, path: []const u8) ?std.json.Value {
             var current = value;
@@ -4311,70 +4311,93 @@ pub const AntflyApiHandler = struct {
             return current;
         }
         fn lookup(raw: *anyopaque, a: std.mem.Allocator, reference: inference_gateway.source_media.Reference) ![]const u8 {
+            return (try lookupMany(raw, a, &.{reference}))[0];
+        }
+        fn lookupMany(raw: *anyopaque, a: std.mem.Allocator, references: []const inference_gateway.source_media.Reference) ![]const []const u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.ctx.isCancellationRequested()) return error.Canceled;
             const now = @import("antfly_platform").time.monotonicNs();
+            // One shared deadline for the whole materialization, not per image.
             const deadline = self.ctx.application_deadline_ns orelse (now + 120 * std.time.ns_per_s);
-            if (deadline <= now) return error.Timeout;
-            var fields: [3][]const u8 = .{ reference.field, reference.revision_field, reference.permissions_field orelse reference.revision_field };
-            const query = try std.json.Stringify.valueAlloc(a, .{
-                .query = .{ .bool = .{ .filter = .{ .ids = &.{reference.document_id} } } },
-                .fields = fields[0..@as(usize, if (reference.permissions_field != null) 3 else 2)],
-                .filter_query = reference.filter_query,
-                .source_projection = .{ .fields = &.{.{ .field = reference.field }} },
-                .limit = @as(u32, 1),
-                .timeout_ms = @min(@as(u64, 120000), @max(@as(u64, 1), (deadline - now) / std.time.ns_per_ms)),
-            }, .{ .emit_null_optional_fields = false });
-            defer a.free(query);
-            var cancellation: http_common.RequestCancellation = .{ .borrowed_context = self.ctx, .borrowed_is_cancelled = struct {
-                fn cancelled(ptr: *const anyopaque) bool {
-                    const context: *const httpx.Context = @ptrCast(@alignCast(ptr));
-                    return context.isCancellationRequested();
+            const output = try a.alloc([]const u8, references.len);
+            const groups = try inference_gateway.source_media.groups(a, references);
+            for (groups) |group| {
+                if (self.ctx.isCancellationRequested()) return error.Canceled;
+                const current = @import("antfly_platform").time.monotonicNs();
+                if (deadline <= current) return error.Timeout;
+                var selected: std.json.ObjectMap = .empty;
+                for (group.images.items, 0..) |field, i| {
+                    const encoded = try std.json.Stringify.valueAlloc(a, .{ .call = "value_identity", .args = .{.{ .field = field }} }, .{});
+                    try selected.put(a, try std.fmt.allocPrint(a, "image_identity_{d}", .{i}), try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
                 }
-            }.cancelled };
-            // The ordinary public query binds the logical table and rechecks
-            // live table permissions and row policy using this ingress identity.
-            var response = try self.server.handlePublicTableQueryWithContentTypeCancellation(reference.table, query, "application/json", self.identity, &cancellation);
-            defer response.deinit(self.server.alloc);
-            if (response.status == 401 or response.status == 403) return error.Forbidden;
-            if (response.status == 404) return error.InferenceSourceUnavailable;
-            if (response.status < 200 or response.status >= 300) return error.InferenceSourceUnavailable;
-            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
-            const responses = at(parsed, "responses") orelse return error.InferenceSourceUnavailable;
-            if (responses != .array or responses.array.items.len != 1) return error.InferenceSourceUnavailable;
-            const result = responses.array.items[0];
-            const status = at(result, "status") orelse return error.InferenceSourceUnavailable;
-            if (status != .integer or status.integer < 200 or status.integer >= 300) return error.InferenceSourceUnavailable;
-            const hits = at(result, "hits.hits") orelse return error.InferenceSourceUnavailable;
-            if (hits != .array or hits.array.items.len != 1) return error.InferenceSourceUnavailable;
-            const hit = hits.array.items[0];
-            const id = at(hit, "_id") orelse return error.InferenceSourceUnavailable;
-            if (id != .string or !std.mem.eql(u8, id.string, reference.document_id)) return error.InferenceSourceUnavailable;
-            const source = at(hit, "_source") orelse return error.InferenceSourceUnavailable;
-            if (reference.identity) |expected| {
-                const projections = at(hit, "_source_projection") orelse return error.InferenceSourceMismatch;
-                if (projections != .object) return error.InferenceSourceMismatch;
-                const identity_state = projections.object.get(reference.field) orelse return error.InferenceSourceMismatch;
-                const actual = at(identity_state, "identity") orelse return error.InferenceSourceMismatch;
-                if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InferenceSourceMismatch;
+                const first = references[group.references.items[0]];
+                const query = try std.json.Stringify.valueAlloc(a, .{
+                    .query = .{ .bool = .{ .filter = .{ .ids = group.ids.items } } },
+                    .fields = group.fields.items,
+                    .select = std.json.Value{ .object = selected },
+                    .filter_query = first.filter_query,
+                    .limit = group.ids.items.len,
+                    .timeout_ms = @min(@as(u64, 120000), @max(@as(u64, 1), (deadline - current) / std.time.ns_per_ms)),
+                }, .{ .emit_null_optional_fields = false });
+                var cancellation: http_common.RequestCancellation = .{ .borrowed_context = self.ctx, .borrowed_is_cancelled = struct {
+                    fn cancelled(ptr: *const anyopaque) bool {
+                        const context: *const httpx.Context = @ptrCast(@alignCast(ptr));
+                        return context.isCancellationRequested();
+                    }
+                }.cancelled };
+                // Use ordinary public query admission and the original identity.
+                var response = try self.server.handlePublicTableQueryWithContentTypeCancellation(first.table, query, "application/json", self.identity, &cancellation);
+                defer response.deinit(self.server.alloc);
+                try inference_gateway.source_media.checkStatus(response.status);
+                const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
+                const responses = at(parsed, "responses") orelse return error.InferenceUpstreamUnavailable;
+                if (responses != .array or responses.array.items.len != 1) return error.InferenceUpstreamUnavailable;
+                const result = responses.array.items[0];
+                const status = at(result, "status") orelse return error.InferenceUpstreamUnavailable;
+                if (status != .integer) return error.InferenceUpstreamUnavailable;
+                try inference_gateway.source_media.checkStatus(status.integer);
+                const hits = at(result, "hits.hits") orelse return error.InferenceUpstreamUnavailable;
+                if (hits != .array) return error.InferenceUpstreamUnavailable;
+                for (group.references.items) |slot| {
+                    const reference = references[slot];
+                    var found: ?std.json.Value = null;
+                    for (hits.array.items) |candidate| {
+                        const id = at(candidate, "_id") orelse return error.InferenceUpstreamUnavailable;
+                        if (id != .string) return error.InferenceUpstreamUnavailable;
+                        if (std.mem.eql(u8, id.string, reference.document_id)) {
+                            if (found != null) return error.InferenceSourceMismatch;
+                            found = candidate;
+                        }
+                    }
+                    const hit = found orelse return error.InferenceSourceUnavailable;
+                    const source = at(hit, "_source") orelse return error.InferenceSourceUnavailable;
+                    if (reference.identity) |expected| {
+                        const image_slot = for (group.images.items, 0..) |field, i| {
+                            if (std.mem.eql(u8, field, reference.field)) break i;
+                        } else return error.InferenceSourceMismatch;
+                        const computed = at(hit, "_computed") orelse return error.InferenceSourceMismatch;
+                        const actual = at(computed, try std.fmt.allocPrint(a, "image_identity_{d}", .{image_slot})) orelse return error.InferenceSourceMismatch;
+                        if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InferenceSourceMismatch;
+                    }
+                    const revision = at(source, reference.revision_field) orelse return error.InferenceSourceMismatch;
+                    if (revision != .string or !std.mem.eql(u8, revision.string, reference.revision)) return error.InferenceSourceMismatch;
+                    if (reference.permissions_field) |path| {
+                        const permission = at(source, path) orelse return error.Forbidden;
+                        const public = at(permission, "public");
+                        var allowed = if (public) |value| value == .bool and value.bool else false;
+                        if (at(permission, "readers")) |readers| if (readers == .array) {
+                            for (readers.array.items) |reader| if (reader == .string) for (reference.principals) |principal| {
+                                allowed = allowed or std.mem.eql(u8, reader.string, principal);
+                            };
+                        };
+                        if (!allowed) return error.Forbidden;
+                    }
+                    const value = at(source, reference.field) orelse return error.InferenceSourceUnavailable;
+                    if (value != .string) return error.InferenceSourceMismatch;
+                    if (self.ctx.isCancellationRequested()) return error.Canceled;
+                    output[slot] = try a.dupe(u8, value.string);
+                }
             }
-            const revision = at(source, reference.revision_field) orelse return error.InferenceSourceMismatch;
-            if (revision != .string or !std.mem.eql(u8, revision.string, reference.revision)) return error.InferenceSourceMismatch;
-            if (reference.permissions_field) |path| {
-                const permission = at(source, path) orelse return error.Forbidden;
-                const public = at(permission, "public");
-                var allowed = if (public) |value| value == .bool and value.bool else false;
-                if (at(permission, "readers")) |readers| if (readers == .array) {
-                    for (readers.array.items) |reader| if (reader == .string) for (reference.principals) |principal| {
-                        allowed = allowed or std.mem.eql(u8, reader.string, principal);
-                    };
-                };
-                if (!allowed) return error.Forbidden;
-            }
-            const value = at(source, reference.field) orelse return error.InferenceSourceUnavailable;
-            if (value != .string) return error.InferenceSourceMismatch;
-            if (self.ctx.isCancellationRequested()) return error.Canceled;
-            return try a.dupe(u8, value.string);
+            return output;
         }
     };
 

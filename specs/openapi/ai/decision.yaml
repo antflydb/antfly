@@ -350,7 +350,7 @@ components:
                 oneOf:
                   - $ref: '#/components/schemas/DecisionEvidenceText'
                   - $ref: '#/components/schemas/DecisionEvidenceImage'
-            - $ref: '#/components/schemas/DecisionEvidenceTableImage'
+                  - $ref: '#/components/schemas/DecisionEvidenceTableImage'
     DecisionEvidenceText:
       type: object
       additionalProperties: false

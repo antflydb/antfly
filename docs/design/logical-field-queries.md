@@ -876,18 +876,16 @@ current authorization, selected-range digests or original-byte work budgets.
 
 ### Conditional source delivery
 
-`QueryRequest.source_projection` conditions the delivery of exact selected
-logical source fields, independently of predicate representation selection.
-It does not introduce physical companion fields into the query DSL. Conditions
-are per record ID and logical path; `_source_projection` distinguishes returned,
-unchanged and missing values. Stored null remains a value. Authorization and
-source-dependent operators run before final delivery, including distributed and
-column-backed execution. See [the grep design](antfly-grep.md#conditional-source-projection-and-future-storage-authorities)
-for the wire contract, bounded verified-image reuse, old-server fallback and
-storage-owned canonical-value certificates. Eligible source-only native JSON
-retrieval can reuse current, atomically published scalar identities at the owner;
-source-dependent operators and unsupported layouts retain the full-value
-reference path. Certificates bind content, directory and canonicalizer ABI, never
-permissions. Missing or stale certificates safely fall back and can be repaired
-by bounded backfill. Remaining selected values may still require physical source
-reads; this does not promise zero server I/O.
+`fields: string[]` remains the source mask. `select` is a map of named pure
+scalar expressions returned in `_computed`, with data-only `params`. It lowers
+to the same SQL scalar IR used by SELECT / CASE. `value_identity(field)` and
+`is_missing(field)` support conditional CASE delivery without introducing physical
+companion fields or a second projection protocol. Present JSON null differs from
+missing. Requested source fields remain in `_source` regardless of CASE results.
+All dependencies are bound before execution; only executed branches load values.
+Native current identity metadata may avoid payload I/O. Missing/stale metadata,
+source-dependent stages, and provider layouts use correct ordinary-read fallbacks.
+Authorization and query membership precede delivery. See [the grep design](antfly-grep.md#conditional-source-projection-and-future-storage-authorities)
+for limits, worker transport, verified-image reuse and gateway batching. The
+unreleased `source_projection` / `_source_projection` API is replaced by this
+shared expression surface. No on-disk document format migration is required.

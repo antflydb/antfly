@@ -25892,9 +25892,27 @@ components:
 
             lower-level vector search overrides are provided internally.
           example: 0.5
-        source_projection:
-          $ref: '#/components/schemas/SourceProjection'
+        select:
+          type: object
+          minProperties: 1
+          maxProperties: 64
+          additionalProperties:
+            $ref: '#/components/schemas/ProjectionExpression'
+          x-zig-type: std.json.Value
           x-go-type-skip-optional-pointer: false
+          description: Pure named output expressions evaluated after final filtering, ranking and pagination;
+            returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL
+            scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref;
+            cycles and collisions with evaluate.compute are rejected. Does not change hit membership or
+            paging.
+        params:
+          type: object
+          additionalProperties: true
+          x-zig-type: std.json.Value
+          x-go-type-skip-optional-pointer: false
+          description: Request-local values bound by select expressions through param. Parameters are
+            data, never executable expressions or read grants. The serialized parameter object is limited
+            to 1 MiB and 1024 named parameters.
         fields:
           x-go-type-skip-optional-pointer: false
           type: array
@@ -27491,87 +27509,188 @@ components:
           type: integer
           format: int64
           description: Published graph metric score generation used for this hit.
-    SourceProjection:
+    ProjectionExpression:
       type: object
+      x-zig-type: std.json.Value
+      x-go-type-skip-optional-pointer: false
       additionalProperties: false
-      required:
-        - fields
       description: >
-        Conditional delivery of selected logical source fields on authorized hits.
+        Exactly one expression node: literal, field, ref, param, call with args,
 
-        Every field must also be selected by `fields` (or the default all-fields
+        case with optional else, cast, or a binary operator. Pure expressions
 
-        projection). Conditions only suppress unchanged source values; they never
+        lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider
 
-        authorize a read, skip filters, or establish the existence of a record.
+        calls remain in evaluate, never execute implicitly in select.
 
-        The response reports value, unchanged, or missing separately for each path.
+        value_identity(field) returns an opaque identity for a present logical
 
-        Older servers may omit this extension; callers must retain full-value fallback.
+        value (including JSON null); missing has no identity. is_missing(field)
+
+        distinguishes missing from present null. Identity reads require the same
+
+        authorization and retained source revision as value reads. Metadata may
+
+        accelerate them; unsupported/old metadata falls back to ordinary reads.
+
+        Untaken CASE branches do not load fields or evaluate erroring calls.
+
+        Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from,
+
+        is_not_distinct_from, and, or, add, subtract, multiply, divide and concat.
+
+        Expressions are limited to depth 64 and 8192 nodes per request.
       properties:
-        fields:
+        literal:
+          x-go-type: json.RawMessage
+        field:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        ref:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        param:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        call:
+          type: string
+          description: Public pure SQL scalar function name, including value_identity and is_missing.
+            Internal and provider-backed functions are forbidden.
+        args:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        case:
           type: array
           minItems: 1
           maxItems: 64
           items:
-            $ref: '#/components/schemas/SourceProjectionField'
-    SourceProjectionField:
-      type: object
-      additionalProperties: false
-      required:
-        - field
-      properties:
-        field:
-          type: string
-          maxLength: 1024
-          description: Exact logical object path; overlapping paths and wildcards are not supported.
-        mode:
-          type: string
-          enum:
-            - value
-            - identity
-          default: value
-          description: Value mode delivers the value unless if_match succeeds. Identity mode returns only
-            a freshly authorized identity; existing values have state reference and are omitted from _source
-            independently of if_match. Reference state is execution evidence, never a read grant.
-        if_match:
+            type: object
+            additionalProperties: false
+            required:
+              - when
+              - then
+            properties:
+              when:
+                $ref: '#/components/schemas/ProjectionExpression'
+              then:
+                $ref: '#/components/schemas/ProjectionExpression'
+        else:
+          $ref: '#/components/schemas/ProjectionExpression'
+          x-go-type-skip-optional-pointer: false
+        cast:
+          type: object
+          x-go-type-skip-optional-pointer: false
+          additionalProperties: false
+          required:
+            - type
+            - expression
+          properties:
+            type:
+              type: string
+              enum:
+                - string
+                - integer
+                - number
+                - boolean
+                - json
+                - datetime
+            expression:
+              $ref: '#/components/schemas/ProjectionExpression'
+        eq:
           type: array
-          maxItems: 4096
-          description: Optional per-record expected identities. Duplicate record IDs are invalid.
+          minItems: 2
+          maxItems: 2
           items:
-            $ref: '#/components/schemas/SourceValueCondition'
-    SourceValueCondition:
-      type: object
-      additionalProperties: false
-      required:
-        - id
-        - identity
-      properties:
-        id:
-          type: string
-          maxLength: 4096
-        identity:
-          type: string
-          pattern: ^sv1-[0-9a-f]{64}$
-          description: Opaque versioned identity previously returned by this server for these exact logical
-            bytes.
-    SourceValueIdentity:
-      type: object
-      required:
-        - state
-      properties:
-        state:
-          type: string
-          enum:
-            - value
-            - unchanged
-            - missing
-            - reference
-          description: Stored null is a value. Missing has no identity; unchanged and reference omit the
-            value from _source.
-        identity:
-          type: string
-          description: Opaque versioned value identity, present for value, unchanged and reference states.
+            $ref: '#/components/schemas/ProjectionExpression'
+        neq:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        lt:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        lte:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        gt:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        gte:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        is_distinct_from:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        is_not_distinct_from:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        and:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        or:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        add:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        subtract:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        multiply:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        divide:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
+        concat:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ProjectionExpression'
     QueryHit:
       type: object
       description: A single query result hit
@@ -27622,12 +27741,6 @@ components:
           $ref: '#/components/schemas/QueryScoreDetails'
           description: Optional score provenance for ranking features applied to this hit.
           x-go-name: scoreDetails
-        _source_projection:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/SourceValueIdentity'
-          description: Conditional source states keyed by exact logical field path; returned only when
-            source_projection was requested.
         _source:
           type: object
           additionalProperties: true
@@ -46859,7 +46972,7 @@ components:
                 oneOf:
                   - $ref: '#/components/schemas/DecisionEvidenceText'
                   - $ref: '#/components/schemas/DecisionEvidenceImage'
-            - $ref: '#/components/schemas/DecisionEvidenceTableImage'
+                  - $ref: '#/components/schemas/DecisionEvidenceTableImage'
     DecisionEvidence:
       description: Text or ordered user messages containing text and images. Named OpenAI and Jev deciders
         and constrained generators accept messages. Generated image decisions require a model that supports

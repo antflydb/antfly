@@ -1930,9 +1930,11 @@ pub const SearchRequest = struct {
     /// Immutable local projection borrowed until synchronous search completion.
     /// Never serialized or populated by a public request.
     document_projection_plan: ?@import("document_query.zig").BorrowedSpanProjection = null,
-    /// Conditional delivery, forwarded only for final source-only hydration.
-    /// Owned canonical JSON on public ingress, borrowed for synchronous reads.
-    source_projection_json: []const u8 = "",
+    /// Normalized final projection, owning selected source paths, expressions
+    /// and data parameters. Pure output does not affect retrieval membership.
+    field_projection_json: []const u8 = "",
+    /// Trusted private worker delivery, never accepted at public ingress.
+    field_projection_transport: bool = false,
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -2114,7 +2116,8 @@ const hierarchy_children_validated_fields = [_][]const u8{
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
     // Conditional delivery runs after child authorization and retrieval.
-    "source_projection_json",
+    "field_projection_json",
+    "field_projection_transport",
     "value_search_work",
     "value_search_scope",
     "document_authority_mode",
@@ -2669,8 +2672,7 @@ pub const SearchHit = struct {
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
-    /// Storage-certified final delivery states; owned and never caller metadata.
-    source_projection_json: ?[]u8 = null,
+    /// Storage-certified final source extent; owned and never caller metadata.
     finalized_source: ?FinalizedSource = null,
     /// Owned typed source for providers that hydrate after source-dependent
     /// ranking/filtering. Highlighting and public projection consume this
@@ -2698,7 +2700,6 @@ pub const SearchHit = struct {
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
-            if (cloned.source_projection_json) |data| alloc.free(data);
             if (cloned.source_value) |*value| deinitJsonValue(alloc, value);
             if (cloned.column_source) |source| source.deinit();
             if (cloned.ancestor_source_data) |data| alloc.free(data);
@@ -2721,7 +2722,6 @@ pub const SearchHit = struct {
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
-        cloned.source_projection_json = if (self.source_projection_json) |data| try alloc.dupe(u8, data) else null;
         if (self.finalized_source) |receipt| if (self.stored_data) |previous| {
             if (receipt.matches(previous)) {
                 if (cloned.stored_data) |bytes| cloned.finalized_source = .{ .bytes = bytes };
@@ -2752,11 +2752,9 @@ pub const SearchHit = struct {
 
     pub fn clearSource(self: *SearchHit, alloc: Allocator) void {
         if (self.stored_data) |data| alloc.free(data);
-        if (self.source_projection_json) |data| alloc.free(data);
         if (self.source_value) |*value| deinitJsonValue(alloc, value);
         if (self.column_source) |source| source.deinit();
         self.stored_data = null;
-        self.source_projection_json = null;
         self.finalized_source = null;
         self.source_value = null;
         self.column_source = null;
@@ -2771,7 +2769,6 @@ pub const SearchHit = struct {
         freeIndexScores(alloc, self.index_scores);
         freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
-        if (self.source_projection_json) |data| alloc.free(data);
         if (self.source_value) |*value| deinitJsonValue(alloc, value);
         if (self.column_source) |source| source.deinit();
         if (self.ancestor_source_data) |data| alloc.free(data);

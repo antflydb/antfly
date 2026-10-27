@@ -4501,7 +4501,10 @@ pub const GlobalStatefulQueryRequest = struct {
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
-    source_projection: ?SourceProjection = null,
+    /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
+    select: ?std.json.Value = null,
+    /// Request-local values bound by select expressions through param. Parameters are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and 1024 named parameters.
+    params: ?std.json.Value = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
@@ -4575,7 +4578,8 @@ pub const GlobalStatefulQueryRequest = struct {
         .{ "aggregations", "aggregations", true },
         .{ "embeddings", "embeddings", true },
         .{ "search_effort", "search_effort", true },
-        .{ "source_projection", "source_projection", true },
+        .{ "select", "select", true },
+        .{ "params", "params", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "highlight", "highlight", true },
@@ -4688,8 +4692,12 @@ pub const GlobalStatefulQueryRequest = struct {
             try jw.objectField("search_effort");
             try jw.write(value);
         }
-        if (self.source_projection) |value| {
-            try jw.objectField("source_projection");
+        if (self.select) |value| {
+            try jw.objectField("select");
+            try jw.write(value);
+        }
+        if (self.params) |value| {
+            try jw.objectField("params");
             try jw.write(value);
         }
         if (self.fields) |value| {
@@ -7275,6 +7283,9 @@ pub const PathFindResult = antfly_indexes_openapi.PathFindResult;
 
 pub const PathFindWeightMode = antfly_indexes_openapi.PathFindWeightMode;
 
+/// Exactly one expression node: literal, field, ref, param, call with args, case with optional else, cast, or a binary operator. Pure expressions lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider calls remain in evaluate, never execute implicitly in select. value_identity(field) returns an opaque identity for a present logical value (including JSON null); missing has no identity. is_missing(field) distinguishes missing from present null. Identity reads require the same authorization and retained source revision as value reads. Metadata may accelerate them; unsupported/old metadata falls back to ordinary reads. Untaken CASE branches do not load fields or evaluate erroring calls. Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from, is_not_distinct_from, and, or, add, subtract, multiply, divide and concat. Expressions are limited to depth 64 and 8192 nodes per request.
+pub const ProjectionExpression = std.json.Value;
+
 /// Statistics from token-based document pruning
 pub const PruneStats = struct {
     /// Number of resources kept after pruning
@@ -7874,8 +7885,6 @@ pub const QueryHit = struct {
     _index_scores: ?std.json.ArrayHashMap(f64) = null,
     /// Optional score provenance for ranking features applied to this hit.
     _score_details: ?QueryScoreDetails = null,
-    /// Conditional source states keyed by exact logical field path; returned only when source_projection was requested.
-    _source_projection: ?std.json.ArrayHashMap(SourceValueIdentity) = null,
     _source: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. V0.2-compatible implicit rollup requests continue to use the deprecated `chunks` field instead of `matches`.
     hierarchy: ?QueryHitHierarchy = null,
@@ -7893,7 +7902,6 @@ pub const QueryHit = struct {
         .{ "_distance", "_distance", true },
         .{ "_index_scores", "_index_scores", true },
         .{ "_score_details", "_score_details", true },
-        .{ "_source_projection", "_source_projection", true },
         .{ "_source", "_source", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "_sort", "_sort", true },
@@ -7932,10 +7940,6 @@ pub const QueryHit = struct {
         }
         if (self._score_details) |value| {
             try jw.objectField("_score_details");
-            try jw.write(value);
-        }
-        if (self._source_projection) |value| {
-            try jw.objectField("_source_projection");
             try jw.write(value);
         }
         if (self._source) |value| {
@@ -8271,7 +8275,10 @@ pub const QueryRequest = struct {
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
-    source_projection: ?SourceProjection = null,
+    /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
+    select: ?std.json.Value = null,
+    /// Request-local values bound by select expressions through param. Parameters are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and 1024 named parameters.
+    params: ?std.json.Value = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
@@ -8336,7 +8343,8 @@ pub const QueryRequest = struct {
         .{ "aggregations", "aggregations", true },
         .{ "embeddings", "embeddings", true },
         .{ "search_effort", "search_effort", true },
-        .{ "source_projection", "source_projection", true },
+        .{ "select", "select", true },
+        .{ "params", "params", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "highlight", "highlight", true },
@@ -8444,8 +8452,12 @@ pub const QueryRequest = struct {
             try jw.objectField("search_effort");
             try jw.write(value);
         }
-        if (self.source_projection) |value| {
-            try jw.objectField("source_projection");
+        if (self.select) |value| {
+            try jw.objectField("select");
+            try jw.write(value);
+        }
+        if (self.params) |value| {
+            try jw.objectField("params");
             try jw.write(value);
         }
         if (self.fields) |value| {
@@ -14104,88 +14116,6 @@ pub const SortProfile = struct {
     }
 };
 
-/// Conditional delivery of selected logical source fields on authorized hits. Every field must also be selected by `fields` (or the default all-fields projection). Conditions only suppress unchanged source values; they never authorize a read, skip filters, or establish the existence of a record. The response reports value, unchanged, or missing separately for each path. Older servers may omit this extension; callers must retain full-value fallback.
-pub const SourceProjection = struct {
-    fields: []const SourceProjectionField,
-};
-
-pub const SourceProjectionField = struct {
-    /// Exact logical object path; overlapping paths and wildcards are not supported.
-    field: []const u8,
-    /// Value mode delivers the value unless if_match succeeds. Identity mode returns only a freshly authorized identity; existing values have state reference and are omitted from _source independently of if_match. Reference state is execution evidence, never a read grant.
-    mode: ?[]const u8 = null,
-    /// Optional per-record expected identities. Duplicate record IDs are invalid.
-    if_match: ?[]const SourceValueCondition = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "field", "field", false },
-        .{ "mode", "mode", true },
-        .{ "if_match", "if_match", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("field");
-        try jw.write(self.field);
-        if (self.mode) |value| {
-            try jw.objectField("mode");
-            try jw.write(value);
-        }
-        if (self.if_match) |value| {
-            try jw.objectField("if_match");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const SourceValueCondition = struct {
-    id: []const u8,
-    /// Opaque versioned identity previously returned by this server for these exact logical bytes.
-    identity: []const u8,
-};
-
-pub const SourceValueIdentity = struct {
-    /// Stored null is a value. Missing has no identity; unchanged and reference omit the value from _source.
-    state: []const u8,
-    /// Opaque versioned value identity, present for value, unchanged and reference states.
-    identity: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "state", "state", false },
-        .{ "identity", "identity", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("state");
-        try jw.write(self.state);
-        if (self.identity) |value| {
-            try jw.objectField("identity");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 pub const SqlSettingDatabaseDefault = struct {
     database: []const u8,
     value: SqlSettingValue,
@@ -14348,7 +14278,10 @@ pub const StatefulQueryRequest = struct {
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
-    source_projection: ?SourceProjection = null,
+    /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
+    select: ?std.json.Value = null,
+    /// Request-local values bound by select expressions through param. Parameters are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and 1024 named parameters.
+    params: ?std.json.Value = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
@@ -14417,7 +14350,8 @@ pub const StatefulQueryRequest = struct {
         .{ "aggregations", "aggregations", true },
         .{ "embeddings", "embeddings", true },
         .{ "search_effort", "search_effort", true },
-        .{ "source_projection", "source_projection", true },
+        .{ "select", "select", true },
+        .{ "params", "params", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "highlight", "highlight", true },
@@ -14527,8 +14461,12 @@ pub const StatefulQueryRequest = struct {
             try jw.objectField("search_effort");
             try jw.write(value);
         }
-        if (self.source_projection) |value| {
-            try jw.objectField("source_projection");
+        if (self.select) |value| {
+            try jw.objectField("select");
+            try jw.write(value);
+        }
+        if (self.params) |value| {
+            try jw.objectField("params");
             try jw.write(value);
         }
         if (self.fields) |value| {

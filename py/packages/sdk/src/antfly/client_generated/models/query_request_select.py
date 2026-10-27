@@ -7,17 +7,22 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
-    from ..models.source_value_identity import SourceValueIdentity
+    from ..models.projection_expression import ProjectionExpression
 
 
-T = TypeVar("T", bound="QueryHitSourceProjection")
+T = TypeVar("T", bound="QueryRequestSelect")
 
 
 @_attrs_define
-class QueryHitSourceProjection:
-    """Conditional source states keyed by exact logical field path; returned only when source_projection was requested."""
+class QueryRequestSelect:
+    """Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed.
+    Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may
+    reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change
+    hit membership or paging.
 
-    additional_properties: dict[str, SourceValueIdentity] = _attrs_field(init=False, factory=dict)
+    """
+
+    additional_properties: dict[str, ProjectionExpression] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
 
@@ -29,28 +34,28 @@ class QueryHitSourceProjection:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.source_value_identity import SourceValueIdentity
+        from ..models.projection_expression import ProjectionExpression
 
         d = dict(src_dict)
-        query_hit_source_projection = cls()
+        query_request_select = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
-            additional_property = SourceValueIdentity.from_dict(prop_dict)
+            additional_property = ProjectionExpression.from_dict(prop_dict)
 
             additional_properties[prop_name] = additional_property
 
-        query_hit_source_projection.additional_properties = additional_properties
-        return query_hit_source_projection
+        query_request_select.additional_properties = additional_properties
+        return query_request_select
 
     @property
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> SourceValueIdentity:
+    def __getitem__(self, key: str) -> ProjectionExpression:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: SourceValueIdentity) -> None:
+    def __setitem__(self, key: str, value: ProjectionExpression) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:

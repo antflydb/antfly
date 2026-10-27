@@ -3278,14 +3278,37 @@ pub fn encodeQueryRequestWithGraphWireMode(
     // Canonical hierarchy requests require an explicit projection at both
     // ingress and storage. Their parser reconstructs deferred projection from
     // these fields, so retain them rather than emitting an invalid envelope.
-    const conditional_delivery = @import("source_projection.zig").storageEligible(req);
+    const conditional_delivery = @import("field_projection.zig").storageEligible(req) or @import("field_projection.zig").hydrationEligible(req);
     if (conditional_delivery) {
-        try appendJsonFieldName(alloc, &out, &first, "source_projection");
-        try out.appendSlice(alloc, req.source_projection_json);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const projection = try std.json.parseFromSliceLeaky(@import("field_projection.zig").Request, a, req.field_projection_json, .{});
+        try appendJsonFieldName(alloc, &out, &first, "select");
+        try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, try @import("field_projection.zig").selection(a, projection), .{}));
+        try appendJsonFieldName(alloc, &out, &first, "params");
+        try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, projection.params, .{}));
+        if (!req.include_all_fields) {
+            var plan = try @import("field_projection.zig").decode(a, req.field_projection_json);
+            defer plan.deinit();
+            var required: std.ArrayList([]const u8) = .empty;
+            try required.appendSlice(a, req.fields);
+            var it = plan.required_fields.keyIterator();
+            while (it.next()) |field| {
+                if (std.mem.eql(u8, field.*, "_id")) continue;
+                const exists = for (required.items) |prior| {
+                    if (std.mem.eql(u8, prior, field.*)) break true;
+                } else false;
+                if (!exists) try required.append(a, field.*);
+            }
+            try appendJsonFieldNames(alloc, &out, &first, "fields", required.items);
+        }
+        try appendJsonFieldName(alloc, &out, &first, "_projection_source_fields");
+        try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, .{ .fields = req.fields, .include_all = req.include_all_fields }, .{}));
     }
     const requires_hierarchy_fields = req.hierarchy_children != null or
         req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit;
-    if (!req.include_all_fields and (preserve_projection or conditional_delivery or requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
+    if (!conditional_delivery and !req.include_all_fields and (preserve_projection or requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
     }
     if (req.highlight) |highlight| {
@@ -4907,7 +4930,7 @@ const RemoteSearchParser = struct {
         if (self.authority_group != null) try self.pending_sources.append(self.alloc, pending);
         hit.stored_data = stored;
         stored = null;
-        if (wire._source_projection) |identities| hit.source_projection_json = try std.json.Stringify.valueAlloc(self.alloc, identities, .{ .emit_null_optional_fields = false });
+        if (wire._computed) |computed| hit.computed_json = try std.json.Stringify.valueAlloc(self.alloc, computed, .{});
         return hit;
     }
     fn rows(self: *@This()) !void {

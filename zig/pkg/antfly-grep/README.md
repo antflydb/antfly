@@ -4845,3 +4845,24 @@ and content before provider delivery. Expanded-image admission limits still
 apply; a reference is not a read grant. The default inline transport remains
 available for ordinary decision endpoints. This uses the existing document
 format.
+
+### General conditional projection
+
+Indexed image reuse uses the ordinary query API's `select` expression map and
+`params`, with pure expressions returned in `_computed`. `fields` stays a list
+of strings and controls `_source` independently. `value_identity`, `is_missing`
+and lazy CASE lower to the existing SQL scalar binder and VM. The unreleased
+`source_projection` / `_source_projection` protocol is removed. Servers that
+reject or ignore `select` fall back to ordinary image reads; missing computed
+values never count as verified cache hits. Source-reference transport requires
+an identity-capable server.
+
+The inference gateway batches images within a parent, then batches parents with
+identical masks and filters. It preserves authorization, revision and digest
+checks per reference, and temporary lookup failures retain retryable statuses.
+See [the design](../../../docs/design/antfly-grep.md#conditional-source-projection-and-future-storage-authorities)
+for the API, limits, metadata fast path and fallback rules. Historical source
+projection reports above predate this interface. The updated
+`e2e/antfly/bench_source_projection.py` compares ordinary, cold, metadata-backed
+warm, and equivalent value-reading reference expressions; optional comparison
+binaries must support `select`.

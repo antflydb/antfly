@@ -70,7 +70,8 @@ QUERY_REQUEST_PROPERTIES = (
     "indexes",
     "embeddings",
     "fields",
-    "source_projection",
+    "select",
+    "params",
     "hierarchy",
     "limit",
     "offset",
@@ -102,6 +103,8 @@ QUERY_REQUEST_PROPERTIES = (
 # OpenAPI contract and describe_query_request; inlining them makes tools/list
 # too large for the clients this projection is designed to support.
 QUERY_REQUEST_OPEN_OBJECT_PROPERTIES = {
+    "select",
+    "params",
     "query",
     "full_text_search",
     "filter_query",
