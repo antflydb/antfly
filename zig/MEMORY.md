@@ -2669,3 +2669,11 @@ retain indexed serving under a bounded current-head proof while affected roots
 use exact fallback. A single new pair with 6,000 unrelated pins requires nine
 owner writes, rather than clearing and rebuilding the entire profile. The shared
 metadata/Lite contracts retain source, head, visibility and final grant fences.
+
+Resolver dependency projection follow-up: static consumers use shared projection
+format 3. Reverse-parent dependencies scope a leaf correction to its affected
+paths, while the bounded journal maintains deduplicated key invalidations for
+unaffected-root read proofs across edit bursts. Complete configured/native graph
+coverage is owner-built before membership readiness; native memory identities
+without static consumers still create neither this projection nor its journal.
+See `RESOLUTION.md` for upgrade floors, bounded maintenance, and fallback rules.

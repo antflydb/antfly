@@ -2730,23 +2730,56 @@ The cursor, shortcuts, members and readiness share one native transaction.
 Native graph edits append to a destination-owned, 256-slot bounded edit journal
 in the same transaction as pin propagation and the new head. Enrollment is owner-only:
 native memory identities without static consumers create no unused log. Slots are
-limited to 64 KiB, bounding the retained journal to 16 MiB per namespace. Each event captures
-changed pin-count boundaries and routing keys. Per-boundary manifests locate old
-membership directly; root-to-path indexes locate only affected canonical shortcuts.
-Owner repair seeds persistent dirty queues, expands affected roots, clears their
-paths, and repairs only queued boundaries. New edits coalesce into these queues;
-they do not discard unaffected members or restart a profile-wide clear/build pass.
-Unchanged paths and text-only edits reuse their prior work.
+limited to 64 KiB. Each event captures changed pin-count boundaries, routing keys,
+and old/new redirect targets. The same transaction maintains a deduplicated
+`invalidated/<latest-sequence>/<key-hash>` range and a point version for each key.
+Overwriting a ring slot removes an expired invalidation only if that event still
+owns its point version. Repeated edits to a hot key therefore retain one posting;
+storage is bounded by retained events, with no synchronous profile fanout.
 
-A read-side proof checks at most 16 retained events and 128 boundary/path steps.
-It admits unaffected root postings across a newer graph cut and excludes dirty,
-old and new affected roots immediately. If that proof is too large, the journal
-has a gap, or cleanup is publishing the final repaired cut, readers use exact
-fallback. Final head, source, and authorization fences are unchanged. The owner
-publishes the repaired graph watermark only after every affected boundary and
-cleanup page completes. Full rebuilding is reserved for initial enrollment,
-legacy-format upgrade, oversized invalidations, or recovery after falling behind
-the journal's retained history. The ring cannot accumulate an unbounded log.
+Projection format 3 first builds the complete configured/native routing graph,
+including unpinned configured nodes. Each graph node has one canonical path row,
+one root-dependency posting, and at most one direct reverse-parent posting. This
+shares converging paths instead of storing every boundary's full dependency list.
+Initial enrollment does more work than format 2, in bounded owner turns, so future
+reads can prove incoming-root changes even when an edited source was previously
+unpinned. Static-only nodes use scalar canonical lookups and one direct edge;
+curated paths share durable, resumable path compression. Pin membership follows
+only after graph dependencies are complete.
+
+Owner repair expands reverse dependencies from changed routing nodes, rather than
+all members of their old canonical root. It clears and rebuilds only those path
+nodes and their incident pin boundaries. New targets acquire routing rows while the changed source path is compressed;
+pin-only edits do not enroll unnecessary graph work.
+Dirty old/new roots remain unreadable during partial publication. Coalesced edits
+requeue the persistent affected-node set before expanding new reverse dependencies.
+A bounded prune queue also removes unconfigured, undeclared nodes with no
+incoming graph dependencies. Old targets and removed sources cannot accumulate
+path rows under sustained unique-target churn. Configured nodes, current native
+routing declarations and referenced targets remain live. Cleanup and the final
+graph watermark share the native writer transaction.
+
+Read-side validity uses one retained lineage anchor and streams the ordered
+invalidation range after the projection watermark in reusable scratch. It checks
+changed keys against the requested roots' dependency postings and the roots
+themselves. Recording both old/new redirect targets ensures that newly incoming
+paths invalidate a root even when their source did not previously belong to it.
+For a configured node, the proof also checks the direct immutable parent against
+its captured routing dependency. This covers an unmerge revealing a previously
+masked configured edge, including alternating configured/native paths. Dirty
+nodes retain their old root until publication, preserving unrelated-root proofs
+while that parent's path is being rebuilt.
+Read work depends on distinct changed keys, not unrelated pin count, without the
+former 16-event/128-hop proof cliff. A journal gap, oversized event, older projection
+format or final cleanup still uses exact fallback. No request advances owner work.
+Final head, source, and authorization fences are unchanged. Full rebuilding is
+reserved for initial enrollment, legacy-format upgrade, oversized invalidations,
+or recovery after falling behind retained history.
+
+This generation uses Lite reader 24, topology protocol 63, metadata bootstrap v16,
+and Lite query-pin enrollment v4. Legacy v12-v15 declaration/profile proofs remain
+valid during dependency backfill; format-2 pin projections use exact read fallback
+until their owner publishes format 3. Older native readers refuse the new floor.
 A profile enrollment epoch also drives bounded retirement cleanup, so replacing
 immutable profiles does not accumulate their obsolete membership generations.
 Namespace retirement uses the existing bounded native-prefix cleanup.
@@ -2803,3 +2836,16 @@ the previous whole-profile repair needed 2,025/12,142 writes and 24/141 turns.
 A separate full-composition reference checks 1,536 seed queries during 48
 interleaved routing edits and partial owner turns. It also exercises a missed
 256-event journal window and verifies bounded recovery rather than stale readiness.
+
+Dependency projection regression evidence: with 1,000 and 6,000 pins sharing a
+root, redirecting one configured leaf completes in one 128-work owner turn with
+29 derived/state writes and 14 scans. A zero-result query on an unrelated root
+uses five scans after 17 unique edits and after 145 edits with repeated hot keys;
+the prior 6,000-pin implementation used 48,481 owner writes/470 turns for the leaf
+and 25,995 scans for the 17-edit read. Fixtures assert the same bounds at both
+sizes and validate portable rows, legacy projection upgrade, masked unmerge at
+every four-work repair cut, and ring eviction without orphan invalidations.
+Continuous redirects to unique temporary targets retain only the live graph;
+a still-masked configured fallback keeps its unaffected root indexed.
+Run the focused dependency contracts with `zig build memory-dependency-test`
+from `zig/`, or include them through the complete `memory-test` target.
