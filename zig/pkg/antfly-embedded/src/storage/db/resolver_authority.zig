@@ -3641,8 +3641,8 @@ test "native resolver authority indexed query fallback follows only relevant com
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var memory: TestMemory = .{ .a = a };
-    const store: Store = .{ .a = a, .prefix = "indexed-query/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "indexed-query/", .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
     const template = "entity/{{_key}}";
     const aliases: []const resolver.KeyAlias = &.{ .{ .key = "entity/static", .target = "entity/middle" }, .{ .key = "entity/middle", .target = "entity/root" }, .{ .key = "entity/removed", .target = "entity/root" } };
     const pairs = try a.alloc(c.Pair, 4001);
@@ -4329,10 +4329,14 @@ const OrderedPinMemory = struct {
     a: A,
     rows: std.StringHashMapUnmanaged([]const u8) = .empty,
     tree: Tree = .{},
+    reads: usize = 0,
     scans: usize = 0,
     writes: usize = 0,
+    visited: usize = 0,
+    distinct_rows: usize = 0,
     fn get(ptr: *anyopaque, a: A, key: []const u8) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.reads += 1;
         return if (self.rows.get(key)) |value| try a.dupe(u8, value) else null;
     }
     fn put(ptr: *anyopaque, _: A, key: []const u8, value: []const u8) !void {
@@ -4370,6 +4374,8 @@ const OrderedPinMemory = struct {
             if (!std.mem.startsWith(u8, node.key, prefix)) break;
             if (rows.items.len == limit) return .{ .rows = rows.items, .next = rows.items[rows.items.len - 1].key };
             try rows.append(a, .{ .key = try a.dupe(u8, node.key), .value = try a.dupe(u8, self.rows.get(node.key).?) });
+            self.visited += 1;
+            if (std.mem.endsWith(u8, prefix, "/distinct/")) self.distinct_rows += 1;
         }
         return .{ .rows = rows.items };
     }
