@@ -8100,6 +8100,8 @@ pub const Node = struct {
             var split = try qwen3vl_projector.encodePreparedProjectedImageResident(&cb, a, cfg, &prepared, .{});
             defer split.deinit();
             try std.testing.expectEqualSlices(f32, serial[index].embeddings, split.embeddings);
+            if (comptime build_options.enable_cuda) if (cb.kind() == .cuda)
+                try @import("../architectures/qwen3vl_device_qualification.zig").check(&cb, a, cfg, &.{&prepared}, &.{split}, .{});
         }
         for ([_]usize{ 2, 3, if (model.session.backend() == .cuda) 8 else 0, if (model.session.backend() == .cuda and width == 16) 16 else 0 }) |count| {
             if (count == 0) continue;
@@ -8125,6 +8127,8 @@ pub const Node = struct {
                 a.free(split_batch);
             }
             for (result, split_batch) |original, split| try std.testing.expectEqualSlices(f32, original.embeddings, split.embeddings);
+            if (comptime build_options.enable_cuda) if (cb.kind() == .cuda)
+                try @import("../architectures/qwen3vl_device_qualification.zig").check(&cb, a, cfg, views[0..count], split_batch, .{ .max_images = count });
             var worst: f32 = 0;
             var squared_error: f64 = 0;
             var squared_reference: f64 = 0;
@@ -8193,7 +8197,7 @@ pub const Node = struct {
                     .value => |value| value,
                     .item_error => |failure| return failure.cause,
                 };
-                errdefer projected.deinit();
+                errdefer ctx.retireProjected(&projected);
                 try request.control.check();
                 return projected;
             }
@@ -8201,6 +8205,11 @@ pub const Node = struct {
             defer ctx.unlockStep();
             ctx.cpu_preprocess_items += 1;
             ctx.cpu_preprocess_ns +|= elapsed;
+            if (ctx.features.device_vision_features) {
+                const result = try qwen3vl_projector.encodePreparedProjectedImagesDeviceBatched(&ctx.cb.?, allocator, ctx.cfg, &.{&prepared}, limits);
+                defer allocator.free(result);
+                return result[0];
+            }
             return qwen3vl_projector.encodePreparedProjectedImageResident(&ctx.cb.?, allocator, ctx.cfg, &prepared, limits);
         }
 
@@ -8235,7 +8244,7 @@ pub const Node = struct {
                 .value => |value| value,
                 .item_error => |failure| return failure.cause,
             };
-            errdefer projected.deinit();
+            errdefer ctx.retireProjected(&projected);
             try request.control.check();
             return projected;
         }
@@ -8380,7 +8389,10 @@ pub const Node = struct {
         const a = std.heap.smp_allocator;
         var group_limits = items[0].payloadAs(LightOnPreparedVisionPayload).limits;
         if (ctx.cb.?.kind() == .cuda and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES")) group_limits.max_images = @max(group_limits.max_images, items.len);
-        const results = qwen3vl_projector.encodePreparedProjectedImagesResidentBatched(&ctx.cb.?, a, ctx.cfg, prepared[0..items.len], group_limits) catch |err| {
+        const results = (if (ctx.features.device_vision_features)
+            qwen3vl_projector.encodePreparedProjectedImagesDeviceBatched(&ctx.cb.?, a, ctx.cfg, prepared[0..items.len], group_limits)
+        else
+            qwen3vl_projector.encodePreparedProjectedImagesResidentBatched(&ctx.cb.?, a, ctx.cfg, prepared[0..items.len], group_limits)) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };

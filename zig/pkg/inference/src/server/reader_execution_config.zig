@@ -43,6 +43,7 @@ pub fn Features(comptime Hooks: type) type {
         gpu_greedy_stream: bool = false,
         stream_chunks: bool = false,
         vision_workspace_cache: bool = false,
+        device_vision_features: bool = false,
         vision_late_seal: bool = false,
         queued_phase_priority: bool = false,
         resident_vision_budget: bool = false,
@@ -99,6 +100,7 @@ pub fn Features(comptime Hooks: type) type {
                 .gpu_token_burst = !cuda,
                 .gpu_token_burst_width = 4,
                 .vision_workspace_cache = !cuda,
+                .device_vision_features = cuda,
                 .vision_late_seal = cuda,
                 .prefill_late_seal = cuda,
                 .queued_phase_priority = cuda,
@@ -156,6 +158,17 @@ pub fn Features(comptime Hooks: type) type {
             return result;
         }
 
+        /// Keep foreground gate fairness when queued broker priority is
+        /// disabled. Resolve the existing rollback control once per epoch.
+        pub fn withQueuedPhasePriorityOverride(self: @This(), text: ?[]const u8) @This() {
+            if (!self.prepared) return self;
+            const value = text orelse return self;
+            const enabled = if (std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off") or std.ascii.eqlIgnoreCase(value, "no")) false else if (std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "yes")) true else return self;
+            var result = self;
+            result.queued_phase_priority = enabled;
+            return result;
+        }
+
         /// Explicit CUDA token chaining uses the existing bounded operator
         /// switch; the selected profile stays unchanged when it is disabled.
         pub fn withCudaTokenBurstOverride(self: @This(), enabled: bool, width_text: ?[]const u8) @This() {
@@ -177,6 +190,12 @@ pub fn Features(comptime Hooks: type) type {
             return resolve(cfg, if (Hooks.cudaLightOnBatchProfileEnabled()) .cuda else .metal);
         }
 
+        pub fn withHostVisionFeatures(self: @This()) @This() {
+            var result = self;
+            result.device_vision_features = false;
+            return result;
+        }
+
         pub fn resolve(cfg: gpt_model_mod.Config, backend: runtime.kv.pool.BackendKind) @This() {
             const profile = selectProfile(cfg, backend, Hooks.cudaLightOnBatchProfileEnabled(), metal_runtime.appleSimdgroupDeviceDefault(), metal_runtime.lightOnThroughputProfileEnabled());
             // Profiling and concurrent planned dispatch do not share the
@@ -192,12 +211,17 @@ pub fn Features(comptime Hooks: type) type {
             if (backend == .cuda) {
                 result = result.withCudaTokenBurstOverride(platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"), platform.env.getenv("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"));
                 result = result.withDecodeStreakOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_DECODE_STREAK"));
+                result = result.withQueuedPhasePriorityOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_QUEUED_PHASE_PRIORITY"));
                 result = result.withPreparedPrefillChunkOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS"));
                 const wide = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES");
                 result = result.withBatchOverrides(platform.env.getenv("ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS"), platform.env.getenv("ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS"), if (wide) 16 else 8, if (wide) 16 else 4);
             }
             if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK"))
                 result.vision_workspace_cache = false;
+            // Keep the encoder handoff rollback independent of shared-pool
+            // admission and the backend workspace policy.
+            if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_DEVICE_VISION"))
+                result = result.withHostVisionFeatures();
             return result;
         }
         pub fn packedSharedFrameEligible(features: @This(), cfg: gpt_model_mod.Config) bool {
@@ -378,4 +402,39 @@ test "LightOnOCR3 CUDA token chaining opt in shares bounded admission configurat
     for ([_][]const u8{ "", "-1", "1", "9", "256", "junk" }) |text| try std.testing.expectEqualDeep(selected.withCudaTokenBurstOverride(true, null), selected.withCudaTokenBurstOverride(true, text));
     const fallback = F.forProfile(.conservative, .{}, 1);
     try std.testing.expectEqualDeep(fallback, fallback.withCudaTokenBurstOverride(true, "8"));
+}
+
+test "LightOnOCR3 CUDA queued phase rollback retains foreground fairness and admission bounds" {
+    const F = Features(struct {});
+    for ([_]F.Profile{ .cuda_lighton08, .cuda_lighton4b }) |profile| {
+        const selected = F.forProfile(profile, .{}, 128);
+        try std.testing.expect(selected.queued_phase_priority);
+        try std.testing.expectEqualDeep(selected, selected.withQueuedPhasePriorityOverride(null));
+        for ([_][]const u8{ "0", "false", "OFF", "no" }) |text| {
+            var resolved = selected.withQueuedPhasePriorityOverride(text);
+            try std.testing.expect(!resolved.queued_phase_priority);
+            try std.testing.expectEqualDeep(selected.auxiliaryAmounts(), resolved.auxiliaryAmounts());
+            for ([_][]const u8{ "1", "TRUE", "on", "yes" }) |enabled| try std.testing.expectEqualDeep(selected, resolved.withQueuedPhasePriorityOverride(enabled));
+            resolved.queued_phase_priority = selected.queued_phase_priority;
+            try std.testing.expectEqualDeep(selected, resolved);
+        }
+        for ([_][]const u8{ "", "invalid", "2", "-1" }) |text| try std.testing.expectEqualDeep(selected, selected.withQueuedPhasePriorityOverride(text));
+    }
+    const fallback = F.forProfile(.conservative, .{}, 1);
+    try std.testing.expectEqualDeep(fallback, fallback.withQueuedPhasePriorityOverride("1"));
+}
+
+test "LightOnOCR3 CUDA device vision profile keeps existing admission and host rollback" {
+    const F = Features(struct {});
+    for ([_]F.Profile{ .cuda_lighton08, .cuda_lighton4b }) |profile| {
+        const selected = F.forProfile(profile, .{}, 128);
+        try std.testing.expect(selected.device_vision_features);
+        var fallback = selected.withHostVisionFeatures();
+        try std.testing.expect(!fallback.device_vision_features);
+        try std.testing.expectEqualDeep(selected.auxiliaryAmounts(), fallback.auxiliaryAmounts());
+        fallback.device_vision_features = true;
+        try std.testing.expectEqualDeep(selected, fallback);
+    }
+    for ([_]F.Profile{ .metal_lighton08, .metal_lighton4b, .conservative }) |profile|
+        try std.testing.expect(!F.forProfile(profile, .{}, 64).device_vision_features);
 }

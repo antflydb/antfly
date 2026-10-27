@@ -5891,7 +5891,7 @@ pub const NativeGenerationPipeline = struct {
                     // before taking the GPU lock. Prompt assembly stays under
                     // the ordinary lock after projected outputs return.
                     var batched: ?qwen3vl_projector.ProjectedImages = null;
-                    errdefer if (batched) |*value| value.deinit();
+                    errdefer if (batched) |*value| self.retireBatchedProjectedImages(value);
                     if (config.qwen3vl_parity_json_path == null) if (self.qwen_vision_batch) |hook| {
                         batched = try hook.encode_fn(hook.ptr, allocator, images, vision_limits);
                     };
@@ -12865,6 +12865,13 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn retireBatchedProjectedImages(self: *NativeGenerationPipeline, projected: *qwen3vl_projector.ProjectedImages) void {
+        const device = projected.device_embeddings != null;
+        if (device) if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
+        defer if (device) if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        projected.deinit();
+    }
+
     pub fn deinit(self: *NativeGenerationPipeline) void {
         if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3") and self.lighton_cuda_execution_id != 0 and
             platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH"))
@@ -13433,7 +13440,7 @@ pub const NativeGenerationPipeline = struct {
             try burst.argmax(logits, step);
         }
         var host: [max_gpu_token_burst_width * 128]u32 = undefined;
-        try burst.read(host[0 .. burst.steps * claimed.len]);
+        try self.readLightOnCudaBurst(burst, host[0 .. burst.steps * claimed.len]);
         try self.cb.checkExecutionControl();
         @memcpy(first, host[0..claimed.len]);
         @memcpy(rest, host[claimed.len .. burst.steps * claimed.len]);
@@ -13448,6 +13455,28 @@ pub const NativeGenerationPipeline = struct {
             }
         }
         return .{ .logits = null, .greedy_tokens = first, .second_greedy_tokens = rest, .max_query_seq_len = 1 };
+    }
+
+    /// Every queued consumer and its claimed pages remain owned while the
+    /// lane admits independent vision/prompt work. Cleanup reacquires the lane
+    /// even for cancellation or a CUDA error before retiring any resource.
+    fn waitOutsideLightOnExecution(self: *NativeGenerationPipeline, pending: anytype) !void {
+        const mutex = self.execution_lock orelse return error.InvalidBatchDecodeState;
+        self.unlockExecution(mutex);
+        const waited = pending.wait();
+        self.lockExecutionForCleanup(mutex);
+        try waited;
+    }
+
+    fn readLightOnCudaBurst(self: *NativeGenerationPipeline, burst: anytype, output: []u32) !void {
+        if (try burst.beginRead(output.len)) |queued| {
+            var pending = queued;
+            defer pending.deinit();
+            const before = burst.owner.ctx.stats.kernel_launches;
+            try self.waitOutsideLightOnExecution(&pending);
+            try pending.copy(std.mem.sliceAsBytes(output));
+            burst.noteReadCompleted(before);
+        } else try burst.read(output);
     }
 
     /// Execute only inside the reader epoch's model lane. The two-step graph
@@ -20597,5 +20626,101 @@ test "LightOnOCR3 CUDA reader epoch logical pools retain positions across growth
                 }
             }
         }
+    }
+}
+
+test "LightOnOCR3 CUDA burst readback releases the execution lane and reacquires for cancelled cleanup" {
+    const Fake = struct {
+        mutex: *std.atomic.Mutex,
+        fail: bool,
+        waited: bool = false,
+        fn wait(self: *@This()) !void {
+            try std.testing.expect(self.mutex.tryLock());
+            self.mutex.unlock();
+            self.waited = true;
+            if (self.fail) return error.Cancelled;
+        }
+        fn cancel(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    for ([_]bool{ false, true }) |event_gate| for ([_]bool{ false, true }) |fail| {
+        var mutex: std.atomic.Mutex = .unlocked;
+        var gate: execution_control_mod.ExecutionLane = .{};
+        var pipeline: NativeGenerationPipeline = undefined;
+        pipeline.execution_lock = &mutex;
+        pipeline.execution_gate = if (event_gate) &gate else null;
+        pipeline.execution_phase_waiters = null;
+        pipeline.execution_control = null;
+        pipeline.execution_contention_wait_ns = 100 * std.time.ns_per_us;
+        pipeline.io = std.testing.io;
+        try pipeline.lockExecution(&mutex);
+        defer pipeline.unlockExecution(&mutex);
+        pipeline.execution_control = .{ .check_fn = Fake.cancel };
+        var pending = Fake{ .mutex = &mutex, .fail = fail };
+        if (fail) {
+            try std.testing.expectError(error.Cancelled, pipeline.waitOutsideLightOnExecution(&pending));
+        } else try pipeline.waitOutsideLightOnExecution(&pending);
+        try std.testing.expect(pending.waited);
+        try std.testing.expect(!mutex.tryLock());
+    };
+}
+
+test "LightOnOCR3 device vision cancellation retires independent page features once under the execution lane" {
+    const Probe = struct {
+        mutex: *std.atomic.Mutex,
+        markers: [2]usize = .{ 7, 9 },
+        freed: [2]bool = .{ false, false },
+        fn free(raw: *anyopaque, tensor: ops.CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.mutex.tryLock());
+            for (&self.markers, 0..) |*marker, i| if (tensor == @as(ops.CT, @ptrCast(marker))) {
+                std.debug.assert(!self.freed[i]);
+                self.freed[i] = true;
+                return;
+            };
+            unreachable;
+        }
+        fn cancel(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    for ([_]bool{ false, true }) |event_gate| {
+        var mutex: std.atomic.Mutex = .unlocked;
+        var gate: execution_control_mod.ExecutionLane = .{};
+        var probe = Probe{ .mutex = &mutex };
+        var table = @import("../ops/native_compute.zig").vtable_impl;
+        table.freeTensor = Probe.free;
+        const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
+        var pipeline: NativeGenerationPipeline = undefined;
+        pipeline.execution_lock = &mutex;
+        pipeline.execution_gate = if (event_gate) &gate else null;
+        pipeline.execution_phase_waiters = null;
+        pipeline.execution_control = .{ .check_fn = Probe.cancel };
+        pipeline.execution_contention_wait_ns = 100 * std.time.ns_per_us;
+        pipeline.io = std.testing.io;
+        var pages: [2]qwen3vl_projector.ProjectedImages = undefined;
+        for (&pages, 0..) |*page, i| page.* = .{
+            .allocator = std.testing.allocator,
+            .embeddings = &.{},
+            .device_embeddings = @ptrCast(&probe.markers[i]),
+            .device_backend = .{ .ptr = cb.ptr, .release_fn = cb.vtable.freeTensor },
+            .deepstack_embeddings = &.{},
+            .tokens_per_image = &.{},
+            .grids = &.{},
+            .preprocess_evidence = &.{},
+            .preprocess_spatial_patches = &.{},
+            .hidden_size = 1,
+            .deepstack_layer_count = 0,
+        };
+        // This models a completed broker value whose receiver was cancelled
+        // before it could acquire the ordinary prompt-assembly lane.
+        pipeline.retireBatchedProjectedImages(&pages[0]);
+        try std.testing.expect(probe.freed[0] and !probe.freed[1]);
+        try std.testing.expect(pages[0].device_embeddings == null and pages[1].device_embeddings != null);
+        pipeline.retireBatchedProjectedImages(&pages[1]);
+        try std.testing.expect(probe.freed[1]);
+        try std.testing.expect(mutex.tryLock());
+        mutex.unlock();
     }
 }

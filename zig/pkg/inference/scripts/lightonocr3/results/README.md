@@ -44,7 +44,7 @@ rare CUDA Florence receipt mismatch is not definitively root-caused.
 
 ## CUDA follow-up qualification
 
-The selected `05a8fc248f` runtime on DGX Spark GB10 uses 256 warmup requests
+The GPU-resident vision and upload-event runtime on DGX Spark GB10 uses 256 warmup requests
 and two 256-request measurements, 128 physical native slots and at most 128
 active vLLM sequences. Every native timed output matches independent native
 serial bytes and complete normalized actual-vLLM content on three synthetic
@@ -54,24 +54,32 @@ attention. These profiles are not a full activation-precision match.
 
 | Model | Native pages/s | vLLM pages/s | Required actual execution |
 | --- | ---: | ---: | --- |
-| LightOn 0.8B | 12.5125 / 12.4897 | 14.4262 / 14.4847 | Wide four-token chains in each round |
-| LightOn 4B | 4.0103 / 4.0152 | 4.6341 / 4.6303 | Wide four-token chains in each round |
+| LightOn 0.8B | 13.2207 / 13.0936 | 14.4262 / 14.4847 | Wide four-token chains in each round |
+| LightOn 4B | 4.0898 / 4.0676 | 4.6341 / 4.6303 | Wide four-token chains in each round |
 
 The 0.8B run uses vision/prefix limits 16/16; 4B uses 8/16 and 256-row
 prefix chunks. Both enable the BF16 normalization-input mirror while retaining
-F32 outputs. Operator byte limits are unchanged. Greedy execution reads token
+F32 outputs. Image uploads reuse an admitted 32 MiB pinned arena after its copy
+event completes; token readback releases the GPU execution lane while waiting.
+Each page independently owns its device vision features. Operator byte limits
+are unchanged. Greedy execution reads token
 IDs; 4B skips all 426 unused intermediate prefix heads per round. Both isolated
 comparisons observed no foreign GPU compute process. LightOn parity and a
 representative OCR accuracy evaluation remain outstanding.
 
-All 50 frozen build345 source/config files match the selected commit. CUDA
-regression: 259 selected, 245 passed, 14 backend skips; wide: 94 selected,
-93 passed, one skip. Independent packet, allocation-denial, admission,
-numerical and ownership checks retain their original tolerances. Packed-state
-qualification includes both recurrent widths, F32/BF16 convolution snapshots,
-poisoned reuse, short prefixes and reset against independent storage. The
-latest runtime compiles for Metal and passes focused CPU tests; these are
-not new Metal GPU throughput measurements.
+The [manifest](followup.json) pins the 54-file build421 snapshot and binary,
+report hashes, settings and actual-vLLM317 references. Preset defaults now apply
+the same token-chain width, vision/prefill limits and pinned-input switch used
+explicitly in those measurements; all runtime and profile inputs match that snapshot.
+CUDA regression: 267 selected, 253 passed, 14 backend skips; wide: 100 selected,
+99 passed, one skip. Independent packet, allocation-denial, admission, numerical
+and ownership checks retain their original tolerances. Both real checkpoints
+also match host vision features and assembled prompt bytes at batch sizes
+1, 2, 3, 8 and 16, with no intermediate feature downloads. CPU tests cover
+cancelled feature retirement and upload-event reuse without draining a later
+GPU producer. Failure-injection checks retain admission charges when physical
+host retirement fails; policy replacement cannot revive a stale readback. Metal compilation and focused CPU checks pass; these are not new
+Metal GPU throughput measurements.
 
 Prior CUDA Florence build283 measurements were 25.5421–25.7362 pages/s versus
 actual vLLM 25.3656 / 25.3890, with matching greedy/no-repeat policy and outputs
@@ -80,7 +88,7 @@ on the same limited fixture set. M5 Metal qualification is in the user guide.
 The [archive manifest](followup.json) pins an immutable 77-file baseline bundle
 and a minimized 56-file supplemental vision qualification bundle. It records
 object generations, sizes, SHA-256 and verified MD5 values. The bundles cover
-earlier selected runtimes; build345 and actual-vLLM317 logs remain local and
+earlier selected runtimes; build421, full419 and actual-vLLM317 logs remain local and
 are excluded from those archived payloads. Binaries, source snapshots, full
 reports and experiment logs stay outside tracked source directories. The
 [previous wide-cohort bundle](followup-bfd1738430.json) and

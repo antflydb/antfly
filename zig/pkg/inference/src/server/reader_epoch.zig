@@ -280,6 +280,16 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (enabled) _ = ctx.phase_waiters.fetchAdd(1, .acq_rel);
             return enabled;
         }
+        /// A cancelled receiver still owns a completed device result. Retire
+        /// it under the same lane as its producer, before the page/epoch dies.
+        pub fn retireProjected(ctx: *LightOnStreamContext, projected: *qwen3vl_projector.ProjectedImages) void {
+            if (projected.device_embeddings != null) {
+                ctx.lockStepForCleanup();
+                defer ctx.unlockStep();
+                projected.deinit();
+            } else projected.deinit();
+        }
+
         pub fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
             if (ctx.phase_fair) _ = ctx.phase_waiters.fetchAdd(1, .acq_rel);
             defer if (ctx.phase_fair) {

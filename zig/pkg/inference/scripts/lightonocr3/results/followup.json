@@ -24,5 +24,143 @@
       "md5_base64": "/h99wHUmtfZxd8813OgBxg==",
       "verification": "Uploaded object size and MD5 match local archive; all 55 payload files match evidence-manifest.json SHA-256 and size."
     }
-  ]
+  ],
+  "latest_local_qualification": {
+    "scope": "GPU-resident independently owned vision features, batched merger, admitted upload-event retirement and asynchronous token readback. F32 decode projection outputs/recurrent state unchanged. CUDA parity remains outstanding.",
+    "runtime_parent_commit": "37d64f8c351898d9f98636e1a195b299fc7495fc",
+    "binary_sha256": "9d21d53cbebe8e28c90b48b9996ab2337cfdef4b08189c5606524fbc205d1cba",
+    "source_manifest_sha256": "e9877c859bc6d3e86e6c89c532d453ddb907581cb870f0bfb9beec01f3b04600",
+    "source_file_sha256": {
+      "zig/pkg/inference/build/runtime.zig": "ab746106497ba472ca2fc4e0b4ebce97fd5451b1a4cb75d9eaf402832de0bb8a",
+      "zig/pkg/inference/build/tests.zig": "7625806a92cd087c3dbd4968bf5d618093ea50364bfba6aa006271dfb7a41709",
+      "zig/pkg/inference/src/architectures/florence.zig": "9c1c49e74869a4533e7bb2b5e194c70cb87031dd5f311144da039219c9151b9c",
+      "zig/pkg/inference/src/architectures/gpt.zig": "d07a09d5f0cf6031c1d527c9bdc855f529a7459ad0968f12e1441030e5e7d501",
+      "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "f77150c3f12e7dfc75b4ac7440f82e2d7db5cd9853cca575d8b86e376fb726a9",
+      "zig/pkg/inference/src/architectures/session_factory.zig": "a343a52332aa523c52aeee6d41b83236e8bf310fa60d512a87be77f7fcbb56eb",
+      "zig/pkg/inference/src/models/gpt.zig": "648f016723da1b985f83ae134e555afd00009ad7c92fda1d7ccb118d5d3cecd4",
+      "zig/pkg/inference/src/ops/cuda/cublaslt.zig": "a4541bd6cc06d2e93a268506ad5b1dcf702ce0afdb6bba207eec396b051fd3de",
+      "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "543173b2806621140be22ea51e30cf4904be2c9e7d9d44d2f5a59c09a78ddca8",
+      "zig/pkg/inference/src/ops/cuda/cudnn_conv.zig": "98902ea34fd935aaffde6f52be43937f8997c03b9d14f3015705949b5294c765",
+      "zig/pkg/inference/src/ops/cuda/cudnn_sdpa.zig": "d732dd69e38f67325707e8f53862de0f50c5786a3053c89bc0d959cf7135e29f",
+      "zig/pkg/inference/src/ops/cuda/florence_fused.ptx": "d4f91e70390ffb1e571526c14370582584cc5c657d316245106ab576d0a0a5f8",
+      "zig/pkg/inference/src/ops/cuda/florence_fused.zig": "eb524921071cf947b33dc04da22afc5898b3982ea94219a8e4922004b07cbd03",
+      "zig/pkg/inference/src/ops/cuda/kernels.zig": "61dd2fdd23c8126ce3bc45efa2f5e5e424bdb47c41e85f71f56d164c0b3339e3",
+      "zig/pkg/inference/src/ops/cuda/lighton_attention.ptx": "f8bf0ecb66a9cd07545c143c06aecb2cab852ee0b7d24073cdf4237e99cbb482",
+      "zig/pkg/inference/src/ops/cuda/lighton_attention.zig": "11c07d461e7739ea181d5d6f77d303563e70786e742b6ee33c3f1660ac905fd5",
+      "zig/pkg/inference/src/ops/cuda/lighton_recurrent.ptx": "f0e2f9a87724fa2a78a45a246e4c6519c48ee213eb38474e21b94bb054c8f324",
+      "zig/pkg/inference/src/ops/cuda/lighton_recurrent.zig": "0a52e200087408a8e31ca57c6cdd6639feaef5dff32f7a29304a5d4f56411c6a",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision.ptx": "61717ac07d1da5ee8175b0721838b5e5eda8c8b8249d714b1abe58b1a263708c",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision.zig": "e80ddac3a42fcb195d988213285851e4caf7405b4e25cb7a49829b26d5f0affd",
+      "zig/pkg/inference/src/ops/cuda/prototypes/florence_fused.cu": "8c0a26fefa8180185cc48ca81ef3f1c09062187f7c2b4e0b46e528cc021fddc0",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_batched_attention.cu": "a253da43c5dce8d14ce0f02f843708cbd670dd74cfe781524384a7596a9dea44",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_qwen35_recurrent.cu": "55f269a128ad50eae0dfcaf8fe591bbded4aea5dbe05df67a8a6d034dff871aa",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision.cu": "41a1a9a0085731f97601182ea114050ac039d7f42699926f90e44e759003500a",
+      "zig/pkg/inference/src/pipelines/generation.zig": "4c90707a836149a1001ce028807fef40615ed5932d526935c09338e1315a98c4",
+      "zig/pkg/inference/src/pipelines/reading.zig": "20ef5a3c5b96b2da54426faa4de9cca75a20afbe7c29c0b297ad2aed92c01bfd",
+      "zig/pkg/inference/src/runtime/scheduler/native_generate.zig": "3500ea6444834b27c3f6c2da0142dec098eef9a045362d5e7f51f716d8a821b6",
+      "zig/pkg/inference/src/server/server.zig": "b6abcda3b20745dc7d956e36d3f3698b1d2cb5a6e624486f79bcbbb6864b23c3",
+      "zig/pkg/inference/src/ops/cuda/driver.zig": "3561b9b1dcb50c2e857cf628fba06769ed371d8ad4b1e3f34f9849f6b5fc73c5",
+      "zig/pkg/inference/src/ops/cuda/lighton_activation.zig": "ecb56a4fccefc42a0b1f369d64c32492a9b0c9771a423e701ee75b03f5afec25",
+      "zig/pkg/inference/src/ops/cuda/lighton_activation.ptx": "ab9e6c67790cafa0f4f51ac9c2ffd5ed4acb89e60c731e46926d8310905f81e7",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_activation.cu": "8b5ba1721669b5b1a59352c974953840240a1678d509e6fb4e6fa52a714673a6",
+      "zig/pkg/inference/src/server/reader_execution_pool.zig": "2265d23d206681b8f36c0ff0e63dbb9077d1311f99e1ac9580761c94cc01beab",
+      "zig/pkg/inference/src/server/reader_epoch.zig": "f1100bb6df08b5daf32c63542916940e91cdaf215a284a87771fac922ad267bd",
+      "zig/pkg/inference/src/server/reader_execution_config.zig": "ba292ef60f1f5e519195ae113816e89a01b5b3bd1bed5c1ef83d302b4790f0d0",
+      "zig/pkg/inference/src/server/reader_admission.zig": "1483ba2042ab77cc573db92c2ccbe64ede718ce7c97f2b5624ada96f1dc256fe",
+      "zig/pkg/inference/src/ops/cuda/lighton_prefill.zig": "ea5e5d978dcdce53d3a526c973c082843914b206e668feb3972847d49053a809",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_bf16_prefill.cu": "0fa3651f1374336081d4744590c56879a743691df4698905c4e68159512f9089",
+      "zig/pkg/inference/src/ops/cuda/lighton_decode_graph.zig": "22440b75a8cf9214978d3b1bc67f248927ce94c36f5135835e2bfe37b399582f",
+      "zig/pkg/inference/src/ops/cuda/execution_arena.zig": "a17673cdc478658c5e890ff47549ed86d63078b76b5be3c7e5ddaa610afea1e1",
+      "zig/pkg/inference/src/ops/cuda/audio_execution_plan.zig": "f1393c6f2418174f28f5a95de60fd6e12e4758a36eb976c69980c73eef2577cc",
+      "zig/pkg/inference/src/runtime/kv/storage_runtime.zig": "4889a0eaac378a0d0028cf7413a6b9d016650da13dbecc2973792352a51f9e18",
+      "zig/pkg/inference/src/ops/cuda/lighton_prefill_attention.zig": "b2da8e2ec686da0d8396649bfda75870ab7d1975d2272cd5d191129ea1317ca8",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_prefill_attention.cpp": "75c68f13762f9532524a66bbc294113cd5b4dec201e67a6688dbd9722b2d6a09",
+      "zig/pkg/inference/src/pipelines/packed_head_rows.zig": "68436c76d4f3e75843585e5829c41c1b83a6d67f72b369cbb7d3912cc15e667f",
+      "zig/pkg/inference/src/backends/metal_runtime.zig": "eff0608420bf035e3d0e9a233f2d8f202d548e010faeb384a4ee530ee0f6b10c",
+      "zig/pkg/inference/src/backends/metal_kernels.m": "c14ef7988614b38a4c047c1723d7b07f7cd4654230935a03f6301770d8aa5340",
+      "zig/pkg/inference/src/ops/metal_compute.zig": "ad7fb99ec9201915216aa33f29f15cf141d13fce436242ec75a5eccd3af36871",
+      "zig/pkg/inference/src/ops/cuda/runtime_policy.zig": "abacb9f82dc94b554aa6d339568dd98a176bc8c43a88b6b937cea1ab384a06b4",
+      "zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profiles.json": "a5f870e275383c5a7d8c5c41891b9b8d42e31d24ced50ce7c1d60f883f6069fa",
+      "zig/pkg/inference/src/architectures/qwen3vl_device_qualification.zig": "c61aaef3133d14e58ae7707a2ae044db7f40c126646254c3bc7643c02bcb25f0",
+      "zig/pkg/inference/src/ops/cuda/burst_readback.zig": "7839493da05812382d27fd89cccc193fea7fcbaad9ce11fbd35fb2e38241d11e",
+      "zig/pkg/inference/src/ops/cuda/pinned_input_arena.zig": "17c8cb1e5e8683fca96a0901811b2b9a580f09c43ac93c869e9f2896a9cd7aa7",
+      "zig/pkg/inference/src/ops/cuda/buffer.zig": "522126f2efd853d23793cf8da50aec5e3a5241fe7f6de60473f2393d4f8e3619"
+    },
+    "published_delta": "All 54 runtime/configuration inputs match frozen build421. Documentation and this evidence index are outside the runtime snapshot; raw reports and binary remain outside tracked source.",
+    "measurement": {
+      "warmup_requests": 256,
+      "requests_per_round": 256,
+      "measured_rounds": 2,
+      "native_physical_rows": 128,
+      "vllm_max_active_sequences": 128,
+      "max_tokens": 256,
+      "native_admission_units": 2048,
+      "memory_gib": 80,
+      "shared_memory_gib": 90,
+      "backend_memory_gib": 60,
+      "kv_memory_gib": 8,
+      "scratch_memory_gib": 40,
+      "token_chain_width": 4,
+      "prefill_items": 16,
+      "vision_items": {
+        "08": 16,
+        "4b": 8
+      },
+      "prefix_chunk_rows": {
+        "08": 0,
+        "4b": 256
+      },
+      "pinned_image_inputs": true,
+      "async_token_readback": true,
+      "precision": "Optional native171 BF16 FFN/recurrent prefill, F16-query/F32-output prefill attention; F32 decode projection outputs and recurrent state. Not full BF16 activation parity.",
+      "fixtures": "../corpus/cases.json and src/models/testdata/lightonocr3/invoice.png",
+      "rows": [
+        {
+          "model": "08",
+          "reference_report_sha256": "c808a5a2faa5410ac39015986dd16ed73883d8fe8003d966e314d7e98dd5e617",
+          "native_report_sha256": "1718818d9992313a63a9f0b555ad079b451de33e0409210f4b08ffa06648ab41",
+          "rates": [
+            12.4693,
+            13.2207,
+            13.0936
+          ],
+          "status": "ok"
+        },
+        {
+          "model": "4b",
+          "reference_report_sha256": "0168dc76a53c50366564340fc71ef5b77f6991c794a0f859302a8546ea41c311",
+          "native_report_sha256": "3c5de4fb20477ebfe295b771503c854ea0ef0a2f175e1b23639323c7d5e28ce2",
+          "rates": [
+            4.0071,
+            4.0898,
+            4.0676
+          ],
+          "status": "ok"
+        }
+      ],
+      "gpu_isolation_foreign_processes": []
+    },
+    "qualification": {
+      "cuda_broad": {
+        "selected": 267,
+        "passed": 253,
+        "skipped": 14
+      },
+      "cuda_wide": {
+        "selected": 100,
+        "passed": 99,
+        "skipped": 1
+      },
+      "real_checkpoint_vision_batches": [
+        1,
+        2,
+        3,
+        8,
+        16
+      ],
+      "feature_and_prompt_parity": "bitwise, both checkpoints",
+      "metal": "compilation plus focused CPU checks only",
+      "host_retirement": "Failure-injection checks preserve pinned host ownership/admission and stale-read generations across policy replacement."
+    }
+  }
 }

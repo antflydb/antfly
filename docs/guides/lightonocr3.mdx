@@ -168,8 +168,8 @@ they are not Antfly runtime measurements.
 CUDA supports both original BF16 checkpoints with opt-in recurrent, attention
 and vision kernels. The experimental DGX Spark presets in
 `scripts/lightonocr3/cuda_ocr_profiles.json` require a CUDA build and cuDNN on the
-dynamic library search path. They preserve operator limits and keep F32
-activations, outputs and recurrent state by default. Native attention KV is F16.
+dynamic library search path. They preserve operator limits and retain F32
+decode projection outputs and recurrent state. Native attention KV is F16.
 
 ```bash
 python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton08 --print-env
@@ -188,12 +188,17 @@ whether a claim replays a graph. It retains the precision of the selected profil
 and independently admits graph metadata and scratch under operator limits.
 Benchmark with `--require-lighton-model-graph` to require actual replay.
 
-CUDA also supports opt-in token chaining for pure decode cohorts through 128
-pages. Set `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST=1` and
-`ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH=4` before launching the profile. Widths
-2–8 queue dependent tokens between host reads, bounded by each page's original
-generation budget. F32 decode and recurrent state remain unchanged. The native
-benchmark's `--require-cuda-token-burst` requires actual requested-width execution.
+The DGX Spark presets enable four-token chains for pure decode cohorts through
+128 pages. `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST=0` restores single-step decoding;
+widths 2–8 remain bounded by each page's original generation budget. Prepared
+vision features stay on GPU through prompt assembly.
+`ANTFLY_LIGHTONOCR3_DISABLE_DEVICE_VISION=1` restores the host feature handoff
+without changing shared-pool admission.
+
+Pinned image uploads retain one independently admitted 32 MiB host arena.
+`ANTFLY_CUDA_ENABLE_OCR_PINNED_INPUTS=0` restores pageable uploads.
+`ANTFLY_INFERENCE_CUDA_DISABLE_PINNED_SCALAR_DOWNLOADS=1` restores synchronous
+token readback. Operator overrides take precedence over preset defaults.
 
 The optional `--bf16-prefill-ffn` switch uses BF16 FFN intermediates for larger
 prefills. On SM12.1, `--bf16-recurrent-prefill LIBRARY` also selects a native BF16
@@ -248,13 +253,15 @@ fixtures, not broad document accuracy or an SLO.
 | M4 Max, LightOn 0.8B | 4.725–4.736 | vLLM 4.097–4.102 |
 | M4 Max, LightOn 4B | 1.210–1.211 | vLLM 1.1517–1.1518 |
 | M4 Max, Florence | 5.306–5.309 | MLX proxy 5.131–5.138 |
-| DGX Spark, LightOn 0.8B, optional prefill | 10.4189–10.4775 | vLLM 14.3396–14.3595 |
-| DGX Spark, LightOn 4B, optional prefill/attention | 3.6641–3.6663 | vLLM 4.6163–4.6200 |
+| DGX Spark, LightOn 0.8B, optional prefill | 13.094–13.221 | vLLM 14.426–14.485 |
+| DGX Spark, LightOn 4B, optional prefill/attention | 4.068–4.090 | vLLM 4.630–4.634 |
 | DGX Spark, Florence FP16 | 25.347–25.758 | vLLM 25.340–25.348 |
 
 The Metal comparisons are paired. Latest LightOn CUDA runs use 256 warmup
-requests and two 256-request measurements, with four-token chains for 0.8B and
-two-token graphs for 4B. LightOn CUDA parity remains outstanding. Metal Florence uses Q4_K weights and
+requests and two 256-request measurements, with four-token chains, GPU-resident
+vision features and asynchronous token readback for both models. The CUDA
+reference is a separate isolated run. LightOn CUDA parity remains outstanding.
+Metal Florence uses Q4_K weights and
 an F16 encoder versus an FP16 MLX proxy. Encoded-image, decoded-image and HTTP
 frontends have different overheads. These are not fully precision-matched runs.
 

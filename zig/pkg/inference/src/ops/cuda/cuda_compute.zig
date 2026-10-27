@@ -2352,6 +2352,22 @@ pub const CudaCompute = struct {
             // immutable model embedding outlive every consumer on this stream.
             return (try embeddingLookupTensor(burst.owner, burst.embedding_weight, @ptrCast(&ids), burst.rows, burst.hidden)) orelse error.UnsupportedOperation;
         }
+        pub fn beginRead(burst: *@This(), count: usize) !?@import("burst_readback.zig").Pending {
+            if (count != try checkedMul(burst.steps, burst.rows)) return error.InvalidShape;
+            const self = burst.owner;
+            if (self.capability_profile != .lightonocr3 or cudaPinnedScalarDownloadsDisabled() or
+                self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+            const pending = try self.lighton_burst_readback.begin(&self.ctx, tensorFromCt(burst.bank).buffer, try checkedMul(count, @sizeOf(u32)));
+            if (pending != null) {
+                self.lighton_async_burst_downloads += 1;
+                self.stats.d2h_bytes += count * @sizeOf(u32);
+            }
+            return pending;
+        }
+        pub fn noteReadCompleted(burst: *@This(), before_launches: usize) void {
+            burst.drained = true;
+            if (burst.owner.ctx.stats.kernel_launches > before_launches) burst.owner.lighton_async_burst_interleavings += 1;
+        }
         pub fn read(burst: *@This(), output: []u32) !void {
             if (output.len != try checkedMul(burst.steps, burst.rows)) return error.InvalidShape;
             try copyToHostTrackedAndSync(burst.owner, tensorFromCt(burst.bank).buffer, std.mem.sliceAsBytes(output));
@@ -3765,9 +3781,7 @@ pub const CudaCompute = struct {
     lighton_activation: @import("lighton_activation.zig").Module = .{},
     lighton_fused_ffn_calls: usize = 0,
     ocr_pinned_inputs_enabled: bool = false,
-    ocr_pinned_input_host: buffer_mod.HostBuffer = .{},
-    ocr_pinned_input_offset: usize = 0,
-    ocr_pinned_input_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
+    ocr_pinned_input: @import("pinned_input_arena.zig").Arena = .{},
     ocr_pinned_input_uploads: usize = 0,
     ocr_pinned_input_wraps: usize = 0,
     ocr_pinned_metadata_enabled: bool = false,
@@ -3887,6 +3901,9 @@ pub const CudaCompute = struct {
     pinned_scalar_upload_ring: PinnedScalarUploadRing = .{},
     pinned_upload_arena: PinnedUploadArena = .{},
     pinned_scalar_download_buffer: PinnedScalarDownloadBuffer = .{},
+    lighton_burst_readback: @import("burst_readback.zig").Slot = .{},
+    lighton_async_burst_downloads: usize = 0,
+    lighton_async_burst_interleavings: usize = 0,
     pinned_bulk_download_buffer: buffer_mod.HostBuffer = .{},
     training_upload_generation: u64 = 0,
     async_i32_scalar_download: AsyncI32ScalarDownload = .{},
@@ -4242,6 +4259,11 @@ pub const CudaCompute = struct {
 
     pub fn configureEmbeddingGemma2Admission(self: *CudaCompute, admission: ?@import("video_cache_budget.zig").Admission) !void {
         if (!std.meta.eql(self.ctx.video_cache_budget.admission, admission)) {
+            // A pending reader owns this slot until its execution lane is
+            // reacquired. Policy replacement cannot destroy its live event.
+            if (self.lighton_burst_readback.busy) return error.ResourceTemporarilyUnavailable;
+            try self.lighton_burst_readback.clear(&self.ctx);
+            try self.ocr_pinned_input.clear(&self.ctx);
             self.lighton_decode_graph.invalidate(&self.ctx);
             self.lighton_decode_graph.epoch_id = 0;
             if (self.lighton_recurrent.bf16_prefill) |*prefill| try prefill.clearWorkspace(&self.ctx);
@@ -4992,6 +5014,7 @@ pub const CudaCompute = struct {
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
             std.debug.print("LIGHTONOCR3 cuda_bucketed_linear_calls={d}\n", .{self.stats.bf16_bucketed_linear_calls});
             if (self.cublaslt) |*blas| std.debug.print("LIGHTONOCR3 cuda_canonical_gdn_calls={d} plans={d}\n", .{ blas.canonical_gdn_calls, blas.canonical_gdn_plans });
+            std.debug.print("LIGHTONOCR3 cuda_async_burst_downloads={d} cuda_async_burst_interleavings={d}\n", .{ self.lighton_async_burst_downloads, self.lighton_async_burst_interleavings });
             std.debug.print("LIGHTONOCR3 cuda_bf16_decode_output_calls={d}\n", .{self.stats.bf16_decode_output_calls});
             std.debug.print("LIGHTONOCR3 cuda_bf16_prefill_ffn_calls={d}\n", .{self.lighton_bf16_prefill_ffn_calls});
             std.debug.print("LIGHTONOCR3 cuda_fused_ffn_calls={d} paired_weights={d}\n", .{ self.lighton_fused_ffn_calls, self.lighton_gate_up_cache.count() });
@@ -5058,7 +5081,8 @@ pub const CudaCompute = struct {
         self.debug_cuda_decode_scalars.free(&self.ctx);
         self.pinned_scalar_upload_ring.host.free(&self.ctx);
         self.pinned_upload_arena.host.free(&self.ctx);
-        self.ocr_pinned_input_host.free(&self.ctx);
+        self.ocr_pinned_input.deinit(&self.ctx);
+        self.lighton_burst_readback.deinit(&self.ctx);
         self.pinned_scalar_download_buffer.host.free(&self.ctx);
         self.pinned_bulk_download_buffer.free(&self.ctx);
         if (self.async_i32_scalar_download.in_use and self.async_i32_scalar_download.event != null) {
@@ -5141,8 +5165,6 @@ pub const CudaCompute = struct {
         self.ctx.releaseResources();
         if (self.ocr_retained_cache_lease) |*lease| lease.release();
         self.ocr_retained_cache_lease = null;
-        if (self.ocr_pinned_input_lease) |*lease| lease.release();
-        self.ocr_pinned_input_lease = null;
         if (self.lighton_mrope_cache_lease) |*lease| lease.release();
         self.lighton_mrope_cache_lease = null;
         for (self.lighton_projection_leases.items) |*lease| lease.release();
@@ -10016,39 +10038,18 @@ fn copyFromPinnedUploadArena(self: *CudaCompute, device: buffer_mod.DeviceBuffer
     return true;
 }
 
-const ocr_pinned_input_capacity: usize = 32 * 1024 * 1024;
+const ocr_pinned_input_capacity = @import("pinned_input_arena.zig").capacity;
 
 fn copyFromPinnedOcrInputArena(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []const u8) !bool {
     if (!self.ocr_pinned_inputs_enabled or
         (self.capability_profile != .lightonocr3 and self.capability_profile != .florence2) or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
         bytes.len <= pinned_upload_arena_capacity or bytes.len > ocr_pinned_input_capacity) return false;
-    if (self.ocr_pinned_input_host.ptr == null) {
-        var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
-        if (self.ctx.video_cache_budget.admission) |policy|
-            lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .host_scratch_bytes = ocr_pinned_input_capacity }, policy.check_live_memory) catch return false;
-        const host = buffer_mod.HostBuffer.alloc(&self.ctx, ocr_pinned_input_capacity) catch {
-            if (lease) |*active| active.release();
-            return false;
-        };
-        self.ocr_pinned_input_host = host;
-        self.ocr_pinned_input_lease = lease;
-    }
-    var start = std.mem.alignForward(usize, self.ocr_pinned_input_offset, pinned_upload_arena_alignment);
-    if (start > ocr_pinned_input_capacity - bytes.len) {
-        // All enqueued transfers must finish before any pinned source bytes
-        // can be reused; the caller's original image/features may retire now.
-        try synchronizeAndDrainDeferredDeviceFrees(self);
-        self.stats.upload_syncs += 1;
-        self.ocr_pinned_input_wraps += 1;
-        start = 0;
-    }
-    const slot = self.ocr_pinned_input_host.bytes()[start..][0..bytes.len];
-    @memcpy(slot, bytes);
-    try device.copyFromHost(&self.ctx, slot);
+    const wraps = self.ocr_pinned_input.wraps;
+    if (!try self.ocr_pinned_input.upload(&self.ctx, device, bytes)) return false;
     self.stats.h2d_bytes += bytes.len;
     self.ocr_pinned_input_uploads += 1;
-    self.ocr_pinned_input_offset = start + bytes.len;
+    self.ocr_pinned_input_wraps += self.ocr_pinned_input.wraps - wraps;
     return true;
 }
 
@@ -35369,4 +35370,81 @@ test "LightOnOCR3 CUDA canonical GDN GEMM preserves exact rows and output bounds
     try std.testing.expectEqualSlices(u16, inputs, saved_input);
     try std.testing.expectEqualSlices(u16, weights, saved_weight);
     try std.testing.expect(blas.canonical_gdn_plans > 0);
+}
+
+test "LightOnOCR3 CUDA burst readback retains admission source and unique pending ownership across reuse and cancellation" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const readback = @import("burst_readback.zig");
+    const memory = @import("../../runtime/tier/memory.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    var controller = memory.AdmissionController{};
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
+        .host_limit_bytes = readback.capacity - 1,
+        .scratch_limit_bytes = readback.capacity,
+    }, .check_live_memory = false };
+    defer compute.ctx.video_cache_budget.admission = null;
+    const slot = &compute.lighton_burst_readback;
+    defer slot.deinit(&compute.ctx);
+    var source = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, readback.capacity + 256);
+    defer source.free(&compute.ctx);
+    try std.testing.expect((try slot.begin(&compute.ctx, source, readback.capacity)) == null);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(slot.host.ptr == null and slot.event == null and !slot.busy);
+    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = readback.capacity;
+    var values: [readback.capacity / 4 + 64]u32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @intCast(i * 31 + 7);
+    try source.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+    try std.testing.expect((try slot.begin(&compute.ctx, source, readback.capacity + 1)) == null);
+    try std.testing.expect((try slot.begin(&compute.ctx, source, 0)) == null);
+    try std.testing.expectError(error.InvalidShape, slot.begin(&compute.ctx, .{}, 4));
+    var pending = (try slot.begin(&compute.ctx, source, readback.capacity)) orelse return error.UnsupportedOperation;
+    try std.testing.expectEqual(@as(usize, readback.capacity), controller.snapshot().host_scratch_bytes);
+    try std.testing.expect((try slot.begin(&compute.ctx, source, 4)) == null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.configureEmbeddingGemma2Admission(null));
+    try std.testing.expectEqual(@as(usize, readback.capacity), controller.snapshot().host_scratch_bytes);
+    var got: [readback.capacity / 4 + 64]u32 = @splat(0xdeadbeef);
+    try std.testing.expectError(error.InvalidCudaState, pending.copy(std.mem.sliceAsBytes(got[32..][0 .. readback.capacity / 4])));
+    // A following independent phase may reuse source storage, but the prior
+    // readback's queued copy and completion event precede that later producer.
+    try compute.kernels.launchFillF32(&compute.ctx, source, source.len / 4, -91);
+    try pending.wait();
+    try pending.copy(std.mem.sliceAsBytes(got[32..][0 .. readback.capacity / 4]));
+    try std.testing.expectEqualSlices(u32, values[0 .. readback.capacity / 4], got[32..][0 .. readback.capacity / 4]);
+    for (got[0..32]) |guard| try std.testing.expectEqual(@as(u32, 0xdeadbeef), guard);
+    for (got[32 + readback.capacity / 4 ..]) |guard| try std.testing.expectEqual(@as(u32, 0xdeadbeef), guard);
+    var stale = pending;
+    pending.deinit();
+    const retained = slot.host.ptr;
+    var second = (try slot.begin(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
+    try std.testing.expectEqual(retained, slot.host.ptr);
+    try std.testing.expectEqual(@as(usize, readback.capacity), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectError(error.InvalidCudaState, stale.copy(std.mem.sliceAsBytes(got[0 .. readback.capacity / 4])));
+    stale.deinit();
+    try std.testing.expect(slot.busy);
+    // Cancellation before wait drains before releasing the unique slot.
+    second.deinit();
+    try std.testing.expect(!slot.busy);
+    var third = (try slot.begin(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
+    try third.wait();
+    try third.copy(std.mem.sliceAsBytes(got[0..1]));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -91))), got[0]);
+    third.deinit();
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+    try std.testing.expect((try slot.begin(&compute.ctx, source, 4)) == null);
+    const graph = try compute.ctx.endStreamCapture();
+    compute.ctx.destroyGraph(graph);
+    try compute.configureEmbeddingGemma2Admission(null);
+    try std.testing.expect(slot.host.ptr == null and slot.event == null and !slot.busy);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    // Policy retirement must not reset generations and revive a copied old
+    // Pending value when a new host allocation starts its first read.
+    var fourth = (try slot.begin(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
+    stale.deinit();
+    try std.testing.expect(slot.busy);
+    try std.testing.expectError(error.InvalidCudaState, stale.copy(std.mem.sliceAsBytes(got[0 .. readback.capacity / 4])));
+    try fourth.wait();
+    try fourth.copy(std.mem.sliceAsBytes(got[0..1]));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -91))), got[0]);
+    fourth.deinit();
 }
