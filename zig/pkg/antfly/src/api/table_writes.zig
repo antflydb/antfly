@@ -15048,7 +15048,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         var primary_only = false;
         var leased = blk: {
-            lockAtomic(&self.local_db_mutex);
+            if (lifetime) |original| try self.local_db_mutex.lockWithLifetime(self.tableActivityIo(), original) else lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return .{};
             const choice = cache.leaseScheduledLsmMaintenanceLocked(false, .all) orelse return .{};

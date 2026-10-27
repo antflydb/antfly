@@ -29739,3 +29739,27 @@ Shared CPU activation, retained physical jobs, bounded lock waits, independently
 funded opening/retirement, other maintenance lanes, and mixed-protocol overload/
 session verification remain required. The same maintenance integration milestone
 and full goal remain open.
+
+
+## Original lifetime during maintenance contention (2026-10-27)
+
+The compiled-owner LSM path now polls its original restriction during registry,
+replication, snapshot, apply, catalog, text-storage and backend lock waits.
+Strict inspection scoring carries the restriction too; fresh scoped scores update
+cached debt under the same backend guard, avoiding an uncontrolled refresh later.
+Best-effort text maintenance refuses a busy text-storage guard immediately.
+None of these waits lends CPU across retained service guards or creates a new Io.
+
+The focused worker root exercises the actual write facade/owner registry while a
+peer keeps the registry mutex held. The physical backend cases keep Backend.mu
+held while score and work attempts reject cancellation, deadline rejection and
+scheduler shutdown. Both retain the holder, release claims/waiters, preserve the
+original error and allow a distinct fresh attempt; the rejected scope stays
+rejected. Native entrypoint analysis covers production DB/index wiring; these
+fixtures are not a whole compiled-owner lock-contention/durability qualification.
+
+This wires these service-lock waits into the normal compiled-owner path.
+Legacy engine-vtable callers still have coarser lifetime coverage. Legacy physical
+work/scoring, startup funding/migration and the quiesced retained flush controller
+still require concurrent, bounded production integration before CPU admission can
+be enabled. The maintenance integration milestone and full goal remain open.

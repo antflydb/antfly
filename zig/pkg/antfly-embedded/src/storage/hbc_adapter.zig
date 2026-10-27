@@ -6018,6 +6018,14 @@ pub const HBCIndex = struct {
         };
     }
 
+    pub fn lsmMaintenanceScoreWithLifetime(self: *const HBCIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !u64 {
+        if (lifetime) |original| try original.checkpoint();
+        return switch (self.env_owner) {
+            .lsm => |handle| try handle.backend.maintenanceScoreWithLifetime(lifetime),
+            .native => 0,
+        };
+    }
+
     pub fn lsmMaintenanceScore(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.maintenanceScore(),

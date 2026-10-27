@@ -6658,7 +6658,7 @@ pub fn storageOwnerMaintenance(
 
     out_result.maintenance_score = switch (action) {
         .inspect, .lsm_step, .prepare_ha_seed_snapshot, .capture_ha_seed_snapshot => @max(
-            handle.db.lsmMaintenanceScore(),
+            handle.db.lsmMaintenanceScoreWithLifetime(lifetime) catch |err| return storageOwnerStatusFromError(err),
             handle.db.lsmMaintenanceDebtHint(),
         ),
         .inspect_best_effort, .lsm_step_best_effort, .dense_posting_idle, .publish_dense_checkpoints, .vector_block_idle => handle.db.lsmMaintenanceDebtHint(),

@@ -245,6 +245,14 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
+    pub fn lsmMaintenanceScoreWithLifetime(self: *const PrimaryStoreOwner, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !u64 {
+        if (lifetime) |original| try original.checkpoint();
+        return switch (self.*) {
+            .none, .mem => 0,
+            .lsm => |owner| try owner.handle.backend.maintenanceScoreWithLifetime(lifetime),
+        };
+    }
+
     pub fn lsmMaintenanceScore(self: *const PrimaryStoreOwner) u64 {
         return switch (self.*) {
             .none, .mem => 0,

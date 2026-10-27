@@ -1931,6 +1931,14 @@ pub const PersistentIndex = struct {
         try self.main_store_owner.sync(force);
     }
 
+    pub fn lsmMaintenanceScoreWithLifetime(self: *const PersistentIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !u64 {
+        if (lifetime) |original| try original.checkpoint();
+        return switch (self.main_store_owner) {
+            .mem => 0,
+            .lsm => |handle| try handle.backend.maintenanceScoreWithLifetime(lifetime),
+        };
+    }
+
     pub fn lsmMaintenanceScore(self: *const PersistentIndex) u64 {
         return self.main_store_owner.lsmMaintenanceScore();
     }
@@ -2096,7 +2104,9 @@ pub const PersistentIndex = struct {
 
     pub fn runLsmMaintenanceStepWithLifetime(self: *PersistentIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         if (lifetime) |original| try original.checkpoint();
-        self.lockStorage();
+        if (lifetime) |original| {
+            try @import("../common/seed_snapshot_lifetime.zig").lockIo(persistentStorageIo(self.io), &self.storage_mu, original);
+        } else self.lockStorage();
         defer self.unlockStorage();
         return try self.main_store_owner.runLsmMaintenanceStepWithLifetime(lifetime);
     }
@@ -2107,7 +2117,9 @@ pub const PersistentIndex = struct {
 
     pub fn runLsmMaintenanceStepBestEffortWithLifetime(self: *PersistentIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         if (lifetime) |original| try original.checkpoint();
-        self.lockStorage();
+        if (lifetime != null) {
+            if (!self.storage_mu.tryLock()) return false;
+        } else self.lockStorage();
         defer self.unlockStorage();
         return try self.main_store_owner.runLsmMaintenanceStepBestEffortWithLifetime(lifetime);
     }

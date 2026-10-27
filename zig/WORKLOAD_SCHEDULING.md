@@ -1794,3 +1794,14 @@ is withheld until the retained physical driver supplies safe bounded suspension;
 wrapping an unbounded guarded legacy step would delay foreground work. That
 integration milestone, other maintenance lanes and whole-path overload/session
 verification remain open. The full design is not complete.
+
+
+### Maintenance lifetime through contended guards (2026-10-27)
+
+Compiled-owner maintenance now preserves its original restriction during registry,
+replication, snapshot, apply, catalog, text-storage and backend lock acquisition,
+including strict inspection scoring. Tests retain the competing registry/backend
+holder and require the waiter to reject without that holder releasing. Fresh
+attempts can proceed after release; rejected scopes are not revived. Shared CPU
+activation remains withheld until normal retained flush/compaction can run in
+bounded slices with safe suspension and independently owned cleanup.

@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Original HA lifetime under retained cache/native-owner leases. This layer
 //! never parks CPU or replaces the caller's deadline/cleanup authority.
 const std = @import("std");
@@ -10,6 +23,9 @@ pub const Control = runtime.runnable_abi.Reentry;
 
 pub fn checkpoint(control: ?*const Control) !void {
     if (control) |original| try original.checkpoint();
+}
+pub fn authority(control: *const Control) @import("../search/work_authority.zig").Authority {
+    return .{ .context = control, .check_fn = check };
 }
 pub fn cancellation(control: ?*const Control) cancellation_mod.CancellationToken {
     const original = control orelse return .none;

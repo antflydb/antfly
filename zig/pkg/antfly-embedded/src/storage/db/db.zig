@@ -6793,6 +6793,22 @@ pub const DB = struct {
         flushDeferredExternalBulkExecutorNotification(self.async_context, self.executor);
     }
 
+    pub fn lsmMaintenanceScoreWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !u64 {
+        const original = lifetime orelse return self.lsmMaintenanceScore();
+        if (comptime storage_engine.enabled) return error.ExecutionWaitUnsupported;
+        try self.core.apply_mutex.lockSharedControlledIo(
+            self.core.apply_mutex.io orelse self.backend_runtime.filesystemIo() orelse self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo,
+            .{ .lifetime = @import("../../common/seed_snapshot_lifetime.zig").authority(original) },
+        );
+        defer self.core.unlockApplyShared();
+        const score = @max(@intFromBool(self.source_pin_cleanup.epoch.load(.acquire) != 0), @max(
+            try self.core.primary_store_owner.lsmMaintenanceScoreWithLifetime(lifetime),
+            try self.core.index_manager.lsmMaintenanceScoreWithLifetime(lifetime),
+        ));
+        try original.checkpoint();
+        return score;
+    }
+
     pub fn lsmMaintenanceScore(self: *DB) u64 {
         if (comptime storage_engine.enabled) return storage_engine.call("lsmMaintenanceScore", .{self}) catch @panic("incompatible storage owner");
         lockApplyShared(self);
@@ -7124,6 +7140,22 @@ pub const DB = struct {
         return self.backend_runtime.snapshotNativeStorageStats();
     }
 
+    fn acquireLsmMaintenanceReplicationMutation(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !?MutationBarrier.SharedLease {
+        const original = lifetime orelse return self.acquireReplicationMutationShared();
+        return @import("mutation_admission.zig").acquireReplicationMutationShared(self, .{
+            .lifetime = @import("../../common/seed_snapshot_lifetime.zig").authority(original),
+        });
+    }
+
+    fn acquireLsmMaintenanceSnapshotMutation(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !snapshot_admission_mod.SnapshotAdmission.MutationLease {
+        const original = lifetime orelse return self.acquireSnapshotReplayMutation();
+        return self.core.snapshot_replay_admission.acquireMutationControlledIo(
+            self.backend_runtime.filesystemIo() orelse self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo,
+            .{ .lifetime = @import("../../common/seed_snapshot_lifetime.zig").authority(original) },
+            null,
+        );
+    }
+
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStep", .{self});
         return self.runLsmMaintenanceStepWithLifetime(null);
@@ -7137,10 +7169,10 @@ pub const DB = struct {
             return self.runLsmMaintenanceStep();
         }
         try @import("../../common/seed_snapshot_lifetime.zig").checkpoint(lifetime);
-        var replication_mutation = self.acquireReplicationMutationShared();
+        var replication_mutation = try self.acquireLsmMaintenanceReplicationMutation(lifetime);
         defer if (replication_mutation) |*lease| lease.release();
         try @import("../../common/seed_snapshot_lifetime.zig").checkpoint(lifetime);
-        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        var snapshot_replay = try self.acquireLsmMaintenanceSnapshotMutation(lifetime);
         defer snapshot_replay.release();
         return self.runLsmMaintenanceStepAdmittedWithLifetime(&snapshot_replay, lifetime);
     }
@@ -7163,11 +7195,13 @@ pub const DB = struct {
         }
 
         try original.checkpoint(lifetime);
-        const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
-        const index_score = self.core.index_manager.lsmMaintenanceScore();
+        const primary_score = try self.core.primary_store_owner.lsmMaintenanceScoreWithLifetime(lifetime);
+        const index_score = try self.core.index_manager.lsmMaintenanceScoreWithLifetime(lifetime);
         if (primary_score == 0 and index_score == 0) {
-            self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
-            self.core.index_manager.refreshLsmMaintenanceDebtHint();
+            if (lifetime == null) {
+                self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+                self.core.index_manager.refreshLsmMaintenanceDebtHint();
+            }
             return try self.runSourcePinCleanupStep();
         }
         try original.checkpoint(lifetime);
@@ -7191,10 +7225,10 @@ pub const DB = struct {
         }
         const original = @import("../../common/seed_snapshot_lifetime.zig");
         try original.checkpoint(lifetime);
-        var replication_mutation = self.acquireReplicationMutationShared();
+        var replication_mutation = try self.acquireLsmMaintenanceReplicationMutation(lifetime);
         defer if (replication_mutation) |*lease| lease.release();
         try original.checkpoint(lifetime);
-        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        var snapshot_replay = try self.acquireLsmMaintenanceSnapshotMutation(lifetime);
         defer snapshot_replay.release();
         try original.checkpoint(lifetime);
         if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
@@ -7214,7 +7248,9 @@ pub const DB = struct {
         try original.checkpoint(lifetime);
         if (try self.core.index_manager.runLsmMaintenanceStepBestEffortWithLifetime(lifetime)) return true;
         if (primary_score > 0) {
-            self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+            if (lifetime != null) {
+                _ = try self.core.primary_store_owner.lsmMaintenanceScoreWithLifetime(lifetime);
+            } else self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         }
         return try self.runSourcePinCleanupStep();
     }

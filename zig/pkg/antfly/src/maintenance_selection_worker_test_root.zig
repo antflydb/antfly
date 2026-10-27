@@ -132,3 +132,80 @@ test "data runtime background provider clients preserve shared bounded admission
         next.release();
     }
 }
+
+test "data runtime maintenance bounded selection keeps original authority while registry ownership waits" {
+    const std = @import("std");
+    const local = @import("antfly_local_sources");
+    const abi_runtime = @import("antfly_runtime_abi");
+    const Source = @import("api/kernel_owner_source.zig").ProvisionedKernelOwnerSource;
+    const Facade = table_writes.ProvisionedTableWriteSource;
+    const Check = struct {
+        reject: std.atomic.Value(bool) = .init(false),
+        cause: anyerror,
+        fn check(raw: *anyopaque) callconv(.c) abi_runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.reject.load(.acquire)) abi_runtime.error_abi.statusFromError(self.cause) else .ok;
+        }
+    };
+    const Worker = struct {
+        facade: *Facade,
+        original: *const abi_runtime.runnable_abi.Reentry,
+        io: std.Io,
+        done: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            defer self.done.set(self.io);
+            _ = self.facade.runLsmMaintenanceRoundDetailedWithLifetime(self.original) catch |cause| {
+                self.failure = cause;
+            };
+        }
+    };
+    var backend = try local.storage_background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend.deinit();
+    var workers = try backend.ptr().acquireWorkers(.{ .capacity = 2 });
+    defer workers.release();
+    const io = workers.io();
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        const catalog = @import("api/table_catalog.zig").emptyCatalogSource();
+        var source = Source.init(std.testing.allocator, "/unused", catalog, @import("raft/read_gate.zig").alreadyReadSafeBarrier());
+        defer source.entries.deinit(std.testing.allocator);
+        _ = source.withBackendRuntime(backend.ptr(), .{});
+        var facade = Facade.init("/unused", catalog);
+        defer facade.deinit();
+        facade.storage_maintenance_source = source.maintenanceSource();
+        try std.testing.expect(source.mutex.tryLock());
+        var held = true;
+        defer if (held) source.mutex.unlock();
+        var check: Check = .{ .cause = cause };
+        const original: abi_runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+        var worker: Worker = .{ .facade = &facade, .original = &original, .io = io };
+        var future = try io.concurrent(Worker.run, .{&worker});
+        var joined = false;
+        defer if (!joined) {
+            check.reject.store(true, .release);
+            if (held) source.mutex.unlock();
+            held = false;
+            future.await(io);
+        };
+        const until = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+        while (!source.lsm_selection_claim.load(.acquire)) {
+            if (@import("antfly_platform").time.monotonicNs() >= until) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        check.reject.store(true, .release);
+        try worker.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+        future.await(io);
+        joined = true;
+        try std.testing.expectEqual(cause, worker.failure.?);
+        try std.testing.expect(!source.mutex.tryLock());
+        try std.testing.expect(!source.lsm_selection_claim.load(.acquire));
+        try std.testing.expectError(cause, original.checkpoint());
+        source.mutex.unlock();
+        held = false;
+        var retry: Check = .{ .cause = cause };
+        const fresh: abi_runtime.runnable_abi.Reentry = .{ .context = &retry, .check = Check.check };
+        const result = try facade.runLsmMaintenanceRoundDetailedWithLifetime(&fresh);
+        try std.testing.expect(!result.progressed and !result.selection_pending);
+        try std.testing.expectError(cause, original.checkpoint());
+    }
+}

@@ -3125,6 +3125,28 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.entries.items.len;
     }
 
+    fn lockMaintenanceRegistry(self: *ProvisionedKernelOwnerSource, best_effort: bool, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
+        if (best_effort) {
+            if (!self.mutex.tryLock()) return false;
+        } else if (lifetime) |original| {
+            if (!self.mutex.tryLock()) {
+                // The existing context owns this Io through every owner join.
+                // Never create a pool or discard the original restriction.
+                try original.checkpoint();
+                const runtime = self.context_runtime orelse return error.BackendRuntimeIoUnavailable;
+                try @import("antfly_local_sources").common_seed_snapshot_lifetime.lockAtomic(
+                    runtime.io() orelse return error.BackendRuntimeIoUnavailable,
+                    &self.mutex,
+                    original,
+                );
+            }
+        } else lock(&self.mutex);
+        errdefer self.mutex.unlock();
+        if (lifetime) |original| try original.checkpoint();
+        return true;
+    }
+
     /// Maintenance must never pin unrelated owners across a slow storage step.
     /// The cursor may skip an entry removed during the round; the next round
     /// will see it if it is still resident. Newly appended entries wait too.
@@ -3135,11 +3157,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         best_effort: bool,
         skip_bulk_ingest: bool,
     ) ?Lease {
-        if (best_effort) {
-            if (!self.mutex.tryLock()) return null;
-        } else {
-            lock(&self.mutex);
-        }
+        return self.nextMaintenanceLeaseWithLifetime(cursor, limit, best_effort, skip_bulk_ingest, null) catch unreachable;
+    }
+
+    fn nextMaintenanceLeaseWithLifetime(self: *ProvisionedKernelOwnerSource, cursor: *usize, limit: usize, best_effort: bool, skip_bulk_ingest: bool, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !?Lease {
+        if (!try self.lockMaintenanceRegistry(best_effort, lifetime)) return null;
         defer self.mutex.unlock();
         while (cursor.* < limit and cursor.* < self.entries.items.len) {
             const entry = self.entries.items[cursor.*];
@@ -3155,9 +3177,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     const LsmSelection = @import("maintenance_selection.zig").Scan.Window;
 
     fn beginLsmSelection(self: *ProvisionedKernelOwnerSource, best_effort: bool) ?LsmSelection {
-        if (best_effort) {
-            if (!self.mutex.tryLock()) return null;
-        } else lock(&self.mutex);
+        return self.beginLsmSelectionWithLifetime(best_effort, null) catch unreachable;
+    }
+
+    fn beginLsmSelectionWithLifetime(self: *ProvisionedKernelOwnerSource, best_effort: bool, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !?LsmSelection {
+        if (!try self.lockMaintenanceRegistry(best_effort, lifetime)) return null;
         defer self.mutex.unlock();
         return self.lsm_scan.next(self.entries.items.len, self.lsm_selection);
     }
@@ -3165,9 +3189,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// An actual live lease pins the selected generation. No table-name copy
     /// or registry search is needed, and every eligibility check is fixed work.
     fn selectRetainedMaintenanceLease(self: *ProvisionedKernelOwnerSource, lease: *Lease, selection: LsmSelection, best_effort: bool) bool {
-        if (best_effort) {
-            if (!self.mutex.tryLock()) return false;
-        } else lock(&self.mutex);
+        return self.selectRetainedMaintenanceLeaseWithLifetime(lease, selection, best_effort, null) catch unreachable;
+    }
+
+    fn selectRetainedMaintenanceLeaseWithLifetime(self: *ProvisionedKernelOwnerSource, lease: *Lease, selection: LsmSelection, best_effort: bool, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (!try self.lockMaintenanceRegistry(best_effort, lifetime)) return false;
         defer self.mutex.unlock();
         std.debug.assert(lease.active and lease.source == self and lease.entry.active_users != 0);
         const entry = lease.entry;
@@ -3197,12 +3223,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (self.lsm_selection_claim.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return .{ .selection_pending = true };
         var selecting = true;
         defer if (selecting) self.lsm_selection_claim.store(false, .release);
-        const selection = self.beginLsmSelection(best_effort) orelse return .{ .selection_pending = true };
+        const selection = (try self.beginLsmSelectionWithLifetime(best_effort, lifetime)) orelse return .{ .selection_pending = true };
         var cursor = selection.start;
         var selected: ?Lease = null;
         defer if (selected) |*lease| lease.deinit();
         var selected_candidate: ?@import("maintenance_selection.zig").Policy.Candidate = null;
-        while (self.nextMaintenanceLease(&cursor, selection.limit, best_effort, true)) |borrowed| {
+        while (try self.nextMaintenanceLeaseWithLifetime(&cursor, selection.limit, best_effort, true, lifetime)) |borrowed| {
             var lease = borrowed;
             const status = lease.owner().maintenanceWithLifetime(
                 lease.entry.table_name,
@@ -3227,7 +3253,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
         if (lifetime) |original| try original.checkpoint();
         if (selected == null) return .{ .selection_pending = selection.more or cursor < selection.limit };
-        if (!self.selectRetainedMaintenanceLease(&selected.?, selection, best_effort)) return .{ .selection_pending = true };
+        if (!try self.selectRetainedMaintenanceLeaseWithLifetime(&selected.?, selection, best_effort, lifetime)) return .{ .selection_pending = true };
         var lease = selected.?;
         selected = null;
         defer lease.deinit();

@@ -9328,6 +9328,26 @@ pub const IndexManager = struct {
         return score;
     }
 
+    pub fn lsmMaintenanceScoreWithLifetime(self: *const IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !u64 {
+        const original = lifetime orelse return self.lsmMaintenanceScore();
+        const mutable: *IndexManager = @constCast(self);
+        try mutable.catalog_mutex.lockSharedControlledIo(self.checkpointIo(), .{
+            .lifetime = @import("../../../common/seed_snapshot_lifetime.zig").authority(original),
+        });
+        defer mutable.catalog_mutex.unlockShared();
+        var score: u64 = 0;
+        for (self.text_indexes.items) |*entry| {
+            try original.checkpoint();
+            score = @max(score, try entry.persistent.lsmMaintenanceScoreWithLifetime(lifetime));
+        }
+        for (self.dense_indexes.items) |*entry| {
+            try original.checkpoint();
+            score = @max(score, try entry.index.lsmMaintenanceScoreWithLifetime(lifetime));
+        }
+        try original.checkpoint();
+        return score;
+    }
+
     pub fn lsmMaintenanceScore(self: *const IndexManager) u64 {
         const mutable: *IndexManager = @constCast(self);
         mutable.catalog_mutex.lockShared();
@@ -10139,7 +10159,11 @@ pub const IndexManager = struct {
 
     pub fn runLsmObsoleteReclaimDueWithLifetime(self: *IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         if (lifetime) |original| try original.checkpoint();
-        self.catalog_mutex.lockShared();
+        if (lifetime) |original| {
+            try self.catalog_mutex.lockSharedControlledIo(self.checkpointIo(), .{
+                .lifetime = @import("../../../common/seed_snapshot_lifetime.zig").authority(original),
+            });
+        } else self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         return try self.runLsmObsoleteReclaimDueUnlocked(false, lifetime);
     }
@@ -10161,7 +10185,11 @@ pub const IndexManager = struct {
 
     pub fn runLsmMaintenanceStepWithLifetime(self: *IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         if (lifetime) |original| try original.checkpoint();
-        self.catalog_mutex.lockShared();
+        if (lifetime) |original| {
+            try self.catalog_mutex.lockSharedControlledIo(self.checkpointIo(), .{
+                .lifetime = @import("../../../common/seed_snapshot_lifetime.zig").authority(original),
+            });
+        } else self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
 
         var best_kind: enum { none, text, dense } = .none;
@@ -10170,7 +10198,7 @@ pub const IndexManager = struct {
 
         for (self.text_indexes.items, 0..) |*entry, i| {
             if (lifetime) |original| try original.checkpoint();
-            const score = entry.persistent.lsmMaintenanceScore();
+            const score = try entry.persistent.lsmMaintenanceScoreWithLifetime(lifetime);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .text;
@@ -10179,7 +10207,7 @@ pub const IndexManager = struct {
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
             if (lifetime) |original| try original.checkpoint();
-            const score = entry.index.lsmMaintenanceScore();
+            const score = try entry.index.lsmMaintenanceScoreWithLifetime(lifetime);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .dense;

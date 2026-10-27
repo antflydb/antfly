@@ -3782,6 +3782,32 @@ pub const Backend = struct {
         _ = self.refreshCachedMaintenanceHintLocked();
     }
 
+    fn lockMaintenanceWithLifetime(self: *Backend, original: *const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (self.mu.tryLock()) return true;
+        const started = platform_time.monotonicNs();
+        try @import("../common/seed_snapshot_lifetime.zig").lockAtomic(
+            self.manifestCoordinationIo() orelse return error.ExecutionWaitUnsupported,
+            &self.mu,
+            original,
+        );
+        self.recordBackendLockWait(platform_time.monotonicNs() -| started);
+        return true;
+    }
+
+    pub fn maintenanceScoreWithLifetime(self: *const Backend, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !u64 {
+        const original = lifetime orelse return self.maintenanceScore();
+        try original.checkpoint();
+        const mutable: *Backend = @constCast(self);
+        const locked = try mutable.lockMaintenanceWithLifetime(original);
+        defer runtime_mod.unlockBackend(Backend, mutable, locked);
+        try original.checkpoint();
+        // This fresh observation also completes the scoped debt-hint refresh.
+        // No second, uncontrolled acquisition is needed after a no-work round.
+        const score = mutable.refreshCachedMaintenanceHintLocked();
+        try original.checkpoint();
+        return score;
+    }
+
     pub fn maintenanceScore(self: *const Backend) u64 {
         const mutable: *Backend = @constCast(self);
         const locked = runtime_mod.lockBackend(Backend, mutable);
@@ -4154,7 +4180,10 @@ pub const Backend = struct {
     pub fn runMaintenanceStepWithLifetime(self: *Backend, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         if (lifetime) |original| try original.checkpoint();
         const progressed = blk: {
-            const locked = runtime_mod.lockBackend(Backend, self);
+            const locked = if (lifetime) |original|
+                try self.lockMaintenanceWithLifetime(original)
+            else
+                runtime_mod.lockBackend(Backend, self);
             defer runtime_mod.unlockBackend(Backend, self, locked);
             if (lifetime) |original| try original.checkpoint();
             break :blk try self.runMaintenanceStepLocked(false);
@@ -33501,6 +33530,88 @@ test "maintenance original lifetime joins durable flush before late cancellation
             var read = try reopened.beginRead();
             defer read.abort();
             try std.testing.expectEqualStrings("durable value", try read.get(.{}, "key"));
+        }
+    }
+}
+
+test "maintenance original lifetime rejects score and work waits while the backend holder stays live" {
+    const runtime = @import("antfly_runtime_abi");
+    const Check = struct {
+        checks: std.atomic.Value(usize) = .init(0),
+        reject: std.atomic.Value(bool) = .init(false),
+        cause: anyerror,
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.checks.fetchAdd(1, .release);
+            return if (self.reject.load(.acquire)) runtime.error_abi.statusFromError(self.cause) else .ok;
+        }
+    };
+    const Worker = struct {
+        backend: *Backend,
+        lifetime: *const runtime.runnable_abi.Reentry,
+        score: bool,
+        io: std.Io,
+        done: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            defer self.done.set(self.io);
+            if (self.score) {
+                _ = self.backend.maintenanceScoreWithLifetime(self.lifetime) catch |cause| {
+                    self.failure = cause;
+                    return;
+                };
+            } else {
+                _ = self.backend.runMaintenanceStepWithLifetime(self.lifetime) catch |cause| {
+                    self.failure = cause;
+                    return;
+                };
+            }
+        }
+    };
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        for ([_]bool{ false, true }) |score| {
+            var backend = Backend.init(std.testing.allocator, .{});
+            defer backend.close();
+            try std.testing.expect(backend.mu.tryLock());
+            var held = true;
+            defer if (held) backend.mu.unlock();
+            var check: Check = .{ .cause = cause };
+            const lifetime: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+            var worker: Worker = .{ .backend = &backend, .lifetime = &lifetime, .score = score, .io = io };
+            var future = try io.concurrent(Worker.run, .{&worker});
+            var joined = false;
+            defer if (!joined) {
+                check.reject.store(true, .release);
+                if (held) backend.mu.unlock();
+                held = false;
+                future.await(io);
+            };
+            const until = platform_time.monotonicNs() + std.time.ns_per_s;
+            while (check.checks.load(.acquire) < 3) {
+                if (platform_time.monotonicNs() >= until) return error.TestUnexpectedResult;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            check.reject.store(true, .release);
+            // The original lock holder deliberately stays live. An unscoped
+            // lock would wait forever despite cancellation or expired time.
+            try worker.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+            future.await(io);
+            joined = true;
+            try std.testing.expectEqual(cause, worker.failure.?);
+            try std.testing.expect(!backend.mu.tryLock());
+            try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+            try std.testing.expectError(cause, lifetime.checkpoint());
+            backend.mu.unlock();
+            held = false;
+            // A fresh attempt succeeds without reviving the rejected scope.
+            var retry: Check = .{ .cause = cause };
+            const fresh: runtime.runnable_abi.Reentry = .{ .context = &retry, .check = Check.check };
+            _ = try backend.maintenanceScoreWithLifetime(&fresh);
+            _ = try backend.runMaintenanceStepWithLifetime(&fresh);
+            try std.testing.expectError(cause, lifetime.checkpoint());
         }
     }
 }
