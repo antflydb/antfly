@@ -1084,7 +1084,12 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
                     server.restart()
                 for term, descending in (("quasar", False), ("pulsar", True)):
                     request = {
-                        "full_text_search": {"match": term, "field": "body"},
+                        "full_text_search": {
+                            "conjuncts": [
+                                {"match": term, "field": "body"},
+                                {"match": "control", "field": "body"},
+                            ]
+                        },
                         "fields": ["id", "bucket"],
                         "limit": 20,
                         "profile": True,
@@ -1206,7 +1211,9 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
             client.session.close()
 
 
-@pytest.mark.parametrize("case", ["native_selective", "wide_boundary"])
+@pytest.mark.parametrize(
+    "case", ["native_selective", "metadata_selective", "wide_boundary"]
+)
 def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
     tmp_path, monkeypatch, case
 ):
@@ -1272,6 +1279,8 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
     keys = (
         [{"column": "bucket", "nulls": "first"}, {"column": "wide"}, {"column": "id"}]
         if wide
+        else [{"column": "bucket", "nulls": "first"}, {"column": "id"}]
+        if case == "metadata_selective"
         else [{"column": "id", "nulls": "first"}]
     )
     definition = {
@@ -1342,12 +1351,21 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
                         ("pulsar", False, list(range(8128, 8148))),
                         ("quasar", True, list(range(63, 43, -1))),
                     ):
+                        if case == "metadata_selective" and descending:
+                            wanted = list(range(20))
                         request = {
                             "full_text_search": {"match": term, "field": "body"},
                             "fields": ["id"],
                             "limit": 20,
                             "profile": True,
-                            "order_by": [{"field": "id", "desc": descending}],
+                            "order_by": [
+                                {
+                                    "field": "bucket"
+                                    if case == "metadata_selective"
+                                    else "id",
+                                    "desc": descending,
+                                }
+                            ],
                         }
                         actual = client.query({"request": request})
                         assert [
@@ -1359,5 +1377,157 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
                         assert "then_text_windows" not in profile["candidate_source"], (
                             profile
                         )
+        finally:
+            client.session.close()
+
+
+def test_ordered_native_delivery_spans_packs_without_parquet_payloads(
+    tmp_path, monkeypatch
+):
+    """Stored winners cross real serving packs without reopening Parquet data."""
+    import base64
+    import importlib.util
+    import random
+    import conftest as harness
+
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
+    if not binary.is_file():
+        pytest.skip("Build the Antfly binary first")
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location(
+        "multi_pack_delivery", root / "tools" / "benchmark_lake_archive.py"
+    )
+    bench = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bench
+    spec.loader.exec_module(bench)
+    # Incompressible stored values exceed the 16 MiB serving-pack target while
+    # the final projection remains small. Each Parquet page stays bounded.
+    rng = random.Random(17)
+    count = 32
+    data = {
+        "id": list(range(count)),
+        "bucket": [0] * count,
+        "body": ["common needle"] * count,
+        "payload": [
+            base64.b64encode(rng.randbytes(768 * 1024)).decode() for _ in range(count)
+        ],
+    }
+    archive = tmp_path / "archive.parquet"
+    pq.write_table(
+        pa.table(data),
+        archive,
+        row_group_size=4,
+        use_dictionary=False,
+        data_page_size=2 * 1024 * 1024,
+        write_batch_size=1,
+    )
+    fixture_root = tmp_path / "fixture"
+    fixture = bench.import_fixture(fixture_root, [archive], "multi-pack-delivery")
+    properties = {
+        name: {
+            "type": "integer",
+            "x-antfly-field": {"type": "number", "sortable": True},
+        }
+        for name in ("id", "bucket")
+    }
+    properties.update(
+        body={"type": "string", "x-antfly-field": {"type": "text"}},
+        payload={"type": "string", "x-antfly-field": {"type": "text", "index": False}},
+    )
+    definition = {
+        "schema": {
+            "storage_mode": "relational",
+            "default_type": "row",
+            "base_source": {
+                "kind": "external",
+                "format": "parquet",
+                "table_id": "multi-pack-delivery",
+                "object_mutability": "immutable",
+                "uri": fixture["manifest_uri"],
+                "row_identity": {"key_columns": ["id"]},
+            },
+            "document_schemas": {
+                "row": {"schema": {"type": "object", "properties": properties}}
+            },
+            "index_sort": [{"field": name, "order": "asc"} for name in ("id", "_id")],
+            "relational_indexes": [
+                {
+                    "name": "bucket",
+                    "keys": [{"column": "bucket", "nulls": "first"}, {"column": "id"}],
+                }
+            ],
+        },
+        "indexes": {"text": {"type": "full_text", "store_source": True}},
+    }
+    config = _write_remote_content_e2e_config(tmp_path)
+    cfg = json.loads(config.read_text())
+    cfg.setdefault("lake_indexes", {}).setdefault("text_cache", {}).update(
+        admission_window_segments=1, admission_window_bytes=1
+    )
+    config.write_text(json.dumps(cfg))
+    monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY", "1")
+    with bench.managed_server(
+        harness.StandaloneAntflyServer,
+        binary,
+        config,
+        tmp_path,
+        api_root=harness.ANTFLY_PUBLIC_API_ROOT,
+    ) as server:
+        client = bench.Client(server, 180)
+        try:
+            client.call("POST", f"/tables/{bench.TABLE}", definition)
+            client.ready(bench.readiness_indexes({"definition": definition}))
+            parquet_object = (
+                fixture_root / "buckets" / "antfly" / "objects" / "import-0.parquet"
+            )
+            unavailable = parquet_object.with_suffix(".unavailable")
+            parquet_object.rename(unavailable)
+            try:
+                for restarted in (False, True):
+                    if restarted:
+                        server.restart()
+                    for highlights in (False, True):
+                        request = {
+                            "full_text_search": {
+                                "conjuncts": [
+                                    {"match": "common", "field": "body"},
+                                    {"match": "needle", "field": "body"},
+                                ]
+                            },
+                            "fields": ["id"] if highlights else ["id", "body"],
+                            "order_by": [{"field": "bucket"}],
+                            "limit": 24,
+                            "profile": True,
+                        }
+                        if highlights:
+                            request["highlight"] = {"fields": ["body"]}
+                        before = client.metrics()
+                        result = client.query({"request": request})
+                        after = client.metrics()
+                        hits = result["hits"]["hits"]
+                        assert [hit["_source"]["id"] for hit in hits] == list(range(24))
+                        assert (
+                            result["profile"]["sort"]["selection_reason"]
+                            == "bounded_ordered_lake_index"
+                        )
+                        assert (
+                            after["antfly_lake_query_hydration_native_calls_total"]
+                            - before["antfly_lake_query_hydration_native_calls_total"]
+                            >= 2
+                        )
+                        assert (
+                            after["antfly_lake_query_hydration_source_calls_total"]
+                            == before["antfly_lake_query_hydration_source_calls_total"]
+                        )
+                        for hit in hits:
+                            if highlights:
+                                assert set(hit["_source"]) == {"id"}
+                                assert hit["_highlights"]["body"]
+                            else:
+                                assert hit["_source"]["body"] == "common needle"
+            finally:
+                unavailable.rename(parquet_object)
         finally:
             client.session.close()
