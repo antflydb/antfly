@@ -918,6 +918,30 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
     return .{ .ref = ref, .bytes = bytes };
 }
 
+/// Pending packed children reserve their final locator before it is known.
+/// This keeps both sorted publication and incremental packing below the same
+/// expanded-page cap after the durable upload wave binds those locators.
+fn packingBytes(store: Store, entry: Entry) usize {
+    return entry.size() + @as(usize, if (store.pack_many != null and entry.child != null and entry.child.?.pack == null) 40 else 0);
+}
+fn commonPrefix(first: []const u8, last: []const u8) usize {
+    var n: usize = 0;
+    while (n < @min(first.len, last.len) and first[n] == last[n]) n += 1;
+    return n;
+}
+/// The soft target bounds unshared payload. A common prefix is one indivisible
+/// overhead, not a repeated charge for every key. The expanded hard cap still
+/// bounds legacy readers, builder arenas and all future mutations.
+fn fitsPage(store: Store, first: []const u8, last: []const u8, count: usize, expanded: usize, target: usize) bool {
+    const reserve: usize = if (store.reduce != null) max_aggregate_bytes else 0;
+    if (expanded > max_page_bytes - reserve) return false;
+    if (!store.prefix_keys or count < 2) return expanded <= target;
+    const prefix = commonPrefix(first, last);
+    const saved = prefix * (count - 1);
+    if (saved <= 8) return expanded <= target;
+    return expanded - saved + 8 <= target + prefix;
+}
+
 /// Pack toward half-full pages, allowing one indivisible record above the
 /// target. Split boundaries depend only on ordered records, not process state.
 fn pack(alloc: Allocator, store: Store, entries: []const Entry, height: u8, out: *Children) !void {
@@ -931,7 +955,7 @@ fn packingTarget(bytes: usize) usize {
 /// immediately makes occupancy repair rewrite another bulk sibling.
 fn packAt(alloc: Allocator, store: Store, entries: []const Entry, height: u8, out: *Children, target: usize) !void {
     var payload: usize = 0;
-    for (entries) |entry| payload += entry.size();
+    for (entries) |entry| payload += packingBytes(store, entry);
     const pages = @max(1, std.math.divCeil(usize, payload, target - header_bytes) catch unreachable);
     const balanced = header_bytes + (std.math.divCeil(usize, payload, pages) catch unreachable);
     var begin: usize = 0;
@@ -939,8 +963,9 @@ fn packAt(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ou
         var end = begin;
         var bytes: usize = header_bytes;
         while (end < entries.len) : (end += 1) {
-            const size = entries[end].size();
-            if (end - begin >= (if (height == 0) @as(usize, 1) else 2) and bytes + size > balanced) break;
+            const size = packingBytes(store, entries[end]);
+            if (end - begin >= (if (height == 0) @as(usize, 1) else 2) and
+                !fitsPage(store, entries[begin].key, entries[end].key, end - begin + 1, bytes + size, balanced)) break;
             bytes += size;
         }
         var aggregate: []u8 = undefined;
@@ -986,7 +1011,11 @@ fn rebalance(alloc: Allocator, store: Store, children: *Children) !void {
         // Their combined payload fits: merge without unnecessarily splitting
         // it back at the soft target. Otherwise redistribute via pack.
         const target = @max(packingTarget(left.bytes.len), packingTarget(right.bytes.len));
-        if (left.bytes.len + right.bytes.len - header_bytes <= target) {
+        var expanded: usize = header_bytes;
+        for (entries) |entry| expanded += packingBytes(store, entry);
+        if (left.bytes.len + right.bytes.len - header_bytes <= target and
+            fitsPage(store, entries[0].key, entries[entries.len - 1].key, entries.len, expanded, max_page_bytes))
+        {
             var aggregate: []u8 = undefined;
             const ref = try save(alloc, store, entries, a.ref.height, &aggregate);
             defer alloc.free(aggregate);
@@ -1376,7 +1405,8 @@ pub const SortedBuilder = struct {
         if (height >= self.levels.len) return error.GraphPageTreeTooDeep;
         const level = &self.levels[height];
         const minimum: usize = if (height == 0) 1 else 2;
-        if (level.entries.items.len >= minimum and level.bytes + entry.size() > self.target_bytes)
+        if (level.entries.items.len >= minimum and
+            !fitsPage(self.store, level.entries.items[0].key, entry.key, level.entries.items.len + 1, level.bytes + packingBytes(self.store, entry), self.target_bytes))
             try self.flush(height);
         if (level.arena == null) level.arena = .init(self.alloc);
         const a = level.arena.?.allocator();
@@ -1384,7 +1414,7 @@ pub const SortedBuilder = struct {
         const value = if (entry.child == null) try a.dupe(u8, entry.value) else "";
         const aggregate = try a.dupe(u8, entry.aggregate);
         try level.entries.append(self.alloc, .{ .key = key, .value = value, .child = entry.child, .aggregate = aggregate });
-        level.bytes += entry.size();
+        level.bytes += packingBytes(self.store, entry);
     }
 
     fn flush(self: *SortedBuilder, height: usize) anyerror!void {
@@ -1429,9 +1459,9 @@ pub const SortedBuilder = struct {
             for (self.pending[0..self.pending_count], self.pending_parents[0..self.pending_count]) |page, parent| {
                 const level = &self.levels[parent.height];
                 const entry = &level.entries.items[parent.index];
-                level.bytes -= entry.size();
+                level.bytes -= packingBytes(self.store, entry.*);
                 entry.child = page.ref;
-                level.bytes += entry.size();
+                level.bytes += packingBytes(self.store, entry.*);
             }
         } else try self.store.put_many.?(self.store.ptr, self.pending[0..self.pending_count]);
         for (self.pending[0..self.pending_count]) |page| self.alloc.free(page.bytes);
@@ -4107,7 +4137,7 @@ test "external lake metadata navigation lazy compressed keys bound memory preser
     const count = 40;
     const keys = try a.alloc([key_bytes]u8, count);
     defer a.free(keys);
-    var builder: SortedBuilder = .{ .alloc = a, .store = backing, .target_bytes = bulk_target_page_bytes };
+    var builder: SortedBuilder = .{ .alloc = a, .store = backing };
     defer builder.deinit();
     for (keys, 0..) |*key, i| {
         @memset(key, 'p');
@@ -4116,6 +4146,7 @@ test "external lake metadata navigation lazy compressed keys bound memory preser
     }
     const root = (try builder.finish()).?;
     try std.testing.expect(root.height != 0);
+    try std.testing.expect(memory.pages.count() < count / 2);
     const Run = struct {
         fn run(alloc: Allocator, store: Store, ref: Ref, expected: []const [key_bytes]u8) !void {
             var cache: Cache = .{ .alloc = alloc, .underlying = store, .decoded = true, .max_bytes = 2 * 1024 * 1024 };
@@ -4169,4 +4200,45 @@ test "external lake metadata navigation lazy compressed keys bound memory preser
     try std.testing.expectEqualStrings("value", (try previous.next()).?.value);
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ backing, root, keys });
+}
+
+test "external lake metadata navigation compressed occupancy repair preserves expanded hard limits" {
+    const a = std.testing.allocator;
+    var memory: testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    var backing = memory.store();
+    backing.prefix_keys = true;
+    const key_bytes = 4104;
+    const count = 400;
+    const keys = try a.alloc([key_bytes]u8, count);
+    defer a.free(keys);
+    var builder: SortedBuilder = .{ .alloc = a, .store = backing };
+    defer builder.deinit();
+    for (keys, 0..) |*key, i| {
+        @memset(key, 's');
+        std.mem.writeInt(u64, key[key_bytes - 8 ..], i, .big);
+        try builder.add(key, "");
+    }
+    const original = (try builder.finish()).?;
+    var root = try readPage(a, backing, original);
+    defer root.deinit(a);
+    try std.testing.expectEqual(@as(u8, 1), original.height);
+    try std.testing.expectEqual(@as(usize, 2), root.entries.len);
+    // Each encoded sibling is under the repair threshold, but their expanded
+    // union exceeds the hard cap. Repair must repartition rather than merge.
+    for (root.entries) |entry| try std.testing.expect(entry.child.?.bytes < target_page_bytes / 4);
+    const updated = (try apply(a, backing, original, &.{
+        .{ .key = &keys[1], .value = null },
+        .{ .key = &keys[300], .value = null },
+    })).?;
+    try std.testing.expectEqual(@as(u64, count - 2), updated.records);
+    var cursor = try Cursor.init(a, backing, updated, "", null);
+    defer cursor.deinit();
+    for (keys, 0..) |key, i| {
+        if (i == 1 or i == 300) continue;
+        const row = (try cursor.nextView()).?;
+        try std.testing.expectEqual(.eq, row.key.order(KeyView.from(&key)));
+    }
+    try std.testing.expect((try cursor.nextView()) == null);
+    try std.testing.expectEqual(@as(u64, count), original.records);
 }

@@ -1720,5 +1720,14 @@ in the final 16 logical key bytes and materialize only a required final page
 boundary. Complete tuple keys remain available for ordinary key consumers and
 mutation/visitor paths; those allocations belong to the operation, not a shared
 cached page. No sort components, public-ID ties, authentication or range bounds
-are discarded. This is a reader change and preserves the existing page format
-and publication recipes.
+are discarded.
+
+Sorted publication and incremental mutation packing use compressed occupancy
+when a store opts into key prefixes. The shared prefix is one indivisible
+page overhead; the soft target bounds the unshared payload. The original
+expanded-page hard cap still bounds builder arenas and contiguous-key readers.
+Pending packed children reserve their final locator bytes before admission, and
+occupancy repair cannot merge compressed siblings whose combined expanded
+shape would exceed that cap. New builds and rewritten pages benefit without
+forcing unchanged publications to rebuild. The page format and publication
+recipes remain unchanged.
