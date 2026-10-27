@@ -56,8 +56,9 @@ floor. Ordinary coordinated operations retain their v2 admission semantics;
 ordinary restore plans retain their previous optional-field encoding and digest.
 
 Query-produced generations now have a private purpose in the shared durable
-job store. Job/name admission commits atomically, and query jobs accept only
-fresh destinations. The capture carries an immutable producer expiry. A worker
+job store. Job/name admission commits atomically. Ordinary query jobs accept
+only fresh destinations; materialized refresh additionally accepts an exact,
+catalog-owned predecessor through the fenced overwrite lane. The capture carries an immutable producer expiry. A worker
 uses read-indexed owner status, never backup import or query evaluation: it waits
 for the request's seal, cancels expired incomplete output, and sends sealed
 output through ordinary global validation and atomic publication. Sealed output
@@ -111,8 +112,9 @@ physical output layout. Metadata decoder v75 and native owner protocol v4 are
 required before reservation; rejected mixed-version attempts do not raise the
 data floor. Table records preserve backing ownership through binary projections,
 cloning and snapshots. The compiled metadata client forwards planning through the
-same native method, including its deadline. Native ABI v77 adds an append-only
-write-rejection status while preserving main's published numeric identities.
+same native method, including its deadline. Native ABI v77 added an append-only
+write-rejection status while preserving main's published numeric identities;
+v78 qualifies the refresh planning projection.
 
 Reads authorize the logical relation and use the existing SQL read/filter path
 over its bound physical generation. They verify that the descriptor still names
@@ -130,18 +132,56 @@ cleanup continue through the shared native lifetime machinery. Ordinary
 
 The mounted campaign closes sql-0351, sql-0352, sql-0353, sql-0358 and sql-0359
 against document and relational sources. The PostgreSQL reference now covers
-nine unchanged originals, plus populated/unpopulated read and mutation
+eleven unchanged originals, plus populated/unpopulated read and mutation
 diagnostics. Native metadata tests verify mixed-version rejection, forged owner
 and output-layout rejection, publication, strict binary framing, snapshot
 recovery and retirement. The broader Debug gates also qualify existing ordinary
 views and mixed document/relational restore cohorts.
 
+## Fenced materialized refresh
+
+Ordinary permanent `REFRESH MATERIALIZED VIEW` evaluates the stored definition
+through the existing owner/delegation, source-column identity and RLS/filter
+machinery. A request-owned preparation factory binds one bounded producer after
+the logical view has been resolved. It is released before its arena and is never
+serialized into recovery state. Compatible source renames use durable column
+identities rather than rebinding by name.
+
+Planning point-reads the expected logical identity and generation, then obtains
+its bounded indexed physical range set. It preserves the output schema and
+placement declaration while allocating a new physical generation. The admitted
+plan binds both predecessor and successor, the unchanged definition and exact
+logical/output identities. Refresh requires metadata decoder v76 before
+reservation; creation remains v75 and the native owner protocol remains v4.
+
+After producer EOF releases source readers, the shared overwrite worker validates
+and seals output, fences the old owners and atomically publishes the new backing.
+The logical view, owner, generation, dependencies and output attribute identities
+remain stable. `WITH NO DATA` publishes an unpopulated generation without opening
+a source cursor. Incomplete production retains the ordinary cancellation and
+receipt-recovery rules; workers never repeat query evaluation.
+
+Namespace reconciliation permits only the descriptor's current backing or the
+exact successor proved by its immutable admitted plan. A pending successor keeps
+the predecessor's logical name readable. Snapshot validation covers that pending
+state as well as publication and retirement; unrelated reservations cannot shadow
+a view. The mounted native campaign runs lost-reply/reopen recovery across both
+document and relational sources, including populated and initially unpopulated
+refreshes, a subsequent `WITH NO DATA`, complete PostgreSQL postimages and stable
+logical/output identities. This closes sql-0356. The original sql-0357 combines
+`CONCURRENTLY` with `WITH NO DATA`: PostgreSQL and the public API agree on 42601
+for a populated view and 0A000 for an unpopulated view, with unchanged data and no
+producer admission. This negative original does not qualify successful concurrent
+refresh.
+
 ## Activation still required
 
 - Explicit transaction participation for population and its catalog publication.
-- Materialized refresh: preserve logical/output identities while replacing the
-  backing through the shared fenced overwrite lane. Finish refresh isolation,
-  MAINTAIN/role-ownership semantics and concurrent-refresh index prerequisites.
+- Successful concurrent refresh: activate materialized index DDL, prove an
+  eligible ready unique index and finish concurrent-reader isolation. Current
+  positive `CONCURRENTLY` attempts report the missing-index prerequisite; this
+  is not eligibility checking. Broader MAINTAIN/role-ownership semantics also
+  remain open. Nonconcurrent in-flight reads may observe a generation change.
 - Materialized index DDL and coherent backup/restore of descriptors and their
   backing generations alongside ordinary tables. Archive restore must not
   fabricate a query population or publish an unbound physical backing.

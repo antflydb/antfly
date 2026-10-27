@@ -2017,8 +2017,10 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .relational_index_source_accept_status => |request| relationalIndexSourceAcceptanceStatusJson(svc, alloc, context, request),
         .query_population_prepare => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
-            const version = if (request.materialized_view) protocol.sql_materialized_view_version else protocol.sql_population_version;
-            if (request.materialized_view)
+            const version = if (request.expected_view != null) protocol.sql_materialized_refresh_version else if (request.materialized_view) protocol.sql_materialized_view_version else protocol.sql_population_version;
+            if (request.expected_view != null)
+                try @import("../metadata/service.zig").ensureMaterializedRefreshCapabilityWithContext(svc, context)
+            else if (request.materialized_view)
                 try @import("../metadata/service.zig").ensureMaterializedViewCapabilityWithContext(svc, context)
             else
                 try @import("../metadata/service.zig").ensureQueryPopulationCapabilityWithContext(svc, context);

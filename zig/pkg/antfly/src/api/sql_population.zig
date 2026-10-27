@@ -70,9 +70,61 @@ fn requestCleanup(server: *http.ApiHttpServer, job_id: u64) void {
     server.schedulePendingRestoreJobs() catch {};
 }
 
-pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, request_context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: @FieldType(catalog.Ddl, "populate"), path: ?*const Path) !catalog.DdlOutcome {
+const Refresh = struct { target: domain.Target, record: @import("../system_catalog/views.zig").Record };
+
+pub fn executeRefresh(root: *@import("sql_execution.zig").Adapter, allocators: catalog.DdlAllocators, input: @FieldType(catalog.Ddl, "populate")) !catalog.DdlOutcome {
+    var region: std.heap.ArenaAllocator = .init(allocators.scratch);
+    defer region.deinit();
+    const a = region.allocator();
     const intent = input.intent;
-    if (intent.persistence != .permanent or (intent.operation != .create_table_as and intent.operation != .select_into and intent.operation != .create_materialized_view)) return error.UnsupportedSqlExecution;
+    var target: domain.Target = .{ .database = intent.name.database orelse root.database, .namespace = intent.name.namespace orelse root.namespace, .table = intent.name.table };
+    var source: ?domain.SqlSource = null;
+    if (intent.name.namespace == null and intent.name.database == null and root.ddl_search_path != null) {
+        for (root.ddl_search_path.?.entries[0..root.ddl_search_path.?.len]) |*entry| {
+            target.namespace = entry.slice();
+            const snapshot = try @import("sql_view_execution.zig").lookup(root, a, target);
+            if (snapshot.sql_sources[0]) |found| {
+                source = found;
+                break;
+            }
+        }
+    } else {
+        const snapshot = try @import("sql_view_execution.zig").lookup(root, a, target);
+        source = snapshot.sql_sources[0];
+    }
+    const found = source orelse return error.TableNotFound;
+    if (found.value != .view) return error.SqlWrongObjectType;
+    const parsed = try @import("../system_catalog/views.zig").Record.decode(a, found.value.view.source_json);
+    const backing = parsed.value.materialization orelse return error.SqlWrongObjectType;
+    const logical = try target.resourceNameAlloc(a);
+    if (!try http.tablePermissionCurrentlyAllowed(root.identity.*, logical, .admin)) return error.Forbidden;
+    try root.server.requireGenerationAuthority(http.storedDestinationPrincipal(root.identity.*), &.{logical}, true);
+    if (intent.concurrently) {
+        if (!backing.populated) return error.SqlConcurrentRefreshUnpopulated;
+        if (!intent.with_data) return error.SqlRefreshOptionsConflict;
+        return error.SqlConcurrentRefreshIndexRequired;
+    }
+    const preparation = input.preparation orelse return error.InvalidSqlBackendResponse;
+    const previous = root.refresh_definition_view;
+    root.refresh_definition_view = parsed.value.id;
+    defer root.refresh_definition_view = previous;
+    defer preparation.release(preparation.ptr);
+    const query = try a.create(local.sql_ast.Select);
+    query.* = .{ .table = .{ .database = target.database, .namespace = target.namespace, .table = target.table } };
+    var bound = intent;
+    bound.name = query.table.?;
+    bound.query = query;
+    bound.columns = &.{};
+    const producer = try preparation.prepare(preparation.ptr, a, bound);
+    return executeInner(root.server, root.identity.*, root.context, root.database, root.namespace, allocators, .{ .intent = bound, .source = producer }, null, .{ .target = target, .record = parsed.value });
+}
+
+pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, request_context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: @FieldType(catalog.Ddl, "populate"), path: ?*const Path) !catalog.DdlOutcome {
+    return executeInner(server, identity, request_context, database, namespace, allocators, input, path, null);
+}
+fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, request_context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: @FieldType(catalog.Ddl, "populate"), path: ?*const Path, refresh: ?Refresh) !catalog.DdlOutcome {
+    const intent = input.intent;
+    if (intent.persistence != .permanent or (intent.operation != .create_table_as and intent.operation != .select_into and intent.operation != .create_materialized_view and !(intent.operation == .refresh_materialized_view and refresh != null))) return error.UnsupportedSqlExecution;
     const source = input.source orelse return error.InvalidSqlBackendResponse;
     const io = server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
     var context = try request_context.platformDeadline();
@@ -117,7 +169,8 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         defer attempt.deinit();
         const bytes = server.source.systemCatalog(attempt.allocator(), trusted, .{ .query_population_prepare = .{
             .namespace_id = ns,
-            .materialized_view = intent.operation == .create_materialized_view,
+            .materialized_view = intent.operation == .create_materialized_view or refresh != null,
+            .expected_view = if (refresh) |value| .{ .id = value.record.id, .generation = value.record.generation } else null,
             .logical_name = target.table,
             .physical_name = physical,
             .tablespace_name = intent.tablespace,
@@ -148,7 +201,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         .capture_id = nonce,
         .definition = source.definition,
         .source_definition = source.source_definition,
-        .target_schema = try stages.runtimeSchemaDigestForTable(a, source.schema_json),
+        .target_schema = try stages.runtimeSchemaDigestForTable(a, prepared.child.schema_json),
         .principal_instance = instance,
         .catalog_revision = prepared.expected_catalog_revision,
         .write_version = @max(1, time.realtimeNs()),
@@ -158,14 +211,16 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     defer if (view_definition) |*value| value.deinit();
     if (intent.operation == .create_materialized_view)
         view_definition = try @import("sql_view_ddl.zig").preparePopulation(server, identity, context, database, namespace, a, intent, prepared.expected_catalog_revision, path);
+    const fences = if (prepared.previous) |prior| try replacementFences(server, a, context, id, prior, prepared.child_ranges) else &.{};
     const destination: stages.Target = .{
         .source_table_id = 0,
         .population = capture,
-        .materialized_view = if (view_definition) |definition| .{ .id = prepared.child.sql_materialized_view_id orelse return error.InvalidSqlBackendResponse, .definition = definition.value, .populated = intent.with_data } else null,
+        .materialized_view = if (refresh) |value| .{ .id = value.record.id, .definition = value.record.definition, .populated = intent.with_data, .refresh_identity = .{ .id = value.record.id, .generation = value.record.generation } } else if (view_definition) |definition| .{ .id = prepared.child.sql_materialized_view_id orelse return error.InvalidSqlBackendResponse, .definition = definition.value, .populated = intent.with_data } else null,
+        .replace = if (prepared.previous) |prior| .{ .table = prior.table, .ranges = prior.ranges, .fences = fences } else null,
         .creation_guard = guard,
         .table = prepared.child,
         .ranges = prepared.child_ranges,
-        .catalog_binding = .{ .kind = if (view_definition != null) .view else .table, .id = prepared.child.sql_materialized_view_id orelse prepared.child.table_id, .parent_id = ns, .tablespace_id = prepared.tablespace_id, .name = target.table, .storage_name = prepared.child.name },
+        .catalog_binding = .{ .kind = if (view_definition != null or refresh != null) .view else .table, .id = prepared.child.sql_materialized_view_id orelse prepared.child.table_id, .parent_id = ns, .tablespace_id = prepared.tablespace_id, .name = target.table, .storage_name = prepared.child.name },
     };
     const plan: stages.Plan = .{ .id = id, .cohort_digest = source.definition, .targets = &.{destination} };
     try plan.validate(a);
@@ -175,6 +230,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     const result = try server.restore_job_store.startRecoverable(allocators.scratch, .{
         .scope = .cluster,
         .source_kind = .query_population,
+        .restore_mode = if (refresh != null) "overwrite" else "fail_if_exists",
         .backup_id = try a.dupe(u8, &std.fmt.bytesToHex(source.definition, .lower)),
         .location = "metadata://query-population",
         .connection = "internal",
@@ -266,4 +322,19 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     }
     transferred = true;
     return pending(receipt, rows);
+}
+
+fn replacementFences(server: *http.ApiHttpServer, a: A, context: operation.RequestContext, id: stages.Id, prior: create.Previous, destinations: []const local.common_topology_records.RangeRecord) ![]const local.storage_db_relational_integrity_topology_contract.Fence {
+    const reads = server.table_reads orelse return error.UnsupportedSqlExecution;
+    const topology = local.storage_db_relational_integrity_topology_contract;
+    const result = try a.alloc(topology.Fence, prior.ranges.len);
+    for (prior.ranges, result, 0..) |range, *fence, i| {
+        try context.ensureActive();
+        var response = (try reads.lookup(a, prior.table.name, range.start_key, .{ .relational_topology_json = "{\"mode\":\"identity\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableNotFound;
+        defer response.deinit(a);
+        const native = try std.json.parseFromSliceLeaky(topology.Identity, a, response.json, .{ .ignore_unknown_fields = true });
+        if (native.namespace.table_id != prior.table.table_id or native.namespace.shard_id != @import("../metadata/table_manager.zig").rangeDocIdentityShardId(range) or native.namespace.range_id != @import("../metadata/table_manager.zig").rangeDocIdentityRangeId(range)) return error.TableGenerationChanged;
+        fence.* = .{ .transition_id = @max(1, std.mem.readInt(u64, id[0..8], .little)), .attempt = 1, .admission_epoch = native.next_epoch, .owner_group_id = range.group_id, .peer_group_id = destinations[i % destinations.len].group_id, .role = .rewrite_source, .namespace = native.namespace, .catalog_digest = native.catalog_digest };
+    }
+    return result;
 }

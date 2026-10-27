@@ -138,7 +138,8 @@ const std = @import("std");
 /// Re-fence the complete index cohort so every admitted job can finish.
 /// Version 74 decodes query-population captures and sealed typed-row delivery.
 /// It does not authorize replaying a lost request-owned query evaluation.
-pub const current_version: u16 = 75;
+pub const current_version: u16 = 76;
+pub const sql_materialized_refresh_version: u16 = 76;
 pub const sql_materialized_view_version: u16 = 75;
 pub const sql_population_version: u16 = 74;
 pub const job_state_version: u16 = 73;

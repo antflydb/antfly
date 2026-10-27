@@ -267,7 +267,8 @@ pub fn prepare(root: *Adapter, a: A, target: domain.Target, resource: domain.Res
     // and compiled body remain owned by that region through cursor teardown.
     const record = parsed.value;
     if (resource.kind != .view or resource.id != record.id) return error.InvalidSqlViewRecord;
-    const authority = if (record.materialization == null) try readAuthority(root, a, target, record, inherited) else null;
+    const expand_definition = root.refresh_definition_view == record.id;
+    const authority = if (record.materialization == null or expand_definition) try readAuthority(root, a, target, record, inherited) else null;
     const Binding = @import("sql_prepared.zig").Binding;
     const manifest = Binding.fromView(target, record.id, record.generation, record.attributes.epoch.digest, root.revision.?);
     if (root.prepared_bindings) |bindings| try Binding.verifyView(bindings, manifest);
@@ -282,7 +283,7 @@ pub fn prepare(root: *Adapter, a: A, target: domain.Target, resource: domain.Res
             try bindings.append(a, manifest);
         }
     }
-    if (record.materialization) |backing| {
+    if (!expand_definition) if (record.materialization) |backing| {
         const incoming = if (inherited) |value| value.effective else root.identity.*;
         const logical = try target.resourceNameAlloc(a);
         if (!try http.tablePermissionCurrentlyAllowed(incoming, logical, .read)) return error.Forbidden;
@@ -303,7 +304,7 @@ pub fn prepare(root: *Adapter, a: A, target: domain.Target, resource: domain.Res
         table.read_authority = inherited;
         try authority_api.check(table);
         return .{ .table = table };
-    }
+    };
     const lookups = try a.alloc(domain.SqlSourceLookup, record.definition.sources.len);
     for (record.definition.sources, lookups) |source, *output| output.* = switch (source.kind) {
         .table => .{ .table_id = source.table_id },

@@ -261,6 +261,7 @@ pub const Adapter = struct {
     dynamic_table: ?[]const u8 = null,
     ranges_staged: bool = false,
     inserting: bool = false,
+    refresh_definition_view: ?u64 = null,
     prepared_bindings: ?[]const @import("sql_prepared.zig").Binding = null,
     setting_overlay: []const setting_catalog.OverlayEntry = &.{},
     setting_baseline: ?[]const setting_catalog.OverlayEntry = null,
@@ -865,6 +866,8 @@ pub const Adapter = struct {
         // Catalog jobs are not transaction participants yet. Never commit
         // their namespace change independently of an explicit SQL transaction.
         if (input == .populate and self.active_transaction != null) return error.UnsupportedSqlExecution;
+        if (input == .populate and input.populate.intent.operation == .refresh_materialized_view)
+            return @import("sql_population.zig").executeRefresh(self, allocators, input.populate);
         return @import("sql_catalog.zig").executeWithAllocators(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path);
     }
 

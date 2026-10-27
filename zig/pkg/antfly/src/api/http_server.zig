@@ -60483,6 +60483,13 @@ test "staged restore worker query population mounted materialized originals reta
     for ([_]bool{ false, true }) |document| for ([_][]const u8{ "sql-0351", "sql-0352", "sql-0353" }) |id| try @import("restore_worker_fixture.zig").runPopulationPublic(RestoreWorkerTestDriver, id, document);
 }
 
+test "staged restore worker query population materialized refresh sql-0356 and sql-0357 retain logical identities across fenced replacement" {
+    for ([_]bool{ false, true }) |document| {
+        for ([_][]const u8{ "sql-0351", "sql-0352", "sql-0353" }) |id| try @import("restore_worker_fixture.zig").runPopulationPublicRefresh(RestoreWorkerTestDriver, id, document, true);
+        try @import("restore_worker_fixture.zig").runPopulationPublicRefresh(RestoreWorkerTestDriver, "sql-0351", document, false);
+    }
+}
+
 test "staged restore worker query population materialized WITH NO DATA rejects reads without opening the source" {
     for ([_]bool{ false, true }) |document| try @import("restore_worker_fixture.zig").runPopulationPublicEmpty(RestoreWorkerTestDriver, document);
 }

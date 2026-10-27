@@ -17,6 +17,10 @@
 //! FK and restore envelopes. Schema/row strings are validated but never copied.
 const std = @import("std");
 
+pub fn requiresMaterializedRefresh(bytes: []const u8) bool {
+    return requiresMarker(bytes, "refresh_identity");
+}
+
 pub fn requiresMaterializedView(bytes: []const u8) bool {
     return requiresMarker(bytes, "materialized_view") or requiresMarker(bytes, "sql_materialized_view_id") or requiresMarker(bytes, "materialized");
 }
@@ -289,4 +293,11 @@ test "FK historical reference decoder marker is explicit escaped and bounded" {
     try std.testing.expect(requiresHistoricalReferences("{\"plan\":{\"historical_reference_coverage\":true}}"));
     try std.testing.expect(requiresHistoricalReferences("{\"plan\":{\"historical_reference_\\u0063overage\":true}}"));
     try std.testing.expect(requiresHistoricalReferences("{"));
+}
+
+test "relational integrity restore staging refresh decoder marker ignores source text and ordinary materializations" {
+    for ([_][]const u8{ "{}", "{\"materialized_view\":{\"refresh_identity\":null}}", "{\"source_json\":\"refresh_identity\"}" }) |bytes|
+        try std.testing.expect(!requiresMaterializedRefresh(bytes));
+    for ([_][]const u8{ "{\"materialized_view\":{\"refresh_identity\":{}}}", "{\"refresh_ident\\u0069ty\":{}}", "{" }) |bytes|
+        try std.testing.expect(requiresMaterializedRefresh(bytes));
 }

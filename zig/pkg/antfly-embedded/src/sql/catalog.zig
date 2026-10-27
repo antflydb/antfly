@@ -1316,6 +1316,14 @@ pub const PopulationSource = struct {
     finish: *const fn (*anyopaque) anyerror!void,
 };
 
+/// A request-owned definition-bound producer factory. Refresh binds the stored
+/// query after resolving its logical descriptor; workers never retain callbacks.
+pub const PopulationPreparation = struct {
+    ptr: *anyopaque,
+    prepare: *const fn (*anyopaque, std.mem.Allocator, ast.RelationPopulation) anyerror!PopulationSource,
+    release: *const fn (*anyopaque) void,
+};
+
 pub const Ddl = union(enum) {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         // Request-owned producer callbacks cannot become stored catalog data.
@@ -1328,7 +1336,7 @@ pub const Ddl = union(enum) {
         }
         try writer.endObject();
     }
-    populate: struct { intent: ast.RelationPopulation, source: ?PopulationSource = null },
+    populate: struct { intent: ast.RelationPopulation, source: ?PopulationSource = null, preparation: ?PopulationPreparation = null },
     create_table: struct {
         name: ast.Name,
         schema_json: []const u8,

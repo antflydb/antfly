@@ -40,6 +40,7 @@ pub const Purpose = enum { foreign_key, query_population };
 
 pub const Request = struct {
     materialized_view: bool = false,
+    expected_view: ?@import("../system_catalog/views.zig").Identity = null,
     physical_name: ?[]const u8 = null,
     namespace_id: u64,
     logical_name: []const u8,
@@ -54,7 +55,7 @@ pub const Request = struct {
     pub fn jsonStringify(self: Request, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Request).@"struct".field_names) |field_name| {
-            if ((!std.mem.eql(u8, field_name, "materialized_view") or self.materialized_view) and (!std.mem.eql(u8, field_name, "generated_constraint_names") or self.generated_constraint_names.len != 0) and (!std.mem.eql(u8, field_name, "physical_name") or self.physical_name != null)) {
+            if ((!std.mem.eql(u8, field_name, "expected_view") or self.expected_view != null) and (!std.mem.eql(u8, field_name, "materialized_view") or self.materialized_view) and (!std.mem.eql(u8, field_name, "generated_constraint_names") or self.generated_constraint_names.len != 0) and (!std.mem.eql(u8, field_name, "physical_name") or self.physical_name != null)) {
                 try writer.objectField(field_name);
                 try writer.write(@field(self, field_name));
             }
@@ -63,7 +64,13 @@ pub const Request = struct {
     }
 };
 
+pub const Previous = struct {
+    resource: @import("antfly_local_sources").system_catalog_domain.Resource,
+    table: records.TableRecord,
+    ranges: []const records.RangeRecord,
+};
 pub const Prepared = struct {
+    previous: ?Previous = null,
     creation_guard: ?Guard = null,
     catalog_id: u64,
     expected_catalog_revision: u64,
@@ -79,7 +86,7 @@ pub const Prepared = struct {
     pub fn jsonStringify(self: Prepared, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Prepared).@"struct".field_names) |field_name| {
-            if ((!std.mem.eql(u8, field_name, "constraint_name_admission") or self.constraint_name_admission != null) and (!std.mem.eql(u8, field_name, "creation_guard") or self.creation_guard != null)) {
+            if ((!std.mem.eql(u8, field_name, "previous") or self.previous != null) and (!std.mem.eql(u8, field_name, "constraint_name_admission") or self.constraint_name_admission != null) and (!std.mem.eql(u8, field_name, "creation_guard") or self.creation_guard != null)) {
                 try writer.objectField(field_name);
                 try writer.write(@field(self, field_name));
             }

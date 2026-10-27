@@ -310,8 +310,10 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
         else
             null;
         defer if (source) |owned| owned.deinit();
+        var preparation: PopulationPreparation = .{ .backend = backend, .compiled = compiled, .parameters = parameters, .limits = limits };
+        defer PopulationPreparation.release(&preparation);
         try backend.vtable.checkpoint(backend.ptr);
-        const result = try dispatch(backend.ptr, .{ .result = arena, .scratch = alloc }, .{ .populate = .{ .intent = intent, .source = if (source) |owned| owned.iface() else null } });
+        const result = try dispatch(backend.ptr, .{ .result = arena, .scratch = alloc }, .{ .populate = .{ .intent = intent, .source = if (source) |owned| owned.iface() else null, .preparation = if (source == null) preparation.iface() else null } });
         // The owner finishes the synchronous producer before publishing. Do
         // not add a fallible checkpoint after a possibly durable admission.
         return .{ .rows_affected = result.rows_affected, .completion_rows = result.rows_affected, .command_tag = if (result.mutation_outcome == .committed_pending or (result.receipt != null and result.receipt.?.state != .ready)) "DDL PENDING" else switch (intent.operation) {
@@ -8320,3 +8322,28 @@ test "SQL EXPLAIN volatile sequence effects execute exactly once and planning ne
         }
     }
 }
+
+const PopulationPreparation = struct {
+    backend: catalog.Backend,
+    compiled: *const @import("compiler.zig").Compiled,
+    parameters: []const Json,
+    limits: Limits,
+    source: ?*@import("relation_population.zig").Source = null,
+    prepared: bool = false,
+
+    fn iface(self: *PopulationPreparation) catalog.PopulationPreparation {
+        return .{ .ptr = self, .prepare = prepare, .release = release };
+    }
+    fn prepare(ptr: *anyopaque, a: std.mem.Allocator, intent: @import("ast.zig").RelationPopulation) !catalog.PopulationSource {
+        const self: *PopulationPreparation = @ptrCast(@alignCast(ptr));
+        if (self.prepared) return error.InvalidSqlBackendResponse;
+        self.prepared = true;
+        self.source = try @import("relation_population.zig").Source.init(a, self.backend, self.compiled, intent, self.parameters, self.limits);
+        return self.source.?.iface();
+    }
+    fn release(ptr: *anyopaque) void {
+        const self: *PopulationPreparation = @ptrCast(@alignCast(ptr));
+        if (self.source) |source| source.deinit();
+        self.source = null;
+    }
+};

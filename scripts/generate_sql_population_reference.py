@@ -20,13 +20,16 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from generate_sql_postgres_reference import postgres, FIXTURES, create_table, properties
+
+from generate_sql_postgres_reference import FIXTURES, create_table, postgres, properties
 
 IDS = frozenset(
     (
         "sql-0351",
         "sql-0352",
         "sql-0353",
+        "sql-0356",
+        "sql-0357",
         "sql-0358",
         "sql-0359",
         "sql-0364",
@@ -57,6 +60,35 @@ def generate():
                 create_table(
                     pg, "usage_records", properties(profile["schema"]), profile["rows"]
                 )
+                if case["id"] in ("sql-0356", "sql-0357"):
+                    pg.execute(
+                        "CREATE MATERIALIZED VIEW usage_records_mv AS SELECT id,status FROM usage_records"
+                    )
+                    pg.execute(
+                        "UPDATE usage_records SET status='refreshed' WHERE id='u5'"
+                    )
+                    entry = {
+                        key: case[key] for key in ("id", "source_entry_sha256", "sql")
+                    }
+                    code = None
+                    command = ""
+                    try:
+                        with pg.transaction():
+                            command = pg.execute(case["sql"]).statusmessage
+                    except Exception as error:
+                        code = getattr(error, "sqlstate", None)
+                        if code is None:
+                            raise
+                    entry.update(
+                        command_tag=command,
+                        sqlstate=code,
+                        columns=[],
+                        rows=pg.execute(
+                            "SELECT * FROM usage_records_mv ORDER BY 1"
+                        ).fetchall(),
+                    )
+                    result["entries"].append(entry)
+                    continue
                 if case["id"] in ("sql-0358", "sql-0359"):
                     pg.execute(
                         "CREATE MATERIALIZED VIEW usage_records_mv AS SELECT id,status FROM usage_records"
@@ -110,6 +142,7 @@ def generate():
                 for query in (
                     "DROP VIEW usage_records_mv",
                     "DELETE FROM usage_records_mv",
+                    "REFRESH MATERIALIZED VIEW CONCURRENTLY usage_records_mv WITH NO DATA",
                     "SELECT * FROM usage_records_mv ORDER BY 1",
                 ):
                     code = None
@@ -144,7 +177,7 @@ def main():
         if existing != actual:
             raise SystemExit("PostgreSQL population reference changed")
         print(
-            "PostgreSQL population reference: all nine unchanged originals and materialized diagnostics match"
+            "PostgreSQL population reference: all eleven unchanged originals and materialized diagnostics match"
         )
     else:
         args.output.write_text(json.dumps(result, indent=2) + "\n")

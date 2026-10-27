@@ -9279,13 +9279,47 @@
     },
     {
       "id": "sql-0356",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original refresh evaluates the stored definition through the existing owner/RLS read graph, seals a new native generation and atomically replaces its fenced predecessor. Mounted document and relational campaigns preserve logical/output identities, compare complete nullable postimages with PostgreSQL, recover lost acknowledgements and exercise populated/unpopulated and WITH NO DATA transitions.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population materialized refresh sql-0356 and sql-0357 retain logical identities across fenced replacement",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL view catalog materialized hidden generation atomically publishes empty backing and definition",
+          "gate": "sql-materialized-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population materialized refresh sql-0356 and sql-0357 retain logical identities across fenced replacement",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0357",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original combines CONCURRENTLY and WITH NO DATA. Independent PostgreSQL and mounted SQL HTTP agree on SQLSTATE 42601 for a populated view and 0A000 for an unpopulated view, preserve existing rows and admit no producer. This closes the original invalid-options case; successful concurrent refresh and its ready unique-index prerequisite remain separate activation work.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population materialized refresh sql-0356 and sql-0357 retain logical identities across fenced replacement",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL view catalog materialized hidden generation atomically publishes empty backing and definition",
+          "gate": "sql-materialized-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population materialized refresh sql-0356 and sql-0357 retain logical identities across fenced replacement",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0358",

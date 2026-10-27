@@ -1023,7 +1023,7 @@ pub const Store = struct {
             const hex = std.fmt.bytesToHex(nonce, .lower);
             req.idempotency_key = try std.fmt.bufPrint(&generated_key_buf, "auto:{s}", .{hex});
         }
-        try validateStartRequest(req);
+        try validateStartRequest(alloc, req);
         _ = self.io orelse return error.AsyncRestoreUnavailable;
         const fingerprint = try requestFingerprintAlloc(alloc, req);
         defer alloc.free(fingerprint);
@@ -2493,11 +2493,19 @@ pub const Store = struct {
     }
 };
 
-fn validateStartRequest(req: StartRequest) !void {
+fn validateStartRequest(alloc: std.mem.Allocator, req: StartRequest) !void {
     if (req.rewrite_plan_json != null and req.generation_plan_json != null) return error.InvalidRestoreJobScope;
     if (req.source_kind.compoundStaging() != (req.rewrite_plan_json != null or req.generation_plan_json != null)) return error.InvalidRestoreJobScope;
     if ((req.source_kind == .empty_generation or req.source_kind == .query_population) and req.generation_plan_json == null) return error.InvalidRestoreJobScope;
-    if (req.source_kind.compoundStaging() and (req.scope != .cluster or !std.mem.eql(u8, req.restore_mode, if (req.source_kind == .query_population) "fail_if_exists" else "overwrite"))) return error.InvalidRestoreJobScope;
+    if (req.source_kind.compoundStaging()) {
+        if (req.scope != .cluster) return error.InvalidRestoreJobScope;
+        if (req.source_kind == .query_population and std.mem.eql(u8, req.restore_mode, "overwrite")) {
+            const parsed = try std.json.parseFromSlice(@import("../metadata/restore_staging.zig").Plan, alloc, req.generation_plan_json.?, .{});
+            defer parsed.deinit();
+            try parsed.value.validate(alloc);
+            for (parsed.value.targets) |target| if (target.population == null or target.materialized_view == null or target.materialized_view.?.refresh_identity == null or target.replace == null) return error.InvalidRestoreJobScope;
+        } else if (!std.mem.eql(u8, req.restore_mode, if (req.source_kind == .query_population) "fail_if_exists" else "overwrite")) return error.InvalidRestoreJobScope;
+    }
     if (req.backup_id.len == 0 or req.backup_id.len > max_restore_string_bytes or
         req.location.len == 0 or req.location.len > max_restore_string_bytes or
         req.connection.len == 0 or req.connection.len > max_restore_string_bytes or

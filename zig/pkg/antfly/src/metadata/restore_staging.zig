@@ -195,6 +195,26 @@ pub const GenerationHandoffRange = struct {
     retired_count: u64,
     mappings: []const @import("antfly_local_sources").storage_db_restore_staging_contract.GenerationAdmissionMapping = &.{},
 };
+pub const MaterializedView = struct {
+    id: u64,
+    definition: @import("antfly_local_sources").sql_view_definition.Definition,
+    populated: bool,
+    refresh_identity: ?@import("../system_catalog/views.zig").Identity = null,
+    pub fn nativeJsonSkipField(self: MaterializedView, comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "refresh_identity") and self.refresh_identity == null;
+    }
+    pub fn jsonStringify(self: MaterializedView, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(MaterializedView).@"struct".field_names) |field| {
+            if (!std.mem.eql(u8, field, "refresh_identity") or self.refresh_identity != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+};
+
 pub const Target = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
         return (std.mem.eql(u8, name, "sequence_handoffs") and self.sequence_handoffs.len == 0) or
@@ -215,11 +235,7 @@ pub const Target = struct {
     empty_generation: bool = false,
     population: ?@import("antfly_local_sources").storage_db_relational_population_contract.Capture = null,
     /// The definition and backing rows publish in one catalog transaction.
-    materialized_view: ?struct {
-        id: u64,
-        definition: @import("antfly_local_sources").sql_view_definition.Definition,
-        populated: bool,
-    } = null,
+    materialized_view: ?MaterializedView = null,
     sequence_handoffs: []const @import("column_sequence_handoff.zig").Move = &.{},
     /// Binds graph artifact retirement to the exact old/new physical table
     /// incarnations and unchanged index declarations. Old edge/metric stores
@@ -556,7 +572,7 @@ pub const Plan = struct {
                 (target.materialized_view != null and target.population == null)) return error.InvalidRestoreStaging;
             if (target.population) |capture| {
                 try capture.validate();
-                if (target.source_table_id != 0 or target.replace != null or target.catalog_binding == null or self.preparing_sources or
+                if (target.source_table_id != 0 or (target.replace != null and target.materialized_view == null) or target.catalog_binding == null or self.preparing_sources or
                     target.empty_generation or target.rewrite != null or target.rewrite_sources.len != 0 or target.source_artifacts.len != 0 or
                     target.source_generation_admissions.len != 0 or target.generation_handoffs.len != 0 or target.sequence_handoffs.len != 0 or
                     target.graph_retirement_digest != null or self.external_fk_parents.len != 0 or
@@ -565,7 +581,11 @@ pub const Plan = struct {
                     const binding = target.catalog_binding.?;
                     if (view.id == 0 or view.id != binding.id or binding.kind != .view or
                         table.sql_materialized_view_id != view.id or capture.materialized_view_id != view.id or view.definition.security != .owner) return error.InvalidRestoreStaging;
-                    switch (view.definition.owner) {
+                    if ((view.refresh_identity != null) != (target.replace != null)) return error.InvalidRestoreStaging;
+                    if (view.refresh_identity) |expected| {
+                        const prior = target.replace.?;
+                        if (expected.id != view.id or expected.generation == 0 or prior.table.sql_materialized_view_id != view.id or prior.fences.len != prior.ranges.len) return error.InvalidRestoreStaging;
+                    } else switch (view.definition.owner) {
                         .auth_disabled => if (capture.principal_name.len != 0) return error.InvalidRestoreStaging,
                         .user => |principal| if (!std.mem.eql(u8, principal.name, capture.principal_name) or !std.mem.eql(u8, &principal.instance_id, &capture.principal_instance)) return error.InvalidRestoreStaging,
                         .role => return error.InvalidRestoreStaging,

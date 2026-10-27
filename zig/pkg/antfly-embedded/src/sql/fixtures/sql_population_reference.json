@@ -376,6 +376,234 @@
       ]
     },
     {
+      "id": "sql-0356",
+      "source_entry_sha256": "607a5187683ba14165ac14e83dae3cda871d24fddd089a3a4f628bbe03c81406",
+      "sql": "REFRESH MATERIALIZED VIEW usage_records_mv",
+      "command_tag": "REFRESH MATERIALIZED VIEW",
+      "sqlstate": null,
+      "columns": [],
+      "rows": [
+        [
+          "c1",
+          "customer"
+        ],
+        [
+          "c2",
+          "customer"
+        ],
+        [
+          "u1",
+          "active"
+        ],
+        [
+          "u10",
+          "active-123"
+        ],
+        [
+          "u11",
+          "--active-"
+        ],
+        [
+          "u12",
+          "active-user"
+        ],
+        [
+          "u13",
+          "active ready"
+        ],
+        [
+          "u14",
+          "hello"
+        ],
+        [
+          "u15",
+          "a_b"
+        ],
+        [
+          "u16",
+          "active  user"
+        ],
+        [
+          "u17",
+          "manual"
+        ],
+        [
+          "u18",
+          null
+        ],
+        [
+          "u19",
+          "ready"
+        ],
+        [
+          "u2",
+          "ready"
+        ],
+        [
+          "u20",
+          "ready"
+        ],
+        [
+          "u21",
+          "ready"
+        ],
+        [
+          "u22",
+          "ready"
+        ],
+        [
+          "u23",
+          "ready"
+        ],
+        [
+          "u24",
+          "ready"
+        ],
+        [
+          "u3",
+          "pending"
+        ],
+        [
+          "u4",
+          "open"
+        ],
+        [
+          "u5",
+          "refreshed"
+        ],
+        [
+          "u6",
+          "draft"
+        ],
+        [
+          "u7",
+          "queued"
+        ],
+        [
+          "u8",
+          "deleted"
+        ],
+        [
+          "u9",
+          "archived"
+        ]
+      ]
+    },
+    {
+      "id": "sql-0357",
+      "source_entry_sha256": "6c3e6929b369cc7787efa14a15f3f9d381c53693d8fa9070ee3e238c072f3e7e",
+      "sql": "REFRESH MATERIALIZED VIEW CONCURRENTLY usage_records_mv WITH NO DATA",
+      "command_tag": "",
+      "sqlstate": "42601",
+      "columns": [],
+      "rows": [
+        [
+          "c1",
+          "customer"
+        ],
+        [
+          "c2",
+          "customer"
+        ],
+        [
+          "u1",
+          "active"
+        ],
+        [
+          "u10",
+          "active-123"
+        ],
+        [
+          "u11",
+          "--active-"
+        ],
+        [
+          "u12",
+          "active-user"
+        ],
+        [
+          "u13",
+          "active ready"
+        ],
+        [
+          "u14",
+          "hello"
+        ],
+        [
+          "u15",
+          "a_b"
+        ],
+        [
+          "u16",
+          "active  user"
+        ],
+        [
+          "u17",
+          "manual"
+        ],
+        [
+          "u18",
+          null
+        ],
+        [
+          "u19",
+          "ready"
+        ],
+        [
+          "u2",
+          "ready"
+        ],
+        [
+          "u20",
+          "ready"
+        ],
+        [
+          "u21",
+          "ready"
+        ],
+        [
+          "u22",
+          "ready"
+        ],
+        [
+          "u23",
+          "ready"
+        ],
+        [
+          "u24",
+          "ready"
+        ],
+        [
+          "u3",
+          "pending"
+        ],
+        [
+          "u4",
+          "open"
+        ],
+        [
+          "u5",
+          "closed"
+        ],
+        [
+          "u6",
+          "draft"
+        ],
+        [
+          "u7",
+          "queued"
+        ],
+        [
+          "u8",
+          "deleted"
+        ],
+        [
+          "u9",
+          "archived"
+        ]
+      ]
+    },
+    {
       "id": "sql-0358",
       "source_entry_sha256": "564733308b46dc7065f7970d02d029e57388e8573a580a71336ec160c7e0f87b",
       "sql": "DROP MATERIALIZED VIEW usage_records_mv",
@@ -507,6 +735,10 @@
           "code": "42809"
         },
         {
+          "sql": "REFRESH MATERIALIZED VIEW CONCURRENTLY usage_records_mv WITH NO DATA",
+          "code": "0A000"
+        },
+        {
           "sql": "SELECT * FROM usage_records_mv ORDER BY 1",
           "code": "55000"
         }
@@ -522,6 +754,10 @@
         {
           "sql": "DELETE FROM usage_records_mv",
           "code": "42809"
+        },
+        {
+          "sql": "REFRESH MATERIALIZED VIEW CONCURRENTLY usage_records_mv WITH NO DATA",
+          "code": "42601"
         },
         {
           "sql": "SELECT * FROM usage_records_mv ORDER BY 1",

@@ -3639,6 +3639,12 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const refresh = switch (command) {
+        .apply_restore_staging => |bytes| @import("schema_reader_wire.zig").requiresMaterializedRefresh(bytes),
+        .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresMaterializedRefresh(request.plan_json),
+        else => false,
+    };
+    if (refresh) return metadata_topology_protocol.sql_materialized_refresh_version;
     const materialized = switch (command) {
         .apply_restore_staging => |bytes| @import("schema_reader_wire.zig").requiresMaterializedView(bytes),
         .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresMaterializedView(request.plan_json),
@@ -4140,10 +4146,16 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
 /// Existing restore/rewrite plans keep their original admission contract.
 pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const u8, context: api_operation.RequestContext) !void {
     try context.ensureActive();
-    if (@import("schema_reader_wire.zig").requiresMaterializedView(bytes))
+    if (@import("schema_reader_wire.zig").requiresMaterializedRefresh(bytes))
+        try ensureMaterializedRefreshCapabilityWithContext(service, context)
+    else if (@import("schema_reader_wire.zig").requiresMaterializedView(bytes))
         try ensureMaterializedViewCapabilityWithContext(service, context)
     else if (@import("schema_reader_wire.zig").requiresPopulation(bytes))
         try ensureQueryPopulationCapabilityWithContext(service, context);
+}
+
+pub fn ensureMaterializedRefreshCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_materialized_refresh_version);
 }
 
 pub fn ensureMaterializedViewCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
