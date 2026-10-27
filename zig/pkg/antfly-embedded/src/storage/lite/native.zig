@@ -277,10 +277,161 @@ test "lite allocator v4 interrupted certificate preserves the previous checkpoin
         }
         var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
         defer reopened.close();
-        // Failed appends may leave an unpublished tail. Recovery must still
-        // retain a fully checked committed prefix and the durable document.
+        // A failed optional close publication must preserve the entire valid
+        // file, not merely a readable prefix followed by an unpublished tail.
+        const checked = try reopened.check();
+        try std.testing.expect(checked.valid);
+        try std.testing.expectEqual(@as(u64, 0), checked.tail_bytes);
+        const value = (try reopened.getDocumentAlloc(a, "doc")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("durable", value);
+    }
+}
+
+test "lite allocator v4 bounded deferred owners verify before consuming reusable capacity" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |deferred| {
+        const path = try testPath(a, tmp, if (deferred) "bounded-deferred.aflite" else "bounded-control.aflite");
+        defer a.free(path);
+        const large: [32768]u8 = @splat('v');
+        {
+            var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+            defer file.close();
+            var keys: [32][16]u8 = undefined;
+            var batch: [32]DocumentMutation = undefined;
+            for (&batch, &keys, 0..) |*mutation, *key, i| mutation.* = .{ .key = try std.fmt.bufPrint(key, "doc-{d}", .{i}), .value = &large };
+            try file.putDocumentBatch(&batch);
+            for (&batch) |*mutation| mutation.* = .{ .key = mutation.key, .is_delete = true };
+            try file.putDocumentBatch(&batch);
+            for (0..8) |_| _ = try file.reclaimPages(4096);
+            try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 64);
+        }
+        var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        const size = (try file.file.stat(file.runtime())).size;
+        file.max_file_bytes = size;
+        file.defer_allocator_verification = deferred;
+        try file.putDocument("new", "fits in the reusable pool");
+        try std.testing.expect(file.free_pages_verified);
+        try std.testing.expect((try file.allocatorStats()).?.reused_pages > 0);
+        try std.testing.expectEqual(size, (try file.file.stat(file.runtime())).size);
+        try std.testing.expect((try file.check()).valid);
+    }
+}
+
+test "lite allocator v4 certificate budget failure rolls back every unpublished tail" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (0..5) |slack| {
+        var name: [64]u8 = undefined;
+        const path = try testPath(a, tmp, try std.fmt.bufPrint(&name, "certificate-budget-{d}.aflite", .{slack}));
+        defer a.free(path);
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer file.close();
+        try file.putDocument("doc", "durable");
+        const before = file.header;
+        const size = (try file.file.stat(file.runtime())).size;
+        file.max_file_bytes = size + slack * file.header.page_size;
+        const certified = file.certifyAllocator() catch |err| switch (err) {
+            error.LiteStorageBudgetExceeded => false,
+            else => return err,
+        };
+        if (!certified) {
+            try std.testing.expect(std.meta.eql(before, file.header));
+            try std.testing.expectEqual(size, (try file.file.stat(file.runtime())).size);
+        }
+        try std.testing.expect(file.transaction_header == null);
+        try std.testing.expect((try file.check()).valid);
+        const value = (try file.getDocumentAlloc(a, "doc")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("durable", value);
+    }
+}
+
+test "lite allocator v4 certificate allocation failures preserve the entire committed file" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "certificate-allocations.aflite");
+    defer a.free(path);
+    const Case = struct {
+        fn attempt(failing: Allocator, seed: *NativeFile, filename: []const u8) !void {
+            var file = try NativeFile.openWithIo(failing, std.testing.io, filename, .{ .externally_locked = true, .no_sync = true });
+            defer file.close();
+            try file.inheritAllocatorVerification(seed);
+            try std.testing.expect(try file.certifyAllocator());
+        }
+        fn run(failing: Allocator, filename: []const u8) !void {
+            var seed = try NativeFile.createWithIo(std.testing.allocator, std.testing.io, filename, .{ .indexed_reclamation = true, .no_sync = true });
+            defer seed.close();
+            try seed.putDocument("doc", "durable");
+            const result = attempt(failing, &seed, filename);
+            var checked = try NativeFile.openWithIo(std.testing.allocator, std.testing.io, filename, .{ .read_only = true });
+            defer checked.close();
+            try std.testing.expect((try checked.check()).valid);
+            const value = (try checked.getDocumentAlloc(std.testing.allocator, "doc")).?;
+            defer std.testing.allocator.free(value);
+            try std.testing.expectEqualStrings("durable", value);
+            return result;
+        }
+    };
+    var count = std.testing.FailingAllocator.init(a, .{});
+    try Case.run(count.allocator(), path);
+    try std.testing.expectEqual(count.allocated_bytes, count.freed_bytes);
+    for (0..count.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        // Optional page-cache admission may legitimately swallow OOM. Both
+        // successful and rejected attempts must retain a valid, leak-free file.
+        Case.run(failing.allocator(), path) catch |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        };
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "lite allocator v4 certificate uncertain publication never rolls back published pages" {
+    const Fault = struct {
+        var fail_offset: ?u64 = null;
+        fn write(userdata: ?*anyopaque, handle: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            const written = try std.testing.io.vtable.fileWritePositional(userdata, handle, header, data, splat, offset);
+            if (fail_offset == offset) return error.Canceled;
+            return written;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = Fault.write;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    for ([_]bool{ false, true }) |after_selector| {
+        const path = try testPath(a, tmp, if (after_selector) "certificate-selector.aflite" else "certificate-slot.aflite");
+        defer a.free(path);
+        {
+            var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+            defer file.close();
+            try file.putDocument("doc", "durable");
+            const size = (try file.file.stat(io)).size;
+            Fault.fail_offset = if (after_selector) active_checkpoint_offset else checkpointOffset(1 - file.header.active_checkpoint);
+            defer Fault.fail_offset = null;
+            try std.testing.expectError(error.Canceled, file.certifyAllocator());
+            try std.testing.expect(file.checkpoint_publication_uncertain);
+            try std.testing.expect(file.transaction_header == null);
+            try std.testing.expect((try file.file.stat(io)).size > size);
+            try std.testing.expect(!try file.certifyAllocator());
+        }
+        var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+        defer reopened.close();
         const prefix = try checkpointPrefixSize(reopened.activeCheckpoint(), reopened.header.page_size);
         try std.testing.expect((try reopened.checkAtFileSizeWithCancel(prefix, null)).valid);
+        if (after_selector) {
+            try std.testing.expect((try reopened.check()).valid);
+            try std.testing.expect(try reopened.inheritAllocatorCertificate());
+        }
         const value = (try reopened.getDocumentAlloc(a, "doc")).?;
         defer a.free(value);
         try std.testing.expectEqualStrings("durable", value);
@@ -4342,6 +4493,11 @@ pub const NativeFile = struct {
         if (!self.header.indexed_reclamation or !self.free_pages_verified or
             self.transaction_header != null or self.durable_header != null or
             self.checkpoint_publication_uncertain) return false;
+        // Use the ordinary rollback/publication boundary. Allocation, budget
+        // and page-write errors must leave no unpublished tail at clean close;
+        // commitTransaction retains the fence if publication becomes uncertain.
+        try self.beginTransaction();
+        errdefer self.abortTransaction();
         const before = self.activeCheckpoint();
         const roots = try self.readCatalogRoots(before.catalog_root_page, before);
         var pages = try self.pageAllocatorFromFreeMap(before);
@@ -4371,8 +4527,10 @@ pub const NativeFile = struct {
         // All pending batches, including the placeholder, have been flushed by
         // persistAllocator. Replace only this unpublished standalone record.
         try self.writePage(record, .catalog, encoded.items);
-        try self.syncIfRequired();
+        // Stage the root in memory. The ordinary commit supplies the single
+        // data durability barrier before publishing the checkpoint slots.
         try self.publishCheckpoint(next);
+        try self.commitTransaction();
         return true;
     }
 
@@ -9525,7 +9683,7 @@ pub const NativeFile = struct {
             const state = try self.loadLedger(checkpoint);
             state.incremental = self.reserve_retirement_capacity or self.incremental_checkpoints;
             errdefer self.invalidateLedger();
-            if (verify and !self.defer_allocator_verification and !self.free_pages_verified and checkpoint.free_map_root_page != 0) {
+            if (verify and (!self.defer_allocator_verification or self.max_file_bytes != null) and !self.free_pages_verified and checkpoint.free_map_root_page != 0) {
                 _ = try self.validateIndexedAllocator(checkpoint, state, self.allocator_cancel_token);
                 self.free_pages_verified = true;
             }
@@ -9541,7 +9699,7 @@ pub const NativeFile = struct {
         }
         var free_pages = try self.readFreePagesAlloc(checkpoint);
         errdefer self.allocator.free(free_pages);
-        if (verify and !self.defer_allocator_verification and !self.free_pages_verified) {
+        if (verify and (!self.defer_allocator_verification or self.max_file_bytes != null) and !self.free_pages_verified) {
             try self.validateFreePagesSafeForCheckpointSlots(free_pages);
             self.free_pages_verified = true;
         }

@@ -25,12 +25,20 @@ file-size, timestamp or sampled-page shortcut is used. Explicit integrity checks
 still traverse the graphs. Certificate publication is one regular metadata
 checkpoint at owner shutdown, never a checkpoint per SQL statement. It changes
 neither the wire format nor old-reader compatibility: an older writer's next
-publication simply invalidates the certificate. Interrupted publication preserves
-the previous committed prefix; an unpublished tail uses ordinary recovery.
+publication simply invalidates the certificate. Pre-publication write, capacity
+and allocation failures roll back all unpublished pages through the ordinary
+transaction boundary. Once checkpoint publication may have happened, the existing
+uncertain-outcome fence preserves those pages for recovery.
 
-A legacy file without a valid certificate can append while its detached proof
-runs. If that process closes before verification completes, it cannot certify
-that state. The append window remains bounded by the configured file-size cap.
+An unbounded legacy owner without a valid certificate can append while its
+detached proof runs. If that process closes before verification completes, it
+cannot certify that state. A bounded native connection instead completes shared
+proof admission before starting the request, releasing the foreground gate and
+path lease throughout the walk and reader teardown. Concurrent requests wait
+without holding those gates, and worker/reclamation turns yield to the same proof
+lane. This admits writes from the free pool at the file-size cap without replaying
+partially executed SQL or moving verification into a publication fence. Standalone
+bounded primitives retain ordinary synchronous proof before reuse.
 
 ## Source volume is not the cited JSONL size
 
@@ -80,15 +88,16 @@ databases are not repository fixtures.
 
 ## Validation
 
-The allocator/reclamation gate passes 73 tests, including cross-process certificate
+The allocator/reclamation gate passes 77 tests, including cross-process certificate
 reuse, changed recovery headers, altered ownership counters and interrupted
 certificate writes. The targeted proof and lease gate
 passes eight tests, including corrupt values, incorrect positive reference counts
 and denied optional read-window admission. The new owner-detach gate passes all
 six lease tests, including active reads against a retired inode after Store close.
-The final C ABI gate passes all 89 unit tests and five focused contracts: detached
-proof gates, lazy large-value SQL upserts, cross-process certified reuse, foreground
-reuse during captured maintenance, and orphan-sweep progress across replay snapshots.
+The final C ABI gate passes all 89 unit tests and six focused contracts: detached
+proof gates, bounded admission outside both publication gates, lazy large-value
+SQL upserts, cross-process certified reuse, foreground reuse during captured
+maintenance, and orphan-sweep progress across replay snapshots.
 
 The supplied `55d97ce423` library imported the frozen original-rollout case in
 34.364 seconds including startup/shutdown (33.7 seconds reported by the importer).
@@ -105,8 +114,11 @@ original database and used the same Python C ABI caller as the candidate probe.
 
 ## Paired release results
 
-The baseline is the issue's supplied `55d97ce423` library, not a rebuild of the
-latest main. The candidate uses ReleaseFast, stripping, Metal off and CUDA off.
+These measurements were recorded at PR head `70a43eb4c1`, before the review
+follow-up for bounded admission and failed-certificate rollback. The complete
+15-process benchmark was not repeated for that follow-up. The baseline is the
+issue's supplied `55d97ce423` library, not a rebuild of the latest main. The
+candidate uses ReleaseFast, stripping, Metal off and CUDA off.
 These are single local runs with other builds active, including open and close.
 Both runs use the same frozen home and unchanged importer executable, with dense
 indexing disabled. The first four threads are the specified original rollout
@@ -160,3 +172,23 @@ bytes. These are internal storage records, not millions of external index files.
 The 47-step release build and its 134-function public export boundary pass. The
 expanded C ABI close/reopen regression includes real SQL primary-key index
 sources and preserves certified ownership through their lease publications.
+
+## Review follow-up regression coverage
+
+The two review reproductions now have permanent tests. A file with hundreds of
+reusable pages admits a write at its exact physical byte cap, including when
+proof deferral is enabled. The native C ABI admission test releases both locks,
+lets a previously queued storage turn yield, and checks that the worker does not
+complete a duplicate proof. While admission holds the proof lane, a mid-round
+maintenance cursor waits instead of repeatedly reacquiring the foreground gate
+at zero delay. Completion restores immediate inter-table progress. A second
+connection also waits off both gates after verification becomes visible but while
+the proof reader still blocks reuse; a warm bounded owner uses only a mutex
+try-lock before normal dispatch. Both requests consume reusable pages without
+growing the file.
+
+Certificate fault coverage checks the entire reopened file and durable document
+after page-write failures, small tail budgets and every allocation failure point
+(optional page-cache misses may recover). Separate injected errors after writing
+the checkpoint slot and active selector assert that uncertain publication keeps
+its fence and does not truncate potentially published pages.

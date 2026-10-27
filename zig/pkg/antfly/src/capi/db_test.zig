@@ -6784,6 +6784,163 @@ test "capi native resolver maintenance retries transient inference and survives 
     try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
 }
 
+test "capi native bounded admission coalesces allocator proof outside publication gates" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-capacity-proof");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    var second: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &second));
+    defer antfly_db_close(second);
+    var limit: u64 = 0;
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const store = guard.handle.owned_lite_backend.?.native_docstore.?;
+        const file = &store.file;
+        try file.completeAllocatorVerification();
+        const large: [32768]u8 = @splat('v');
+        var keys: [32][32]u8 = undefined;
+        var batch: [32]lite_backend.native.CatalogMutation = undefined;
+        for (&batch, &keys, 0..) |*mutation, *key, i| mutation.* = .{ .key = try std.fmt.bufPrint(key, "test/free-{d}", .{i}), .value = &large };
+        try file.putCatalogBatch(&batch);
+        for (&batch) |*mutation| mutation.* = .{ .key = mutation.key, .is_delete = true };
+        try file.putCatalogBatch(&batch);
+        for (0..8) |_| _ = try file.reclaimPages(4096);
+        try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 64);
+        limit = (try file.file.stat(file.runtime())).size;
+        store.maintenance_policy.options.max_storage_bytes = limit;
+        file.max_file_bytes = limit;
+        file.free_pages_verified = false;
+        owner.maintenance_storage_pending = true;
+    }
+    const Probe = struct {
+        owner: @TypeOf(owner),
+        path: []const u8,
+        second: ?*anyopaque,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        worker: ?std.Thread = null,
+        worker_failure: ?anyerror = null,
+        waiting: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        fn write(self: *@This()) !void {
+            const guard = public.enterHandle(self.second, .exclusive).?;
+            defer guard.leave();
+            try std.testing.expect(guard.entry_error == null);
+            try std.testing.expect(guard.connection.?.owner == self.owner);
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = "second", .value = "{\"body\":\"waits for reader teardown\"}" }}, .sync_level = .write });
+        }
+        fn run(self: *@This()) void {
+            self.write() catch |err| {
+                self.worker_failure = err;
+            };
+            self.done.store(true, .release);
+        }
+        fn onWait(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waiting.store(true, .release);
+        }
+        fn check(self: *@This(), reader: *lite_backend.native.NativeFile) !void {
+            try std.testing.expect(self.owner.gate.mutex.tryLock());
+            self.owner.gate.mutex.unlock(shared.handleLockIo());
+            var lease = try lite_backend.native.lockWriterPathWithIo(a, shared.handleLockIo(), self.path);
+            lease.close();
+            // The worker yields to the admission proof instead of duplicating
+            // its graph walk or waiting for it while holding the owner gate.
+            for (0..2) |_| try std.testing.expect(try self.owner.maintenanceTurnForTest());
+            try std.testing.expect(!self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+            const cursor = self.owner.maintenance_table_cursor;
+            self.owner.maintenance_table_cursor = 1;
+            defer self.owner.maintenance_table_cursor = cursor;
+            try std.testing.expect(self.owner.maintenanceWaitMillisForTest(true) >= 100);
+            try std.testing.expectEqual(@as(usize, 1), self.calls);
+            // Reproduce the interval after publishing verification but before
+            // closing its reader. The second connection must still queue off
+            // the publication gates, rather than fail to reuse at the cap.
+            try reader.completeAllocatorVerification();
+            self.owner.gate.mutex.lockUncancelable(shared.handleLockIo());
+            {
+                defer self.owner.gate.mutex.unlock(shared.handleLockIo());
+                var publication = try lite_backend.native.lockWriterPathWithIo(a, shared.handleLockIo(), self.path);
+                defer publication.close();
+                try self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(reader);
+            }
+            self.worker = try std.Thread.spawn(.{}, run, .{self});
+            const io = shared.handleLockIo();
+            const deadline = std.Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s;
+            while (!self.waiting.load(.acquire) and !self.done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.CapacityWaitTimeout;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(self.waiting.load(.acquire));
+            try std.testing.expect(!self.done.load(.acquire));
+            try std.testing.expect(self.owner.gate.mutex.tryLock());
+            self.owner.gate.mutex.unlock(io);
+            var available = try lite_backend.native.lockWriterPathWithIo(a, io, self.path);
+            available.close();
+        }
+        fn notify(raw: *anyopaque, reader: *lite_backend.native.NativeFile) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.check(reader) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var probe = Probe{ .owner = owner, .path = path, .second = second };
+    defer if (probe.worker) |worker| worker.join();
+    owner.test_capacity_wait = .{ .ptr = &probe, .notify = Probe.onWait };
+    defer owner.test_capacity_wait = null;
+    owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_after_allocator_capture = null;
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+        try std.testing.expect(file.free_pages_verified);
+        const reused = (try file.allocatorStats()).?.reused_pages;
+        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"reuses capacity\"}" }}, .sync_level = .write });
+        try std.testing.expect((try file.allocatorStats()).?.reused_pages > reused);
+        try std.testing.expect((try file.file.stat(file.runtime())).size <= limit);
+        try std.testing.expect((try file.check()).valid);
+    }
+    if (probe.worker) |worker| {
+        worker.join();
+        probe.worker = null;
+    }
+    if (probe.failure) |err| return err;
+    if (probe.worker_failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    // Completion restores immediate progress between namespaces, rather than
+    // charging every table another wait quantum.
+    const cursor = owner.maintenance_table_cursor;
+    owner.maintenance_table_cursor = 1;
+    defer owner.maintenance_table_cursor = cursor;
+    try std.testing.expectEqual(@as(i64, 0), owner.maintenanceWaitMillisForTest(true));
+}
+
 test "capi native close certifies allocator before the next process opens sources" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
