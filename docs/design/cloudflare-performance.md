@@ -8,18 +8,24 @@ Objects as warm writers. No application SQLite/KV path is added.
 
 ```mermaid
 flowchart LR
-  App[Application Worker and query WASM] -->|one openReadView RPC| Writer[Tenant writer: Antfly metadata]
-  Writer -->|recover and validate ownership| Meta[R2 metadata tree and commit log]
+  App[Application Worker and query WASM] --> Observer[Native read-only metadata observer]
+  Observer -->|fresh committed proof and bounded inline rows| Meta[R2 metadata tree and commit log]
+  Observer -->|admission or pin fallback| Writer[Tenant writer: Antfly metadata]
+  Writer -->|recover and validate ownership| Meta
   App -->|immutable manifest, facts and body packs| Data[R2 database artifacts]
   Writes[Whole mutation batches and operation IDs] --> Writer
   Writer -->|upload WAL pages, then commit metadata| Data
   Maintenance[Coalesced Queues and adaptive collection] --> Writer
 ```
 
-`openReadView` reads the published HEAD, WAL HEAD and manifest GC floor from one
-transactional metadata root. It observes or publishes a generation-shared pin
-in that same transaction. The response supplies records in the existing object
-ABI, so native session, visibility, checksum and lease validation still execute.
+The app's native observer reads the published HEAD, WAL HEAD and manifest GC
+floor from a freshly authenticated committed metadata root. Bounded inline rows
+can satisfy these reads without metadata page GETs. The observer acquires no
+writer ownership and cannot extend a generation pin. Missing authority,
+admission or a pin that needs renewal falls back to `openReadView` on the tenant
+writer. That RPC observes or publishes the generation-shared pin in the same
+transaction. Both paths supply records in the existing object ABI, so native
+session, visibility, checksum and lease validation still execute.
 
 The Worker captures one view per query and uses its records for all metadata
 reads in that operation. It does not reuse the view across HTTP requests.

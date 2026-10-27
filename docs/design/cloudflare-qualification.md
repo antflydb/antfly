@@ -1,8 +1,17 @@
 # Cloudflare hosted profile qualification
 
-This records successive disposable live runs on 2026-10-24–25 UTC for issue #1278.
+This records successive disposable live runs on 2026-10-24–27 UTC for issue #1278.
 The fixture is deliberately small; it does not establish arbitrary-dataset
 capacity or complete native feature parity.
+
+The current candidate uses Antfly-native transactional coordination in R2;
+SQLite below describes the initial deployment and migration history. The latest
+local evidence passes 660 native tests (six skipped), 247 Node tests, 18 persisted
+Worker tests, the 50,000-document capacity fixture, the 1,000-document reindex
+fixture and both frozen ANN comparisons. The three-pair live gate remains
+unpassed. The approved control is `c44896ac8c` with its original native modules.
+Current live work is validating request-owned background cache fills and
+overlapping diagnostic capture before another one-hour qualification population.
 
 ## Durability and collection
 
