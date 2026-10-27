@@ -41,6 +41,7 @@ const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const field_projection = @import("field_projection.zig");
+pub const ProjectionReceipt = field_projection.Receipt;
 test {
     _ = field_projection;
     _ = @import("../storage/db/field_projection_source.zig");
@@ -81,7 +82,11 @@ fn finalizeCompletedProjectionSources(a: std.mem.Allocator, req: db_mod.types.Se
         const stored = hit.stored_data orelse continue;
         if (hit.computed_json) |bytes| if ((if (hit.computed_receipt) |receipt| receipt.matches(bytes, plan.fingerprint) else false) or try plan.wireOutput(a, bytes, true) != null) {
             hit.finalized_source = .{ .bytes = stored };
-            hit.computed_receipt = plan.receiptForValidated(bytes);
+            if (hit.computed_receipt == null or !hit.computed_receipt.?.matches(bytes, plan.fingerprint)) {
+                const owned = try plan.ownValidatedReceipt(a, bytes);
+                if (hit.computed_receipt) |previous| a.destroy(previous);
+                hit.computed_receipt = owned;
+            }
         };
     }
 }

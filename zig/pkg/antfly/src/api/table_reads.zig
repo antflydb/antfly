@@ -9059,14 +9059,24 @@ fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, r
                     document.stored_data = null;
                 } else selected.stored_data = try alloc.dupe(u8, hit.stored_data.?);
                 if (hit.computed_json) |computed| {
-                    const bytes = if (slot.output_allocator != null) moved: {
+                    const move = slot.output_allocator != null;
+                    const bytes = if (move) computed else try alloc.dupe(u8, computed);
+                    errdefer if (!move) alloc.free(bytes);
+                    const receipt = if (move) hit.computed_receipt else copied: {
+                        const previous = hit.computed_receipt orelse break :copied null;
+                        const value = previous.afterCopy(computed, bytes) orelse break :copied null;
+                        const owned = try alloc.create(@import("antfly_local_sources").api_query_contract.ProjectionReceipt);
+                        owned.* = value;
+                        break :copied owned;
+                    };
+                    if (move) {
                         document.computed_json = null;
                         document.computed_receipt = null;
-                        break :moved computed;
-                    } else try alloc.dupe(u8, computed);
+                    }
                     if (selected.computed_json) |prior| alloc.free(prior);
+                    if (selected.computed_receipt) |prior| alloc.destroy(prior);
                     selected.computed_json = bytes;
-                    selected.computed_receipt = if (hit.computed_receipt) |receipt| receipt.afterCopy(computed, bytes) else null;
+                    selected.computed_receipt = receipt;
                 }
                 // Hydration may already have normalized and masked this row.
                 // Rebind the producer receipt to the transferred/copied bytes.

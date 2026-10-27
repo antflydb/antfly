@@ -45,7 +45,7 @@ fn Raw(comptime root_kind: RootKind) type {
         // Explicit producer-only receipt for immutable, already validated bytes.
         // Parsing never accepts receipts from JSON. Ordinary constructors keep
         // validation on every emission, including callers with mutable buffers.
-        immutable: ?struct { bytes: []const u8, members_end: ?usize } = null,
+        immutable: if (root_kind == .object) ?struct { bytes: []const u8, members_end: ?usize } else void = if (root_kind == .object) null else {},
 
         const Self = @This();
 
@@ -93,14 +93,14 @@ fn Raw(comptime root_kind: RootKind) type {
         /// it must be a producer-known member boundary, never caller metadata.
         pub fn fromImmutableValidated(bytes: []const u8, members_end: ?usize) Self {
             std.debug.assert(members_end == null or (root_kind == .object and members_end.? <= bytes.len));
-            return .{ .bytes = bytes, .immutable = .{ .bytes = bytes, .members_end = members_end } };
+            return if (root_kind == .object) .{ .bytes = bytes, .immutable = .{ .bytes = bytes, .members_end = members_end } } else .{ .bytes = bytes };
         }
 
         pub fn jsonStringify(self: Self, jw: anytype) !void {
             // std.json's custom stringify hook can only surface WriteFailed.
             // Call validate() when a caller needs to distinguish malformed raw
             // input before serialization.
-            if (self.immutable) |proof| if (proof.bytes.ptr == self.bytes.ptr and proof.bytes.len == self.bytes.len) {
+            if (root_kind == .object) if (self.immutable) |proof| if (proof.bytes.ptr == self.bytes.ptr and proof.bytes.len == self.bytes.len) {
                 try jw.beginWriteRaw();
                 if (proof.members_end) |end| {
                     try jw.writer.writeAll(self.bytes[0..end]);
@@ -302,6 +302,7 @@ test "raw JSON nesting is bounded during parsing and final validation" {
 
 test "immutable producer object prefixes stay extent-bound and are never wire metadata" {
     const a = std.testing.allocator;
+    try std.testing.expectEqual(@sizeOf([]const u8), @sizeOf(RawValue));
     const bytes = "{\"n\":1,\"private\":true}";
     const raw = RawObject.fromImmutableValidated(bytes, "{\"n\":1".len);
     const output = try std.json.Stringify.valueAlloc(a, raw, .{});

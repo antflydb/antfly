@@ -349,6 +349,13 @@ pub const Plan = struct {
         if (!std.mem.startsWith(u8, bytes[end..], prefix) or !std.mem.eql(u8, bytes[end + prefix.len ..][0..64], &self.fingerprint) or !std.mem.endsWith(u8, bytes, "\"}")) return null;
         return .{ .bytes = bytes, .fingerprint = self.fingerprint, .members_end = end };
     }
+    /// Receipts allocate only for selected projected hits, not every candidate.
+    pub fn ownValidatedReceipt(self: *const Plan, a: A, bytes: []const u8) !?*Receipt {
+        const value = self.receiptForValidated(bytes) orelse return null;
+        const owned = try a.create(Receipt);
+        owned.* = value;
+        return owned;
+    }
     /// Only for fresh, complete native evaluateEncoded output.
     pub fn receipt(self: *const Plan, bytes: []const u8) Receipt {
         return self.receiptForValidated(bytes).?;
@@ -953,4 +960,30 @@ test "api query contract batches unconditional fields without speculative CASE r
     var mock: Mock = .{};
     _ = try plan.evaluateEncoded(a, a, .{ .context = &mock, .read = Mock.read, .prefetch = Mock.prefetch }, null, .{});
     try std.testing.expectEqual(@as(usize, 1), mock.batches);
+}
+
+test "api query contract optional producer receipts clone independently and release allocation failures" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const fields = try std.json.parseFromSliceLeaky([]const V, temp, "[{\"name\":\"n\",\"expression\":{\"field\":\"n\"}}]", .{});
+    var plan = try Plan.init(a, .{ .fields = fields });
+    defer plan.deinit();
+    var source: JsonSource = .{ .id = "a", .root = try std.json.parseFromSliceLeaky(V, temp, "{\"n\":5}", .{}) };
+    const Hit = @import("../storage/db/types.zig").SearchHit;
+    var hit: Hit = .{ .id = try a.dupe(u8, "a") };
+    defer hit.deinit(a);
+    hit.computed_json = try plan.evaluateEncoded(temp, a, source.source(), null, .{});
+    hit.computed_receipt = try plan.ownValidatedReceipt(a, hit.computed_json.?);
+    const Copy = struct {
+        fn run(alloc: A, original: *const Hit, fingerprint: [64]u8) !void {
+            var copied = try original.clone(alloc);
+            defer copied.deinit(alloc);
+            try std.testing.expect(copied.computed_receipt != original.computed_receipt);
+            try std.testing.expect(copied.computed_receipt.?.matches(copied.computed_json.?, fingerprint));
+            try std.testing.expect(!copied.computed_receipt.?.matches(original.computed_json.?, fingerprint));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Copy.run, .{ &hit, plan.fingerprint });
 }

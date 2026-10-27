@@ -3120,3 +3120,98 @@ def test_select_numeric_outputs_are_independent_of_materialization_order(
             if outputs is not None:
                 assert values == outputs
             outputs = values
+
+
+@pytest.mark.fresh_antfly_process
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_gateway_materializes_distinct_masks_before_model_execution(
+    tmp_path, num_shards
+):
+    import copy
+    import hashlib
+    from conftest import StandaloneAntflyServer, find_free_port
+
+    binary = os.environ.get("ANTFLY_BIN")
+    if not binary:
+        pytest.skip("Set ANTFLY_BIN for isolated gateway source checks")
+    config = tmp_path / "gateway.json"
+    config.write_text(json.dumps({"public_inference": {"enabled": True}}))
+    server = StandaloneAntflyServer(
+        binary, "127.0.0.1", find_free_port(), config_path=config
+    )
+    encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII="
+    digest = hashlib.sha256(base64.b64decode(encoded)).hexdigest()
+    try:
+        table = server.api_url + "/tables/media_groups"
+        created = requests.post(table, json={"num_shards": num_shards}, timeout=30)
+        assert created.ok, created.text
+        deadline = time.monotonic() + 30
+        while requests.get(table, timeout=5).status_code != 200:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        documents = {
+            f"doc-{i}": {
+                "revision": "r1",
+                "permissions": {"public": True},
+                "images": {f"image{i}": "data:image/png;base64," + encoded},
+            }
+            for i in range(4)
+        }
+
+        def write_document(doc_id):
+            result = requests.post(
+                table + "/batch",
+                json={
+                    "inserts": {doc_id: documents[doc_id]},
+                    "sync_level": "full_index",
+                },
+                timeout=60,
+            )
+            assert result.status_code == 201, result.text
+
+        for doc_id in documents:
+            write_document(doc_id)
+        references = [
+            {
+                "type": "input_image",
+                "source": {
+                    "table": "media_groups",
+                    "document_id": f"doc-{i}",
+                    "field": f"images.image{i}",
+                    "revision_field": "revision",
+                    "revision": "r1",
+                    "permissions_field": "permissions",
+                    "sha256": digest,
+                    "mime_type": "image/png",
+                    "byte_length": len(base64.b64decode(encoded)),
+                    "max_pixels": 1,
+                },
+            }
+            for i in range(4)
+        ]
+        payload = {"input": [{"role": "user", "content": references}]}
+
+        def invoke(body):
+            return requests.post(server.url + "/ai/v1/decisions", json=body, timeout=30)
+
+        # No model is selected: reaching ModelRequired proves all authorized
+        # groups materialized, without invoking or downloading a provider.
+        ready = invoke(payload)
+        assert ready.status_code == 400, ready.text
+        assert ready.json()["error"]["code"] == "ModelRequired", ready.text
+        mismatched = copy.deepcopy(payload)
+        mismatched["input"][0]["content"][1]["source"]["sha256"] = "0" * 64
+        bad_digest = invoke(mismatched)
+        assert bad_digest.status_code == 409, bad_digest.text
+        documents["doc-3"]["permissions"]["public"] = False
+        write_document("doc-3")
+        denied = invoke(payload)
+        assert denied.status_code == 403, denied.text
+        documents["doc-3"]["permissions"]["public"] = True
+        write_document("doc-3")
+        documents["doc-2"]["revision"] = "r2"
+        write_document("doc-2")
+        stale = invoke(payload)
+        assert stale.status_code == 409, stale.text
+    finally:
+        server.stop()
