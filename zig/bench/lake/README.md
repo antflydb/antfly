@@ -631,3 +631,52 @@ failures or leaks), 18 benchmark-tooling tests, and all 29 selected real
 Parquet/Iceberg E2Es without skips. Main `9d553bc925` is merged; its integrated
 production build and three real-file rechecks pass, including the strengthened
 source/score/sort-tuple assertions, Parquet pagination and Iceberg pagination.
+
+
+### Ordered execution refinements
+
+The [refinement observation](native-ordered-execution-refinements-v1-observation.json)
+qualifies the review fixes with three samples per case and cache mode. Eligible
+native physical ordering keeps the selective postings path, and the shared native
+cost rule avoids speculative global demand when a small text posting list is
+cheaper. On the 8,192-row forward and backward fixtures, every final sample
+examines the 64 matching candidates with zero speculative ordered visits; the
+reviewed branch visited 1,024 unrelated ordered references before fallback.
+
+Identity-only metadata pulls retain row references and one final boundary key.
+The 256-row wide-key fixture has a nonconstant 131 KB unused suffix: it now
+finishes through the bounded ordered path with 129 references. A separate native
+allocation test fits 20 references with 96 KiB suffixes and their boundary into a
+512 KiB page budget. Sparse supported text predicates use batched exact probes;
+dense and unsupported shapes retain bitmap membership. Selected-pack waves use
+four shared scheduler I/O lanes at most and join before releasing query state.
+When every final winner shares a stored-source pack, one retained outer pin
+allows covered projection delivery with validated native ordinals.
+
+| Case | Reviewed warm median | Final warm median |
+|---|---:|---:|
+| Selective native ordering, forward | 286.75 ms | 18.29 ms |
+| Selective native ordering, reverse | 293.19 ms | 18.11 ms |
+| Wide unused ordered suffix | 2,247.41 ms | 648.80 ms |
+
+The existing correlated-boundary cases retain their 84-reference/64-candidate
+bound; their warm medians are 46.92/48.79 ms, versus 50.44/54.30 ms on the preceding
+boundary build. All 36 paired pages preserve IDs, projected sources, sort tuples,
+scores and other hit fields exactly. Exact and lower-bound total pairs remain
+visible separately in the evidence. An intermediate boundary-only fix took
+2.73 seconds in its single warm wide-key sample; retaining the proven winning
+source for final projection addressed that additional delivery work.
+
+The evidence pins binaries, sources, configurations, runners, every timing/work
+sample and full-answer digests. These are sequential local Debug observations
+on a shared machine, with build activity overlapping some baseline samples.
+They do not establish causal latency, empty-cache performance, cloud transport
+or full-archive throughput. Restarts retain persistent and OS caches and startup
+navigation warming.
+
+Validation on the frozen merged build passes 247 focused native tests (one
+declared benchmark skip; no failures or leaks), 18 benchmark-tooling tests and
+31 real Parquet/Iceberg E2Es without skips. New real-file regressions fail against
+the reviewed binary and pass before and after restart on the candidate. Main
+`2f47731030` is merged, with a successful integrated production build and the full
+real-file suite. Formatting, syntax, license, Apache boundary and diff checks pass.
