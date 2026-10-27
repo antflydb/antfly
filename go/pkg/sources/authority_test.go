@@ -270,3 +270,22 @@ func TestWorkspacePermissionAuditResumesLabelChecksAfterRateLimit(t *testing.T) 
 		}
 	}
 }
+
+func TestGmailAbsenceAttachmentCheckRequestsIdentityMetadataOnly(t *testing.T) {
+	c := &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, Services: []string{"gmail"}, GmailBase: "https://fixture.test"}
+	c.HTTPClient = fixtureClient(t, func(r *http.Request) (int, any) {
+		if strings.HasSuffix(r.URL.Path, "/profile") {
+			return 200, map[string]any{"emailAddress": "alice@example.com"}
+		}
+		require.True(t, strings.HasSuffix(r.URL.Path, "/messages/m1"))
+		require.Equal(t, "full", r.URL.Query().Get("format"))
+		fields := r.URL.Query().Get("fields")
+		require.Contains(t, fields, "payload(partId,filename,mimeType,body(attachmentId),parts(")
+		require.NotContains(t, fields, "data")
+		require.NotContains(t, fields, "headers")
+		return 200, map[string]any{"id": "m1", "payload": map[string]any{"parts": []any{map[string]any{"partId": "1.1", "filename": "report.pdf", "mimeType": "application/pdf", "body": map[string]any{"attachmentId": "a1"}}}}}
+	})
+	ids, err := c.currentAttachmentIDs(t.Context(), CollaborationConfig{Resource: "gmail"}, collaborationRef{Resource: "gmail", Container: "alice@example.com", ID: "m1"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"1.1"}, ids)
+}

@@ -175,7 +175,15 @@ func (c *CollaborationConnector) currentAttachmentIDs(ctx context.Context, confi
 		}
 	case "gmail":
 		var message gmailMessage
-		if err := c.get(ctx, "gmail", "/messages/"+url.PathEscape(ref.ID)+"?format=full", &message); err != nil {
+		// Gmail requires full format to expose the MIME tree. A partial
+		// response retains only attachment identities at every supported depth.
+		// The final child marker lets the walker reject deeper MIME trees.
+		fields := "partId,filename,mimeType,body(attachmentId),parts(partId)"
+		for depth := 0; depth < 50; depth++ {
+			fields = "partId,filename,mimeType,body(attachmentId),parts(" + fields + ")"
+		}
+		query := "?format=full&fields=" + url.QueryEscape("id,payload("+fields+")")
+		if err := c.get(ctx, "gmail", "/messages/"+url.PathEscape(ref.ID)+query, &message); err != nil {
 			return nil, err
 		}
 		if message.ID != ref.ID {
