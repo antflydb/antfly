@@ -109,7 +109,7 @@ func (c *GoogleConnector) get(ctx context.Context, client *http.Client, path str
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return googleRequestError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -373,7 +373,7 @@ func (c *GoogleConnector) read(ctx context.Context, client *http.Client, r Reque
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, googleRequestError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

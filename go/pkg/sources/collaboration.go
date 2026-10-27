@@ -268,6 +268,9 @@ func (c *CollaborationConnector) get(ctx context.Context, resource, path string,
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
+		if c.ProviderName == ProviderGoogleWorkspace {
+			return googleRequestError(err)
+		}
 		return err
 	}
 	defer resp.Body.Close()

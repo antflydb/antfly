@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 )
 
 func googleQuotaBody(reasons ...string) string {
@@ -193,5 +194,105 @@ func TestWorkspaceQuotaAuditsResumeSuccessfulScopeChecks(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestGoogleTokenRefreshFailuresAreSafeAndRetryable(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		code   string
+		retry  bool
+	}{
+		{503, "temporarily_unavailable", true}, {429, "temporarily_unavailable", true},
+		{400, "temporarily_unavailable", true}, {400, "server_error", true},
+		{400, "invalid_grant", false}, {401, "invalid_client", false}, {400, "provider-secret", false},
+	} {
+		for _, resource := range []string{"gmail", "calendar", "drive", "gcs"} {
+			t.Run(fmt.Sprintf("%s/%d/%s", resource, tc.status, tc.code), func(t *testing.T) {
+				deadline := time.Now().UTC().Add(10 * time.Minute).Truncate(time.Second)
+				calls := 0
+				transport := collaborationTransport(func(r *http.Request) (*http.Response, error) {
+					calls++
+					require.Equal(t, "oauth2.googleapis.com", r.URL.Host)
+					body, _ := json.Marshal(map[string]string{"error": tc.code, "error_description": "provider-secret"})
+					return &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": []string{"application/json"}, "Retry-After": []string{deadline.Format(http.TimeFormat)}}, Request: r, Body: io.NopCloser(strings.NewReader(string(body)))}, nil
+				})
+				ctx := context.WithValue(t.Context(), oauth2.HTTPClient, &http.Client{Transport: transport})
+				config := oauth2.Config{ClientID: "client", ClientSecret: "provider-secret", Endpoint: oauth2.Endpoint{TokenURL: "https://oauth2.googleapis.com/token", AuthStyle: oauth2.AuthStyleInParams}}
+				client := oauth2.NewClient(ctx, config.TokenSource(ctx, &oauth2.Token{RefreshToken: "provider-secret"}))
+				c := &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, HTTPClient: client}
+				var err error
+				switch resource {
+				case "gmail", "calendar":
+					var out any
+					err = c.get(ctx, resource, "/profile", &out)
+				case "drive":
+					var out any
+					err = c.drive().get(ctx, client, "/files/file", &out)
+				case "gcs":
+					_, err = (&GoogleConnector{ProviderName: ProviderGCS}).read(ctx, client, Request{Config: SourceConfig(`{"bucket":"bucket"}`)}, Item{Path: "file", Revision: "1", Metadata: map[string]any{"bucket": "bucket"}})
+				}
+				var api *GoogleHTTPError
+				require.ErrorAs(t, err, &api)
+				require.Equal(t, tc.status, api.Status)
+				require.Equal(t, tc.retry, api.Retryable())
+				require.Equal(t, tc.retry, (&GoogleConnector{}).IsRetryable(err))
+				require.Equal(t, tc.status == 429, IsRateLimited(err))
+				require.Equal(t, deadline, api.AntflyRetryAfter())
+				require.NotContains(t, err.Error(), "provider-secret")
+				var raw *oauth2.RetrieveError
+				require.NotErrorAs(t, err, &raw, "raw refresh body must not survive normalization")
+				require.Equal(t, 1, calls)
+			})
+		}
+	}
+}
+
+func TestGoogleTokenNormalizationPreservesNonOAuthErrors(t *testing.T) {
+	for _, err := range []error{context.Canceled, context.DeadlineExceeded, fmt.Errorf("transport failed")} {
+		require.Equal(t, err, googleRequestError(err))
+	}
+	// API error reasons cannot accidentally acquire OAuth retry semantics.
+	require.False(t, (&GoogleHTTPError{Status: 400, Reason: "temporarily_unavailable"}).Retryable())
+}
+
+type googleTestTokenSource func() (*oauth2.Token, error)
+
+func (f googleTestTokenSource) Token() (*oauth2.Token, error) { return f() }
+
+func TestDriveRefreshFailureBeforeDownloadRetainsCooldown(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		t.Run(fmt.Sprint(native), func(t *testing.T) {
+			deadline := time.Now().UTC().Add(10 * time.Minute).Truncate(time.Second)
+			tokens, metadata := 0, 0
+			source := googleTestTokenSource(func() (*oauth2.Token, error) {
+				tokens++
+				if tokens <= 2 {
+					return &oauth2.Token{AccessToken: "fixture"}, nil
+				}
+				return nil, &oauth2.RetrieveError{Response: &http.Response{StatusCode: 503, Header: http.Header{"Retry-After": []string{deadline.Format(http.TimeFormat)}}}, ErrorCode: "temporarily_unavailable", Body: []byte("provider-secret"), ErrorDescription: "provider-secret"}
+			})
+			base := collaborationTransport(func(r *http.Request) (*http.Response, error) {
+				metadata++
+				require.Empty(t, r.URL.Query().Get("alt"))
+				require.False(t, strings.HasSuffix(r.URL.Path, "/export"))
+				mime := "text/plain"
+				if native {
+					mime = "application/vnd.google-apps.document"
+				}
+				body, _ := json.Marshal(map[string]any{"id": "file", "name": "notes", "version": "1", "size": "5", "mimeType": mime})
+				return &http.Response{StatusCode: 200, Header: http.Header{}, Request: r, Body: io.NopCloser(strings.NewReader(string(body)))}, nil
+			})
+			c := &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, HTTPClient: &http.Client{Transport: &oauth2.Transport{Source: source, Base: base}}}
+			_, err := c.workspaceDriveFile(t.Context(), "file")
+			var api *GoogleHTTPError
+			require.ErrorAs(t, err, &api)
+			require.Equal(t, 503, api.Status)
+			require.True(t, api.Retryable())
+			require.Equal(t, deadline, api.AntflyRetryAfter())
+			require.NotContains(t, err.Error(), "provider-secret")
+			require.Equal(t, 2, metadata)
+			require.Equal(t, 3, tokens)
+		})
 	}
 }

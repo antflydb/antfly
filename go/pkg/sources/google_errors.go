@@ -22,6 +22,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"golang.org/x/oauth2"
 )
 
 // GoogleHTTPError retains the legacy Google error type while exposing the same
@@ -31,6 +33,7 @@ type GoogleHTTPError struct {
 	Status  int
 	Reason  string
 	RetryAt time.Time
+	oauth   bool
 }
 
 func (e *GoogleHTTPError) Error() string {
@@ -43,7 +46,29 @@ func (e *GoogleHTTPError) AntflyRetryAfter() time.Time { return e.RetryAt }
 func (e *GoogleHTTPError) RateLimited() bool {
 	return e.Status == 429 || (e.Status == 403 && googleRateLimitReason(e.Reason))
 }
-func (e *GoogleHTTPError) Retryable() bool { return e.RateLimited() || e.Status >= 500 }
+func (e *GoogleHTTPError) Retryable() bool {
+	return e.RateLimited() || e.Status >= 500 || (e.oauth && (e.Reason == "server_error" || e.Reason == "temporarily_unavailable"))
+}
+
+// OAuth transports return token-endpoint failures before a resource response
+// exists. Drop the raw RetrieveError (which includes provider bodies and error
+// descriptions), retaining only status, an allowlisted code and bounded cooldown.
+func googleRequestError(err error) error {
+	var token *oauth2.RetrieveError
+	if !errors.As(err, &token) {
+		return err
+	}
+	api := &GoogleHTTPError{Reason: "unknown_oauth_error", oauth: true}
+	if token.Response != nil {
+		api.Status = token.Response.StatusCode
+		api.RetryAt = providerRetryAt(token.Response.Header.Get("Retry-After"), time.Now())
+	}
+	switch token.ErrorCode {
+	case "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope", "access_denied", "server_error", "temporarily_unavailable":
+		api.Reason = token.ErrorCode
+	}
+	return api
+}
 
 // IsRateLimited recognizes wrapped legacy Google and collaboration errors alike.
 // Runtimes use it for bounded audit waits and durable acquisition-progress budgets.

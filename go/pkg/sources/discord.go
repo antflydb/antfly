@@ -180,7 +180,16 @@ func (c *CollaborationConnector) discordScope(ctx context.Context, config Collab
 	}
 	return nil
 }
-func (c *CollaborationConnector) discordThreads(ctx context.Context, config CollaborationConfig, parent string) ([]string, error) {
+func discordArchivePaths(channelType int) []string {
+	paths := []string{"threads/archived/public"}
+	// Private threads exist only under guild text channels, not forums, media,
+	// or announcement channels.
+	if channelType == 0 {
+		paths = append(paths, "users/@me/threads/archived/private")
+	}
+	return paths
+}
+func (c *CollaborationConnector) discordThreads(ctx context.Context, config CollaborationConfig, parent discordChannel) ([]string, error) {
 	ids := []string{}
 	var active struct {
 		Threads []discordChannel `json:"threads"`
@@ -189,11 +198,11 @@ func (c *CollaborationConnector) discordThreads(ctx context.Context, config Coll
 		return nil, err
 	}
 	for _, thread := range active.Threads {
-		if thread.ParentID == parent {
+		if thread.ParentID == parent.ID {
 			ids = append(ids, thread.ID)
 		}
 	}
-	for _, suffix := range []string{"threads/archived/public", "users/@me/threads/archived/private"} {
+	for _, suffix := range discordArchivePaths(parent.Type) {
 		before := ""
 		seen := map[string]bool{}
 		for {
@@ -205,11 +214,11 @@ func (c *CollaborationConnector) discordThreads(ctx context.Context, config Coll
 				Threads []discordChannel `json:"threads"`
 				HasMore bool             `json:"has_more"`
 			}
-			if err := c.get(ctx, ProviderDiscord, "/channels/"+parent+"/"+suffix+"?"+q.Encode(), &result); err != nil {
+			if err := c.get(ctx, ProviderDiscord, "/channels/"+parent.ID+"/"+suffix+"?"+q.Encode(), &result); err != nil {
 				return nil, err
 			}
 			for _, thread := range result.Threads {
-				if thread.ParentID != parent {
+				if thread.ParentID != parent.ID {
 					return nil, ErrInventoryIncomplete
 				}
 				ids = append(ids, thread.ID)
@@ -239,6 +248,9 @@ func (c *CollaborationConnector) discordThreads(ctx context.Context, config Coll
 	return ids, nil
 }
 func (c *CollaborationConnector) discordRefs(ctx context.Context, config CollaborationConfig) ([]collaborationRef, error) {
+	if config.preview {
+		return c.discordPreviewRefs(ctx, config)
+	}
 	channels := append([]string{}, config.ChannelIDs...)
 	for _, id := range config.ChannelIDs {
 		if err := c.discordScope(ctx, config, id); err != nil {
@@ -249,7 +261,7 @@ func (c *CollaborationConnector) discordRefs(ctx context.Context, config Collabo
 			return nil, err
 		}
 		if (channel.Type == 0 || channel.Type == 5 || channel.Type == 15 || channel.Type == 16) && (config.IncludeThreads == nil || *config.IncludeThreads) {
-			threads, err := c.discordThreads(ctx, config, id)
+			threads, err := c.discordThreads(ctx, config, channel)
 			if err != nil {
 				return nil, err
 			}

@@ -258,3 +258,9 @@ errors remain permanent. The same classification applies to Gmail, Calendar and
 legacy Drive/GCS acquisition, including Calendar-linked Drive downloads/exports.
 `IsRateLimited` recognizes wrapped errors for audit waits and progress accounting;
 provider messages and response bodies never enter persisted error diagnostics.
+
+Discord previews sample at most eight channel/thread containers and never follow
+archive cursors; narrowing the selection is required when the sample is exhausted.
+Normal syncs retain complete archive pagination. Google OAuth refresh failures use
+the same safe retry/cooldown contract as resource errors: transient failures retry,
+invalid grants remain permanent, and token response bodies are not retained.

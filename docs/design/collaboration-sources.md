@@ -389,3 +389,16 @@ errors and collaboration errors share retryability, cooldown and rate-limit
 contracts, so bounded audit waits and hosted acquisition progress apply equally.
 See [Gmail error handling](https://developers.google.com/workspace/gmail/api/guides/handle-errors)
 and [Calendar error handling](https://developers.google.com/workspace/calendar/api/guides/errors).
+
+
+Google token-refresh failures are normalized at the portable HTTP boundary too.
+Transient OAuth server errors and 429/5xx responses preserve bounded Retry-After
+cooldowns without retaining token response bodies or descriptions. Invalid grants
+remain permanent. Hosted audits keep the old bounded lease on transient refresh
+failure and never renew its successful-check clock.
+
+Discord previews sample a message before enumerating threads. They inspect at most
+eight containers, reuse one active-thread listing and read at most one page per
+applicable archive kind without following cursors. A truncated sample without a
+message fails explicitly rather than claiming an empty source. Full syncs retain
+complete archive pagination; private archives are queried only for text channels.
