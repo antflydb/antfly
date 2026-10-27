@@ -321,11 +321,44 @@ def write_report(path: Path, records: list[dict]) -> None:
     temporary.replace(path)
 
 
+class CompilerWatchdog:
+    """Bound each compiler and idle orchestration, independent of graph size."""
+
+    def __init__(self, seconds: float, started: float):
+        self.seconds = seconds
+        self.last_work = started
+        self.first_seen: dict[int, float] = {}
+
+    def expired(self, now: float, processes: list[dict]) -> bool:
+        compilers = [p for p in processes if p.get("executable") == "zig"]
+        live = {p["pid"] for p in compilers}
+        self.first_seen = {
+            pid: start for pid, start in self.first_seen.items() if pid in live
+        }
+        if compilers:
+            self.last_work = now
+        for process in compilers:
+            started = self.first_seen.setdefault(process["pid"], now)
+            elapsed = process.get("elapsed", "")
+            try:
+                days, _, clock = elapsed.rpartition("-")
+                seconds = 0
+                for component in clock.split(":"):
+                    seconds = seconds * 60 + int(component)
+                seconds += int(days or 0) * 86400
+            except ValueError:
+                seconds = now - started
+            if seconds >= self.seconds:
+                return True
+        return not compilers and now - self.last_work >= self.seconds
+
+
 def measured_build(
     command: list[str],
     cwd: Path,
     *,
     timeout_seconds: float = 1800,
+    compiler_timeout_seconds: float | None = None,
     progress=None,
     env=None,
 ) -> tuple[int, str, dict]:
@@ -338,6 +371,11 @@ def measured_build(
     cgroup = {}
     peak_anon = peak_file = None
     last_report = started
+    watchdog = (
+        CompilerWatchdog(compiler_timeout_seconds, started)
+        if compiler_timeout_seconds is not None
+        else None
+    )
     with tempfile.TemporaryFile(mode="w+") as output:
         process = subprocess.Popen(
             command,
@@ -381,6 +419,14 @@ def measured_build(
                         peak_file = max(peak_file or 0, cgroup["file"])
                     if not timed_out:
                         active_processes = active_build_processes(process.pid, cwd)
+                        if watchdog is not None and watchdog.expired(
+                            now, active_processes
+                        ):
+                            timed_out = True
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
                     current = {
                         "active_processes": active_processes,
                         "cgroup_memory_stat": cgroup,
@@ -423,6 +469,8 @@ def measured_build(
                 "rss_sample_interval_seconds": 0.25,
                 "min_disk_free_bytes": min(min_disk_free, shutil.disk_usage(cwd).free),
                 "timed_out": timed_out,
+                "build_timeout_seconds": timeout_seconds,
+                "compiler_timeout_seconds": compiler_timeout_seconds,
             },
         )
 
@@ -654,6 +702,13 @@ def main() -> None:
                     root / "zig",
                     progress=progress,
                     env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(global_cache)},
+                    # The cold graph has several independent archives and
+                    # owner/consumer executables. A newly started compiler is
+                    # not stalled because earlier units consumed 30 minutes.
+                    # Keep the original bound per compiler/idle period, plus
+                    # an absolute one-hour bound for the complete cold graph.
+                    timeout_seconds=3600 if label.endswith("cold") else 1800,
+                    compiler_timeout_seconds=1800,
                 )
             except BaseException as err:
                 record.update(status="interrupted", error=type(err).__name__)
@@ -677,7 +732,7 @@ def main() -> None:
             if returncode:
                 if measurements["timed_out"]:
                     print(
-                        f"{label}: production compilation exceeded 30 minutes",
+                        f"{label}: production compilation exceeded its build or compiler deadline",
                         flush=True,
                     )
                 # Zig's failed compiler command can span hundreds of KB.

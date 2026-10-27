@@ -12501,15 +12501,18 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "termite_metal_decode_gqa_split_eligible("));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "termite_metal_encode_decode_gqa_split_dispatch("));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "dispatchThreadgroups:MTLSizeMake(params->q_len, params->num_kv_heads, launch->params.split_count)"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(7)]]"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(3)]]"));
+    // The generic and dedicated OCR stage/reducer pairs share the schedule ABI.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(7)]]"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(3)]]"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "_Static_assert(sizeof(termite_metal_decode_gqa_split_params) == 16"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "[encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:7]"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "[encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:3]"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "const bool use_decode_1x = !use_decode_gqa_split"));
     // Cached decode also excludes explicit-position requests from the 1x path.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "const bool use_decode_1x = !has_explicit_positions && !use_decode_gqa_split"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "split_launch.scratch_bytes"));
+    // Both encoders retain scratch; coalesced attention also bounds and
+    // advances its pooled scratch slice.
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, host_source, "split_launch.scratch_bytes"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "launch->scratch_bytes"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "if (needs_explicit_split_barrier) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "runtime->decode_gqa_split_calls += 1"));

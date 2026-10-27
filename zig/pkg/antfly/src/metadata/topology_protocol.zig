@@ -138,56 +138,62 @@ const std = @import("std");
 /// Re-fence the complete index cohort so every admitted job can finish.
 /// Version 74 decodes query-population captures and sealed typed-row delivery.
 /// It does not authorize replaying a lost request-owned query evaluation.
-pub const current_version: u16 = 76;
-pub const sql_materialized_refresh_version: u16 = 76;
-pub const sql_materialized_view_version: u16 = 75;
-pub const sql_population_version: u16 = 74;
-pub const job_state_version: u16 = 73;
-pub const sql_drop_generation_version: u16 = 72;
-pub const sql_view_domains_version: u16 = 71;
-pub const sql_column_sequences_version: u16 = 70;
-pub const native_service_tables_version: u16 = 69;
-pub const resolver_records_version: u16 = 69;
+/// Private SQL capability floors are shifted above main's published v62 on
+/// integration. Historical versions 36–76 above describe development stages;
+/// their qualified floors are now 63–103. Main v62 must not admit SQL stages
+/// whose earlier development numbers happened to overlap its resolver protocol.
+/// Version 104 additionally combines main's indexed resolver replay and published
+/// tag 80; the private SQL delivery command uses the unallocated tag 90.
+pub const current_version: u16 = 104;
+pub const sql_materialized_refresh_version: u16 = 103;
+pub const sql_materialized_view_version: u16 = 102;
+pub const sql_population_version: u16 = 101;
+pub const job_state_version: u16 = 104;
+pub const sql_drop_generation_version: u16 = 99;
+pub const sql_view_domains_version: u16 = 98;
+pub const sql_column_sequences_version: u16 = 97;
+pub const native_service_tables_version: u16 = 96;
+pub const resolver_records_version: u16 = 104;
 /// Stable database/namespace annotations, without physical schema publication.
-pub const sql_resource_comments_version: u16 = 68;
-pub const fk_historical_references_version: u16 = 66;
+pub const sql_resource_comments_version: u16 = 95;
+pub const fk_historical_references_version: u16 = 93;
 /// Version 65 retains presentation metadata on stable column identities.
-pub const sql_column_comments_version: u16 = 65;
-/// Role-default patches share this branch's unreleased v63 reader cohort.
+pub const sql_column_comments_version: u16 = 92;
+/// Role-default patches share this branch's qualified SQL reader cohort.
 /// Earlier main readers reject empty/global role scopes; never admit one
 /// using only the original v12 setting-catalog floor.
-pub const sql_role_defaults_version: u16 = 63;
+pub const sql_role_defaults_version: u16 = 90;
 /// Sequence records retain their original SQL reader cohort.
-pub const sql_sequence_catalog_version: u16 = 63;
+pub const sql_sequence_catalog_version: u16 = 90;
 /// Version 64 binds validation-only publication to signed physical owner cuts,
 /// durable all-owner installation/publication/release barriers and recovery.
-pub const schema_validation_publication_version: u16 = 64;
+pub const schema_validation_publication_version: u16 = 91;
 /// The same unreleased cohort decodes bounded native reporter retirement jobs.
-pub const native_reporter_restart_version: u16 = 64;
-pub const sql_column_transform_version: u16 = 62;
-pub const fk_generation_column_addition_version: u16 = 61;
-pub const sql_row_policy_intent_version: u16 = 60;
-pub const sql_deferred_check_validation_version: u16 = 59;
-pub const initial_fk_checks_catalog_version: u16 = 59;
-pub const sql_row_policy_mutation_version: u16 = 58;
-pub const sql_view_catalog_version: u16 = 57;
-pub const index_publication_release_version: u16 = 73;
+pub const native_reporter_restart_version: u16 = 91;
+pub const sql_column_transform_version: u16 = 89;
+pub const fk_generation_column_addition_version: u16 = 88;
+pub const sql_row_policy_intent_version: u16 = 87;
+pub const sql_deferred_check_validation_version: u16 = 86;
+pub const initial_fk_checks_catalog_version: u16 = 86;
+pub const sql_row_policy_mutation_version: u16 = 85;
+pub const sql_view_catalog_version: u16 = 84;
+pub const index_publication_release_version: u16 = 100;
 // One coordinated floor for this unreleased protocol. A cohort capable only
 // of an earlier partial stage must not admit work that it cannot finish.
-pub const index_publication_installation_version: u16 = 73;
-pub const index_publication_decision_version: u16 = 73;
-pub const index_publication_head_version: u16 = 73;
-pub const index_delivery_version: u16 = 73;
+pub const index_publication_installation_version: u16 = 100;
+pub const index_publication_decision_version: u16 = 100;
+pub const index_publication_head_version: u16 = 100;
+pub const index_delivery_version: u16 = 100;
 /// Metadata replicas must validate ASCH/reader profile 34 before admitting it.
-pub const clock_defaults_reader_version: u16 = 67;
-pub const schema_reader_publication_version: u16 = 41;
-pub const schema_reader_floor_version: u16 = 40;
-pub const schema_reader_capability_version: u16 = 39;
-pub const index_publication_admission_version: u16 = 73;
-pub const checks_catalog_identity_version: u16 = 37;
+pub const clock_defaults_reader_version: u16 = 94;
+pub const schema_reader_publication_version: u16 = 68;
+pub const schema_reader_floor_version: u16 = 67;
+pub const schema_reader_capability_version: u16 = 66;
+pub const index_publication_admission_version: u16 = 100;
+pub const checks_catalog_identity_version: u16 = 64;
 /// Decoder floor for occupancy-capable reconciliation and name admission.
-pub const constraint_occupancy_version: u16 = 36;
-pub const resolver_namespaces_version: u16 = 63;
+pub const constraint_occupancy_version: u16 = 63;
+pub const resolver_namespaces_version: u16 = 104;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

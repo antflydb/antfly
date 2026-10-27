@@ -16,6 +16,8 @@
 //! Private, bounded resolver catalog reads. No public request supplies authority.
 const std = @import("std");
 const metadata = @import("table_manager.zig");
+pub const QueryHead = struct { table_id: u64, key_template: []const u8, stamp: @import("../metadata/resolver_authority.zig").records.Stamp };
+pub const QueryProfile = struct { name: []const u8, target: []const u8, id: []const u8 };
 
 /// Materialize one execution definition against the routing cut that admitted
 /// its owner. A concurrent catalog change must retry, never mix definitions.
@@ -37,13 +39,29 @@ pub const Request = struct {
     cursor: ?[]const u8 = null,
     standalone: bool = false,
     compact_consumers: bool = false,
+    /// Progress pages count individual resolver references, using individually
+    /// indexed resolver descriptors. Zero retains the admission paging contract.
+    consumer_limit: u32 = 0,
+    /// Admission already has native heads and indexed static profiles.
+    /// Only source-owned namespaces missing a head need consumer folding.
+    cold_only: bool = false,
     /// null expands all policies; an empty list is a descriptor/status cut.
     projection_names: ?[]const []const u8 = null,
     routing_siblings: bool = false,
+    /// Query execution hydrates only mention/candidate policy through authority reads.
+    policy_descriptors: bool = false,
+    compact_query: bool = false,
+    /// Resolve executes routing siblings for identity-template dependencies;
+    /// render only needs their label declarations. Verification reads headers.
+    query_execution: bool = true,
+    expected_query_fingerprint: ?[32]u8 = null,
+    /// Progress routing needs identity/ranges, never DDL or policy bodies.
+    identity_only: bool = false,
+    authority_admission: bool = false,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
+            const include = if (comptime std.mem.eql(u8, field, "compact_query")) self.compact_query else if (comptime std.mem.eql(u8, field, "authority_admission")) self.authority_admission else if (comptime std.mem.eql(u8, field, "identity_only")) self.identity_only else if (comptime std.mem.eql(u8, field, "query_execution")) !self.query_execution else if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -54,12 +72,18 @@ pub const Request = struct {
 };
 pub const Page = struct {
     version: u8,
+    query_fingerprint: ?[32]u8 = null,
+    query_heads: []const QueryHead = &.{},
+    /// null is a legacy reply; an empty set explicitly qualifies inline fallback.
+    query_profiles: ?[]const QueryProfile = null,
+    admission: ?@import("resolver_authority.zig").Admission = null,
     revision: u64,
     table: metadata.TableRecord,
     configs: ?[]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig = null,
     execution_indexes: ?[]const u8 = null,
     ranges: []metadata.RangeRecord = &.{},
     consumers: []const Consumer = &.{},
+    cold_profiles: []const @import("resolver_authority.zig").AliasProfile = &.{},
     visited: usize = 0,
     next_cursor: ?[]const u8 = null,
     indexed: bool = false,
@@ -69,7 +93,22 @@ pub const Page = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "configs")) {
+            if (comptime std.mem.eql(u8, field, "query_profiles")) {
+                if (self.query_profiles) |profiles| {
+                    try writer.objectField(field);
+                    try writer.write(profiles);
+                }
+            } else if (comptime std.mem.eql(u8, field, "admission")) {
+                if (self.admission) |proof| {
+                    try writer.objectField(field);
+                    try writer.write(proof);
+                }
+            } else if (comptime std.mem.eql(u8, field, "cold_profiles")) {
+                if (self.cold_profiles.len > 0) {
+                    try writer.objectField(field);
+                    try writer.write(self.cold_profiles);
+                }
+            } else if (comptime std.mem.eql(u8, field, "configs")) {
                 if (self.configs) |values| {
                     try writer.objectField(field);
                     try writer.beginArray();
@@ -98,7 +137,7 @@ pub const Page = struct {
         return .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = @constCast((&self.table)[0..1]), .ranges = self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
     }
 };
-pub const Cursor = struct { revision: u64, table_id: u64, key_digest: [32]u8, indexed: bool, after: []const u8 };
+pub const Cursor = struct { revision: u64, table_id: u64, key_digest: [32]u8, indexed: bool, after: []const u8, scoped: bool = false, namespace_index: usize = 0, progress_routes: bool = false, route_position: @import("antfly_local_sources").storage_db_resolver_authority.routes.Position = .{}, namespace_template: ?[]const u8 = null };
 pub fn keyDigest(key: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(key, &out, .{});
@@ -124,7 +163,7 @@ pub const Consumer = struct {
 };
 fn writeExecutionConfigs(writer: anytype, values: anytype) !void {
     try writer.beginArray();
-    for (values) |cfg| try cfg.jsonExecution(writer);
+    for (values) |cfg| try writer.write(@import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverAdmission.fromConfig(cfg, false));
     try writer.endArray();
 }
 
@@ -155,9 +194,12 @@ pub fn decodeConsumerReference(a: std.mem.Allocator, bytes: []const u8) !Consume
 test "resolver curation namespace propagation compact consumers retain unadopted merges" {
     const a = std.testing.allocator;
     const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
-    const cfg: Config = .{ .name = "legacy", .table = "entities", .key_template = "other/{{_entity.text}}", .source_artifact = "source", .resolution_artifact = "resolved", .merges = &.{.{ .key = "other/a", .target = "other/b" }}, .merge_generation = 7, .merge_state_version = 1 };
+    const cfg: Config = .{ .name = "legacy", .table = "entities", .key_template = "other/{{_entity.text}}", .source_artifact = "source", .resolution_artifact = "resolved", .merges = &.{.{ .key = "other/a", .target = "other/b" }}, .merge_generation = 7, .merge_state_version = 1, .scorer_json = "SCORER_PROMPT_MUST_STAY_WITH_EXECUTION", .name_embedding = "EXECUTION_EMBEDDER" };
     const bytes = try std.json.Stringify.valueAlloc(a, ConsumerReference{ .source_id = 2, .source_name = "source", .configs = &.{cfg} }, .{});
     defer a.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "SCORER_PROMPT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "EXECUTION_EMBEDDER") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "scorer_json") == null);
     {
         var row_arena = std.heap.ArenaAllocator.init(a);
         defer row_arena.deinit();
@@ -171,6 +213,9 @@ test "resolver curation namespace propagation compact consumers retain unadopted
     }
     const reference = try std.json.parseFromSlice(ConsumerReference, a, bytes, .{});
     defer reference.deinit();
+    try std.testing.expectEqualStrings("", reference.value.configs[0].scorer_json);
+    try std.testing.expectEqualStrings("", reference.value.configs[0].source_artifact);
+    try std.testing.expectEqual(@as(u64, 7), reference.value.configs[0].effectiveGeneration());
     try std.testing.expect(Config.aliasesEqual(cfg.merges, reference.value.configs[0].merges));
     const page_bytes = try std.json.Stringify.valueAlloc(a, Consumer{ .table = .{ .table_id = 2, .name = "source" }, .names = &.{"legacy"}, .configs = reference.value.configs }, .{});
     defer a.free(page_bytes);

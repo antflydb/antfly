@@ -79,27 +79,19 @@ pub const native_resolver_records_reader_version: u32 = 12;
 pub const resolver_projection_bindings_reader_version: u32 = 13;
 pub const resolver_projection_work_reader_version: u32 = 14;
 pub const resolver_projection_delta_reader_version: u32 = 15;
-pub const supported_reader_version: u32 = resolver_projection_delta_reader_version;
+pub const resolver_static_profiles_reader_version: u32 = 19;
+pub const resolver_pin_index_reader_version: u32 = 23;
+pub const supported_reader_version: u32 = resolver_pin_index_reader_version;
 
+const reader_version_encodings = blk: {
+    @setEvalBranchQuota(10000);
+    var encodings: [supported_reader_version + 1][]const u8 = undefined;
+    for (&encodings, 0..) |*encoding, version| encoding.* = std.fmt.comptimePrint("{d}", .{version});
+    break :blk encodings;
+};
 pub fn readerVersionBytes(version: u32) ![]const u8 {
-    return switch (version) {
-        1 => "1",
-        2 => "2",
-        3 => "3",
-        4 => "4",
-        5 => "5",
-        6 => "6",
-        7 => "7",
-        8 => "8",
-        9 => "9",
-        10 => "10",
-        11 => "11",
-        12 => "12",
-        13 => "13",
-        14 => "14",
-        15 => "15",
-        else => error.UnsupportedDatabaseReaderVersion,
-    };
+    if (version == 0 or version > supported_reader_version) return error.UnsupportedDatabaseReaderVersion;
+    return reader_version_encodings[version];
 }
 
 pub fn versionedCatalog(a: Allocator, data: []const u8, version: u32) ![]u8 {
@@ -288,6 +280,7 @@ pub const ResolverObservation = struct {
     retired: bool,
     promote: bool,
     config_generation: u64,
+    effective_generation: u64 = 0,
     namespace_generation: u64,
     curation_revision: u64,
     namespace_curation_table_id: u64,
@@ -300,13 +293,63 @@ pub const ResolverObservation = struct {
         const table = try a.dupe(u8, cfg.table);
         errdefer a.free(table);
         const template = try a.dupe(u8, cfg.key_template);
-        return .{ .name = name, .table = table, .key_template = template, .retired = cfg.retired, .promote = cfg.promote, .config_generation = cfg.config_generation, .namespace_generation = cfg.namespace_generation, .curation_revision = cfg.curation_revision, .namespace_curation_table_id = cfg.namespace_curation_table_id, .namespace_curation_generation = cfg.namespace_curation_generation, .namespace_curation_missing = cfg.namespace_curation_missing };
+        return .{ .name = name, .table = table, .key_template = template, .retired = cfg.retired, .promote = cfg.promote, .config_generation = cfg.config_generation, .effective_generation = cfg.effectiveGeneration(), .namespace_generation = cfg.namespace_generation, .curation_revision = cfg.curation_revision, .namespace_curation_table_id = cfg.namespace_curation_table_id, .namespace_curation_generation = cfg.namespace_curation_generation, .namespace_curation_missing = cfg.namespace_curation_missing };
     }
     pub fn deinit(self: *ResolverObservation, a: Allocator) void {
         a.free(self.name);
         a.free(self.table);
         a.free(self.key_template);
         self.* = undefined;
+    }
+};
+
+/// Shared curation admission contract. These fields suffice to fold legacy
+/// namespace policy, retain static declarations and fence owner publication.
+/// Execution prompts, providers, artifacts and embedding selectors never travel
+/// with an entity consumer. Empty artifact fields keep the private wire shape
+/// readable by existing ResolverConfig decoders; this is not executable config.
+pub const ResolverAdmission = struct {
+    name: []const u8,
+    table: []const u8,
+    key_template: []const u8,
+    source_artifact: []const u8 = "",
+    resolution_artifact: []const u8 = "",
+    admission_profile: []const u8 = "",
+    aliases: []const resolver_lib.KeyAlias = &.{},
+    suppress_json: []const u8 = "",
+    merges: []const resolver_lib.KeyAlias = &.{},
+    curation_json: []const u8 = "{}",
+    merge_generation: u64 = 0,
+    merge_state_version: u32 = 0,
+    resolution_generation: u64 = 0,
+    namespace_generation: u64 = 0,
+    config_generation: u64 = 0,
+    curation_revision: u64 = 0,
+    namespace_curation_generation: u64 = 0,
+    namespace_curation_table_id: u64 = 0,
+    namespace_curation_missing: bool = false,
+    retired: bool = false,
+    promote: bool = true,
+
+    pub fn fromConfig(cfg: ResolverConfig, namespace_owned: bool) ResolverAdmission {
+        var result: ResolverAdmission = .{ .name = cfg.name, .table = cfg.table, .key_template = cfg.key_template };
+        inline for (@typeInfo(ResolverAdmission).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "source_artifact") and !std.mem.eql(u8, field, "resolution_artifact")) @field(result, field) = @field(cfg, field);
+        }
+        if (namespace_owned) {
+            result.merges = &.{};
+            result.curation_json = "{}";
+        }
+        return result;
+    }
+    /// Borrowed adapter for policy helpers shared with resolver execution.
+    pub fn config(self: ResolverAdmission) ResolverConfig {
+        var result: ResolverConfig = .{ .name = self.name, .table = self.table, .key_template = self.key_template, .source_artifact = "", .resolution_artifact = "" };
+        inline for (@typeInfo(ResolverAdmission).@"struct".field_names) |field| @field(result, field) = @field(self, field);
+        return result;
+    }
+    pub fn cloneConfig(a: Allocator, cfg: ResolverConfig, namespace_owned: bool) !ResolverConfig {
+        return ResolverConfig.clone(a, fromConfig(cfg, namespace_owned).config());
     }
 };
 
@@ -327,6 +370,7 @@ pub const ResolverConfig = struct {
     /// Template that renders a canonical entity key from a mention.
     key_template: []const u8,
     /// Explicit key redirects, usable without entity promotion.
+    admission_profile: []const u8 = "",
     aliases: []const resolver_lib.KeyAlias = &.{},
     /// API-created redirects are durable identity state, never inline config.
     merges: []const resolver_lib.KeyAlias = &.{},
@@ -506,7 +550,7 @@ pub const ResolverConfig = struct {
     pub fn effectiveAliasesAlloc(self: ResolverConfig, alloc: Allocator) ![]const resolver_lib.KeyAlias {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        const curation = try resolver_lib.curation.Index.init(arena.allocator(), self.suppress_json, self.curation_json);
+        const curation = try resolver_lib.curation.Index.init(arena.allocator(), "", self.curation_json);
         var curated: std.StringHashMapUnmanaged(void) = .empty;
         for (self.merges) |alias| try curated.put(arena.allocator(), alias.key, {});
         var result: std.ArrayList(resolver_lib.KeyAlias) = .empty;
@@ -530,7 +574,7 @@ pub const ResolverConfig = struct {
                     .adjudicate_json, .suppress_json, .curation_json => @field(self, field).len == 0,
                     .namespace_curation_missing, .retired => !@field(self, field),
                     .namespace_curation_table_id, .namespace_curation_generation, .curation_revision, .merge_generation, .merge_state_version, .resolution_generation, .namespace_generation => @field(self, field) == 0,
-                    .aliases, .replacement_index, .replacement_resolver => @field(self, field).len == 0,
+                    .aliases, .admission_profile, .replacement_index, .replacement_resolver => @field(self, field).len == 0,
                     .promote => self.promote,
                     .inline_managed => self.inline_managed == null,
                     .retain_work => self.retain_work == .full,
@@ -606,6 +650,23 @@ pub const ResolverConfig = struct {
         return self.replacement_index.len == 0 or std.mem.eql(u8, self.replacement_index, index_name);
     }
 
+    /// Pure source declaration: asynchronous authority projection clocks are
+    /// checked separately through native head stamps.
+    pub fn queryDefinitionFingerprint(cfg: ResolverConfig, a: Allocator) ![32]u8 {
+        var copy = cfg;
+        copy.merges = &.{};
+        copy.curation_json = "";
+        copy.curation_revision = 0;
+        copy.merge_generation = 0;
+        copy.merge_state_version = 0;
+        copy.namespace_generation = 0;
+        copy.namespace_curation_generation = 0;
+        copy.namespace_curation_table_id = 0;
+        copy.namespace_curation_missing = false;
+        copy.shared_projection = null;
+        copy.validation_proof = null;
+        return resolver_lib.fingerprint(a, copy);
+    }
     pub fn clone(alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
         var owned = cfg;
         owned.shared_projection = null;
@@ -669,6 +730,7 @@ pub const ResolverConfig = struct {
         if (self.candidate_ann_index.len > 0) alloc.free(@constCast(self.candidate_ann_index));
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
         if (self.fusion_combine.len > 0) alloc.free(@constCast(self.fusion_combine));
+        if (self.admission_profile.len > 0) alloc.free(self.admission_profile);
         if (self.replacement_index.len > 0) alloc.free(self.replacement_index);
         if (self.replacement_resolver.len > 0) alloc.free(self.replacement_resolver);
         self.* = undefined;
@@ -694,6 +756,7 @@ pub const ResolverConfig = struct {
         try @import("../resolver_authority.zig").validateProfile(a, .{ .key_template = self.key_template, .merges = self.merges, .state = try resolver_lib.curation.parseState(a, self.curation_json) }, self.aliases, self.suppress_json);
     }
     pub fn validateDefinition(self: ResolverConfig) !void {
+        if (self.admission_profile.len != 0) return error.InvalidResolverConfig;
         if (self.adjudicate_json.len > 0) {
             if (self.scorer_json.len == 0) return error.InvalidResolverConfig;
             try @import("../../../functions/resolver_adjudication.zig").validate(std.heap.page_allocator, self.adjudicate_json);
@@ -1429,6 +1492,15 @@ test "resolver catalog shares immutable native policy in memory and after reopen
     }
     // No JSON input can manufacture a runtime ownership reference.
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(ResolverConfig, a, "{\"name\":\"r\",\"table\":\"t\",\"source_artifact\":\"s\",\"resolution_artifact\":\"o\",\"key_template\":\"{{_key}}\",\"shared_projection\":{}}", .{}));
+}
+
+test "resolver curation reader floors encode every supported version" {
+    for (1..supported_reader_version + 1) |version| {
+        const encoded = try readerVersionBytes(@intCast(version));
+        try std.testing.expectEqual(version, try std.fmt.parseInt(usize, encoded, 10));
+    }
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(0));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(supported_reader_version + 1));
 }
 
 test "resolver catalog encoding preserves optional empty projection dictionaries" {

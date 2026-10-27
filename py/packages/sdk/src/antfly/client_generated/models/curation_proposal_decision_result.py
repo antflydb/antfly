@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.curation_proposal import CurationProposal
     from ..models.curation_proposal_decision_result_results_item import CurationProposalDecisionResultResultsItem
+    from ..models.entity_namespace_outcome import EntityNamespaceOutcome
 
 
 T = TypeVar("T", bound="CurationProposalDecisionResult")
@@ -26,6 +27,9 @@ class CurationProposalDecisionResult:
         changed (bool | Unset):
         atomicity (CurationProposalDecisionResultAtomicity | Unset):
         applied (bool | Unset):
+        progress_url (str | Unset): Relative native consumer-progress resource; resolve against the decision request
+            URI.
+        namespaces (list[EntityNamespaceOutcome] | Unset):
         results (list[CurationProposalDecisionResultResultsItem] | Unset):
     """
 
@@ -34,6 +38,8 @@ class CurationProposalDecisionResult:
     changed: bool | Unset = UNSET
     atomicity: CurationProposalDecisionResultAtomicity | Unset = UNSET
     applied: bool | Unset = UNSET
+    progress_url: str | Unset = UNSET
+    namespaces: list[EntityNamespaceOutcome] | Unset = UNSET
     results: list[CurationProposalDecisionResultResultsItem] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -51,6 +57,15 @@ class CurationProposalDecisionResult:
             atomicity = self.atomicity.value
 
         applied = self.applied
+
+        progress_url = self.progress_url
+
+        namespaces: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.namespaces, Unset):
+            namespaces = []
+            for namespaces_item_data in self.namespaces:
+                namespaces_item = namespaces_item_data.to_dict()
+                namespaces.append(namespaces_item)
 
         results: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.results, Unset):
@@ -72,6 +87,10 @@ class CurationProposalDecisionResult:
             field_dict["atomicity"] = atomicity
         if applied is not UNSET:
             field_dict["applied"] = applied
+        if progress_url is not UNSET:
+            field_dict["progress_url"] = progress_url
+        if namespaces is not UNSET:
+            field_dict["namespaces"] = namespaces
         if results is not UNSET:
             field_dict["results"] = results
 
@@ -81,6 +100,7 @@ class CurationProposalDecisionResult:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.curation_proposal import CurationProposal
         from ..models.curation_proposal_decision_result_results_item import CurationProposalDecisionResultResultsItem
+        from ..models.entity_namespace_outcome import EntityNamespaceOutcome
 
         d = dict(src_dict)
         _proposal = d.pop("proposal", UNSET)
@@ -103,6 +123,17 @@ class CurationProposalDecisionResult:
 
         applied = d.pop("applied", UNSET)
 
+        progress_url = d.pop("progress_url", UNSET)
+
+        _namespaces = d.pop("namespaces", UNSET)
+        namespaces: list[EntityNamespaceOutcome] | Unset = UNSET
+        if _namespaces is not UNSET:
+            namespaces = []
+            for namespaces_item_data in _namespaces:
+                namespaces_item = EntityNamespaceOutcome.from_dict(namespaces_item_data)
+
+                namespaces.append(namespaces_item)
+
         _results = d.pop("results", UNSET)
         results: list[CurationProposalDecisionResultResultsItem] | Unset = UNSET
         if _results is not UNSET:
@@ -118,6 +149,8 @@ class CurationProposalDecisionResult:
             changed=changed,
             atomicity=atomicity,
             applied=applied,
+            progress_url=progress_url,
+            namespaces=namespaces,
             results=results,
         )
 

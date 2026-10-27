@@ -108,13 +108,15 @@ transaction. Reverse physical bindings distinguish tables from materializations
 without scanning the catalog. Legacy ordinary-view records retain their bytes.
 
 The admission capture binds the logical owner, principal instance and exact
-physical output layout. Metadata decoder v75 and native owner protocol v4 are
+physical output layout. Metadata decoder v102 and native owner protocol v4 are
 required before reservation; rejected mixed-version attempts do not raise the
 data floor. Table records preserve backing ownership through binary projections,
 cloning and snapshots. The compiled metadata client forwards planning through the
 same native method, including its deadline. Native ABI v77 added an append-only
 write-rejection status while preserving main's published numeric identities;
-v78 qualifies the refresh planning projection.
+v78 qualifies the refresh planning projection. Integration with main v62
+requalifies the private SQL metadata floors above that published cohort; the
+combined resolver/SQL metadata decoder is v104.
 
 Reads authorize the logical relation and use the existing SQL read/filter path
 over its bound physical generation. They verify that the descriptor still names
@@ -151,8 +153,8 @@ Planning point-reads the expected logical identity and generation, then obtains
 its bounded indexed physical range set. It preserves the output schema and
 placement declaration while allocating a new physical generation. The admitted
 plan binds both predecessor and successor, the unchanged definition and exact
-logical/output identities. Refresh requires metadata decoder v76 before
-reservation; creation remains v75 and the native owner protocol remains v4.
+logical/output identities. Refresh requires metadata decoder v103 before
+reservation; creation remains v102 and the native owner protocol remains v4.
 
 After producer EOF releases source readers, the shared overwrite worker validates
 and seals output, fences the old owners and atomically publishes the new backing.

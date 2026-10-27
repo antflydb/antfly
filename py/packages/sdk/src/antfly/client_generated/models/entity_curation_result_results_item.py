@@ -28,7 +28,8 @@ class EntityCurationResultResultsItem:
         canonical_key (str | Unset):
         curation (EntityCurationResultResultsItemCuration | Unset):
         revision (int | Unset):
-        absorbed (list[EntityCurationResultResultsItemAbsorbedItem] | Unset):
+        absorbed (list[EntityCurationResultResultsItemAbsorbedItem] | Unset): Legacy per-consumer outcomes; native
+            mutations return namespaces instead.
         changed (bool | Unset):
         replay_sequence (int | Unset):
         applied (bool | Unset):

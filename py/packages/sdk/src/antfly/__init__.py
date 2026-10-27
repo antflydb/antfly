@@ -299,8 +299,10 @@ __all__ = [
 ]
 
 from .client_generated.models import (
+    EntityConsumerProgressPage,
     EntityCurationResult,
     EntityMergeRequest,
+    EntityNamespaceOutcome,
     GraphResolverSuppressionConfig,
     ResolverCurationState,
     ResolverList,
@@ -324,6 +326,8 @@ from .resolvers import CurationProposalOperations, EntityOperations, ResolverOpe
 
 __all__ += [
     "EntityCurationResult",
+    "EntityConsumerProgressPage",
+    "EntityNamespaceOutcome",
     "EntityMergeRequest",
     "GraphResolverSuppressionConfig",
     "ResolverCurationState",

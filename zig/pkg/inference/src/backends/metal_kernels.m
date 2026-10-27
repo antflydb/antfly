@@ -346,7 +346,7 @@ static void termite_metal_jit_exact_pipeline_entry_copy(
 #define TERMITE_METAL_OPERATOR_UNKNOWN 255u
 
 static bool termite_metal_env_flag_enabled(const char *value);
-int termite_metal_qualified_m4_device_default(void);
+int termite_metal_apple_simdgroup_device_default(void);
 
 // Mirrors zig/lib/platform/src/env.zig getenvBoolDefault: unset -> default,
 // empty/"0"/"false"/"no"/"off" -> false, any other value -> true (the same
@@ -357,8 +357,8 @@ static BOOL termite_metal_env_bool_default(const char *env_name, BOOL default_va
     return termite_metal_env_flag_enabled(value) ? YES : NO;
 }
 
-static BOOL termite_metal_qualified_m4_feature_enabled(const char *env_name) {
-    return termite_metal_env_bool_default(env_name, termite_metal_qualified_m4_device_default() != 0);
+static BOOL termite_metal_apple_simdgroup_feature_enabled(const char *env_name) {
+    return termite_metal_env_bool_default(env_name, termite_metal_apple_simdgroup_device_default() != 0);
 }
 
 // The serving preset changes execution policy only. Explicit per-feature
@@ -367,7 +367,7 @@ static BOOL termite_metal_lightonocr3_profile_feature_enabled(const char *name) 
     const char *value = getenv(name);
     if (value != NULL) return termite_metal_env_flag_enabled(value);
     return termite_metal_env_flag_enabled(getenv("ANTFLY_LIGHTONOCR3_THROUGHPUT")) &&
-        termite_metal_qualified_m4_device_default() != 0;
+        termite_metal_apple_simdgroup_device_default() != 0;
 }
 
 static BOOL termite_metal_generated_quant_disabled(void) {
@@ -1422,6 +1422,7 @@ typedef struct termite_metal_decode_runtime {
     BOOL embeddinggemma2_rms_norm_enabled;
     BOOL qwen35_ocr_vector_loads_enabled;
     BOOL lightonocr3_projections_enabled;
+    BOOL lightonocr3_local_initialization_attempted;
     bool lighton_vision_mpp_required;
     // Immutable only while this frame is active; refresh on every begin so
     // subsequent frame controls never inherit a process-global cached flag.
@@ -1694,7 +1695,7 @@ typedef struct termite_metal_decode_runtime {
     uint8_t q4_0_pair_activation_mm_variant_override;
     uint8_t decode_gqa_split_swa_variant_override;
     uint8_t decode_gqa_split_global_variant_override;
-    BOOL apple_m4_device;
+    BOOL apple_simdgroup_device;
     BOOL prefill_direct_kv_enabled;
     BOOL swa_scan_clamp_enabled;
     BOOL fast_prepared_frame_enabled;
@@ -20949,13 +20950,12 @@ static termite_metal_q4_0_mmv_selection termite_metal_select_q4_0_mmv(
         effective_override != TERMITE_METAL_Q4_0_MMV_VARIANT_LEGACY)
     {
         if (effective_override == TERMITE_METAL_Q4_0_MMV_VARIANT_AUTO) {
-            // Only the explicitly identified M4 generation is qualified.
-            // Keep M3, older, and future devices on the legacy shape policy
-            // until they have their own measured portfolio decision.
-            const BOOL is_m4_gemma4_ffn = runtime->apple_m4_device &&
+            // Use the model geometry on compatible Apple SIMD-group devices.
+            // Missing pipelines still retain the legacy variant below.
+            const BOOL is_gemma4_ffn = runtime->apple_simdgroup_device &&
                 ((descriptor->in_dim == 2560u && descriptor->out_dim == 10240u) ||
                  (descriptor->in_dim == 10240u && descriptor->out_dim == 2560u));
-            if (is_m4_gemma4_ffn && !runtime->q4_0_small_reduce_disabled) {
+            if (is_gemma4_ffn && !runtime->q4_0_small_reduce_disabled) {
                 selected_variant = TERMITE_METAL_Q4_0_MMV_VARIANT_NR4_NSG2;
             }
         } else {
@@ -20978,7 +20978,7 @@ static termite_metal_q4_0_mmv_selection termite_metal_select_q4_0_mmv(
     }
     const BOOL a4b_ffn_down_nq8 =
         selected_variant == TERMITE_METAL_Q4_0_MMV_VARIANT_NR4_NSG4 &&
-        runtime->apple_m4_device &&
+        runtime->apple_simdgroup_device &&
         descriptor->in_dim == 2112u && descriptor->out_dim == 2816u &&
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_A4B_FFN_NQ8")) &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_A4B_FFN_NQ8"));
@@ -20990,7 +20990,7 @@ static termite_metal_q4_0_mmv_selection termite_metal_select_q4_0_mmv(
          descriptor->out_dim == 2816u);
     const BOOL a4b_attention_nq8 =
         selected_variant == TERMITE_METAL_Q4_0_MMV_VARIANT_NR4_NSG4 &&
-        runtime->apple_m4_device &&
+        runtime->apple_simdgroup_device &&
         workload == TERMITE_METAL_Q4_0_MMV_WORKLOAD_ATTENTION &&
         a4b_attention_shape &&
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_A4B_ATTENTION_NQ8")) &&
@@ -21110,7 +21110,7 @@ termite_metal_select_q4_0_pair_activation_mmv(
         (termite_metal_q4_0_pair_activation_mmv_variant)
             runtime->q4_0_pair_activation_mmv_variant_override;
     if (override == TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT_AUTO) {
-        if (runtime->apple_m4_device &&
+        if (runtime->apple_simdgroup_device &&
             descriptor->in_dim == 2560u && descriptor->out_dim == 10240u)
         {
             selected = TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT_NR4_NSG2;
@@ -21130,7 +21130,7 @@ termite_metal_select_q4_0_pair_activation_mmv(
     }
     const BOOL a4b_ffn_pair_nq8 =
         selected == TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT_NR4_NSG2 &&
-        runtime->apple_m4_device &&
+        runtime->apple_simdgroup_device &&
         descriptor->in_dim == 2816u && descriptor->out_dim == 2112u &&
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_A4B_FFN_NQ8")) &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_A4B_FFN_NQ8"));
@@ -21173,7 +21173,7 @@ typedef struct termite_metal_q4_0_pair_activation_mm_selection {
 // embedding workspace. An explicit opt-in retains the wider diagnostic scope.
 static BOOL termite_metal_qwen_short_rows_enabled(termite_metal_decode_runtime *runtime) {
     return termite_metal_env_bool_default("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS",
-        runtime != NULL && runtime->apple_m4_device && runtime->embedding_workspace_bounded);
+        runtime != NULL && runtime->apple_simdgroup_device && runtime->embedding_workspace_bounded);
 }
 
 static BOOL termite_metal_q4_0_pair_activation_mm_shape_enabled(
@@ -21189,7 +21189,7 @@ static BOOL termite_metal_q4_0_pair_activation_mm_enabled_for_shape(
 ) {
     if (runtime == NULL || !runtime->q4_0_pair_activation_mm_enabled) return NO;
     const BOOL e2b_enabled =
-        termite_metal_qualified_m4_feature_enabled("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM") &&
+        termite_metal_apple_simdgroup_feature_enabled("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM") &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_E2B_Q4_0_PAIR_ACTIVATION_MM"));
     return termite_metal_q4_0_pair_activation_mm_shape_enabled(
         in_dim, out_dim, runtime->q4_0_pair_activation_mm_e4b_enabled, e2b_enabled);
@@ -21212,7 +21212,7 @@ termite_metal_select_q4_0_pair_activation_mm(
     termite_metal_q4_0_pair_activation_mm_selection selection = {0};
     if (runtime == NULL || descriptor == NULL ||
         !termite_metal_q4_0_pair_activation_mm_enabled_for_shape(runtime, descriptor->in_dim, descriptor->out_dim) ||
-        !runtime->apple_m4_device ||
+        !runtime->apple_simdgroup_device ||
         descriptor->format != TERMITE_METAL_QUANT_FORMAT_Q4_0 ||
         descriptor->rows < 9u ||
         descriptor->input_dtype != TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32 ||
@@ -24044,7 +24044,7 @@ static bool termite_metal_q4_k_mmv_v2_selected(
     }
     if (cached == 1) return true;
     if (cached == 2) return false;
-    return runtime != NULL && runtime->apple_m4_device &&
+    return runtime != NULL && runtime->apple_simdgroup_device &&
         workload == TERMITE_METAL_Q4_0_MMV_WORKLOAD_TAIL && out_dim >= 32768u;
 }
 
@@ -24293,7 +24293,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
                         descriptor->out_dim == 1536u);
                 const BOOL q4_0_mm_sg_aligned_e2b =
                     q4_0_mm_sg_aligned_e2b_shape &&
-                    termite_metal_qualified_m4_feature_enabled("TERMITE_METAL_ENABLE_E2B_Q4_0_MM_SG_ALIGNED") &&
+                    termite_metal_apple_simdgroup_feature_enabled("TERMITE_METAL_ENABLE_E2B_Q4_0_MM_SG_ALIGNED") &&
                     !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_E2B_Q4_0_MM_SG_ALIGNED"));
                 const BOOL q4_0_mm_sg_aligned_override =
                     termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_MM_SG_ALIGNED"));
@@ -26637,21 +26637,29 @@ static bool termite_metal_prefill_direct_kv_enabled_for_device(id<MTLDevice> dev
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_QWEN3VL_PREFILL_SG_ATTENTION"));
 }
 
+// Apple7 is the SIMD-group reduction/matrix baseline (M1 and later). Feature
+// eligibility is forward compatible; individual kernels still validate their
+// compiled pipeline and resource envelope before dispatch.
+static bool termite_metal_apple_simdgroup_device(id<MTLDevice> device) {
+    return device != nil && [device respondsToSelector:@selector(supportsFamily:)] &&
+        [device supportsFamily:MTLGPUFamilyApple7];
+}
+
 static bool termite_metal_fast_prepared_frame_enabled_for_device(id<MTLDevice> device, uint16_t apple_gpu_family) {
+    (void)apple_gpu_family;
     if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME"))) return false;
-    return device != nil && apple_gpu_family == 9u && [device.name hasPrefix:@"Apple M4"];
+    return termite_metal_apple_simdgroup_device(device);
 }
 
 // Serving qualification is a hardware property. Keep it independent of the
 // fast-prepared-frame kill switch so unrelated rollback flags stay isolated.
-int termite_metal_qualified_m4_device_default(void) {
+int termite_metal_apple_simdgroup_device_default(void) {
     static int qualified = 0;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         @autoreleasepool {
             id<MTLDevice> device = termite_metal_shared_device();
-            qualified = device != nil && termite_metal_device_apple_gpu_family(device) == 9u &&
-                [device.name hasPrefix:@"Apple M4"];
+            qualified = termite_metal_apple_simdgroup_device(device);
         }
     });
     return qualified;
@@ -26703,10 +26711,10 @@ static bool termite_metal_a4b_flash_prefill_hd256_shape(
         head_dim == 256u && sliding_window == 1024u;
 }
 
-// Gemma4 E2B MQA (8Q/1KV) defaults on for qualified M4 devices. Its exact
+// Gemma4 E2B MQA (8Q/1KV) defaults on for compatible Apple GPUs. Its exact
 // geometry and independent rollback keep the E4B and A4B policies isolated.
 static bool termite_metal_e2b_flash_prefill_hd256_enabled(void) {
-    return termite_metal_qualified_m4_feature_enabled(
+    return termite_metal_apple_simdgroup_feature_enabled(
                "TERMITE_METAL_ENABLE_E2B_FLASH_PREFILL_HD256") &&
         !termite_metal_env_flag_enabled(
                getenv("TERMITE_METAL_DISABLE_E2B_FLASH_PREFILL_HD256"));
@@ -26943,7 +26951,7 @@ int termite_metal_decode_runtime_lighton_attention_batch_begin(
     termite_metal_decode_runtime *runtime) {
   if (runtime == NULL || runtime->active_frame_cb == nil ||
       runtime->lighton_attention_batch != NULL ||
-      !termite_metal_qualified_m4_device_default())
+      !termite_metal_apple_simdgroup_device_default())
     return -1;
   const size_t bank = runtime->active_frame_decode_gqa_split_scratch_slot & 1u;
   if (runtime->lighton_attention_batch_scratch[bank] == nil) {
@@ -27459,8 +27467,7 @@ static bool termite_metal_decode_gqa_split_eligible(
     if (launch_out != NULL) memset(launch_out, 0, sizeof(*launch_out));
     if (strict_failure_out != NULL) *strict_failure_out = false;
     if (runtime == NULL) return false;
-    const bool lightonocr3_shape = runtime->qwen35_ocr_vector_loads_enabled &&
-        termite_metal_qualified_m4_device_default() && q_len == 1u &&
+    const bool lightonocr3_shape = runtime->qwen35_ocr_vector_loads_enabled && q_len == 1u &&
         head_dim == 256u && sliding_window == 0u &&
         ((num_heads == 8u && num_kv_heads == 2u) || (num_heads == 16u && num_kv_heads == 4u));
     size_t min_kv_tokens = runtime->decode_gqa_split_min_kv_explicit
@@ -30266,11 +30273,33 @@ static bool termite_metal_a4b_simd4_rms_norm_rows_preferred(
     return enabled == 1 && rows >= 1u && rows <= 32u && hidden_size >= 128u && (hidden_size % 4u) == 0u;
 }
 
-// Model-scoped rollout: the shared provider lease is held by its owner.
+// Model-scoped policy; dispatchers check the actual pipeline's resource limits.
+// Device marketing names do not describe kernel compatibility.
 void termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(termite_metal_decode_runtime *runtime, int enabled) {
     if (runtime == NULL) return;
-    runtime->qwen35_ocr_vector_loads_enabled = enabled != 0 &&
-        [runtime->device.name isEqualToString:@"Apple M4 Max"];
+    runtime->qwen35_ocr_vector_loads_enabled = enabled != 0;
+}
+
+static void termite_metal_initialize_lightonocr3_local(termite_metal_decode_runtime *runtime) {
+    if (runtime->lightonocr3_local_initialization_attempted) return;
+    runtime->lightonocr3_local_initialization_attempted = YES;
+    id<MTLDevice> device = runtime->device;
+    id<MTLLibrary> library = runtime->library;
+    // Build these only for the model owner. Missing/unsupported PSOs remain nil
+    // and the per-dispatch SIMD/threadgroup checks retain the fallback routes.
+    for(size_t b=0;b<2;b++) {
+        runtime->lightonocr3_local_gate_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_gate_vec%zu_16_2",b+2]);
+        runtime->lightonocr3_local_down_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_proj_vec%zu_32_4",b+2]);
+    }
+    for(size_t b=0;b<3;b++)runtime->lightonocr3_local_projection_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_proj_vec%zu_16_%zu",b+2,b==2?(size_t)4:(size_t)2]);
+    runtime->lightonocr3_local_down_vector4=termite_metal_make_pipeline(device,library,@"termite_lightonocr3_local_proj_vec4_16_2");
+    for(size_t model=0;model<2;model++)for(size_t row=0;row<8;row++)
+        runtime->lightonocr3_recurrent_gate_vectors[model][row]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_recurrent_gate_%zu_%zu_32_1",row+1,model?(size_t)16:(size_t)8]);
+    const size_t caps[6]={4,4,4,4,2,2},lanes[6]={16,16,32,32,16,32},tiles[6]={2,4,4,8,4,8};
+    for(size_t tile=0;tile<4;tile++)for(size_t row=0;row<4;row++)
+        runtime->lightonocr3_decode_chunks[tile][row]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_chunk_%zu_%zu_%zu",row+1,lanes[tile],tiles[tile]]);
+    for(size_t tile=0;tile<6;tile++)for(size_t row=0;row<3;row++)
+        runtime->lightonocr3_decode_tails[tile][row]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_decode_%zu_%zu_%zu_%zu",row+5,caps[tile],lanes[tile],tiles[tile]]);
 }
 
 int termite_metal_decode_runtime_lightonocr3_batch_projection_available(termite_metal_decode_runtime *runtime, size_t rows, size_t in_dim) {
@@ -30379,8 +30408,8 @@ int termite_metal_decode_runtime_require_lighton_vision_mpp(termite_metal_decode
 void termite_metal_decode_runtime_set_lightonocr3_projections(termite_metal_decode_runtime *runtime, int enabled) {
     if (runtime == NULL)
         return;
-    runtime->lightonocr3_projections_enabled =
-        enabled != 0 && [runtime->device.name isEqualToString:@"Apple M4 Max"];
+    runtime->lightonocr3_projections_enabled = enabled != 0;
+    if (runtime->lightonocr3_projections_enabled) termite_metal_initialize_lightonocr3_local(runtime);
     if (runtime->lightonocr3_projections_enabled) termite_metal_initialize_lightonocr3_recurrent(runtime);
     if (runtime->lightonocr3_projections_enabled &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS")) &&
@@ -31026,9 +31055,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->precise_library = precise_library;
         runtime->precise_library_safe = precise_library_safe;
         runtime->apple_gpu_family = termite_metal_device_apple_gpu_family(device);
-        runtime->apple_m4_device = device != nil &&
-            runtime->apple_gpu_family == 9u &&
-            [device.name hasPrefix:@"Apple M4"];
+        runtime->apple_simdgroup_device = termite_metal_apple_simdgroup_device(device);
         runtime->prefill_direct_kv_enabled = termite_metal_prefill_direct_kv_enabled_for_device(
             device,
             runtime->apple_gpu_family);
@@ -31131,21 +31158,21 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             runtime,
             TERMITE_METAL_Q4_0_MMV_WORKLOAD_TAIL,
             "TERMITE_METAL_Q4_0_MMV_TAIL_VARIANT");
-        // Default-on for the qualified M4 generation: interleaved A/B measured
+        // Default-on for compatible Apple GPUs: interleaved A/B measured
         // a repeatable win with bit-identical tokens on E2B and E4B, and the
         // fusion removes ~84 dispatches/frame (2 matvecs + activation-multiply
         // -> 1 pair kernel per FFN). Other devices stay opt-in until they earn
         // their own measured decision.
         runtime->q4_0_pair_activation_fusion_enabled =
             (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION")) ||
-             runtime->apple_m4_device ||
+             runtime->apple_simdgroup_device ||
              termite_metal_a4b_high_memory_feature_enabled(
                  "TERMITE_METAL_ENABLE_A4B_SHARED_FFN_FUSION",
                  "TERMITE_METAL_DISABLE_A4B_SHARED_FFN_FUSION")) &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION")) &&
             !termite_metal_env_flag_truthy(getenv("TERMITE_METAL_DISABLE_A4B_SHARED_FFN_FUSION"));
         const bool e2b_pair_activation_mm_requested =
-            termite_metal_qualified_m4_feature_enabled("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM") &&
+            termite_metal_apple_simdgroup_feature_enabled("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM") &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_E2B_Q4_0_PAIR_ACTIVATION_MM"));
         runtime->q4_0_pair_activation_mm_e4b_enabled =
             termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM")) &&
@@ -31273,7 +31300,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->vision_norm_rope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_vision_norm_rope");
         runtime->rope_pair_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_rope_pair");
         runtime->head_rms_rope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_head_rms_rope");
-        const bool enable_qwen_head_norm_sg = termite_metal_qualified_m4_feature_enabled("TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG");
+        const bool enable_qwen_head_norm_sg = termite_metal_apple_simdgroup_feature_enabled("TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG");
         runtime->head_rms_rope_hd128_sg_pipeline = enable_qwen_head_norm_sg ? termite_metal_make_pipeline(device, precise_library, @"termite_apply_head_rms_rope_hd128_sg") : nil;
         runtime->attention_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_attention_f32");
         runtime->attention_f32_decode_1x_hd64_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_attention_f32_decode_1x_hd64");
@@ -31558,21 +31585,6 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->linear_bf16_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_bf16_1x_reduce");
         runtime->lightonocr3_gemv_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_gemv_vec4");
         runtime->lightonocr3_gemv_rows2_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_gemv_vec4_rows2");
-        if ([device.name isEqualToString:@"Apple M4 Max"]) {
-            for(size_t b=0;b<2;b++) {
-                runtime->lightonocr3_local_gate_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_gate_vec%zu_16_2",b+2]);
-                runtime->lightonocr3_local_down_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_proj_vec%zu_32_4",b+2]);
-            }
-            for(size_t b=0;b<3;b++)runtime->lightonocr3_local_projection_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_proj_vec%zu_16_%zu",b+2,b==2?(size_t)4:(size_t)2]);
-            runtime->lightonocr3_local_down_vector4=termite_metal_make_pipeline(device,library,@"termite_lightonocr3_local_proj_vec4_16_2");
-            for(size_t model=0;model<2;model++)for(size_t row=0;row<8;row++)
-                runtime->lightonocr3_recurrent_gate_vectors[model][row]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_recurrent_gate_%zu_%zu_32_1",row+1,model?(size_t)16:(size_t)8]);
-            const size_t caps[6]={4,4,4,4,2,2},lanes[6]={16,16,32,32,16,32},tiles[6]={2,4,4,8,4,8};
-            for(size_t tile=0;tile<4;tile++)for(size_t row=0;row<4;row++)
-                runtime->lightonocr3_decode_chunks[tile][row]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_chunk_%zu_%zu_%zu",row+1,lanes[tile],tiles[tile]]);
-            for(size_t tile=0;tile<6;tile++)for(size_t row=0;row<3;row++)
-                runtime->lightonocr3_decode_tails[tile][row]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_decode_%zu_%zu_%zu_%zu",row+5,caps[tile],lanes[tile],tiles[tile]]);
-        }
         runtime->lightonocr3_gate_up_gemv_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_gate_up_gemv");
         runtime->lightonocr3_pack_bf16_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lightonocr3_pack_bf16");
         runtime->lightonocr3_batch2_pipeline = termite_metal_make_pipeline(device, library, @"termite_lightonocr3_batch2_vec4");
@@ -37165,7 +37177,7 @@ int termite_metal_decode_runtime_florence_channel_attention_f32_device(
         id<MTLComputeCommandEncoder> scores_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
         if (scores_encoder == nil) return -14;
         const bool parallel_scores = channels_per_group == 32 && seq_len >= 64 &&
-            termite_metal_qualified_m4_device_default() &&
+            termite_metal_apple_simdgroup_device_default() &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_FLORENCE2_CHANNEL_REDUCTION")) &&
             runtime->florence_channel_scores_parallel_pipeline != nil &&
             runtime->florence_channel_scores_parallel_pipeline.threadExecutionWidth == 32 &&
@@ -38690,7 +38702,7 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
             if (encoder == nil) return -12;
         }
         const bool batch_argmax = rows >= 2 && rows <= 64 && out_dim == 248320u &&
-            runtime->lightonocr3_projections_enabled && termite_metal_qualified_m4_device_default() != 0 &&
+            runtime->lightonocr3_projections_enabled &&
             termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_BATCH_ARGMAX")) &&
             runtime->lighton_batch_argmax_partials_pipeline != nil &&
             runtime->lighton_batch_argmax_reduce_pipeline != nil &&
@@ -40579,7 +40591,6 @@ static int termite_metal_try_f16_encoder_mpp(termite_metal_decode_runtime *runti
     if (runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F16 ||
         !termite_metal_f16_encoder_mpp_shape(rows,in_dim,out_dim) || input_offset % 16 != 0 ||
         output_offset % 4 != 0 || input == output ||
-        ![runtime->device.name isEqualToString:@"Apple M4 Max"] ||
         termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_F16_ENCODER_MPP)) return 0;
     // Shares the existing optional Metal 4 library; unsupported OS/pipelines
     // retain MPS. Initialization is once per execution-lane-owned runtime.
@@ -41393,7 +41404,7 @@ static bool termite_metal_use_bf16_mm(
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_BF16_TILED"));
 }
 
-// Defaults cover base-M4 Qwen3 0.6B shapes and the model-scoped M4 Max
+// Defaults cover Qwen3 0.6B shapes and model-scoped LightOnOCR
 // LightOnOCR shapes below. Other devices and shapes remain explicit-only.
 static bool termite_metal_bf16_qualified_default(
     termite_metal_decode_runtime *runtime, size_t rows, size_t in_dim, size_t out_dim
@@ -41409,8 +41420,7 @@ static bool termite_metal_bf16_qualified_default(
             (in_dim == 4096u && (out_dim == 1024u || out_dim == 2560u || out_dim == 4096u)) ||
             (in_dim == 9216u && out_dim == 2560u);
     }
-    if (runtime == NULL || !runtime->apple_m4_device ||
-        ![runtime->device.name isEqualToString:@"Apple M4"] || rows < 32u || rows > 2551u) return false;
+    if (runtime == NULL || !runtime->apple_simdgroup_device || rows < 32u || rows > 2551u) return false;
     return (in_dim == 1024u && (out_dim == 1024u || out_dim == 2048u || out_dim == 3072u)) ||
         ((in_dim == 2048u || in_dim == 3072u) && out_dim == 1024u);
 }
@@ -53689,7 +53699,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             bias_mode == 0u && has_mask == 0u && head_dim == 32u && seq_len <= 256u &&
             runtime->sdpa_f32_florence_window_hd32_pipeline != nil;
         const BOOL use_florence_window_parallel = use_florence_window_hd32 &&
-            termite_metal_qualified_m4_device_default() &&
+            termite_metal_apple_simdgroup_device_default() &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_FLORENCE2_WINDOW_SOFTMAX")) &&
             runtime->sdpa_f32_florence_window_parallel_pipeline != nil &&
             runtime->sdpa_f32_florence_window_parallel_pipeline.threadExecutionWidth == 32 &&
@@ -67110,7 +67120,7 @@ int termite_metal_decode_runtime_score_selected_attention(
     size_t base_key_row_bytes, float score_scale, float softcap,
     float *scores_out, void *check_ctx, int (*check_fn)(void *)) {
     if (runtime == NULL || queries == NULL || query_positions == NULL || key_positions == NULL || scores_out == NULL || check_fn == NULL) return -1;
-    if (slot >= TERMITE_METAL_PAGED_KV_SLOT_CAPACITY || query_count == 0 || query_count > 64u || key_count == 0 || key_count > 8704u || num_heads == 0 || num_kv_heads == 0 || num_heads % num_kv_heads != 0 || format > 4u || !isfinite(score_scale) || score_scale <= 0.0f || !isfinite(softcap) || softcap < 0.0f) return -2;
+    if (slot >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY || query_count == 0 || query_count > 64u || key_count == 0 || key_count > 8704u || num_heads == 0 || num_kv_heads == 0 || num_heads % num_kv_heads != 0 || format > 4u || !isfinite(score_scale) || score_scale <= 0.0f || !isfinite(softcap) || softcap < 0.0f) return -2;
     if (query_count > UINT32_MAX || key_count > UINT32_MAX || num_heads > UINT32_MAX || num_kv_heads > UINT32_MAX || head_dim > UINT32_MAX || key_row_bytes > UINT32_MAX || base_key_row_bytes > UINT32_MAX) return -2;
     if (runtime->selection_score_norm_pipeline == nil || runtime->selection_score_reduce_pipeline == nil || runtime->attention_span_encoded_key_buffers[slot] == nil) return -3;
     if (check_fn(check_ctx) != 0) return -12;
@@ -73114,7 +73124,7 @@ static int termite_metal_dispatch_quant_matmul_none(termite_metal_provider *prov
             runtime.q4_0_reduce_nr4_nsg4_nq8_pipeline = source_runtime->q4_0_reduce_nr4_nsg4_nq8_pipeline;
             runtime.q4_0_reduce_nr8_nsg4_pipeline = source_runtime->q4_0_reduce_nr8_nsg4_pipeline;
             runtime.apple_gpu_family = source_runtime->apple_gpu_family;
-            runtime.apple_m4_device = source_runtime->apple_m4_device;
+            runtime.apple_simdgroup_device = source_runtime->apple_simdgroup_device;
             runtime.swa_scan_clamp_enabled = source_runtime->swa_scan_clamp_enabled;
             runtime.q4_0_mmv_variant_override = source_runtime->q4_0_mmv_variant_override;
             memcpy(

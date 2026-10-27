@@ -68,13 +68,13 @@ pub fn Features(comptime Hooks: type) type {
                 .cpu_preprocess = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_CPU_PREPROCESS"),
                 .vision_batch_items = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_VISION_BATCH")) @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS") orelse 4, 1), 4)) else 1,
                 .prefill_batch_items = if (prefill_batch) @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_BATCH_ITEMS") orelse 4, 1), generation.NativeGenerationPipeline.default_prepared_qwen_prefill_items)) else 1,
-                .vision_frame_blocks = if (metal_runtime.qualifiedM4DeviceDefault() and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_CPU_PREPROCESS")) @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_FRAME_BLOCKS") orelse 1, 1), 4)) else 1,
+                .vision_frame_blocks = if (metal_runtime.appleSimdgroupDeviceDefault() and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_CPU_PREPROCESS")) @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_FRAME_BLOCKS") orelse 1, 1), 4)) else 1,
                 .prepared = prepared,
                 .prefill_batch = prefill_batch,
                 .queued_phase_priority = epoch_auxiliary and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_QUEUED_PHASE_PRIORITY"),
-                .vision_late_seal = epoch_auxiliary and metal_runtime.qualifiedM4DeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_VISION_LATE_SEAL"),
-                .prefill_late_seal = epoch_auxiliary and metal_runtime.qualifiedM4DeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PREFILL_LATE_SEAL"),
-                .shared_decoder_scratch = metal_runtime.qualifiedM4DeviceDefault() and epoch_auxiliary and prepared and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_SHARED_DECODER_SCRATCH"),
+                .vision_late_seal = epoch_auxiliary and metal_runtime.appleSimdgroupDeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_VISION_LATE_SEAL"),
+                .prefill_late_seal = epoch_auxiliary and metal_runtime.appleSimdgroupDeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PREFILL_LATE_SEAL"),
+                .shared_decoder_scratch = metal_runtime.appleSimdgroupDeviceDefault() and epoch_auxiliary and prepared and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_SHARED_DECODER_SCRATCH"),
                 .prepared_rows = if (physical_rows > 64) 128 else if (physical_rows > 32) 64 else if (physical_rows > 16) 32 else 16,
                 .scheduling_rows = @intCast(physical_rows),
                 .activation_pool = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_ACTIVATION_POOL"),
@@ -113,12 +113,12 @@ pub fn Features(comptime Hooks: type) type {
             }
             features.shared_decoder_scratch = features.shared_decoder_scratch and cfg.qwen35_device_only_state;
             features.gpu_greedy_stream = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_GREEDY_STREAM") and
-                metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
+                metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
                 cfg.qwen35_device_only_state and features.epoch_auxiliary and features.prepared and
                 features.activation_pool and features.batch_attention and features.stream_first_layers != 0 and
                 !features.single_frame;
             features.gpu_token_burst = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST") and
-                metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
+                metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
                 cfg.qwen35_device_only_state and features.shared_decoder_scratch and features.epoch_auxiliary and
                 features.prepared and features.worker and features.activation_pool and features.batch_attention and
                 features.single_frame and features.stream_first_layers == 0 and
@@ -136,7 +136,7 @@ pub fn Features(comptime Hooks: type) type {
             }
             features.gpu_token_burst_width = @intCast(std.math.clamp(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH") orelse 2, 2, generation.NativeGenerationPipeline.max_gpu_token_burst_width));
             features.pipeline_vision = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PIPELINE_VISION") and
-                metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
+                metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
                 features.resident_vision_budget and features.cpu_preprocess and features.epoch_auxiliary and
                 features.vision_batch_items == 1 and features.vision_frame_blocks <= 2 and
                 !platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME") and
@@ -144,10 +144,10 @@ pub fn Features(comptime Hooks: type) type {
                 !platform.env.getenvBool("TERMITE_QWEN3VL_PROFILE") and
                 platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") == null;
             features.stream_chunks = features.gpu_greedy_stream and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_STREAM_CHUNKS");
-            features.vision_workspace_cache = features.epoch_auxiliary and metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
+            features.vision_workspace_cache = features.epoch_auxiliary and metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
                 !platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK") and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_KEEP_VISION_WORKSPACE");
             features.shared_core_weights = features.epoch_auxiliary and platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS", metal_runtime.lightOnThroughputProfileEnabled() and cfg.hidden_size == 2560);
-            if (metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
+            if (metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
                 cfg.qwen35_device_only_state and features.shared_decoder_scratch and features.shared_core_weights and
                 features.epoch_auxiliary and features.prepared and features.worker and features.activation_pool and
                 features.prefill_batch_items == 1 and
@@ -156,13 +156,13 @@ pub fn Features(comptime Hooks: type) type {
                 !platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"))
                 features.prefill_stream_layers = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_STREAM_LAYERS") orelse 0, 16));
             features.packed_mixed = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PACKED_MIXED") and
-                (metal_runtime.qualifiedM4DeviceDefault() or
+                (metal_runtime.appleSimdgroupDeviceDefault() or
                     (Hooks.cudaLightOnBatchProfileEnabled() and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_PACKED_MIXED"))) and cfg.hasQwen35VisionArchitectureContract() and
                 cfg.qwen35_device_only_state and features.shared_decoder_scratch and features.prepared and
                 features.worker and features.epoch_auxiliary and features.prefill_batch_items == 1 and
                 !features.gpu_greedy_stream;
             features.prefill_activation_pool = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PREFILL_ACTIVATION_POOL") and
-                metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
+                metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
                 features.epoch_auxiliary and features.activation_pool and features.prepared and
                 features.worker and cfg.qwen35_device_only_state and features.shared_decoder_scratch;
             if (features.packed_mixed) features.packed_prefill_items = @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS") orelse 1, 1), generation.NativeGenerationPipeline.default_prepared_qwen_prefill_items));
@@ -171,7 +171,7 @@ pub fn Features(comptime Hooks: type) type {
                 features.prepared_prefill_chunk_rows = if (rows == 0) 0 else @intCast(@min(@max(rows, 64), 1024));
             }
             features.packed_shared_frame = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PACKED_SHARED_FRAME") and
-                metal_runtime.qualifiedM4DeviceDefault() and features.packedSharedFrameEligible(cfg) and
+                metal_runtime.appleSimdgroupDeviceDefault() and features.packedSharedFrameEligible(cfg) and
                 !platform.env.getenvBool("TERMITE_QWEN3VL_PROFILE") and
                 platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") == null and
                 !platform.env.getenvBool("TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH");

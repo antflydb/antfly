@@ -3600,6 +3600,14 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     // Main's new resolver records must not be admitted by earlier SQL-only
     // profiles that reused main's resolver numbers for unrelated catalog work.
     try std.testing.expect(protocol.resolver_namespaces_version > protocol.sql_column_transform_version);
+    // Published main v62 understands resolver records, not private SQL commands.
+    for ([_]u16{
+        protocol.constraint_occupancy_version,
+        protocol.schema_reader_capability_version,
+        protocol.sql_view_catalog_version,
+        protocol.sql_row_policy_mutation_version,
+        protocol.sql_column_transform_version,
+    }) |floor| try std.testing.expect(floor > 62);
     try std.testing.expect(protocol.current_version >= protocol.schema_validation_publication_version);
     var table: metadata_table_manager.TableRecord = .{
         .table_id = 77,
@@ -3669,7 +3677,7 @@ fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCom
     };
     if (population) return metadata_topology_protocol.sql_population_version;
     if (command == .compare_and_set_job_state) return metadata_topology_protocol.job_state_version;
-    if (command == .apply_resolver_authority) return metadata_topology_protocol.resolver_records_version;
+    if (command == .apply_resolver_authority or command == .advance_resolver_namespace) return metadata_topology_protocol.resolver_records_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresResourceComments(command.apply_system_catalog)) return metadata_topology_protocol.sql_resource_comments_version;
     if (command == .apply_fk_generation_publication and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_generation_publication)) return metadata_topology_protocol.fk_historical_references_version;
     if (command == .apply_fk_initial_create and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_initial_create)) return metadata_topology_protocol.fk_historical_references_version;
@@ -4936,13 +4944,16 @@ fn runResolverNamespaceRound(service: anytype) !void {
     if (!try service.ensureReconcileLease()) return;
     var arena = std.heap.ArenaAllocator.init(service.alloc);
     defer arena.deinit();
+    // Replay is observed through its durable queue/CAS on the next round.
+    // No caller waits on an exact receipt; tracking one here would retain an
+    // unowned compaction proof for every page and exhaust mutation admission.
     const table = (try store.pendingResolverNamespaceTable(arena.allocator(), service.metadata_group_id)) orelse {
         const id = (try store.pendingResolverNamespaceDrop(arena.allocator(), service.metadata_group_id)) orelse return;
         const fence = try store.getTableTransitionFence(service.metadata_group_id, id);
-        _ = try service.proposeTransitionCommandWithReceipt(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
+        try service.proposeTransitionCommand(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
         return;
     };
-    _ = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } });
+    try service.proposeTransitionCommand(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } });
 }
 
 fn runRelationReconciliationRound(service: anytype) !void {

@@ -82,3 +82,26 @@ def test_proposals_and_absorbed_suppression_use_scoped_typed_resources() -> None
         "/db/v1/databases/app/namespaces/private/tables/entities/curation/proposals/proposal%2Fone:accept",
         json={"actor": "curator", "pin_distinct": False},
     )
+
+
+def test_entity_progress_pages_keep_scope_cursor_and_encoded_keys() -> None:
+    client = AntflyClient("https://antfly.test")
+    client._request = MagicMock(
+        return_value={
+            "entity_table": "notes",
+            "key": "concept/alpha",
+            "catalog_revision": 7,
+            "complete": False,
+            "results": [],
+            "next_cursor": "page-two",
+        }
+    )
+    page = client.entities.in_namespace("app", "private").progress(
+        "notes", "concept/alpha", cursor="opaque-next", limit=7
+    )
+    assert page.next_cursor == "page-two"
+    client._request.assert_called_once_with(
+        "GET",
+        "/db/v1/databases/app/namespaces/private/tables/notes/entities/concept%2Falpha/progress",
+        params={"limit": 7, "cursor": "opaque-next"},
+    )

@@ -116,7 +116,7 @@ pub fn nativeFlorencePreprocessOverlapEnabled(session: backends.Session) bool {
     if (comptime !build_options.enable_metal) return false;
     return session.backend() == .metal and
         session_factory.getFlorenceConfig(session) != null and
-        @import("../backends/metal_runtime.zig").qualifiedM4DeviceDefault() and
+        @import("../backends/metal_runtime.zig").appleSimdgroupDeviceDefault() and
         platform.env.getenvBool("ANTFLY_FLORENCE_CPU_PREPROCESS");
 }
 
@@ -784,7 +784,7 @@ pub const ReadingPipeline = struct {
         // frame; token publication and row compaction follow its completion.
         const single_frame = if (comptime build_options.enable_metal)
             checked_no_repeat_argmax and self.config.no_repeat_ngram_size > 0 and
-                @import("../backends/metal_runtime.zig").qualifiedM4DeviceDefault() and
+                @import("../backends/metal_runtime.zig").appleSimdgroupDeviceDefault() and
                 platform.env.getenvBoolDefault("ANTFLY_FLORENCE2_SINGLE_FRAME", true) and
                 !platform.env.getenvBool("TERMITE_FLORENCE2_METAL_DISABLE_FRAMES") and
                 !platform.env.getenvBool("TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH") and
