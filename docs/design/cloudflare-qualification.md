@@ -1672,4 +1672,26 @@ vectors and 1,000 model embeddings, at 8, 32 and exhaustive probes. Recall is
 unchanged, exhaustive recall is one, and R2 GETs and bytes do not exceed the
 original control. At exhaustive synthetic search, average GETs fall from 170.7
 to 140.3; the model workload at eight probes transfers 1,029,942 bytes versus
-1,116,461. These local reports are separate from the pre-merge live trials.
+1,116,461. The evidence validator rejected initial refreshes that omitted the
+candidate's inline-WAL setting. Both workloads were rerun with that setting
+enabled before sealing the replacement manifest. These local reports are
+separate from the pre-merge live trials.
+
+The merged lake targets pass 236 tests with one skipped. A refreshed 50,000-
+document workload completes ingestion/publication, cold scalar/vector/sparse
+reads, warm reads, updates, deletion and compaction on the rebuilt module. Its
+sampled peak linear memory is 27,525,120 bytes and working memory 11,788,282 bytes.
+That first scale run uses the non-inline WAL profile; a separately named run
+validates the deployment's inline profile. The inline-WAL 1,000-document reindex
+workload also completes. These are local capacity checks, not live latency or
+whole-isolate memory measurements.
+
+Latest main was subsequently merged through `9ace47d363` in `583fe1863b`. The
+new macOS precision probe passes; the Worker and serverless runtime source is
+identical to sealed candidate `4b8bdb0375`. All three candidate stacks deploy
+that candidate, with approved control `8a61f42df8` unchanged and fresh paired
+corpora. The former c732 bundles and reports remain archived. Three remaining
+control-2 DLQ jobs were replayed with their original bodies/identities before
+exact-lease acknowledgement; a subsequent empty pull was recorded and its
+temporary consumer removed. The new live trials must finish independently
+before any gate result can be claimed.
