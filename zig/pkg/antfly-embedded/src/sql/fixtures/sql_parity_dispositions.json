@@ -3644,6 +3644,45 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-operator-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-operator-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-operator-kernel-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=operator",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-operator-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_operator_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_operator_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -5349,18 +5388,69 @@
     },
     {
       "id": "sql-0133",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged binary operator CREATE, DROP and conditional DROP execute through the shared native callable catalog and scalar VM. PostgreSQL and authenticated mounted tests compare typed overloads, complete query/mutation rows and NULL flags, command tags, exact notices and SQLSTATEs. Stable function IDs survive namespace rename and function replacement; RESTRICT retains dependencies and CASCADE retires them atomically across cold restart. Operator and quoted-function signatures remain disjoint, and bound row execution performs no allocator or catalog work. This qualifies the original binary declarations, not unary operators or optional commutator/selectivity planner contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_operator_lifecycle_integration_test.zig",
+          "test": "mounted SQL original operators preserve typed overloads stable function identities and cold dependency retirement",
+          "gate": "sql-operator-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_operator_lifecycle_integration_test.zig",
+          "test": "mounted SQL original operators preserve typed overloads stable function identities and cold dependency retirement",
+          "gate": "sql-operator-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL original operator declarations retain signatures implementation and owned symbols",
+          "gate": "sql-operator-kernel-debug"
+        }
+      ]
     },
     {
       "id": "sql-0134",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged binary operator CREATE, DROP and conditional DROP execute through the shared native callable catalog and scalar VM. PostgreSQL and authenticated mounted tests compare typed overloads, complete query/mutation rows and NULL flags, command tags, exact notices and SQLSTATEs. Stable function IDs survive namespace rename and function replacement; RESTRICT retains dependencies and CASCADE retires them atomically across cold restart. Operator and quoted-function signatures remain disjoint, and bound row execution performs no allocator or catalog work. This qualifies the original binary declarations, not unary operators or optional commutator/selectivity planner contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_operator_lifecycle_integration_test.zig",
+          "test": "mounted SQL original operators preserve typed overloads stable function identities and cold dependency retirement",
+          "gate": "sql-operator-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_operator_lifecycle_integration_test.zig",
+          "test": "mounted SQL original operators preserve typed overloads stable function identities and cold dependency retirement",
+          "gate": "sql-operator-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL original operator declarations retain signatures implementation and owned symbols",
+          "gate": "sql-operator-kernel-debug"
+        }
+      ]
     },
     {
       "id": "sql-0135",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged binary operator CREATE, DROP and conditional DROP execute through the shared native callable catalog and scalar VM. PostgreSQL and authenticated mounted tests compare typed overloads, complete query/mutation rows and NULL flags, command tags, exact notices and SQLSTATEs. Stable function IDs survive namespace rename and function replacement; RESTRICT retains dependencies and CASCADE retires them atomically across cold restart. Operator and quoted-function signatures remain disjoint, and bound row execution performs no allocator or catalog work. This qualifies the original binary declarations, not unary operators or optional commutator/selectivity planner contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_operator_lifecycle_integration_test.zig",
+          "test": "mounted SQL original operators preserve typed overloads stable function identities and cold dependency retirement",
+          "gate": "sql-operator-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_operator_lifecycle_integration_test.zig",
+          "test": "mounted SQL original operators preserve typed overloads stable function identities and cold dependency retirement",
+          "gate": "sql-operator-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL original operator declarations retain signatures implementation and owned symbols",
+          "gate": "sql-operator-kernel-debug"
+        }
+      ]
     },
     {
       "id": "sql-0136",

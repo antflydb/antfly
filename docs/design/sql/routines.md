@@ -49,8 +49,8 @@ validates and prepares the body before writing catalog/index changes. Its
 preparation allocator is bounded. Deterministic definition failures are retained
 rejections; allocator/storage failures abort the transaction.
 
-Decoder floor 107 activates function/procedure publication and retained callable
-annotations with version 2 routine records. Linked control reaches the
+Decoder floor 108 activates callable publication, retained annotations and
+operator dependencies with version 2 routine records. Linked control reaches the
 same concrete native owner through catalog projection interfaces, preserving
 request deadlines and cancellation. Routine records have no physical table,
 placement or storage binding. Parent schema/database emptiness checks include
@@ -82,6 +82,38 @@ annotation text. Text is bounded to 64 KiB, validated before admission, and is
 never interpreted as SQL. Lost acknowledgments use the same read-only,
 kind/scope-bound recovery path as publication. Stale executable identities are
 retained rejections; a name lookup cannot retarget a recovered annotation.
+
+## Native binary operators
+
+Binary SQL operators use the same catalog resources, owner capture, scalar VM,
+prepared manifests and bounded outcome journal as functions. The catalog keeps
+operator signatures in a separate family, so a quoted function with the same
+symbol and argument types cannot collide. Each operator references an immutable
+function ID and namespace ID. Replacement follows the function generation;
+namespace rename follows its identity; dropping and recreating a function name
+never retargets an existing operator.
+
+Binding prepares the referenced function once. A 10,000-row regression uses a
+zero-byte execution allocator and checks that catalog callbacks stop after
+binding. A covering dependency directory bounds function retirement to its
+actual dependents, rather than scanning unrelated catalog objects. Native
+publication and restore rebuild/validate this directory. RESTRICT returns 2BP01;
+CASCADE removes the function and operators in one catalog transaction. Retirement
+is bounded to 1,024 dependent objects and fails before publication above that
+limit. Transport notice buffers reserve capacity before admission, and notice
+bytes live through durable outcome serialization.
+
+Expected semantic rejections travel as typed outcome payloads across compiled
+storage boundaries, preserving PostgreSQL errors without depending on a
+status-only error registry. Apply persists the same rejection under the original
+nonce; ambiguous transport failures still require read-only observation.
+
+The independent PostgreSQL operator fixture and mounted cold-owner campaign
+qualify original cases sql-0133 through sql-0135, including overloads, UPDATE
+RETURNING row multisets, NULLs, namespace rename, dependency rejection, cascade
+notices and authenticated reader restrictions. Unary operators, commutators,
+negators, selectivity callbacks and hash/merge planner declarations remain
+explicitly unsupported.
 
 ## Qualification and remaining activation
 

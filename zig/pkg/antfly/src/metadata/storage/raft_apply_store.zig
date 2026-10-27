@@ -24471,7 +24471,13 @@ pub const RaftApplyStore = struct {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
         if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null or command.sql_routine != null)) return error.InvalidCatalogMutation;
-        if (command.sql_routine != null) return std.json.Stringify.valueAlloc(alloc, try self.prepareSqlRoutineCatalogTxn(&txn, group_id, command), .{});
+        if (command.sql_routine != null) {
+            var region: std.heap.ArenaAllocator = .init(alloc);
+            defer region.deinit();
+            // Expected SQL rejections are payloads across the compiled owner
+            // boundary. Status-only errors cannot preserve arbitrary SQLSTATEs.
+            return std.json.Stringify.valueAlloc(alloc, try self.prepareSqlRoutineCatalogTxn(region.allocator(), &txn, group_id, command), .{});
+        }
         if (command.sql_sequence != null) return std.json.Stringify.valueAlloc(alloc, try self.prepareSqlSequenceCatalogTxn(&txn, group_id, command), .{});
         if (command.sql_view != null) return std.json.Stringify.valueAlloc(alloc, try self.applySqlViewLifecycleTxn(&txn, group_id, command, false), .{});
         if (command.mutation.action == .comment) _ = try self.requireTopologyActivationTxn(&txn, group_id, topology_protocol.sql_resource_comments_version);
@@ -37056,10 +37062,9 @@ pub const RaftApplyStore = struct {
         if (!std.mem.eql(u8, &try catalogIncarnationTxn(txn, group), &request.incarnation)) return error.CatalogGenerationChanged;
     }
 
-    fn applySqlRoutineCatalogTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: sql_routines.Mutation, apply: bool) !sql_routines.Result {
-        var region: std.heap.ArenaAllocator = .init(self.alloc);
-        defer region.deinit();
-        const a = region.allocator();
+    // Result strings borrow a and remain live through preview serialization or
+    // the outcome-ring append; never return a slice from a local arena.
+    fn applySqlRoutineCatalogTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: sql_routines.Mutation, apply: bool) !sql_routines.Result {
         const meta = try system_catalog_storage.readMeta(a, txn, group);
         const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
         const namespace = try view.namespaceFor(request.target.database, request.target.namespace);
@@ -37169,13 +37174,16 @@ pub const RaftApplyStore = struct {
         return result;
     }
 
-    fn prepareSqlRoutineCatalogTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !sql_routines.Result {
+    fn prepareSqlRoutineCatalogTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !sql_routines.Outcome {
         try self.validateSqlRoutineCommandTxn(txn, group, command);
         const request = command.sql_routine.?;
         const outcomes: sql_routines.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group = group, .incarnation = request.incarnation };
-        return switch (try outcomes.prepare(self.alloc, request.admission, try sql_routines.boundDigest(self.alloc, try sql_routines.observation(self.alloc, request)))) {
-            .replay => |outcome| outcome.result(),
-            .append => self.applySqlRoutineCatalogTxn(txn, group, request, false),
+        return switch (try outcomes.prepare(a, request.admission, try sql_routines.boundDigest(a, try sql_routines.observation(a, request)))) {
+            .replay => |outcome| outcome,
+            .append => prepared: {
+                const result = self.applySqlRoutineCatalogTxn(a, txn, group, request, false);
+                break :prepared if (result) |value| .{ .success = value } else |err| sql_routines.Outcome.fromError(err) orelse return err;
+            },
         };
     }
 
@@ -37187,9 +37195,12 @@ pub const RaftApplyStore = struct {
         switch (try outcomes.prepare(self.alloc, request.admission, digest)) {
             .replay => return,
             .append => |ordinal| {
-                const result = self.applySqlRoutineCatalogTxn(txn, group, request, true);
+                var region: std.heap.ArenaAllocator = .init(self.alloc);
+                defer region.deinit();
+                const a = region.allocator();
+                const result = self.applySqlRoutineCatalogTxn(a, txn, group, request, true);
                 const outcome: sql_routines.Outcome = if (result) |value| .{ .success = value } else |err| sql_routines.Outcome.fromError(err) orelse return err;
-                try outcomes.append(self.alloc, ordinal, request.admission, digest, outcome);
+                try outcomes.append(a, ordinal, request.admission, digest, outcome);
             },
         }
     }
@@ -59424,7 +59435,11 @@ test "SQL routine catalog overloads replacements and bounded outcomes survive na
             invalid.admission = .{ .nonce = @splat(4), .head = (try T.snapshot(&store, temporary, .{ .scalar = .text })).head };
             invalid.operation.publish.expected = identity;
             invalid.operation.publish.definition.result = .{ .scalar = .numeric };
+            const preview = try store.prepareSystemCatalogResult(temporary, group, sql_routines.command(invalid));
+            const preview_outcome = try std.json.parseFromSliceLeaky(sql_routines.Outcome, temporary, preview, .{});
+            try std.testing.expectEqual(.SqlFunctionReturnTypeChanged, preview_outcome.rejected);
             const rejected = try T.apply(&store, temporary, invalid);
+            try std.testing.expectEqualDeep(preview_outcome, rejected);
             try std.testing.expectEqual(.SqlFunctionReturnTypeChanged, rejected.rejected);
             try std.testing.expectEqualDeep(rejected, try T.apply(&store, temporary, invalid));
             var bad_body = replacement;
