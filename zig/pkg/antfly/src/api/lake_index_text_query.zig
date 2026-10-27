@@ -2799,7 +2799,28 @@ const Execution = struct {
             native_filter.include = if (numbers.items.len == 0) .none else .{ .doc_nums = numbers.items };
             effective.resolved_text_doc_filter = &native_filter;
         }
-        var result = try search.searchTextQuery(a, effective, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquireForRanking, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .open_native_tie_order = NativeTies.open, .native_count_visibility_exact = true, .project_key = publicKey, .project_doc_num = publicDocNum, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        var result = try search.searchTextQuery(a, effective, text, .{
+            .ctx = raw,
+            .exact_doc_id_filters = true,
+            .acquire_text_source = acquireForRanking,
+            .resolve_indexed_filter = resolveIndexedFilter,
+            // The global cost decision also governs the final collector: a broad
+            // filter must not reopen the declined metadata-order prefix there.
+            .open_ordered_candidates = if (attempt.prefer_text_candidates) null else openOrderedTextCandidates,
+            .open_native_tie_order = NativeTies.open,
+            .native_count_visibility_exact = true,
+            .project_key = publicKey,
+            .project_doc_num = publicDocNum,
+            .native_key = nativeKey,
+            .filter_candidate_presence = true,
+            .text_index_entry = noLocal,
+            .text_index_is_chunk_backed = chunkBacked,
+            .search_match_all = matchAll,
+            .project_stored_search = project,
+            .load_stored = loadOne,
+            .load_projected_documents = loadProjected,
+            .postprocess = postprocess,
+        });
         errdefer result.deinit();
         try attempt.attach(&result, false);
         return result;
