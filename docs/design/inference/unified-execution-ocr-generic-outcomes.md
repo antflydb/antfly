@@ -1,6 +1,7 @@
 # Integrating the OCR kernel families
 
-Main through `41814339ff` (LightOnOCR3, PR #1250) is integrated with the
+Main through `a69c0b582e`, including LightOnOCR3 (PR #1250) and the later
+document-inference APIs, is integrated with the
 unified execution branch. The integration retains upstream's device/model
 rollout gates and specialized schedules. It does not promote unqualified
 shapes or devices.
@@ -69,15 +70,16 @@ negative control confirms that the prior Safe-only policy fails that regression.
 
 Receipts are under `.benchmark-assets/1166/ocr-generic/`.
 
-The scoped consolidation removes **10,393 maintained production bytes**, counting
+The scoped consolidation removes **8,937 maintained production bytes**, counting
 the complete replacement owners, 829 added build-identity bytes and 902 bytes
-of precision-check build integration. CUDA module
+of precision-check build integration. The final count also charges 1,456 bytes
+for disabled-target admission and document-control portability reconciliation. CUDA module
 production text falls from 32,395 to 31,475 bytes; its line count rises from 674
 to 693. The rollback regression adds 2,281 test bytes, and the independent Metal
 framework regression adds 1,190 test/tool bytes separately. Metal
 projection wrappers remove 4,630 physical source bytes. Unrelated upstream
 changes and earlier campaigns are excluded from these figures. Combined with
-Y's 5,537-byte reduction, these two batches remove 15,930 maintained production
+Y's 5,537-byte reduction, these two batches remove 14,474 maintained production
 bytes. This does not establish a 20% CUDA/Metal reduction or smaller native
 instruction streams.
 
@@ -105,3 +107,47 @@ is restarted from the corrected precision snapshot; partial cohorts are not
 carried forward. The final model/control campaign is recorded as it completes.
 CUDA device qualification waits for the existing Glowworm workload; no new
 CUDA performance result is claimed here.
+
+The warm encoder/reranker gates pass, but the first warmup interval is 11–13%
+higher than X in six Metal cases (the ONNX case is approximately unchanged).
+These intervals include cold library/pipeline setup. The expanded main program
+grew with upstream's 45 added kernels; source-preserving consolidation does not
+reduce that compiled program. The warm latency gates do not establish cold-start
+parity. Lazy operation-library/pipeline construction remains a separate
+performance opportunity; the receipts retain these cold measurements.
+
+The final kernel snapshot passes all 13 encoder/reranker cases, native decoder
+latency, all 42 primitive/host controls and the route/resource-counter checks.
+Every output comparison passes. Metal decoder's original 32-arm cohort misses
+the median gate at 1.053644 (p95 1.045393), with a pronounced clock step; that
+failure remains unmodified. A protocol declared before confirmation requires
+three complete 32-arm cohorts with 100 warmups and 201 measurements per arm:
+identical qualified images, forward candidate comparison and reversed image
+comparison. All pass the original 1.05 median / 1.10 p95 limits. Forward and
+normalized reverse median ratios are 1.009128 and 1.007737; p95 ratios are
+0.996486 and 0.995403. The identical-image control is 0.999322 / 1.003329.
+No automatic retry or tolerance relaxation is used. Both independent decoder
+references pass. All seven protected CPU groups retain their instructions,
+resources and required alignment; changed addresses resolve to the same data.
+
+All five 120-second native/Metal ownership soaks pass with final tracked
+allocator bytes at zero. The later main merge changes document/host/build APIs;
+its delta leaves the kernel, backend, graph and linalg paths unchanged. The
+shared reader module is retained rather than duplicated.
+
+Portable validation exposed two independent reachability/dependency failures.
+Twenty optional CUDA entry points now decline at compile time when CUDA is
+disabled, preventing lowering of unsupported CUDA allocation/profiling paths
+on WebAssembly. Enabled-CUDA body text is unchanged after eliminating those
+constant guards. The common execution contract carries borrowed opaque
+document session/meter handles; their concrete reader types are restored only
+by the document service, keeping the common control usable without readers.
+WASM32 and the merged both-backend product build pass after these fixes.
+
+The final merged-main checks pass 350 document/model/ownership tests with 60
+fixture or disabled-backend skips, the both-backend product build, WASM32 and
+WASM64, all three x86 portable profiles, generated-source freshness and all
+24 qualification-tool tests. The first document/Metal compile exceeded its
+14 GiB scheduler reservation at 17,557,094,400 bytes, despite Zig returning
+success. The strict log guard rejected that run. A measured 20 GiB single-Metal
+compiler reservation passes the rerun; inference memory limits are unchanged.

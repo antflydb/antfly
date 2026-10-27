@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const cuda_enabled = @import("build_options").enable_cuda;
 const ops = @import("../ops.zig");
 const kernel_geometry = ops.kernel_descriptor.kernel_geometry;
 const tensor_mod = @import("../../backends/tensor.zig");
@@ -2249,6 +2250,7 @@ pub const CudaCompute = struct {
     /// Cache only immutable, resident checkpoint norm weights. The ordinary
     /// addScalar operation remains valid for mutable request tensors.
     pub fn lightOnAdjustedNormWeight(cb: *const ops.ComputeBackend, weight: CT, dim: usize, offset: f32) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .lightonocr3 or !self.lighton_norm_weight_cache_enabled or
@@ -2290,6 +2292,7 @@ pub const CudaCompute = struct {
     /// Fuse only the existing F32 split/RoPE and BF16 cuDNN input boundary.
     /// QKV GEMM, its bias, attention precision, and output projection are unchanged.
     pub fn lightOnVisionAttention(cb: *const ops.ComputeBackend, packed_ct: CT, positions: []const u32, batch: usize, rows: usize, heads: usize, dim: usize, theta: f32) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (!self.lighton_fused_vision_qkv_enabled or self.capability_profile != .lightonocr3 or self.resident_training_cache or
@@ -2372,6 +2375,7 @@ pub const CudaCompute = struct {
     };
 
     pub fn beginLightOnTokenBurst(cb: *const ops.ComputeBackend, embedding_weight: CT, rows: usize, steps: usize, hidden: usize, vocab: usize, suppress_ids: []const i32) !?LightOnTokenBurst {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .lightonocr3 or self.lazy_host_store != null or self.resident_training_cache or
@@ -2398,12 +2402,14 @@ pub const CudaCompute = struct {
     }
 
     pub fn lightOnCudaBurstStats(cb: *const ops.ComputeBackend) [5]u64 {
+        if (comptime !cuda_enabled) return @splat(0);
         if (cb.kind() != .cuda) return @splat(0);
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         return .{ self.lighton_cuda_burst_calls, 0, self.lighton_cuda_burst_extra_steps, self.lighton_cuda_burst_extra_rows, self.lighton_cuda_burst_max_width };
     }
 
     pub fn lightOnFfnBlockEnabled(cb: *const ops.ComputeBackend) bool {
+        if (comptime !cuda_enabled) return false;
         if (cb.kind() != .cuda) return false;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         return self.lighton_ffn_block_enabled and self.capability_profile == .lightonocr3 and
@@ -2423,6 +2429,7 @@ pub const CudaCompute = struct {
     };
 
     pub fn lightOnFfnBlock(cb: *const ops.ComputeBackend, request: LightOnFfnBlockRequest) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (!lightOnFfnBlockEnabled(cb)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const rows = request.rows;
@@ -2469,6 +2476,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn lightOnVisionMlp(cb: *const ops.ComputeBackend, input_ct: CT, weights: [6]CT, rows: usize, dim: usize, hidden: usize, eps: f32) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .lightonocr3 or !self.lighton_fused_vision_mlp_enabled or self.ctx.info.compute_major < 8 or
@@ -2522,6 +2530,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn florenceBartFfn(cb: *const ops.ComputeBackend, input_ct: CT, weights: [6]CT, rows: usize, dim: usize, hidden: usize) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .florence2 or !self.florence_bart_ffn_enabled or !self.florence_f16_weights_enabled or !self.florence_fused_bias_enabled or
@@ -2572,6 +2581,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn lightOnProjectionFusionEnabled(cb: *const ops.ComputeBackend) bool {
+        if (comptime !cuda_enabled) return false;
         if (cb.kind() != .cuda) return false;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         return self.capability_profile == .lightonocr3 and self.lighton_fused_projections;
@@ -2580,6 +2590,7 @@ pub const CudaCompute = struct {
     /// Immutable BF16 checkpoint-row concatenation, one input cast/GEMM and
     /// one exact FP32 split. Mutable recurrent/KV state is outside this path.
     pub fn lightOnInputProjections(cb: *const ops.ComputeBackend, input_ct: CT, weights: [4]CT, rows: usize, hidden: usize, mixed_dim: usize, z_dim: usize, heads: usize) !?[4]CT {
+        if (comptime !cuda_enabled) return null;
         if (!lightOnProjectionFusionEnabled(cb)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.lazy_host_store != null or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
@@ -2650,6 +2661,7 @@ pub const CudaCompute = struct {
     /// DaViT MLP with the existing FP32 norm/GELU arithmetic and FP16
     /// storage at its two GEMM inputs. All scratch belongs to this invocation.
     pub fn florenceMlp(cb: *const ops.ComputeBackend, input: CT, weights: [6]CT, rows: usize, dim: usize, hidden: usize) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .florence2 or !self.florence_fused_mlp_enabled or
@@ -2703,6 +2715,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn florenceDepthwiseResidual(cb: *const ops.ComputeBackend, input: CT, weight: CT, bias: CT, batch: usize, height: usize, width: usize, channels: usize) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .florence2 or !self.florence_fused_depthwise_enabled or self.ctx.info.compute_major < 8 or
@@ -2730,6 +2743,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn concatFlorenceImagePrompt(cb: *const ops.ComputeBackend, image: CT, prompt: CT, batch: usize, image_seq: usize, prompt_seq: usize, dim: usize) !CT {
+        if (comptime !cuda_enabled) return error.InvalidShape;
         if (cb.kind() != .cuda or batch == 0 or batch > 64 or image_seq == 0 or prompt_seq == 0 or dim == 0)
             return error.InvalidShape;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -2747,6 +2761,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn florenceAppendSelfCachePair(cb: *const ops.ComputeBackend, slabs: [2]CT, next: [2]CT, batch: usize, capacity: usize, old_len: usize, dim: usize) !?[2]CT {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .florence2 or !self.florence_fused_append_enabled or self.ctx.info.compute_major < 8) return null;
@@ -2780,6 +2795,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn compactFlorenceSelfCache(cb: *const ops.ComputeBackend, slab: CT, batch: usize, capacity: usize, active_len: usize, dim: usize) !CT {
+        if (comptime !cuda_enabled) return error.InvalidShape;
         if (cb.kind() != .cuda or batch == 0 or batch > 64 or capacity == 0 or active_len == 0 or active_len > capacity or dim == 0)
             return error.InvalidShape;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -2802,6 +2818,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn qwen35LinearCoreBatch(cb: *const ops.ComputeBackend, states: []const *@import("gated_delta.zig").State, request: anytype) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (!self.lighton_recurrent_batch_enabled or self.capability_profile != .lightonocr3 or states.len < 2 or states.len > 64) return null;
@@ -2901,6 +2918,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn lightOnRaggedCoreEnabled(cb: *const ops.ComputeBackend) bool {
+        if (comptime !cuda_enabled) return false;
         if (cb.kind() != .cuda) return false;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         return self.lighton_ragged_recurrent_enabled and self.lighton_recurrent_batch_enabled and
@@ -2910,6 +2928,7 @@ pub const CudaCompute = struct {
     /// Compact query rows and independent per-page initialization. A declined
     /// shape changes no state; any failure after launch poisons the whole claim.
     pub fn qwen35LinearCoreRaggedBatch(cb: *const ops.ComputeBackend, states: []const *@import("gated_delta.zig").State, lengths: []const usize, request: anytype) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (!lightOnRaggedCoreEnabled(cb) or states.len < 2 or states.len > 128) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (states.len > 64 and (!self.lighton_physical128_enabled or self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1)) return null;
@@ -3017,6 +3036,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn qwen35LinearCorePrefillBatch(cb: *const ops.ComputeBackend, states: []const *@import("gated_delta.zig").State, request: anytype) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const wide = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES");
@@ -3159,6 +3179,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn qwen35LinearCore(cb: *const ops.ComputeBackend, state: *@import("gated_delta.zig").State, request: anytype) !?CT {
+        if (comptime !cuda_enabled) return null;
         if (cb.kind() != .cuda) return null;
         if (state.failed) return error.CudaRecurrentStateInvalid;
         if (request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4) {

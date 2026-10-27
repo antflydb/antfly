@@ -281,7 +281,7 @@ pub fn Service(comptime Node: type) type {
                     try ctl.check();
                 }
             };
-            var owned_run = c.Run{ .durable = control.document_session, .event_allocator = a, .work_allocator = backing, .limits = if (@hasDecl(Node, "documentLimits")) node.documentLimits(def.budget) else def.budget, .control = .{ .ptr = &control, .check_fn = Probe.check } };
+            var owned_run = c.Run{ .durable = if (control.document_session) |session| @ptrCast(@alignCast(session)) else null, .event_allocator = a, .work_allocator = backing, .limits = if (@hasDecl(Node, "documentLimits")) node.documentLimits(def.budget) else def.budget, .control = .{ .ptr = &control, .check_fn = Probe.check } };
             defer owned_run.deinit();
             const run = shared orelse &owned_run;
             const parent_limits = run.limits;
@@ -1383,7 +1383,7 @@ pub fn Service(comptime Node: type) type {
                     try ctl.check();
                 }
             };
-            var run = c.Run{ .durable = control.document_session, .event_allocator = a, .work_allocator = backing, .limits = if (@hasDecl(Node, "documentLimits")) node.documentLimits(def.budget) else def.budget, .control = .{ .ptr = &extraction_control, .check_fn = Probe.check } };
+            var run = c.Run{ .durable = if (control.document_session) |session| @ptrCast(@alignCast(session)) else null, .event_allocator = a, .work_allocator = backing, .limits = if (@hasDecl(Node, "documentLimits")) node.documentLimits(def.budget) else def.budget, .control = .{ .ptr = &extraction_control, .check_fn = Probe.check } };
             defer run.deinit();
             try pinDurableGraph(a, &run, root_key, def, &graph);
             const binding = try extractionBinding(def, &graph);

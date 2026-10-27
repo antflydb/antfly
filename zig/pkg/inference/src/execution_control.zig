@@ -126,8 +126,10 @@ pub const UninterruptibleGuard = struct {
 /// callers can migrate without weakening cancellation coverage.
 pub const InferenceExecutionControl = struct {
     document_store: @import("antfly_runtime_abi").document_abi.View = .{},
-    document_session: ?*@import("antfly_readers").document_runs.Session = null,
-    document_dispatch_meter: ?*@import("antfly_readers").document_runs.DispatchMeter = null,
+    // Application-owned handles. The document service restores their concrete
+    // reader types; the common execution contract stays usable without readers.
+    document_session: ?*anyopaque = null,
+    document_dispatch_meter: ?*anyopaque = null,
     /// Runtime used for cancellation monitors and other structured background
     /// work. HTTP requests always supply their owning runtime; library callers
     /// may omit it when no monitor is required.

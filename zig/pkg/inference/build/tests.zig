@@ -42,11 +42,13 @@ pub fn create(ctx: Context) Suite {
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
     // The macOS dual-backend ReleaseFast CUDA scope with regenerated images
     // peaked at 20,664,074,240 bytes; reserve 24 GiB for compiler headroom.
-    // Keep the existing single-backend and CPU Debug reservations.
+    // The merged document/Metal suite peaked at 17,557,094,400 bytes.
+    // Reserve 20 GiB for single-Metal compiler headroom; runtime quotas and
+    // the CPU Debug/CUDA-only reservations remain unchanged.
     const dual_accelerator_macos = ctx.target.result.os.tag == .macos and
         ctx.backend.enable_metal and ctx.backend.enable_cuda;
     const tests = b.addTest(.{
-        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (dual_accelerator_macos) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else if (ctx.backend.enable_cuda) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (dual_accelerator_macos) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else if (ctx.backend.enable_cuda) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
