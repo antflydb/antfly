@@ -1641,6 +1641,7 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
         }
         for name in ("id", "bucket", "counter")
     }
+    properties["counter"]["nullable"] = True
     properties.update(
         body={"type": "string", "x-antfly-field": {"type": "text"}},
         note={"type": "string", "x-antfly-field": {"type": "text"}},
