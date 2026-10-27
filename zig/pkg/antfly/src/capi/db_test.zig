@@ -5536,14 +5536,21 @@ test "capi SQL recovery stays clean across row writes reads and cursors" {
 test "capi SQL reclamation assessment and copy release the foreground gate" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
+    const native = @import("antfly_local_sources").storage_lite_native;
     const Store = @import("antfly_local_sources").storage_lite_docstore.Store;
     for ([_]bool{ false, true }) |independent| {
         for ([_]Store.MaintenancePhase{ .assessment, .copy, .verification }) |phase| {
-            if (phase == .verification and !independent) continue;
             const Gate = struct {
                 phase: Store.MaintenancePhase,
+                failure: ?anyerror = null,
                 started: std.Io.Event = .unset,
                 allowed: std.Io.Event = .unset,
+                fn allocatorCaptured(ptr: *anyopaque, _: *native.NativeFile) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    notify(ptr, .verification) catch |err| {
+                        self.failure = err;
+                    };
+                }
                 fn notify(ptr: *anyopaque, current: Store.MaintenancePhase) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (current != self.phase) return;
@@ -5595,13 +5602,16 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
                 store.maintenance_policy.options.assessment_bytes = 4096;
                 store.maintenance_policy.options.minimum_reclaim_bytes = 4096;
                 store.maintenance_policy.next_assessment_size = 0;
-                store.test_maintenance_hook = .{ .ptr = &gate, .notify = Gate.notify };
+                if (phase != .verification) store.test_maintenance_hook = .{ .ptr = &gate, .notify = Gate.notify };
                 if (phase == .verification) {
                     store.file.free_pages_verified = false;
                     guard.connection.?.owner.maintenance_pending = true;
+                    // Verification now runs at the owner capture boundary.
+                    guard.connection.?.owner.test_after_allocator_capture = .{ .ptr = &gate, .notify = Gate.allocatorCaptured };
                 }
                 break :blk guard.connection.?.owner;
             };
+            defer connection.test_after_allocator_capture = null;
             var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started };
             const before_capture = connection.current.?;
             const background = try std.Thread.spawn(.{}, @TypeOf(driver).run, .{&driver});
@@ -5642,6 +5652,7 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
             background.join();
             joined = true;
             try driver.result();
+            if (gate.failure) |err| return err;
             try std.testing.expect(completed);
             try std.testing.expectEqual(capi.ErrorCode.ok, foreground.status);
             const guard = public.enterHandle(handle, .exclusive).?;

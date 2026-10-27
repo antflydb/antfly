@@ -1020,6 +1020,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     inference_checkpoint_mod.addImport("antfly_platform", platform_mod);
     inference_checkpoint_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    inference_checkpoint_mod.addImport("antfly_document_runs", antfly_imports.readers.import_table.get("antfly_document_runs").?);
     const inference_checkpoint_tests = b.addTest(.{ .root_module = inference_checkpoint_mod });
     b.step("runtime-inference-checkpoint-test", "Verify checkpoint replacement retains capabilities and rebinds the error dispatcher").dependOn(&b.addRunArtifact(inference_checkpoint_tests).step);
 
@@ -1634,7 +1635,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "match_all rejects field sort without native doc values",
         "match_all rejects score sort without score-bearing source",
         "composed search rejects exact field sort across embedding sources",
-        "composed text exact sort preserves native component profile",
+        "composed text exact sort preserves owned native component profile",
         "composed exact sort validates component sort tuples",
         "composed text exact sort surfaces missing component profile",
         "declared runtime sortable field capability reports covered queryable state",
