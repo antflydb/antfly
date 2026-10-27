@@ -83,3 +83,8 @@ The earlier live-tip diagnostic took 1,045.8 seconds in the importer, produced a
 roughly 4 GB file and retained 244,109 raw / 78,611 normalized rows. These inputs
 are different, and those timings must not be compared as a speed improvement.
 All local timings were measured with other builds active on the machine.
+
+On an APFS clone of the supplied 9.7 GB file, the supplied baseline library took
+1.256 seconds to open and 143.954 seconds for `CREATE TABLE` as its first authored
+statement; open/write/close took 145.438 seconds. The clone was isolated from the
+original database and used the same Python C ABI caller as the candidate probe.

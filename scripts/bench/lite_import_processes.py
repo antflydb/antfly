@@ -118,6 +118,11 @@ def main() -> None:
             except subprocess.TimeoutExpired:
                 returncode = "timeout"
         elapsed = time.monotonic() - started
+        summary = re.search(
+            r"done: imported (\d+), already present (\d+), failed (\d+)",
+            log.read_text(errors="replace"),
+        )
+        counts = list(map(int, summary.groups())) if summary else None
         after = storage_state(database)
         print(
             json.dumps(
@@ -126,6 +131,7 @@ def main() -> None:
                     "thread": thread,
                     "elapsed_seconds": elapsed,
                     "returncode": returncode,
+                    "counts": counts,
                     "before": before,
                     "after": after,
                     "growth_bytes": after["file_bytes"] - before["file_bytes"],
@@ -134,7 +140,7 @@ def main() -> None:
             ),
             flush=True,
         )
-        if returncode != 0:
+        if returncode != 0 or counts != [1, 0, 0]:
             raise SystemExit(1)
 
 
