@@ -585,6 +585,15 @@ test "lite allocator proof read window coalesces IO and still rejects corrupt va
     const record = try decodeDocumentEntry(try decodePagePayload(raw_record, .document));
     const root = record.external_value_root_page;
     try std.testing.expect(root != 0);
+    {
+        // A positive count passes checkpoint liveness but must still match
+        // the exact active graph ownership, even when that graph is reused.
+        const references = state.count(root);
+        state.counts.items[@intCast(root)] = references + 1;
+        defer state.counts.items[@intCast(root)] = references;
+        try std.testing.expectError(error.InvalidNativeAllocator, file.validateIndexedAllocator(checkpoint, state, null));
+        try std.testing.expect(file.allocator_proof_window == null);
+    }
     const raw_value = try file.readPageAlloc(a, root);
     defer a.free(raw_value);
     raw_value[page_header_size] ^= 1;
@@ -4263,11 +4272,7 @@ pub const NativeFile = struct {
         return graph;
     }
 
-    fn validateIndexedOwnership(self: *NativeFile, checkpoint: CheckpointSlot, state: *allocator_v4.State, cancel: ?*const maintenance.CancelToken) !void {
-        var expected = allocator_v4.State.init(self.allocator);
-        defer expected.deinit();
-        var graph = try self.indexedGraph(checkpoint, &expected, cancel);
-        defer graph.deinit(self.allocator);
+    fn validateIndexedOwnership(self: *NativeFile, checkpoint: CheckpointSlot, state: *allocator_v4.State, graph: *IndexedGraph, expected: *allocator_v4.State, cancel: ?*const maintenance.CancelToken) !void {
         var current_metadata: ReachablePageSet = .empty;
         defer current_metadata.deinit(self.allocator);
         for (state.metadata.items) |page| {
@@ -4281,13 +4286,13 @@ pub const NativeFile = struct {
             if (cancel) |token| try token.check();
             if (item.kind != .record and physicalPage(item.page) != item.page) return error.InvalidNativeAllocator;
             if (item.epoch > checkpoint.commit_sequence) return error.InvalidNativeAllocator;
-            try self.indexedMark(&graph, checkpoint, item.page);
+            try self.indexedMark(graph, checkpoint, item.page);
             switch (item.kind) {
                 .allocator_chain => {
                     var page = item.page;
                     while (page != 0) {
                         if (cancel) |token| try token.check();
-                        try self.indexedMark(&graph, checkpoint, page);
+                        try self.indexedMark(graph, checkpoint, page);
                         if (state.count(page) != 0 or page == state.root_page or metadata_retirements.contains(page) or current_metadata.contains(page)) return error.InvalidNativeAllocator;
                         try metadata_retirements.put(self.allocator, page, {});
                         const next = try self.retiredAllocatorNext(page, checkpoint);
@@ -4299,7 +4304,7 @@ pub const NativeFile = struct {
                     try metadata_retirements.put(self.allocator, item.page, {});
                 },
                 .page => try expected.retain(item.page),
-                .value => try self.indexedValue(&graph, checkpoint, item.page, item.length, cancel),
+                .value => try self.indexedValue(graph, checkpoint, item.page, item.length, cancel),
                 .index => {
                     if (graph.nodes.contains(item.page)) return error.InvalidNativeAllocator;
                     try graph.nodes.put(self.allocator, item.page, {});
@@ -4309,7 +4314,7 @@ pub const NativeFile = struct {
                     var node = try decodeDocumentIndexNode(self.allocator, payload);
                     defer node.deinit(self.allocator);
                     for (node.key_pages.?) |key_page| if (key_page != 0) {
-                        try self.indexedMark(&graph, checkpoint, key_page);
+                        try self.indexedMark(graph, checkpoint, key_page);
                         try expected.retain(key_page);
                     };
                 },
@@ -4330,7 +4335,7 @@ pub const NativeFile = struct {
                         },
                         else => return error.InvalidNativeAllocator,
                     };
-                    if (root != 0) try self.indexedValue(&graph, checkpoint, root, length, cancel);
+                    if (root != 0) try self.indexedValue(graph, checkpoint, root, length, cancel);
                 },
             }
         }
@@ -4353,12 +4358,19 @@ pub const NativeFile = struct {
         var window: AllocatorProofWindow = undefined;
         window.initInto(self);
         defer window.deinit();
+        if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
         var active_records: u64 = 0;
+        var validated_active = false;
         for (self.header.checkpoints, 0..) |slot, index| {
             if (!validCheckpointSlot(slot)) continue;
-            var graph = try self.indexedGraph(slot, null, cancel);
+            const active = index == self.header.active_checkpoint;
+            var expected = allocator_v4.State.init(self.allocator);
+            defer expected.deinit();
+            // Retain the active graph's exact reference counts during its
+            // liveness walk instead of reading and checking every page again.
+            var graph = try self.indexedGraph(slot, if (active) &expected else null, cancel);
             defer graph.deinit(self.allocator);
-            if (index == self.header.active_checkpoint) active_records = graph.record_count;
+            if (active) active_records = graph.record_count;
             var pages = graph.pages.keyIterator();
             while (pages.next()) |page| {
                 if (cancel) |token| try token.check();
@@ -4376,9 +4388,13 @@ pub const NativeFile = struct {
                 if (cancel) |token| try token.check();
                 if (state.count(page) == allocator_v4.free) return error.InvalidNativeAllocator;
             }
+            if (active) {
+                if (!std.meta.eql(slot, checkpoint)) return error.InvalidNativeAllocator;
+                try self.validateIndexedOwnership(checkpoint, state, &graph, &expected, cancel);
+                validated_active = true;
+            }
         }
-        if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
-        try self.validateIndexedOwnership(checkpoint, state, cancel);
+        if (!validated_active) return error.InvalidNativeAllocator;
         return active_records;
     }
 

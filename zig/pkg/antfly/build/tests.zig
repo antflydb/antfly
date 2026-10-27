@@ -368,7 +368,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-document-owner-simulation-test", "Replay document owner failure schedules on the shared VOPR durable lane").dependOn(&addFilteredTestRunArtifact(b, document_owner_simulation_tests).step);
     const document_owner_metadata_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{"metadata durable job state"},
+        .filters = &.{ "metadata durable job state", "metadata raft apply store snapshot key registry" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-document-owner-metadata-test", "Verify authoritative document metadata CAS, replay and reopen").dependOn(&addFilteredTestRunArtifact(b, document_owner_metadata_tests).step);

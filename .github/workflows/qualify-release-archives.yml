@@ -42,6 +42,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # The source prefetch and both products must use the same package cache.
+      ANTFLY_ZIG_CACHE_ROOT: ${{ github.workspace }}/.zig-cache/release-toolchain
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/release-toolchain/global
     steps:
       - name: Checkout requested revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -108,6 +115,23 @@ jobs:
           test -d "$sdk_path/System/Library/Frameworks/MetalPerformanceShaders.framework"
           test -d "$sdk_path/System/Library/Frameworks/Accelerate.framework"
           echo "SDK_PATH=$sdk_path" >> "$GITHUB_ENV"
+
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+        with:
+          mirror-only: 'true'
 
       - name: Build source-declared runtime archives
         env:
