@@ -171,7 +171,7 @@ only that pair, captures eight auxiliary live streams, drives the existing
 fixed-arrival workload, and pauses both sides in cleanup. It audits one interior
 minute twice after settlement. It explicitly does not claim whole-execution
 coverage or exact body/receipt verification. Each invocation writes a distinct
-private report directory; subsequent versions also snapshot the diagnostic
+private report directory; subsequent versions also snapshot selected diagnostic
 driver sources. Live socket gaps remain recorded even when this diagnostic
 experiment continues collecting load. This behavior does not change the strict
 gate's immediate cancellation rule.

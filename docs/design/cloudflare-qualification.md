@@ -1910,3 +1910,72 @@ file and removes it on completion. This is local native capacity evidence,
 not a total-isolate-memory or live latency result. The refreshed evidence
 manifest binds 27 artifacts to the new native module; the prior manifests and
 all original report files remain preserved.
+
+
+## Fresh invocation accounting and metadata-drain remeasurement
+
+The common driver now records each physical attempt and declares its request
+identity policy. The initially UUID-shaped query values are redacted by the
+provider; the corrected encoding preserves 128-bit identity without changing
+control source or request bodies. A second live decoder correction scopes event
+IDs by invocation: distinct console events can share a metadata event ID and
+timestamp across requests. Both events are retained, and repetition of the
+complete identity remains fatal. Original failed reports remain preserved.
+
+The first fresh attempt stops during publication admission, before offered
+load. Read-only follow-up confirms all eight tenants published; a retry completes
+a ten-minute fixed-arrival workload against the existing corpus. It records
+240 reads and 80 writes on each side, with final counts of 512 for all tenants.
+Candidate read/write p95 is 1,324/4,727 ms versus control 7,932/8,919 ms. One
+control compaction exhausts `WorkLeaseLost` admission; candidate compactions
+include exhausted `CoordinatorRecovering` admission and one unreplayed
+`ECONNRESET`. Round annotations accompany those failures. Candidate writer and
+reader live streams later lose their shared sessions with code `1006`. This is
+failed diagnostic evidence, with no complete exact-body/receipt verification.
+
+Its selected persisted minute has ingestion sampling on the candidate builder
+(`1.1636363636363636`). With invocation-scoped event IDs, seven roles can be
+collected, including the inactive candidate reader's empty stored set. One
+candidate HTTP acknowledgement has no matching terminal Ray hash in five
+adjacent complete app event responses. That search is not a delivery proof or a
+claim about every possible later window. Counter and stored-log populations do
+not all agree; some fresh platform aggregates are unsampled even though the
+historical aggregates were sampled. Stable counts, configured 100% capture and
+query ABR one cannot replace expected-invocation reconciliation.
+
+The metadata-drain runtime is then deployed only to paused candidate 3, archiving
+its previous bundles. The approved control and native WASM modules are unchanged.
+A subsequent three-minute paired diagnostic completes 72 reads and 24 writes
+per side, with no client errors and matching final tenant counts. All eight
+live streams remain connected, with zero observed resource signals, and all
+owned sessions are removed. Candidate read/write p95 is 1,573/4,233 ms versus
+control 6,043/6,496 ms. The candidate still exceeds both absolute warm targets.
+Different durations and changing remote-I/O costs prevent a causal before/after
+latency claim from these two experiments.
+
+For this short run, all sixteen persisted observations complete and each role's
+two event-set hashes agree. The new attempt tags survive source redaction. This
+is progress in collector correctness, not qualified delivery: candidate HTTP
+acknowledgements still do not completely reconcile, a baseline builder event
+has a deployment version outside the captured active-version set, and exact
+independent role totals remain unqualified. Quiet-role zero counts are not an
+exception. The gate evaluator still rejects these diagnostic-only artifacts.
+
+Local validation is 265 passing Node tests, 20 passing workerd tests, and twelve
+additional workerd context/direct-read tests against the final drain logic.
+The 16,384-row metadata scale/reopen/collection/observer fixture passes with
+100 peak operations, 2,107,085 transferred bytes, 978,422 working bytes and
+7,405,568 linear-memory bytes. Native modules are unchanged from the prior
+660-passed/six-skipped suite and completed 50,000-document fixture. Cache cleanup
+completes after testing. All six disposable stacks are paused and every reserved
+cold epoch remains unused. One-hour qualification stays blocked on complete
+coverage, warm latency and clean maintenance outcomes; no thresholds or retry
+rules were relaxed.
+
+
+The updated local evidence manifest verifies 108 artifacts, including all 24
+completed live journals, 22 original persisted-window artifacts, selected driver
+source snapshots, scale/test logs, independent counter probes and the preserved
+compaction experiment. All 27 prior artifact hashes verify before the manifest
+is archived and extended. Artifact integrity is independently verified; none of
+these hashes changes the failed qualification status.

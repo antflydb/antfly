@@ -1391,3 +1391,37 @@ cover request-context lifetime and direct-read recovery. A 16,384-row metadata
 scale/reopen/collection run also exercises the final observer without writes.
 These establish the dependency correction; deployed latency still needs a fresh
 measurement of this runtime.
+
+
+The short deployed remeasurement completes 72 candidate lookups. Their reported
+metadata-admission p95 is 618 ms and native lookup p95 is 846 ms, with working-set
+p95 60,592 bytes. The 52 lookups with physical misses report two GET waves at
+median and three at p95. These clocks include awaited remote I/O and do not
+measure CPU. The client read p95 remains 1,573 ms. The dependency regression is
+fixed, but these observations do not establish a deployed latency improvement
+or suggest increasing memory/operation caps. The next read optimization needs
+to reduce authenticated proof/data-fetch dependency depth while preserving
+fresh mutable authority, rather than reuse completed mutable views.
+
+## Preserve the paged no-op compaction path
+
+A local staged-unkeyed-compaction experiment validates both an actual flat
+compaction and a paged no-op, including lease release, exact bodies, restart and
+platform-storage loss. The existing flat case uses one snapshot admission plus
+five publication RPCs; staging uses begin/finalize with no per-object publication
+RPC. However, the existing paged no-op uses one snapshot admission and zero
+publication RPCs. Eagerly acquiring a writer lease for that path adds authority
+work and serializes publication unnecessarily. The experiment and comparison
+logs remain local; that unconditional runtime change is not selected.
+
+The long-term extension should let native compaction classify a protected source
+as a read-only no-op or as requiring publication before acquiring a writer lease.
+The no-op must retain its current bounded validation and read-pin protection.
+Only the writing case should use staged metadata, fenced immutable uploads and
+atomic HEAD/offset/pin/native-release commit. Revalidate after lease acquisition
+if the source changed; never treat a JavaScript manifest heuristic as authority.
+Any two-stage execution must share the original deadline and aggregate I/O and
+memory budgets. Fault coverage must include a changed source between stages,
+expired/replaced ownership, cancellation with outstanding I/O, lost acquisition
+and finalization acknowledgements, and both paged/legacy formats. Unkeyed client
+transport replay remains forbidden even when its internal metadata is staged.
