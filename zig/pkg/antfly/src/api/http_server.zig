@@ -14886,9 +14886,10 @@ pub const ApiHttpServer = struct {
         var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
         var binding = try self.bindCatalogQuery(alloc, context, logical_name, body, &identity, &resolver);
         defer binding.deinit();
+        const bound_body = binding.bound_body orelse body;
         // Retrieval must use the same bound engine and publication as HTTP
         // search. Object tables have no native data shards to query.
-        if (try self.tryObjectTableQuery(binding.physical, body, identity, null, binding.label, if (binding.join) |*join| join else null, &resolver, binding.dispatch)) |value| {
+        if (try self.tryObjectTableQuery(binding.physical, bound_body, identity, null, binding.label, if (binding.join) |*join| join else null, &resolver, binding.dispatch)) |value| {
             var response = value;
             defer response.deinit(self.alloc);
             if (response.status != 200) return switch (response.status) {
@@ -14909,7 +14910,7 @@ pub const ApiHttpServer = struct {
             alloc,
             source,
             binding.physical,
-            body,
+            bound_body,
             row_filter,
             identity,
             context.deadline_ns,
@@ -58511,6 +58512,63 @@ test "system catalog graph primary qualifiers bind full target without namespace
         try std.testing.expectEqualStrings("table:primary", paths.get("from").?.object.get("table").?.string);
         try std.testing.expectEqualStrings("table:primary", paths.get("to").?.object.get("table").?.string);
     }
+}
+
+test "system catalog retrieval executes bound primary graph qualifiers" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        queries: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try std.testing.expect(input == .resolve_many);
+            try std.testing.expectEqual(@as(usize, 1), input.resolve_many.targets.len);
+            try std.testing.expectEqualStrings("docs", input.resolve_many.targets[0].table);
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 10, .name = "table:primary" }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 7, .tables = &tables }, .{});
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+        fn query(raw: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.queries += 1;
+            try std.testing.expectEqualStrings("table:primary", table_name);
+            try std.testing.expectEqual(@as(usize, if (self.queries <= 2) 1 else 0), req.graph_queries.len);
+            for (req.graph_queries) |operation| {
+                if (operation.query.match_pattern) |pattern| {
+                    try std.testing.expectEqual(@as(usize, 1), pattern.nodes.len);
+                    try std.testing.expectEqualStrings("table:primary", pattern.nodes[0].table.?);
+                } else {
+                    const identities = operation.query.start_nodes.identities;
+                    try std.testing.expectEqualStrings("table:primary", identities[0].table.?);
+                    try std.testing.expectEqualStrings("foreign", identities[1].table.?);
+                }
+            }
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"hits\":[]}}]}") };
+        }
+    };
+    var fake: Fake = .{};
+    const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, reads, null);
+    defer server.deinit();
+    const bodies = [_][]const u8{
+        \\{"graph_queries":{"q":{"index":"graph","match":{"anchor":"a","nodes":{"a":{"table":"docs"}},"edges":[]},"return":{"bindings":["a"]}}}}
+        ,
+        \\{"graph_queries":{"q":{"index":"graph","traverse":{"start":{"identities":[{"key":"a","table":"docs"},{"key":"b","table":"foreign"}]},"max_depth":1}}}}
+        ,
+        \\{"query":{"match_all":{}}}
+        ,
+    };
+    for (bodies) |body| {
+        var response = try server.executeCatalogRetrievalQuery(a, .{}, "docs", body, null);
+        defer response.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, bodies.len), fake.queries);
 }
 
 test "system catalog binds primary and nested joins once without conflating literal names" {
