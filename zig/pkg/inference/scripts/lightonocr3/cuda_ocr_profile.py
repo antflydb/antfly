@@ -56,6 +56,11 @@ def main():
         metavar="LIBRARY",
         help="Optional SM12.1 native BF16 recurrent prefill library; F32 state and decode remain unchanged.",
     )
+    parser.add_argument(
+        "--decode-graph",
+        action="store_true",
+        help="Experimental two-token native decoder graph within an owned LightOn reader epoch.",
+    )
     argv = sys.argv[1:]
     delimiter = argv.index("--") if "--" in argv else len(argv)
     command = argv[delimiter + 1 :]
@@ -64,8 +69,13 @@ def main():
         args.bf16_prefill_ffn or args.bf16_recurrent_prefill
     ) and args.profile == "florence":
         parser.error("BF16 prefill options apply only to the LightOn models")
+    if args.decode_graph and args.profile == "florence":
+        parser.error("Decoder graphs apply only to LightOn models")
     defaults = profile_environment(data["profiles"], args.profile)
     if args.profile != "florence":
+        defaults["ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH"] = (
+            "1" if args.decode_graph else "0"
+        )
         defaults["ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN"] = (
             "1" if args.bf16_prefill_ffn else "0"
         )

@@ -40,9 +40,12 @@ struct LightOnAttentionParams {
   uint32_t row_values;
   uint32_t capacity;
   LightOnAttentionPage pages[64];
+  const uint32_t *graph_progress;
+  uint32_t graph_step;
+  uint32_t reserved;
 };
 static_assert(sizeof(LightOnAttentionPage) == 268, "page ABI");
-static_assert(sizeof(LightOnAttentionParams) == 17248, "packet ABI");
+static_assert(sizeof(LightOnAttentionParams) == 17264, "packet ABI");
 
 // Each page owns an exclusive writable tail. Host validation proves bounds,
 // physical capacity and non-aliasing before a single suffix is changed.
@@ -53,7 +56,15 @@ extern "C" __global__ void lighton_attention_write_suffix(
   if (item >= p.items || d >= p.row_values)
     return;
   const LightOnAttentionPage &page = p.pages[item];
-  const uint32_t token = page.tokens - 1;
+  const uint32_t progress = p.graph_progress ? *p.graph_progress : 0;
+  if (p.graph_progress && progress < p.graph_step)
+    return;
+  const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0;
+  if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens)
+    return;
+  const uint32_t token = page.tokens + delta - 1;
+  if (token / p.page_size >= page.block_count)
+    return;
   const uint32_t physical =
       page.blocks[token / p.page_size] * p.page_size + token % p.page_size;
   const uint32_t destination = physical * p.row_values + d;
@@ -73,11 +84,123 @@ __device__ __forceinline__ float warp_max(float x) {
   return x;
 }
 
-// One warp owns each of four query heads sharing a KV head. Each lane
-// preserves the original F32 dot-product reduction and value summation order.
+// Small cohorts retain four warps per query head to fill the device.
 template <unsigned Chunk>
 __device__ __forceinline__ void
 attention_chunks(const LightOnAttentionParams &p) {
+  const uint32_t head = blockIdx.x;
+  const uint32_t item = blockIdx.y / p.chunks;
+  const uint32_t chunk = blockIdx.y % p.chunks;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t lane = tid % 32;
+  const uint32_t warp = tid / 32;
+  if (item >= p.items || head >= p.heads || blockDim.x != 128)
+    return;
+  const LightOnAttentionPage &page = p.pages[item];
+  const uint32_t progress = p.graph_progress ? *p.graph_progress : 0;
+  if (p.graph_progress && progress < p.graph_step)
+    return;
+  const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0;
+  if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens)
+    return;
+  const uint32_t tokens = page.tokens + delta;
+  const uint32_t query_position = page.query_position + delta;
+  if (chunk * Chunk >= tokens || chunk * Chunk > query_position) {
+    const uint32_t row = (item * p.heads + head) * p.chunks + chunk;
+    p.partials[row * 256 + tid] = 0.f;
+    p.partials[row * 256 + tid + 128] = 0.f;
+    if (tid == 0) {
+      p.statistics[row * 2] = -INFINITY;
+      p.statistics[row * 2 + 1] = 0.f;
+    }
+    return;
+  }
+  const uint32_t kv_head = head / (p.heads / p.kv_heads);
+  const uint32_t q_base = (item * p.heads + head) * 256;
+  __shared__ float scores[Chunk];
+  __shared__ float maximum;
+  __shared__ float denominator;
+  float query[8];
+#pragma unroll
+  for (uint32_t d = 0; d < 8; ++d)
+    query[d] = p.q[q_base + lane + d * 32];
+#pragma unroll(Chunk == 32 ? 8 : 1)
+  for (uint32_t local_key = warp; local_key < Chunk; local_key += 4) {
+    const uint32_t key = chunk * Chunk + local_key;
+    const uint32_t logical_page = key / p.page_size;
+    uint32_t physical = p.capacity;
+    if (key < tokens && key <= query_position &&
+        logical_page < page.block_count)
+      physical = page.blocks[logical_page] * p.page_size + key % p.page_size;
+    float score = 0;
+    if (physical < p.capacity) {
+      const uint32_t base = physical * p.row_values + kv_head * 256;
+#pragma unroll
+      for (uint32_t d = 0; d < 8; ++d)
+        score += query[d] * __half2float(p.k[base + lane + d * 32]);
+    }
+    score = warp_sum(score) * 0.0625f;
+    if (lane == 0)
+      scores[local_key] = physical < p.capacity ? score : -INFINITY;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    if constexpr (Chunk == 32) {
+      float m = warp_max(scores[lane]);
+      m = __shfl_sync(0xffffffff, m, 0);
+      const float e = isfinite(m) ? expf(scores[lane] - m) : 0;
+      scores[lane] = e;
+      const float sum = warp_sum(e);
+      if (lane == 0) {
+        maximum = m;
+        denominator = sum;
+      }
+    } else {
+      float m = -INFINITY;
+      for (uint32_t key = lane; key < Chunk; key += 32)
+        m = fmaxf(m, scores[key]);
+      m = warp_max(m);
+      m = __shfl_sync(0xffffffff, m, 0);
+      float sum = 0;
+      for (uint32_t key = lane; key < Chunk; key += 32) {
+        const float e = isfinite(m) ? expf(scores[key] - m) : 0;
+        scores[key] = e;
+        sum += e;
+      }
+      sum = warp_sum(sum);
+      if (lane == 0) {
+        maximum = m;
+        denominator = sum;
+      }
+    }
+  }
+  __syncthreads();
+  float first = 0, second = 0;
+#pragma unroll(Chunk == 32 ? 32 : 1)
+  for (uint32_t local_key = 0; local_key < Chunk; ++local_key) {
+    const uint32_t key = chunk * Chunk + local_key;
+    if (key < tokens && key <= query_position && scores[local_key] != 0) {
+      const uint32_t physical =
+          page.blocks[key / p.page_size] * p.page_size + key % p.page_size;
+      if (physical < p.capacity) {
+        const uint32_t base = physical * p.row_values + kv_head * 256;
+        first += scores[local_key] * __half2float(p.v[base + tid]);
+        second += scores[local_key] * __half2float(p.v[base + tid + 128]);
+      }
+    }
+  }
+  const uint32_t index = (item * p.heads + head) * p.chunks + chunk;
+  p.partials[index * 256 + tid] = first;
+  p.partials[index * 256 + tid + 128] = second;
+  if (tid == 0) {
+    p.statistics[index * 2] = maximum;
+    p.statistics[index * 2 + 1] = denominator;
+  }
+}
+
+template <unsigned Chunk>
+__device__ __forceinline__ void
+attention_grouped_chunks(const LightOnAttentionParams &p) {
   const unsigned item = blockIdx.y / p.chunks, chunk = blockIdx.y % p.chunks;
   const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5,
                  kh = blockIdx.x, head = kh * 4 + warp;
@@ -85,6 +208,25 @@ attention_chunks(const LightOnAttentionParams &p) {
       blockDim.x != 128)
     return;
   const auto &page = p.pages[item];
+  const uint32_t progress = p.graph_progress ? *p.graph_progress : 0;
+  if (p.graph_progress && progress < p.graph_step)
+    return;
+  const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0;
+  if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens)
+    return;
+  const uint32_t tokens = page.tokens + delta;
+  const uint32_t query_position = page.query_position + delta;
+  if (chunk * Chunk >= tokens || chunk * Chunk > query_position) {
+    const unsigned row = (item * p.heads + head) * p.chunks + chunk;
+#pragma unroll
+    for (unsigned d = 0; d < 8; ++d)
+      p.partials[row * 256 + lane + d * 32] = 0.f;
+    if (lane == 0) {
+      p.statistics[row * 2] = -INFINITY;
+      p.statistics[row * 2 + 1] = 0.f;
+    }
+    return;
+  }
   __shared__ float scores[4][Chunk];
   float query[8];
 #pragma unroll
@@ -93,7 +235,7 @@ attention_chunks(const LightOnAttentionParams &p) {
 #pragma unroll 1
   for (unsigned local = 0; local < Chunk; ++local) {
     unsigned key = chunk * Chunk + local, physical = p.capacity;
-    if (key < page.tokens && key <= page.query_position &&
+    if (key < tokens && key <= query_position &&
         key / p.page_size < page.block_count)
       physical =
           page.blocks[key / p.page_size] * p.page_size + key % p.page_size;
@@ -129,8 +271,7 @@ attention_chunks(const LightOnAttentionParams &p) {
 #pragma unroll 1
   for (unsigned local = 0; local < Chunk; ++local) {
     unsigned key = chunk * Chunk + local;
-    if (key < page.tokens && key <= page.query_position &&
-        scores[warp][local] != 0.f) {
+    if (key < tokens && key <= query_position && scores[warp][local] != 0.f) {
       unsigned physical =
           page.blocks[key / p.page_size] * p.page_size + key % p.page_size;
       if (physical < p.capacity) {
@@ -199,4 +340,24 @@ lighton_attention_combine(const __grid_constant__ LightOnAttentionParams p) {
   }
   p.out[row * 256 + tid] = first / denominator;
   p.out[row * 256 + tid + 128] = second / denominator;
+}
+
+// One ordered stream operation advances both graph steps and all M-RoPE axes.
+extern "C" __global__ void
+lighton_graph_advance(uint32_t *positions, uint32_t *progress, uint32_t count) {
+  if (blockIdx.x != 0 || blockDim.x != 256)
+    return;
+  if (threadIdx.x < count)
+    positions[threadIdx.x] += 1;
+  if (threadIdx.x == 0)
+    *progress += 1;
+}
+
+extern "C" __global__ void lighton_attention_grouped_chunks32(
+    const __grid_constant__ LightOnAttentionParams p) {
+  attention_grouped_chunks<32>(p);
+}
+extern "C" __global__ void lighton_attention_grouped_chunks128(
+    const __grid_constant__ LightOnAttentionParams p) {
+  attention_grouped_chunks<128>(p);
 }

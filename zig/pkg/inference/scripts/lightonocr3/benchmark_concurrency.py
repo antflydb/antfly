@@ -524,6 +524,7 @@ def run(args, model, label, mode, concurrency, output):
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PARALLEL_PREFIX",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_PREFIX",
                 "ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY",
+                "ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PREFIX_SHARED_QK",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_STATE_POOL",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_SHARED_RECURRENT_WEIGHTS",
@@ -1268,6 +1269,11 @@ def run(args, model, label, mode, concurrency, output):
                 args.require_cuda_token_burst,
             ),
             (
+                "cuda_model_graph_replays",
+                "lighton_model_graph",
+                args.require_lighton_model_graph,
+            ),
+            (
                 "cuda_bf16_recurrent_prefill_calls",
                 "lighton_bf16_recurrent_prefill",
                 args.require_lighton_bf16_recurrent_prefill,
@@ -1920,6 +1926,7 @@ def main():
     parser.add_argument("--require-lighton-fused-vision-mlp", action="store_true")
     parser.add_argument("--require-lighton-bf16-prefill-ffn", action="store_true")
     parser.add_argument("--require-lighton-bf16-recurrent-prefill", action="store_true")
+    parser.add_argument("--require-lighton-model-graph", action="store_true")
     parser.add_argument("--require-wide-packed-prefill", action="store_true")
     parser.add_argument("--require-lighton-norm-weight-cache", action="store_true")
     parser.add_argument("--require-florence-bart-ffn", action="store_true")

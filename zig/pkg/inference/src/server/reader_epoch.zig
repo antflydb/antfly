@@ -288,6 +288,13 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             const queued = if (ctx.gate_events) try ctx.step_gate.acquireWithPriority(control, true) else null;
             errdefer if (queued) |lease| lease.release();
             try control.lockWithPoll(&ctx.step_mutex, ctx.phase_wait_ns);
+            ctx.invalidateCudaDecodeGraph();
+        }
+        fn invalidateCudaDecodeGraph(ctx: *LightOnStreamContext) void {
+            // Vision and other foreground phases may resize shared CUDA
+            // scratch. Retire captured addresses before that phase executes.
+            if (comptime build_options.enable_cuda) if (ctx.cb) |*cb|
+                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraph(cb);
         }
         pub fn lockStepForCleanup(ctx: *LightOnStreamContext) void {
             if (ctx.phase_fair) _ = ctx.phase_waiters.fetchAdd(1, .acq_rel);
@@ -297,10 +304,14 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (ctx.gate_events) {
                 _ = ctx.step_gate.acquireForCleanup(if (ctx.worker_io) |*owner| owner.io() else null, true);
             }
-            if (ctx.phase_wait_ns == 0) return platform.sync.lockYielding(&ctx.step_mutex);
-            // Cleanup must retain stack-backed state until its owner releases
-            // the backend. An empty control cannot cancel this acquisition.
-            (InferenceExecutionControl{}).lockWithPoll(&ctx.step_mutex, ctx.phase_wait_ns) catch unreachable;
+            if (ctx.phase_wait_ns == 0) {
+                platform.sync.lockYielding(&ctx.step_mutex);
+            } else {
+                // Cleanup retains stack-backed state until its owner releases
+                // the backend; an empty control cannot cancel acquisition.
+                (InferenceExecutionControl{}).lockWithPoll(&ctx.step_mutex, ctx.phase_wait_ns) catch unreachable;
+            }
+            ctx.invalidateCudaDecodeGraph();
         }
         pub fn unlockStep(ctx: *LightOnStreamContext) void {
             ctx.step_mutex.unlock();
@@ -408,7 +419,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 .gpu_token_burst_lighton_decode = ctx.features.gpu_token_burst,
                 .gpu_token_burst_width = ctx.features.gpu_token_burst_width,
                 .gpu_greedy_stream_lighton_decode = ctx.features.gpu_greedy_stream,
+                .lighton_cuda_execution_id = ctx.execution_id,
             };
+            defer pipeline.deinit();
             var storage: [reader_execution_pool.Pool.max_capacity]runtime.scheduler.native_generate.StepItem = undefined;
             var step = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
             while (!ctx.worker_stop.load(.acquire)) {

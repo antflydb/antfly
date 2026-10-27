@@ -39,15 +39,18 @@ pub const Params = extern struct {
     row_values: u32 = 0,
     capacity: u32 = 0,
     pages: [64]Page = @splat(.{}),
+    graph_progress: driver.CUdeviceptr = 0,
+    graph_step: u32 = 0,
+    reserved: u32 = 0,
 };
 comptime {
-    if (@sizeOf(Page) != 268 or @sizeOf(Params) != 17248 or @offsetOf(Params, "pages") != 92)
+    if (@sizeOf(Page) != 268 or @sizeOf(Params) != 17264 or @offsetOf(Params, "pages") != 92)
         @compileError("LightOn CUDA attention packet ABI changed");
 }
 
 pub const Module = struct {
     module: driver.CUmodule = null,
-    functions: [4]driver.CUfunction = @splat(null),
+    functions: [7]driver.CUfunction = @splat(null),
     calls: usize = 0,
     suffix_write_calls: usize = 0,
     chunk128_calls: usize = 0,
@@ -67,11 +70,20 @@ pub const Module = struct {
         const image = @embedFile("lighton_attention.ptx") ++ "\x00";
         try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, image.ptr, 0, null, null));
         errdefer _ = ctx.driver.fns.cuModuleUnload(module);
-        var functions: [4]driver.CUfunction = @splat(null);
-        inline for (.{ "lighton_attention_chunks", "lighton_attention_combine", "lighton_attention_write_suffix", "lighton_attention_chunks128" }, 0..) |name, i|
+        var functions: [7]driver.CUfunction = @splat(null);
+        inline for (.{ "lighton_attention_chunks", "lighton_attention_combine", "lighton_attention_write_suffix", "lighton_attention_chunks128", "lighton_graph_advance", "lighton_attention_grouped_chunks32", "lighton_attention_grouped_chunks128" }, 0..) |name, i|
             try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&functions[i], module, name));
         self.module = module;
         self.functions = functions;
+    }
+    pub fn advanceGraph(self: *Module, ctx: *context.CudaContext, positions: driver.CUdeviceptr, progress: driver.CUdeviceptr, count: u32) !void {
+        if (count == 0 or count > 192) return error.InvalidShape;
+        var p = positions;
+        var c = progress;
+        var n = count;
+        var args = [_]?*anyopaque{ &p, &c, &n };
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[4], 1, 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        ctx.noteKernelLaunch();
     }
     pub fn writeSuffix(self: *Module, ctx: *context.CudaContext, params: *Params) !void {
         var args = [_]?*anyopaque{@ptrCast(params)};
@@ -81,7 +93,13 @@ pub const Module = struct {
     }
     pub fn run(self: *Module, ctx: *context.CudaContext, params: *Params, chunk128: bool) !void {
         var args = [_]?*anyopaque{@ptrCast(params)};
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[if (chunk128) 3 else 0], params.kv_heads, params.items * params.chunks, 1, 128, 1, 1, 0, ctx.stream, &args, null));
+        // Small cohorts need more independent CTAs for occupancy. These
+        // two grouped ranges are selected from complete-operation timings;
+        // operator overrides retain the original F32 kernel elsewhere.
+        const grouped = (params.heads == 8 and !chunk128 and params.items >= 8) or
+            (params.heads == 16 and chunk128 and params.items >= 16);
+        const function = self.functions[if (grouped) (if (chunk128) @as(usize, 6) else 5) else if (chunk128) 3 else 0];
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, if (grouped) params.kv_heads else params.heads, params.items * params.chunks, 1, 128, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[1], params.items * params.heads, 1, 1, 128, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();

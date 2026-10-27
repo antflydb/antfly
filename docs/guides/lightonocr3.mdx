@@ -169,6 +169,12 @@ attention layers. Each recurrent layer retains its own state. Up to 128 physical
 rows use recurrent and attention packets of at most 64. Client concurrency,
 admitted live pages and physical GPU rows remain separate limits.
 
+The experimental `--decode-graph` switch replays two dependent decode tokens
+inside the reader epoch. Qualified cohorts contain 2–64 pages; larger cohorts
+use the existing packed path. It retains the precision of the selected profile
+and independently admits graph metadata and scratch under operator limits.
+Benchmark with `--require-lighton-model-graph` to require actual replay.
+
 The optional `--bf16-prefill-ffn` switch uses BF16 FFN intermediates for larger
 prefills. On SM12.1, `--bf16-recurrent-prefill LIBRARY` also selects a native BF16
 recurrent prefill kernel. Both retain F32 residuals, recurrent state and decode;

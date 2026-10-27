@@ -42,6 +42,24 @@ uses original FP16. Defaults retain F32 activations and recurrent state; the
 partial BF16 options are not complete activation-precision matches. An older
 rare CUDA Florence receipt mismatch is not definitively root-caused.
 
+## CUDA follow-up qualification
+
+The bounded two-token decoder graph has fresh DGX Spark qualification for both
+LightOn models with default decode, optional BF16 prefill FFN, and optional BF16
+recurrent prefill. Every timed output agrees with native serial decoding and the
+fresh vLLM reference's normalized content on all three fixtures. The six 64-page
+runs require positive model-graph replay counters. The CUDA regression groups
+pass (240 selected: 226 passed, 14 backend skips; wide group: 76 selected,
+75 passed, one skip), including independent admission, ownership and state checks.
+These are functional checks, not a sustained vLLM parity result.
+
+Use `cuda_ocr_profile.py --decode-graph` and the native harness's
+`--require-lighton-model-graph`. Graph rows follow stable sequence IDs and both
+output columns return to the scheduler's original claim order. The public
+attention verifier also checks repeated two-token replay, reset, complete KV
+contents and unused slots with the original F32 threshold. Raw follow-up logs
+and manifests remain outside the tracked source tree.
+
 ## Reproduce
 
 Keep the fixture definitions in `../corpus/cases.json`, their images, the invoice

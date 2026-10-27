@@ -2364,6 +2364,253 @@ pub const CudaCompute = struct {
         }
     };
 
+    /// Graph execution is authorized only by an exclusive reader epoch. The
+    /// shared session backend never infers ownership from a request pointer.
+    pub fn lightOnDecodeGraphEnabled(cb: *const ops.ComputeBackend) bool {
+        if (cb.kind() != .cuda) return false;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_decode_graph_enabled and self.capability_profile == .lightonocr3 and
+            self.lighton_attention_enabled and self.lighton_batched_kv_write_enabled and self.lighton_recurrent_batch_enabled and
+            self.lighton_ffn_block_enabled and self.lighton_ffn_bf16_inputs and
+            self.lighton_state_pool_enabled and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and !self.resident_training_cache and self.lazy_host_store == null and
+            self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1;
+    }
+    pub fn endLightOnDecodeGraphEpoch(cb: *const ops.ComputeBackend, epoch: u64) void {
+        if (cb.kind() != .cuda or epoch == 0) return;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const owner = &self.lighton_decode_graph;
+        while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer owner.mutex.unlock();
+        if (owner.epoch_id != epoch) return;
+        owner.clear(&self.ctx) catch {};
+        owner.epoch_id = 0;
+    }
+    pub fn invalidateLightOnDecodeGraph(cb: *const ops.ComputeBackend) void {
+        if (cb.kind() != .cuda) return;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.lighton_decode_graph_enabled) self.lighton_decode_graph.invalidate(&self.ctx);
+    }
+    pub fn lightOnGraphWeightPointer(cb: *const ops.ComputeBackend, weight: CT) ?driver_mod.CUdeviceptr {
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const tensor = tensorFromCt(weight);
+        if (tensor.dtype != .bf16 or tensor.quant_type != null or tensor.strict_resident_training or tensor.owns_buffer or
+            residentTensorForSlot(self, tensor) != tensor)
+        {
+            if (self.lighton_decode_graph.weight_declines_logged < 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                self.lighton_decode_graph.weight_declines_logged += 1;
+                std.debug.print("LIGHTONOCR3 cuda_model_graph_weight_decline bf16={d} quantized={d} training={d} owns_buffer={d} exact_resident={d}\n", .{ @intFromBool(tensor.dtype == .bf16), @intFromBool(tensor.quant_type != null), @intFromBool(tensor.strict_resident_training), @intFromBool(tensor.owns_buffer), @intFromBool(residentTensorForSlot(self, tensor) == tensor) });
+            }
+            return null;
+        }
+        return tensor.buffer.ptr;
+    }
+    pub fn lightOnGraphWorkspacePointer(cb: *const ops.ComputeBackend) driver_mod.CUdeviceptr {
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return cublasLtWorkspace(self).ptr;
+    }
+    pub fn lightOnGraphStateOwned(cb: *const ops.ComputeBackend, state: *const @import("lighton_recurrent.zig").State) bool {
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const eligible = state.ctx == &self.ctx and state.initialized and !state.failed and
+            state.release_context == @as(*anyopaque, @ptrCast(self)) and state.release_buffer == &recycleLightOnStateBuffer and
+            state.recurrent.ptr != 0 and state.history[0].ptr != 0 and state.history[1].ptr != 0;
+        if (!eligible and self.lighton_decode_graph.state_declines_logged == 0 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+            self.lighton_decode_graph.state_declines_logged += 1;
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_state_decline ctx={d} initialized={d} failed={d} release_owner={d} release_callback={d} buffers={d}\n", .{ @intFromBool(state.ctx == &self.ctx), @intFromBool(state.initialized), @intFromBool(state.failed), @intFromBool(state.release_context == @as(*anyopaque, @ptrCast(self))), @intFromBool(state.release_buffer == &recycleLightOnStateBuffer), @intFromBool(state.recurrent.ptr != 0 and state.history[0].ptr != 0 and state.history[1].ptr != 0) });
+        }
+        return eligible;
+    }
+    pub fn lightOnGraphKvWords(cb: *const ops.ComputeBackend, storage: *kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId, future_tokens: usize, layer_indices: []const usize, words: []u64) !usize {
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const hook = storage.device_write_hook orelse return error.InvalidPagedKvState;
+        if (hook.vtable != &CudaKvDeviceStorage.hook_vtable or storage.storage.config.dtype != .f16)
+            return error.InvalidPagedKvState;
+        if (storage.storage.config.sliding_window_size) |window|
+            if (future_tokens > window) return error.InvalidPagedKvState;
+        const device: *CudaKvDeviceStorage = @ptrCast(@alignCast(hook.ctx));
+        if (device.compute != self or words.len < layer_indices.len * 3 + 1) return error.InvalidPagedKvState;
+        words[0] = @intFromPtr(device);
+        var count: usize = 1;
+        for (layer_indices) |index| {
+            const key = try device.layerKey(sequence, index);
+            const layer = device.layers.getPtr(key) orelse return error.InvalidPagedKvState;
+            if (layer.compressed_format != cuda_kv_format_f16 or layer.value_format != cuda_kv_value_format_f16 or layer.k.ptr == 0 or layer.v.ptr == 0)
+                return error.InvalidPagedKvState;
+            words[count..][0..3].* = .{ layer.k.ptr, layer.v.ptr, layer.capacity_tokens };
+            count += 3;
+        }
+        return count;
+    }
+    pub const LightOnGraphClaim = struct {
+        compute: *CudaCompute,
+        future_tokens: usize,
+        pub fn deinit(self: *@This()) void {
+            self.compute.lighton_decode_graph.active = false;
+            self.compute.execution_scope = null;
+            self.compute.lighton_decode_graph.mutex.unlock();
+        }
+        pub fn burst(self: *@This(), embedding: CT, vocab: usize) !LightOnTokenBurst {
+            const owner = &self.compute.lighton_decode_graph;
+            const shape = try allocShape2(self.compute.allocator, 2, owner.rows);
+            errdefer self.compute.allocator.free(shape);
+            const bank = try createTensorWithDType(self.compute, owner.bank(), shape, 2 * owner.rows, .i32);
+            tensorFromCt(bank).owns_buffer = false;
+            return .{ .owner = self.compute, .bank = bank, .embedding_weight = embedding, .suppress = .{}, .suppress_count = 0, .rows = owner.rows, .steps = 2, .hidden = owner.hidden, .vocab = vocab };
+        }
+        pub fn setInput(self: *@This(), input_ct: CT) !void {
+            const owner = &self.compute.lighton_decode_graph;
+            const source = tensorFromCt(input_ct);
+            try ensureF32(source);
+            try ensureCount(source, owner.rows * owner.hidden);
+            try copyFromDeviceTracked(self.compute, owner.input(), source.buffer, source.elem_count * 4);
+        }
+        pub fn input(self: *@This()) !CT {
+            const owner = &self.compute.lighton_decode_graph;
+            const shape = try allocShape2(self.compute.allocator, owner.rows, owner.hidden);
+            errdefer self.compute.allocator.free(shape);
+            const tensor = try createTensor(self.compute, owner.input(), shape, owner.rows * owner.hidden);
+            tensorFromCt(tensor).owns_buffer = false;
+            return tensor;
+        }
+        pub fn beginStep(self: *@This(), step: usize) void {
+            self.compute.lighton_decode_graph.capture_step = @intCast(step);
+        }
+        pub fn advance(self: *@This()) !void {
+            const owner = &self.compute.lighton_decode_graph;
+            try self.compute.lighton_attention.advanceGraph(&self.compute.ctx, owner.positions().ptr, owner.counter().ptr, @intCast(owner.rows * 3));
+        }
+        pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void) !void {
+            const compute = self.compute;
+            const owner = &compute.lighton_decode_graph;
+            if (owner.phase == .replay) {
+                try compute.ctx.launchGraph(owner.graph);
+                owner.replays += 1;
+                return;
+            }
+            const phase = owner.phase;
+            if (phase == .disabled) return error.InvalidExecutionPlan;
+            var scope = @import("execution_arena.zig").Scope{ .plan = owner.plan.?, .base = if (phase == .capture) owner.arena.ptr else 0 };
+            const capture = phase == .capture;
+            var capture_active = false;
+            errdefer {
+                std.log.warn("LightOn decoder graph aborted: phase={s} event={d}/{d}", .{ @tagName(phase), scope.cursor, owner.plan.?.event_count });
+                compute.execution_scope = null;
+                owner.active = false;
+                if (capture_active) {
+                    if (compute.ctx.endStreamCapture()) |g| compute.ctx.destroyGraph(g) else |_| {}
+                }
+                owner.disabled_epoch = owner.epoch_id;
+                owner.clear(&compute.ctx) catch {};
+            }
+            if (capture) {
+                try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+                capture_active = true;
+            }
+            const h2d = compute.stats.h2d_bytes;
+            const d2h = compute.stats.d2h_bytes;
+            const attention_calls = compute.lighton_attention.calls;
+            if (phase == .learn or capture) compute.execution_scope = &scope;
+            owner.active = true;
+            callback(context, self) catch |failure| {
+                std.log.warn("LightOn decoder graph forward failed: phase={s} error={s}", .{ @tagName(phase), @errorName(failure) });
+                return failure;
+            };
+            owner.active = false;
+            compute.execution_scope = null;
+            if (phase == .learn) {
+                if (!owner.plan.?.finishNoOutput() or compute.stats.h2d_bytes != h2d or compute.stats.d2h_bytes != d2h or compute.lighton_attention.calls - attention_calls != owner.expected_attention_calls) {
+                    std.log.warn("LightOn decoder graph plan declined: allocations={d} events={d} peak={d} h2d={d} d2h={d}", .{ owner.plan.?.count, owner.plan.?.event_count, owner.plan.?.peak, compute.stats.h2d_bytes - h2d, compute.stats.d2h_bytes - d2h });
+                    owner.disabled_epoch = owner.epoch_id;
+                    owner.phase = .disabled;
+                } else owner.phase = .capture;
+            } else if (capture) {
+                const matches = scope.valid and scope.cursor == owner.plan.?.event_count and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
+                const graph = try compute.ctx.endStreamCapture();
+                capture_active = false;
+                defer compute.ctx.destroyGraph(graph);
+                if (!matches) return error.InvalidExecutionPlan;
+                owner.graph = try compute.ctx.instantiateGraph(graph);
+                try compute.ctx.launchGraph(owner.graph);
+                owner.captures += 1;
+                owner.phase = .replay;
+            } else owner.phase = .learn;
+        }
+        pub fn read(self: *@This(), burst_value: *LightOnTokenBurst, tokens: []u32) !void {
+            const owner = &self.compute.lighton_decode_graph;
+            if (tokens.len != 2 * owner.rows) return error.InvalidShape;
+            var host: [384]u32 = undefined;
+            const bytes = owner.progress_offset + 4 - owner.bank_offset;
+            const source = buffer_mod.DeviceBuffer{ .ptr = owner.bank().ptr, .len = bytes, .borrowed = true };
+            try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(host[0 .. bytes / 4]));
+            burst_value.drained = true;
+            const expected = try std.math.add(u32, owner.progress, 2);
+            if (host[(owner.progress_offset - owner.bank_offset) / 4] != expected) return error.InvalidExecutionPlan;
+            const position_offset = (owner.positions_offset - owner.bank_offset) / 4;
+            for (owner.next_positions[0 .. owner.rows * 3], 0..) |position, i|
+                if (host[position_offset + i] != try std.math.add(u32, position, 2)) return error.InvalidExecutionPlan;
+            @memcpy(tokens, host[0..tokens.len]);
+            try owner.notePair();
+        }
+        pub fn noteKvTokens(self: *@This(), storage: *kv_storage_runtime.KvStorageRuntime, max_tokens: usize) void {
+            const hook = storage.device_write_hook orelse return;
+            if (hook.vtable != &CudaKvDeviceStorage.hook_vtable) return;
+            const device: *CudaKvDeviceStorage = @ptrCast(@alignCast(hook.ctx));
+            if (device.compute != self.compute) return;
+            var it = device.layers.iterator();
+            while (it.next()) |entry| entry.value_ptr.token_count = @max(entry.value_ptr.token_count, max_tokens);
+        }
+    };
+    pub fn beginLightOnDecodeGraph(cb: *const ops.ComputeBackend, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, future_tokens: usize, attention_layers: usize) !?LightOnGraphClaim {
+        if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > 64 or future_tokens == 0 or future_tokens > 1024 or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
+        const owner = &self.lighton_decode_graph;
+        while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
+        var claimed = false;
+        defer if (!claimed) owner.mutex.unlock();
+        if (owner.disabled_epoch == epoch) return null;
+        if (owner.epoch_id != epoch or !owner.matches(key, positions)) {
+            if (owner.resets_logged < 12 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                var mismatch: usize = 0;
+                while (mismatch < @min(owner.key.len, key.len) and owner.key[mismatch] == key[mismatch]) : (mismatch += 1) {}
+                std.debug.print("LIGHTONOCR3 cuda_model_graph_reset phase={s} old_epoch={d} epoch={d} old_words={d} words={d} first_word={d} old_value={d} value={d} positions_equal={d} invalidations={d} progress={d}\n", .{
+                    @tagName(owner.phase),                                    owner.epoch_id,                               epoch,                                                                                                                    owner.key.len,       key.len,        mismatch,
+                    if (mismatch < owner.key.len) owner.key[mismatch] else 0, if (mismatch < key.len) key[mismatch] else 0, @intFromBool(positions.len == owner.rows * 3 and std.mem.eql(u32, owner.next_positions[0 .. owner.rows * 3], positions)), owner.invalidations, owner.progress,
+                });
+                owner.resets_logged += 1;
+            }
+            owner.reset(&self.ctx, key, positions, rows, hidden) catch |err| switch (err) {
+                error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
+                    owner.admission_denials += 1;
+                    return null;
+                },
+                else => return err,
+            };
+            owner.epoch_id = epoch;
+        }
+        if (owner.phase == .disabled) return null;
+        if (owner.phase == .capture) owner.reserveArena(&self.ctx) catch |err| switch (err) {
+            error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
+                owner.admission_denials += 1;
+                owner.phase = .disabled;
+                return null;
+            },
+            else => return err,
+        };
+        try self.lighton_attention.init(&self.ctx);
+        if (owner.phase != .replay) {
+            owner.progress = 0;
+            @memcpy(owner.base_positions[0..positions.len], positions);
+            @memcpy(owner.next_positions[0..positions.len], positions);
+            try copyFromHostTracked(self, owner.positions(), std.mem.sliceAsBytes(positions));
+            const zero = [_]u32{0};
+            try copyFromHostTracked(self, owner.counter(), std.mem.sliceAsBytes(&zero));
+        }
+        owner.future_tokens = future_tokens;
+        owner.expected_attention_calls = try checkedMul(2, attention_layers);
+        claimed = true;
+        return .{ .compute = self, .future_tokens = future_tokens };
+    }
+
     pub fn beginLightOnTokenBurst(cb: *const ops.ComputeBackend, embedding_weight: CT, rows: usize, steps: usize, hidden: usize, vocab: usize, suppress_ids: []const i32) !?LightOnTokenBurst {
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -2401,7 +2648,7 @@ pub const CudaCompute = struct {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         return self.lighton_ffn_block_enabled and self.capability_profile == .lightonocr3 and
             !self.resident_training_cache and self.lazy_host_store == null and
-            !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active;
+            ((!self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active) or lightOnOwnedDecodeCapture(self));
     }
 
     pub const LightOnFfnBlockRequest = struct {
@@ -2575,7 +2822,7 @@ pub const CudaCompute = struct {
     pub fn lightOnInputProjections(cb: *const ops.ComputeBackend, input_ct: CT, weights: [4]CT, rows: usize, hidden: usize, mixed_dim: usize, z_dim: usize, heads: usize) !?[4]CT {
         if (!lightOnProjectionFusionEnabled(cb)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (self.lazy_host_store != null or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+        if (self.lazy_host_store != null or ((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self)) or
             self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or
             rows == 0 or rows > 8192 or !((hidden == 1024 and mixed_dim == 6144 and z_dim == 2048 and heads == 16) or
             (hidden == 2560 and mixed_dim == 8192 and z_dim == 4096 and heads == 32)) or
@@ -2798,7 +3045,7 @@ pub const CudaCompute = struct {
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (!self.lighton_recurrent_batch_enabled or self.capability_profile != .lightonocr3 or states.len < 2 or states.len > 64) return null;
-        if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
+        if (((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return error.CudaGraphCaptureUnsafeTempAlloc;
         if (request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or
             request.key_heads != 16 or (request.value_heads != 16 and request.value_heads != 32)) return null;
         if (!std.math.isFinite(request.eps) or request.eps <= 0) return error.InvalidTensorShape;
@@ -2906,7 +3153,7 @@ pub const CudaCompute = struct {
         if (!lightOnRaggedCoreEnabled(cb) or states.len < 2 or states.len > 128) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (states.len > 64 and (!self.lighton_physical128_enabled or self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1)) return null;
-        if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
+        if (((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return error.CudaGraphCaptureUnsafeTempAlloc;
         if (lengths.len != states.len) return error.InvalidTensorShape;
         if (request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or
             request.key_heads != 16 or (request.value_heads != 16 and request.value_heads != 32)) return null;
@@ -3500,7 +3747,10 @@ pub const CudaCompute = struct {
     embedding_gemma2_constant_misses: u64 = 0,
     audio_plans: @import("audio_execution_plan.zig").Cache = .{},
     audio_execution_active: bool = false,
-    audio_scope: ?*@import("audio_execution_plan.zig").Scope = null,
+    execution_scope: ?*@import("execution_arena.zig").Scope = null,
+    lighton_decode_graph: @import("lighton_decode_graph.zig").Module = .{},
+    lighton_decode_graph_enabled: bool = false,
+
     audio_arena_executes: u64 = 0,
     audio_graph_replays: u64 = 0,
     embedding_gemma2_execution: @import("embedding_gemma2_execution.zig").Cache = .{},
@@ -3799,6 +4049,8 @@ pub const CudaCompute = struct {
 
     pub fn configureEmbeddingGemma2Admission(self: *CudaCompute, admission: ?@import("video_cache_budget.zig").Admission) !void {
         if (!std.meta.eql(self.ctx.video_cache_budget.admission, admission)) {
+            self.lighton_decode_graph.invalidate(&self.ctx);
+            self.lighton_decode_graph.epoch_id = 0;
             if (self.lighton_recurrent.bf16_prefill) |*prefill| try prefill.clearWorkspace(&self.ctx);
             try self.embedding_gemma2_execution.clear(self.allocator, &self.ctx);
             try self.embedding_gemma2_resize.clear(&self.ctx);
@@ -4371,6 +4623,7 @@ pub const CudaCompute = struct {
             .lighton_bf16_decode_outputs = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_DECODE_OUTPUTS"),
             .lighton_bf16_projection_outputs = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS"),
             .lighton_bf16_prefill_ffn = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN"),
+            .lighton_decode_graph_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH"),
             .lighton_fused_ffn = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_FFN"),
             .lighton_ffn_bf16_inputs = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BF16_INPUTS"),
             .lighton_ffn_block_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK"),
@@ -4483,6 +4736,11 @@ pub const CudaCompute = struct {
             std.debug.print("OCR_CUDA temp_lock_diagnostic_interval=1024 alloc_ops={d} alloc_samples={d} alloc_cpu_samples={d} alloc_cpu_ns={d} alloc_wall_ns={d} release_ops={d} release_samples={d} release_cpu_samples={d} release_cpu_ns={d} release_wall_ns={d}\n", .{ alloc_lock.operations, alloc_lock.samples, alloc_lock.cpu_samples, alloc_lock.cpu_ns, alloc_lock.wall_ns, release_lock.operations, release_lock.samples, release_lock.cpu_samples, release_lock.cpu_ns, release_lock.wall_ns });
             std.debug.print("OCR_CUDA temp_scan_diagnostic_interval=1024 alloc_ops={d} alloc_samples={d} alloc_cpu_samples={d} alloc_cpu_ns={d} alloc_wall_ns={d} alloc_entries={d} release_ops={d} release_samples={d} release_cpu_samples={d} release_cpu_ns={d} release_wall_ns={d} release_entries={d}\n", .{ search.operations, search.samples, search.cpu_samples, search.cpu_ns, search.wall_ns, search.entries, release.operations, release.samples, release.cpu_samples, release.cpu_ns, release.wall_ns, release.entries });
         }
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_captures={d} cuda_model_graph_replays={d} cuda_model_graph_admission_denials={d}\n", .{ self.lighton_decode_graph.captures, self.lighton_decode_graph.replays, self.lighton_decode_graph.admission_denials });
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_enabled={d} state_pool={d} lazy={d} training={d}\n", .{ @intFromBool(self.lighton_decode_graph_enabled), @intFromBool(self.lighton_state_pool_enabled), @intFromBool(self.lazy_host_store != null), @intFromBool(self.resident_training_cache) });
+        self.lighton_decode_graph.invalidate(&self.ctx);
         self.lighton_activation.deinit(&self.ctx);
         self.lighton_vision_fused.deinit(&self.ctx);
 
@@ -6827,6 +7085,7 @@ const CudaKvDeviceStorage = struct {
 
     fn releaseSequence(ctx: *anyopaque, sequence_id: kv_storage_runtime.SequenceId) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        if (self.compute.lighton_decode_graph_enabled) self.compute.lighton_decode_graph.invalidate(&self.compute.ctx);
         if (self.match_binding) |binding| if (binding.sequence == sequence_id) {
             binding.deinit();
             self.allocator.destroy(binding);
@@ -6854,6 +7113,7 @@ const CudaKvDeviceStorage = struct {
         retained_token_count: usize,
     ) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        if (self.compute.lighton_decode_graph_enabled) self.compute.lighton_decode_graph.invalidate(&self.compute.ctx);
         self.revision = std.math.add(u64, self.revision, 1) catch std.math.maxInt(u64);
         // A completed lookahead forward may be rolled back within its exact
         // tail. Never revive a failed forward or cross evicted/fitted history.
@@ -7803,6 +8063,8 @@ fn beginRequest(ctx: *anyopaque) anyerror!void {
     // by token readback, but making it explicit keeps the ownership invariant
     // independent of sampling and response plumbing.
     if (self.ctx.debug_graph_capture_active) return error.InvalidCudaState;
+    self.lighton_decode_graph.invalidate(&self.ctx);
+    self.lighton_decode_graph.epoch_id = 0;
     try synchronizeAndDrainDeferredDeviceFrees(self);
     try resetDebugCudaGraphRequestState(self);
     if (self.temp_slot_config.autoplan_enabled or
@@ -8348,7 +8610,7 @@ fn getDenseStreamWeight(self: *CudaCompute, name: []const u8) !?*CudaTensor {
 }
 
 fn copyFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []const u8) !void {
-    if (self.audio_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
     if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) {
         self.debug_cuda_graph_capture_disabled = true;
         std.log.warn("cuda_graph_capture_probe: unsafe_h2d_copy bytes={d} disabled=1", .{bytes.len});
@@ -9677,7 +9939,7 @@ fn flushDeferredDecodeScalarUpload(self: *CudaCompute) !void {
 }
 
 fn copyToHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
-    if (self.audio_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
     if (self.debug_cuda_graph_capture_active) {
         self.debug_cuda_graph_capture_disabled = true;
         std.log.warn("cuda_graph_capture_probe: unsafe_d2h_copy bytes={d} disabled=1", .{bytes.len});
@@ -9713,7 +9975,7 @@ fn copyToPinnedScalarDownloadAndSync(self: *CudaCompute, device: buffer_mod.Devi
 }
 
 fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
-    if (self.audio_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
     const tried_pinned_scalar_download = pinnedScalarDownloadEligible(self, bytes);
     if (try copyToPinnedScalarDownloadAndSync(self, device, bytes)) return;
     if (tried_pinned_scalar_download) self.stats.pinned_scalar_download_fallbacks += 1;
@@ -11603,7 +11865,7 @@ test "CUDA op-profile pool free-stack, drain no-op, and category mapping" {
     compute.ocr_temp_cache_budget_bytes = null;
 
     compute.ocr_deferred_free_budget_bytes = null;
-    compute.audio_scope = null;
+    compute.execution_scope = null;
     compute.audio_execution_active = false;
     compute.embedding_gemma2_constant_generation = 0;
     compute.allocator = std.testing.allocator;
@@ -12153,7 +12415,7 @@ test "CUDA greedy graph output borrows only the prepared replay slot" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -12191,7 +12453,7 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -12223,9 +12485,9 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
 
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
-    if (self.audio_scope) |scope| if (scope.base != 0) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
+    if (self.execution_scope) |scope| if (scope.base != 0) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
     var result = try allocDeviceBufferOrdinary(self, len);
-    if (self.audio_scope) |scope| {
+    if (self.execution_scope) |scope| {
         result.len = len;
         scope.plan.allocate(len, result.ptr);
     }
@@ -12360,6 +12622,7 @@ fn allocLightOnStateBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuf
 fn recycleLightOnStateBuffer(context: *anyopaque, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
     const self: *CudaCompute = @ptrCast(@alignCast(context));
+    if (self.lighton_decode_graph_enabled) self.lighton_decode_graph.invalidate(&self.ctx);
     if (self.lighton_state_pool_enabled and self.capability_profile == .lightonocr3 and
         cudaTempCacheBudgetBytes(self) != 0 and
         (self.ctx.video_cache_budget.admission == null or self.ocr_retained_cache_lease != null))
@@ -12373,7 +12636,7 @@ fn recycleLightOnStateBuffer(context: *anyopaque, buffer: *buffer_mod.DeviceBuff
 
 fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
-    if (self.audio_scope) |scope| {
+    if (self.execution_scope) |scope| {
         if (scope.base == 0) scope.release(buffer.ptr) else if (scope.owns(buffer.ptr)) {
             scope.release(buffer.ptr);
             buffer.* = .{};
@@ -12840,7 +13103,7 @@ fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -13312,7 +13575,7 @@ test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -13374,7 +13637,7 @@ test "CUDA persistent buffer reallocation invalidates graph pointers and rejects
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -13418,7 +13681,7 @@ test "clearing CUDA graph capture state removes stale disabled latch" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -13448,7 +13711,7 @@ test "CUDA graph request reset clears stale capture and scalar state" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -13496,7 +13759,7 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -14672,7 +14935,7 @@ fn audioBufferView(buffer: buffer_mod.DeviceBuffer, offset: usize, bytes: usize)
 }
 fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.audio_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
+    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.execution_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
     self.audio_execution_active = true;
     defer self.audio_execution_active = false;
     var hash = std.hash.Wyhash.init(key);
@@ -14717,16 +14980,16 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         var scope = plan_mod.Scope{ .plan = plan };
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
-        self.audio_scope = &scope;
+        self.execution_scope = &scope;
         const out = run(context, canonical[0..canonical_count]) catch |err| {
-            self.audio_scope = null;
+            self.execution_scope = null;
             if (err == error.Cancelled or err == error.Timeout) {
                 std.heap.c_allocator.destroy(plan);
                 entry.plan = null;
             } else entry.disabled = true;
             return err;
         };
-        self.audio_scope = null;
+        self.execution_scope = null;
         if (!plan.finish(tensorFromCt(out).buffer.ptr) or self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before) entry.disabled = true;
         return out;
     }
@@ -14789,9 +15052,9 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         };
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
-        self.audio_scope = &scope;
+        self.execution_scope = &scope;
         const result = run(context, stable[0..count]) catch |err| {
-            self.audio_scope = null;
+            self.execution_scope = null;
             if (capture) {
                 if (self.ctx.endStreamCapture()) |g| self.ctx.destroyGraph(g) else |_| {}
             }
@@ -14801,7 +15064,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             if (!capture and err != error.AudioPlanChanged and err != error.CudaGraphCaptureUnsafeHostCopy) return err;
             return null;
         };
-        self.audio_scope = null;
+        self.execution_scope = null;
         const result_tensor = tensorFromCt(result);
         const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.valid and scope.cursor == plan.event_count and result_tensor.buffer.ptr == scope.base + plan.allocations[plan.output].offset;
         result_tensor.owns_buffer = false;
@@ -15084,7 +15347,7 @@ test "Gemma 4 audio CUDA hooks decline pre-Ampere before touching tensors" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.ctx.info.compute_major = 7;
@@ -17942,7 +18205,7 @@ test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
     compute.ocr_temp_cache_budget_bytes = null;
 
     compute.ocr_deferred_free_budget_bytes = null;
-    compute.audio_scope = null;
+    compute.execution_scope = null;
     compute.audio_execution_active = false;
     compute.embedding_gemma2_constant_generation = 0;
     compute.allocator = std.testing.allocator;
@@ -22878,7 +23141,7 @@ test "GLiNER Decide CUDA Q8 long-context attention requires complete supported m
     compute.ocr_temp_cache_budget_bytes = null;
 
     compute.ocr_deferred_free_budget_bytes = null;
-    compute.audio_scope = null;
+    compute.execution_scope = null;
     compute.audio_execution_active = false;
     compute.embedding_gemma2_constant_generation = 0;
     compute.gliner_encoder_attention = true;
@@ -25034,7 +25297,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         attention.sliding_window != 0 or attention.attn_or_mask != null or attention.attention_sink.hasMetadata() or
         views.len < 2 or views.len > 64 or dim != 256 or
         !((heads == 8 and kv_heads == 2) or (heads == 16 and kv_heads == 4)) or
-        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+        ((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return null;
     const module = @import("lighton_attention.zig");
     const storage = views[0].kv_storage orelse return null;
     if (storage.storage.config.dtype != .f16 or storage.storage.config.page_size_tokens == 0) return null;
@@ -25061,7 +25324,10 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         // the same block IDs. Read the authoritative table used by KV writes;
         // copy it now because the storage helper reuses one scratch array.
         const blocks = try storage.logicalBlocksWithReservations(view.kv_cache.sequence_id);
-        const count = std.math.divCeil(usize, tokens, params.page_size) catch return error.InvalidPagedKvState;
+        const count = if (self.lighton_decode_graph.active)
+            blocks.len
+        else
+            std.math.divCeil(usize, tokens, params.page_size) catch return error.InvalidPagedKvState;
         if (count > 64 or blocks.len < count) return null;
         for (views[0..i]) |prior| if (prior.kv_cache.sequence_id == view.kv_cache.sequence_id) return error.InvalidPagedKvBatch;
         params.pages[i].tokens = @intCast(tokens);
@@ -25071,7 +25337,12 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         max_tokens = @max(max_tokens, tokens);
     }
     const chunk_size: usize = if (self.lighton_attention_chunk128) 128 else 32;
-    params.chunks = @intCast((max_tokens + chunk_size - 1) / chunk_size);
+    const planned_tokens = if (self.lighton_decode_graph.active) self.lighton_decode_graph.future_tokens else max_tokens;
+    params.chunks = @intCast((planned_tokens + chunk_size - 1) / chunk_size);
+    if (self.lighton_decode_graph.active) {
+        params.graph_progress = self.lighton_decode_graph.counter().ptr;
+        params.graph_step = self.lighton_decode_graph.capture_step;
+    }
     // Allocate and qualify the module before the first KV mutation. Physical
     // buffers use the existing budgeted temporary pool and retire on this stream.
     try self.lighton_attention.init(&self.ctx);
@@ -25126,6 +25397,8 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         break :direct true;
     };
     if (!direct_suffix) {
+        if (self.lighton_decode_graph.active and self.lighton_decode_graph.phase != .warm)
+            return error.CudaGraphCaptureUnsafeKvWrite;
         for (views, 0..) |view, i| {
             const tokens = params.pages[i].tokens;
             try storage.writeLayerKvSuffixDevice(.{
@@ -26277,7 +26550,19 @@ fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: u
 // at every attention block, forcing the CPU to wait for preceding GPU work.
 const lighton_mrope_position_capacity: usize = 2 * 16 * 4096;
 
+fn lightOnOwnedDecodeCapture(self: *const CudaCompute) bool {
+    return self.lighton_decode_graph.active and self.lighton_decode_graph.epoch_id != 0 and
+        self.execution_scope != null and self.execution_scope.?.base != 0 and self.ctx.debug_graph_capture_active;
+}
+
 fn cachedLightOnMropePositions(self: *CudaCompute, positions: []const u32) !?buffer_mod.DeviceBuffer {
+    if (self.lighton_decode_graph.active) {
+        const owner = &self.lighton_decode_graph;
+        if (positions.len != owner.rows * 3) return error.InvalidShape;
+        for (positions, owner.next_positions[0..positions.len]) |position, base|
+            if (position != try std.math.add(u32, base, owner.capture_step)) return error.InvalidExecutionPlan;
+        return owner.positions();
+    }
     if (!self.lighton_cached_mrope_enabled or self.capability_profile != .lightonocr3 or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
         positions.len == 0 or positions.len > lighton_mrope_position_capacity) return null;
@@ -31189,7 +31474,7 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             compute.ocr_temp_cache_budget_bytes = null;
 
             compute.ocr_deferred_free_budget_bytes = null;
-            compute.audio_scope = null;
+            compute.execution_scope = null;
             compute.audio_execution_active = false;
             compute.embedding_gemma2_constant_generation = 0;
             compute.allocator = a;
@@ -31284,8 +31569,8 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     try std.testing.expect(try audioExecutionOp(&compute, 0, undefined, undefined, undefined) == null);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.evictEmbeddingGemma2Caches());
     var plan: @import("audio_execution_plan.zig").Plan = undefined;
-    var scope = @import("audio_execution_plan.zig").Scope{ .plan = &plan, .base = 1 };
-    compute.audio_scope = &scope;
+    var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 1 };
+    compute.execution_scope = &scope;
     var bytes = [_]u8{0};
     try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyFromHostTracked(&compute, undefined, &bytes));
     try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTracked(&compute, undefined, &bytes));
@@ -34281,4 +34566,53 @@ test "LightOnOCR3 CUDA optional BF16 prefill scratch preserves admission across 
     try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), prefill.calls);
+}
+
+test "LightOnOCR3 CUDA decoder graph arena admission rejects partial allocations and releases every reservation" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const memory = @import("../../runtime/tier/memory.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    var controller = memory.AdmissionController{};
+    var owner = @import("lighton_decode_graph.zig").Module{};
+    defer owner.clear(&compute.ctx) catch {};
+    const positions = [_]u32{ 10, 20, 30, 40, 50, 60 };
+    const key = [_]u64{ 1, 2, 3 };
+    const bytes = 9216;
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
+        .backend_limit_bytes = bytes - 1,
+        .host_limit_bytes = 16 * 1024 * 1024,
+        .scratch_limit_bytes = 16 * 1024 * 1024,
+    }, .check_live_memory = false };
+    const baseline = compute.ctx.device_allocations.snapshot().live;
+    try std.testing.expectError(error.ResourceLimitExceeded, owner.reset(&compute.ctx, &key, &positions, 2, 1024));
+    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes;
+    try owner.reset(&compute.ctx, &key, &positions, 2, 1024);
+    try std.testing.expectEqual(@as(usize, bytes), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expect(owner.matches(&key, &positions));
+    owner.plan.?.allocate(1024, 0x1000);
+    owner.plan.?.release(0x1000);
+    try std.testing.expect(owner.plan.?.finishNoOutput());
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes + 1023;
+    // The arena fits on its own; the retained metadata lease occupies the
+    // missing byte, so this is a temporary denial rather than an oversized request.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, owner.reserveArena(&compute.ctx));
+    try std.testing.expectEqual(@as(usize, 0), owner.arena.ptr);
+    try std.testing.expectEqual(baseline + bytes, compute.ctx.device_allocations.snapshot().live);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes + 1024;
+    try owner.reserveArena(&compute.ctx);
+    const arena_pointer = owner.arena.ptr;
+    try owner.reserveArena(&compute.ctx);
+    try std.testing.expectEqual(arena_pointer, owner.arena.ptr);
+    try std.testing.expectEqual(@as(usize, bytes + 1024), controller.snapshot().backend_scratch_bytes);
+    try owner.notePair();
+    try std.testing.expect(!owner.matches(&key, &positions));
+    try owner.clear(&compute.ctx);
+    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.key.len);
 }
