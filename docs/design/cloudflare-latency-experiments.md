@@ -163,10 +163,12 @@ its reports must not be attributed to the follow-up implementation.
 A repeat of the point experiment on the final codec module at 512 documents
 records no-inline versus inline p95 of 224/207 ms with the immutable cache
 cleared, and 176/158 ms warm. The GET reduction and retained-payload tradeoff
-remain the same as the earlier intermediate-module experiment.
+remain the same as the earlier intermediate-module experiment. The final codec
+repeat at 4,096 documents records warm p95 174/155 ms and cache-cleared p95
+220/198 ms, with about 27% additional retained payload.
 
 The first fresh 512-document-per-tenant Cloudflare preparation was interrupted
-after about nineteen minutes once the control stalled at publication budget one
+after about eighteen minutes once the control stalled at publication budget one
 with repeated cancellation. The candidate had completed two tenants and begun
 the third. This is failed preparation evidence, not a completed latency trial;
 it cannot attribute the difference to inline bodies because locality differs
@@ -175,3 +177,72 @@ were changed. The diagnostic driver additionally accepts explicit 64/128-documen
 corpora, records their size and remains `qualification:false`; strict gate runs
 continue requiring 512 documents per tenant. Smaller diagnostic corpora isolate
 steady-state/placement experiments from the bulk-preparation blocker.
+
+## Remaining bulk-publication boundary
+
+The control's budget-one cancellation shows that lowering a record prefix alone
+cannot guarantee a useful slice fits the fixed deadline under slow storage. It
+does not prove whether minimum-unit work, storage locality or a particular
+artifact phase dominates; retain per-phase I/O evidence before choosing a fix.
+The durable long-term extension is a native resumable publication plan: persist
+validated source/prefix identities and content-addressed intermediate outputs,
+bound each build/upload slice, upload independent immutable pages in bounded
+waves, and atomically publish HEAD only after the whole planned prefix is ready.
+Reacquire and revalidate fenced ownership/source protection after reconstruction;
+never expose a partially built prefix or retry an ambiguous unkeyed mutation.
+The wall-headroom guard reduces regrowth into deadlines but does not implement
+that minimum-unit split or establish a Cloudflare throughput improvement.
+
+## Completed Cloudflare diagnostics
+
+All three timed comparisons use four tenants with **128 documents each**, the
+same combined candidate (`daca7145ad`, full module `c0f96a55…`) and unchanged
+approved `c44896ac8c` control. Each side offers 72 reads, 24 writes and eight
+unkeyed compactions over three minutes. All read/write populations complete and
+final tenant counts are checked. These are end-to-end client p95 values, not
+CPU measurements. The later wall-headroom guard is locally tested but was not
+part of these deployed bundles.
+
+| Candidate placement | Control read/write p95 (ms) | Candidate read/write p95 (ms) | Compaction connection resets, control/candidate |
+| --- | --- | --- | --- |
+| Default | 5,993 / 7,796 | 1,291 / 4,851 | 0 / 0 |
+| Smart | 7,305 / 10,267 | 1,670 / 4,960 | 1 / 2 |
+| Explicit `aws:us-west-2` | 6,133 / 7,628 | 1,349 / 5,041 | 3 / 4 |
+
+The default run records no client logical errors. The other runs retain the
+unreplayed `ECONNRESET` compaction failures and failed round markers. A completed
+read/write latency population does not make those workloads successful.
+Production maintenance should use the existing keyed compaction receipt/status
+path; an ambiguous unkeyed transport outcome is never blindly replayed.
+
+Smart's app status reaches `SUCCESS`, while private roles report
+`INSUFFICIENT_INVOCATIONS`. Its recorded response placement headers are all local
+(SJC, PDX and one LAX), establishing no remote placement benefit. Explicit region
+placement records 161 `remote-SEA` and two `local-SEA` responses, proving that
+relocation took effect. It does not prove proximity to R2. Neither mode improves
+on the observed default p95 pair. These small, ordered runs and changing control
+latencies do not establish a statistically stable placement effect. Placement
+only affects fetch handlers, not the Durable Object RPC work.
+
+The control predates other implementation improvements, so the large
+candidate/control gap does not isolate the five new experiments. Local matrices
+supply the individual experiment comparisons. The cloud runs show that the
+combined deployment still misses the 1,000 ms read and 3,000 ms write targets,
+even on the smaller diagnostic corpus.
+
+No experiment qualifies the gate. All sixteen persisted observations per timed
+run settle with matching repeated hashes, but independent invocation counts and
+transport/acknowledgement/version reconciliation remain incomplete. Live capture
+also has gaps. No resource failure is observed in available live journals or
+client responses; incomplete coverage cannot establish an exhaustive zero.
+All owned tail sessions are removed, all six stacks are paused/sealed, the
+approved control bundles are unchanged, and all 300 reserved cold epochs remain
+unused. The 512-document preparation failure and prior 108-artifact gate evidence
+remain preserved separately from this experiment's content-addressed manifest.
+
+The immediate next performance work is the native resumable publication boundary
+above and a native read plan that overlaps immutable query inputs with fresh
+authority validation. The scheduling experiment alone does not implement that
+full plan. Keep the inline-body tradeoff opt-in until bulk publication and the
+unchanged full-size gate are qualified; placement is not a substitute for
+reducing dependent storage waves.

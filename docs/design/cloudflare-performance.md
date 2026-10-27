@@ -4,6 +4,10 @@ This extends the [R2 backend design](antfly-object-storage-backend.md). It keeps
 Antfly's immutable data and transactional coordination in R2 and uses Durable
 Objects as warm writers. No application SQLite/KV path is added.
 
+Current opt-in latency experiments, local measurements, rollout requirements and
+Cloudflare diagnostic results are tracked in
+[native latency experiments](cloudflare-latency-experiments.md).
+
 ## Read path
 
 ```mermaid
@@ -1425,3 +1429,8 @@ memory budgets. Fault coverage must include a changed source between stages,
 expired/replaced ownership, cancellation with outstanding I/O, lost acquisition
 and finalization acknowledgements, and both paged/legacy formats. Unkeyed client
 transport replay remains forbidden even when its internal metadata is staged.
+
+The opt-in `NATIVE_COMPACTION_PLAN` implementation now uses this native
+classification and preserves the paged no-op path; see the linked experiment
+design for actual-workerd coverage and deployment status. It does not change
+the unkeyed transport retry rule.
