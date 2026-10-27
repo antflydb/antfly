@@ -44,42 +44,47 @@ rare CUDA Florence receipt mismatch is not definitively root-caused.
 
 ## CUDA follow-up qualification
 
-The latest DGX Spark GB10 comparison uses 256 warmup requests and two
-256-request measurements, 128 physical native slots and at most 128 active vLLM
-sequences. Native and fresh vLLM serial references are byte-identical on all
-three fixtures. Every native timed output matches native serial bytes and the
-complete normalized vLLM content. Both profiles retain F32 decode and recurrent
-state, with optional BF16 FFN/recurrent prefill and F16-query/F32-output paged
-prefill attention.
+The selected `05a8fc248f` runtime on DGX Spark GB10 uses 256 warmup requests
+and two 256-request measurements, 128 physical native slots and at most 128
+active vLLM sequences. Every native timed output matches independent native
+serial bytes and complete normalized actual-vLLM content on three synthetic
+fixtures. Decode outputs and recurrent state remain F32; the measured profiles
+use optional BF16 FFN/recurrent prefill and F16-query/F32-output paged prefill
+attention. These profiles are not a full activation-precision match.
 
 | Model | Native pages/s | vLLM pages/s | Required actual execution |
 | --- | ---: | ---: | --- |
-| LightOn 0.8B | 11.4627 / 11.5924 | 14.6135 / 14.5742 | Wide four-token chains in each round |
-| LightOn 4B | 3.7639 / 3.7325 | 4.6205 / 4.6164 | Wide four-token chains in each round |
+| LightOn 0.8B | 12.5125 / 12.4897 | 14.4262 / 14.4847 | Wide four-token chains in each round |
+| LightOn 4B | 4.0103 / 4.0152 | 4.6341 / 4.6303 | Wide four-token chains in each round |
 
-The 0.8B profile uses vision/prefix limits 16/16; 4B uses 8/16 and prefix
-chunks of 256 rows. Operator byte limits are unchanged. Greedy execution reads
-back token IDs instead of vocabulary rows; 4B skips all 426 unused intermediate
-prefix heads in each round. These measurements do not establish CUDA parity
-or broad OCR accuracy. Fresh CUDA Florence throughput qualification remains
-outstanding; M5 Metal qualification is documented in the user guide.
+The 0.8B run uses vision/prefix limits 16/16; 4B uses 8/16 and 256-row
+prefix chunks. Both enable the BF16 normalization-input mirror while retaining
+F32 outputs. Operator byte limits are unchanged. Greedy execution reads token
+IDs; 4B skips all 426 unused intermediate prefix heads per round. Both isolated
+comparisons observed no foreign GPU compute process. LightOn parity and a
+representative OCR accuracy evaluation remain outstanding.
 
-All 48 frozen build223 runtime files match commit `d90a4f5048`. CUDA broad
-regression: 254 selected, 240 passed, 14 backend skips. Wide group: 89 selected,
-88 passed, one skip. Independent packet, admission, numerical and ownership
-checks retain their original tolerances. Default-F32 execution on both models
-also preserves exact independent baseline bytes; those short correctness runs
-are excluded from throughput comparisons.
+All 50 frozen build345 source/config files match the selected commit. CUDA
+regression: 259 selected, 245 passed, 14 backend skips; wide: 94 selected,
+93 passed, one skip. Independent packet, allocation-denial, admission,
+numerical and ownership checks retain their original tolerances. Packed-state
+qualification includes both recurrent widths, F32/BF16 convolution snapshots,
+poisoned reuse, short prefixes and reset against independent storage. The
+latest runtime compiles for Metal and passes focused CPU tests; these are
+not new Metal GPU throughput measurements.
 
-The [latest archive manifest](followup.json) records the immutable URI, object
-generation, SHA-256 and 77 files. It retains frozen binaries/source, public
-scripts/fixtures, sanitized commands/settings, full native/reference reports,
-native libraries and diagnostic summaries. Every member has a verified SHA-256;
-the uploaded object's size and MD5 were also checked. The separately labeled
-ReleaseSafe transport qualification includes runtime bounds checks.
-The [previous wide-cohort bundle](followup-bfd1738430.json) retains the graph
-control and Florence regression evidence; the [earlier 64-page functional
-bundle](followup-736f721b59.json) remains available.
+Prior CUDA Florence build283 measurements were 25.5421–25.7362 pages/s versus
+actual vLLM 25.3656 / 25.3890, with matching greedy/no-repeat policy and outputs
+on the same limited fixture set. M5 Metal qualification is in the user guide.
+
+The [archive manifest](followup.json) pins an immutable 77-file baseline bundle
+and a minimized 56-file supplemental vision qualification bundle. It records
+object generations, sizes, SHA-256 and verified MD5 values. The bundles cover
+earlier selected runtimes; build345 and actual-vLLM317 logs remain local and
+are excluded from those archived payloads. Binaries, source snapshots, full
+reports and experiment logs stay outside tracked source directories. The
+[previous wide-cohort bundle](followup-bfd1738430.json) and
+[earlier 64-page functional bundle](followup-736f721b59.json) remain available.
 
 ## Reproduce
 
