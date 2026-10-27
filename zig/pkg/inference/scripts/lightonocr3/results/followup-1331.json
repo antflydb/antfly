@@ -1,0 +1,285 @@
+{
+  "schema_version": 1,
+  "scope": "Draft PR1331 selected CUDA follow-up. Three synthetic pages; separate isolated native/vLLM measurements. No vLLM parity, full BF16 decoder, representative OCR accuracy, or Metal throughput claim. Raw experiment logs/binaries remain outside tracked source.",
+  "hardware": {
+    "gpu": "NVIDIA GB10, DGX Spark, SM12.1",
+    "driver": "580.178.04",
+    "physical_memory_bytes": 130660974592,
+    "architecture": "aarch64",
+    "nvcc": "13.0.88"
+  },
+  "reference_versions": {
+    "vllm": "0.32.0",
+    "vllm-bart-plugin": "0.6.2",
+    "transformers": "5.19.0",
+    "torch": "2.13.0"
+  },
+  "measurement": {
+    "warmup_requests": 256,
+    "requests_per_measured_round": 256,
+    "measured_rounds": 2,
+    "native_physical_slots": 128,
+    "vllm_max_sequences": 128,
+    "native_limits_gib": {
+      "memory": 80,
+      "shared": 90,
+      "backend": 60,
+      "kv": 8,
+      "scratch": 40
+    },
+    "prefix_and_processor_cache_reuse": false,
+    "isolation_audits": {
+      "native507_foreign_processes": 0,
+      "vllm498_foreign_processes": 0,
+      "block506_foreign_processes": 0
+    },
+    "fixtures": [
+      {
+        "path": "invoice.png",
+        "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+      },
+      {
+        "path": "receipt.png",
+        "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+      },
+      {
+        "path": "shipping.png",
+        "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+      }
+    ]
+  },
+  "results": [
+    {
+      "model": "08",
+      "precision_profile": "bf16_vision",
+      "native_measured_pages_per_second": [
+        13.5842,
+        13.5823
+      ],
+      "vllm_measured_pages_per_second": [
+        14.496870871559043,
+        14.474025298068133
+      ],
+      "native_warmup_pages_per_second": [
+        12.5328
+      ],
+      "native_serial_byte_parity": true,
+      "vllm_normalized_complete_content_parity": true,
+      "actual_burst_widths": [
+        [
+          4
+        ],
+        [
+          4
+        ],
+        [
+          4
+        ]
+      ],
+      "plan_cache_entries": 687,
+      "plan_cache_capacity": 1024,
+      "uncached_and_scalar_fallbacks": 0
+    },
+    {
+      "model": "4b",
+      "precision_profile": "f32",
+      "native_measured_pages_per_second": [
+        4.1449,
+        4.1669
+      ],
+      "vllm_measured_pages_per_second": [
+        4.537649409795433,
+        4.608095582711677
+      ],
+      "native_warmup_pages_per_second": [
+        4.1344
+      ],
+      "native_serial_byte_parity": true,
+      "vllm_normalized_complete_content_parity": true,
+      "actual_burst_widths": [
+        [
+          4
+        ],
+        [
+          4
+        ],
+        [
+          4
+        ]
+      ],
+      "plan_cache_entries": 859,
+      "plan_cache_capacity": 1024,
+      "uncached_and_scalar_fallbacks": 0
+    }
+  ],
+  "qualification": {
+    "matched_backend": "Independent installed Transformers Qwen3_5VisionBlock with equal-size batched PyTorch cuDNN SDPA; BF16 reductions and split-K GEMM reductions disabled. This does not qualify Flash Attention equivalence.",
+    "checkpoint_fingerprints": {
+      "0.8B": {
+        "config_sha256": "842fafd8f06807269960515fa6f0e4b5dd27f9e645b67a2b3e84f1699ee8d60c",
+        "safetensors_sha256": "ae46aa6fd7136d57297ac006ed9ec345b7a2083feb2e99501bedcb014ca3efdf"
+      },
+      "4B": {
+        "config_sha256": "99b4c363a998c2d8c5ed5b3f3a40ec5cb97a156034df5002d0d789c74324f5f0",
+        "safetensors_sha256": "6b0dab74a2dab02d5b10ca56322255024ed8dca35c02746b42e9f296aaeb4e67"
+      }
+    },
+    "reference_source_sha256": "aac2a1bcca88829afc6dbdf83f97155ebf64d800ee9d703af3802a9aebcfcd18",
+    "cases": 118,
+    "bit_exact_cases": 118,
+    "max_rows": 65536,
+    "max_batch": 16,
+    "readonly_and_canaries": true,
+    "negative_controls": [
+      "wrong row ordering",
+      "cross-image attention",
+      "input/output alias",
+      "invalid shape",
+      "misaligned input/output/positions/weights"
+    ],
+    "fixed_criteria": {
+      "maximum_element_error": "2 BF16 ULP at independent reference output + original F32 2e-4 + abs(reference)*2e-5",
+      "relative_L2_limit": 0.00390625,
+      "default_F32_oracles": "Unchanged and separately qualified; this is a distinct BF16 activation profile."
+    },
+    "default_F32_regression": {
+      "selected": 271,
+      "passed": 257,
+      "skipped": 14
+    },
+    "wide_regression": {
+      "selected": 101,
+      "passed": 100,
+      "skipped": 1
+    },
+    "real_default_F32_models": [
+      "0.8B",
+      "4B"
+    ],
+    "real_default_F32_vision_batch_sizes": [
+      1,
+      1,
+      2,
+      3,
+      8,
+      16
+    ],
+    "Metal": "Compilation and 7 focused CPU tests passed; no new Metal GPU measurements."
+  },
+  "reproduction": {
+    "runtime_build_base_commit": "8f2d6ab60b22510f356cf87601f38d92df4a9991",
+    "runtime_binary_sha256": "e65753d4c239cc7ea3bc7880b31b0ecf1bc0518bf66b5e04e3c7db1a1cbfc594",
+    "runtime_build_command": [
+      "zig",
+      "build",
+      "test-bin",
+      "-Dtarget=aarch64-linux.7.0...7.0-gnu.2.39",
+      "-Dcpu=cortex_a725+aes+sha2+sha3+sm4-perfmon-spe",
+      "-Dcuda=true",
+      "-Dcuda-artifacts=fatbin",
+      "-Dcuda-libs=auto",
+      "-Doptimize=ReleaseFast",
+      "-Dstrip=true",
+      "-Dtest-filter=LightOnOCR3"
+    ],
+    "runtime_source_sha256": {
+      "zig/pkg/inference/build/runtime.zig": "ab746106497ba472ca2fc4e0b4ebce97fd5451b1a4cb75d9eaf402832de0bb8a",
+      "zig/pkg/inference/build/tests.zig": "3ebd7564f8f0894c5196b3f6f34299dd1c6c63fcbfdd867d7ff20843aa7c739e",
+      "zig/pkg/inference/src/architectures/florence.zig": "9c1c49e74869a4533e7bb2b5e194c70cb87031dd5f311144da039219c9151b9c",
+      "zig/pkg/inference/src/architectures/gpt.zig": "d07a09d5f0cf6031c1d527c9bdc855f529a7459ad0968f12e1441030e5e7d501",
+      "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "b945c249e06a17ee336f6ddc7fa0bcd7c1e6370128c754c81937067699f77e13",
+      "zig/pkg/inference/src/architectures/session_factory.zig": "a343a52332aa523c52aeee6d41b83236e8bf310fa60d512a87be77f7fcbb56eb",
+      "zig/pkg/inference/src/models/gpt.zig": "648f016723da1b985f83ae134e555afd00009ad7c92fda1d7ccb118d5d3cecd4",
+      "zig/pkg/inference/src/ops/cuda/cublaslt.zig": "5957dd8062f97e260bb3204273737a8bcb750eb0c2d2a695a598631c1975debc",
+      "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "09cbbc462fec6d6e90347ca6a1579e16f76708302bd4397ccfb84258d80fbecf",
+      "zig/pkg/inference/src/ops/cuda/cudnn_conv.zig": "98902ea34fd935aaffde6f52be43937f8997c03b9d14f3015705949b5294c765",
+      "zig/pkg/inference/src/ops/cuda/cudnn_sdpa.zig": "d732dd69e38f67325707e8f53862de0f50c5786a3053c89bc0d959cf7135e29f",
+      "zig/pkg/inference/src/ops/cuda/florence_fused.ptx": "d4f91e70390ffb1e571526c14370582584cc5c657d316245106ab576d0a0a5f8",
+      "zig/pkg/inference/src/ops/cuda/florence_fused.zig": "eb524921071cf947b33dc04da22afc5898b3982ea94219a8e4922004b07cbd03",
+      "zig/pkg/inference/src/ops/cuda/kernels.zig": "61dd2fdd23c8126ce3bc45efa2f5e5e424bdb47c41e85f71f56d164c0b3339e3",
+      "zig/pkg/inference/src/ops/cuda/lighton_attention.ptx": "f8bf0ecb66a9cd07545c143c06aecb2cab852ee0b7d24073cdf4237e99cbb482",
+      "zig/pkg/inference/src/ops/cuda/lighton_attention.zig": "11c07d461e7739ea181d5d6f77d303563e70786e742b6ee33c3f1660ac905fd5",
+      "zig/pkg/inference/src/ops/cuda/lighton_recurrent.ptx": "f0e2f9a87724fa2a78a45a246e4c6519c48ee213eb38474e21b94bb054c8f324",
+      "zig/pkg/inference/src/ops/cuda/lighton_recurrent.zig": "0a52e200087408a8e31ca57c6cdd6639feaef5dff32f7a29304a5d4f56411c6a",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision.ptx": "61717ac07d1da5ee8175b0721838b5e5eda8c8b8249d714b1abe58b1a263708c",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision.zig": "e80ddac3a42fcb195d988213285851e4caf7405b4e25cb7a49829b26d5f0affd",
+      "zig/pkg/inference/src/ops/cuda/prototypes/florence_fused.cu": "8c0a26fefa8180185cc48ca81ef3f1c09062187f7c2b4e0b46e528cc021fddc0",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_batched_attention.cu": "a253da43c5dce8d14ce0f02f843708cbd670dd74cfe781524384a7596a9dea44",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_qwen35_recurrent.cu": "55f269a128ad50eae0dfcaf8fe591bbded4aea5dbe05df67a8a6d034dff871aa",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision.cu": "41a1a9a0085731f97601182ea114050ac039d7f42699926f90e44e759003500a",
+      "zig/pkg/inference/src/pipelines/generation.zig": "b206cc60466859e17e445e038e694d1f3765dcf6db236623bc36d3d6de337d98",
+      "zig/pkg/inference/src/pipelines/reading.zig": "20ef5a3c5b96b2da54426faa4de9cca75a20afbe7c29c0b297ad2aed92c01bfd",
+      "zig/pkg/inference/src/runtime/scheduler/native_generate.zig": "3500ea6444834b27c3f6c2da0142dec098eef9a045362d5e7f51f716d8a821b6",
+      "zig/pkg/inference/src/server/server.zig": "b6abcda3b20745dc7d956e36d3f3698b1d2cb5a6e624486f79bcbbb6864b23c3",
+      "zig/pkg/inference/src/ops/cuda/driver.zig": "3561b9b1dcb50c2e857cf628fba06769ed371d8ad4b1e3f34f9849f6b5fc73c5",
+      "zig/pkg/inference/src/ops/cuda/lighton_activation.zig": "ecb56a4fccefc42a0b1f369d64c32492a9b0c9771a423e701ee75b03f5afec25",
+      "zig/pkg/inference/src/ops/cuda/lighton_activation.ptx": "ab9e6c67790cafa0f4f51ac9c2ffd5ed4acb89e60c731e46926d8310905f81e7",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_activation.cu": "8b5ba1721669b5b1a59352c974953840240a1678d509e6fb4e6fa52a714673a6",
+      "zig/pkg/inference/src/server/reader_execution_pool.zig": "3df029d8a5d8b66b73c6f110420b11a0713feecc30bf1453b83267b7209aab02",
+      "zig/pkg/inference/src/server/reader_epoch.zig": "e405cc24cdc8c73f9769ecf39c8ec0596e2d2f8e2e070819949d403a1e0d827a",
+      "zig/pkg/inference/src/server/reader_execution_config.zig": "ba292ef60f1f5e519195ae113816e89a01b5b3bd1bed5c1ef83d302b4790f0d0",
+      "zig/pkg/inference/src/server/reader_admission.zig": "1483ba2042ab77cc573db92c2ccbe64ede718ce7c97f2b5624ada96f1dc256fe",
+      "zig/pkg/inference/src/ops/cuda/lighton_prefill.zig": "ea5e5d978dcdce53d3a526c973c082843914b206e668feb3972847d49053a809",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_bf16_prefill.cu": "0fa3651f1374336081d4744590c56879a743691df4698905c4e68159512f9089",
+      "zig/pkg/inference/src/ops/cuda/lighton_decode_graph.zig": "22440b75a8cf9214978d3b1bc67f248927ce94c36f5135835e2bfe37b399582f",
+      "zig/pkg/inference/src/ops/cuda/execution_arena.zig": "a17673cdc478658c5e890ff47549ed86d63078b76b5be3c7e5ddaa610afea1e1",
+      "zig/pkg/inference/src/ops/cuda/audio_execution_plan.zig": "f1393c6f2418174f28f5a95de60fd6e12e4758a36eb976c69980c73eef2577cc",
+      "zig/pkg/inference/src/runtime/kv/storage_runtime.zig": "4889a0eaac378a0d0028cf7413a6b9d016650da13dbecc2973792352a51f9e18",
+      "zig/pkg/inference/src/ops/cuda/lighton_prefill_attention.zig": "b2da8e2ec686da0d8396649bfda75870ab7d1975d2272cd5d191129ea1317ca8",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_prefill_attention.cpp": "75c68f13762f9532524a66bbc294113cd5b4dec201e67a6688dbd9722b2d6a09",
+      "zig/pkg/inference/src/pipelines/packed_head_rows.zig": "68436c76d4f3e75843585e5829c41c1b83a6d67f72b369cbb7d3912cc15e667f",
+      "zig/pkg/inference/src/backends/metal_runtime.zig": "eff0608420bf035e3d0e9a233f2d8f202d548e010faeb384a4ee530ee0f6b10c",
+      "zig/pkg/inference/src/backends/metal_kernels.m": "c14ef7988614b38a4c047c1723d7b07f7cd4654230935a03f6301770d8aa5340",
+      "zig/pkg/inference/src/ops/metal_compute.zig": "ad7fb99ec9201915216aa33f29f15cf141d13fce436242ec75a5eccd3af36871",
+      "zig/pkg/inference/src/ops/cuda/runtime_policy.zig": "abacb9f82dc94b554aa6d339568dd98a176bc8c43a88b6b937cea1ab384a06b4",
+      "zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profiles.json": "8da2d2efaed926b1f302a97200e5233bae5ad8fe20b5b71ce9c74b2820af390b",
+      "zig/pkg/inference/src/architectures/qwen3vl_device_qualification.zig": "c61aaef3133d14e58ae7707a2ae044db7f40c126646254c3bc7643c02bcb25f0",
+      "zig/pkg/inference/src/ops/cuda/burst_readback.zig": "7839493da05812382d27fd89cccc193fea7fcbaad9ce11fbd35fb2e38241d11e",
+      "zig/pkg/inference/src/ops/cuda/pinned_input_arena.zig": "17c8cb1e5e8683fca96a0901811b2b9a580f09c43ac93c869e9f2896a9cd7aa7",
+      "zig/pkg/inference/src/ops/cuda/buffer.zig": "522126f2efd853d23793cf8da50aec5e3a5241fe7f6de60473f2393d4f8e3619",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.zig": "f5a2179e9b7e5b33a6f13eb570416b7b30b89a553853e83afa631570daec6dfe",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.ptx": "43b0814e68ac61d94dafc54ca06c2745f83f0a5319a13178421b2e6090617c60",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_bf16.cu": "d4bb2ae275a04bf8425d1d9bd9596a51c155af6a0d9340e232b92dc851727f09",
+      "zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py": "e1b2adfb5e49e3e071e31f28cd09c37e3ab4655a89a994c9ee785c726fbcee83",
+      "zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py": "e1613b8f0a6274aa3ed90040c30c504bf044de9055b40aa7246e487022c01770"
+    },
+    "qualification_helper_sha256": "32a97c96e510b89a6c2cef86ebdf1d8d885b4f2f3a8ea74dd28608f16ae70504",
+    "qualification_checker_sha256": "0acb5c01cbd12ad5ae4b55e3bdd5ff4cd6802be907a63dbfef3aaf7ead89debd",
+    "qualification_library_sha256": "42a89d08cd8b4cfdfbd1f6ddbf2834fc98b262b20312c5152d02d9eadce7e91d",
+    "kernel_generation": {
+      "command": [
+        "/usr/local/cuda/bin/nvcc",
+        "-ptx",
+        "-arch=sm_80",
+        "-O3",
+        "--fmad=false",
+        "-std=c++17",
+        ".cache/vision500/lighton_vision_bf16.cu",
+        "-o",
+        ".cache/vision500/lighton_vision_bf16.ptx"
+      ],
+      "source_sha256": "d4bb2ae275a04bf8425d1d9bd9596a51c155af6a0d9340e232b92dc851727f09",
+      "ptx_sha256": "43b0814e68ac61d94dafc54ca06c2745f83f0a5319a13178421b2e6090617c60",
+      "published_ptx_sha256": "b00eaff6ca8720442e85a81bc840f3a9c11aded2c89e9fa24dcac89aed397583",
+      "postprocess": "Remove trailing blank lines and append one LF."
+    },
+    "report_sha256": {
+      "native08": "c48e520dc2b22e84fa677f381bbff2d589faed518128fdfd3c0ba6ca292e59ae",
+      "vllm08": "b34c682f78c4032bb8305e484d99d3fb7b4bd82140eacdc67572cf62def56d68",
+      "native4b": "52d558800cad591db0fbe22d1c19a90b1024778f6ff99e40fa4a260e00f480fd",
+      "vllm4b": "10fb9d7e50ddb2bbe29f6aab4a9a6f37ebb2001c826506c37b123b0a9c06da50",
+      "checkpoint_block_qualification": "c42ca20b70c85fec6ee47b14fe9c1864e99de5b419f41671e13aca19c0c9d069"
+    },
+    "raw_report_bundle_sha256": "ae7568b3259e5dd83159deda13fc101de0c668d71fe82eb4240a0cfceae7505e",
+    "raw_report_bundle_location": "Retained locally outside the source tree; not yet published. Reproduction commands are in README.md.",
+    "published_source_normalizations": {
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.ptx": {
+        "qualified_raw_sha256": "43b0814e68ac61d94dafc54ca06c2745f83f0a5319a13178421b2e6090617c60",
+        "published_sha256": "b00eaff6ca8720442e85a81bc840f3a9c11aded2c89e9fa24dcac89aed397583",
+        "rule": "Remove trailing blank lines from NVCC output and append one LF; all PTX instructions/directives remain byte-identical."
+      }
+    },
+    "qualification_checker_qualified_sha256": "dd529cdf12e4903b0430de436fe570d381027e797504faaadb8670cd8d527c5c",
+    "qualification_checker_formatting": "Repository pre-commit formatter normalized parentheses; Python AST is identical to the qualified checker."
+  }
+}

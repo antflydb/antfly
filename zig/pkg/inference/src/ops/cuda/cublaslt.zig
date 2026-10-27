@@ -36,6 +36,7 @@ const CUBLASLT_MATMUL_DESC_TRANSA: c_int = 3;
 const CUBLASLT_MATMUL_DESC_TRANSB: c_int = 4;
 const CUBLASLT_MATMUL_DESC_EPILOGUE: c_int = 7;
 const CUBLASLT_MATMUL_DESC_BIAS_POINTER: c_int = 8;
+const CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE: c_int = 26;
 const CUBLASLT_EPILOGUE_BIAS: c_int = 4;
 const CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES: c_int = 1;
 const CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES: c_int = 5;
@@ -461,6 +462,12 @@ pub const CublasLt = struct {
         _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_32F, .{}, .dense_bias, bias);
     }
 
+    /// BF16 activations and checkpoint bias retain their BF16 storage. The
+    /// output type in the plan key keeps this descriptor separate from F32.
+    pub fn matmulBf16WeightBiasBf16Out(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) Error!void {
+        _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_16BF, .{}, .dense_bias, bias);
+    }
+
     /// Shape/alignment/workspace-specific bounded tuning, cached for replay.
     pub fn matmulBf16WeightBf16OutWithTuning(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) Error!MatmulSelection {
         return self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_16BF, tuning, .dense, null);
@@ -571,7 +578,7 @@ pub const CublasLt = struct {
         };
         if (residual != null and (tuning.enabled or bias != null or kind != .dense or input_type != CUDA_R_16BF or output_type != CUDA_R_32F)) return error.CublasLtUnsupported;
         if (bias != null) {
-            if ((input_type != CUDA_R_32F and input_type != CUDA_R_16F and input_type != CUDA_R_16BF) or output_type != CUDA_R_32F or tuning.enabled) return error.CublasLtUnsupported;
+            if ((input_type != CUDA_R_32F and input_type != CUDA_R_16F and input_type != CUDA_R_16BF) or (output_type != CUDA_R_32F and !(input_type == CUDA_R_16BF and output_type == CUDA_R_16BF)) or tuning.enabled) return error.CublasLtUnsupported;
             spinLock(&self.bias_submission_mutex);
         }
         defer if (bias != null) self.bias_submission_mutex.unlock();
@@ -594,7 +601,7 @@ pub const CublasLt = struct {
         try requireDisjoint(workspace, workspace.len, weight, weight_bytes);
         try requireDisjoint(workspace, workspace.len, dst, dst_bytes);
         if (bias) |value| {
-            const bias_bytes = try checkedMatrixBytes(1, out_dim, @sizeOf(f32));
+            const bias_bytes = try checkedMatrixBytes(1, out_dim, if (output_type == CUDA_R_32F) @sizeOf(f32) else @sizeOf(u16));
             try checkRawBytes(value, bias_bytes);
             try requireDisjoint(dst, dst_bytes, value, bias_bytes);
             try requireDisjoint(workspace, workspace.len, value, bias_bytes);
@@ -618,7 +625,7 @@ pub const CublasLt = struct {
         defer plan_lease.deinit(self);
         const plan = plan_lease.plan;
         try checkRawBytes(workspace, plan.workspace_size);
-        if (bias) |value| try self.setBias(plan.op_desc, value);
+        if (bias) |value| try self.setBias(plan.op_desc, value, output_type);
 
         var alpha: f32 = 1.0;
         var beta: f32 = if (residual != null) 1.0 else 0.0;
@@ -808,7 +815,7 @@ pub const CublasLt = struct {
         const output_dim = if (key.kind == .dense_input_gradient) key.in_dim else key.out_dim;
         try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.c_desc, key.output_type, output_dim, key.rows, output_dim));
         try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.d_desc, key.output_type, output_dim, key.rows, output_dim));
-        if (key.kind == .dense_bias) try self.setBias(plan.op_desc, invocation.bias orelse return error.CublasLtUnsupported);
+        if (key.kind == .dense_bias) try self.setBias(plan.op_desc, invocation.bias orelse return error.CublasLtUnsupported, key.output_type);
 
         if (key.kind == .strided_batched) {
             var row_order = CUBLASLT_ORDER_ROW;
@@ -1378,9 +1385,10 @@ pub const CublasLt = struct {
         _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_32F, CUDA_R_32F, .{}, .dense_bias, bias);
     }
 
-    fn setBias(self: *const CublasLt, desc: MatmulDesc, bias: buffer_mod.DeviceBuffer) Error!void {
+    fn setBias(self: *const CublasLt, desc: MatmulDesc, bias: buffer_mod.DeviceBuffer, output_type: c_int) Error!void {
         const epilogue: c_int = CUBLASLT_EPILOGUE_BIAS;
         const pointer: *const anyopaque = @ptrFromInt(bias.ptr);
+        try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &output_type, @sizeOf(c_int)));
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, @sizeOf(c_int)));
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, @ptrCast(&pointer), @sizeOf(@TypeOf(pointer))));
     }

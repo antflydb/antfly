@@ -2281,6 +2281,122 @@ pub const CudaCompute = struct {
         return adjusted;
     }
 
+    pub fn lightOnBf16VisionEnabled(cb: *const ops.ComputeBackend) bool {
+        if (cb.kind() != .cuda) return false;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.capability_profile == .lightonocr3 and self.lighton_precision == .bf16_vision and
+            !self.resident_training_cache and self.lazy_host_store == null and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
+            self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1 and self.cublaslt != null;
+    }
+
+    pub fn lightOnVisionBf16ToF32(cb: *const ops.ComputeBackend, input: CT) !?CT {
+        if (!lightOnBf16VisionEnabled(cb)) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const tensor = tensorFromCt(input);
+        if (tensor.dtype == .f32) return null;
+        if (tensor.dtype != .bf16 or tensor.quant_type != null or tensor.strict_resident_training) return error.UnsupportedTensorType;
+        if (tensor.elem_count == 0 or tensor.buffer.ptr == 0 or tensor.buffer.len < try checkedMul(tensor.elem_count, 2)) return error.InvalidShape;
+        const shape = try dupeShape(self.allocator, tensor.shape);
+        errdefer self.allocator.free(shape);
+        var data = try allocDeviceBuffer(self, try checkedMul(tensor.elem_count, 4));
+        errdefer releaseDeviceBuffer(self, &data);
+        try self.scalar_clamp_kernel.widen16Bit(&self.ctx, tensor.buffer.ptr, data.ptr, tensor.elem_count, true);
+        return createTensor(self, data, shape, tensor.elem_count);
+    }
+
+    pub fn lightOnBf16VisionBlock(cb: *const ops.ComputeBackend, input_ct: CT, weights: [12]CT, positions: []const u32, rows: usize, hidden: usize, intermediate: usize, batch: usize, eps: f32, theta: f32) !?CT {
+        if (!lightOnBf16VisionEnabled(cb)) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const compact = @import("lighton_vision_bf16.zig");
+        _ = try compact.Layout.init(rows, hidden, intermediate, 0);
+        if (batch == 0 or batch > 16 or rows % batch != 0 or rows / batch > 4096 or positions.len != try checkedMul(rows, 2)) return error.InvalidShape;
+        if (!std.math.isFinite(eps) or eps <= 0 or !std.math.isFinite(theta) or theta <= 0) return error.InvalidShape;
+        const input = tensorFromCt(input_ct);
+        if (input.strict_resident_training or input.quant_type != null or (input.dtype != .f32 and input.dtype != .bf16)) return error.UnsupportedTensorType;
+        const count = try checkedMul(rows, hidden);
+        try ensureCount(input, count);
+        if (input.buffer.ptr == 0 or input.buffer.len < try checkedMul(count, input.dtype.byteSize())) return error.InvalidShape;
+        var w: [12]buffer_mod.DeviceBuffer = undefined;
+        var needs_bias_pack = false;
+        const weight_counts = [_]usize{ hidden, hidden, 3 * hidden * hidden, 3 * hidden, hidden * hidden, hidden, hidden, hidden, hidden * intermediate, intermediate, intermediate * hidden, hidden };
+        for (weights, 0..) |weight, index| {
+            const tensor = tensorFromCt(weight);
+            if (tensor.quant_type != null or tensor.strict_resident_training) return error.UnsupportedTensorType;
+            try ensureCount(tensor, weight_counts[index]);
+            const norm = index == 0 or index == 1 or index == 6 or index == 7;
+            if (norm) {
+                try ensureF32(tensor);
+                try ensureCount(tensor, hidden);
+                w[index] = tensor.buffer;
+            } else if (tensor.dtype == .bf16) {
+                w[index] = tensor.buffer;
+            } else {
+                // BF16 checkpoint biases are expanded by the general weight
+                // loader. This profile explicitly rounds any F32 bias once.
+                if (index != 3 and index != 5 and index != 9 and index != 11) return error.UnsupportedTensorType;
+                try ensureF32(tensor);
+                needs_bias_pack = true;
+                w[index] = tensor.buffer;
+            }
+        }
+        if (self.embedding_gemma2_cudnn_unavailable) return error.CudnnFailure;
+        if (self.embedding_gemma2_cudnn == null) self.embedding_gemma2_cudnn = try cudnn_sdpa_mod.Module.init(self.ctx.stream);
+        const attention = &self.embedding_gemma2_cudnn.?;
+        const key = cudnn_sdpa_mod.Key{ .batch = batch, .q_heads = hidden / 64, .kv_heads = hidden / 64, .sequence = rows / batch, .dim = 64, .scale = 0.125, .ocr_vision = true, .dtype = .bf16 };
+        const workspace_bytes = (try attention.workspaceBytesFor(key)) orelse return error.CudnnFailure;
+        // Retain the existing vendor-workspace admission and retirement
+        // policy; encoder temporaries create no additional retained pool.
+        if (self.run_budget) |budget| {
+            const limit = budget.limits.scratch_limit_bytes;
+            const growth = workspace_bytes -| self.embedding_gemma2_cudnn_attention_scratch.buffer.len;
+            if (limit != 0 and growth > limit -| budget.scratchTotalBytes()) return error.MemoryBudgetExceeded;
+        }
+        const vendor_workspace = try self.embedding_gemma2_cudnn_attention_scratch.acquire(&self.ctx, workspace_bytes);
+        const layout = try compact.Layout.init(rows, hidden, intermediate, 0);
+        var arena = try allocDeviceBuffer(self, layout.bytes);
+        defer releaseDeviceBuffer(self, &arena);
+        // Bias conversion is part of this block's checked working set. It
+        // creates no model-lifetime cache or unowned retained reservation.
+        const bias_counts = [_]usize{ hidden * 3, hidden, intermediate, hidden };
+        const bias_indices = [_]usize{ 3, 5, 9, 11 };
+        var bias_bytes: usize = 0;
+        for (bias_counts) |bias_count| bias_bytes = try std.math.add(usize, bias_bytes, try checkedMul(bias_count, 2));
+        var bias_pack = if (needs_bias_pack) try allocDeviceBuffer(self, bias_bytes) else buffer_mod.DeviceBuffer{};
+        defer releaseDeviceBuffer(self, &bias_pack);
+        var converted = buffer_mod.DeviceBuffer{};
+        defer releaseDeviceBuffer(self, &converted);
+        const source = if (input.dtype == .bf16) input.buffer else compact_input: {
+            converted = try allocDeviceBuffer(self, try checkedMul(count, 2));
+            break :compact_input converted;
+        };
+        const cached = try cachedLightOnMropePositions(self, positions);
+        var position_buffer = cached orelse try allocDeviceBuffer(self, try checkedMul(positions.len, 4));
+        defer if (cached == null) releaseDeviceBuffer(self, &position_buffer);
+        const shape = try allocShape2(self.allocator, rows, hidden);
+        errdefer self.allocator.free(shape);
+        var output = try allocDeviceBuffer(self, try checkedMul(count, 2));
+        errdefer releaseDeviceBuffer(self, &output);
+        // After uploads/launches, all temporaries remain alive until a drain
+        // on failure. A failed reduced-precision block cannot fall back.
+        errdefer self.ctx.synchronize() catch {};
+        var bias_offset: usize = 0;
+        for (bias_indices, bias_counts) |index, bias_count| {
+            const tensor = tensorFromCt(weights[index]);
+            if (tensor.dtype == .f32) {
+                try ensureCount(tensor, bias_count);
+                if (tensor.buffer.ptr == 0 or tensor.buffer.len < try checkedMul(bias_count, 4)) return error.InvalidShape;
+                const destination = buffer_mod.DeviceBuffer{ .ptr = bias_pack.ptr + bias_offset, .len = bias_count * 2, .borrowed = true };
+                try self.kernels.launchF32ToBf16(&self.ctx, destination, tensor.buffer, bias_count);
+                w[index] = destination;
+            }
+            bias_offset += bias_count * 2;
+        }
+        if (input.dtype == .f32) try self.kernels.launchF32ToBf16(&self.ctx, converted, input.buffer, count);
+        if (cached == null) try copyFromHostTracked(self, position_buffer, std.mem.sliceAsBytes(positions));
+        try self.lighton_vision_bf16.block(&self.ctx, &self.cublaslt.?, attention, key, arena, layout, cublasLtWorkspace(self), .{ .input = source, .output = output, .weights = w, .positions = position_buffer, .rows = rows, .hidden = hidden, .intermediate = intermediate, .batch = batch, .epsilon = eps, .theta = theta, .attention_workspace = vendor_workspace });
+        return createTensorWithDType(self, output, shape, count, .bf16);
+    }
+
     /// Fuse only the existing F32 split/RoPE and BF16 cuDNN input boundary.
     /// QKV GEMM, its bias, attention precision, and output projection are unchanged.
     pub fn lightOnVisionAttention(cb: *const ops.ComputeBackend, packed_ct: CT, positions: []const u32, batch: usize, rows: usize, heads: usize, dim: usize, theta: f32) !?CT {
@@ -3748,6 +3864,8 @@ pub const CudaCompute = struct {
     lighton_norm_weight_cache_hits: usize = 0,
     lighton_norm_weight_cache_misses: usize = 0,
     lighton_vision_fused: @import("lighton_vision.zig").Module = .{},
+    lighton_precision: @import("lighton_vision_bf16.zig").Precision = .f32,
+    lighton_vision_bf16: @import("lighton_vision_bf16.zig").Module = .{},
     florence_bart_ffn_enabled: bool = false,
     florence_bart_ffn_calls: usize = 0,
     florence_fused_append_enabled: bool = false,
@@ -4868,6 +4986,7 @@ pub const CudaCompute = struct {
             .florence_channel_tc_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_CHANNEL_TC"),
             .florence_fused_bias_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_BIAS"),
             .florence_fused_depthwise_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_DEPTHWISE"),
+            .lighton_precision = try @import("lighton_vision_bf16.zig").Precision.resolveWithAttention(platform.env.getenv("ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE"), platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN", true)),
             .lighton_fused_vision_mlp_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP"),
             .lighton_fused_vision_qkv_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV"),
             .lighton_norm_weight_cache_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE"),
@@ -4941,6 +5060,8 @@ pub const CudaCompute = struct {
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_vision_mlp_calls={d}\n", .{self.lighton_vision_fused.calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_bf16_vision_blocks={d} precision_profile={s}\n", .{ self.lighton_vision_bf16.blocks, @tagName(self.lighton_precision) });
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_vision_bias_epilogue_calls={d}\n", .{self.lighton_vision_bias_epilogue_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_vision_norm_qkv_calls={d}\n", .{self.lighton_vision_norm_qkv_calls});
@@ -4966,6 +5087,7 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_model_graph_enabled={d} state_pool={d} lazy={d} training={d}\n", .{ @intFromBool(self.lighton_decode_graph_enabled), @intFromBool(self.lighton_state_pool_enabled), @intFromBool(self.lazy_host_store != null), @intFromBool(self.resident_training_cache) });
         self.lighton_decode_graph.invalidate(&self.ctx);
         self.lighton_activation.deinit(&self.ctx);
+        self.lighton_vision_bf16.deinit(&self.ctx);
         self.lighton_vision_fused.deinit(&self.ctx);
 
         self.florence_fused.deinit(&self.ctx);
@@ -35447,4 +35569,64 @@ test "LightOnOCR3 CUDA burst readback retains admission source and unique pendin
     try fourth.copy(std.mem.sliceAsBytes(got[0..1]));
     try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -91))), got[0]);
     fourth.deinit();
+}
+
+test "LightOnOCR3 CUDA BF16 vision projection retains bias dtype, readonly inputs and alias guards across F32 plans" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const blas = &(compute.cublaslt orelse return error.SkipZigTest);
+    const rows = 4;
+    const dim = 16;
+    const width = 32;
+    var x: [rows * dim]u16 = undefined;
+    var weight: [width * dim]u16 = undefined;
+    var bias: [width]u16 = undefined;
+    var bias_f32: [width]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 16)) >> 16);
+    for (&weight, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) / 32)) >> 16);
+    for (&bias, &bias_f32, 0..) |*v, *f, i| {
+        f.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 3)) - 1)) / 32;
+        v.* = @truncate(@as(u32, @bitCast(f.*)) >> 16);
+    }
+    const sizes = [_]usize{ @sizeOf(@TypeOf(x)), @sizeOf(@TypeOf(weight)), @sizeOf(@TypeOf(bias)), @sizeOf(@TypeOf(bias_f32)), rows * width * 2, rows * width * 4 };
+    var buffers: [6]buffer_mod.DeviceBuffer = @splat(.{});
+    defer {
+        compute.ctx.synchronize() catch {};
+        for (&buffers) |*item| item.free(&compute.ctx);
+    }
+    for (&buffers, sizes) |*item, bytes| item.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, bytes);
+    try buffers[0].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&x));
+    try buffers[1].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&weight));
+    try buffers[2].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&bias));
+    try buffers[3].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&bias_f32));
+    for (0..2) |_| {
+        try blas.matmulBf16WeightBiasBf16Out(&compute.ctx, buffers[4], buffers[0], buffers[1], buffers[2], .{}, rows, dim, width);
+        try blas.matmulBf16WeightBiasF32Out(&compute.ctx, buffers[5], buffers[0], buffers[1], buffers[3], .{}, rows, dim, width);
+    }
+    var reduced: [rows * width]u16 = undefined;
+    var full: [rows * width]f32 = undefined;
+    try buffers[4].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&reduced));
+    try buffers[5].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&full));
+    try compute.ctx.synchronize();
+    for (0..rows) |row| for (0..width) |col| {
+        var expected = bias_f32[col];
+        for (0..dim) |k| expected += @as(f32, @bitCast(@as(u32, x[row * dim + k]) << 16)) * @as(f32, @bitCast(@as(u32, weight[col * dim + k]) << 16));
+        try std.testing.expectEqual(expected, full[row * width + col]);
+        try std.testing.expectEqual(expected, @as(f32, @bitCast(@as(u32, reduced[row * width + col]) << 16)));
+    };
+    const before = compute.ctx.stats.kernel_launches;
+    try std.testing.expectError(error.CublasLtUnsupported, blas.matmulBf16WeightBiasBf16Out(&compute.ctx, buffers[4], buffers[0], buffers[1], .{ .ptr = buffers[2].ptr, .len = sizes[2] - 1 }, .{}, rows, dim, width));
+    try std.testing.expectError(error.CublasLtUnsupported, blas.matmulBf16WeightBiasBf16Out(&compute.ctx, .{ .ptr = buffers[0].ptr, .len = sizes[4] }, buffers[0], buffers[1], buffers[2], .{}, rows, dim, width));
+    try std.testing.expectEqual(before, compute.ctx.stats.kernel_launches);
+    var actual_x: @TypeOf(x) = undefined;
+    var actual_weight: @TypeOf(weight) = undefined;
+    var actual_bias: @TypeOf(bias) = undefined;
+    try buffers[0].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual_x));
+    try buffers[1].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual_weight));
+    try buffers[2].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual_bias));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u16, &x, &actual_x);
+    try std.testing.expectEqualSlices(u16, &weight, &actual_weight);
+    try std.testing.expectEqualSlices(u16, &bias, &actual_bias);
 }

@@ -470,6 +470,7 @@ def run(args, model, label, mode, concurrency, output):
                 "ANTFLY_CUDA_ENABLE_LIGHTON_GEMM_BUCKET_ROWS",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_DECODE_OUTPUTS",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS",
+                "ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_FFN",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE",
@@ -1363,6 +1364,11 @@ def run(args, model, label, mode, concurrency, output):
                 args.require_lighton_fused_vision_qkv,
             ),
             (
+                "cuda_bf16_vision_blocks",
+                "lighton_bf16_vision",
+                args.require_lighton_bf16_vision,
+            ),
+            (
                 "cuda_prefix_shared_qk_calls",
                 "lighton_prefix_shared_qk",
                 args.require_lighton_prefix_shared_qk,
@@ -2001,6 +2007,7 @@ def main():
     parser.add_argument("--require-florence-incremental-admission", action="store_true")
     parser.add_argument("--require-cuda-temp-cache", action="store_true")
     parser.add_argument("--require-lighton-fused-vision-qkv", action="store_true")
+    parser.add_argument("--require-lighton-bf16-vision", action="store_true")
     parser.add_argument("--require-lighton-ragged-recurrent", action="store_true")
     parser.add_argument("--require-lighton-ffn-bf16-inputs", action="store_true")
     parser.add_argument("--require-lighton-ffn-block", action="store_true")

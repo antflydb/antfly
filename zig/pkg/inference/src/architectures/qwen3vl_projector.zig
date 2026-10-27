@@ -1773,6 +1773,26 @@ fn visionBlockActivation(cb: *const ComputeBackend, cfg: Config, input: CT) !CT 
     return (try cb.geluExact(input)) orelse try cb.gelu(input);
 }
 
+fn tryLightOnBf16VisionBlock(cb: *const ComputeBackend, weights: *WeightCache, cfg: Config, input: CT, positions: []const u32, rows: usize, layer: usize, image_batch: usize) !?CT {
+    if (comptime !build_options.enable_cuda) return null;
+    const Cuda = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+    if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or !cfg.block_gelu_tanh or !Cuda.lightOnBf16VisionEnabled(cb)) return null;
+    const keys = [_][]const u8{ "ln1.weight", "ln1.bias", "attn_qkv.weight", "attn_qkv.bias", "attn_out.weight", "attn_out.bias", "ln2.weight", "ln2.bias", "ffn_up.weight", "ffn_up.bias", "ffn_down.weight", "ffn_down.bias" };
+    var tensors: [12]CT = undefined;
+    var name: [128]u8 = undefined;
+    for (keys, 0..) |key, index| {
+        const full = try std.fmt.bufPrint(&name, "v.blk.{d}.{s}", .{ layer, key });
+        tensors[index] = switch (index) {
+            2 => try weights.linear(full, cfg.vision_hidden, 3 * cfg.vision_hidden),
+            4 => try weights.linear(full, cfg.vision_hidden, cfg.vision_hidden),
+            8 => try weights.linear(full, cfg.vision_hidden, cfg.intermediate),
+            10 => try weights.linear(full, cfg.intermediate, cfg.vision_hidden),
+            else => try weights.weight(full),
+        };
+    }
+    return Cuda.lightOnBf16VisionBlock(cb, input, tensors, positions, rows, cfg.vision_hidden, cfg.intermediate, image_batch, cfg.layer_norm_eps, cfg.rope_theta);
+}
+
 fn encoderBlock(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1784,6 +1804,7 @@ fn encoderBlock(
     layer: usize,
     image_batch: usize,
 ) !CT {
+    if (try tryLightOnBf16VisionBlock(cb, weights, cfg, input_ct, positions, token_count, layer, image_batch)) |compact| return compact;
     var resident_scope = try ResidentVisionScope.begin(cb, cfg, input_ct);
     defer resident_scope.deinit();
     const input = resident_scope.input;
@@ -2111,6 +2132,10 @@ fn layerNormNamed(
     defer allocator.free(bias_name);
     const weight = try weights.weight(weight_name);
     const bias = try weights.weight(bias_name);
+    if (comptime build_options.enable_cuda) if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionBf16ToF32(cb, input)) |expanded| {
+        defer cb.free(expanded);
+        return cb.layerNorm(expanded, weight, bias, dim, eps);
+    };
     return cb.layerNorm(input, weight, bias, dim, eps);
 }
 

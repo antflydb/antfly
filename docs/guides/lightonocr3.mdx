@@ -170,6 +170,10 @@ and vision kernels. The experimental DGX Spark presets in
 `scripts/lightonocr3/cuda_ocr_profiles.json` require a CUDA build and cuDNN on the
 dynamic library search path. They preserve operator limits and retain F32
 decode projection outputs and recurrent state. Native attention KV is F16.
+The 0.8B preset keeps vision-block activations BF16 on SM12.1; patch embedding
+and the final merger retain F32. The 4B preset retains F32 vision. Set
+`ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE=f32` to select the original vision path.
+This is a partial precision profile, not a full BF16 decoder.
 
 ```bash
 python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton08 --print-env
@@ -253,8 +257,8 @@ fixtures, not broad document accuracy or an SLO.
 | M4 Max, LightOn 0.8B | 4.725–4.736 | vLLM 4.097–4.102 |
 | M4 Max, LightOn 4B | 1.210–1.211 | vLLM 1.1517–1.1518 |
 | M4 Max, Florence | 5.306–5.309 | MLX proxy 5.131–5.138 |
-| DGX Spark, LightOn 0.8B, optional prefill | 13.073–13.096 | vLLM 14.426–14.485 |
-| DGX Spark, LightOn 4B, optional prefill/attention | 4.036–4.083 | vLLM 4.630–4.634 |
+| DGX Spark, LightOn 0.8B, BF16 vision and optional prefill | 13.582–13.584 | vLLM 14.474–14.497 |
+| DGX Spark, LightOn 4B, optional prefill/attention | 4.145–4.167 | vLLM 4.538–4.608 |
 | DGX Spark, Florence FP16 | 25.347–25.758 | vLLM 25.340–25.348 |
 
 The Metal comparisons are paired. Latest LightOn CUDA runs use 256 warmup
