@@ -1660,8 +1660,12 @@ pub fn prepareEmbeddingGemma2Audio(allocator: std.mem.Allocator, bytes: []const 
 /// Inspect only trustworthy sample-count headers. Unknown durations retain the
 /// full model envelope; admission must never infer a 30-second input limit.
 pub fn embeddingGemma2EncodedAudioSequenceBound(bytes: []const u8) !usize {
+    return embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes, .{});
+}
+
+pub fn embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes: []const u8, options: audio.DecodeOptions) !usize {
     const generic = @import("inference_audio");
-    const format = generic.detectFormat(bytes) orelse return error.UnsupportedAudioFormat;
+    const format = generic.detectFormatWithOptions(bytes, options) orelse return error.UnsupportedAudioFormat;
     const info: ?struct { samples: usize, rate: u32 } = switch (format) {
         .wav => wav: {
             const parsed = try generic.wav.parseData(bytes);

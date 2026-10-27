@@ -2210,7 +2210,7 @@ fn cudaGroupRequest(group: Group, options: Options) !@import("../backends/sessio
                 tower = @max(tower, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
             },
             .audio => |bytes| {
-                const audio_tokens = try projector.embeddingGemma2EncodedAudioSequenceBound(bytes);
+                const audio_tokens = try projector.embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes, options.audio_decode_options);
                 tokens = try std.math.add(usize, tokens, audio_tokens);
                 host = @max(host, try std.math.add(usize, options.max_audio_decode_working_bytes, 64 * 1024 * 1024 + audio_tokens * 32 * 1024));
                 tower = @max(tower, 512 * 1024 * 1024);
@@ -4919,6 +4919,30 @@ test "embeddinggemma2 CUDA one second WAV stays within production scratch admiss
     var permit = try session.admit(request);
     defer permit.deinit();
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admit(.{ .batch = 1, .sequence = 8192, .workspace_bytes = 1536 * 1024 * 1024 }));
+}
+
+test "embeddinggemma2 CUDA audio admission preserves decode hint precedence" {
+    // MP3 decoders can scan past leading padding; admission cannot require a
+    // byte-zero signature when the caller supplies the encoded format.
+    const padded = "\x00\xff\xfb\x90\x00";
+    const group = Group{ .content = &.{.{ .audio = padded }} };
+    try std.testing.expectError(error.UnsupportedAudioFormat, cudaGroupRequest(group, .{}));
+    const hints = [_]@import("audio.zig").DecodeOptions{
+        .{ .format_hint = .mp3 },
+        .{ .mime_hint = "audio/mpeg" },
+        .{ .file_name_hint = "padded.mp3" },
+    };
+    for (hints) |hint| {
+        const request = try cudaGroupRequest(group, .{ .audio_decode_options = hint });
+        // Unknown duration keeps the full sequence and tower envelope.
+        try std.testing.expectEqual(@as(usize, 8192), request.sequence);
+        try std.testing.expect(request.workspace_bytes >= 512 * 1024 * 1024);
+    }
+    // A format hint must also override a misleading signature. Parsing this
+    // as WAV would fail before the hinted MP3 decoder could inspect it.
+    const misleading = Group{ .content = &.{.{ .audio = "RIFFxxxxWAVE" }} };
+    const request = try cudaGroupRequest(misleading, .{ .audio_decode_options = .{ .format_hint = .mp3 } });
+    try std.testing.expectEqual(@as(usize, 8192), request.sequence);
 }
 
 test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and retry after cancellation" {
