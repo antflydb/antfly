@@ -34,12 +34,15 @@ export async function probePersistedDiagnostics(run,token,timeframe,{fetch:reque
  return{worker:run.id,timeframe,read_only:true,qualification:false,status:response.status,success:response.ok&&value.success===true,error_codes:(value.errors??[]).map(e=>e.code).filter(Number.isSafeInteger),result_fields:Object.keys(value.result??{}).filter(k=>['run','statistics','calculations','events','invocations','traces','agents','distribution'].includes(k))};
 }
 
+export async function readObservabilityToken(gate){
+ const tokenPath=resolve(gate.dir,'observability-token'),info=await stat(tokenPath);
+ if(!info.isFile()||info.size>4096||(info.mode&0o077)!==0||await realpath(tokenPath)!==tokenPath)throw Error('ObservabilityTokenMustBePrivateRegularFile');
+ return(await readFile(tokenPath,'utf8')).trim();
+}
 async function main(){
  const path=process.argv[2];if(!path||process.argv.length!==3)throw Error('usage: persisted-diagnostic-probe GATE_JSON');
  const gate=JSON.parse(await readFile(path)),run=JSON.parse(await readFile(gate.trials[0].baseline));assertGateRun(run,{account:gate.account,dir:gate.dir});
- const tokenPath=resolve(gate.dir,'observability-token'),info=await stat(tokenPath);
- if(!info.isFile()||info.size>4096||(info.mode&0o077)!==0||await realpath(tokenPath)!==tokenPath)throw Error('ObservabilityTokenMustBePrivateRegularFile');
- const token=(await readFile(tokenPath,'utf8')).trim(),to=Date.now(),report=await probePersistedDiagnostics(run,token,{from:to-3600000,to});
+ const token=await readObservabilityToken(gate),to=Date.now(),report=await probePersistedDiagnostics(run,token,{from:to-3600000,to});
  await writeFile(resolve(gate.dir,'persisted-diagnostic-access.json'),JSON.stringify(report,null,2),{mode:0o600});console.log(JSON.stringify(report));if(!report.success)process.exitCode=1;
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))await main();
