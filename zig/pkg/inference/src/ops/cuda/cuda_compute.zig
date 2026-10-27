@@ -3635,6 +3635,7 @@ pub const CudaCompute = struct {
     // Experimental BF16 projection boundary for both prefix and decode rows.
     // Tensor ABI and recurrent state remain F32; this is not full BF16 execution.
     lighton_bf16_projection_outputs: bool = false,
+    lighton_vision_bias_epilogue_calls: usize = 0,
     lighton_bf16_prefill_ffn: bool = false,
     lighton_bf16_prefill_ffn_calls: usize = 0,
     lighton_fused_ffn: bool = false,
@@ -4797,6 +4798,7 @@ pub const CudaCompute = struct {
             std.debug.print("FLORENCE2 cuda_bart_ffn_calls={d}\n", .{self.florence_bart_ffn_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_vision_mlp_calls={d}\n", .{self.lighton_vision_fused.calls});
+        std.debug.print("LIGHTONOCR3 cuda_vision_bias_epilogue_calls={d}\n", .{self.lighton_vision_bias_epilogue_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_norm_weight_cache_hits={d} cuda_norm_weight_cache_misses={d}\n", .{ self.lighton_norm_weight_cache_hits, self.lighton_norm_weight_cache_misses });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
@@ -18395,6 +18397,34 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         return result;
     }
     if (isBf16Weight(weight_tensor)) {
+        // Vision QKV and output projections already round their inputs to
+        // BF16 and accumulate into F32. Keep those boundaries while applying
+        // their F32 bias in the GEMM epilogue instead of a second matrix pass.
+        if (self.capability_profile == .lightonocr3 and self.lighton_fused_vision_qkv_enabled and
+            (in_dim == 768 or in_dim == 1024) and (out_dim == in_dim or out_dim == 3 * in_dim) and
+            rows >= 256 and rows <= 65536 and self.cublaslt_bf16_tuning_profile == .off and
+            !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
+        {
+            if (try stageBf16ActivationForCublasLt(self, input_tensor, rows, in_dim)) |staged| {
+                const blas = &(self.cublaslt orelse return error.InvalidCudaState);
+                var device = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, out_dim), 4));
+                errdefer releaseDeviceBuffer(self, &device);
+                const shape = try allocShape2(self.allocator, rows, out_dim);
+                errdefer self.allocator.free(shape);
+                if (blas.matmulBf16WeightBiasF32Out(&self.ctx, device, staged, weight_tensor.buffer, bias_tensor.buffer, cublasLtWorkspace(self), rows, in_dim, out_dim)) |_| {
+                    self.lighton_vision_bias_epilogue_calls += 1;
+                    self.dispatch_stats.note(self.allocator, .linear, .bf16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+                    return try createTensor(self, device, shape, rows * out_dim);
+                } else |err| switch (err) {
+                    error.CublasLtUnsupported => {
+                        releaseDeviceBuffer(self, &device);
+                        self.allocator.free(shape);
+                    },
+                    else => return err,
+                }
+            }
+        }
+
         const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
         errdefer freeTensor(ctx, result);
         const result_tensor = tensorFromCt(result);
@@ -23503,9 +23533,10 @@ fn tryReducedVisionCudnnInput(
     if (rotary_qkv) |rotary| {
         if (use_f16 or packed_qkv != null) return error.InvalidShape;
         try self.lighton_vision_fused.init(&self.ctx);
-        var position_buffer = try allocDeviceBuffer(self, try checkedMul(rotary.positions.len, @sizeOf(u32)));
-        defer releaseDeviceBuffer(self, &position_buffer);
-        try copyFromHostTracked(self, position_buffer, std.mem.sliceAsBytes(rotary.positions));
+        const cached_positions = try cachedLightOnMropePositions(self, rotary.positions);
+        var position_buffer = cached_positions orelse try allocDeviceBuffer(self, try checkedMul(rotary.positions.len, @sizeOf(u32)));
+        defer if (cached_positions == null) releaseDeviceBuffer(self, &position_buffer);
+        if (cached_positions == null) try copyFromHostTracked(self, position_buffer, std.mem.sliceAsBytes(rotary.positions));
         try self.lighton_vision_fused.qkvRope(&self.ctx, .{ q_bf16.ptr, k_bf16.ptr, v_bf16.ptr, rotary.qkv.buffer.ptr, position_buffer.ptr }, @intCast(batch * seq_len), @intCast(num_heads), @intCast(head_dim), rotary.theta);
     } else if (packed_qkv) |packed_input| {
         if (!use_f16) return error.InvalidShape;
@@ -34078,6 +34109,7 @@ test "LightOnOCR3 CUDA fused vision QKV preserves cuDNN inputs output and readon
     var compute = try CudaCompute.init(a);
     defer compute.deinit();
     compute.capability_profile = .lightonocr3;
+    compute.lighton_cached_mrope_enabled = true;
     const cb = compute.computeBackend();
     for ([_]usize{ 768, 1024 }) |hidden| {
         for ([_]usize{ 1, 2 }) |batch| {
@@ -34117,6 +34149,34 @@ test "LightOnOCR3 CUDA fused vision QKV preserves cuDNN inputs output and readon
             const want = try cb.toFloat32(reference, a);
             defer a.free(want);
             try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+            // The fused path must share the content-checked position cache
+            // already used by unfused vision RoPE. No second upload is needed
+            // for an identical layer, even after generic scratch is overwritten.
+            _ = try uploadTempU32(&compute, &.{ 99, 88, 77 });
+            const hits = compute.lighton_mrope_cache_hits;
+            const h2d = compute.stats.h2d_bytes;
+            const repeated = (try tryReducedVisionCudnnInput(&compute, input, input, input, null, .{ .qkv = input, .positions = positions, .theta = 10000 }, batch, rows / batch, heads, 64)).?;
+            defer cb.free(repeated);
+            try std.testing.expectEqual(hits + 1, compute.lighton_mrope_cache_hits);
+            try std.testing.expectEqual(h2d, compute.stats.h2d_bytes);
+            const repeated_values = try cb.toFloat32(repeated, a);
+            defer a.free(repeated_values);
+            try std.testing.expectEqualSlices(f32, got, repeated_values);
+            positions[positions.len - 1] += 1;
+            const uploads = compute.lighton_mrope_cache_uploads;
+            const changed = (try tryReducedVisionCudnnInput(&compute, input, input, input, null, .{ .qkv = input, .positions = positions, .theta = 10000 }, batch, rows / batch, heads, 64)).?;
+            defer cb.free(changed);
+            try std.testing.expectEqual(uploads + 1, compute.lighton_mrope_cache_uploads);
+            compute.lighton_cached_mrope_enabled = false;
+            const uncached = (try tryReducedVisionCudnnInput(&compute, input, input, input, null, .{ .qkv = input, .positions = positions, .theta = 10000 }, batch, rows / batch, heads, 64)).?;
+            defer cb.free(uncached);
+            compute.lighton_cached_mrope_enabled = true;
+            const changed_values = try cb.toFloat32(changed, a);
+            defer a.free(changed_values);
+            const uncached_values = try cb.toFloat32(uncached, a);
+            defer a.free(uncached_values);
+            try std.testing.expectEqualSlices(f32, changed_values, uncached_values);
+            positions[positions.len - 1] -= 1;
             const unchanged = try cb.toFloat32(packed_input, a);
             defer a.free(unchanged);
             try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(unchanged));
@@ -34126,7 +34186,7 @@ test "LightOnOCR3 CUDA fused vision QKV preserves cuDNN inputs output and readon
             }
         }
     }
-    try std.testing.expectEqual(@as(usize, 4), compute.lighton_vision_fused.qkv_calls);
+    try std.testing.expectEqual(@as(usize, 16), compute.lighton_vision_fused.qkv_calls);
 }
 
 test "LightOnOCR3 CUDA fused FFN activation input preserves F32 outputs for independent and paired checkpoint projections" {
@@ -34905,4 +34965,71 @@ test "LightOnOCR3 CUDA optional paged prefill owner admits host and GPU bytes be
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), owner.device.ptr);
     for (owner.copy_pending) |pending| try std.testing.expect(!pending);
+}
+
+test "LightOnOCR3 CUDA BF16 vision bias epilogue preserves F32 boundaries and read only inputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try compute.requireProfile(.lightonocr3);
+    compute.capability_profile = .lightonocr3;
+    compute.lighton_fused_vision_qkv_enabled = true;
+    for ([_]usize{ 768, 1024 }) |dim| {
+        for ([_]usize{ 1, 3 }) |multiple| {
+            const rows = 257;
+            const columns = dim * multiple;
+            const weights = try a.alloc(u16, dim * columns);
+            defer a.free(weights);
+            for (weights, 0..) |*value, i| {
+                const f = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + i / dim) % 17)) - 8)) / 128;
+                value.* = f32ToBf16BitsRoundNearestEven(f);
+            }
+            const shape = [_]i64{ @intCast(columns), @intCast(dim) };
+            const name = try std.fmt.allocPrint(a, "bias-epilogue-{d}-{d}.weight", .{ dim, multiple });
+            defer a.free(name);
+            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(weights), .dtype = .bf16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+            try compute.insertBf16WeightFromTensor(try a.dupe(u8, tensor.name), &tensor);
+            const weight = try cb.getWeight(tensor.name);
+            defer cb.free(weight);
+            const values = try a.alloc(f32, rows * dim);
+            defer a.free(values);
+            const biases = try a.alloc(f32, columns);
+            defer a.free(biases);
+            for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) / 32;
+            for (biases, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) / 16;
+            const input = try cb.fromFloat32Shape(values, &.{ rows, @intCast(dim) });
+            defer cb.free(input);
+            const bias = try cb.fromFloat32Shape(biases, &.{@intCast(columns)});
+            defer cb.free(bias);
+            const calls = compute.lighton_vision_bias_epilogue_calls;
+            const fused = try cb.linear(input, weight, bias, rows, dim, columns);
+            defer cb.free(fused);
+            try std.testing.expectEqual(calls + 1, compute.lighton_vision_bias_epilogue_calls);
+            const plain = try cb.linearNoBias(input, weight, rows, dim, columns);
+            defer cb.free(plain);
+            const got = try cb.toFloat32(fused, a);
+            defer a.free(got);
+            const want = try cb.toFloat32(plain, a);
+            defer a.free(want);
+            for (got, want, 0..) |actual, product, i| try std.testing.expectApproxEqAbs(product + biases[i % columns], actual, 2e-5);
+            // Sample independent scalar dot products, including both matrix
+            // tails; fixture operands are exactly representable BF16 values.
+            for ([_]usize{ 0, 17, rows - 1 }) |row| for ([_]usize{ 0, 19, columns - 1 }) |column| {
+                var sum: f32 = 0;
+                for (0..dim) |k| {
+                    const w: f32 = @bitCast(@as(u32, weights[column * dim + k]) << 16);
+                    sum += values[row * dim + k] * w;
+                }
+                try std.testing.expectApproxEqAbs(sum + biases[column], got[row * columns + column], 2e-5);
+            };
+            const unchanged_input = try cb.toFloat32(input, a);
+            defer a.free(unchanged_input);
+            const unchanged_bias = try cb.toFloat32(bias, a);
+            defer a.free(unchanged_bias);
+            try std.testing.expectEqualSlices(f32, values, unchanged_input);
+            try std.testing.expectEqualSlices(f32, biases, unchanged_bias);
+        }
+    }
 }
