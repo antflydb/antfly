@@ -4435,7 +4435,7 @@ pub const NativeFile = struct {
         var counters: [4096]u8 = undefined;
         var start: usize = 0;
         while (start < state.counts.items.len) {
-            const n = @min(counters.len / 4, state.counts.items.len - start);
+            const n: usize = @min(counters.len / 4, state.counts.items.len - start);
             for (state.counts.items[start..][0..n], 0..) |value, k|
                 std.mem.writeInt(u32, counters[k * 4 ..][0..4], value, .little);
             hash.update(counters[0 .. n * 4]);
@@ -19724,5 +19724,31 @@ test "lite native sparse linked ranges walk forward across sorted cohorts and ca
         for (ranges, output) |range, value| try std.testing.expectEqualSlices(u8, bytes[@intCast(range.offset)..][0..range.length], value);
         try std.testing.expect(projected * 2 < scalar);
         std.debug.print("LINKED_RANGE_FORWARD indexed={any} scalar_backing={d} forward_backing={d} ranges={d}\n", .{ indexed, scalar, projected, ranges.len });
+    }
+}
+
+test "lite allocator fingerprint batches preserve canonical bytes across counter boundaries" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 1, 511, 512, 513, 1023, 1024, 1025, 2048, 2051 }) |count| {
+        var state = allocator_v4.State.init(a);
+        defer state.deinit();
+        try state.counts.resize(a, count);
+        state.root.covered_pages = count;
+        for (state.counts.items, 0..) |*value, i| value.* = @intCast(i * 17);
+        // The certificate format is unchanged: batching must hash exactly the
+        // same canonical stream as individual little-endian u32 counters.
+        var reference = std.crypto.hash.Blake3.init(.{});
+        reference.update("Antfly checked allocator v1");
+        var root: [128]u8 = undefined;
+        allocator_v4.State.encodeRoot(state.root, &root);
+        reference.update(&root);
+        for (state.counts.items) |value| {
+            var encoded: [4]u8 = undefined;
+            std.mem.writeInt(u32, &encoded, value, .little);
+            reference.update(&encoded);
+        }
+        var expected: [32]u8 = undefined;
+        reference.final(&expected);
+        try std.testing.expectEqualSlices(u8, &expected, &try NativeFile.allocatorFingerprint(&state));
     }
 }
