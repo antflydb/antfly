@@ -364,6 +364,20 @@ pub fn build(b: *std.Build) void {
     }
 
     const quant_kernel_metal_runtime_check_step = b.step("quant-kernel-metal-runtime-check", "Run dev-only generated Metal quant kernel correctness check");
+    if (target.result.os.tag == .macos and b.graph.host.result.os.tag == .macos) {
+        const math_options = b.addExecutable(.{ .name = "metal-math-options-check", .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .fast,
+            .link_libc = true,
+        }) });
+        addMacosSdkPaths(b, math_options.root_module, b.graph.host);
+        math_options.root_module.linkFramework("Foundation", .{});
+        math_options.root_module.linkFramework("Metal", .{});
+        math_options.root_module.addCSourceFile(.{ .file = b.path("scripts/metal_math_options_check.m"), .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" } });
+        const run_math_options = b.addRunArtifact(math_options);
+        quant_kernel_metal_check_step.dependOn(&run_math_options.step);
+        quant_kernel_metal_runtime_check_step.dependOn(&run_math_options.step);
+    }
     const a4b_metal_id_replay_step = b.step("a4b-metal-id-replay", "Replay exact Gemma4 26B-A4B Q4_0 MUL_MV_ID decode shapes on Metal");
     const a4b_metal_common_q4_replay_step = b.step("a4b-metal-common-q4-replay", "Replay packed-layout candidates for Gemma4 26B-A4B common Q4_0 decode shapes on Metal");
     const a4b_metal_route_select_replay_step = b.step("a4b-metal-route-select-replay", "Replay exact Gemma4 26B-A4B serial and SIMD-group route selection on Metal");

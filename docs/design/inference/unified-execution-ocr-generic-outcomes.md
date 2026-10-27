@@ -33,6 +33,14 @@ with two columns, 5–8 rows with four columns, and 9–16 rows with one column.
 Their generated Metal text is unchanged. Model rollout policy stays in the
 adapters rather than the operation source family.
 
+Paged GQA split attention now shares its numerical staging and reduction tiles
+between the existing qualified geometries and the new OCR geometries. The
+shared stage owns KV acquisition, score/value work and online accumulation;
+the shared reducer owns split statistics and output normalization. The four
+entries also share two native ABI families. Profile-specific admission guards
+remain explicit. This removes another 7,062 maintained native source bytes;
+the entire expanded Metal program is unchanged.
+
 CUDA qualification identity now covers the five module adapters, their shared
 owner, all five embedded PTX images and their native producer inputs.
 
@@ -49,17 +57,27 @@ The new F32 row-chunk launch bound is combined with shared typed argument
 packing. F16 resident-weight accounting is charged once after successful insert.
 Metal hidden-state wrappers retain upstream's external-handle lifetime fix.
 
+A shared Metal compile-options owner preserves both effects of the deprecated
+`fastMathEnabled = NO`: safe arithmetic optimization and precise default math
+functions. Setting only `mathMode = Safe` leaves the function mode fast on the
+current framework. The three new library initializers use the complete policy.
+A hardware-independent Objective-C regression compares the owner with the
+framework's legacy setter and runs in both Metal qualification targets. A
+negative control confirms that the prior Safe-only policy fails that regression.
+
 ## Source and equivalence evidence
 
 Receipts are under `.benchmark-assets/1166/ocr-generic/`.
 
-The scoped consolidation removes **4,766 maintained production bytes**, counting
-the complete replacement owner and 784 added build-identity bytes. CUDA module
+The scoped consolidation removes **10,393 maintained production bytes**, counting
+the complete replacement owners, 829 added build-identity bytes and 902 bytes
+of precision-check build integration. CUDA module
 production text falls from 32,395 to 31,475 bytes; its line count rises from 674
-to 693. The new rollback regression adds 2,281 test bytes separately. Metal
+to 693. The rollback regression adds 2,281 test bytes, and the independent Metal
+framework regression adds 1,190 test/tool bytes separately. Metal
 projection wrappers remove 4,630 physical source bytes. Unrelated upstream
 changes and earlier campaigns are excluded from these figures. Combined with
-Y's 5,537-byte reduction, these two batches remove 10,303 maintained production
+Y's 5,537-byte reduction, these two batches remove 15,930 maintained production
 bytes. This does not establish a 20% CUDA/Metal reduction or smaller native
 instruction streams.
 
@@ -82,6 +100,8 @@ freshness and the both-backend product build. The full selected test body also
 compiles with both accelerators enabled. Its initial execution retains 53
 `CudaUnavailable` failures on the Mac; the subsequent host/Metal execution
 explicitly excludes those device-only cases. The rollback regression passes.
-The model/control performance campaign is recorded separately as it completes.
+The pre-correction performance campaign is retained separately. Qualification
+is restarted from the corrected precision snapshot; partial cohorts are not
+carried forward. The final model/control campaign is recorded as it completes.
 CUDA device qualification waits for the existing Glowworm workload; no new
 CUDA performance result is claimed here.
