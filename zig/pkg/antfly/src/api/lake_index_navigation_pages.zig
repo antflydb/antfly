@@ -25,12 +25,12 @@ const ranges = @import("lake_index_page_ranges.zig");
 const Decoded = local.serverless_query_lake_decoded_cache;
 const A = std.mem.Allocator;
 const Token = @import("antfly_cancellation").CancellationToken;
-const Value = struct { page: tree.Page };
+const Value = struct { page: tree.NavigationPage };
 fn release(owner: *anyopaque, item: *anyopaque) void {
     const lease: Decoded.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
     lease.release();
 }
-fn page(lease: Decoded.Lease) tree.Page {
+fn page(lease: Decoded.Lease) tree.NavigationPage {
     const value: *const Value = @ptrCast(@alignCast(lease.item.payload.extension));
     var result = value.page;
     result.lease = .{ .owner = lease.cache, .item = lease.item, .release = release };
@@ -69,7 +69,7 @@ pub const Reader = struct {
         return result;
     }
     /// Authority is checked even when a caller reuses a warm-page allowance.
-    pub fn lookup(self: *const Reader, ref: tree.Ref) !?tree.Page {
+    pub fn lookup(self: *const Reader, ref: tree.Ref) !?tree.NavigationPage {
         try ref.validate();
         try self.check();
         const held = self.cached.cache.navigation.lookup(self.key(ref)) orelse return null;
@@ -77,7 +77,7 @@ pub const Reader = struct {
         try self.check();
         return page(held);
     }
-    pub fn read(self: *const Reader, a: A, ref: tree.Ref, encoded: ?[]const u8) !tree.Page {
+    pub fn read(self: *const Reader, a: A, ref: tree.Ref, encoded: ?[]const u8) !tree.NavigationPage {
         try ref.validate();
         try self.check();
         const Loader = struct {
@@ -99,7 +99,7 @@ pub const Reader = struct {
             }
             fn fill(self_: *@This(), item: *Decoded.Item, out: A) !void {
                 const value = try out.create(Value);
-                value.* = .{ .page = try tree.decodePage(out, self_.reader.domain, self_.ref, try self_.bytes(out)) };
+                value.* = .{ .page = try tree.decodeNavigationPage(out, self_.reader.domain, self_.ref, try self_.bytes(out)) };
                 item.payload = .{ .extension = value };
             }
         };
@@ -116,15 +116,15 @@ pub const Reader = struct {
         const held = self.cached.cache.navigation.acquire(self.key(ref), tree.readWorkspace(ref) * 2, context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
             if (err != error.SqlMemoryLimitExceeded) return err;
             try self.check();
-            return tree.decodePage(a, self.domain, ref, try loader.bytes(a));
+            return tree.decodeNavigationPage(a, self.domain, ref, try loader.bytes(a));
         };
         errdefer held.release();
         try self.check();
         return page(held);
     }
-    pub fn many(self: *const Reader, a: A, refs: []const tree.Ref, output: []tree.Page, budget: ranges.Budget) !void {
+    pub fn many(self: *const Reader, a: A, refs: []const tree.Ref, output: []tree.NavigationPage, budget: ranges.Budget) !void {
         if (refs.len != output.len or refs.len > tree.max_read_batch) return error.InvalidGraphPage;
-        var ready: [tree.max_read_batch]?tree.Page = @splat(null);
+        var ready: [tree.max_read_batch]?tree.NavigationPage = @splat(null);
         defer for (&ready) |*value| if (value.*) |*held| held.deinit(a);
         var missing: [tree.max_read_batch]tree.Ref = undefined;
         var positions: [tree.max_read_batch]usize = undefined;
@@ -215,7 +215,7 @@ test "external lake shared navigation leases reuse decoded pages and preserve au
     // Optional encoded copies cannot fail required cache-owned page reads.
     var narrow: local.sql_memory_budget = .{ .backing = a, .limit = 1 };
     const before_narrow = reads;
-    var recovered: [3]tree.Page = undefined;
+    var recovered: [3]tree.NavigationPage = undefined;
     try reader.many(narrow.allocator(), &refs, &recovered, .{ .ptr = &reads, .charge = Charge.charge });
     for (&recovered) |*value| value.deinit(narrow.allocator());
     try std.testing.expectEqual(before_narrow - refs[0].bytes - refs[1].bytes - refs[2].bytes, reads);
@@ -223,20 +223,20 @@ test "external lake shared navigation leases reuse decoded pages and preserve au
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, reader.many(failing.allocator(), &refs, &recovered, .{ .ptr = &reads, .charge = Charge.charge }));
     reader.cached.scope = @splat(9);
-    var first: [3]tree.Page = undefined;
+    var first: [3]tree.NavigationPage = undefined;
     try reader.many(a, &refs, &first, .{ .ptr = &reads, .charge = Charge.charge });
     defer for (&first) |*value| value.deinit(a);
     try std.testing.expect(first[0].entries.ptr == first[2].entries.ptr);
     const traffic = cache.snapshot().provider_reads;
     const before = reads;
-    var second: [3]tree.Page = undefined;
+    var second: [3]tree.NavigationPage = undefined;
     try reader.many(a, &refs, &second, .{ .ptr = &reads, .charge = Charge.charge });
     defer for (&second) |*value| value.deinit(a);
     for (first, second) |left, right| try std.testing.expect(left.entries.ptr == right.entries.ptr);
     try std.testing.expectEqual(traffic, cache.snapshot().provider_reads);
     try std.testing.expectEqual(before - refs[0].bytes - refs[1].bytes - refs[2].bytes, reads);
     var denied: u64 = 1;
-    var rejected: [3]tree.Page = undefined;
+    var rejected: [3]tree.NavigationPage = undefined;
     try std.testing.expectError(error.ArtifactReadBudgetExceeded, reader.many(a, &refs, &rejected, .{ .ptr = &denied, .charge = Charge.charge }));
     var wrong = roots[0];
     wrong.records += 1;

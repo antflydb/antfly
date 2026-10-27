@@ -1704,3 +1704,21 @@ conservatively require complete source. The lake path maps these dependencies
 once per batch, reuses already projected values when they cover the plan, and
 fetches hidden fields under the same native identity checks when needed. Final
 response projection continues to hide fields requested only for highlighting.
+
+### Compressed ordered-key navigation
+
+Authenticated ordered pages retain their common key prefix once, alongside
+borrowed suffix views. Structural validation checks the same full logical key
+lengths, aggregate record counts and strict ordering without reconstructing a
+buffer per entry. A shared-prefix sibling comparison skips the common bytes;
+comparisons across pages or against seek bounds compare both key pieces.
+
+Decoded navigation caches retain this compact representation. Forward, reverse,
+rank and window cursors validate parent routing boundaries using complete key
+views under the original page lease. Identity-only row scans check the coordinate
+in the final 16 logical key bytes and materialize only a required final page
+boundary. Complete tuple keys remain available for ordinary key consumers and
+mutation/visitor paths; those allocations belong to the operation, not a shared
+cached page. No sort components, public-ID ties, authentication or range bounds
+are discarded. This is a reader change and preserves the existing page format
+and publication recipes.

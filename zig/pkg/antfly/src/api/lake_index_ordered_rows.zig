@@ -927,7 +927,7 @@ pub const Reader = struct {
     pub fn countRange(self: *Reader, a: A, lower: []const u8, upper: ?[]const u8) !u64 {
         return tree.countRange(a, self.pages.store(), self.root.page, lower, upper);
     }
-    fn readDecoded(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, ref: tree.Ref, token: Cancellation, remaining: *u64) !tree.Page {
+    fn readDecoded(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, ref: tree.Ref, token: Cancellation, remaining: *u64) !tree.NavigationPage {
         const self: *Reader = @ptrCast(@alignCast(raw));
         try token.check();
         try self.cached.?.context.ensureActive();
@@ -935,7 +935,7 @@ pub const Reader = struct {
         const reader: @import("lake_index_navigation_pages.zig").Reader = .{ .store = store.*, .domain = domain, .token = token, .cached = self.cached.? };
         return reader.read(a, ref, null);
     }
-    fn readDecodedMany(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, refs_: []const tree.Ref, output: []tree.Page, token: Cancellation, remaining: *u64) !void {
+    fn readDecodedMany(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, refs_: []const tree.Ref, output: []tree.NavigationPage, token: Cancellation, remaining: *u64) !void {
         const self: *Reader = @ptrCast(@alignCast(raw));
         const reader: @import("lake_index_navigation_pages.zig").Reader = .{ .store = store.*, .domain = domain, .token = token, .cached = self.cached.? };
         const Charge = struct {
@@ -1003,7 +1003,7 @@ pub const Reader = struct {
         try stores.chargeReadBudget(&self.remaining_reads, ref.bytes);
         try self.rememberDictionary(ref);
     }
-    fn readDictionaryDecoded(raw: *anyopaque, a: A, ref: tree.Ref) !tree.Page {
+    fn readDictionaryDecoded(raw: *anyopaque, a: A, ref: tree.Ref) !tree.NavigationPage {
         const self: *Reader = @ptrCast(@alignCast(raw));
         const reader: @import("lake_index_navigation_pages.zig").Reader = .{ .store = self.pages.artifacts.*, .domain = self.pages.domain, .token = self.pages.cancellation, .cached = self.cached.? };
         if (try reader.lookup(ref)) |held| {
@@ -1022,11 +1022,11 @@ pub const Reader = struct {
         try self.rememberDictionary(ref);
         return value;
     }
-    fn readDictionaryMany(raw: *anyopaque, a: A, refs_: []const tree.Ref, output: []tree.Page) !void {
+    fn readDictionaryMany(raw: *anyopaque, a: A, refs_: []const tree.Ref, output: []tree.NavigationPage) !void {
         const self: *Reader = @ptrCast(@alignCast(raw));
         if (refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
         const reader: @import("lake_index_navigation_pages.zig").Reader = .{ .store = self.pages.artifacts.*, .domain = self.pages.domain, .token = self.pages.cancellation, .cached = self.cached.? };
-        var ready: [tree.max_read_batch]?tree.Page = @splat(null);
+        var ready: [tree.max_read_batch]?tree.NavigationPage = @splat(null);
         defer for (&ready) |*page_| if (page_.*) |*held| held.deinit(a);
         var missing: [tree.max_read_batch]tree.Ref = undefined;
         var positions: [tree.max_read_batch]usize = undefined;
@@ -1046,7 +1046,7 @@ pub const Reader = struct {
                 try stores.chargeReadBudget(@ptrCast(@alignCast(ptr)), bytes);
             }
         };
-        var cold: [tree.max_read_batch]tree.Page = undefined;
+        var cold: [tree.max_read_batch]tree.NavigationPage = undefined;
         if (count != 0) {
             try reader.many(a, missing[0..count], cold[0..count], .{ .ptr = &self.remaining_reads, .charge = Charge.charge });
             for (cold[0..count], positions[0..count]) |page_, position| ready[position] = page_;
@@ -1259,6 +1259,9 @@ pub const Reader = struct {
     fn nextRecord(self: *Reader) !?tree.Cursor.Record {
         return if (self.preserve_path) self.cursor.?.nextWindow(self.window_upper) else self.cursor.?.next();
     }
+    fn nextRecordView(self: *Reader) !?tree.Cursor.ViewRecord {
+        return if (self.preserve_path) self.cursor.?.nextWindowView(self.window_upper) else self.cursor.?.nextView();
+    }
     /// Resolve physical identity through the reverse tree, then authenticate
     /// the forward covering reference. Neither cursor changes scan position.
     pub fn entryAtPhysical(self: *Reader, a: A, ref: rows.RowRef) !?Entry {
@@ -1341,12 +1344,12 @@ pub const Reader = struct {
         var key: ?[]const u8 = null;
         errdefer if (key) |value| a.free(value);
         while (!self.exhausted and refs.items.len < max_rows) {
-            const record = try self.nextRecord() orelse {
+            const record = try self.nextRecordView() orelse {
                 self.exhausted = true;
                 break;
             };
-            try refs.append(a, try self.decode(a, record));
-            if (refs.items.len == max_rows) key = try a.dupe(u8, record.key);
+            try refs.append(a, try self.decodeView(a, record));
+            if (refs.items.len == max_rows) key = try record.key.dupe(a);
         }
         return .{ .refs = try refs.toOwnedSlice(a), .key = key, .exhausted = self.exhausted };
     }
@@ -1364,7 +1367,12 @@ pub const Reader = struct {
         return entries.toOwnedSlice(a);
     }
     pub fn decode(self: *Reader, a: A, record: tree.Cursor.Record) !rows.RowRef {
-        if ((record.value.len != 16 and record.value.len != 70) or record.key.len < 16 or !std.mem.eql(u8, record.value[0..16], record.key[record.key.len - 16 ..])) return error.InvalidNativeLakeRowIndex;
+        return self.decodeView(a, .{ .key = tree.KeyView.from(record.key), .value = record.value });
+    }
+    fn decodeView(self: *Reader, a: A, record: tree.Cursor.ViewRecord) !rows.RowRef {
+        if (record.value.len != 16 and record.value.len != 70) return error.InvalidNativeLakeRowIndex;
+        const tail = record.key.tail(16) orelse return error.InvalidNativeLakeRowIndex;
+        if (!std.mem.eql(u8, record.value[0..16], &tail)) return error.InvalidNativeLakeRowIndex;
         const physical: *const [16]u8 = @ptrCast(record.value.ptr);
         const file = std.mem.readInt(u32, physical[0..4], .big);
         if (file >= self.root.fileCount()) return error.InvalidNativeLakeRowIndex;
@@ -1375,11 +1383,11 @@ pub const Reader = struct {
         var refs: std.ArrayList(rows.RowRef) = .empty;
         errdefer refs.deinit(a);
         while (!self.exhausted and refs.items.len < max_rows) {
-            const record = try self.nextRecord() orelse {
+            const record = try self.nextRecordView() orelse {
                 self.exhausted = true;
                 break;
             };
-            try refs.append(a, try self.decode(a, record));
+            try refs.append(a, try self.decodeView(a, record));
         }
         // Root strings already belong to the reader's arena. The consumer
         // retains that owner throughout candidate hydration.
