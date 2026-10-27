@@ -467,6 +467,7 @@ pub fn create(config: Config) Graph {
         .target = target,
         .optimize = optimize,
     });
+    documents_mod.addImport("antfly_hash", hash_mod);
     documents_mod.addImport("antfly_image", image_mod);
     documents_mod.addImport("antfly_pdf", pdf_mod);
     inference_mod.addImport("antfly_documents", documents_mod);
