@@ -2783,6 +2783,54 @@ pub const CudaCompute = struct {
         return output;
     }
 
+    /// Keep layer-norm output compact until the existing QKV GEMM. The
+    /// projection, bias, residual and downstream attention retain F32 policy.
+    pub fn lightOnVisionNormQkv(cb: *const ops.ComputeBackend, input_ct: CT, weights: [4]CT, rows: usize, dim: usize, eps: f32) !?CT {
+        if (cb.kind() != .cuda) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.capability_profile != .lightonocr3 or !self.lighton_fused_vision_qkv_enabled or
+            self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            self.resident_training_cache or self.lazy_host_store != null or self.lighton_bf16_projection_outputs or
+            (dim != 768 and dim != 1024) or rows < 256 or rows > 65536 or
+            !cudaCublasLtEnabled() or self.cublaslt == null or self.cublaslt_bf16_tuning_profile != .off) return null;
+        if (!std.math.isFinite(eps) or eps <= 0) return error.InvalidTensorShape;
+        const input = tensorFromCt(input_ct);
+        if (input.strict_resident_training) return null;
+        try ensureF32(input);
+        try ensureCount(input, try checkedMul(rows, dim));
+        const tensors = [_]*const CudaTensor{ tensorFromCt(weights[0]), tensorFromCt(weights[1]), tensorFromCt(weights[2]), tensorFromCt(weights[3]) };
+        const counts = [_]usize{ dim, dim, 3 * dim * dim, 3 * dim };
+        for (tensors, counts, 0..) |tensor, count, i| {
+            if (tensor.strict_resident_training) return null;
+            if (i == 2) {
+                if (tensor.quant_type != null or tensor.dtype != .bf16) return null;
+            } else try ensureF32(tensor);
+            try ensureCount(tensor, count);
+        }
+        try self.lighton_vision_fused.init(&self.ctx);
+        var normalized = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, dim), 2));
+        defer releaseDeviceBuffer(self, &normalized);
+        const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(3 * dim) })).?;
+        errdefer cb.free(output);
+        try self.lighton_vision_fused.norm(&self.ctx, .{ normalized.ptr, input.buffer.ptr, tensors[0].buffer.ptr, tensors[1].buffer.ptr }, @intCast(rows), @intCast(dim), eps);
+        const blas = &self.cublaslt.?;
+        blas.matmulBf16WeightBiasF32Out(&self.ctx, tensorFromCt(output).buffer, normalized, tensors[2].buffer, tensors[3].buffer, cublasLtWorkspace(self), rows, dim, 3 * dim) catch |err| switch (err) {
+            error.CublasLtUnsupported => {
+                cb.free(output);
+                return null;
+            },
+            else => return err,
+        };
+        self.stats.launch_norm += 1;
+        self.stats.launch_norm_layer += 1;
+        self.stats.launch_linear += 1;
+        self.stats.bf16_cublaslt_linear_calls += 1;
+        self.lighton_vision_norm_qkv_calls += 1;
+        self.lighton_vision_bias_epilogue_calls += 1;
+        return output;
+    }
+
     pub fn lightOnVisionMlp(cb: *const ops.ComputeBackend, input_ct: CT, weights: [6]CT, rows: usize, dim: usize, hidden: usize, eps: f32) !?CT {
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -3636,6 +3684,7 @@ pub const CudaCompute = struct {
     // Tensor ABI and recurrent state remain F32; this is not full BF16 execution.
     lighton_bf16_projection_outputs: bool = false,
     lighton_vision_bias_epilogue_calls: usize = 0,
+    lighton_vision_norm_qkv_calls: usize = 0,
     lighton_bf16_prefill_ffn: bool = false,
     lighton_bf16_prefill_ffn_calls: usize = 0,
     lighton_fused_ffn: bool = false,
@@ -4800,6 +4849,8 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_fused_vision_mlp_calls={d}\n", .{self.lighton_vision_fused.calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_vision_bias_epilogue_calls={d}\n", .{self.lighton_vision_bias_epilogue_calls});
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_vision_norm_qkv_calls={d}\n", .{self.lighton_vision_norm_qkv_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_norm_weight_cache_hits={d} cuda_norm_weight_cache_misses={d}\n", .{ self.lighton_norm_weight_cache_hits, self.lighton_norm_weight_cache_misses });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
@@ -35032,5 +35083,101 @@ test "LightOnOCR3 CUDA BF16 vision bias epilogue preserves F32 boundaries and re
             try std.testing.expectEqualSlices(f32, values, unchanged_input);
             try std.testing.expectEqualSlices(f32, biases, unchanged_bias);
         }
+    }
+}
+
+test "LightOnOCR3 CUDA compact vision norm QKV preserves rounded normalization F32 projection and readonly inputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]usize{ 768, 1024 }) |dim| {
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+        compute.capability_profile = .lightonocr3;
+        compute.lighton_fused_vision_qkv_enabled = true;
+        compute.lighton_bf16_projection_outputs = false;
+        compute.cublaslt_bf16_tuning_profile = .off;
+        const cb = compute.computeBackend();
+        const matrix = try a.alloc(u16, 3 * dim * dim);
+        defer a.free(matrix);
+        for (matrix, 0..) |*bits, i| bits.* = f32ToBf16BitsRoundNearestEven(@sin(@as(f32, @floatFromInt(i)) * 0.037) * 0.01);
+        const matrix_shape = [_]i64{ @intCast(3 * dim), @intCast(dim) };
+        const checkpoint = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(matrix), .dtype = .bf16, .shape = &matrix_shape, .name = "vision.norm_qkv.weight", .allocator = a, .owns_data = false, .owns_shape = false };
+        try compute.insertBf16WeightFromTensor(try a.dupe(u8, checkpoint.name), &checkpoint);
+        const weight = try cb.getWeight(checkpoint.name);
+        defer cb.free(weight);
+        const gamma_values = try a.alloc(f32, dim);
+        defer a.free(gamma_values);
+        const beta_values = try a.alloc(f32, dim);
+        defer a.free(beta_values);
+        const bias_values = try a.alloc(f32, 3 * dim);
+        defer a.free(bias_values);
+        for (gamma_values, 0..) |*v, i| v.* = 1 + @as(f32, @floatFromInt(i % 13)) / 64;
+        for (beta_values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 32;
+        for (bias_values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) / 128;
+        const gamma = try cb.fromFloat32(gamma_values);
+        defer cb.free(gamma);
+        const beta = try cb.fromFloat32(beta_values);
+        defer cb.free(beta);
+        const bias = try cb.fromFloat32(bias_values);
+        defer cb.free(bias);
+        const weights = [_]CT{ gamma, beta, weight, bias };
+        for ([_]usize{ 256, 2592 }) |rows| {
+            const values = try a.alloc(f32, rows * dim);
+            defer a.free(values);
+            for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.017) * 0.7;
+            const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(dim) });
+            defer cb.free(input);
+            const normalized = try cb.layerNorm(input, gamma, beta, dim, 1e-6);
+            defer cb.free(normalized);
+            const normalized_values = try cb.toFloat32(normalized, a);
+            defer a.free(normalized_values);
+            // The fused kernel must round exactly the same F32 norm values
+            // that the existing projection stages, including both matrix tails.
+            var compact = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, rows * dim * 2);
+            defer compact.free(&compute.ctx);
+            try compute.lighton_vision_fused.init(&compute.ctx);
+            try compute.lighton_vision_fused.norm(&compute.ctx, .{ compact.ptr, tensorFromCt(input).buffer.ptr, tensorFromCt(gamma).buffer.ptr, tensorFromCt(beta).buffer.ptr }, @intCast(rows), @intCast(dim), 1e-6);
+            const bits = try a.alloc(u16, rows * dim);
+            defer a.free(bits);
+            try compact.copyToHost(&compute.ctx, std.mem.sliceAsBytes(bits));
+            try compute.ctx.synchronize();
+            for (bits, normalized_values) |actual, expected| try std.testing.expectEqual(f32ToBf16BitsRoundNearestEven(expected), actual);
+            const reference = try cb.linear(normalized, weight, bias, rows, dim, 3 * dim);
+            defer cb.free(reference);
+            const casts = compute.stats.bf16_cublaslt_activation_staging_calls;
+            const calls = compute.lighton_vision_norm_qkv_calls;
+            const projected = (try CudaCompute.lightOnVisionNormQkv(&cb, input, weights, rows, dim, 1e-6)).?;
+            defer cb.free(projected);
+            try std.testing.expectEqual(tensor_mod.DType.f32, tensorFromCt(projected).dtype);
+            try std.testing.expectEqual(calls + 1, compute.lighton_vision_norm_qkv_calls);
+            try std.testing.expectEqual(casts, compute.stats.bf16_cublaslt_activation_staging_calls);
+            const expected = try cb.toFloat32(reference, a);
+            defer a.free(expected);
+            const actual = try cb.toFloat32(projected, a);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+            const unchanged = try cb.toFloat32(input, a);
+            defer a.free(unchanged);
+            try std.testing.expectEqualSlices(f32, values, unchanged);
+            const launches = compute.ctx.stats.kernel_launches;
+            compute.capability_profile = .florence2;
+            try std.testing.expect(try CudaCompute.lightOnVisionNormQkv(&cb, input, weights, rows, dim, 1e-6) == null);
+            compute.capability_profile = .lightonocr3;
+            compute.resident_training_cache = true;
+            try std.testing.expect(try CudaCompute.lightOnVisionNormQkv(&cb, input, weights, rows, dim, 1e-6) == null);
+            compute.resident_training_cache = false;
+            try std.testing.expect(try CudaCompute.lightOnVisionNormQkv(&cb, input, weights, 255, dim, 1e-6) == null);
+            try std.testing.expectError(error.InvalidTensorShape, CudaCompute.lightOnVisionNormQkv(&cb, input, weights, rows, dim, 0));
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+        for ([_]CT{ gamma, beta, bias }, [_][]const f32{ gamma_values, beta_values, bias_values }) |source, expected| {
+            const actual = try cb.toFloat32(source, a);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, expected, actual);
+        }
+        const unchanged_weight = try cb.toFloat32(weight, a);
+        defer a.free(unchanged_weight);
+        for (matrix, unchanged_weight) |bits, value| try std.testing.expectEqual(@as(u32, bits) << 16, @as(u32, @bitCast(value)));
     }
 }

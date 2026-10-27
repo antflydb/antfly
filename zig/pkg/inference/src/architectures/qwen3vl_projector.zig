@@ -1674,6 +1674,17 @@ const ResidentVisionScope = struct {
 
 // Hugging Face uses config.hidden_act in vision blocks. Patch mergers
 // deliberately retain their separate nn.GELU() (exact-erf) operation.
+fn tryLightOnVisionNormQkv(cb: *const ComputeBackend, weights: *WeightCache, cfg: Config, input: CT, rows: usize, layer: usize) !?CT {
+    if (comptime !build_options.enable_cuda) return null;
+    if (cb.kind() != .cuda or !cfg.is_qwen35 or !platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV")) return null;
+    var name: [128]u8 = undefined;
+    const norm_w = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln1.weight", .{layer}));
+    const norm_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln1.bias", .{layer}));
+    const qkv_w = try weights.linear(try std.fmt.bufPrint(&name, "v.blk.{d}.attn_qkv.weight", .{layer}), cfg.vision_hidden, cfg.vision_hidden * 3);
+    const qkv_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.attn_qkv.bias", .{layer}));
+    return @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionNormQkv(cb, input, .{ norm_w, norm_b, qkv_w, qkv_b }, rows, cfg.vision_hidden, cfg.layer_norm_eps);
+}
+
 fn tryLightOnVisionMlp(
     cb: *const ComputeBackend,
     weights: *WeightCache,
@@ -1732,18 +1743,26 @@ fn encoderBlock(
         zig017_return_error = zig017_err;
         return zig017_err;
     });
-    const normed1 = (layerNormNamed(cb, allocator, weights, input, ln1_prefix, cfg.vision_hidden, cfg.layer_norm_eps) catch |zig017_err| {
+    var projected_qkv = try tryLightOnVisionNormQkv(cb, weights, cfg, input, token_count, layer);
+    defer if (projected_qkv) |projected| cb.free(projected);
+    const normed1: ?CT = if (projected_qkv == null) (layerNormNamed(cb, allocator, weights, input, ln1_prefix, cfg.vision_hidden, cfg.layer_norm_eps) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
-    });
-    defer cb.free(normed1);
+    }) else null;
+    defer if (normed1) |normalized| cb.free(normalized);
     const ln1_ns = profileLap(profile, &stage_started_at);
     failed_stage = "attention";
-    const attn = (visionAttention(cb, allocator, weights, cfg, normed1, positions, token_count, layer, image_batch) catch |zig017_err| {
+    const attn = (visionAttention(cb, allocator, weights, cfg, normed1 orelse input, positions, token_count, layer, image_batch, projected_qkv) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
     defer cb.free(attn);
+    // Attention has submitted every QKV consumer. Release its borrowed input
+    // before the MLP starts so fusion does not extend the large QKV lifetime.
+    if (projected_qkv) |projected| {
+        cb.free(projected);
+        projected_qkv = null;
+    }
     const attention_ns = profileLap(profile, &stage_started_at);
     failed_stage = "attention_residual";
     const residual1 = (cb.add(input, attn) catch |zig017_err| {
@@ -1833,6 +1852,7 @@ fn visionAttention(
     token_count: usize,
     layer: usize,
     image_batch: usize,
+    projected_qkv: ?CT,
 ) !CT {
     var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
@@ -1847,11 +1867,11 @@ fn visionAttention(
         zig017_return_error = zig017_err;
         return zig017_err;
     });
-    const qkv = (linearNamed(cb, allocator, weights, input, qkv_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden * 3) catch |zig017_err| {
+    const qkv = projected_qkv orelse (linearNamed(cb, allocator, weights, input, qkv_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden * 3) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
-    defer cb.free(qkv);
+    defer if (projected_qkv == null) cb.free(qkv);
     const qkv_ns = profileLap(profile, &stage_started_at);
     if (comptime build_options.enable_cuda) {
         if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionAttention(cb, qkv, positions, image_batch, token_count, cfg.head_count, cfg.headDim(), cfg.rope_theta)) |attended| {
