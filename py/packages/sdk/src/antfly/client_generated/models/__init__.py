@@ -401,6 +401,8 @@ from .enrichment_producer_config_type import EnrichmentProducerConfigType
 from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
 from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
+from .entity_consumer_progress_page import EntityConsumerProgressPage
+from .entity_consumer_progress_page_results_item import EntityConsumerProgressPageResultsItem
 from .entity_curation_result import EntityCurationResult
 from .entity_curation_result_atomicity import EntityCurationResultAtomicity
 from .entity_curation_result_results_item import EntityCurationResultResultsItem
@@ -411,6 +413,9 @@ from .entity_curation_result_results_item_absorbed_item_disposition import (
 from .entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
 from .entity_distinct_request import EntityDistinctRequest
 from .entity_merge_request import EntityMergeRequest
+from .entity_namespace_outcome import EntityNamespaceOutcome
+from .entity_namespace_outcome_absorbed_item import EntityNamespaceOutcomeAbsorbedItem
+from .entity_namespace_outcome_absorbed_item_disposition import EntityNamespaceOutcomeAbsorbedItemDisposition
 from .entity_suppress_request import EntitySuppressRequest
 from .entity_suppress_request_absorbed import EntitySuppressRequestAbsorbed
 from .equals_query import EqualsQuery
@@ -2886,6 +2891,8 @@ __all__ = (
     "EnrichmentRuntimeStatus",
     "EnrichmentRuntimeStatusActivePhase",
     "EnrichmentRuntimeStatusStallReason",
+    "EntityConsumerProgressPage",
+    "EntityConsumerProgressPageResultsItem",
     "EntityCurationResult",
     "EntityCurationResultAtomicity",
     "EntityCurationResultResultsItem",
@@ -2894,6 +2901,9 @@ __all__ = (
     "EntityCurationResultResultsItemCuration",
     "EntityDistinctRequest",
     "EntityMergeRequest",
+    "EntityNamespaceOutcome",
+    "EntityNamespaceOutcomeAbsorbedItem",
+    "EntityNamespaceOutcomeAbsorbedItemDisposition",
     "EntitySuppressRequest",
     "EntitySuppressRequestAbsorbed",
     "EqualsQuery",

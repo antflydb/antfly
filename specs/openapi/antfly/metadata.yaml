@@ -19345,6 +19345,47 @@ paths:
           description: Resolver owner is busy; retry with backoff
         "503":
           description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/entities/{key}/progress:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: listEntityResolverProgress
+      tags: [resolver_curation]
+      summary: List a bounded page of entity consumer replay progress
+      description: Pages enumerate resolver consumers at one catalog cut. Each page reads current native namespace heads and verifies them again after observing replay. A changed catalog or binding invalidates the cursor. Applied describes an individual consumer, not consumers on other pages.
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 256, default: 64}
+        - name: cursor
+          in: query
+          schema: {type: string, maxLength: 65536}
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityConsumerProgressPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
   /tables/{tableName}/entities/{key}:merge:
     parameters:
       - name: tableName
@@ -20283,6 +20324,55 @@ paths:
             application/json:
               schema:
                 $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/progress:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: namespaceListEntityResolverProgress
+      tags: [resolver_curation]
+      summary: List a bounded page of entity consumer replay progress
+      description: Pages enumerate resolver consumers at one catalog cut. Each page reads current native namespace heads and verifies them again after observing replay. A changed catalog or binding invalidates the cursor. Applied describes an individual consumer, not consumers on other pages.
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 256, default: 64}
+        - name: cursor
+          in: query
+          schema: {type: string, maxLength: 65536}
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityConsumerProgressPage"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":

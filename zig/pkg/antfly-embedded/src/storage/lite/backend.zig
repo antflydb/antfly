@@ -499,6 +499,17 @@ pub const Handle = struct {
         try self.configureDbOpenOptionsForNamespace(opts, path);
     }
 
+    /// Physical metadata address for a logical namespace, including a root
+    /// namespace adopted by an existing file. Does not open serving runtimes.
+    pub fn documentPrefixAlloc(self: *Handle, allocator: Allocator, namespace: []const u8) ![]u8 {
+        const canonical = try canonicalDbNamespaceAlloc(allocator, namespace);
+        defer allocator.free(canonical);
+        platform_sync.lockYielding(&self.namespace_mutex);
+        defer self.namespace_mutex.unlock();
+        if (self.root_namespace_alias) |alias| if (std.mem.eql(u8, alias, canonical)) return allocator.dupe(u8, "");
+        return std.mem.concat(allocator, u8, &.{ "\x02db/", canonical, "\x00" });
+    }
+
     /// Returns a cached raw store for small system records such as the
     /// standalone metadata catalog. The pointer remains valid until deinit.
     pub fn runtimeStoreForNamespace(self: *Handle, namespace: []const u8) !*backend_erased.Store {

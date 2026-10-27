@@ -221,6 +221,7 @@ pub const VTable = struct {
     listResolverIdentities: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig),
     listResolverStaticDescriptors: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig),
     consumeResolverMetadataDrop: *const fn (self: *DB, alloc: std.mem.Allocator, identity: @import("db/resolver_curation.zig").MetadataIdentity) Outcome(void),
+    resolverReplayObservation: *const fn (self: *DB, alloc: Allocator) Outcome(types.ResolverReplayObservation),
     pendingWorkStats: *const fn (self: *DB) Outcome(@import("db/core.zig").PendingWorkStats),
     runArtifactRepairMetadataMaintenanceUntilIdle: *const fn (self: *DB) Outcome(void),
     publishVectorBlockBasesOnline: *const fn (self: *DB, options: @import("db/catalog/index_manager.zig").IndexManager.OnlineVectorBlockPublicationOptions) Outcome(usize),
