@@ -2157,6 +2157,56 @@ test "lite mapped read only views report unavailable when directory cannot write
     try std.testing.expectEqualStrings("immutable", bytes);
 }
 
+test "lite artifact leases expire detached caches and retain active readers through close" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Markers = struct {
+        fn count(path: []const u8) !usize {
+            var dir = try std.Io.Dir.cwd().openDir(std.testing.io, std.fs.path.dirname(path).?, .{ .iterate = true });
+            defer dir.close(std.testing.io);
+            var iterator = dir.iterate();
+            var total: usize = 0;
+            while (try iterator.next(std.testing.io)) |entry| {
+                if (entry.name.len == ".aflite-lease-".len + 32 and std.mem.startsWith(u8, entry.name, ".aflite-lease-")) total += 1;
+            }
+            return total;
+        }
+    };
+    inline for (.{ false, true }) |active| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "detached-cache.aflite");
+        defer a.free(path);
+        var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = io, .reclamation = .{ .enabled = false } });
+        var docs_open = true;
+        defer if (docs_open) docs.close();
+        docs.maintenance_start_suppressed = true;
+        var indexes = Store.init(a, &docs);
+        try indexes.storage().writeFileAbsolute("/cached", "immutable payload");
+        var source = try docs.openArtifactSource("/cached");
+        defer source.close();
+        source.enableIdleExpiry();
+        if (active) {
+            try std.testing.expect(source.acquireUse());
+            _ = try docs.vacuum();
+        }
+        try std.testing.expectEqual(@as(usize, 1), try Markers.count(path));
+        docs.close();
+        docs_open = false;
+        if (active) {
+            // The retired inode and its accounting survive owner teardown
+            // until the final active reader returns its use token.
+            try std.testing.expectEqual(@as(usize, 1), try Markers.count(path));
+            var bytes: [9]u8 = undefined;
+            try source.readInto(0, &bytes);
+            try std.testing.expectEqualStrings("immutable", &bytes);
+            source.releaseUse();
+        }
+        try std.testing.expect(!source.acquireUse());
+        try std.testing.expectEqual(@as(usize, 0), try Markers.count(path));
+    }
+}
+
 test "lite artifact leases survive owner close and do not pin document retirement" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
