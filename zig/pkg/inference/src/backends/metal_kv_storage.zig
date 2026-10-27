@@ -1442,6 +1442,7 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .head_dim = head_dim,
             .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
             .scores_out = &gpu_scores,
+            .check_ctx = null,
             .check_fn = selectionTestNotCancelled,
         });
         const oracle = try selection.scoreConsumerNormalizedAttention(allocator, .{
@@ -1482,6 +1483,7 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .head_dim = head_dim,
             .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
             .scores_out = &compact_scores,
+            .check_ctx = null,
             .check_fn = selectionTestNotCancelled,
         });
         var compact_keys: [3 * width]f32 = undefined;
