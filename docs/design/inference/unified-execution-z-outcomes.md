@@ -169,3 +169,13 @@ This is queued validation, not a CUDA device or latency pass. The seven-target
 compiler/resource audit above is complete; GPU correctness and performance
 admission for this snapshot still require that isolated run. The individual
 CUDA/Metal 20% maintained-source targets remain open.
+
+Frozen implementation is `9a9054d6f849f5b92cc9e1f55861040b2ccb0ae6`.
+The 8,009-input source/image manifest is
+`26b68b43cd98c7b3eebd7796d7472abbd2498246e77c34e5019a88b88e91bb7e`.
+Glowworm's matching synthetic import is
+`05c66030fd71094e60456b2e6ed004cdb797348a`, with 37 pinned helper inputs.
+The controller was verified alive and waiting behind the earlier queues and
+active GPU work. Raw receipts, image hashes and timing arms remain under the
+Z evidence directory; later documentation-only commits do not change the
+qualified source/image closure.
