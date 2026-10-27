@@ -49,6 +49,8 @@ func (c *CollaborationConnector) ValidateAbsentSources(ctx context.Context, r Re
 	fresh.Baseline = nil
 	fresh.discordPass = nil
 	fresh.scopeChecks = nil
+	fresh.calendarRoles = nil
+	fresh.calendarSelections = nil
 	fresh.observedScopes = nil
 	var refs []collaborationRef
 	switch c.ProviderName {

@@ -297,3 +297,8 @@ absence reconciliation retain accessible messages after a thread is archived.
 Calendar `writerWithoutPrivateAccess` is selectable like `reader`: ordinary events
 remain readable, while retained private/confidential details cannot be renewed or
 reused through this restricted role. Unknown and free/busy-only roles are rejected.
+
+Calendar alias/role resolution is shared within each bounded audit and acquisition
+phase. A 20-calendar audit makes 20 calendar metadata reads, rather than 230.
+New audits and publication checks clear proofs; long operations refresh expired
+proofs. Provider failures never become permission proofs.

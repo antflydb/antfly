@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/net/html/charset"
 )
@@ -77,7 +78,24 @@ func calendarCanReadPrivateDetails(role string) bool {
 	return role == "writer" || role == "owner"
 }
 
+// Successful alias and role proofs belong to one bounded acquisition/audit.
+// Enumeration, publication checks and each new audit clear them; long operations
+// refresh expired entries. Failures are never cached, so a rate-limited retry can
+// reuse completed selections while retrying the unfinished one.
+type calendarSelection struct {
+	id, role  string
+	checkedAt time.Time
+}
+
 func (c *CollaborationConnector) calendarID(ctx context.Context, id string) (string, error) {
+	if proof, ok := c.calendarSelections[id]; ok && time.Since(proof.checkedAt) < c.accessCheckWindow() {
+		if c.calendarRoles == nil {
+			c.calendarRoles = map[string]string{}
+		}
+		c.calendarRoles[proof.id] = proof.role
+		return proof.id, nil
+	}
+	started := time.Now()
 	var entry struct {
 		ID         string `json:"id"`
 		AccessRole string `json:"accessRole"`
@@ -92,6 +110,10 @@ func (c *CollaborationConnector) calendarID(ctx context.Context, id string) (str
 		c.calendarRoles = map[string]string{}
 	}
 	c.calendarRoles[entry.ID] = entry.AccessRole
+	if c.calendarSelections == nil {
+		c.calendarSelections = map[string]calendarSelection{}
+	}
+	c.calendarSelections[id] = calendarSelection{id: entry.ID, role: entry.AccessRole, checkedAt: started}
 	return entry.ID, nil
 }
 func (c *CollaborationConnector) workspaceRefs(ctx context.Context, config CollaborationConfig) ([]collaborationRef, error) {

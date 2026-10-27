@@ -1,6 +1,6 @@
 # Collaboration source qualification
 
-Status on 2026-10-26: local contract checks pass; live hosted qualification is
+Status on 2026-10-27: local contract checks pass; live hosted qualification is
 blocked by the deployed management API version and provider setup. This is not a
 release approval or evidence of a completed live sync.
 
@@ -108,3 +108,17 @@ identity-only absence checks, rate-limited permission audits, managed chat token
 validation, daily content schedules with independent access renewal, discovery
 clock agreement, and bounded checkpoint cleanup. These fixture results do not
 establish a live provider installation or hosted qualification.
+
+## Readiness recheck on 2026-10-27
+
+Read-only `connections list` requests against the saved `antfly-inc` / `grepstein`
+context return HTTP 400 (unsupported/invalid provider) for Google Workspace, Slack
+and Discord. Authentication succeeds; this is a deployed management API version
+gate. Live sync/search qualification requires deployment of the matching source
+API/worker/dashboard and provider installation/consent before it can proceed.
+These checks changed no connections, content, secrets, or infrastructure.
+
+Calendar audit scaling now has portable and hosted regressions: a 20-calendar
+publication resolves each selected alias/role once per bounded audit. Subsequent
+audits fetch fresh grants, expired proofs are refreshed, and failures never become
+authorization proofs. This local coverage does not replace live qualification.

@@ -68,6 +68,7 @@ func (c *CollaborationConnector) AuthorizeInventory(ctx context.Context, r Reque
 	}
 	c.scopeChecks = map[string]time.Time{}
 	c.calendarRoles = nil
+	c.calendarSelections = nil
 	c.observedScopes = nil
 	defer c.beginDiscordReadPass()()
 	c.accessAuditWindow = time.Duration(policy.TTL) * time.Second
@@ -187,7 +188,7 @@ func (c *CollaborationConnector) authorizeInventoryOnce(ctx context.Context, r R
 			}
 		} else {
 			for _, id := range config.CalendarIDs {
-				if err := c.checkedAuthority("calendar-selection/"+id, func() error { _, err := c.calendarID(ctx, id); return err }); err != nil {
+				if _, err := c.calendarID(ctx, id); err != nil {
 					return err
 				}
 			}

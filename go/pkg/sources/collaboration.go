@@ -65,6 +65,7 @@ type CollaborationConnector struct {
 	ExtractorVersion                            string
 	scopeChecks                                 map[string]time.Time
 	calendarRoles                               map[string]string
+	calendarSelections                          map[string]calendarSelection
 	accessAuditWindow                           time.Duration
 	accessWait                                  func(context.Context, time.Duration) error
 	observedScopes                              map[string]collaborationRef
@@ -330,6 +331,7 @@ func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inve
 	c.retainedRef = ""
 	c.scopeChecks = nil
 	c.calendarRoles = nil
+	c.calendarSelections = nil
 	c.observedScopes = nil
 	if r.SourceNamespace == "" {
 		return Inventory{}, fmt.Errorf("%w: source namespace required", ErrInvalidInput)
@@ -657,6 +659,7 @@ func (c *CollaborationConnector) ValidateInventory(ctx context.Context, r Reques
 	defer c.beginDiscordReadPass()()
 	c.scopeChecks = nil
 	c.calendarRoles = nil
+	c.calendarSelections = nil
 	if err := c.Validate(ctx, r); err != nil {
 		return err
 	}
