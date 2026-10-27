@@ -1,0 +1,931 @@
+{
+  "experiment": "native_compressed_ordered_navigation_v1",
+  "scope": "Sequential local Debug observations on a shared machine. No isolated causal latency, empty-cache, real-cloud or archive-scale throughput claim. No own E2E/build overlap during the final comparisons.",
+  "cache_contract": "Three samples per wide/native case and cache mode. Five alternating warm samples for each projection after both field-count variants are primed. Process restart retains persistent/OS caches and readiness warming.",
+  "candidate": {
+    "source_commit": "1ef0378632dde806594b3f489fa07e97ccae2dc1",
+    "source_tree": "7a40f6af72295b9d6802490208e8462c77b2ca27",
+    "source_clean": true,
+    "build_mode": "Debug",
+    "zig_version": "0.17.0",
+    "binary_sha256": "32ce08b7defc490fc50aa7363eeef07ec98295a4b8189078a7296ea23fec35a9",
+    "merged_main": "ef25cb940581485480600fc0edb10b7c596ad3a8",
+    "qualification": "Production build; 263 targeted lake checks and 98 graph/page checks passed, one declared skip, zero failures/leaks; 35 real Parquet/Iceberg E2Es passed without skips; 28 exact paired pages including scores and work counts."
+  },
+  "changes": [
+    "Navigation cache entries retain a shared prefix plus borrowed suffixes. Cursor views compare complete logical keys without entry-wise expansion; identity scans validate only the final coordinate and materialize one required boundary.",
+    "Sorted and incremental packing use compressed occupancy while preserving expanded hard limits, summary headroom and pending child locator reservations. Repair cannot over-merge small compressed siblings.",
+    "Native ordered producers enable page-prefix encoding for serving, reverse and checkpoint forests. Old page formats and immutable roots remain readable; new builds and rewritten pages gain packing improvements.",
+    "Pagination checks repeat identical cursor requests to verify physical reuse. Peak allocation, rather than historical speculative-resize rejection, qualifies successful bounded output."
+  ],
+  "structural_qualification": {
+    "published_wide_keys": 40,
+    "bytes_per_key": 131000,
+    "identity_scan_navigation_read_bytes": 525052,
+    "identity_scan_peak_output_bytes": 212264,
+    "identity_scan_output_limit_bytes": 262144,
+    "identity_scan_cursor_materialization_capacity_bytes": 0,
+    "repeated_cursor_additional_provider_reads": 0
+  },
+  "comparisons": [
+    {
+      "workload": "wide",
+      "before_source": "f0632861c13dc3c4a7e8481a22e71141bda2ec43",
+      "before_binary_sha256": "b0deec71301b8b22c96d7fda7f576d5d0f0db64420e88917c47f8834447a4a26",
+      "after_source": "1ef0378632dde806594b3f489fa07e97ccae2dc1",
+      "after_binary_sha256": "32ce08b7defc490fc50aa7363eeef07ec98295a4b8189078a7296ea23fec35a9",
+      "before_report_sha256": "2a23ceae4d2bdb2933f3eb2e82ba1801a28e20ed76f45c657e8409bbc2296ebb",
+      "after_report_sha256": "21e2ccefe9f046afd5bd29e88e797f5450da7dd6ed6726ee1f9fc5edb7c6ebc0",
+      "parquet_sha256": "b3e2b65a49b53805fabcffd091d41182481a7407ca968205a7207331d0ab96f4",
+      "config_sha256": "a61cb3fd493765dc01898d3ae607f4466b28c3f543e3b287106c4d27f2374a32",
+      "runner_sha256": "4c905dbb8398777802d1d0264e38d9af4604cadaf847a1452521ec5c628814fc",
+      "definition_sha256": "00db809aa9728872f22825b5193c1b77b823e8b15c64476f66e627611e094e18",
+      "definition": {
+        "schema": {
+          "storage_mode": "relational",
+          "default_type": "row",
+          "base_source": {
+            "kind": "external",
+            "format": "parquet",
+            "table_id": "ordered-demand-paired",
+            "object_mutability": "immutable",
+            "uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/ordered-demand/review-wide-input-v3/fixture/snapshot.parquet-manifest.json",
+            "row_identity": {
+              "key_columns": [
+                "id"
+              ]
+            }
+          },
+          "document_schemas": {
+            "row": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "x-antfly-field": {
+                      "type": "number",
+                      "sortable": true
+                    }
+                  },
+                  "bucket": {
+                    "type": "integer",
+                    "x-antfly-field": {
+                      "type": "number",
+                      "sortable": true
+                    }
+                  },
+                  "wide": {
+                    "type": "string",
+                    "x-antfly-field": {
+                      "type": "text",
+                      "index": false
+                    }
+                  },
+                  "body": {
+                    "type": "string",
+                    "x-antfly-field": {
+                      "type": "text"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "index_sort": [
+            {
+              "field": "id",
+              "order": "asc"
+            },
+            {
+              "field": "_id",
+              "order": "asc"
+            }
+          ],
+          "relational_indexes": [
+            {
+              "name": "bucket",
+              "keys": [
+                {
+                  "column": "bucket",
+                  "nulls": "first"
+                },
+                {
+                  "column": "wide"
+                },
+                {
+                  "column": "id"
+                }
+              ]
+            },
+            {
+              "name": "id",
+              "keys": [
+                {
+                  "column": "id",
+                  "nulls": "first"
+                }
+              ]
+            }
+          ]
+        },
+        "indexes": {
+          "text": {
+            "type": "full_text",
+            "store_source": true
+          }
+        }
+      },
+      "requests": {
+        "wide_primary_boundary": {
+          "full_text_search": {
+            "match": "quasar",
+            "field": "body"
+          },
+          "fields": [
+            "id",
+            "bucket"
+          ],
+          "order_by": [
+            {
+              "field": "bucket",
+              "desc": false
+            }
+          ],
+          "profile": true,
+          "limit": 128
+        }
+      },
+      "before_summary": [
+        {
+          "case": "wide_primary_boundary",
+          "cache_mode": "process_restarted",
+          "median_ns": 881247083
+        },
+        {
+          "case": "wide_primary_boundary",
+          "cache_mode": "warm",
+          "median_ns": 508023791
+        }
+      ],
+      "after_summary": [
+        {
+          "case": "wide_primary_boundary",
+          "cache_mode": "process_restarted",
+          "median_ns": 136514666
+        },
+        {
+          "case": "wide_primary_boundary",
+          "cache_mode": "warm",
+          "median_ns": 79019416
+        }
+      ],
+      "exact_paired_pages": 6,
+      "samples": [
+        {
+          "sample": 0,
+          "case": "wide_primary_boundary",
+          "cache_mode": "process_restarted",
+          "before_elapsed_ns": 939067125,
+          "after_elapsed_ns": 138361250,
+          "full_hits_sha256": "08b25221eca933230f2a236e36a01dbe59ab6ce63fe88c901637e25c17f6cd74",
+          "work": {
+            "candidate_count": 129,
+            "ordered_scanned_count": 129,
+            "cursor_rejected_count": 0,
+            "selected_count": 128
+          }
+        },
+        {
+          "sample": 0,
+          "case": "wide_primary_boundary",
+          "cache_mode": "warm",
+          "before_elapsed_ns": 536116458,
+          "after_elapsed_ns": 83993584,
+          "full_hits_sha256": "08b25221eca933230f2a236e36a01dbe59ab6ce63fe88c901637e25c17f6cd74",
+          "work": {
+            "candidate_count": 129,
+            "ordered_scanned_count": 129,
+            "cursor_rejected_count": 0,
+            "selected_count": 128
+          }
+        },
+        {
+          "sample": 1,
+          "case": "wide_primary_boundary",
+          "cache_mode": "process_restarted",
+          "before_elapsed_ns": 878636792,
+          "after_elapsed_ns": 136514666,
+          "full_hits_sha256": "08b25221eca933230f2a236e36a01dbe59ab6ce63fe88c901637e25c17f6cd74",
+          "work": {
+            "candidate_count": 129,
+            "ordered_scanned_count": 129,
+            "cursor_rejected_count": 0,
+            "selected_count": 128
+          }
+        },
+        {
+          "sample": 1,
+          "case": "wide_primary_boundary",
+          "cache_mode": "warm",
+          "before_elapsed_ns": 495408250,
+          "after_elapsed_ns": 79019416,
+          "full_hits_sha256": "08b25221eca933230f2a236e36a01dbe59ab6ce63fe88c901637e25c17f6cd74",
+          "work": {
+            "candidate_count": 129,
+            "ordered_scanned_count": 129,
+            "cursor_rejected_count": 0,
+            "selected_count": 128
+          }
+        },
+        {
+          "sample": 2,
+          "case": "wide_primary_boundary",
+          "cache_mode": "process_restarted",
+          "before_elapsed_ns": 881247083,
+          "after_elapsed_ns": 126461708,
+          "full_hits_sha256": "08b25221eca933230f2a236e36a01dbe59ab6ce63fe88c901637e25c17f6cd74",
+          "work": {
+            "candidate_count": 129,
+            "ordered_scanned_count": 129,
+            "cursor_rejected_count": 0,
+            "selected_count": 128
+          }
+        },
+        {
+          "sample": 2,
+          "case": "wide_primary_boundary",
+          "cache_mode": "warm",
+          "before_elapsed_ns": 508023791,
+          "after_elapsed_ns": 77578542,
+          "full_hits_sha256": "08b25221eca933230f2a236e36a01dbe59ab6ce63fe88c901637e25c17f6cd74",
+          "work": {
+            "candidate_count": 129,
+            "ordered_scanned_count": 129,
+            "cursor_rejected_count": 0,
+            "selected_count": 128
+          }
+        }
+      ]
+    },
+    {
+      "workload": "native",
+      "before_source": "f0632861c13dc3c4a7e8481a22e71141bda2ec43",
+      "before_binary_sha256": "b0deec71301b8b22c96d7fda7f576d5d0f0db64420e88917c47f8834447a4a26",
+      "after_source": "1ef0378632dde806594b3f489fa07e97ccae2dc1",
+      "after_binary_sha256": "32ce08b7defc490fc50aa7363eeef07ec98295a4b8189078a7296ea23fec35a9",
+      "before_report_sha256": "818ba42baa5087b7fc46c14260bf5c8744f395d8c93e03d2937714a19cc4ce0d",
+      "after_report_sha256": "2400057e6cd58892d9a4bddadffa721a110c4e1c0d6f2b5c55c5d59b6e40b7c8",
+      "parquet_sha256": "e6908a886d29929c85f81585c424349f330eb9b65876b02282a68a92e9e583f3",
+      "config_sha256": "a61cb3fd493765dc01898d3ae607f4466b28c3f543e3b287106c4d27f2374a32",
+      "runner_sha256": "cbfa07c294b71c51b5d8ca2b286e2c5503d6e2f8cab95c2cf875bd0932785c3f",
+      "definition_sha256": "76d150fa09a68c00c562dfd8ac9fcb8554ee1c20d888a5c2dd848bc31824318b",
+      "definition": {
+        "schema": {
+          "storage_mode": "relational",
+          "default_type": "row",
+          "base_source": {
+            "kind": "external",
+            "format": "parquet",
+            "table_id": "ordered-demand-paired",
+            "object_mutability": "immutable",
+            "uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/ordered-demand/review-native-input/fixture/snapshot.parquet-manifest.json",
+            "row_identity": {
+              "key_columns": [
+                "id"
+              ]
+            }
+          },
+          "document_schemas": {
+            "row": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "x-antfly-field": {
+                      "type": "number",
+                      "sortable": true
+                    }
+                  },
+                  "bucket": {
+                    "type": "integer",
+                    "x-antfly-field": {
+                      "type": "number",
+                      "sortable": true
+                    }
+                  },
+                  "body": {
+                    "type": "string",
+                    "x-antfly-field": {
+                      "type": "text"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "index_sort": [
+            {
+              "field": "id",
+              "order": "asc"
+            },
+            {
+              "field": "_id",
+              "order": "asc"
+            }
+          ],
+          "relational_indexes": [
+            {
+              "name": "bucket",
+              "keys": [
+                {
+                  "column": "bucket",
+                  "nulls": "first"
+                },
+                {
+                  "column": "id"
+                }
+              ]
+            },
+            {
+              "name": "id",
+              "keys": [
+                {
+                  "column": "id",
+                  "nulls": "first"
+                }
+              ]
+            }
+          ]
+        },
+        "indexes": {
+          "text": {
+            "type": "full_text",
+            "store_source": true
+          }
+        }
+      },
+      "requests": {
+        "native_tail_match": {
+          "full_text_search": {
+            "match": "pulsar",
+            "field": "body"
+          },
+          "fields": [
+            "id",
+            "bucket"
+          ],
+          "order_by": [
+            {
+              "field": "id",
+              "desc": false
+            }
+          ],
+          "profile": true,
+          "limit": 20
+        },
+        "native_head_reverse": {
+          "full_text_search": {
+            "match": "quasar",
+            "field": "body"
+          },
+          "fields": [
+            "id",
+            "bucket"
+          ],
+          "order_by": [
+            {
+              "field": "id",
+              "desc": true
+            }
+          ],
+          "profile": true,
+          "limit": 20
+        }
+      },
+      "before_summary": [
+        {
+          "case": "native_tail_match",
+          "cache_mode": "process_restarted",
+          "median_ns": 112611375
+        },
+        {
+          "case": "native_tail_match",
+          "cache_mode": "warm",
+          "median_ns": 19167250
+        },
+        {
+          "case": "native_head_reverse",
+          "cache_mode": "process_restarted",
+          "median_ns": 109756750
+        },
+        {
+          "case": "native_head_reverse",
+          "cache_mode": "warm",
+          "median_ns": 19987542
+        }
+      ],
+      "after_summary": [
+        {
+          "case": "native_tail_match",
+          "cache_mode": "process_restarted",
+          "median_ns": 137560750
+        },
+        {
+          "case": "native_tail_match",
+          "cache_mode": "warm",
+          "median_ns": 18378125
+        },
+        {
+          "case": "native_head_reverse",
+          "cache_mode": "process_restarted",
+          "median_ns": 128365084
+        },
+        {
+          "case": "native_head_reverse",
+          "cache_mode": "warm",
+          "median_ns": 17852958
+        }
+      ],
+      "exact_paired_pages": 12,
+      "samples": [
+        {
+          "sample": 0,
+          "case": "native_tail_match",
+          "cache_mode": "process_restarted",
+          "before_elapsed_ns": 112611375,
+          "after_elapsed_ns": 105985208,
+          "full_hits_sha256": "6470ccd97c892831c026af60c8edf590cc1d3f8b284f2825008ff7066a30fae0",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 0,
+          "case": "native_tail_match",
+          "cache_mode": "warm",
+          "before_elapsed_ns": 20019958,
+          "after_elapsed_ns": 19814208,
+          "full_hits_sha256": "6470ccd97c892831c026af60c8edf590cc1d3f8b284f2825008ff7066a30fae0",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 1,
+          "case": "native_tail_match",
+          "cache_mode": "process_restarted",
+          "before_elapsed_ns": 113516291,
+          "after_elapsed_ns": 145555333,
+          "full_hits_sha256": "6470ccd97c892831c026af60c8edf590cc1d3f8b284f2825008ff7066a30fae0",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 1,
+          "case": "native_tail_match",
+          "cache_mode": "warm",
+          "before_elapsed_ns": 19167250,
+          "after_elapsed_ns": 17719209,
+          "full_hits_sha256": "6470ccd97c892831c026af60c8edf590cc1d3f8b284f2825008ff7066a30fae0",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 2,
+          "case": "native_tail_match",
+          "cache_mode": "process_restarted",
+          "before_elapsed_ns": 109760333,
+          "after_elapsed_ns": 137560750,
+          "full_hits_sha256": "6470ccd97c892831c026af60c8edf590cc1d3f8b284f2825008ff7066a30fae0",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 2,
+          "case": "native_tail_match",
+          "cache_mode": "warm",
+          "before_elapsed_ns": 18656625,
+          "after_elapsed_ns": 18378125,
+          "full_hits_sha256": "6470ccd97c892831c026af60c8edf590cc1d3f8b284f2825008ff7066a30fae0",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 0,
+          "case": "native_head_reverse",
+          "cache_mode": "process_restarted",
+          "before_elapsed_ns": 109756750,
+          "after_elapsed_ns": 128365084,
+          "full_hits_sha256": "37279399b91dc24dcce88949db844f155f7823881a039bd5f972aece2f60f6bf",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 0,
+          "case": "native_head_reverse",
+          "cache_mode": "warm",
+          "before_elapsed_ns": 17720166,
+          "after_elapsed_ns": 18000208,
+          "full_hits_sha256": "37279399b91dc24dcce88949db844f155f7823881a039bd5f972aece2f60f6bf",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 1,
+          "case": "native_head_reverse",
+          "cache_mode": "process_restarted",
+          "before_elapsed_ns": 107534792,
+          "after_elapsed_ns": 131349041,
+          "full_hits_sha256": "37279399b91dc24dcce88949db844f155f7823881a039bd5f972aece2f60f6bf",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 1,
+          "case": "native_head_reverse",
+          "cache_mode": "warm",
+          "before_elapsed_ns": 19987542,
+          "after_elapsed_ns": 17523292,
+          "full_hits_sha256": "37279399b91dc24dcce88949db844f155f7823881a039bd5f972aece2f60f6bf",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 2,
+          "case": "native_head_reverse",
+          "cache_mode": "process_restarted",
+          "before_elapsed_ns": 114663959,
+          "after_elapsed_ns": 119560125,
+          "full_hits_sha256": "37279399b91dc24dcce88949db844f155f7823881a039bd5f972aece2f60f6bf",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        },
+        {
+          "sample": 2,
+          "case": "native_head_reverse",
+          "cache_mode": "warm",
+          "before_elapsed_ns": 20241667,
+          "after_elapsed_ns": 17852958,
+          "full_hits_sha256": "37279399b91dc24dcce88949db844f155f7823881a039bd5f972aece2f60f6bf",
+          "work": {
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20
+          }
+        }
+      ]
+    },
+    {
+      "workload": "projection",
+      "before_source": "f0632861c13dc3c4a7e8481a22e71141bda2ec43",
+      "before_binary_sha256": "b0deec71301b8b22c96d7fda7f576d5d0f0db64420e88917c47f8834447a4a26",
+      "after_source": "1ef0378632dde806594b3f489fa07e97ccae2dc1",
+      "after_binary_sha256": "32ce08b7defc490fc50aa7363eeef07ec98295a4b8189078a7296ea23fec35a9",
+      "before_report_sha256": "b40438ba39da355b18d50a21da8ef4918b1aaa3a964ee5fd953783c175292bfe",
+      "after_report_sha256": "71c41b8297284d327bcff5c0efab048a63fc13cc94c86aad74acaa917caeb330",
+      "parquet_sha256": "6d982793b6521f32c25983f9864fc48a4cdd678bce4b35736d3af7b974e28c59",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "runner_sha256": "708c15c86a119978b53e3cab56ac40574369a2d875f3748918ca179cece119ec",
+      "definition_sha256": "4d7ea8276a6cef9af9b6da184e91c4686effadc2bf68386ee426697d171a7596",
+      "definition": {
+        "schema": {
+          "storage_mode": "relational",
+          "default_type": "row",
+          "base_source": {
+            "kind": "external",
+            "format": "parquet",
+            "table_id": "projection-review",
+            "object_mutability": "immutable",
+            "uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/ordered-demand/review-52c9-projection/input/fixture/snapshot.parquet-manifest.json",
+            "row_identity": {
+              "key_columns": [
+                "id"
+              ]
+            }
+          },
+          "document_schemas": {
+            "row": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "x-antfly-field": {
+                      "type": "number",
+                      "sortable": true
+                    }
+                  },
+                  "bucket": {
+                    "type": "integer",
+                    "x-antfly-field": {
+                      "type": "number",
+                      "sortable": true
+                    }
+                  },
+                  "body": {
+                    "type": "string",
+                    "x-antfly-field": {
+                      "type": "text"
+                    }
+                  },
+                  "f0": {
+                    "type": "string",
+                    "x-antfly-field": {
+                      "type": "text",
+                      "index": false
+                    }
+                  },
+                  "f1": {
+                    "type": "string",
+                    "x-antfly-field": {
+                      "type": "text",
+                      "index": false
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "index_sort": [
+            {
+              "field": "id",
+              "order": "asc"
+            },
+            {
+              "field": "_id",
+              "order": "asc"
+            }
+          ]
+        },
+        "indexes": {
+          "text": {
+            "type": "full_text",
+            "store_source": true
+          }
+        }
+      },
+      "requests": {
+        "4": {
+          "full_text_search": {
+            "match": "needle",
+            "field": "body"
+          },
+          "fields": [
+            "id",
+            "body",
+            "f0",
+            "f1"
+          ],
+          "order_by": [
+            {
+              "field": "id"
+            }
+          ],
+          "limit": 24,
+          "profile": true
+        },
+        "5": {
+          "full_text_search": {
+            "match": "needle",
+            "field": "body"
+          },
+          "fields": [
+            "id",
+            "body",
+            "f0",
+            "f1",
+            "bucket"
+          ],
+          "order_by": [
+            {
+              "field": "id"
+            }
+          ],
+          "limit": 24,
+          "profile": true
+        }
+      },
+      "before_summary": [
+        {
+          "fields": 4,
+          "median_ns": 17282916
+        },
+        {
+          "fields": 5,
+          "median_ns": 17546250
+        }
+      ],
+      "after_summary": [
+        {
+          "fields": 4,
+          "median_ns": 17564084
+        },
+        {
+          "fields": 5,
+          "median_ns": 17962334
+        }
+      ],
+      "exact_paired_pages": 10,
+      "samples": [
+        {
+          "sample": 0,
+          "fields": 4,
+          "cache_mode": "warm",
+          "before_elapsed_ns": 17458541,
+          "after_elapsed_ns": 17564084,
+          "full_hits_sha256": "a9f59bb4e8ace917bf3152cc7791df4828344322324707971b6f5e2d46bbc8d4",
+          "work": {
+            "candidate_count": 25,
+            "ordered_scanned_count": 27,
+            "cursor_rejected_count": 0,
+            "selected_count": 24
+          }
+        },
+        {
+          "sample": 0,
+          "fields": 5,
+          "cache_mode": "warm",
+          "before_elapsed_ns": 17546250,
+          "after_elapsed_ns": 18204458,
+          "full_hits_sha256": "c9693e37ae07b75d236b4f651c1270bd9258e614d6b1bc587a2125e6d6cc9c8a",
+          "work": {
+            "candidate_count": 25,
+            "ordered_scanned_count": 27,
+            "cursor_rejected_count": 0,
+            "selected_count": 24
+          }
+        },
+        {
+          "sample": 1,
+          "fields": 5,
+          "cache_mode": "warm",
+          "before_elapsed_ns": 18012000,
+          "after_elapsed_ns": 17960916,
+          "full_hits_sha256": "c9693e37ae07b75d236b4f651c1270bd9258e614d6b1bc587a2125e6d6cc9c8a",
+          "work": {
+            "candidate_count": 25,
+            "ordered_scanned_count": 27,
+            "cursor_rejected_count": 0,
+            "selected_count": 24
+          }
+        },
+        {
+          "sample": 1,
+          "fields": 4,
+          "cache_mode": "warm",
+          "before_elapsed_ns": 17682166,
+          "after_elapsed_ns": 17732292,
+          "full_hits_sha256": "a9f59bb4e8ace917bf3152cc7791df4828344322324707971b6f5e2d46bbc8d4",
+          "work": {
+            "candidate_count": 25,
+            "ordered_scanned_count": 27,
+            "cursor_rejected_count": 0,
+            "selected_count": 24
+          }
+        },
+        {
+          "sample": 2,
+          "fields": 4,
+          "cache_mode": "warm",
+          "before_elapsed_ns": 17282916,
+          "after_elapsed_ns": 17274750,
+          "full_hits_sha256": "a9f59bb4e8ace917bf3152cc7791df4828344322324707971b6f5e2d46bbc8d4",
+          "work": {
+            "candidate_count": 25,
+            "ordered_scanned_count": 27,
+            "cursor_rejected_count": 0,
+            "selected_count": 24
+          }
+        },
+        {
+          "sample": 2,
+          "fields": 5,
+          "cache_mode": "warm",
+          "before_elapsed_ns": 18116375,
+          "after_elapsed_ns": 18565125,
+          "full_hits_sha256": "c9693e37ae07b75d236b4f651c1270bd9258e614d6b1bc587a2125e6d6cc9c8a",
+          "work": {
+            "candidate_count": 25,
+            "ordered_scanned_count": 27,
+            "cursor_rejected_count": 0,
+            "selected_count": 24
+          }
+        },
+        {
+          "sample": 3,
+          "fields": 5,
+          "cache_mode": "warm",
+          "before_elapsed_ns": 17182500,
+          "after_elapsed_ns": 17530708,
+          "full_hits_sha256": "c9693e37ae07b75d236b4f651c1270bd9258e614d6b1bc587a2125e6d6cc9c8a",
+          "work": {
+            "candidate_count": 25,
+            "ordered_scanned_count": 27,
+            "cursor_rejected_count": 0,
+            "selected_count": 24
+          }
+        },
+        {
+          "sample": 3,
+          "fields": 4,
+          "cache_mode": "warm",
+          "before_elapsed_ns": 16918833,
+          "after_elapsed_ns": 17668125,
+          "full_hits_sha256": "a9f59bb4e8ace917bf3152cc7791df4828344322324707971b6f5e2d46bbc8d4",
+          "work": {
+            "candidate_count": 25,
+            "ordered_scanned_count": 27,
+            "cursor_rejected_count": 0,
+            "selected_count": 24
+          }
+        },
+        {
+          "sample": 4,
+          "fields": 4,
+          "cache_mode": "warm",
+          "before_elapsed_ns": 16929333,
+          "after_elapsed_ns": 17305708,
+          "full_hits_sha256": "a9f59bb4e8ace917bf3152cc7791df4828344322324707971b6f5e2d46bbc8d4",
+          "work": {
+            "candidate_count": 25,
+            "ordered_scanned_count": 27,
+            "cursor_rejected_count": 0,
+            "selected_count": 24
+          }
+        },
+        {
+          "sample": 4,
+          "fields": 5,
+          "cache_mode": "warm",
+          "before_elapsed_ns": 17473834,
+          "after_elapsed_ns": 17962334,
+          "full_hits_sha256": "c9693e37ae07b75d236b4f651c1270bd9258e614d6b1bc587a2125e6d6cc9c8a",
+          "work": {
+            "candidate_count": 25,
+            "ordered_scanned_count": 27,
+            "cursor_rejected_count": 0,
+            "selected_count": 24
+          }
+        }
+      ]
+    }
+  ],
+  "exact_paired_pages": 28,
+  "qualification": {
+    "production_build": "Zig 0.17.0 Debug succeeded",
+    "targeted_native_passed": 263,
+    "targeted_native_skipped": 1,
+    "graph_page_passed": 98,
+    "failures": 0,
+    "leaks": 0,
+    "real_parquet_iceberg_e2e_passed": 35,
+    "e2e_skipped": 0,
+    "benchmark_tooling_tests_passed": 18,
+    "apache_boundary_source_files": 2542
+  }
+}

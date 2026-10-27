@@ -838,3 +838,57 @@ chunk boundaries with five projected fields, nullable exact integers above 2^53,
 forward/backward cursor pages and hidden highlights before/after restart, while
 the original Parquet object is unavailable. Benchmark tooling, formatting/lint,
 syntax, license, Apache boundary and whitespace checks pass.
+
+### Compressed ordered navigation and page occupancy
+
+The [compressed-navigation observation](native-compressed-ordered-navigation-v1-observation.json)
+compares identical Parquet files, index definitions, configuration and requests.
+Native ordered publications now enable shared-prefix encoding. Both sorted
+publication and incremental packing account for compressed occupancy, while
+retaining the expanded-page hard cap and reserving final packed-child locators.
+Decoded caches retain one prefix per page; identity scans consume borrowed key
+views and copy only a required final boundary. Complete-key mutation and visitor
+consumers retain their contiguous interface.
+
+| Case | Reviewed median | Final median |
+|---|---:|---:|
+| 131 KB unused ordered suffix, warm | 508.02 ms | 79.02 ms |
+| Same query, process restarted | 881.25 ms | 136.51 ms |
+| Native order, forward, warm | 19.17 ms | 18.38 ms |
+| Native order, reverse, warm | 19.99 ms | 17.85 ms |
+| Native order, forward, process restarted | 112.61 ms | 137.56 ms |
+| Native order, reverse, process restarted | 109.76 ms | 128.37 ms |
+| Four projected fields, warm | 17.28 ms | 17.56 ms |
+| Five projected fields, warm | 17.55 ms | 17.96 ms |
+
+All 28 paired pages preserve complete hits and scores exactly, with unchanged
+candidate, ordered-reference, selected and cursor-rejection counts. Wide/native
+cases retain three samples per case/cache mode; projections retain five
+alternating warm samples after both variants are primed. Reports pin source,
+executable, Parquet, configuration, definition and runner hashes. The wide input
+has 256 rows: `id=i`, `bucket=i//128`, `wide="w"*131000+str(i).zfill(4)`, and
+`body="control quasar"`. Its bucket index retains the complete `bucket, wide, id`
+tuple in both variants. This comparison does not remove the unused suffix from
+the index definition.
+
+A real publication regression scans forty 131,000-byte keys using 525,052 bytes
+of navigation reads and 212,264 bytes of peak result allocation under a 256 KiB
+limit, with zero cursor key materialization. Tests cover all key-view split
+positions, cross-page forward/reverse/window/rank seeks, mutation preservation,
+compressed sibling repair at the expanded hard cap, scoped cache reuse and
+exhaustive allocation failures. Repeating an identical pagination request makes
+zero additional provider reads; logical read-budget charges remain distinct
+from physical cache misses.
+
+These are sequential local Debug measurements on a shared machine. The final
+pairs have no overlapping build or E2E work from this task. Native restart
+controls were slower in this run, and the small projection changes are retained
+alongside the long-key improvement. Restarts retain OS/persistent caches and
+readiness warming. These observations do not qualify isolated causal latency,
+empty-cache behavior, real cloud transport or archive-scale throughput.
+
+The Zig 0.17.0 production build succeeds. All 263 targeted lake checks and 98
+page/graph checks pass, with one declared benchmark skip and zero failures or
+leaks. All 35 selected real Parquet/Iceberg E2Es pass without skips. Benchmark
+tooling's 18 tests, formatting, license, Apache boundary (2,542 source files) and
+whitespace checks pass. Latest fetched main `ef25cb9405` is already merged.
