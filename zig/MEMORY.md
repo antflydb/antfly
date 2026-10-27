@@ -2671,14 +2671,18 @@ owner writes, rather than clearing and rebuilding the entire profile. The shared
 metadata/Lite contracts retain source, head, visibility and final grant fences.
 
 Resolver dependency projection follow-up: static consumers use shared projection
-format 4. Reverse-parent dependencies scope a leaf correction to its affected
-paths, while the bounded journal maintains deduplicated key invalidations for
-unaffected-root read proofs across edit bursts. Deletable counting summaries
-with exact SHA-256 checks keep large distinct-key bursts out of request arenas.
-Durable ingestion and next-work queues preserve active repair/walk progress under
-unrelated edits; ingestion uses available turn capacity with one scratch decode
-per event. Root-batch proofs bound the roots-by-edits cross product and reuse
-complete invalidation pages. Configured parent guards cover masked-edge unmerge.
-Complete configured/native graph coverage is owner-built before membership readiness; native memory identities
-without static consumers still create neither this projection nor its journal.
-See `RESOLUTION.md` for upgrade floors, bounded maintenance, and fallback rules.
+format 5. Reverse-parent dependencies scope a leaf correction to its affected
+paths. The bounded journal maintains deduplicated key invalidations; compact
+full-SHA digests are deduplicated once and sorted before unaffected-root proofs.
+Adaptive summaries store small roots inline and larger roots in bounded sorted
+fingerprint leaves, with full-SHA verification after every positive. Reference
+counts preserve collisions during deletion. Durable ingestion and next-work
+queues preserve active repair/walk progress under unrelated edits, with one
+scratch decode per event. Configured parent guards cover masked-edge unmerge.
+Owner-built coverage includes all configured nodes and only their reachable
+native paths. A shared latest-version native-tail index fences newly incoming
+paths without copying an entire native namespace into every profile. Unreferenced
+native paths are pruned even if native declarations survive. Native memory
+identities without static consumers create neither this projection nor its
+journal. See `RESOLUTION.md` for upgrade floors, bounded maintenance, measurements
+and fallback rules.

@@ -2737,23 +2737,38 @@ Overwriting a ring slot removes an expired invalidation only if that event still
 owns its point version. Repeated edits to a hot key therefore retain one posting;
 storage is bounded by retained events, with no synchronous profile fanout.
 
-Projection format 4 first builds the complete configured/native routing graph,
-including unpinned configured nodes. Each graph node has one canonical path row,
-one root-dependency posting, and at most one direct reverse-parent posting. This
-shares converging paths instead of storing every boundary's full dependency list.
-Initial enrollment does more work than formats 2/3, in bounded owner turns, so future
-reads can prove incoming-root changes even when an edited source was previously
-unpinned. Static-only nodes use scalar canonical lookups and one direct edge;
-curated paths share durable, resumable path compression. Pin membership follows
-only after graph dependencies and configured-edge guards are complete. Each
-configured edge retains a direct parent guard. If its source and parent have
-different effective roots, a latent root dependency covers future unmerge.
-Parent-path changes refresh guards through immutable reverse configured edges,
-including edges currently masked by native routing.
+Projection format 5 builds every configured node, including unpinned and
+masked configured parents, plus the native forward paths reachable from them.
+It never enumerates the whole native namespace for each static profile. Each
+included node has one canonical path row, one root-dependency posting, and at
+most one direct reverse-parent posting. Converging paths share these rows.
+Static-only nodes use scalar canonical lookups and one direct edge; curated
+paths share durable, resumable path compression. Pin membership follows only
+after dependencies and configured-edge guards are complete. Each configured
+edge retains a direct parent guard. If its source and parent have different
+effective roots, a latent root dependency covers future unmerge. Parent-path
+changes refresh guards through immutable reverse configured edges, including
+edges currently masked by native routing.
+
+Scoping the projection also requires detecting new incoming native paths.
+The shared edit journal records native redirect targets that themselves have a
+native redirect, using bounded point reads in the mutation transaction, without
+walking chains or publishing per-profile rows. A latest-version `tails/` index
+and `tail-key/` ownership postings deduplicate these entry points across slots;
+slot expiration removes only descriptors it still owns. Negative dependency
+proofs stream new entries and resolve their current mixed native/configured
+paths. A fixed full-SHA memo shares converging suffixes, with at most 16,384 hops
+in reusable scratch. Reaching a requested root, a cycle or exhausting this
+budget selects exact fallback. Flat unrelated edits require one empty range
+scan. Tail-index enrollment has its own journal readiness flag and barrier;
+legacy history cannot authorize a scoped projection accidentally.
 
 Owner repair expands reverse dependencies from changed routing nodes, rather than
 all members of their old canonical root. It clears and rebuilds only those path
-nodes and their incident pin boundaries. New targets acquire routing rows while the changed source path is compressed;
+nodes and their incident pin boundaries. Only configured, projected, queued or
+active-walk nodes enter routing repair; unrelated native edits are ingested
+without copying their paths. New targets acquire routing rows while the changed
+source path is compressed;
 pin-only edits do not enroll unnecessary graph work.
 Dirty old/new roots remain unreadable during partial publication. Journal ingestion
 has its own durable sequence and graph anchor, separate from the published graph.
@@ -2767,10 +2782,11 @@ available ingestion capacity while still behind. A persisted set of visited walk
 nodes invalidates only walks whose prefix intersects a routing edit. Unrelated heads do
 not restart a long walk, even across more than 256 updates, provided ingestion
 keeps pace. Trace rows and retired work sets are reclaimed in bounded turns.
-A bounded prune queue also removes unconfigured, undeclared nodes with no
-incoming graph dependencies. Old targets and removed sources cannot accumulate
-path rows under sustained unique-target churn. Configured nodes, current native
-routing declarations and referenced targets remain live. Cleanup and the final
+A bounded prune queue also removes unconfigured nodes with no incoming graph
+dependencies, cascading through their old forward edges. A native declaration
+alone does not keep a profile path live. Old targets and removed sources cannot
+accumulate path rows under sustained unique-target churn. Configured nodes and
+referenced targets remain live. Cleanup and the final
 graph watermark share the native writer transaction.
 
 Read-side validity uses one retained lineage anchor. Tiny edit bursts use one
@@ -2778,31 +2794,36 @@ ordered invalidation page and exact dependency reads. Strategy selection also
 bounds the roots-by-edits cross product: beyond 128 combinations (except one/two
 edits, which stay linear in roots), a complete small page supplies digests to the
 same summary proof without reopening journal slots. Empty root summaries return
-before allocating or clearing a counter buffer, avoiding 128 MiB of scratch
-clearing for a 1,024-root absent batch. Larger bursts use compact
-full SHA-256 digests from the same 256-event journal and a deletable counting
-summary per requested root. Four digest-derived positions use four-bit counters
-in nonempty 1-KiB pages (128 KiB maximum per root), with exact sparse overflow
-counters. Adds/removals require at most four native writes per dependency;
-empty pages and exhausted overflows are reclaimed. Summaries are negative proofs
-only: every hit is checked against the exact root dependency posting. Latent
-configured-edge hits also require the native mask to be absent. Collisions cannot
-change policy or bypass fallback. Compact records are at most 20 KiB plus an eight-byte sequence per event,
-with no per-profile fanout on native edits.
+before allocating a leaf-page buffer. Larger bursts read compact full SHA-256
+digests from the same 256-event journal into bounded scratch. A full-SHA hash
+set compacts duplicate digests once, then sorts only the unique digests. The
+maximum retained ring uses 5 MiB for digests and a 1-MiB index table. No per-root
+sort or repeated slot decoding is required.
+
+Root summaries contain sorted 64-bit SHA fingerprints with reference counts.
+Small roots fit in one compact binary row; larger roots split into sorted
+interval leaves of at most 128 entries. Inserts, splits, local merges, collapse
+and deletion require at most four native writes per dependency. Readers stream
+up to 128 leaves per page with reusable scalar caches. Empty leaves and exhausted
+roots are reclaimed. Fingerprints are negative proofs only: every hit is checked
+against the full-SHA root dependency posting. Reference counts preserve collisions
+on deletion; latent configured-edge hits also require the native mask to be
+absent. Compact journal records are at most 20 KiB plus an eight-byte sequence
+per event, with no per-profile fanout on native edits.
 
 This keeps scans independent of distinct edited-key cardinality for unrelated
 roots. All transient journal, native mask and dependency reads use reusable
-scratch rather than the request arena. Recording old/new redirect targets covers
+scratch rather than the request arena. Old/new redirect targets and the native-tail fence cover
 new incoming paths. Dirty roots retain exact fallback during partial publication.
 A journal gap, oversized event or older projection format also uses exact fallback.
 No request advances owner work. Final head, source and authorization fences remain
 independent. Full rebuilding is reserved for initial enrollment, format upgrade,
 oversized invalidations, or ingestion falling behind retained history.
 
-This generation uses Lite reader 25, topology protocol 64, metadata bootstrap v17,
-and Lite query-pin enrollment v5. Legacy v12-v16 declaration/profile proofs remain
-valid during dependency backfill; formats 2/3 pin projections use exact fallback
-until their owner publishes format 4. Older native readers refuse the new floor.
+This generation uses Lite reader 26, topology protocol 65, metadata bootstrap v18,
+and Lite query-pin enrollment v6. Legacy v12-v17 declaration/profile proofs remain
+valid during dependency backfill; older pin projections use exact fallback
+until their owner publishes format 5. Older native readers refuse the new floor.
 A profile enrollment epoch also drives bounded retirement cleanup, so replacing
 immutable profiles does not accumulate their obsolete membership generations.
 Namespace retirement uses the existing bounded native-prefix cleanup.
@@ -2862,8 +2883,8 @@ interleaved routing edits and partial owner turns. It also exercises a missed
 
 Dependency projection regression evidence: with 1,000 and 6,000 pins sharing a
 root, redirecting one configured leaf completes in one 128-work owner turn with
-60 derived/state writes and 41 scans. A zero-result query on an unrelated root
-uses five scans after 17 unique edits and after 145 edits with repeated hot keys;
+45 derived/state writes and 39 scans. A zero-result query on an unrelated root
+uses six scans after 17 unique edits and after 145 edits with repeated hot keys;
 the prior 6,000-pin implementation used 48,481 owner writes/470 turns for the leaf
 and 25,995 scans for the 17-edit read. Fixtures assert the same bounds at both
 sizes and validate portable rows, legacy projection upgrade, masked unmerge at
@@ -2874,28 +2895,43 @@ Run the focused dependency contracts with `zig build memory-dependency-test`
 from `zig/`, or include them through the complete `memory-test` target.
 
 The distinct-invalidation regression edits 256 and 4,096 different configured
-keys. Both unrelated zero-result queries use six scans and less than 34 KiB
+keys. Both unrelated zero-result queries use seven scans and less than 34 KiB
 of request arena; both succeed with a 64-KiB fixed request allocator. An
 8,192-root proof checks scratch reuse when every summary is empty. The former
 4,096-key path used 133 scans, 3.75 MiB of arena and exhausted that allocator.
-A 128-pin root repair completes in 52 owner turns with an unrelated routing edit
+A 128-pin root repair completes in 51 owner turns with an unrelated routing edit
 before every turn (49 without churn), moving all 128 members. Previously it moved
 none in 64 busy turns. The long-walk regression ingests 500 consecutive unrelated
-heads during a 16,000-hop backfill. Counter regressions cover collisions, repeated
-positions, overflow removal and empty-page reclamation. Owner turns allow at most
+heads during a 16,000-hop backfill. Summary regressions cover fingerprint collisions, repeated references, leaf
+splits, merges, collapse, deletion and empty-root reclamation. Owner turns allow at most
 129 derived/state writes with a 128-work budget; the minimum internal repair
-budget is 32 to accommodate atomic counter and guard updates.
+budget is 32 to accommodate atomic summary and guard updates.
 
 Further owner/read regressions use 16 unrelated routing updates before each
 128-work owner turn. The older 128-member component is fully moved within
 128 busy turns; the current background component then reaches global readiness
-in six quiet turns. Previously no members moved in 64 busy turns and recovery
+in one quiet turn. Previously no members moved in 64 busy turns and recovery
 needed another 123 quiet turns. Global readiness under sustained input still
 depends on whether the complete repair workload fits available owner capacity.
-For 128-key journal batches, a turn performs 65 derived/state writes with under
+For 128-key journal batches, a turn performs 64 derived/state writes with under
 93 KiB of owner arena (formerly 17 writes with 1.03 MiB); a 512-KiB fixed allocator
 succeeds, and event reads are bounded to one lineage anchor plus one ingestion
-read. A 1,024-root, small-burst proof uses 2,050 point reads rather than 41,986;
-the complete zero-result query uses 11,270 point reads rather than 51,206.
+read. A 1,024-root, small-burst proof uses 3,074 point reads rather than 41,986;
+the complete zero-result query uses 12,294 point reads rather than 51,206.
 The summary path adds bounded root-prefix scans; this measures storage-operation
 counts rather than claiming equivalent end-to-end latency gains.
+
+Scoped-projection and summary regressions extend these measurements. With 16
+configured aliases, adding 6,000 unrelated native aliases leaves 18 projected
+paths and 264 bytes of summary values: enrollment takes six bounded turns and
+204 writes, rather than 863 turns and 67,121 writes. Updating 64 unrelated native
+routes then takes three state writes. For 6,000 independent two-node roots,
+summary values occupy 288,000 logical bytes instead of 47,841,280 bytes of counter
+pages. These are encoded value sizes, not physical database or resident sizes.
+A 100,000-member root uses 1,204,420 summary bytes; 10,000 absent fingerprints
+produce zero positives in nine leaf scans with the deterministic fixture.
+Repeated-edit proof coverage holds 130 unique invalidations across 64 events and
+64 queried roots to 8,320 summary probes, versus 532,416 without deduplication.
+Native-tail tests cover chains present before and constructed after a redirect,
+correct results at every partial owner cut, orphan pruning while native
+declarations survive, shared thousand-hop suffixes and ring ownership expiry.
