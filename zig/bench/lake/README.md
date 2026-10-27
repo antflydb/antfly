@@ -976,3 +976,77 @@ also checks long predicate bounds in both directions before and after restart.
 Benchmark tooling's 19 tests and storage-audit tooling's 24 tests pass using the
 pinned compiler and worktree caches. Formatting, license and Apache-boundary
 checks pass. No build or E2E work from this task overlaps measured query runs.
+
+
+### Projection-pruned covering delivery
+
+Covering gathers now use a physical-coordinate tree with fixed-size key witnesses.
+They no longer copy complete wide tuple keys through reverse lookup, forward
+lookup and the result. The identity stripe checks the requested physical row and
+its domain-separated key hash. Incremental publication updates this map together
+with forward/reverse roots, preserving retained roots and cover dependencies.
+
+Each covering batch publishes two objects: an authenticated directory and a pack
+of independently authenticated native SQL column stripes. SQL windows read their
+projection and predicate dependencies; ranked gathers read only requested fields.
+The shared scheduler runs at most four joined block reads after exact selected-byte
+admission. Decoded leases, cancellation, workspace limits, upload-scope retention
+and both GC paths include these stripes. Metadata versions 11/12 and reader
+protocol 90 fence workers that cannot interpret this publication layout.
+
+The native structural regression gathers 32 rows with 131,000-byte tuple keys
+under a 256 KiB workspace cap, peaking at **25,980 bytes**. A separate 16-row cover
+pack contains **2,098,000 bytes**; its directory plus the requested identity/scalar
+ranges total **2,427 bytes** of read admission. The unused wide value stripe is not read or
+decoded. These are bounded component measurements, not total query-memory or
+before/after transport measurements. Allocation-failure cases, wrong coordinates,
+wrong key hashes, prepared-reference mismatches, a selected stripe larger than
+1 MiB, and retained-root reads after incremental replacement are checked.
+
+The [covering-projection observation](native-covering-projection-v1-observation.json)
+records hashes, raw timing/profile samples, complete-hit comparison digests and
+all narrow controls. The real Parquet fixture has 256 rows with a 131 KB unused
+relational-key column, native `id` ordering and `store_source: false`. Each query
+returns 128 `id`/`bucket` projections. Three restarts each yield one first query
+and one warm query per executable. The narrow control removes the wide key.
+
+| Query | Cache mode | Reviewed median | Final median |
+|---|---|---:|---:|
+| Wide covering keys | Warm | 792.85 ms | 54.14 ms |
+| Wide covering keys | Process restarted | 1,502.52 ms | 76.98 ms |
+| Narrow-key control | Warm | 51.70 ms | 48.49 ms |
+| Narrow-key control | Process restarted | 63.44 ms | 62.41 ms |
+
+All 12 paired pages preserve complete hits, including scores, sources and sort
+keys, as well as totals and collector work counts (129 candidates/scanned rows,
+128 selected rows and zero cursor rejects). Wide runs execute reviewed then final;
+narrow controls execute final then reviewed. These are sequential local Debug
+observations on a shared host. No build, E2E or cache cleanup from this task overlaps
+measured queries; unrelated worktree compilations were observed. The final binary
+also includes main integration. Restarts retain persistent/OS caches and readiness
+warming. These measurements do not isolate causal, Release, empty-cache, cloud or
+archive-scale latency. The ordinary narrow control shows no observed regression;
+the large wide-key result agrees with the direct allocation and read reductions.
+
+To reproduce with immutable executables built from the recorded revisions:
+
+```sh
+zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/covering_projection.py before-wide /path/to/reviewed-antfly 2b954e55f401ce3b3914404741609c661dfe7f6f
+zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/covering_projection.py after-wide /path/to/final-antfly 8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4
+COVER_CONTROL_NARROW=1 zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/covering_projection.py after-narrow /path/to/final-antfly 8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4
+COVER_CONTROL_NARROW=1 zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/covering_projection.py before-narrow /path/to/reviewed-antfly 2b954e55f401ce3b3914404741609c661dfe7f6f
+```
+
+The checked-in E2E removes the imported Parquet object during HTTP and SQL queries,
+checks both ordering directions, restores the object for replica readiness, then
+repeats after restart. Full-text source storage is disabled, so duplicate source
+rows cannot hide a fallback. The reviewed executable fails this fixture; the new
+covering path passes. The production CLI and all 366 targeted native checks pass
+with one declared benchmark skip, zero failures and zero leaks. Benchmark tooling's
+19 tests, formatting, license, Apache boundary (2,546 sources) and whitespace checks
+pass. Main `e8423151c59b` is merged; the final fetch adds only the HN
+qualification document after executable freezing, with no production-source change.
+
+All **36 selected real Parquet/Iceberg E2Es pass without skips** against the final
+frozen executable, including the new wide covering regression. No runtime source
+changed in the final main merge.
