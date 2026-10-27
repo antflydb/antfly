@@ -2533,6 +2533,13 @@ fn shouldUseCudaPrefillGreedyToken(
         config.grammar == null;
 }
 
+fn shouldUsePreparedQwenPrefillGreedyToken(backend: ops.BackendKind, model: gpt_mod.Config, config: GenerationConfig, allow: bool, needs_host_logits: bool, enabled: bool) bool {
+    return !needs_host_logits and model.hasQwen35VisionArchitectureContract() and
+        config.token_observer == null and config.kv_cache_mode == .exact_hybrid and config.cache_compaction_ratio == null and
+        gpt_arch.canUseFastGreedyArgmaxForConfig(model) and
+        shouldUseCudaPrefillGreedyToken(backend, config, allow, model.suppressTokenIds().len != 0, enabled);
+}
+
 fn directPrefillExecutionMutex(
     prepared_multimodal: bool,
     use_cuda_prefill_greedy_token: bool,
@@ -4124,7 +4131,7 @@ pub const PreEncodedPrompt = struct {
 /// Runs autoregressive decoding: tokenize → loop(gpt_arch.forward → sample → append).
 pub const QwenPrefillBatchHook = struct {
     ptr: *anyopaque,
-    run_fn: *const fn (*anyopaque, *NativeGenerationPipeline, *qwen3vl_projector.PreparedPrompt, usize, *NativeDecodeState) anyerror!?[]f32,
+    run_fn: *const fn (*anyopaque, *NativeGenerationPipeline, *qwen3vl_projector.PreparedPrompt, usize, *NativeDecodeState, bool) anyerror!NativeGenerationPipeline.PrefillOutput,
 };
 
 pub const QwenVisionBatchHook = struct {
@@ -5417,6 +5424,8 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         query_seq_len: usize,
         wants_last_logits: bool,
+        wants_greedy: bool = false,
+        greedy_token: ?u32 = null,
         allow_shared_kv_prefill: bool = false,
         logits: ?[]f32 = null,
         failure: ?anyerror = null,
@@ -6145,7 +6154,14 @@ pub const NativeGenerationPipeline = struct {
         const prefill_output = if (self.checkpoint_resume) |request|
             try self.resumeNativeCheckpoint(request, token_ids[0..seq_len], max_tokens, decode_state, config)
         else if (prepared_qwen3vl_prompt) |*prepared|
-            PrefillOutput{ .last_logits = try self.executePreparedQwen3VlPrefill(prepared, seq_len, decode_state) }
+            try self.executePreparedQwen3VlPrefill(prepared, seq_len, decode_state, shouldUsePreparedQwenPrefillGreedyToken(
+                self.cb.kind(),
+                self.gpt_config,
+                config,
+                allow_prefill_greedy_token and !use_speculative and !has_any_grammar,
+                self.checkpoint_prepare != null or config.qwen3vl_parity_json_path != null or config.qwen3vl_parity_logits_path != null or firstTokenTopKTraceCount() > 0 or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE"),
+                enableCudaPrefillFirstToken() and enableCudaPrefillGreedyToken(),
+            ))
         else if (prepared_multimodal_prompt) |*prepared|
             try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden)
         else
@@ -7177,7 +7193,7 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
-    const PrefillOutput = struct {
+    pub const PrefillOutput = struct {
         last_logits: ?[]f32 = null,
         greedy_token: ?usize = null,
         last_hidden: ?ops.CT = null,
@@ -8265,7 +8281,8 @@ pub const NativeGenerationPipeline = struct {
         prepared: *qwen3vl_projector.PreparedPrompt,
         seq_len: usize,
         decode_state: *NativeDecodeState,
-    ) !?[]f32 {
+        wants_greedy: bool,
+    ) !PrefillOutput {
         if (prepared.plan.tokenCount() != seq_len or !decode_state.isPaged()) return error.InvalidPreparedPrompt;
         // A chunk-sized epoch workspace cannot admit the direct full-prefix
         // fallback. Reject unsupported routing before cache or GPU mutation.
@@ -8274,7 +8291,7 @@ pub const NativeGenerationPipeline = struct {
         try decode_state.ensureQwen35LinearCache(self.gpt_config);
         decode_state.resetQwen35LinearCache();
         if (self.qwen_prefill_batch) |hook| if (prepared.deepstack_layer_count == 0) {
-            return hook.run_fn(hook.ptr, self, prepared, seq_len, decode_state);
+            return hook.run_fn(hook.ptr, self, prepared, seq_len, decode_state, wants_greedy);
         };
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var direct_prefill_turn_acquired = false;
@@ -8322,7 +8339,7 @@ pub const NativeGenerationPipeline = struct {
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
         }
-        return logits;
+        return .{ .last_logits = logits };
     }
 
     const DecodeResult = struct {
@@ -13069,7 +13086,7 @@ pub const NativeGenerationPipeline = struct {
 
     /// Queue a resident visual prefix alongside ordinary decode work. The
     /// scheduler owns the stack-backed work until it publishes completion.
-    pub fn runScheduledPreparedQwenPrefill(self: *NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, state: *NativeDecodeState, seq: usize) ![]f32 {
+    pub fn runScheduledPreparedQwenPrefill(self: *NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, state: *NativeDecodeState, seq: usize, wants_greedy: bool) !PrefillOutput {
         const scheduler = self.scheduler orelse return error.InvalidBatchDecodeState;
         const lease = self.scheduler_lease orelse return error.InvalidBatchDecodeState;
         const io = self.io orelse return error.MissingIo;
@@ -13084,7 +13101,7 @@ pub const NativeGenerationPipeline = struct {
             const final = end == seq;
             var decode_runtime = BorrowedDecodeStateRuntime.init(state);
             const context = decode_runtime.makeDecodeContext(end, query);
-            var work = PendingPrefillBatchWork{ .allocator = self.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .prepared_prompt = prepared };
+            var work = PendingPrefillBatchWork{ .allocator = self.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .wants_greedy = final and wants_greedy, .prepared_prompt = prepared };
             defer if (work.logits) |logits| work.allocator.free(logits);
             try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), end, query, context.kv_sequence_len, context.kv_position_offset, pendingWorkOptionsFromState(state, query));
             defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
@@ -13096,9 +13113,13 @@ pub const NativeGenerationPipeline = struct {
             if (state.total_tokens != end) return error.InvalidBatchDecodeState;
             scheduler.notePrefillProgress(lease, end, seq);
             if (final) {
+                if (work.greedy_token) |token| {
+                    if (!wants_greedy or work.logits != null or token >= self.gpt_config.vocab_size) return error.InvalidBatchDecodeState;
+                    return .{ .greedy_token = token };
+                }
                 const logits = work.logits orelse return error.InvalidBatchDecodeState;
                 work.logits = null;
-                return logits;
+                return .{ .last_logits = logits };
             }
             processed = end;
         }
@@ -13773,16 +13794,38 @@ pub const NativeGenerationPipeline = struct {
             if (all_decode_greedy and prefill_count < claimed.len and !cb.decoderRuntimeHasActiveFrame())
                 gpu_choices = @import("../ops/metal_compute.zig").MetalCompute.reserveLightOnFrameArgmax(cb, claimed.len, cfg.vocab_size);
         }
-        if (cuda_packed) gpu_choices = all_decode_greedy and prefill_count < claimed.len;
+        var greedy_prefills: usize = 0;
+        var host_prefills: usize = 0;
+        for (claimed) |item| if (item.phase == .prefill) {
+            const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+            if (work.wants_greedy) greedy_prefills += 1 else host_prefills += 1;
+        };
+        if (cuda_packed) gpu_choices = all_decode_greedy and (prefill_count < claimed.len or greedy_prefills > 0);
+        const needs_logits = scheduledStepNeedsLogits(claimed);
         const shared_frame = !cuda_packed and self.packed_shared_frame and gpu_choices;
         const trace_frame = platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3");
         const before_submits = if (trace_frame) cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits else 0;
-        // Greedy decode returns token IDs. Only prefills retain independent
-        // vocabulary rows, so admission follows the actual output lifetime.
-        const host_rows = if (gpu_choices) prefill_count else claimed.len;
+        // Device-greedy rows return token IDs. Only host-sampled prefixes
+        // retain vocabulary rows and their independent publication copies.
+        const host_rows = if (!needs_logits) 0 else if (gpu_choices) host_prefills else claimed.len;
         const logits_bytes = try std.math.mul(usize, try std.math.mul(usize, host_rows, cfg.vocab_size), 2 * @sizeOf(f32));
         const positions_bytes = try std.math.mul(usize, total, 3 * @sizeOf(u32));
         const host_bytes = try std.math.add(usize, try std.math.add(usize, logits_bytes, positions_bytes), (if (claimed.len > 64) @as(usize, 64) else 32) * 1024);
+        var recurrent_groups: usize = 0;
+        var recurrent_rows: usize = 0;
+        var attention_groups: usize = 0;
+        var attention_rows: usize = 0;
+        var forward_completed = false;
+        defer if (forward_completed) {
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_items={d} packed_step_decode_items={d} packed_step_query_rows={d}\n", .{ prefill_count, claimed.len - prefill_count, total });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_starts={d} packed_step_prefill_finishes={d} prepared_prefill_chunk_rows={d}\n", .{ prefix_starts, prefix_finishes, self.prepared_qwen_prefill_chunk_rows });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_recurrent_groups={d} packed_recurrent_rows={d}\n", .{ recurrent_groups, recurrent_rows });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_attention_groups={d} packed_attention_rows={d}\n", .{ attention_groups, attention_rows });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_input_frames={d} packed_cuda_steps={d}\n", .{ @intFromBool(!cuda_packed), @intFromBool(cuda_packed) });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_decode_rows={d} packed_cpu_logit_rows={d} packed_standalone_wide_heads={d}\n", .{ if (needs_logits and gpu_choices) claimed.len - prefill_count else 0, host_rows, @intFromBool(needs_logits and !gpu_choices and claimed.len > 16) });
+            if (trace_frame) std.debug.print("LIGHTONOCR3 packed_shared_frame={d} packed_forward_submissions={d}\n", .{ @intFromBool(shared_frame), cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits -| before_submits });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_prefill_rows={d} packed_skipped_prefix_heads={d}\n", .{ if (needs_logits and gpu_choices) greedy_prefills else 0, if (!needs_logits) prefill_count else 0 });
+        };
         const session = self.session orelse return error.InvalidBatchDecodeState;
         var host_lease = try session.admitHostPreprocess(host_bytes);
         errdefer host_lease.deinit();
@@ -13805,10 +13848,6 @@ pub const NativeGenerationPipeline = struct {
         }
         var owned = try buildOwnedMixedBatchDecodeContextLayout(a, mixed[0..claimed.len], positions, lengths[0..claimed.len]);
         defer owned.deinit();
-        var recurrent_groups: usize = 0;
-        var recurrent_rows: usize = 0;
-        var attention_groups: usize = 0;
-        var attention_rows: usize = 0;
         owned.context.packed_recurrent_groups = &recurrent_groups;
         owned.context.packed_recurrent_rows = &recurrent_rows;
         owned.context.packed_attention_groups = &attention_groups;
@@ -13856,6 +13895,9 @@ pub const NativeGenerationPipeline = struct {
         const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(cb, a, cfg, combined, .{}, 1, total, &owned.context, null);
         defer cb.free(hidden.hidden);
         if (hidden.total_rows != total) return error.InvalidTensorShape;
+        forward_completed = true;
+        if (!needs_logits) return .{ .logits = null, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
+
         // One gather selects every page's final row. In the shared-frame path
         // the model borrows the producer frame, which is still active here.
         var last_indices: [gpt_arch.max_packed_qwen_items]i64 = undefined;
@@ -13886,10 +13928,10 @@ pub const NativeGenerationPipeline = struct {
         // host arrays escape this forward; all device views retire below.
         var gathered_prefix_logits: ?ops.CT = null;
         defer if (gathered_prefix_logits) |tensor| cb.free(tensor);
-        if (shared_frame) {
+        if (shared_frame and host_rows != 0) {
             var rows: [gpt_arch.max_packed_qwen_items]i64 = undefined;
             var count: usize = 0;
-            for (claimed, 0..) |item, index| if (item.phase == .prefill) {
+            for (claimed, 0..) |item, index| if (item.phase == .prefill and !@as(*PendingPrefillBatchWork, @ptrCast(@alignCast(item.work_ptr))).wants_greedy) {
                 rows[count] = @intCast(index);
                 count += 1;
             };
@@ -13906,18 +13948,18 @@ pub const NativeGenerationPipeline = struct {
             }
         }
         if (cuda_packed and gpu_choices) {
-            // Keep decode logits on the CUDA stream. Prefix rows retain the
-            // existing independently admitted F32 sampling/publication path.
+            // Greedy prefix and decode rows share the existing suppressed
+            // device argmax. Sampled prefixes retain admitted F32 logits.
             tokens = try cb.argmaxRowsSuppress(logits, 0, claimed.len, cfg.vocab_size, cfg.suppressTokenIds(), a) orelse return error.ResidentImageOperationUnavailable;
             if (tokens.?.len != claimed.len) return error.InvalidBatchDecodeState;
         }
-        // A pure decode packet has no prefix rows to sample on the CPU.
+        // A fully device-greedy packet has no vocabulary rows for the CPU.
         // Keep an owned empty slice for the existing publication contract;
         // do not dispatch an embedding gather with zero rows.
-        const host = if (gpu_choices and prefill_count == 0) try a.alloc(f32, 0) else if (gathered_prefix_logits) |tensor| try cb.toFloat32(tensor, a) else if (gpu_choices) blk: {
+        const host = if (gpu_choices and host_rows == 0) try a.alloc(f32, 0) else if (gathered_prefix_logits) |tensor| try cb.toFloat32(tensor, a) else if (gpu_choices) blk: {
             var rows: [gpt_arch.max_packed_qwen_items]i64 = undefined;
             var count: usize = 0;
-            for (claimed, 0..) |item, index| if (item.phase == .prefill) {
+            for (claimed, 0..) |item, index| if (item.phase == .prefill and !@as(*PendingPrefillBatchWork, @ptrCast(@alignCast(item.work_ptr))).wants_greedy) {
                 rows[count] = @intCast(index);
                 count += 1;
             };
@@ -13926,13 +13968,6 @@ pub const NativeGenerationPipeline = struct {
             break :blk try cb.toFloat32(prefix_logits, a);
         } else try cb.toFloat32(logits, a);
         gpt_arch.applyFinalLogitSoftcapInPlace(cfg, host);
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_items={d} packed_step_decode_items={d} packed_step_query_rows={d}\n", .{ prefill_count, claimed.len - prefill_count, total });
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_starts={d} packed_step_prefill_finishes={d} prepared_prefill_chunk_rows={d}\n", .{ prefix_starts, prefix_finishes, self.prepared_qwen_prefill_chunk_rows });
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_recurrent_groups={d} packed_recurrent_rows={d}\n", .{ recurrent_groups, recurrent_rows });
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_attention_groups={d} packed_attention_rows={d}\n", .{ attention_groups, attention_rows });
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_input_frames={d} packed_cuda_steps={d}\n", .{ @intFromBool(!cuda_packed), @intFromBool(cuda_packed) });
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_decode_rows={d} packed_cpu_logit_rows={d} packed_standalone_wide_heads={d}\n", .{ if (gpu_choices) claimed.len - prefill_count else 0, host_rows, @intFromBool(!gpu_choices and claimed.len > 16) });
-        if (trace_frame) std.debug.print("LIGHTONOCR3 packed_shared_frame={d} packed_forward_submissions={d}\n", .{ @intFromBool(shared_frame), cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits -| before_submits });
         return .{ .logits = host, .packed_greedy_tokens = tokens, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
     }
 
@@ -14451,12 +14486,23 @@ pub const NativeGenerationPipeline = struct {
         var prefills: usize = 0;
         var valid = tokens.len == claimed.len;
         for (claimed) |item| switch (item.phase) {
-            .prefill => prefills += 1,
+            .prefill => {
+                const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                if (work.wants_greedy) {
+                    valid = valid and work.wants_last_logits;
+                } else prefills += 1;
+            },
             .decode => {
                 const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                 valid = valid and work.wants_greedy;
             },
             .waiting => valid = false,
+        };
+        if (valid) for (claimed, tokens) |item, token| {
+            if (item.phase == .prefill) {
+                const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                if (work.wants_greedy and token >= vocab_size) valid = false;
+            }
         };
         const expected = std.math.mul(usize, prefills, vocab_size) catch {
             markStepFailed(claimed, error.InvalidBatchDecodeState);
@@ -14471,13 +14517,15 @@ pub const NativeGenerationPipeline = struct {
             .decode => publishGreedyToken(@ptrCast(@alignCast(item.work_ptr)), token),
             .prefill => {
                 const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                if (work.wants_last_logits) {
+                if (work.wants_greedy) {
+                    work.greedy_token = token;
+                } else if (work.wants_last_logits) {
                     work.logits = work.allocator.dupe(f32, logits.?[row * vocab_size ..][0..vocab_size]) catch |err| blk: {
                         work.failure = err;
                         break :blk null;
                     };
                 }
-                row += 1;
+                row += @intFromBool(!work.wants_greedy);
                 work.ready.store(true, .release);
             },
             .waiting => unreachable,
@@ -20293,10 +20341,10 @@ test "LightOnOCR3 bounded chunk workspace rejects direct fallback before cache m
     var visual = [_]bool{true};
     var prompt = qwen3vl_projector.PreparedPrompt{ .allocator = a, .token_ids = &ids, .input_embeddings = null, .plan = .{ .allocator = a, .mrope_positions = &axes, .causal_positions = &causal, .visual_token_mask = &visual, .visual_spans = &.{}, .mrope_position_delta = 0 }, .deepstack_embeddings = &.{}, .deepstack_layer_count = 0 };
     var pipeline = NativeGenerationPipeline{ .allocator = a, .cb = undefined, .gpt_config = .{}, .tokenizer = undefined, .prepared_qwen_prefill_chunk_rows = 128 };
-    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state));
+    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state, false));
     try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
     prompt.deepstack_layer_count = 1;
-    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state));
+    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state, false));
     try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
 }
 
@@ -20397,5 +20445,61 @@ test "LightOnOCR3 CUDA wide graph contexts own explicit unequal page positions t
         };
         @memset(&states[0].qwen3vl_decode_positions, 99999);
         try std.testing.expectEqual(@as(u32, 103), owned.context.mrope_positions.?[0]);
+    }
+}
+
+test "LightOnOCR3 CUDA prepared prefill greedy eligibility preserves sampled constrained and raw output requests" {
+    const model = try gpt_mod.parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config.json"));
+    try std.testing.expect(shouldUsePreparedQwenPrefillGreedyToken(.cuda, model, .{}, true, false, true));
+    for ([_]ops.BackendKind{ .native, .metal }) |backend| try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(backend, model, .{}, true, false, true));
+    for ([_]GenerationConfig{ .{ .temperature = 0.2 }, .{ .grammar = "json" }, .{ .repetition_penalty = 1.1 }, .{ .presence_penalty = 1 }, .{ .kv_cache_mode = .select_v1 }, .{ .cache_compaction_ratio = 0.5 } }) |config| try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, model, config, true, false, true));
+    try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, model, .{}, false, false, true));
+    try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, model, .{}, true, true, true));
+    try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, model, .{}, true, false, false));
+    var softcap = model;
+    softcap.final_logit_softcapping = 10;
+    try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, softcap, .{}, true, false, true));
+}
+
+test "LightOnOCR3 packed prefix publication separates device choices host logits and intermediate chunks" {
+    const P = NativeGenerationPipeline;
+    const a = std.testing.allocator;
+    // Per-work host allocation failure must not erase a completed GPU choice
+    // or leave an intermediate chunk waiting. Invalid GPU IDs fail the whole
+    // claim before any result is published.
+    for ([_]u8{ 0, 1, 2, 3 }) |mode| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var sampled = P.PendingPrefillBatchWork{ .allocator = if (mode == 1) failing.allocator() else a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = true };
+        defer if (sampled.logits) |values| sampled.allocator.free(values);
+        var greedy = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = mode != 3, .wants_greedy = true };
+        var middle = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = false };
+        var decode = P.PendingDecodeBatchWork{ .allocator = a, .decode_state = undefined, .token_id = 0, .seq_len = 1, .wants_greedy = true };
+        const Item = runtime.scheduler.native_generate.StepItem;
+        const items = [_]Item{
+            .{ .work_ptr = &sampled, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+            .{ .work_ptr = &decode, .phase = .decode, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+            .{ .work_ptr = &greedy, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+            .{ .work_ptr = &middle, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
+        };
+        const logits = [_]f32{ 0.3, 0.2, 0.1, 111, 222, 333 };
+        P.dispatchPackedGreedyResults(3, &items, &logits, &.{ 99, 1, if (mode == 2) 3 else 2, 99 });
+        try std.testing.expect(sampled.ready.load(.acquire) and greedy.ready.load(.acquire) and middle.ready.load(.acquire) and decode.ready.load(.acquire));
+        if (mode >= 2) {
+            try std.testing.expectEqual(error.InvalidBatchDecodeState, sampled.failure.?);
+            try std.testing.expectEqual(error.InvalidBatchDecodeState, greedy.failure.?);
+            try std.testing.expectEqual(error.InvalidBatchDecodeState, middle.failure.?);
+            try std.testing.expectEqual(error.InvalidBatchDecodeState, decode.failure.?);
+            try std.testing.expect(greedy.greedy_token == null and decode.greedy_token == null and sampled.logits == null);
+            continue;
+        }
+        try std.testing.expectEqual(@as(?u32, 2), greedy.greedy_token);
+        try std.testing.expectEqual(@as(?u32, 1), decode.greedy_token);
+        try std.testing.expect(greedy.logits == null and middle.logits == null and middle.greedy_token == null);
+        if (mode == 1) {
+            try std.testing.expectEqual(error.OutOfMemory, sampled.failure.?);
+        } else {
+            try std.testing.expectEqualSlices(f32, logits[0..3], sampled.logits.?);
+            try std.testing.expect(sampled.failure == null);
+        }
     }
 }

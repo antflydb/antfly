@@ -8244,16 +8244,16 @@ pub const Node = struct {
     const LightOnPrefillPayload = struct {
         item: generation.NativeGenerationPipeline.PreparedQwenPrefillItem,
     };
-    fn batchLightOnPreparedPrefill(raw: *anyopaque, pipeline: *generation.NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, seq: usize, state: *generation.NativeDecodeState) !?[]f32 {
+    fn batchLightOnPreparedPrefill(raw: *anyopaque, pipeline: *generation.NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, seq: usize, state: *generation.NativeDecodeState, wants_greedy: bool) !generation.NativeGenerationPipeline.PrefillOutput {
         const request: *LightOnVisionRequest = @ptrCast(@alignCast(raw));
         try request.control.check();
         const lease = pipeline.scheduler_lease orelse return error.InvalidBatchDecodeState;
         if (request.ctx.features.packed_mixed) {
-            const logits = try pipeline.runScheduledPreparedQwenPrefill(prepared, state, seq);
-            errdefer pipeline.allocator.free(logits);
+            const output = try pipeline.runScheduledPreparedQwenPrefill(prepared, state, seq, wants_greedy);
+            errdefer if (output.last_logits) |logits| pipeline.allocator.free(logits);
             try request.control.check();
             request.ctx.coordinator.beginDecode(lease, seq);
-            return logits;
+            return output;
         }
         // Collection stays waiting until the broker seals its group.
         const payload = LightOnPrefillPayload{ .item = .{ .pipeline = pipeline, .prepared = prepared, .seq_len = seq, .state = state } };
@@ -8276,7 +8276,7 @@ pub const Node = struct {
         try request.control.check();
         // No manual prefill work remains while the caller samples its first token.
         request.ctx.coordinator.beginDecode(lease, seq);
-        return logits;
+        return .{ .last_logits = logits };
     }
 
     /// The broker executes synchronously on its leader's Io task. Retain that
