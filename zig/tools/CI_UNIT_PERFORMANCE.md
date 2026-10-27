@@ -769,5 +769,9 @@ reuses the already validated active graph and its reference counts, while the
 fallback checkpoint, pending retirements, CRCs, and exact reference counts are
 still checked. The 33 allocator regressions pass, including positive-but-wrong
 reference counts, corrupt values, cancellation, shared ownership, and denied
-optional scratch admission. The optimized real-file measurement of this further
-traversal reduction is pending.
+optional scratch admission. With the same optimized build settings and copied
+file, the additional traversal reduction lowered first-write time from 62.974 to
+34.599 seconds (36.702 seconds including open/close), versus the original
+138.308-second first write. The existing 337,798 raw and 108,532 normalized rows
+were retained after creating the probe table. Both optimized builds passed all
+47 steps; the complete import above was measured before graph reuse.
