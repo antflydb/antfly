@@ -3489,6 +3489,74 @@ pub const CudaCompute = struct {
         return output;
     }
 
+    fn canBorrowLightOnRecurrentWeight(self: *CudaCompute, tensor: *const CudaTensor) bool {
+        return self.lighton_shared_recurrent_weights_enabled and self.capability_profile == .lightonocr3 and
+            self.lazy_host_store == null and !self.resident_training_cache and !tensor.strict_resident_training and
+            tensor.dtype == .f32 and !tensor.owns_buffer and residentTensorForSlot(self, tensor) == tensor;
+    }
+
+    /// Pack a fresh pooled state without adding bytes or cache entries for
+    /// its views. Existing independent states retain their storage contract.
+    fn preparePackedLightOnRecurrentState(self: *CudaCompute, state: *@import("lighton_recurrent.zig").State, weights: [4]CT, weight_counts: [4]usize, channels: usize, vh: usize) !bool {
+        if (state.packed_storage.ptr != 0 or state.history[0].ptr != 0 or state.history[1].ptr != 0 or state.recurrent.ptr != 0) return false;
+        for (state.weights) |weight| if (weight.ptr != 0) return false;
+        if (!lightOnStatePoolEnabled(self)) return false;
+        const history_bytes = try checkedMul(channels, 4 * @sizeOf(f32));
+        const recurrent_bytes = try checkedMul(try checkedMul(vh, 128 * 128), @sizeOf(f32));
+        var bytes = try checkedAdd(try checkedMul(history_bytes, 2), recurrent_bytes);
+        var borrowed: [4]bool = undefined;
+        var sources: [4]driver_mod.CUdeviceptr = undefined;
+        for (weights, weight_counts, &borrowed, &sources) |weight, count, *borrow, *source| {
+            const tensor = tensorFromCt(weight);
+            borrow.* = self.canBorrowLightOnRecurrentWeight(tensor);
+            source.* = tensor.buffer.ptr;
+            if (!borrow.*) bytes = try checkedAdd(bytes, try checkedMul(count, @sizeOf(f32)));
+        }
+        var storage = try allocLightOnStateBuffer(self, bytes);
+        errdefer {
+            // An accepted widening/copy must drain before a failed unpublished
+            // owner can be freed. Failure never publishes partial descriptors.
+            self.ctx.synchronize() catch {};
+            storage.free(&self.ctx);
+        }
+        const history = [_]buffer_mod.DeviceBuffer{
+            .{ .ptr = storage.ptr, .len = history_bytes, .borrowed = true },
+            .{ .ptr = storage.ptr + history_bytes, .len = history_bytes, .borrowed = true },
+        };
+        const recurrence = buffer_mod.DeviceBuffer{ .ptr = storage.ptr + 2 * history_bytes, .len = recurrent_bytes, .borrowed = true };
+        var offset = 2 * history_bytes + recurrent_bytes;
+        var snapshots: [4]buffer_mod.DeviceBuffer = undefined;
+        var ownership: [4]bool = undefined;
+        var borrow_count: usize = 0;
+        for (weights, weight_counts, borrowed, &snapshots, &ownership) |weight, count, borrow, *snapshot, *owned| {
+            const tensor = tensorFromCt(weight);
+            owned.* = !borrow;
+            if (borrow) {
+                snapshot.* = tensor.buffer;
+                borrow_count += 1;
+                continue;
+            }
+            const weight_bytes = try checkedMul(count, @sizeOf(f32));
+            snapshot.* = .{ .ptr = storage.ptr + offset, .len = weight_bytes, .borrowed = true };
+            if (tensor.dtype == .f32) {
+                try copyFromDeviceTracked(self, snapshot.*, tensor.buffer, weight_bytes);
+            } else {
+                try self.scalar_clamp_kernel.widen16Bit(&self.ctx, tensor.buffer.ptr, snapshot.ptr, count, tensor.dtype == .bf16);
+            }
+            offset += weight_bytes;
+        }
+        std.debug.assert(offset == storage.len);
+        state.packed_storage = storage;
+        state.history = history;
+        state.recurrent = recurrence;
+        state.weights = snapshots;
+        state.owns_weights = ownership;
+        state.weight_sources = sources;
+        self.lighton_shared_recurrent_weight_borrows += borrow_count;
+        self.lighton_packed_state_calls += 1;
+        return true;
+    }
+
     fn prepareLightOnRecurrentState(self: *CudaCompute, state: *@import("lighton_recurrent.zig").State, weights: [4]CT, weight_counts: [4]usize, kh: usize, vh: usize, pre_admitted: bool) !void {
         if (lightOnStatePoolEnabled(self)) {
             state.release_context = self;
@@ -3509,6 +3577,7 @@ pub const CudaCompute = struct {
             state.key_heads = kh;
             state.value_heads = vh;
         }
+        if (try self.preparePackedLightOnRecurrentState(state, weights, weight_counts, channels, vh)) return;
         // Persistent state bypasses scratch arenas and oversized temporary reuse.
         // DeviceBuffer admission charges every physical allocation to this session.
         state.ctx = &self.ctx;
@@ -3523,11 +3592,7 @@ pub const CudaCompute = struct {
             const tensor = tensorFromCt(weight);
             // Resident scalar/vector weights are immutable and model-owned.
             // A page state cannot outlive this same model's CUDA context.
-            if (self.lighton_shared_recurrent_weights_enabled and self.capability_profile == .lightonocr3 and
-                self.lazy_host_store == null and !self.resident_training_cache and !tensor.strict_resident_training and
-                tensor.dtype == .f32 and !tensor.owns_buffer and
-                residentTensorForSlot(self, tensor) == tensor)
-            {
+            if (self.canBorrowLightOnRecurrentWeight(tensor)) {
                 state.weights[i] = tensor.buffer;
                 state.owns_weights[i] = false;
                 state.weight_sources[i] = tensor.buffer.ptr;
@@ -3729,6 +3794,7 @@ pub const CudaCompute = struct {
     lighton_shared_recurrent_weights_enabled: bool = false,
     lighton_state_pool_hits: usize = 0,
     lighton_state_pool_misses: usize = 0,
+    lighton_packed_state_calls: usize = 0,
     lighton_state_pool_releases: std.atomic.Value(usize) = .init(0),
     lighton_shared_recurrent_weight_borrows: usize = 0,
     lighton_parallel_prefix: bool = false,
@@ -4892,6 +4958,8 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_ragged_batch_calls={d} cuda_ragged_query_rows={d}\n", .{ self.lighton_recurrent.ragged_batch_calls, self.lighton_recurrent.ragged_query_rows });
             std.debug.print("LIGHTONOCR3 cuda_state_pool_hits={d} cuda_state_pool_misses={d} cuda_state_pool_releases={d} cuda_shared_recurrent_weight_borrows={d}\n", .{ self.lighton_state_pool_hits, self.lighton_state_pool_misses, self.lighton_state_pool_releases.load(.monotonic), self.lighton_shared_recurrent_weight_borrows });
         }
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_packed_state_calls={d} cuda_rms_norm_bf16_mirror_hits={d} activation_mirror_hits={d}\n", .{ self.lighton_packed_state_calls, self.stats.rms_norm_bf16_mirror_hits, self.stats.bf16_cublaslt_activation_mirror_hits });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_gdn_decode_calls={d} cuda_fused_gdn_decode_pages={d}\n", .{ self.lighton_recurrent.fused_decode_calls, self.lighton_recurrent.fused_decode_pages });
         if (self.lighton_recurrent.bf16_prefill) |prefill| {
@@ -33984,7 +34052,7 @@ fn checkLightOnStateRecycling() !void {
     const a = std.testing.allocator;
     const recurrent = @import("lighton_recurrent.zig");
     const memory = @import("../../runtime/tier/memory.zig");
-    for ([_]usize{ 16, 32 }) |vh| {
+    for ([_]bool{ false, true }) |conv_bf16| for ([_]usize{ 16, 32 }) |vh| {
         var controller = memory.AdmissionController{};
         var compute = try CudaCompute.init(a);
         var owned = true;
@@ -34011,8 +34079,16 @@ fn checkLightOnStateRecycling() !void {
                 else => @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 64,
             };
             const shape = [_]i64{@intCast(count)};
-            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(frozen[wi]), .dtype = .f32, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
-            try compute.insertWeightFromTensor(try a.dupe(u8, name), &tensor);
+            if (conv_bf16 and wi == 0) {
+                const bits = try a.alloc(u16, count);
+                defer a.free(bits);
+                for (bits, frozen[wi]) |*value, f| value.* = f32ToBf16BitsRoundNearestEven(f);
+                const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(bits), .dtype = .bf16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+                try compute.insertBf16WeightFromTensor(try a.dupe(u8, name), &tensor);
+            } else {
+                const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(frozen[wi]), .dtype = .f32, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+                try compute.insertWeightFromTensor(try a.dupe(u8, name), &tensor);
+            }
         }
         var weights: [4]CT = undefined;
         for (names, &weights) |name, *weight| weight.* = try cb.getWeight(name);
@@ -34020,18 +34096,50 @@ fn checkLightOnStateRecycling() !void {
         try compute.configureEmbeddingGemma2Admission(.{ .controller = &controller, .limits = .{ .backend_limit_bytes = baseline + 64 * 1024 * 1024, .scratch_limit_bytes = 256 * 1024 * 1024 }, .check_live_memory = false });
         const retained = controller.snapshot().backend_scratch_bytes;
         try std.testing.expect(retained != 0);
+        // A one-byte-short physical limit cannot publish any packed view or
+        // leave partial allocations behind. The retained cache charge survives.
+        const expected_bytes = 2 * c * 4 * 4 + vh * 128 * 128 * 4 + if (conv_bf16) counts[0] * 4 else @as(usize, 0);
+        const allocation_before = compute.ctx.device_allocations.snapshot();
+        try compute.ctx.device_allocations.setLimit(allocation_before.live + expected_bytes - 1);
+        var denied: recurrent.State = .{};
+        try std.testing.expectError(error.CudaMemoryLimitExceeded, compute.prepareLightOnRecurrentState(&denied, weights, counts, 16, vh, true));
+        try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), denied.packed_storage.ptr);
+        try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), denied.recurrent.ptr);
+        for (denied.history) |view| try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), view.ptr);
+        for (denied.weights) |view| try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), view.ptr);
+        denied.deinit();
+        try std.testing.expectEqual(allocation_before.live, compute.ctx.device_allocations.snapshot().live);
+        try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
+        try compute.ctx.device_allocations.setLimit(allocation_before.limit);
         var first: recurrent.State = .{};
         defer first.deinit();
         try compute.prepareLightOnRecurrentState(&first, weights, counts, 16, vh, false);
-        for (weights, first.weights, first.owns_weights) |source, weight, ownership| {
-            try std.testing.expectEqual(tensorFromCt(source).buffer.ptr, weight.ptr);
-            try std.testing.expect(!ownership);
+        for (weights, first.weights, first.owns_weights, 0..) |source, weight, ownership, wi| {
+            if (conv_bf16 and wi == 0) {
+                try std.testing.expect(ownership and weight.borrowed);
+                try std.testing.expect(weight.ptr != tensorFromCt(source).buffer.ptr);
+            } else {
+                try std.testing.expectEqual(tensorFromCt(source).buffer.ptr, weight.ptr);
+                try std.testing.expect(!ownership);
+            }
         }
+        try std.testing.expectEqual(expected_bytes, first.packed_storage.len);
         const first_buffers = [_]buffer_mod.DeviceBuffer{ first.history[0], first.history[1], first.recurrent };
+        const first_owner = first.packed_storage;
+        try std.testing.expect(first_owner.ptr != 0 and !first_owner.borrowed);
+        for (first_buffers) |view| {
+            try std.testing.expect(view.borrowed and view.allocation_bytes == 0);
+            try std.testing.expect(view.ptr >= first_owner.ptr and view.ptr + view.len <= first_owner.ptr + first_owner.len);
+        }
         for (first_buffers) |buffer| try compute.kernels.launchFillF32(&compute.ctx, buffer, buffer.len / 4, std.math.nan(f32));
         try compute.ctx.synchronize();
         const first_live = compute.ctx.device_allocations.snapshot().live;
+        const cached_before = compute.temp_buffers.items.len;
+        const releases_before = compute.lighton_state_pool_releases.load(.monotonic);
         first.deinit();
+        try std.testing.expectEqual(cached_before + 1, compute.temp_buffers.items.len);
+        try std.testing.expectEqual(releases_before + 1, compute.lighton_state_pool_releases.load(.monotonic));
+        for (compute.temp_buffers.items) |entry| try std.testing.expect(!entry.borrowed);
         // The independent cache owner funds retired storage after the page's
         // own lease is gone. No allocation is freed or left unreserved.
         try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
@@ -34052,7 +34160,7 @@ fn checkLightOnStateRecycling() !void {
             try std.testing.expect(found);
             for (reused[0..i]) |prior| try std.testing.expect(prior.ptr != buffer.ptr);
         }
-        try std.testing.expect(compute.lighton_state_pool_hits >= 3);
+        try std.testing.expect(compute.lighton_state_pool_hits >= 1);
         // Compare fresh execution from poisoned recycled storage with the
         // original independently allocated/cloned state, without changing math.
         compute.lighton_state_pool_enabled = false;
@@ -34095,13 +34203,14 @@ fn checkLightOnStateRecycling() !void {
             try std.testing.expectEqualSlices(u8, l, r);
         }
         // Failed states bypass retention, while borrowed model weights remain
-        // intact. Every buffer is independently freed exactly once.
+        // intact. The packed owner is freed exactly once; views never recycle.
         const before_failure = compute.ctx.device_allocations.snapshot().live;
-        var state_bytes: usize = 0;
-        for (reused) |buffer| state_bytes += buffer.len;
+        const state_bytes = actual.packed_storage.len;
+        const before_failed_releases = compute.lighton_state_pool_releases.load(.monotonic);
         actual.failed = true;
         actual.deinit();
         try std.testing.expectEqual(before_failure - state_bytes, compute.ctx.device_allocations.snapshot().live);
+        try std.testing.expectEqual(before_failed_releases, compute.lighton_state_pool_releases.load(.monotonic));
         reference.deinit();
         try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
         // Mutable external aliases must retain the old independent snapshot.
@@ -34148,7 +34257,7 @@ fn checkLightOnStateRecycling() !void {
         compute.deinit();
         owned = false;
         try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
-    }
+    };
 }
 
 test "LightOnOCR3 CUDA fused vision QKV preserves cuDNN inputs output and readonly packed storage" {
@@ -34641,15 +34750,29 @@ test "LightOnOCR3 CUDA 128 page recurrent partitioning preserves both original 6
                 for (&states) |*state| try std.testing.expect(state.ctx == null);
                 // Poison the same independent storage before fresh execution,
                 // so untouched inactive history also has a strict bit oracle.
-                for (0..128) |index| for ([_]*recurrent.State{ &states[index], &references[index] }) |state| {
-                    try compute.prepareLightOnRecurrentState(state, weights, counts, 16, vh, false);
-                    for ([_]buffer_mod.DeviceBuffer{ state.history[0], state.history[1], state.recurrent }) |buffer|
-                        try compute.kernels.launchFillF32(&compute.ctx, buffer, buffer.len / 4, std.math.nan(f32));
-                };
+                for (0..128) |index| {
+                    compute.lighton_state_pool_enabled = true;
+                    try compute.prepareLightOnRecurrentState(&states[index], weights, counts, 16, vh, false);
+                    compute.lighton_state_pool_enabled = false;
+                    try compute.prepareLightOnRecurrentState(&references[index], weights, counts, 16, vh, false);
+                    for ([_]*recurrent.State{ &states[index], &references[index] }) |state| {
+                        for ([_]buffer_mod.DeviceBuffer{ state.history[0], state.history[1], state.recurrent }) |buffer|
+                            try compute.kernels.launchFillF32(&compute.ctx, buffer, buffer.len / 4, std.math.nan(f32));
+                    }
+                }
             }
             const before_groups = compute.lighton_recurrent.ragged_batch_calls;
+            compute.lighton_state_pool_enabled = true;
             const actual = (try CudaCompute.qwen35LinearCoreRaggedBatch(&cb, &pointers, &lengths, request)) orelse return error.UnsupportedOperation;
             defer cb.free(actual);
+            for (states) |state| {
+                try std.testing.expect(state.packed_storage.ptr != 0);
+                for ([_]buffer_mod.DeviceBuffer{ state.history[0], state.history[1], state.recurrent }) |view| {
+                    try std.testing.expect(view.borrowed and view.allocation_bytes == 0);
+                    try std.testing.expect(view.ptr >= state.packed_storage.ptr and view.ptr + view.len <= state.packed_storage.ptr + state.packed_storage.len);
+                }
+            }
+            compute.lighton_state_pool_enabled = false;
             try std.testing.expectEqual(before_groups + 2, compute.lighton_recurrent.ragged_batch_calls);
             const got = try cb.toFloat32(actual, a);
             defer a.free(got);

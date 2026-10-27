@@ -21,6 +21,9 @@ pub const State = struct {
     ctx: ?*context.CudaContext = null,
     history: [2]buffer.DeviceBuffer = .{ .{}, .{} },
     recurrent: buffer.DeviceBuffer = .{},
+    /// One physical owner for pooled history, recurrence and owned weight
+    /// snapshots. Their descriptors are borrowed, non-overlapping views.
+    packed_storage: buffer.DeviceBuffer = .{},
     weights: [4]buffer.DeviceBuffer = .{ .{}, .{}, .{}, .{} },
     owns_weights: [4]bool = @splat(true),
     // The compute/session owner already outlives ctx and every page state.
@@ -40,6 +43,11 @@ pub const State = struct {
     }
 
     fn releaseOwned(self: *State, ctx: *context.CudaContext, value: *buffer.DeviceBuffer) void {
+        // A packed view must never become an independently cached alias.
+        if (value.borrowed) {
+            value.free(ctx);
+            return;
+        }
         if (!self.failed) if (self.release_buffer) |release| {
             release(self.release_context.?, value);
             return;
@@ -52,6 +60,7 @@ pub const State = struct {
             for (&self.history) |*value| self.releaseOwned(ctx, value);
             self.releaseOwned(ctx, &self.recurrent);
             for (&self.weights, self.owns_weights) |*value, owned| if (owned) self.releaseOwned(ctx, value);
+            self.releaseOwned(ctx, &self.packed_storage);
         }
         if (self.admission) |*lease| lease.release();
         self.* = .{};
