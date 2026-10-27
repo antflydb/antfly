@@ -17,7 +17,7 @@
 //! this buffer only after the first notice and release it at the statement cut.
 const std = @import("std");
 pub const Notice = struct { code: []const u8 = "00000", message: []const u8 };
-pub const Sink = struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Notice) anyerror!void };
+pub const Sink = struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Notice) anyerror!void, reserve: ?*const fn (*anyopaque, usize, usize) anyerror!void = null };
 pub const Buffer = struct {
     pub const max_count = 256;
     pub const max_bytes = 64 * 1024;
@@ -27,6 +27,9 @@ pub const Buffer = struct {
     count: usize = 0,
     bytes: usize = 0,
     sent: usize = 0,
+    pub fn reserve(self: *const Buffer, count: usize, bytes: usize) !void {
+        if (count > max_count - self.count or bytes > max_bytes - self.bytes) return error.SqlProgramLimitExceeded;
+    }
     pub fn append(self: *Buffer, notice: Notice) !void {
         if (notice.code.len != 5 or !std.unicode.utf8ValidateSlice(notice.message) or std.mem.indexOfScalar(u8, notice.message, 0) != null) return error.InvalidSqlBackendResponse;
         if (self.count >= max_count or notice.message.len > max_bytes - self.bytes) return error.SqlProgramLimitExceeded;

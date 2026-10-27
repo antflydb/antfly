@@ -28,10 +28,16 @@ pub const SnapshotRequest = struct {
     expected_revision: ?u64 = null,
     /// Presentation metadata is excluded from hot-path execution capture.
     include_description: bool = false,
+    kind: ?records.Kind = null,
+    reference: ?records.FunctionReference = null,
     signature: ?[]const u8 = null,
     arguments: ?[]const records.Input = null,
     pub fn validate(self: @This()) !void {
-        if (self.targets.len == 0 or self.targets.len > 64 or (self.signature != null and self.arguments != null)) return error.InvalidCatalogMutation;
+        if ((self.targets.len == 0 and self.reference == null) or self.targets.len > 64 or (self.signature != null and self.arguments != null)) return error.InvalidCatalogMutation;
+        if (self.reference) |reference| {
+            try reference.validate();
+            if (self.targets.len != 0 or self.signature != null or self.arguments != null or self.kind != null) return error.InvalidCatalogMutation;
+        }
         for (self.targets) |target| try target.validate();
         if (self.signature) |signature| if (signature.len > 4096 or std.mem.indexOfScalar(u8, signature, 0) != null) return error.InvalidCatalogMutation;
         if (self.arguments) |arguments| {
@@ -51,15 +57,16 @@ pub const Snapshot = struct {
     found: ?Found,
     pub fn validate(self: @This(), request: SnapshotRequest) !void {
         try request.validate();
-        if (self.next_id < 3 or self.scopes.len != request.targets.len or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidSqlBackendResponse;
+        if (self.next_id < 3 or self.scopes.len != (if (request.reference != null) @as(usize, 1) else request.targets.len) or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidSqlBackendResponse;
         if (request.expected_revision) |revision| if (revision != self.revision) return error.CatalogGenerationChanged;
-        for (self.scopes, request.targets) |scope, target| {
+        for (self.scopes[0..request.targets.len], request.targets) |scope, target| {
             if (!std.mem.eql(u8, scope.target.database, target.database) or !std.mem.eql(u8, scope.target.namespace, target.namespace) or !std.mem.eql(u8, scope.target.table, target.table) or
                 scope.namespace_id == 0 or (!scope.database_exists and scope.namespace_id != null)) return error.InvalidSqlBackendResponse;
         }
         if (self.found) |found| {
             if (found.scope >= self.scopes.len or self.scopes[found.scope].namespace_id == null or found.record.id >= self.next_id) return error.InvalidSqlBackendResponse;
             try found.record.validate();
+            if (request.reference) |reference| if (found.record.id != reference.id or found.record.kind != .function or self.scopes[found.scope].namespace_id != reference.namespace_id) return error.InvalidSqlBackendResponse;
         }
     }
 };
@@ -154,4 +161,13 @@ pub fn commandAction(request: Mutation) domain.Action {
         .drop => .drop,
         .comment => .comment,
     };
+}
+
+pub fn storageSignature(a: std.mem.Allocator, kind: ?records.Kind, signature: []const u8) ![]const u8 {
+    return if (kind == .operator) try std.mem.concat(a, u8, &.{ "operator:", signature }) else signature;
+}
+pub fn inputSignature(kind: ?records.Kind, signature: []const u8) ?[]const u8 {
+    const operator = std.mem.startsWith(u8, signature, "operator:");
+    if (operator != (kind == .operator)) return null;
+    return if (operator) signature[9..] else signature;
 }

@@ -23045,6 +23045,7 @@ components:
         - sequence
         - function
         - procedure
+        - operator
       description: Native catalog resource kind; never a synthetic physical table.
     SQLCatalogOperationKind:
       type: string

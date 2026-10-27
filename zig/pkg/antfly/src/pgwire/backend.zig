@@ -115,6 +115,15 @@ pub const Diagnostic = struct {
         if (self.notices_buffer) |buffer| self.notice_allocator.?.destroy(buffer);
         self.notices_buffer = null;
     }
+    pub fn reserveNotices(raw: *anyopaque, count: usize, bytes: usize) !void {
+        const self: *Diagnostic = @ptrCast(@alignCast(raw));
+        const a = self.notice_allocator orelse return error.InvalidSqlBackendResponse;
+        if (self.notices_buffer == null) {
+            self.notices_buffer = try a.create(notices.Buffer);
+            self.notices_buffer.?.* = .{};
+        }
+        try self.notices_buffer.?.reserve(count, bytes);
+    }
     pub fn emitNotice(raw: *anyopaque, notice: notices.Notice) !void {
         const self: *Diagnostic = @ptrCast(@alignCast(raw));
         const a = self.notice_allocator orelse return error.InvalidSqlBackendResponse;

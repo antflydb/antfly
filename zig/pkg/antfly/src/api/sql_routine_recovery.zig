@@ -85,7 +85,7 @@ pub fn recoverIfCallable(server: *http.ApiHttpServer, identity: ?http.Authentica
     base64.Decoder.decode(bytes, encoded) catch return error.InvalidSqlRecoveryToken;
     const header = std.json.parseFromSliceLeaky(struct { version: u8, kind: common.Receipt.Kind }, scratch, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidSqlRecoveryToken;
     if (header.version == 1 and header.kind == .sequence) return null;
-    if (header.version != 2 or (header.kind != .function and header.kind != .procedure)) return error.InvalidSqlRecoveryToken;
+    if (header.version != 2 or (header.kind != .function and header.kind != .procedure and header.kind != .operator)) return error.InvalidSqlRecoveryToken;
     const token = std.json.parseFromSliceLeaky(Token, scratch, bytes, .{ .allocate = .alloc_always }) catch return error.InvalidSqlRecoveryToken;
     try token.request.validate();
     if (!std.mem.eql(u8, @tagName(token.kind), @tagName(token.request.kind))) return error.InvalidSqlRecoveryToken;

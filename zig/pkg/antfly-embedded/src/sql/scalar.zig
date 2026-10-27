@@ -3227,7 +3227,7 @@ const Binder = struct {
                     break :blk .{ .kind = .integer, .nullable = false };
                 }
                 const function = functionId(call.name) catch {
-                    break :blk (try self.resolveRoutine(call.name, call.args, depth + 1)).output;
+                    break :blk (try self.resolveCallable(call.name, call.args, call.operator, depth + 1)).output;
                 };
                 try arity(function, call.args.len);
                 if (@import("sequence_effects.zig").function(@tagName(function)) != null) {
@@ -3712,7 +3712,7 @@ const Binder = struct {
         return self.compileArrayContext(expression, expected, null, depth);
     }
 
-    fn resolveRoutine(self: *Binder, name: []const u8, args: []const *const ast.Scalar, depth: usize) !*const @import("routine_bindings.zig").Resolved {
+    fn resolveCallable(self: *Binder, name: []const u8, args: []const *const ast.Scalar, operator: bool, depth: usize) !*const @import("routine_bindings.zig").Resolved {
         const routines = @import("routine_bindings.zig");
         const resolver = self.limits.routines orelse (if (self.limits.invocation) |invocation| invocation.routine_resolver else null) orelse return error.UnsupportedSqlShape;
         if (args.len > routines.max_arguments or depth > self.limits.depth) return error.SqlProgramLimitExceeded;
@@ -3724,7 +3724,8 @@ const Binder = struct {
             // domain; only an actual literal participates in this defaulting.
             if (arg.* == .literal and arg.literal == .integer) input.type.element_type = if (std.math.cast(i32, arg.literal.integer) != null) .int32 else .int64;
         }
-        const bound = try resolver.resolve(resolver.ptr, self.alloc, name, inputs[0..args.len]);
+        const resolve = if (operator) resolver.resolve_operator orelse return error.SqlUndefinedOperator else resolver.resolve;
+        const bound = try resolve(resolver.ptr, self.alloc, name, inputs[0..args.len]);
         if (bound.id == 0 or bound.generation == 0 or bound.arguments.len != args.len or bound.output.kind == null) return error.InvalidSqlProgram;
         return bound;
     }
@@ -3914,7 +3915,7 @@ const Binder = struct {
                     break :blk .{ .literal = .{ .integer = 1 } };
                 }
                 const function = functionId(call.name) catch {
-                    const routine = try self.resolveRoutine(call.name, call.args, depth + 1);
+                    const routine = try self.resolveCallable(call.name, call.args, call.operator, depth + 1);
                     const args = try self.alloc.alloc(u32, call.args.len);
                     for (call.args, args, routine.arguments) |arg, *out, target| {
                         const cast = try self.alloc.create(ast.Scalar);

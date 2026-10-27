@@ -282,6 +282,28 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             try tokens.append(alloc, .{ .kind = .placeholder, .text = sql[start..i] });
             continue;
         }
+        if (operatorCharacter(ch)) {
+            const start = i;
+            var end = i;
+            while (end < sql.len and operatorCharacter(sql[end])) : (end += 1) {
+                if (end > start and end + 1 < sql.len and ((sql[end] == '-' and sql[end + 1] == '-') or (sql[end] == '/' and sql[end + 1] == '*'))) break;
+            }
+            var special = false;
+            for (sql[start..end]) |byte| if (std.mem.indexOfScalar(u8, "~!@#%^&|?", byte) != null) {
+                special = true;
+                break;
+            };
+            if (!special) while (end > start + 1 and (sql[end - 1] == '+' or sql[end - 1] == '-')) {
+                end -= 1;
+            };
+            const spelling = sql[start..end];
+            if (!builtinOperator(spelling)) {
+                if (spelling.len > 63) return lexError(diagnostic, .invalid_operator, start, end);
+                try tokens.append(alloc, .{ .kind = .custom_operator, .text = spelling });
+                i = end;
+                continue;
+            }
+        }
         switch (ch) {
             ',' => {
                 try tokens.append(alloc, .{ .kind = .comma, .text = sql[i .. i + 1] });
@@ -1089,4 +1111,12 @@ test "sql adapter lexer tokenizes graph relationship labels" {
             try std.testing.expect(saw_dot);
         }
     }
+}
+
+fn operatorCharacter(byte: u8) bool {
+    return std.mem.indexOfScalar(u8, "+-*/<>=~!@#%^&|?", byte) != null;
+}
+fn builtinOperator(text: []const u8) bool {
+    for ([_][]const u8{ "+", "-", "*", "/", "%", "=", "<>", "!=", "<", ">", "<=", ">=", "@>", "&&", "||", "?", "?|", "?&", "->", "->>", "#>", "#>>", "~", "~*", "!~", "!~*", "=>" }) |builtin| if (std.mem.eql(u8, text, builtin)) return true;
+    return false;
 }

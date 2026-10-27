@@ -1073,7 +1073,7 @@ const Job = struct {
         };
         defer native_adapter.releaseExecutionOwners();
         if (self.request.diagnostics) |diagnostic| {
-            if (diagnostic.notice_allocator != null) native_adapter.notice_sink = .{ .ptr = diagnostic, .emit = wire.Diagnostic.emitNotice };
+            if (diagnostic.notice_allocator != null) native_adapter.notice_sink = .{ .ptr = diagnostic, .emit = wire.Diagnostic.emitNotice, .reserve = wire.Diagnostic.reserveNotices };
         }
         var captured_bindings: std.ArrayList(@import("sql_prepared.zig").Binding) = .empty;
         if (self.kind == .describe) native_adapter.collect_prepared_bindings = &captured_bindings else native_adapter.prepared_bindings = try viewBindings(self.alloc, self.request.binding_guard);
@@ -1779,7 +1779,7 @@ fn viewBindings(a: std.mem.Allocator, guard: ?[]const u8) !?[]const @import("sql
     for (bindings) |binding| {
         if (binding.id == 0 or binding.database.len == 0 or binding.namespace.len == 0 or binding.name.len == 0) return error.CatalogGenerationChanged;
         if (binding.kind == .view and (binding.schema_version == 0 or binding.definition_digest == null)) return error.CatalogGenerationChanged;
-        if ((binding.kind == .function or binding.kind == .procedure) and (binding.schema_version == 0 or binding.routine_incarnation == null or std.mem.allEqual(u8, &binding.routine_incarnation.?, 0) or binding.routine_signature == null)) return error.CatalogGenerationChanged;
+        if ((binding.kind == .function or binding.kind == .procedure or binding.kind == .operator) and (binding.schema_version == 0 or binding.routine_incarnation == null or std.mem.allEqual(u8, &binding.routine_incarnation.?, 0) or binding.routine_signature == null)) return error.CatalogGenerationChanged;
         if (binding.kind == .sequence) {
             const identity: @import("antfly_local_sources").sql_sequence_session.Identity = .{ .id = binding.id, .incarnation = binding.sequence_incarnation orelse return error.CatalogGenerationChanged };
             identity.validate() catch return error.CatalogGenerationChanged;

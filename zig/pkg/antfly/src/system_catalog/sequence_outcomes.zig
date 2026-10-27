@@ -32,7 +32,9 @@ pub const Result = struct {
     revision: u64,
     identity: ?Identity,
     removed: usize,
+    cascade_notice: ?[]const u8 = null,
     pub fn validate(self: Result) !void {
+        if (self.cascade_notice) |notice| if (notice.len == 0 or notice.len > 1024 or self.removed != 1 or !std.unicode.utf8ValidateSlice(notice) or std.mem.indexOfScalar(u8, notice, 0) != null) return error.InvalidSequenceOutcome;
         if (self.identity) |value| try value.validate();
         if (self.removed > 1 or (self.removed != 0 and self.identity != null) or
             (self.revision == 0 and (self.removed != 0 or self.identity != null))) return error.InvalidSequenceOutcome;
@@ -61,6 +63,9 @@ pub const Rejection = enum {
     SequenceValueOutOfRange,
     CatalogGenerationExhausted,
     SqlDuplicateFunction,
+    SqlDuplicateOperator,
+    SqlOperatorNotFound,
+    SqlDependentCallable,
     SqlFunctionReturnTypeChanged,
     SqlUndefinedFunction,
     SqlUndefinedProcedure,

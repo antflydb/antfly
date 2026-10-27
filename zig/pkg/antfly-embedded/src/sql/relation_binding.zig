@@ -1064,7 +1064,7 @@ const Builder = struct {
                     }
                     spec.order = order;
                 }
-                break :blk .{ .call = .{ .name = part.name, .args = args, .star = part.star, .distinct = part.distinct, .filter = if (part.filter) |filter| try self.expression(columns, filter, aliases) else null, .window = window, .within_group = part.within_group } };
+                break :blk .{ .call = .{ .name = part.name, .operator = part.operator, .args = args, .star = part.star, .distinct = part.distinct, .filter = if (part.filter) |filter| try self.expression(columns, filter, aliases) else null, .window = window, .within_group = part.within_group } };
             },
             .case_when => |part| blk: {
                 const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);

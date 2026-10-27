@@ -1912,7 +1912,7 @@ components:
           minimum: 0
     SQLCatalogObjectKind:
       type: string
-      enum: [sequence, function, procedure]
+      enum: [sequence, function, procedure, operator]
       description: Native catalog resource kind; never a synthetic physical table.
     SQLCatalogOperationKind:
       type: string

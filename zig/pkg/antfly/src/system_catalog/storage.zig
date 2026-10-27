@@ -21,6 +21,7 @@ const docstore = @import("antfly_local_sources").storage_docstore;
 const domain = @import("antfly_local_sources").system_catalog_domain;
 const settings = @import("antfly_local_sources").system_catalog_settings;
 const policies = @import("antfly_local_sources").system_catalog_policies;
+const routines = @import("antfly_local_sources").sql_catalog.routines.records;
 
 pub const Meta = domain.Meta;
 
@@ -832,6 +833,7 @@ pub fn rebuildNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
         try txn.put(key, &id);
         try writeReferences(alloc, txn, group_id, resource);
     }
+    try validateNameIndex(alloc, txn, group_id);
 }
 
 pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !void {
@@ -840,7 +842,18 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
     var index = try domain.StateIndex.init(alloc, state.value);
     defer index.deinit(alloc);
     for (state.value.resources) |resource| {
-        var found = (try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
+        var found = (if (resource.kind == .routine) try findFunction(alloc, txn, group_id, resource.parent_id, resource.name, resource.signature orelse return error.InvalidCatalogRecord) else try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
+        if (resource.kind == .routine) {
+            var record = try routines.Record.decode(alloc, resource.source_json);
+            defer record.deinit();
+            try validateCallableReference(alloc, txn, group_id, record.value);
+            if (record.value.definition.function_reference) |reference| {
+                const key = try functionDependencyKey(alloc, group_id, reference.id, resource.id);
+                defer alloc.free(key);
+                const bytes = txn.get(key) catch return error.InvalidCatalogRecord;
+                if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
+            }
+        }
         defer found.deinit();
         if (found.value.id != resource.id) return error.InvalidCatalogRecord;
         const child_key = try childKey(alloc, group_id, resource);
@@ -877,12 +890,62 @@ fn childKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource) ![]u8 {
     defer alloc.free(base);
     return std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ base, r.signature orelse return error.InvalidCatalogRecord });
 }
+fn functionDependencyPrefix(a: std.mem.Allocator, group: u64, function: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:routine_dependency:{d}:", .{ group, function });
+}
+fn functionDependencyKey(a: std.mem.Allocator, group: u64, function: u64, dependent: u64) ![]u8 {
+    const prefix = try functionDependencyPrefix(a, group, function);
+    defer a.free(prefix);
+    return std.fmt.allocPrint(a, "{s}{d}", .{ prefix, dependent });
+}
+
+/// Reads only the referenced function's covering dependency directory. The
+/// statement bound prevents an unbounded CASCADE under serialized apply.
+pub fn functionDependents(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, function: u64, limit: usize) ![]const domain.Resource {
+    const prefix = try functionDependencyPrefix(a, group, function);
+    defer a.free(prefix);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var result: std.ArrayList(domain.Resource) = .empty;
+    var row = try cursor.seekAtOrAfter(prefix);
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        if (result.items.len >= limit) return error.SqlProgramLimitExceeded;
+        if (item.value.len != 8) return error.InvalidCatalogRecord;
+        const id = std.mem.readInt(u64, item.value[0..8], .little);
+        const resource = (try getById(a, txn, group, .routine, id)) orelse return error.InvalidCatalogRecord;
+        const record = (try routines.Record.decode(a, resource.value.source_json)).value;
+        if (record.id != id or record.kind != .operator or record.definition.function_reference == null or record.definition.function_reference.?.id != function) return error.InvalidCatalogRecord;
+        try result.append(a, resource.value);
+    }
+    return result.toOwnedSlice(a);
+}
+fn validateCallableReference(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: routines.Record) !void {
+    const reference = record.definition.function_reference orelse return;
+    const resource = (try getById(a, txn, group, .routine, reference.id)) orelse return error.InvalidCatalogRecord;
+    if (resource.value.parent_id != reference.namespace_id) return error.InvalidCatalogRecord;
+    const function = (try routines.Record.decode(a, resource.value.source_json)).value;
+    if (function.kind != .function or function.id != reference.id or function.definition.arguments.len != record.definition.arguments.len or !std.meta.eql(function.definition.result, record.definition.result)) return error.InvalidCatalogRecord;
+    for (function.definition.arguments, record.definition.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared.type)) return error.InvalidCatalogRecord;
+}
+
 fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
     const child_key = try childKey(alloc, group_id, r);
     defer alloc.free(child_key);
     const child_json = try std.json.Stringify.valueAlloc(alloc, r, .{});
     defer alloc.free(child_json);
     try txn.put(child_key, child_json);
+    if (r.kind == .routine) {
+        var parsed = try routines.Record.decode(alloc, r.source_json);
+        defer parsed.deinit();
+        if (parsed.value.definition.function_reference) |reference| {
+            const key = try functionDependencyKey(alloc, group_id, reference.id, r.id);
+            defer alloc.free(key);
+            var id: [8]u8 = undefined;
+            std.mem.writeInt(u64, &id, r.id, .little);
+            try txn.put(key, &id);
+        }
+    }
     if (domain.hasPhysicalStorageBinding(r)) {
         const key = try storageBindingKey(alloc, group_id, r.storage_name);
         defer alloc.free(key);
@@ -908,6 +971,18 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
         error.NotFound => {},
         else => return err,
     };
+    if (r.kind == .routine) {
+        var parsed = try routines.Record.decode(alloc, r.source_json);
+        defer parsed.deinit();
+        if (parsed.value.definition.function_reference) |reference| {
+            const key = try functionDependencyKey(alloc, group_id, reference.id, r.id);
+            defer alloc.free(key);
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+    }
     if (domain.hasPhysicalStorageBinding(r)) {
         const key = try storageBindingKey(alloc, group_id, r.storage_name);
         defer alloc.free(key);

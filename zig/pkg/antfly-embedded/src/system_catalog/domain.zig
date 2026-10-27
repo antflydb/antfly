@@ -371,7 +371,7 @@ pub const StateIndex = struct {
                 if (r.storage_name.len != 0 or r.tablespace_id != 0 or r.native_service != null or !std.mem.eql(u8, r.location_json, "null")) return error.InvalidCatalogRecord;
                 const record = try @import("routines.zig").Record.decode(alloc, r.source_json);
                 defer record.deinit();
-                const signature = try record.value.definition.signatureAlloc(alloc);
+                const signature = try record.value.catalogSignatureAlloc(alloc);
                 defer alloc.free(signature);
                 if (record.value.id != r.id or !std.mem.eql(u8, signature, r.signature.?)) return error.InvalidCatalogRecord;
             }
@@ -408,6 +408,21 @@ pub const StateIndex = struct {
         };
         if (!self.ids.contains(.{ .kind = .database, .id = default_database_id })) try self.appendChild(alloc, default_database);
         if (!self.ids.contains(.{ .kind = .namespace, .id = default_namespace_id })) try self.appendChild(alloc, default_namespace);
+        // Whole-state adoption/restore verifies references after every ID is
+        // indexed, independent of physical resource ordering. Ordinary point
+        // publication validates the same identity in its native transaction.
+        for (state.resources) |resource| if (resource.kind == .routine) {
+            var record = try @import("routines.zig").Record.decode(alloc, resource.source_json);
+            defer record.deinit();
+            if (record.value.definition.function_reference) |reference| {
+                const target = self.ids.get(.{ .kind = .routine, .id = reference.id }) orelse return error.InvalidCatalogRecord;
+                if (target.parent_id != reference.namespace_id) return error.InvalidCatalogRecord;
+                var function = try @import("routines.zig").Record.decode(alloc, target.source_json);
+                defer function.deinit();
+                if (function.value.kind != .function or function.value.definition.arguments.len != record.value.definition.arguments.len or !std.meta.eql(function.value.definition.result, record.value.definition.result)) return error.InvalidCatalogRecord;
+                for (function.value.definition.arguments, record.value.definition.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared.type)) return error.InvalidCatalogRecord;
+            }
+        };
         return self;
     }
     fn appendChild(self: *StateIndex, alloc: std.mem.Allocator, resource: Resource) !void {

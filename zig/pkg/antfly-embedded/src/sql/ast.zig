@@ -21,6 +21,7 @@ pub const Scalar = union(enum) {
     binary: struct { op: Binary, left: *const Scalar, right: *const Scalar },
     call: struct {
         name: []const u8,
+        operator: bool = false,
         args: []const *const Scalar,
         star: bool = false,
         distinct: bool = false,
@@ -402,7 +403,7 @@ pub const RelationPopulation = struct {
 };
 
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure },
+    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence, populate },
     name: Name,
     new_name: ?[]const u8 = null,
@@ -427,6 +428,7 @@ pub const CatalogDdl = struct {
     materialized: bool = false,
     routine: ?RoutineDefinition = null,
     routine_signature: ?[]const RoutineDefinition.Type = null,
+    operator_function: ?Name = null,
 };
 /// A typed SQL declaration, owned by the compiled request. Durable publication
 /// supplies catalog/owner identities independently of this syntax tree.

@@ -15,12 +15,25 @@
 
 //! Durable callable identity, independent of parser trees or execution programs.
 const std = @import("std");
+const A = std.mem.Allocator;
 pub const max_arguments = 100;
 pub const max_body_bytes = 64 * 1024;
 pub const Type = struct {
     pub const Scalar = enum { text, uuid, int16, int32, int64, float32, float64, boolean, jsonb, numeric, date, time, time_tz, timestamp, timestamp_tz, interval, numrange, daterange, tsrange, tstzrange };
     scalar: Scalar,
     array: bool = false,
+    pub fn sqlName(self: Type) []const u8 {
+        return switch (self.scalar) {
+            .int16 => "smallint",
+            .int32 => "integer",
+            .int64 => "bigint",
+            .float32 => "real",
+            .float64 => "double precision",
+            .time_tz => "time with time zone",
+            .timestamp_tz => "timestamp with time zone",
+            else => @tagName(self.scalar),
+        };
+    }
     pub fn validate(self: Type) !void {
         if (self.array) switch (self.scalar) {
             .text, .uuid, .int16, .int32, .int64, .float32, .float64, .boolean, .jsonb, .numeric => {},
@@ -30,18 +43,37 @@ pub const Type = struct {
 };
 pub const Argument = struct { name: ?[]const u8 = null, type: Type };
 pub const Volatility = enum { immutable, stable, @"volatile" };
-pub const Kind = enum { function, procedure };
+pub const Kind = enum { function, procedure, operator };
+/// An operator owns its identity while referencing a stable function identity.
+/// Function replacement can advance its executable generation; name reuse can
+/// never retarget this reference.
+pub const FunctionReference = struct {
+    database: []const u8,
+    namespace: []const u8,
+    name: []const u8,
+    namespace_id: u64,
+    id: u64,
+    pub fn validate(self: @This()) !void {
+        const domain = @import("domain.zig");
+        try domain.validateName(self.database);
+        try domain.validateName(self.namespace);
+        try domain.validateTableName(self.name);
+        if (self.namespace_id == 0 or self.id == 0) return error.InvalidSqlRoutineRecord;
+    }
+};
 pub const Definition = struct {
     arguments: []const Argument,
     result: ?Type = null,
     language: enum { sql, plpgsql } = .sql,
     body: []const u8,
+    function_reference: ?FunctionReference = null,
     strict: bool = false,
     volatility: Volatility = .@"volatile",
     owner: @import("owners.zig").Owner,
     pub fn validate(self: Definition) !void {
-        if (self.arguments.len > max_arguments or self.body.len == 0 or self.body.len > max_body_bytes or
+        if (self.arguments.len > max_arguments or (self.body.len == 0 and self.function_reference == null) or self.body.len > max_body_bytes or
             !std.unicode.utf8ValidateSlice(self.body) or std.mem.indexOfScalar(u8, self.body, 0) != null) return error.InvalidSqlRoutineRecord;
+        if (self.function_reference) |reference| try reference.validate();
         if (self.result) |result| try result.validate();
         // There are at most 100 names; validation needs no heap or global state.
         for (self.arguments, 0..) |argument, i| {
@@ -57,6 +89,16 @@ pub const Definition = struct {
                 if (principal.name.len == 0 or principal.name.len > 255 or std.mem.allEqual(u8, &principal.instance_id, 0)) return error.InvalidSqlRoutineRecord;
             },
         }
+    }
+    pub fn displaySignatureAlloc(self: Definition, a: A) ![]u8 {
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(a);
+        for (self.arguments, 0..) |argument, ordinal| {
+            if (ordinal != 0) try text.append(a, ',');
+            try text.appendSlice(a, argument.type.sqlName());
+            if (argument.type.array) try text.appendSlice(a, "[]");
+        }
+        return text.toOwnedSlice(a);
     }
     pub fn signatureAlloc(self: Definition, a: std.mem.Allocator) ![]u8 {
         try self.validate();
@@ -80,9 +122,18 @@ pub const Record = struct {
         if (self.version != 2 or self.id == 0 or self.generation == 0) return error.InvalidSqlRoutineRecord;
         try self.definition.validate();
         switch (self.kind) {
-            .function => if (self.definition.result == null or self.definition.language != .sql) return error.InvalidSqlRoutineRecord,
-            .procedure => if (self.definition.result != null or self.definition.strict or self.definition.volatility != .@"volatile") return error.InvalidSqlRoutineRecord,
+            .function => if (self.definition.function_reference != null or self.definition.result == null or self.definition.language != .sql) return error.InvalidSqlRoutineRecord,
+            .procedure => if (self.definition.function_reference != null or self.definition.result != null or self.definition.strict or self.definition.volatility != .@"volatile") return error.InvalidSqlRoutineRecord,
+            .operator => if (self.definition.function_reference == null or self.definition.body.len != 0 or self.definition.result == null or self.definition.arguments.len != 2 or self.definition.language != .sql or self.definition.strict) return error.InvalidSqlRoutineRecord,
         }
+    }
+    /// Functions/procedures share a signature namespace; operator signatures
+    /// are disjoint even from a quoted function named with the same symbol.
+    pub fn catalogSignatureAlloc(self: Record, a: A) ![]u8 {
+        const signature = try self.definition.signatureAlloc(a);
+        if (self.kind != .operator) return signature;
+        defer a.free(signature);
+        return std.mem.concat(a, u8, &.{ "operator:", signature });
     }
     pub fn encode(self: Record, a: std.mem.Allocator) ![]u8 {
         try self.validate();

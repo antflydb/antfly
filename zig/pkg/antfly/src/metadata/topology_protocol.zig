@@ -147,8 +147,9 @@ const std = @import("std");
 /// Version 105 admits typed callable overloads and shared catalog outcomes.
 /// Version 107 decodes identity-fenced callable annotations on the retained
 /// catalog outcome lane without advancing executable generations.
-pub const current_version: u16 = 107;
-pub const sql_routine_version: u16 = 107;
+/// Version 108 decodes identity-bound operators and their derived dependency directory.
+pub const current_version: u16 = 108;
+pub const sql_routine_version: u16 = 108;
 pub const sql_materialized_refresh_version: u16 = 103;
 pub const sql_materialized_view_version: u16 = 102;
 pub const sql_population_version: u16 = 101;

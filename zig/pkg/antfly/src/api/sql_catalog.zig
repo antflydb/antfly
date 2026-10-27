@@ -942,7 +942,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     if (input == .populate) return @import("sql_population.zig").execute(server, identity, context, database, namespace, allocators, input.populate, path);
     const alloc = allocators.result;
     try context.ensureActive();
-    if (input == .catalog_ddl and (input.catalog_ddl.kind == .function or input.catalog_ddl.kind == .procedure)) {
+    if (input == .catalog_ddl and (input.catalog_ddl.kind == .function or input.catalog_ddl.kind == .procedure or input.catalog_ddl.kind == .operator)) {
         var actor = identity;
         var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &actor, .context = context, .database = database, .namespace = namespace, .ddl_search_path = path };
         defer adapter.releaseExecutionOwners();
@@ -971,7 +971,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     try target.validate();
     const kind: domain.Kind = switch (input) {
         .catalog_ddl => |ddl| switch (ddl.kind) {
-            .index, .view, .role, .sequence, .function, .procedure => unreachable,
+            .index, .view, .role, .sequence, .function, .procedure, .operator => unreachable,
             inline else => |tag| @field(domain.Kind, @tagName(tag)),
         },
         .policy_ddl, .populate => unreachable,

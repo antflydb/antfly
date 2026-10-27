@@ -79,6 +79,23 @@ pub fn definition(a: A, intent: ast.RoutineDefinition, owner: @import("../system
 
 pub fn prepare(a: A, record: records.Record, resolver: ?@import("routine_bindings.zig").Resolver, settings: ?*const @import("setting_catalog.zig").View) !*const @import("routine_bindings.zig").Resolved {
     try record.validate();
+    if (record.kind == .operator) {
+        const provider = resolver orelse return error.UnsupportedSqlShape;
+        const resolve_reference = provider.resolve_reference orelse return error.UnsupportedSqlShape;
+        const inputs = try a.alloc(bindings.Argument, record.definition.arguments.len);
+        for (record.definition.arguments, inputs) |argument, *input| input.* = .{ .type = runtimeType(argument.type) };
+        const function = try resolve_reference(provider.ptr, a, record.definition.function_reference.?, inputs);
+        if (function.id != record.definition.function_reference.?.id or !std.meta.eql(function.output, runtimeType(record.definition.result.?))) {
+            // Nullability is a runtime inference property; declared domains
+            // remain invariant through the referenced function's replacement.
+            if (function.id != record.definition.function_reference.?.id or function.output.kind != runtimeType(record.definition.result.?).kind or function.output.element_type != runtimeType(record.definition.result.?).element_type or function.output.temporal_kind != runtimeType(record.definition.result.?).temporal_kind) return error.CatalogGenerationChanged;
+        }
+        const alias = try a.create(bindings.Resolved);
+        alias.* = function.*;
+        alias.id = record.id;
+        alias.generation = record.generation;
+        return alias;
+    }
     if (record.kind != .function) return error.SqlWrongObjectType;
     var parsed = try @import("compiler.zig").compile(a, record.definition.body, .{ .max_bytes = records.max_body_bytes });
     defer parsed.deinit();
@@ -185,5 +202,46 @@ pub fn validateBody(a: A, record: records.Record) !void {
     switch (record.kind) {
         .function => _ = try prepare(a, record, null, null),
         .procedure => _ = try @import("procedure.zig").compileBody(a, record),
+        .operator => {},
     }
+}
+
+test "SQL native operator row execution performs no allocator or catalog work after binding" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const arguments: []const records.Argument = &.{ .{ .type = .{ .scalar = .int32 } }, .{ .type = .{ .scalar = .int32 } } };
+    const function = try prepare(a, .{ .id = 7, .generation = 1, .definition = .{ .arguments = arguments, .result = .{ .scalar = .boolean }, .body = "SELECT $1<>$2", .owner = .auth_disabled } }, null, null);
+    const Fixture = struct {
+        function: *const bindings.Resolved,
+        alias: *const bindings.Resolved = undefined,
+        references: usize = 0,
+        operators: usize = 0,
+        fn reference(raw: *anyopaque, _: A, ref: records.FunctionReference, _: []const bindings.Argument) !*const bindings.Resolved {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (ref.id != self.function.id) return error.CatalogGenerationChanged;
+            self.references += 1;
+            return self.function;
+        }
+        fn operator(raw: *anyopaque, _: A, _: []const u8, _: []const bindings.Argument) !*const bindings.Resolved {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.operators += 1;
+            return self.alias;
+        }
+    };
+    var fixture: Fixture = .{ .function = function };
+    fixture.alias = try prepare(a, .{ .kind = .operator, .id = 8, .generation = 1, .definition = .{ .arguments = arguments, .result = .{ .scalar = .boolean }, .body = "", .owner = .auth_disabled, .function_reference = .{ .database = "default", .namespace = "public", .name = "different", .namespace_id = 2, .id = 7 } } }, .{ .ptr = &fixture, .resolve = undefined, .resolve_reference = Fixture.reference }, null);
+    var parsed = try @import("compiler.zig").compileScalar(a, "left_value===right_value", .{});
+    defer parsed.deinit();
+    var program = try scalar.bind(a, parsed.expression, &.{ .{ .name = "left_value", .type = .integer, .element_type = .int32 }, .{ .name = "right_value", .type = .integer, .element_type = .int32 } }, &.{}, .{ .routines = .{ .ptr = &fixture, .resolve = undefined, .resolve_operator = Fixture.operator } });
+    defer program.deinit();
+    const lookups = fixture.operators;
+    var none: std.heap.FixedBufferAllocator = .init(&.{});
+    for (0..10000) |ordinal| {
+        const value: i64 = @intCast(ordinal);
+        const result = try program.evaluate(none.allocator(), &.{ scalar.Datum.json(.{ .integer = value }), scalar.Datum.json(.{ .integer = value + 1 }) }, &.{}, .{});
+        try std.testing.expectEqual(true, result.value.bool);
+    }
+    try std.testing.expectEqual(lookups, fixture.operators);
+    try std.testing.expectEqual(@as(usize, 1), fixture.references);
 }

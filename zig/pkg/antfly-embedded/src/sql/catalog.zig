@@ -1374,7 +1374,7 @@ pub const DdlReceipt = struct {
 /// Native catalog operations have no physical table/schema receipt. Identity
 /// integers stay native here and stringify as exact decimal strings on wire.
 pub const CatalogOperationReceipt = struct {
-    pub const Kind = enum { sequence, function, procedure };
+    pub const Kind = enum { sequence, function, procedure, operator };
     pub const Operation = enum { create, alter, rename, drop };
     pub const State = enum { committed, rejected, unknown };
     pub const Diagnostic = struct { code: []const u8, message: []const u8, retryable: bool };

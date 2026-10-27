@@ -1120,6 +1120,20 @@ const Parser = struct {
                 }
                 continue;
             }
+            if (self.peek(.custom_operator) or (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "OPERATOR"))) {
+                if (minimum > 4) break;
+                const operator_name = if (self.peek(.custom_operator)) try self.operatorName() else qualified: {
+                    self.pos += 1;
+                    try self.expect(.lparen);
+                    const reference = try self.operatorName();
+                    try self.expect(.rparen);
+                    break :qualified reference;
+                };
+                const encoded = if (operator_name.namespace) |namespace| try std.mem.concat(self.alloc, u8, &.{ namespace, "\x00", operator_name.table }) else operator_name.table;
+                const right = try self.scalar(depth + 1, 5);
+                left = try self.scalarNode(.{ .call = .{ .name = encoded, .operator = true, .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, right }) } });
+                continue;
+            }
             const current = self.tokens[self.pos];
             if (minimum <= 4 and (current.kind == .regex_match or current.kind == .regex_imatch or current.kind == .regex_not_match or current.kind == .regex_not_imatch)) {
                 self.pos += 1;
@@ -2242,7 +2256,7 @@ const Parser = struct {
     // it before relational lowering substitutes internal expression columns.
     fn projectionLabel(expression: *const ast.Scalar) ?[]const u8 {
         return switch (expression.*) {
-            .call => |call| if (std.mem.eql(u8, call.name, "$current_timestamp")) "current_timestamp" else if (std.mem.eql(u8, call.name, "$current_date")) "current_date" else if (std.mem.eql(u8, call.name, "$current_user")) "current_user" else if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else if (std.mem.lastIndexOfScalar(u8, call.name, 0)) |at| call.name[at + 1 ..] else call.name,
+            .call => |call| if (call.operator) "?column?" else if (std.mem.eql(u8, call.name, "$current_timestamp")) "current_timestamp" else if (std.mem.eql(u8, call.name, "$current_date")) "current_date" else if (std.mem.eql(u8, call.name, "$current_user")) "current_user" else if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else if (std.mem.lastIndexOfScalar(u8, call.name, 0)) |at| call.name[at + 1 ..] else call.name,
             .case_when => "case",
             .column => |column| if (std.mem.lastIndexOfScalar(u8, column, 0)) |at| column[at + 1 ..] else column,
             .cast => |cast| switch (cast.operand.*) {
@@ -3304,6 +3318,56 @@ const Parser = struct {
     /// Definition admission is deliberately separate from routine activation.
     /// Validate the supported declaration grammar to its end before reporting
     /// a missing body. Never publish a definition or execute a valid prefix.
+    fn operatorName(self: *Parser) Error!ast.Name {
+        var namespace: ?[]const u8 = null;
+        if (self.peek(.identifier)) {
+            namespace = try self.identifier();
+            try self.expect(.dot);
+        }
+        if (self.pos >= self.tokens.len) return self.fail(error.InvalidSqlSyntax, "expected operator name");
+        const symbol_token = self.tokens[self.pos];
+        if (symbol_token.kind != .custom_operator and symbol_token.kind != .eq and symbol_token.kind != .neq and symbol_token.kind != .gt and symbol_token.kind != .gte and symbol_token.kind != .lt and symbol_token.kind != .lte and symbol_token.kind != .plus and symbol_token.kind != .minus and symbol_token.kind != .star and symbol_token.kind != .slash and symbol_token.kind != .percent and symbol_token.kind != .pipe_concat and symbol_token.kind != .at_contains and symbol_token.kind != .range_overlap and symbol_token.kind != .regex_match and symbol_token.kind != .regex_imatch and symbol_token.kind != .regex_not_match and symbol_token.kind != .regex_not_imatch and symbol_token.kind != .question and symbol_token.kind != .question_all and symbol_token.kind != .question_any) return self.fail(error.InvalidSqlSyntax, "expected operator name");
+        self.pos += 1;
+        return .{ .namespace = namespace, .table = try self.alloc.dupe(u8, symbol_token.text) };
+    }
+    fn operatorDdl(self: *Parser, creating: bool) Error!ast.CatalogDdl {
+        const conditional = !creating and self.keyword(.@"if");
+        if (conditional) try self.expectKeyword(.exists);
+        const operator_name = try self.operatorName();
+        try self.expect(.lparen);
+        var types: [2]ast.RoutineDefinition.Type = undefined;
+        var seen: u3 = 0;
+        var implementation: ?ast.Name = null;
+        if (creating) {
+            while (true) {
+                const option = try self.identifier();
+                try self.expect(.eq);
+                const bit: u3 = if (std.ascii.eqlIgnoreCase(option, "FUNCTION") or std.ascii.eqlIgnoreCase(option, "PROCEDURE")) 1 else if (std.ascii.eqlIgnoreCase(option, "LEFTARG")) 2 else if (std.ascii.eqlIgnoreCase(option, "RIGHTARG")) 4 else return self.fail(error.UnsupportedSqlShape, "operator option requires native planner semantics");
+                if (seen & bit != 0) return self.fail(error.InvalidSqlSyntax, "duplicate operator option");
+                seen |= bit;
+                if (bit == 1) implementation = try self.name() else {
+                    const kind = try self.castType();
+                    if (kind.numeric_modifier != null) return self.fail(error.UnsupportedSqlShape, "operator modifiers require declaration notices");
+                    types[if (bit == 2) @as(usize, 0) else 1] = .{ .kind = kind.type, .element_type = kind.element_type, .temporal_kind = kind.temporal_kind };
+                }
+                if (self.take(.rparen)) break;
+                try self.expect(.comma);
+            }
+            if (seen != 7) return self.fail(error.UnsupportedSqlShape, "a binary operator requires FUNCTION LEFTARG and RIGHTARG");
+        } else {
+            for (&types, 0..) |*kind, ordinal| {
+                const declared = try self.castType();
+                if (declared.numeric_modifier != null) return self.fail(error.UnsupportedSqlShape, "operator modifiers require declaration notices");
+                kind.* = .{ .kind = declared.type, .element_type = declared.element_type, .temporal_kind = declared.temporal_kind };
+                if (ordinal == 0) try self.expect(.comma);
+            }
+            try self.expect(.rparen);
+        }
+        const cascade = !creating and self.keyword(.cascade);
+        if (!creating and !cascade) _ = self.keyword(.restrict);
+        return .{ .kind = .operator, .action = if (creating) .create else .drop, .name = operator_name, .conditional = conditional, .cascade = cascade, .routine_signature = try self.alloc.dupe(ast.RoutineDefinition.Type, &types), .operator_function = implementation };
+    }
+
     fn routineDrop(self: *Parser, procedure: bool) Error!ast.CatalogDdl {
         return self.routineReference(procedure, false);
     }
@@ -4022,6 +4086,7 @@ const Parser = struct {
             return .{ .catalog_ddl = .{ .kind = kind, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column } };
         }
         if (self.keyword(.create)) {
+            if (self.ddlWord("OPERATOR")) return .{ .catalog_ddl = try self.operatorDdl(true) };
             if (self.keyword(.@"or")) {
                 if (!self.ddlWord("REPLACE")) return self.fail(error.InvalidSqlSyntax, "CREATE OR requires REPLACE");
                 if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.table) or self.tokens[self.pos].isKeyword(.materialized)))
@@ -4058,6 +4123,7 @@ const Parser = struct {
             return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("OPERATOR")) return .{ .catalog_ddl = try self.operatorDdl(false) };
             if (self.ddlWord("FUNCTION")) return .{ .catalog_ddl = try self.routineDrop(false) };
             if (self.ddlWord("PROCEDURE")) return .{ .catalog_ddl = try self.routineDrop(true) };
             if (self.keyword(.materialized)) {
@@ -5620,4 +5686,25 @@ test "compiler SQL callable comments retain exact overload identity without pars
     try std.testing.expectEqual(@as(usize, 2), quoted.statement.catalog_ddl.routine_signature.?.len);
     try std.testing.expectEqualStrings("a 'quoted' Ω; -- payload", quoted.statement.catalog_ddl.comment_value.?);
     for ([_][]const u8{ "COMMENT ON FUNCTION IF EXISTS f() IS 'x'", "COMMENT ON PROCEDURE p() CASCADE IS 'x'", "COMMENT ON FUNCTION f() RESTRICT IS 'x'", "COMMENT ON FUNCTION f() IS 12", "COMMENT ON FUNCTION f() IS $1" }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(a, sql, .{}));
+}
+
+test "compiler SQL original operator declarations retain signatures implementation and owned symbols" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0133", "sql-0134", "sql-0135" }, 0..) |id, ordinal| {
+        var parsed = try compile(a, (try corpus.get(id)).sql, .{});
+        defer parsed.deinit();
+        const ddl = parsed.statement.catalog_ddl;
+        try std.testing.expectEqual(.operator, ddl.kind);
+        try std.testing.expectEqualStrings("===", ddl.name.table);
+        try std.testing.expectEqual(@as(usize, 2), ddl.routine_signature.?.len);
+        try std.testing.expectEqual(ordinal == 0, ddl.operator_function != null);
+        try std.testing.expectEqual(ordinal == 2, ddl.conditional);
+    }
+    var qualified = try compile(a, "SELECT 'one' OPERATOR(public.===) 'one' AS same", .{});
+    defer qualified.deinit();
+    const expression = qualified.statement.select.columns[0].expression.?;
+    try std.testing.expect(expression.call.operator);
+    try std.testing.expectEqualStrings("public\x00===", expression.call.name);
 }

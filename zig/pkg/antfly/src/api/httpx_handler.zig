@@ -6057,6 +6057,14 @@ pub const AntflyApiHandler = struct {
         connection_session_hex: [32]u8 = undefined,
         statement_start_ns: u64 = 0,
         notice_buffer: ?*@import("antfly_local_sources").sql_catalog.notices.Buffer = null,
+        fn reserveNotices(raw: *anyopaque, count: usize, bytes: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.notice_buffer == null) {
+                self.notice_buffer = try self.prepared_response_budget.allocator().create(@import("antfly_local_sources").sql_catalog.notices.Buffer);
+                self.notice_buffer.?.* = .{};
+            }
+            try self.notice_buffer.?.reserve(count, bytes);
+        }
         fn emitNotice(raw: *anyopaque, notice: @import("antfly_local_sources").sql_catalog.notices.Notice) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const a = self.prepared_response_budget.allocator();
@@ -6166,7 +6174,7 @@ pub const AntflyApiHandler = struct {
         }
 
         fn run(self: *@This()) void {
-            self.adapter.notice_sink = .{ .ptr = self, .emit = emitNotice };
+            self.adapter.notice_sink = .{ .ptr = self, .emit = emitNotice, .reserve = reserveNotices };
             defer self.adapter.releaseExecutionOwners();
             // Wake on the executor that owns the request waiter, not the
             // backend executor running this worker.

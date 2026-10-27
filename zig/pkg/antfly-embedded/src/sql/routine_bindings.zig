@@ -30,4 +30,6 @@ pub const Resolved = struct {
 pub const Resolver = struct {
     ptr: *anyopaque,
     resolve: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const Argument) anyerror!*const Resolved,
+    resolve_reference: ?*const fn (*anyopaque, std.mem.Allocator, @import("../system_catalog/routines.zig").FunctionReference, []const Argument) anyerror!*const Resolved = null,
+    resolve_operator: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const Argument) anyerror!*const Resolved = null,
 };

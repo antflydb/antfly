@@ -7400,7 +7400,7 @@ export interface components {
          * @description Native catalog resource kind; never a synthetic physical table.
          * @enum {string}
          */
-        SQLCatalogObjectKind: "sequence" | "function" | "procedure";
+        SQLCatalogObjectKind: "sequence" | "function" | "procedure" | "operator";
         /** @enum {string} */
         SQLCatalogOperationKind: "create" | "alter" | "rename" | "drop";
         /**

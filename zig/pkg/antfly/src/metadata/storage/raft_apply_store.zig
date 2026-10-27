@@ -36984,6 +36984,19 @@ pub const RaftApplyStore = struct {
         if (request.expected_revision) |revision| if (revision != meta.revision) return error.CatalogGenerationChanged;
         const incarnation = try catalogIncarnationTxn(&txn, group);
         const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
+        const outcomes: sql_routines.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+        if (request.reference) |reference| {
+            const resource = (try system_catalog_storage.getById(a, &txn, group, .routine, reference.id)) orelse return error.CatalogGenerationChanged;
+            if (resource.value.parent_id != reference.namespace_id) return error.CatalogGenerationChanged;
+            const namespace = (try system_catalog_storage.getById(a, &txn, group, .namespace, reference.namespace_id)) orelse return error.CatalogGenerationChanged;
+            const database = (try system_catalog_storage.getById(a, &txn, group, .database, namespace.value.parent_id)) orelse return error.CatalogGenerationChanged;
+            const record = (try sql_routines.records.Record.decode(a, resource.value.source_json)).value;
+            if (record.id != resource.value.id or record.kind != .function) return error.CatalogGenerationChanged;
+            const scope: sql_routines.Snapshot.Scope = .{ .target = .{ .database = database.value.name, .namespace = namespace.value.name, .table = resource.value.name }, .namespace_id = namespace.value.id, .database_exists = true };
+            const result: sql_routines.Snapshot = .{ .revision = meta.revision, .next_id = meta.next_id, .head = try outcomes.head(a), .incarnation = incarnation, .scopes = &.{scope}, .found = .{ .scope = 0, .record = record } };
+            try result.validate(request);
+            return std.json.Stringify.valueAlloc(alloc, result, .{});
+        }
         const scopes = try a.alloc(sql_routines.Snapshot.Scope, request.targets.len);
         var candidates: std.ArrayList(system_catalog_storage.CallableHeader) = .empty;
         var owners: std.ArrayList(usize) = .empty;
@@ -36996,14 +37009,15 @@ pub const RaftApplyStore = struct {
             const namespace = (try view.lookup(.namespace, db.id, target.namespace)) orelse continue;
             scope.namespace_id = namespace.id;
             if (request.signature) |signature| {
-                const found = (try system_catalog_storage.findFunction(a, &txn, group, namespace.id, target.table, signature)) orelse continue;
+                const found = (try system_catalog_storage.findFunction(a, &txn, group, namespace.id, target.table, try sql_routines.storageSignature(a, request.kind, signature))) orelse continue;
                 if ((try signatures.getOrPut(a, signature)).found_existing) continue;
                 try candidates.append(a, .{ .id = found.value.id, .signature = signature });
                 try owners.append(a, ordinal);
             } else {
                 for (try system_catalog_storage.functionOverloads(a, &txn, group, namespace.id, target.table)) |header| {
-                    if ((try signatures.getOrPut(a, header.signature)).found_existing) continue;
-                    try candidates.append(a, header);
+                    const input_signature = sql_routines.inputSignature(request.kind, header.signature) orelse continue;
+                    if ((try signatures.getOrPut(a, input_signature)).found_existing) continue;
+                    try candidates.append(a, .{ .id = header.id, .signature = input_signature });
                     try owners.append(a, ordinal);
                 }
             }
@@ -37017,14 +37031,13 @@ pub const RaftApplyStore = struct {
             const resource = (try system_catalog_storage.getById(a, &txn, group, .routine, header.id)) orelse return error.InvalidCatalogRecord;
             const record = try sql_routines.records.Record.decode(a, resource.value.source_json);
             const signature = try record.value.definition.signatureAlloc(a);
-            if (record.value.id != header.id or !std.mem.eql(u8, resource.value.signature orelse return error.InvalidCatalogRecord, signature) or !std.mem.eql(u8, signature, header.signature)) return error.InvalidCatalogRecord;
+            if (record.value.id != header.id or !std.mem.eql(u8, resource.value.signature orelse return error.InvalidCatalogRecord, try record.value.catalogSignatureAlloc(a)) or !std.mem.eql(u8, signature, header.signature)) return error.InvalidCatalogRecord;
             for (candidates.items, owners.items) |candidate, owner| if (candidate.id == header.id) {
                 if (resource.value.parent_id != scopes[owner].namespace_id or !std.mem.eql(u8, resource.value.name, scopes[owner].target.table)) return error.InvalidCatalogRecord;
                 found = .{ .scope = owner, .record = record.value, .description = if (request.include_description) resource.value.description else null };
                 break;
             };
         }
-        const outcomes: sql_routines.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
         const result: sql_routines.Snapshot = .{ .revision = meta.revision, .next_id = meta.next_id, .head = try outcomes.head(a), .incarnation = incarnation, .scopes = scopes, .found = found };
         try result.validate(request);
         return std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -37056,15 +37069,22 @@ pub const RaftApplyStore = struct {
             .drop => |value| value.signature,
             .comment => |value| value.signature,
         };
-        const previous = try system_catalog_storage.findFunction(a, txn, group, namespace.id, request.target.table, signature);
+        const kind = switch (request.operation) {
+            .publish => |value| value.kind,
+            .drop => |value| value.kind,
+            .comment => |value| value.kind,
+        };
+        const storage_signature = try sql_routines.storageSignature(a, kind, signature);
+        const previous = try system_catalog_storage.findFunction(a, txn, group, namespace.id, request.target.table, storage_signature);
         const prior = if (previous) |resource| (try sql_routines.records.Record.decode(a, resource.value.source_json)).value else null;
         var next: ?sql_routines.records.Record = null;
         var description: ?[]const u8 = if (previous) |resource| resource.value.description else null;
         var next_id = meta.next_id;
+        var dependents: []const system_catalog.Resource = &.{};
         switch (request.operation) {
             .publish => |value| {
                 if (prior) |old| {
-                    if (!value.replace) return error.SqlDuplicateFunction;
+                    if (!value.replace) return if (value.kind == .operator) error.SqlDuplicateOperator else error.SqlDuplicateFunction;
                     if (old.kind != value.kind) return error.SqlWrongObjectType;
                     const expected = value.expected orelse return error.CatalogGenerationChanged;
                     if (expected.id != old.id or expected.generation != old.generation) return error.CatalogGenerationChanged;
@@ -37081,6 +37101,14 @@ pub const RaftApplyStore = struct {
                     next = .{ .kind = value.kind, .id = meta.next_id, .generation = 1, .definition = value.definition };
                     next_id = std.math.add(u64, meta.next_id, 1) catch return error.CatalogRevisionExhausted;
                 }
+                if (next.?.definition.function_reference) |reference| {
+                    const function_resource = (try system_catalog_storage.getById(a, txn, group, .routine, reference.id)) orelse return error.CatalogGenerationChanged;
+                    if (function_resource.value.parent_id != reference.namespace_id) return error.CatalogGenerationChanged;
+                    const function = (try sql_routines.records.Record.decode(a, function_resource.value.source_json)).value;
+                    const function_namespace = (try system_catalog_storage.getById(a, txn, group, .namespace, reference.namespace_id)) orelse return error.CatalogGenerationChanged;
+                    if (function_namespace.value.parent_id != namespace.parent_id or function.kind != .function or !std.meta.eql(function.definition.result, next.?.definition.result) or function.definition.arguments.len != next.?.definition.arguments.len) return error.CatalogGenerationChanged;
+                    for (function.definition.arguments, next.?.definition.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared.type)) return error.SqlUndefinedFunction;
+                }
                 // SQL body validation is deterministic native preparation, never
                 // a stored execution callback or an evaluation of the body.
                 var workspace: @import("antfly_local_sources").sql_memory_budget = .{ .backing = self.alloc, .limit = sql_routines.native.preparation_bytes };
@@ -37092,7 +37120,7 @@ pub const RaftApplyStore = struct {
                 };
             },
             .comment => |value| {
-                const old = prior orelse return if (value.kind == .procedure) error.SqlUndefinedProcedure else error.SqlUndefinedFunction;
+                const old = prior orelse return if (value.kind == .procedure) error.SqlUndefinedProcedure else if (value.kind == .operator) error.SqlOperatorNotFound else error.SqlUndefinedFunction;
                 if (old.kind != value.kind) return error.SqlWrongObjectType;
                 if (value.expected.id != old.id or value.expected.generation != old.generation) return error.CatalogGenerationChanged;
                 // Presentation metadata never recompiles a body or invalidates
@@ -37105,21 +37133,35 @@ pub const RaftApplyStore = struct {
                     if (old.kind != value.kind) return error.SqlWrongObjectType;
                     const expected = value.expected orelse return error.CatalogGenerationChanged;
                     if (expected.id != old.id or expected.generation != old.generation) return error.CatalogGenerationChanged;
+                    if (old.kind == .function) {
+                        dependents = try system_catalog_storage.functionDependents(a, txn, group, old.id, 1024);
+                        if (dependents.len != 0 and !value.cascade) return error.SqlDependentCallable;
+                    }
                 } else {
                     if (value.expected != null) return error.CatalogGenerationChanged;
-                    if (!value.if_exists) return if (value.kind == .procedure) error.SqlUndefinedProcedure else error.SqlUndefinedFunction;
+                    if (!value.if_exists) return if (value.kind == .procedure) error.SqlUndefinedProcedure else if (value.kind == .operator) error.SqlOperatorNotFound else error.SqlUndefinedFunction;
                     return .{ .revision = meta.revision, .identity = null, .removed = 0 };
                 }
             },
         }
         const revision = std.math.add(u64, meta.revision, 1) catch return error.CatalogRevisionExhausted;
-        const result: sql_routines.Result = .{ .revision = revision, .identity = if (next) |value| .{ .id = value.id, .generation = value.generation } else null, .removed = @intFromBool(next == null) };
+        const cascade_notice = if (dependents.len == 1) single: {
+            const dependent = dependents[0];
+            const record = (try sql_routines.records.Record.decode(a, dependent.source_json)).value;
+            const parent = (try system_catalog_storage.getById(a, txn, group, .namespace, dependent.parent_id)) orelse return error.InvalidCatalogRecord;
+            const qualified_name = if (std.mem.eql(u8, parent.value.name, request.target.namespace)) dependent.name else try std.fmt.allocPrint(a, "{s}.{s}", .{ parent.value.name, dependent.name });
+            break :single try std.fmt.allocPrint(a, "drop cascades to operator {s}({s})", .{ qualified_name, try record.definition.displaySignatureAlloc(a) });
+        } else if (dependents.len > 1) try std.fmt.allocPrint(a, "drop cascades to {d} other objects", .{dependents.len}) else null;
+        const result: sql_routines.Result = .{ .revision = revision, .identity = if (next) |value| .{ .id = value.id, .generation = value.generation } else null, .removed = @intFromBool(next == null), .cascade_notice = cascade_notice };
         if (!apply) return result;
         var upserts: [1]system_catalog.Resource = undefined;
-        if (next) |value| upserts[0] = .{ .kind = .routine, .id = value.id, .parent_id = namespace.id, .name = request.target.table, .signature = signature, .source_json = try value.encode(a), .description = description };
-        var removes: [1]system_catalog.Resource = undefined;
-        if (next == null) removes[0] = previous.?.value;
-        const delta: system_catalog.Delta = .{ .upserts = if (next != null) &upserts else &.{}, .removes = if (next == null) &removes else &.{}, .next_id = next_id };
+        if (next) |value| upserts[0] = .{ .kind = .routine, .id = value.id, .parent_id = namespace.id, .name = request.target.table, .signature = storage_signature, .source_json = try value.encode(a), .description = description };
+        const removes: []system_catalog.Resource = if (next == null) try a.alloc(system_catalog.Resource, 1 + dependents.len) else &.{};
+        if (next == null) {
+            removes[0] = previous.?.value;
+            @memcpy(removes[1..], dependents);
+        }
+        const delta: system_catalog.Delta = .{ .upserts = if (next != null) &upserts else &.{}, .removes = removes, .next_id = next_id };
         const bytes = try std.json.Stringify.valueAlloc(a, sql_routines.command(request), .{});
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});

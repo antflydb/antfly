@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class SQLCatalogObjectKind(StrEnum):
     FUNCTION = "function"
+    OPERATOR = "operator"
     PROCEDURE = "procedure"
     SEQUENCE = "sequence"
 

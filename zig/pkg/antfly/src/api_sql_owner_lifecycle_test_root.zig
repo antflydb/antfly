@@ -54,6 +54,7 @@ test {
     _ = @import("api/sql_view_domain_integration_test.zig");
     _ = @import("api/sql_routine_lifecycle_integration_test.zig");
     _ = @import("api/sql_procedure_lifecycle_integration_test.zig");
+    _ = @import("api/sql_operator_lifecycle_integration_test.zig");
     _ = @import("pgwire/protocol_test.zig");
     _ = @import("api/sql_collection_integration_test.zig");
     _ = @import("system_catalog/views.zig");

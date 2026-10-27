@@ -225,7 +225,7 @@ pub fn same(a: *const ast.Scalar, b: *const ast.Scalar) bool {
         .binary => |binary| binary.op == b.binary.op and same(binary.left, b.binary.left) and same(binary.right, b.binary.right),
         .cast => |cast| cast.type == b.cast.type and cast.temporal_kind == b.cast.temporal_kind and cast.element_type == b.cast.element_type and @import("../common/sql_builtin_type.zig").NumericModifier.eql(cast.numeric_modifier, b.cast.numeric_modifier) and same(cast.operand, b.cast.operand),
         .call => |call| blk: {
-            if (!std.mem.eql(u8, functionName(call.name), functionName(b.call.name)) or call.star != b.call.star or call.distinct != b.call.distinct or (call.filter == null) != (b.call.filter == null) or call.args.len != b.call.args.len) break :blk false;
+            if (call.operator != b.call.operator or !std.mem.eql(u8, functionName(call.name), functionName(b.call.name)) or call.star != b.call.star or call.distinct != b.call.distinct or (call.filter == null) != (b.call.filter == null) or call.args.len != b.call.args.len) break :blk false;
             // Query and window domains cannot lose their metadata through
             // ordinary aggregate-expression deduplication.
             if (call.subquery != null or b.call.subquery != null or call.window != null or b.call.window != null) break :blk a == b;
@@ -404,7 +404,7 @@ const Builder = struct {
             .call => |call| blk: {
                 const args = try self.alloc.alloc(*const ast.Scalar, call.args.len);
                 for (call.args, args) |arg, *out| out.* = try self.rewrite(arg);
-                break :blk .{ .call = .{ .name = call.name, .args = args, .star = call.star, .distinct = call.distinct, .filter = if (call.filter) |filter| try self.rewrite(filter) else null, .within_group = call.within_group } };
+                break :blk .{ .call = .{ .name = call.name, .operator = call.operator, .args = args, .star = call.star, .distinct = call.distinct, .filter = if (call.filter) |filter| try self.rewrite(filter) else null, .within_group = call.within_group } };
             },
             .case_when => |case| blk: {
                 const branches = try self.alloc.alloc(ast.Scalar.Branch, case.branches.len);
