@@ -1,4 +1,4 @@
-# Full human-output quickstart. See scripts/quickstart/README.md for setup.
+# Wikipedia search demo. See scripts/quickstart/README.md for setup.
 # Run from the repository root against a fresh, isolated local server.
 # OpenAI generation is billed; embeddings, reranking and retrieval stay local.
 Output .recordings/quickstart.mp4
@@ -23,7 +23,7 @@ Type `clear`
 Enter
 Sleep 500ms
 Show
-Type `# Full quickstart - waits shortened for this demo`
+Type `# Wikipedia search - waits shortened for this demo`
 Enter
 Type `antfly table create -t wikipedia -f wikipedia-config.json`
 Enter

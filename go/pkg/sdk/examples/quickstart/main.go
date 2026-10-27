@@ -13,9 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command quickstart is the compile-checked Go counterpart to the documentation
-// quickstart. It expects Antfly at http://127.0.0.1:8080 and the Wikipedia JSONL
-// fixture to have been loaded by the shared CLI ingestion step.
+// Command quickstart is the compile-checked Go counterpart to
+// docs/guides/wikipedia-search.mdx. It expects Antfly at http://127.0.0.1:8080
+// and the Wikipedia JSONL fixture loaded by the guide's shared CLI ingestion step.
 package main
 
 import (
