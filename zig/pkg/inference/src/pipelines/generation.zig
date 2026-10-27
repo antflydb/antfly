@@ -13821,6 +13821,9 @@ pub const NativeGenerationPipeline = struct {
                 context.context.prepared_lighton_decode = true;
                 if (try self.tryLightOnCudaDecodeGraph(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context.context)) |result| return result;
                 @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraph(&self.cb);
+                // Eager decode introduces shapes absent from a mixed prefix
+                // frame; reserve bounded plan slots before enqueueing them.
+                try @import("../ops/cuda/cuda_compute.zig").CudaCompute.prepareLightOnMatmulFrame(&self.cb);
                 if (try self.tryLightOnCudaTokenBurst(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context.context)) |result| return result;
             }
         }
@@ -14177,6 +14180,7 @@ pub const NativeGenerationPipeline = struct {
                     if (try self.tryLightOnCudaDecodeGraph(claimed, items, input_ids, &owned_ctx.context)) |result| return result;
                     @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraph(&self.cb);
                 }
+                if (cuda_lighton) try @import("../ops/cuda/cuda_compute.zig").CudaCompute.prepareLightOnMatmulFrame(&self.cb);
                 if (cuda_lighton) if (try self.tryLightOnCudaTokenBurst(claimed, items, input_ids, &owned_ctx.context)) |result| return result;
             }
             if (comptime build_options.enable_metal) {

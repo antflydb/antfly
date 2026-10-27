@@ -26,10 +26,10 @@
     }
   ],
   "latest_local_qualification": {
-    "scope": "GPU-resident independently owned vision features, batched merger, admitted upload-event retirement and asynchronous token readback. F32 decode projection outputs/recurrent state unchanged. CUDA parity remains outstanding.",
-    "runtime_parent_commit": "37d64f8c351898d9f98636e1a195b299fc7495fc",
-    "binary_sha256": "9d21d53cbebe8e28c90b48b9996ab2337cfdef4b08189c5606524fbc205d1cba",
-    "source_manifest_sha256": "e9877c859bc6d3e86e6c89c532d453ddb907581cb870f0bfb9beec01f3b04600",
+    "scope": "GPU-resident independently owned vision features, batched merger, admitted upload-event retirement, asynchronous token readback, event-based reader admission and bounded eager-decode plan reservation. F32 decode projection outputs/recurrent state unchanged. CUDA throughput parity remains outstanding.",
+    "runtime_parent_commit": "6d15573b697e816cb45e4885fd69634b8bc043ba",
+    "binary_sha256": "7240a44c7410217574484b8a05d271953521f694a90fac19811a41b7d43d0a67",
+    "source_manifest_sha256": "5bd4ad58c34cdebe75d345a8da4c75fa72145643566b09e6205d7078c6cd167f",
     "source_file_sha256": {
       "zig/pkg/inference/build/runtime.zig": "ab746106497ba472ca2fc4e0b4ebce97fd5451b1a4cb75d9eaf402832de0bb8a",
       "zig/pkg/inference/build/tests.zig": "7625806a92cd087c3dbd4968bf5d618093ea50364bfba6aa006271dfb7a41709",
@@ -55,7 +55,7 @@
       "zig/pkg/inference/src/ops/cuda/prototypes/lighton_batched_attention.cu": "a253da43c5dce8d14ce0f02f843708cbd670dd74cfe781524384a7596a9dea44",
       "zig/pkg/inference/src/ops/cuda/prototypes/lighton_qwen35_recurrent.cu": "55f269a128ad50eae0dfcaf8fe591bbded4aea5dbe05df67a8a6d034dff871aa",
       "zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision.cu": "41a1a9a0085731f97601182ea114050ac039d7f42699926f90e44e759003500a",
-      "zig/pkg/inference/src/pipelines/generation.zig": "4c90707a836149a1001ce028807fef40615ed5932d526935c09338e1315a98c4",
+      "zig/pkg/inference/src/pipelines/generation.zig": "b206cc60466859e17e445e038e694d1f3765dcf6db236623bc36d3d6de337d98",
       "zig/pkg/inference/src/pipelines/reading.zig": "20ef5a3c5b96b2da54426faa4de9cca75a20afbe7c29c0b297ad2aed92c01bfd",
       "zig/pkg/inference/src/runtime/scheduler/native_generate.zig": "3500ea6444834b27c3f6c2da0142dec098eef9a045362d5e7f51f716d8a821b6",
       "zig/pkg/inference/src/server/server.zig": "b6abcda3b20745dc7d956e36d3f3698b1d2cb5a6e624486f79bcbbb6864b23c3",
@@ -63,8 +63,8 @@
       "zig/pkg/inference/src/ops/cuda/lighton_activation.zig": "ecb56a4fccefc42a0b1f369d64c32492a9b0c9771a423e701ee75b03f5afec25",
       "zig/pkg/inference/src/ops/cuda/lighton_activation.ptx": "ab9e6c67790cafa0f4f51ac9c2ffd5ed4acb89e60c731e46926d8310905f81e7",
       "zig/pkg/inference/src/ops/cuda/prototypes/lighton_activation.cu": "8b5ba1721669b5b1a59352c974953840240a1678d509e6fb4e6fa52a714673a6",
-      "zig/pkg/inference/src/server/reader_execution_pool.zig": "2265d23d206681b8f36c0ff0e63dbb9077d1311f99e1ac9580761c94cc01beab",
-      "zig/pkg/inference/src/server/reader_epoch.zig": "f1100bb6df08b5daf32c63542916940e91cdaf215a284a87771fac922ad267bd",
+      "zig/pkg/inference/src/server/reader_execution_pool.zig": "3df029d8a5d8b66b73c6f110420b11a0713feecc30bf1453b83267b7209aab02",
+      "zig/pkg/inference/src/server/reader_epoch.zig": "e405cc24cdc8c73f9769ecf39c8ec0596e2d2f8e2e070819949d403a1e0d827a",
       "zig/pkg/inference/src/server/reader_execution_config.zig": "ba292ef60f1f5e519195ae113816e89a01b5b3bd1bed5c1ef83d302b4790f0d0",
       "zig/pkg/inference/src/server/reader_admission.zig": "1483ba2042ab77cc573db92c2ccbe64ede718ce7c97f2b5624ada96f1dc256fe",
       "zig/pkg/inference/src/ops/cuda/lighton_prefill.zig": "ea5e5d978dcdce53d3a526c973c082843914b206e668feb3972847d49053a809",
@@ -86,7 +86,7 @@
       "zig/pkg/inference/src/ops/cuda/pinned_input_arena.zig": "17c8cb1e5e8683fca96a0901811b2b9a580f09c43ac93c869e9f2896a9cd7aa7",
       "zig/pkg/inference/src/ops/cuda/buffer.zig": "522126f2efd853d23793cf8da50aec5e3a5241fe7f6de60473f2393d4f8e3619"
     },
-    "published_delta": "All 54 runtime/configuration inputs match frozen build421. Documentation and this evidence index are outside the runtime snapshot; raw reports and binary remain outside tracked source.",
+    "published_delta": "All 54 runtime/configuration inputs match frozen build429. Documentation and this evidence index are outside the runtime snapshot; raw reports and binary remain outside tracked source.",
     "measurement": {
       "warmup_requests": 256,
       "requests_per_round": 256,
@@ -118,32 +118,54 @@
         {
           "model": "08",
           "reference_report_sha256": "c808a5a2faa5410ac39015986dd16ed73883d8fe8003d966e314d7e98dd5e617",
-          "native_report_sha256": "1718818d9992313a63a9f0b555ad079b451de33e0409210f4b08ffa06648ab41",
+          "native_report_sha256": "5973900ee024a5e1090ecc5fefe9a2a1b399b49ec54ec64d1eae54126759ae71",
           "rates": [
-            12.4693,
-            13.2207,
-            13.0936
+            12.5137,
+            13.0734,
+            13.0963
           ],
           "status": "ok"
         },
         {
           "model": "4b",
           "reference_report_sha256": "0168dc76a53c50366564340fc71ef5b77f6991c794a0f859302a8546ea41c311",
-          "native_report_sha256": "3c5de4fb20477ebfe295b771503c854ea0ef0a2f175e1b23639323c7d5e28ce2",
+          "native_report_sha256": "378cba2fc6c512b0a225c33a2f996080d002b75d57e40d67154f51ffe6d189f1",
           "rates": [
-            4.0071,
-            4.0898,
-            4.0676
+            4.0317,
+            4.0833,
+            4.0357
           ],
           "status": "ok"
         }
       ],
-      "gpu_isolation_foreign_processes": []
+      "gpu_isolation_foreign_processes": [],
+      "cpu_observations": {
+        "scope": "Sampled GPU-resident process CPU across warmup and two measured rounds, excluding unsampled process boundaries. Same build425 control settings versus build429 event waits; no sustained throughput gain claimed.",
+        "rows": [
+          {
+            "model": "08",
+            "control_mean_cores": 4.17322545785929,
+            "event_mean_cores": 1.5622106464231467,
+            "event_reduction_fraction": 0.6256586992008568,
+            "control_sampled_seconds": 63.67257237434387,
+            "event_sampled_seconds": 63.730201959609985
+          },
+          {
+            "model": "4b",
+            "control_mean_cores": 3.6662285133686154,
+            "event_mean_cores": 1.2118037671159152,
+            "event_reduction_fraction": 0.6694685662126167,
+            "control_sampled_seconds": 209.40865993499756,
+            "event_sampled_seconds": 211.56065607070923
+          }
+        ],
+        "proof_sha256": "c0a93ba8e0485932ad0d99a8760ea37c1a3015539e120b5ea2e1f390d9cf054f"
+      }
     },
     "qualification": {
       "cuda_broad": {
-        "selected": 267,
-        "passed": 253,
+        "selected": 269,
+        "passed": 255,
         "skipped": 14
       },
       "cuda_wide": {
@@ -160,7 +182,12 @@
       ],
       "feature_and_prompt_parity": "bitwise, both checkpoints",
       "metal": "compilation plus focused CPU checks only",
-      "host_retirement": "Failure-injection checks preserve pinned host ownership/admission and stale-read generations across policy replacement."
+      "host_retirement": "Failure-injection checks preserve pinned host ownership/admission and stale-read generations across policy replacement.",
+      "shared_reader_pool": {
+        "selected": 4,
+        "passed": 4,
+        "skipped": 0
+      }
     }
   }
 }

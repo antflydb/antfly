@@ -54,8 +54,8 @@ attention. These profiles are not a full activation-precision match.
 
 | Model | Native pages/s | vLLM pages/s | Required actual execution |
 | --- | ---: | ---: | --- |
-| LightOn 0.8B | 13.2207 / 13.0936 | 14.4262 / 14.4847 | Wide four-token chains in each round |
-| LightOn 4B | 4.0898 / 4.0676 | 4.6341 / 4.6303 | Wide four-token chains in each round |
+| LightOn 0.8B | 13.0734 / 13.0963 | 14.4262 / 14.4847 | Wide four-token chains in each round |
+| LightOn 4B | 4.0833 / 4.0357 | 4.6341 / 4.6303 | Wide four-token chains in each round |
 
 The 0.8B run uses vision/prefix limits 16/16; 4B uses 8/16 and 256-row
 prefix chunks. Both enable the BF16 normalization-input mirror while retaining
@@ -64,20 +64,27 @@ event completes; token readback releases the GPU execution lane while waiting.
 Each page independently owns its device vision features. Operator byte limits
 are unchanged. Greedy execution reads token
 IDs; 4B skips all 426 unused intermediate prefix heads per round. Both isolated
-comparisons observed no foreign GPU compute process. LightOn parity and a
-representative OCR accuracy evaluation remain outstanding.
+comparisons observed no foreign GPU compute process. Replacing 100-microsecond
+reader-slot polling with release events reduced sampled resident-process CPU
+from 4.17 to 1.56 cores for 0.8B and from 3.67 to 1.21 for 4B, with comparable
+throughput. These observations cover warmup plus both measured rounds; they are
+not per-request CPU measurements. Eager decode reserves bounded cuBLAS plan
+slots after graph retirement; an eight-page 4B prefill control now completes
+without uncached fallbacks. The selected prefill limit remains sixteen.
+LightOn parity and a representative OCR accuracy evaluation remain outstanding.
 
-The [manifest](followup.json) pins the 54-file build421 snapshot and binary,
+The [manifest](followup.json) pins the 54-file build429 snapshot and binary,
 report hashes, settings and actual-vLLM317 references. Preset defaults now apply
 the same token-chain width, vision/prefill limits and pinned-input switch used
 explicitly in those measurements; all runtime and profile inputs match that snapshot.
-CUDA regression: 267 selected, 253 passed, 14 backend skips; wide: 100 selected,
+CUDA regression: 269 selected, 255 passed, 14 backend skips; wide: 100 selected,
 99 passed, one skip. Independent packet, allocation-denial, admission, numerical
 and ownership checks retain their original tolerances. Both real checkpoints
 also match host vision features and assembled prompt bytes at batch sizes
 1, 2, 3, 8 and 16, with no intermediate feature downloads. CPU tests cover
 cancelled feature retirement and upload-event reuse without draining a later
-GPU producer. Failure-injection checks retain admission charges when physical
+GPU producer. Four pool tests cover slot/epoch wakeup, cancellation, deadlines
+and failed creation. Failure-injection checks retain admission charges when physical
 host retirement fails; policy replacement cannot revive a stale readback. Metal compilation and focused CPU checks pass; these are not new
 Metal GPU throughput measurements.
 
@@ -88,7 +95,7 @@ on the same limited fixture set. M5 Metal qualification is in the user guide.
 The [archive manifest](followup.json) pins an immutable 77-file baseline bundle
 and a minimized 56-file supplemental vision qualification bundle. It records
 object generations, sizes, SHA-256 and verified MD5 values. The bundles cover
-earlier selected runtimes; build421, full419 and actual-vLLM317 logs remain local and
+earlier selected runtimes; build429, full431 and actual-vLLM317 logs remain local and
 are excluded from those archived payloads. Binaries, source snapshots, full
 reports and experiment logs stay outside tracked source directories. The
 [previous wide-cohort bundle](followup-bfd1738430.json) and
