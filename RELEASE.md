@@ -104,6 +104,14 @@ native Linux architectures; portable musl arm64 and macOS arm64 cross-compile
 from the amd64 Linux runner. The macOS build uses the pinned cross-compilation
 SDK and enables Metal and Accelerate.
 
+Release archive jobs prepare pinned Zig source dependencies from the private
+GCS mirror using the controller's authenticated preparation action. Preparation
+and the server/embedded builds share `.zig-cache/release-dependencies/global`;
+release preparation requires the mirror and never falls back to upstream. Every
+package is verified against the source inventory's Zig content hash. The
+short-lived, bucket-scoped reader token is limited to preparation and is not
+passed to the compiler.
+
 ## Pipeline Ownership
 
 Release is split into an untrusted request plane, a default-branch artifact
@@ -126,7 +134,8 @@ credentials.
    the versioned builder inputs.
    The controller first requires that source to declare the supported
    `scripts/release/build-contract.json` schema and all required build paths.
-   With only read permission, it builds the canonical Zig archives,
+   With read-only repository permission and keyless source-mirror read access
+   limited to archive jobs, it builds the canonical Zig archives,
    calls `.github/workflows/cli-package.yml`, extracts `install.sh` and
    `openapi.yaml` directly from the selected Git commit, and uploads the native
    archives, CLI snapshot, commit-bound source snapshot, and
