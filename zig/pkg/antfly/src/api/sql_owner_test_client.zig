@@ -186,6 +186,15 @@ pub fn executeInDatabase(ctx: *fixture.Context, database: []const u8, namespace:
     return executeBody(ctx, null, body, retry);
 }
 
+/// Campaigns with large complete postimages must request their bounded read
+/// budget explicitly; ordinary callers retain the production default.
+pub fn executeBounded(ctx: *fixture.Context, statement: []const u8, limit: u32, retry: Retry) !http.HttpResponse {
+    if (limit == 0 or limit > 4096) return error.InvalidSqlLimit;
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .limit = limit }, .{});
+    defer ctx.alloc.free(body);
+    return executeBody(ctx, null, body, retry);
+}
+
 pub fn executeParameters(ctx: *fixture.Context, statement: []const u8, parameters: []const std.json.Value, retry: Retry) !http.HttpResponse {
     const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .parameters = parameters }, .{});
     defer ctx.alloc.free(body);

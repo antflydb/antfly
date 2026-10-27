@@ -44,6 +44,9 @@ pub const Identity = struct {
 
 pub const Request = struct {
     statement: []const u8,
+    /// Internal ingress intent: preserve PostgreSQL COPY/RLS admission on every batch.
+    copy_input: bool = false,
+    statement_instant: ?@import("antfly_local_sources").sql_catalog.Clock.Instant = null,
     /// Reclaiming allocator sharing the connection cap. Result envelopes use
     /// the describe/execute arena; backend-owned execution scratch/results can
     /// release memory independently instead of nesting under that arena.
@@ -118,11 +121,18 @@ pub const Description = struct {
     /// alone cannot distinguish SELECT from a mutation with RETURNING.
     cursor_readable: bool = false,
     copy_out: ?@import("antfly_local_sources").sql_ast.CopyOptions = null,
+    copy_in: ?CopyInput = null,
     columns: []const Column = &.{},
     parameter_types: []const Type = &.{},
     parameter_descriptors: []const Parameter = &.{},
     binding_guard: ?[]const u8 = null,
     setting_epoch: ?u64 = null,
+};
+
+pub const CopyInput = struct {
+    table: @import("antfly_local_sources").sql_ast.Name,
+    columns: []const Column,
+    options: @import("antfly_local_sources").sql_ast.CopyOptions,
 };
 
 pub const Result = struct {

@@ -164,6 +164,10 @@ pub const Session = struct {
     diagnostic: backend.Diagnostic = .{},
     mutation_ack_pending: bool = false,
     discard_after_reply: bool = false,
+    copy_running: bool = false,
+    copy_instant: ?@import("antfly_local_sources").sql_catalog.Clock.Instant = null,
+    discard_copy_data: bool = false,
+    copy_sync_received: bool = false,
 
     pub fn deinit(self: *Session) void {
         if (self.hooks) |hooks| hooks.unregister(hooks.context, self);
@@ -217,6 +221,13 @@ pub const Session = struct {
                 if (payload.len != 0) return error.ProtocolViolation;
                 return;
             }
+            if (self.discard_copy_data) {
+                if (tag == 'd' or tag == 'c' or tag == 'f') {
+                    if (tag != 'd') self.discard_copy_data = false;
+                    continue;
+                }
+                self.discard_copy_data = false;
+            }
             if (self.skip_until_sync and tag != 'S') continue;
             const timeout = self.statement_timeout orelse self.limits.statement_timeout_ms;
             self.setDeadline(if (timeout == 0) self.limits.statement_timeout_ms else @min(timeout, self.limits.statement_timeout_ms));
@@ -224,7 +235,9 @@ pub const Session = struct {
             self.mutation_ack_pending = false;
             self.dispatch(tag, payload) catch |err| {
                 if (err == error.Canceled) return err;
-                self.skip_until_sync = tag != 'Q';
+                const copied_sync = self.copy_sync_received;
+                self.copy_sync_received = false;
+                self.skip_until_sync = tag != 'Q' and !copied_sync;
                 if (self.diagnostic.transaction_status) |status| {
                     self.status = status;
                     if (status == .idle) {
@@ -248,7 +261,8 @@ pub const Session = struct {
                 if (self.status == .idle) self.finishSqlCursors(false);
                 if (self.mutation_ack_pending) self.diagnostic.set("40003", "mutation committed but its acknowledgement failed; do not replay this statement", self.diagnostic.transaction_id, false);
                 if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), sqlMessage(err));
-                if (tag == 'Q') try self.ready();
+                if (copied_sync and self.status == .idle) self.clearPortals();
+                if (tag == 'Q' or copied_sync) try self.ready();
             };
             try self.writer.flush();
         }
@@ -376,6 +390,7 @@ pub const Session = struct {
             .statement = statement,
             .scratch_allocator = self.alloc,
             .parameters = parameters,
+            .statement_instant = if (self.copy_running) self.copy_instant else null,
             .parameter_types = types,
             .database = self.database,
             .namespace = self.request_namespace orelse self.effectiveNamespace(),
@@ -474,6 +489,7 @@ pub const Session = struct {
         const current = try self.describeTyped(alloc, statement, original.parameter_types, original.parameter_descriptors);
         if (!cachedColumnsEqual(original.columns, current.columns) or
             (original.copy_out == null) != (current.copy_out == null) or
+            (original.copy_in == null) != (current.copy_in == null) or
             original.parameter_types.len != current.parameter_types.len)
             return self.cachedPlanChanged();
         for (original.parameter_types, current.parameter_types, 0..) |before, after, i| {
@@ -520,10 +536,11 @@ pub const Session = struct {
                 },
             };
         }
-        self.cancel_requested.store(false, .release);
+        if (!self.copy_running) self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
+        defer self.executing.store(self.copy_running, .release);
         var req = self.request(statement, parameters, types);
+        req.copy_input = self.copy_running;
         req.parameter_descriptors = descriptors;
         req.parameter_cells = native_cells;
         req.parameter_owner = if (parameter_owner) |owner| owner.lease() else null;
@@ -900,6 +917,16 @@ pub const Session = struct {
                         try self.ready();
                         return;
                     }
+                    if (commands.isCopy(statement)) {
+                        const description = try self.describeTyped(arena.allocator(), statement, &.{}, &.{});
+                        if (description.copy_in != null) {
+                            try self.copyIn(arena.allocator(), description);
+                            self.copy_sync_received = false;
+                            if (self.status == .idle) self.clearPortals();
+                            try self.ready();
+                            return;
+                        }
+                    }
                     if (try self.simpleStream(statement)) {
                         if (self.status == .idle) self.clearPortals();
                         try self.ready();
@@ -1045,6 +1072,7 @@ pub const Session = struct {
                 const description = backend.Description{
                     .cursor_readable = current.cursor_readable,
                     .copy_out = current.copy_out,
+                    .copy_in = current.copy_in,
                     .columns = current.columns,
                     .parameter_types = types,
                     .parameter_descriptors = current.parameter_descriptors,
@@ -1096,11 +1124,11 @@ pub const Session = struct {
                         try bytes.writer.writeInt(u16, @intCast(prepared.parameter_oids.len), .big);
                         for (prepared.parameter_oids) |oid| try bytes.writer.writeInt(u32, oid, .big);
                         try self.message('t', bytes.written());
-                        if (description.copy_out != null) try self.message('n', "") else try self.rowDescription(description.columns, &.{});
+                        if (description.copy_out != null or description.copy_in != null) try self.message('n', "") else try self.rowDescription(description.columns, &.{});
                     },
                     'P' => {
                         const portal = self.portals.get(name) orelse return error.InvalidPortalName;
-                        if (portal.description.copy_out != null) try self.message('n', "") else try self.rowDescription(portal.description.columns, portal.formats);
+                        if (portal.description.copy_out != null or portal.description.copy_in != null) try self.message('n', "") else try self.rowDescription(portal.description.columns, portal.formats);
                     },
                     else => return error.ProtocolViolation,
                 }
@@ -1132,6 +1160,17 @@ pub const Session = struct {
                     self.read_receipt_budget = .{};
                     portal.description = try self.rebindCached(portal.arena.allocator(), portal.statement, portal.description);
                     portal.stream_opened = true;
+                    if (portal.description.copy_in != null) {
+                        try self.copyIn(portal.arena.allocator(), portal.description);
+                        portal.stream_complete = true;
+                        portal.failed = false;
+                        if (self.copy_sync_received) {
+                            self.copy_sync_received = false;
+                            if (self.status == .idle) self.clearPortals();
+                            try self.ready();
+                        }
+                        return;
+                    }
                     if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
                         self.cancel_requested.store(false, .release);
                         self.executing.store(true, .release);
@@ -1145,6 +1184,7 @@ pub const Session = struct {
                         portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
                     };
                 }
+                if (portal.description.copy_in != null and portal.stream_complete) return error.PortalExecutionFailed;
                 if (portal.stream != null or portal.stream_complete) {
                     try self.executeStream(portal, requested);
                     portal.failed = false;
@@ -1748,6 +1788,216 @@ pub const Session = struct {
         }
     };
 
+    fn copyIn(self: *Session, a: std.mem.Allocator, description: backend.Description) !void {
+        const input = description.copy_in orelse return error.InvalidResult;
+        const width = input.columns.len;
+        if (width == 0 or width > self.limits.columns or width > self.limits.parameters) return error.ProgramLimitExceeded;
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        self.copy_running = true;
+        defer {
+            self.copy_running = false;
+            self.copy_instant = null;
+            self.executing.store(false, .release);
+        }
+        self.copy_instant = try (@import("antfly_local_sources").sql_catalog.Clock.Source{ .io = self.io }).sample();
+        const implicit = self.status == .idle;
+        if (implicit) {
+            var begin = try self.execute(a, "BEGIN", &.{}, &.{}, null, null);
+            defer begin.deinit();
+            if (self.status != .in_transaction or self.session_id == null) return error.InvalidResult;
+        }
+        errdefer {
+            // Do not wait for a client to finish sending after reporting an
+            // error. The outer loop discards its queued COPY frames.
+            self.discard_copy_data = true;
+            if (implicit) self.abortCopy(a) else {
+                self.markTransactionFailed("");
+                self.status = .failed;
+                self.diagnostic.transaction_status = .failed;
+            }
+        }
+        var decoder = try @import("copy_in.zig").Decoder.init(self.alloc, input.options, width, self.limits.frame_bytes);
+        defer decoder.deinit();
+        var batch: CopyBatch = .{ .session = self, .description = description, .arena = .init(self.alloc), .max_rows = @min(@as(usize, 128), self.limits.parameters / width) };
+        defer batch.deinit();
+        var response: std.Io.Writer.Allocating = .init(self.alloc);
+        defer response.deinit();
+        const format: u16 = if (input.options.format == .binary) 1 else 0;
+        try response.writer.writeByte(@intCast(format));
+        try response.writer.writeInt(u16, @intCast(width), .big);
+        for (input.columns) |_| try response.writer.writeInt(u16, format, .big);
+        try self.message('G', response.written());
+        try self.writer.flush();
+        while (true) {
+            try self.request("", &.{}, &.{}).check();
+            const tag = try self.reader.takeByte();
+            const bytes = try self.readPayload(4);
+            defer self.alloc.free(bytes);
+            switch (tag) {
+                'd' => {
+                    var remaining: []const u8 = bytes;
+                    while (try decoder.next(&remaining)) |row| try batch.row(row);
+                },
+                'c' => {
+                    if (bytes.len != 0) return error.ProtocolViolation;
+                    if (try decoder.finish()) |row| try batch.row(row);
+                    break;
+                },
+                'f' => {
+                    var cursor: Cursor = .{ .bytes = bytes };
+                    _ = try cursor.string();
+                    try cursor.finish();
+                    return error.CopyAborted;
+                },
+                'S' => {
+                    if (bytes.len != 0) return error.ProtocolViolation;
+                    self.copy_sync_received = true;
+                },
+                'H' => {
+                    if (bytes.len != 0) return error.ProtocolViolation;
+                    try self.writer.flush();
+                },
+                else => return error.ProtocolViolation,
+            }
+        }
+        try batch.flush();
+        if (implicit) {
+            var committed = try self.execute(a, "COMMIT", &.{}, &.{}, null, null);
+            defer committed.deinit();
+            if (self.status != .idle) return error.InvalidResult;
+        }
+        var tag: [64]u8 = undefined;
+        try self.command(try std.fmt.bufPrint(&tag, "COPY {d}", .{batch.total}));
+    }
+
+    fn abortCopy(self: *Session, a: std.mem.Allocator) void {
+        const diagnostic = self.diagnostic;
+        defer {
+            self.diagnostic = diagnostic;
+            self.diagnostic.transaction_status = self.status;
+        }
+        self.cancel_requested.store(false, .release);
+        self.setDeadline(5000);
+        var rolled = self.execute(a, "ROLLBACK", &.{}, &.{}, null, null) catch {
+            // Shared cleanup retains any already admitted commit decision.
+            self.source.vtable.disconnect(self.source.context, self.identity.?, self.session_id);
+            if (self.session_id) |id| self.alloc.free(id);
+            self.session_id = null;
+            self.status = .idle;
+            if (self.catalog_settings) |*state| state.finish(false);
+            if (self.timeout_transaction) |settings| {
+                self.statement_timeout = settings.before;
+                self.namespace_setting = settings.namespace_before;
+                self.application_name = settings.application_before;
+                self.lake_visibility = settings.lake_before;
+            }
+            self.timeout_transaction = null;
+            self.transaction_namespace = null;
+            self.clearCursorSavepoints();
+            return;
+        };
+        rolled.deinit();
+    }
+
+    const CopyBatch = struct {
+        session: *Session,
+        description: backend.Description,
+        arena: std.heap.ArenaAllocator,
+        max_rows: usize,
+        count: usize = 0,
+        total: u64 = 0,
+        bytes: usize = 0,
+        parameters: std.ArrayList(std.json.Value) = .empty,
+        cells: std.ArrayList(@import("antfly_local_sources").sql_scalar.Datum) = .empty,
+        types: std.ArrayList(backend.Type) = .empty,
+        descriptors: std.ArrayList(backend.Parameter) = .empty,
+        fn deinit(self: *CopyBatch) void {
+            self.arena.deinit();
+            self.parameters.deinit(self.session.alloc);
+            self.cells.deinit(self.session.alloc);
+            self.types.deinit(self.session.alloc);
+            self.descriptors.deinit(self.session.alloc);
+        }
+        fn row(self: *CopyBatch, fields: []const @import("copy_in.zig").Field) !void {
+            const input = self.description.copy_in.?;
+            if (fields.len != input.columns.len) return error.InvalidCopyData;
+            try self.session.request("", &.{}, &.{}).check();
+            var row_bytes: usize = 0;
+            for (fields) |field| if (field) |value| {
+                row_bytes +|= value.len;
+            };
+            if (self.count != 0 and self.bytes +| row_bytes > 256 * 1024) try self.flush();
+            self.bytes +|= row_bytes;
+            const a = self.arena.allocator();
+            for (fields, input.columns) |field, column| {
+                const oid = try values.columnOid(column);
+                if (column.type == .string) if (field) |bytes| {
+                    if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.SqlInvalidTextEncoding;
+                };
+                const datum = if (field) |bytes| try values.decodeNative(a, oid, if (input.options.format == .binary) 1 else 0, bytes) else @import("antfly_local_sources").sql_scalar.Datum{};
+                try self.cells.append(self.session.alloc, datum);
+                try self.parameters.append(self.session.alloc, datum.value);
+                try self.types.append(self.session.alloc, column.type);
+                try self.descriptors.append(self.session.alloc, try values.parameterFromOid(oid));
+            }
+            self.count += 1;
+            if (self.count == self.max_rows) try self.flush();
+        }
+        fn quote(writer: *std.Io.Writer, name: []const u8) !void {
+            try writer.writeByte('"');
+            for (name) |ch| {
+                try writer.writeByte(ch);
+                if (ch == '"') try writer.writeByte(ch);
+            }
+            try writer.writeByte('"');
+        }
+        fn flush(self: *CopyBatch) !void {
+            if (self.count == 0) return;
+            const input = self.description.copy_in.?;
+            const a = self.arena.allocator();
+            var sql: std.Io.Writer.Allocating = .init(a);
+            try sql.writer.writeAll("INSERT INTO ");
+            if (input.table.database) |database| {
+                try quote(&sql.writer, database);
+                try sql.writer.writeByte('.');
+            }
+            if (input.table.namespace) |namespace| {
+                try quote(&sql.writer, namespace);
+                try sql.writer.writeByte('.');
+            }
+            try quote(&sql.writer, input.table.table);
+            try sql.writer.writeByte('(');
+            for (input.columns, 0..) |column, i| {
+                if (i != 0) try sql.writer.writeByte(',');
+                try quote(&sql.writer, column.name);
+            }
+            try sql.writer.writeAll(") OVERRIDING SYSTEM VALUE VALUES ");
+            for (0..self.count) |row_index| {
+                if (row_index != 0) try sql.writer.writeByte(',');
+                try sql.writer.writeByte('(');
+                for (0..input.columns.len) |i| {
+                    if (i != 0) try sql.writer.writeByte(',');
+                    try sql.writer.print("${d}", .{row_index * input.columns.len + i + 1});
+                }
+                try sql.writer.writeByte(')');
+            }
+            var result = try self.session.executeCells(a, sql.written(), self.parameters.items, self.types.items, self.descriptors.items, self.cells.items, null, self.description.binding_guard, self.description.setting_epoch);
+            defer result.deinit();
+            if (result.transaction_status != .in_transaction or result.rows_affected != self.count) return error.InvalidResult;
+            self.total = std.math.add(u64, self.total, self.count) catch return error.ProgramLimitExceeded;
+            self.count = 0;
+            self.bytes = 0;
+            self.parameters.clearRetainingCapacity();
+            self.cells.clearRetainingCapacity();
+            self.types.clearRetainingCapacity();
+            self.descriptors.clearRetainingCapacity();
+            result.deinit();
+            _ = self.arena.reset(.retain_capacity);
+        }
+    };
+
     fn executeCopyOut(self: *Session, portal: *Portal) !void {
         // Admission already cleared cancellation before opening this stream.
         // Do not erase a cancel received between open and the first COPY page.
@@ -2170,7 +2420,8 @@ fn sqlstate(err: anyerror) []const u8 {
         error.AuthenticationFailed, error.Unauthorized => "28000",
         error.InvalidPassword => "28P01",
         error.Forbidden, error.AccessDenied, error.SettingWriteForbidden => "42501",
-        error.QueryCanceled, error.Timeout => "57014",
+        error.QueryCanceled, error.Timeout, error.CopyAborted => "57014",
+        error.InvalidCopyData => "22P04",
         error.UniqueConstraintViolation => "23505",
         error.ForeignKeyParentMissing, error.ForeignKeyReferenced => "23503",
         error.InvalidParameter => "22P02",
@@ -2225,6 +2476,8 @@ fn sqlstate(err: anyerror) []const u8 {
 }
 
 fn sqlMessage(err: anyerror) []const u8 {
+    if (err == error.InvalidCopyData) return "Invalid COPY input: check column count, quoting, and binary framing.";
+    if (err == error.CopyAborted) return "COPY input was canceled by the client.";
     const diagnostic = @import("antfly_local_sources").sql_errors.describe(err);
     const code = sqlstate(err);
     if (std.mem.eql(u8, diagnostic.code, code)) return diagnostic.message;

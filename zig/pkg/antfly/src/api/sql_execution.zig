@@ -210,6 +210,9 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
 const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
 
 pub const Adapter = struct {
+    /// COPY input retains ordinary write authority but cannot target active RLS.
+    copy_input: bool = false,
+    statement_instant: ?catalog.Clock.Instant = null,
     lake_visibility: enum { committed, accepted } = .committed,
     read_requirements: @import("antfly_local_sources").sql_read_requirements.Requirements = .{},
     receipt_wait_budget: ReceiptWaitBudget = .{},
@@ -312,7 +315,7 @@ pub const Adapter = struct {
         // One statement cut precedes cursor selection, snapshot admission and
         // materializing fallback. The source remains borrowed from this owner.
         const statement_source: catalog.Clock.Source = .{ .io = self.server.embedding_provider_runtime.io };
-        const statement_instant = try statement_source.sample();
+        const statement_instant = if (self.statement_instant) |value| try catalog.Clock.Instant.init(value.micros) else try statement_source.sample();
         const previous_receipt_wait_budget = self.receipt_wait_budget;
         self.receipt_wait_budget = .{};
         defer self.receipt_wait_budget = previous_receipt_wait_budget;
@@ -990,6 +993,11 @@ pub const Adapter = struct {
             }
         }
         if (self.identity.*) |*identity| try http_server.projectCatalogIdentity(self.server.alloc, identity, logical, table.name);
+        if (self.copy_input) {
+            const proof = try self.server.rowPolicyMutationReadProof(alloc, if (self.identity.*) |*identity| identity else null, self.context, binding.id, binding.physical_name, target.database, binding.schema_version, .normalize);
+            defer if (proof) |bytes| alloc.free(bytes);
+            if (proof != null) return error.UnsupportedSqlShape;
+        }
         return binding;
     }
 

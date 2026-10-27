@@ -126,6 +126,37 @@ be accepted on loopback by default; remote binding requires explicit deployment
 acknowledgement of an externally protected transport. This override supplies no
 TLS itself.
 
+## COPY input
+
+`COPY table [(columns)] FROM STDIN` accepts PostgreSQL text, CSV and binary
+payloads in simple and extended queries. Input frames may split any field,
+UTF-8 character, quoted newline or binary length word. CSV supports HEADER,
+DELIMITER, NULL, QUOTE and ESCAPE. Only UTF-8 encoding is accepted. Implicit
+column lists omit generated columns. Supplied identity values use PostgreSQL's
+COPY override semantics; omitted identity/default columns retain normal defaults.
+
+One COPY owns one transaction. An idle connection uses an implicit BEGIN/COMMIT;
+an explicit transaction retains its normal commit, rollback and savepoint
+rules. Decoding and native constraints must succeed before COPY completion.
+Malformed input or a disconnected upload rolls back an implicit COPY, including
+already staged batches. A failed explicit COPY marks the transaction failed.
+An uncertain COMMIT retains the ordinary reconciliation diagnostic and must not
+be automatically replayed.
+
+The decoder retains one bounded row; typed batches contain at most 128 rows
+and respect parameter, connection-memory and transaction limits. Full COPY input
+is never accumulated in the transport. Cached parameterized INSERT plans reuse
+native row preparation, constraints, schema fences and distributed decisions.
+One statement clock spans all batches. Retained normalization checks live write
+authority during preparation and finalization, and closes before writer admission.
+
+COPY requires write permission. Tables with active row-level security reject
+COPY input with `0A000`, following PostgreSQL; use INSERT for policy-protected
+writes. Normal row filters, owner proofs and transaction checks remain active.
+WHERE, FORCE_NULL/FORCE_NOT_NULL, DEFAULT, FREEZE and error-skipping input options
+are not activated by this implementation. COPY requires the wire streaming
+protocol; the ordinary JSON SQL endpoint cannot carry an input stream.
+
 ## COPY output
 
 `COPY table [(columns)] TO STDOUT` and `COPY (SELECT ...) TO STDOUT`
@@ -143,7 +174,7 @@ another; cancellation, authorization revocation and errors abort without a
 successful COPY completion. One reusable field buffer is connection-budgeted;
 neither a complete row nor the complete result is buffered by the transport.
 
-COPY FROM, server files, PROGRAM, write-returning queries and zero-column
+Server files, PROGRAM, write-returning COPY queries and zero-column
 implicit projections remain unsupported. COPY is a wire streaming operation,
 not an alias for a JSON SQL response; ordinary nonstreaming execution rejects it.
 As in PostgreSQL, `TO STDIN` is accepted as an alternative spelling for client

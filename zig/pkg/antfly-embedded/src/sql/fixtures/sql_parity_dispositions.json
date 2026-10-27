@@ -3464,6 +3464,46 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-copy-input-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-copy-input-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-copy-input-protocol-debug": {
+      "command": [
+        "zig",
+        "build",
+        "pgwire-test",
+        "sql-test",
+        "-Doptimize=Debug",
+        "-j1",
+        "-Dtest-filter=COPY"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-copy-input-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_copy_input_reference.py",
+        "--check",
+        "zig/pkg/antfly/src/pgwire/fixtures/copy_input_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -9219,13 +9259,47 @@
     },
     {
       "id": "sql-0370",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COPY FROM STDIN original streams through authenticated pgwire into one existing native SQL transaction. Independent PostgreSQL 18 witnesses and real compiled metadata/session/data owners verify all 300 rows, labels/types/NULL provenance, defaults/generated values, primary versions/content digests, atomic duplicate/CHECK/NOT NULL/framing failures, explicit rollback, read-only denial, incomplete-upload rollback and cold recovery. Shared retained preparation additionally preserves identity override/default counters, RLS denial, revocation, cancellation and owner cleanup. Values remain typed parameters; bounded reusable framing and batched mutation admission avoid per-row SQL execution. Advanced COPY options and server-file/PROGRAM execution are not claimed.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_input_integration_test.zig",
+          "test": "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+          "gate": "sql-copy-input-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/pgwire/protocol_test.zig",
+          "test": "pgwire COPY input batches transactional typed rows across simple and extended fragmented streams",
+          "gate": "sql-copy-input-protocol-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_input_integration_test.zig",
+          "test": "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+          "gate": "sql-copy-input-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0371",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COPY FROM STDIN original streams through authenticated pgwire into one existing native SQL transaction. Independent PostgreSQL 18 witnesses and real compiled metadata/session/data owners verify all 300 rows, labels/types/NULL provenance, defaults/generated values, primary versions/content digests, atomic duplicate/CHECK/NOT NULL/framing failures, explicit rollback, read-only denial, incomplete-upload rollback and cold recovery. Shared retained preparation additionally preserves identity override/default counters, RLS denial, revocation, cancellation and owner cleanup. Values remain typed parameters; bounded reusable framing and batched mutation admission avoid per-row SQL execution. Advanced COPY options and server-file/PROGRAM execution are not claimed.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_input_integration_test.zig",
+          "test": "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+          "gate": "sql-copy-input-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/pgwire/protocol_test.zig",
+          "test": "pgwire COPY input batches transactional typed rows across simple and extended fragmented streams",
+          "gate": "sql-copy-input-protocol-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_input_integration_test.zig",
+          "test": "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+          "gate": "sql-copy-input-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0372",
@@ -9235,7 +9309,7 @@
     {
       "id": "sql-0373",
       "status": "implemented",
-      "reason": "The unchanged COPY TO STDOUT original executes through authenticated retained native read ownership over durable typed rows. PostgreSQL independently verifies complete COPY payload bytes, including NULL/empty/escaped fields and generated-column omission; wire tests cover simple/extended framing, bounded pages/frames, cancellation, revocation and nontruncation. COPY input and server-file/PROGRAM operations remain unsupported.",
+      "reason": "The unchanged COPY TO STDOUT original executes through authenticated retained native read ownership over durable typed rows. PostgreSQL independently verifies complete COPY payload bytes, including NULL/empty/escaped fields and generated-column omission; wire tests cover simple/extended framing, bounded pages/frames, cancellation, revocation and nontruncation. Server-file/PROGRAM operations remain unsupported; COPY input now has its separately qualified native lifecycle.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_pgwire.zig",
@@ -9257,7 +9331,7 @@
     {
       "id": "sql-0374",
       "status": "implemented",
-      "reason": "The unchanged COPY TO STDOUT original executes through authenticated retained native read ownership over durable typed rows. PostgreSQL independently verifies complete COPY payload bytes, including NULL/empty/escaped fields and generated-column omission; wire tests cover simple/extended framing, bounded pages/frames, cancellation, revocation and nontruncation. COPY input and server-file/PROGRAM operations remain unsupported.",
+      "reason": "The unchanged COPY TO STDOUT original executes through authenticated retained native read ownership over durable typed rows. PostgreSQL independently verifies complete COPY payload bytes, including NULL/empty/escaped fields and generated-column omission; wire tests cover simple/extended framing, bounded pages/frames, cancellation, revocation and nontruncation. Server-file/PROGRAM operations remain unsupported; COPY input now has its separately qualified native lifecycle.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_pgwire.zig",
@@ -9315,8 +9389,25 @@
     },
     {
       "id": "sql-0379",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COPY FROM STDIN original streams through authenticated pgwire into one existing native SQL transaction. Independent PostgreSQL 18 witnesses and real compiled metadata/session/data owners verify all 300 rows, labels/types/NULL provenance, defaults/generated values, primary versions/content digests, atomic duplicate/CHECK/NOT NULL/framing failures, explicit rollback, read-only denial, incomplete-upload rollback and cold recovery. Shared retained preparation additionally preserves identity override/default counters, RLS denial, revocation, cancellation and owner cleanup. Values remain typed parameters; bounded reusable framing and batched mutation admission avoid per-row SQL execution. Advanced COPY options and server-file/PROGRAM execution are not claimed.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_input_integration_test.zig",
+          "test": "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+          "gate": "sql-copy-input-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/pgwire/protocol_test.zig",
+          "test": "pgwire COPY input batches transactional typed rows across simple and extended fragmented streams",
+          "gate": "sql-copy-input-protocol-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_copy_input_integration_test.zig",
+          "test": "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
+          "gate": "sql-copy-input-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0380",
@@ -9343,7 +9434,7 @@
     {
       "id": "sql-0383",
       "status": "implemented",
-      "reason": "The unchanged COPY TO STDOUT original executes through authenticated retained native read ownership over durable typed rows. PostgreSQL independently verifies complete COPY payload bytes, including NULL/empty/escaped fields and generated-column omission; wire tests cover simple/extended framing, bounded pages/frames, cancellation, revocation and nontruncation. COPY input and server-file/PROGRAM operations remain unsupported.",
+      "reason": "The unchanged COPY TO STDOUT original executes through authenticated retained native read ownership over durable typed rows. PostgreSQL independently verifies complete COPY payload bytes, including NULL/empty/escaped fields and generated-column omission; wire tests cover simple/extended framing, bounded pages/frames, cancellation, revocation and nontruncation. Server-file/PROGRAM operations remain unsupported; COPY input now has its separately qualified native lifecycle.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_pgwire.zig",

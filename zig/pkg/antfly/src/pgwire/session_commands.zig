@@ -28,6 +28,11 @@ pub const Command = union(enum) {
     close_cursor: ?[]const u8,
 };
 
+pub fn isCopy(input: []const u8) bool {
+    var parser: Parser = .{ .alloc = undefined, .input = input };
+    return std.ascii.eqlIgnoreCase(parser.word() catch return false, "copy");
+}
+
 pub fn isCommit(input: []const u8) bool {
     var parser: Parser = .{ .alloc = undefined, .input = input };
     const verb = parser.word() catch return false;

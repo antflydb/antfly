@@ -6314,7 +6314,7 @@ pub const AntflyApiHandler = struct {
             const compiled = lease.compiled();
             // COPY owns a wire streaming contract. Neither JSON execution nor
             // JSON prepared resources may silently expose its SELECT body.
-            if (compiled.statement == .copy_to) return error.UnsupportedSqlExecution;
+            if (compiled.statement == .copy_to or compiled.statement == .copy_from) return error.UnsupportedSqlExecution;
             if (self.prepared_mode == .prepare) {
                 if (self.statement.len > prepared.max_statement_bytes) return error.SqlProgramLimitExceeded;
                 switch (compiled.statement) {
@@ -6353,7 +6353,7 @@ pub const AntflyApiHandler = struct {
                 return;
             }
             self.is_write = switch (compiled.statement) {
-                .select, .explain, .copy_to => false,
+                .select, .explain, .copy_to, .copy_from => false,
                 .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => true,
             };
             var execution = self.adapter.server.acquireSqlExecution(self.is_write) catch |err| {

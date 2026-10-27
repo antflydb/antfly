@@ -59,6 +59,15 @@ const Mock = struct {
     stream_definitions: ?[]const backend.Column = null,
     cursor_readable: bool = true,
     copy_out: ?@import("copy_out.zig").Options = null,
+    copy_in: ?@import("copy_out.zig").Options = null,
+    copy_staged: usize = 0,
+    copy_committed: usize = 0,
+    copy_sum: i64 = 0,
+    copy_sql_nulls: usize = 0,
+    copy_json_nulls: usize = 0,
+    copy_instant: ?i64 = null,
+    copy_batches: usize = 0,
+    copy_rollbacks: usize = 0,
     stream_text: ?[]const u8 = null,
     stream_cells: bool = false,
     stream_page_begin: usize = 0,
@@ -247,6 +256,7 @@ const Mock = struct {
         if (self.stream_definitions) |columns| if (std.mem.startsWith(u8, request.statement, "SELECT")) return .{ .columns = columns, .cursor_readable = self.cursor_readable };
         if (self.json_null_results) return .{ .columns = &.{.{ .name = "j", .type = .json }} };
         if (self.array_results) return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }} };
+        if (self.copy_in) |options| if (@import("session_commands.zig").isCopy(request.statement)) return .{ .copy_in = .{ .table = .{ .table = "t" }, .columns = self.stream_definitions orelse &.{.{ .name = "n", .type = .integer }}, .options = options }, .binding_guard = "immutable-catalog-binding" };
         return .{ .cursor_readable = self.cursor_readable, .copy_out = self.copy_out, .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
@@ -278,15 +288,35 @@ const Mock = struct {
                 request.diagnostics.?.transaction_status = .idle;
                 return error.SqlTransactionOutcomeUnknown;
             }
+            self.copy_committed += self.copy_staged;
+            self.copy_staged = 0;
             if (self.revoke_after_commit) self.cursor_revoked = true;
             return .{ .command_tag = "COMMIT", .transaction_status = .idle };
         }
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "rollback")) return .{ .command_tag = "ROLLBACK", .transaction_status = .idle };
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "rollback")) {
+            self.copy_staged = 0;
+            self.copy_rollbacks += 1;
+            return .{ .command_tag = "ROLLBACK", .transaction_status = .idle };
+        }
         if (try @import("session_commands.zig").control(alloc, request.statement)) |command| return .{ .command_tag = switch (command) {
             .savepoint => "SAVEPOINT",
             .rollback_to => "ROLLBACK",
             .release => "RELEASE",
         }, .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
+        if (self.copy_in != null and std.mem.startsWith(u8, request.statement, "INSERT INTO")) {
+            try std.testing.expect(request.session_id != null);
+            const instant = request.statement_instant orelse return error.MissingCopyClock;
+            if (self.copy_instant) |prior| try std.testing.expectEqual(prior, instant.micros) else self.copy_instant = instant.micros;
+            try std.testing.expectEqualStrings("immutable-catalog-binding", request.binding_guard.?);
+            try std.testing.expect(request.parameters.len <= 128);
+            try std.testing.expectEqual(request.parameters.len, request.parameter_cells.?.len);
+            for (request.parameter_cells.?) |cell| {
+                if (cell.sql_null) self.copy_sql_nulls += 1 else if (cell.value == .null) self.copy_json_nulls += 1 else if (cell.value == .integer) self.copy_sum += cell.value.integer;
+            }
+            self.copy_staged += request.parameters.len;
+            self.copy_batches += 1;
+            return .{ .command_tag = "INSERT", .rows_affected = request.parameters.len, .transaction_status = .in_transaction, .session_id = request.session_id };
+        }
         if (self.expected_execute_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
         self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, if (self.catalog_rebind) "current-catalog-binding" else "immutable-catalog-binding") else false;
         if (self.entered) |event| event.set(request.io);
@@ -3129,4 +3159,116 @@ test "pgwire materialized FETCH cannot emit continuation rows in a failed transa
         try oracle.verifyFailed(output.written());
         try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
     }
+}
+
+test "pgwire COPY input batches transactional typed rows across simple and extended fragmented streams" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |simple| for ([_]@import("copy_out.zig").Options{ .{}, .{ .format = .csv, .header = true }, .{ .format = .binary } }) |options| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (simple) try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00") else {
+            try parse(&input.writer, "q", "COPY t FROM STDIN", false);
+            try bind(&input.writer, "p", "q", null);
+            try frame(&input.writer, 'D', "Pp\x00");
+            try execute(&input.writer, "p", 1);
+            // libpq can pipeline Sync before waiting for CopyInResponse.
+            try frame(&input.writer, 'S', "");
+        }
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        var encoder = try @import("copy_out.zig").Encoder.init(a, arena.allocator(), &.{.{ .name = "n", .type = .integer }}, options, 1024);
+        defer encoder.deinit();
+        var payload: std.Io.Writer.Allocating = .init(a);
+        defer payload.deinit();
+        try encoder.start(&payload.writer);
+        for (0..300) |i| try encoder.row(arena.allocator(), &payload.writer, .{ .columns = encoder.columns, .rows = &.{&.{.{ .integer = @intCast(i) }}}, .command_tag = "SELECT" }, 0);
+        try encoder.finish(&payload.writer);
+        // Single-byte frames cover length words, UTF8 and row boundaries.
+        for (payload.written()) |byte| try frame(&input.writer, 'd', &.{byte});
+        try frame(&input.writer, 'c', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .copy_in = options };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(a, output.written());
+        defer a.free(messages);
+        if (std.mem.count(u8, messages, "E") != 0) std.debug.print("COPY input simple={} format={s} errors={d}\n", .{ simple, @tagName(options.format), std.mem.count(u8, messages, "E") });
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "G"));
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, messages, "Z"));
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "COPY 300\x00") != null);
+        try std.testing.expectEqual(@as(usize, 300), mock.copy_committed);
+        try std.testing.expectEqual(@as(usize, 0), mock.copy_staged);
+        try std.testing.expectEqual(@as(usize, 3), mock.copy_batches);
+        try std.testing.expectEqual(@as(i64, 44850), mock.copy_sum);
+    };
+}
+
+test "pgwire COPY input aborts an implicit transaction after a staged batch and drains queued data" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |copy_fail| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00");
+        for (0..128) |_| try frame(&input.writer, 'd', "1\n");
+        if (copy_fail) try frame(&input.writer, 'f', "client canceled\x00") else {
+            try frame(&input.writer, 'd', "too\tmany\n");
+            try frame(&input.writer, 'd', "already queued\n");
+            try frame(&input.writer, 'c', "");
+        }
+        try frame(&input.writer, 'Q', "SELECT 1\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .copy_in = .{} };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(a, output.written());
+        defer a.free(messages);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, 0), mock.copy_committed);
+        try std.testing.expectEqual(@as(usize, 0), mock.copy_staged);
+        try std.testing.expectEqual(@as(usize, 1), mock.copy_batches);
+        try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), if (copy_fail) "57014" else "22P04") != null);
+    }
+}
+
+test "pgwire COPY input preserves independent SQL and JSON null provenance in native batches" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00");
+    try frame(&input.writer, 'd', "\\N\nnull\n{\"x\":1}\n");
+    try frame(&input.writer, 'c', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .copy_in = .{}, .stream_definitions = &.{.{ .name = "j", .type = .json }} };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 3), mock.copy_committed);
+    try std.testing.expectEqual(@as(usize, 1), mock.copy_sql_nulls);
+    try std.testing.expectEqual(@as(usize, 1), mock.copy_json_nulls);
+}
+
+test "pgwire COPY local input failure marks an explicit transaction failed after staged batches" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00");
+    for (0..128) |_| try frame(&input.writer, 'd', "1\n");
+    try frame(&input.writer, 'd', "too\tmany\n");
+    try frame(&input.writer, 'c', "");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .copy_in = .{} };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.failed_transactions);
+    try std.testing.expectEqual(@as(usize, 0), mock.copy_committed);
+    try std.testing.expectEqual(@as(usize, 0), mock.copy_staged);
+    try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Z\x00\x00\x00\x05E") != null);
 }

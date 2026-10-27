@@ -258,9 +258,63 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     return result;
 }
 
-/// Lower COPY's relational read once, pinning the table used to expand its
-/// implicit column list. Generated columns are omitted only for table COPY;
-/// an explicit query or column list keeps exactly the requested projection.
+/// Bind COPY input with ordinary INSERT authority and assignment inference.
+/// The one immutable target owns expansion of the implicit column list.
+pub fn copyWrite(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled) !struct { compiled: compiler.Compiled, binding_backend: catalog.Backend } {
+    const input = compiled.statement.copy_from;
+    const adapter = try allocator.create(CopyWriteAdapter);
+    adapter.* = .{ .backend = backend, .name = input.table, .table = try backend.vtable.resolve(backend.ptr, allocator, input.table, .write) };
+    var names: std.ArrayList([]const u8) = .empty;
+    if (input.columns.len != 0) try names.appendSlice(allocator, input.columns) else for (adapter.table.columns) |column| {
+        if (!column.generated) try names.append(allocator, column.name);
+    }
+    if (names.items.len == 0) return error.UnsupportedSqlShape;
+    const row = try allocator.alloc(ast.Value, names.items.len);
+    for (row, 0..) |*value, i| value.* = .{ .parameter = @intCast(i + 1) };
+    const rows = try allocator.alloc([]const ast.Value, 1);
+    rows[0] = row;
+    var lowered = compiled.*;
+    lowered.parameter_count = @intCast(row.len);
+    lowered.statement = .{ .insert = .{ .table = input.table, .columns = try names.toOwnedSlice(allocator), .rows = rows, .overriding = .system } };
+    return .{ .compiled = lowered, .binding_backend = adapter.iface() };
+}
+
+// Description-only INSERT binding may reuse exactly the authorized target.
+// The shared read adapter deliberately rejects write authority; keep it so.
+const CopyWriteAdapter = struct {
+    backend: catalog.Backend,
+    name: ast.Name,
+    table: catalog.Table,
+    const with_identity: catalog.Backend.VTable = .{ .resolve = resolve, .checkpoint = checkpoint, .scan = scan, .mutate = mutate, .generate_row_id = generateRowId };
+    const without_identity: catalog.Backend.VTable = .{ .resolve = resolve, .checkpoint = checkpoint, .scan = scan, .mutate = mutate };
+    fn iface(self: *@This()) catalog.Backend {
+        var result = self.backend;
+        result.ptr = self;
+        result.vtable = if (self.backend.vtable.generate_row_id != null) &with_identity else &without_identity;
+        return result;
+    }
+    fn resolve(raw: *anyopaque, _: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (action != .write or !std.meta.eql(self.name, name)) return error.UnsupportedSqlExecution;
+        return self.table;
+    }
+    fn generateRowId(raw: *anyopaque, a: std.mem.Allocator) ![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const generate = self.backend.vtable.generate_row_id orelse return error.UnsupportedSqlExecution;
+        return generate(self.backend.ptr, a);
+    }
+    fn checkpoint(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.backend.vtable.checkpoint(self.backend.ptr);
+    }
+    fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+        return error.UnsupportedSqlExecution;
+    }
+    fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        return error.UnsupportedSqlExecution;
+    }
+};
+
 pub fn copyRead(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled) !struct { compiled: compiler.Compiled, binding_backend: catalog.Backend } {
     var read = compiled.*;
     const command = compiled.statement.copy_to;
@@ -1728,4 +1782,47 @@ test "SQL implicit INSERT pins declaration order source arity and assignment dom
     var arena: std.heap.ArenaAllocator = .init(a);
     defer arena.deinit();
     try std.testing.expectError(error.InvalidSqlSyntax, bindInternal(arena.allocator(), backend, &excess, &.{}));
+}
+
+test "SQL COPY input pins write-only description without granting reads or mutation authority" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(catalog.Action.write, action);
+            self.calls += 1;
+            return .{ .id = 17, .physical_name = "physical", .schema_version = 2, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .integer, .element_type = .int64 },
+                .{ .name = "status", .path = "status", .type = .string },
+                .{ .name = "generated", .path = "generated", .type = .string, .generated = true },
+            } };
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn generate(_: *anyopaque, _: std.mem.Allocator) ![]const u8 {
+            return error.UnexpectedDescribeIdentityAllocation;
+        }
+    };
+    for ([_][]const u8{ "COPY t(id,status) FROM STDIN (FORMAT text)", "COPY t FROM STDIN (FORMAT csv)", "COPY t FROM STDIN (FORMAT binary)" }) |sql| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(compiled.statement == .copy_from);
+        var probe: Probe = .{};
+        const backend: catalog.Backend = .{ .ptr = &probe, .vtable = &.{ .resolve = Probe.resolve, .checkpoint = Probe.checkpoint, .scan = undefined, .mutate = undefined, .generate_row_id = Probe.generate } };
+        const input = try copyWrite(a, backend, &compiled);
+        var description = try describe(a, input.binding_backend, &input.compiled, &.{});
+        defer description.deinit();
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        try std.testing.expectEqual(@as(usize, 0), description.binding.columns.len);
+        try std.testing.expectEqual(@as(usize, 2), description.binding.parameter_types.len);
+        try std.testing.expectEqual(@as(?ast.ColumnType, .integer), description.binding.parameter_types[0]);
+        try std.testing.expectEqual(@as(?ast.ColumnType, .string), description.binding.parameter_types[1]);
+        try std.testing.expectEqual(@as(u64, 17), description.binding.table.?.id);
+        try std.testing.expectEqual(@as(usize, 2), input.compiled.statement.insert.columns.len);
+        try std.testing.expectEqual(.system, input.compiled.statement.insert.overriding);
+        try std.testing.expectError(error.UnsupportedSqlExecution, input.binding_backend.vtable.resolve(input.binding_backend.ptr, a, .{ .table = "t" }, .read));
+        try std.testing.expectError(error.UnsupportedSqlExecution, input.binding_backend.vtable.resolve(input.binding_backend.ptr, a, .{ .table = "different" }, .write));
+    }
 }

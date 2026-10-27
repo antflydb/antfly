@@ -553,6 +553,8 @@ pub const Statement = union(enum) {
     /// Read plan plus output contract. Ordinary execute must never silently
     /// expose this as SELECT; the COPY-capable stream owns protocol framing.
     copy_to: struct { query: *const Select, options: CopyOptions, implicit_columns: bool = false },
+    /// Input belongs to a transactional client stream, never ordinary execute.
+    copy_from: struct { table: Name, columns: []const []const u8, options: CopyOptions },
     explain: Explain,
     select: Select,
     insert: Insert,

@@ -3489,6 +3489,7 @@ const Parser = struct {
         if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "COPY nesting limit exceeded");
         const query = try self.alloc.create(ast.Select);
         var implicit_columns = false;
+        const query_copy = self.peek(.lparen);
         if (self.take(.lparen)) {
             const nested = try self.statement();
             if (nested != .select) return self.fail(error.UnsupportedSqlShape, "COPY query must be a read-only SELECT");
@@ -3506,8 +3507,9 @@ const Parser = struct {
             implicit_columns = projections.items.len == 0;
             query.* = .{ .table = table_name, .columns = try projections.toOwnedSlice(self.alloc) };
         }
-        if (self.ddlWord("FROM")) return self.fail(error.UnsupportedSqlShape, "COPY input requires a transactional input stream");
-        if (!self.ddlWord("TO")) return self.fail(error.InvalidSqlSyntax, "COPY requires TO or FROM");
+        const input = self.ddlWord("FROM");
+        if (!input and !self.ddlWord("TO")) return self.fail(error.InvalidSqlSyntax, "COPY requires TO or FROM");
+        if (input and query_copy) return self.fail(error.InvalidSqlSyntax, "COPY FROM requires a table");
         // PostgreSQL's grammar accepts either stream spelling in either
         // direction; TO determines CopyOut even when the token says STDIN.
         if (!self.ddlWord("STDOUT") and !self.ddlWord("STDIN")) return self.fail(error.UnsupportedSqlShape, "server files and PROGRAM are not COPY client streams");
@@ -3565,6 +3567,12 @@ const Parser = struct {
             try self.expect(.rparen);
         }
         options.validate() catch return self.fail(error.SqlInvalidParameterValue, "invalid COPY format options");
+        if (input) {
+            if (options.force_quote_all or options.force_quote_columns.len != 0) return self.fail(error.SqlInvalidParameterValue, "FORCE_QUOTE is only valid for COPY TO");
+            const columns = try self.alloc.alloc([]const u8, query.columns.len);
+            for (columns, query.columns) |*out, projection| out.* = projection.field;
+            return .{ .copy_from = .{ .table = query.table.?, .columns = columns, .options = options } };
+        }
         return .{ .copy_to = .{ .query = query, .options = options, .implicit_columns = implicit_columns } };
     }
 
@@ -4882,7 +4890,7 @@ test "SQL COPY output retains format and read shape while guarding nonclient inp
         try std.testing.expect(compiled.statement == .copy_to);
     }
     for ([_][]const u8{
-        "COPY usage_records FROM STDIN",
+        "COPY usage_records FROM PROGRAM 'cat'",
         "COPY usage_records TO '/tmp/rows'",
         "COPY usage_records TO PROGRAM 'cat'",
         "COPY (DELETE FROM usage_records RETURNING *) TO STDOUT",

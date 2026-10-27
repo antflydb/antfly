@@ -81,6 +81,7 @@ pub const SourceCampaign = struct {
     cold_fingerprints: std.ArrayList(Fingerprint) = .empty,
     initial_fingerprints: std.ArrayList(Fingerprint) = .empty,
     credentials: client.ApiKeyHeaders = .{},
+    read_result_rows: ?u32 = null,
 
     fn resolve(ctx: *fixture.Context, name: []const u8) ![]u8 {
         const domain = local.system_catalog_domain;
@@ -103,7 +104,7 @@ pub const SourceCampaign = struct {
         for (self.entry.tables) |table| {
             const sql = try std.fmt.allocPrint(ctx.alloc, "SELECT _id FROM {s} ORDER BY _id", .{table.name});
             defer ctx.alloc.free(sql);
-            var response = try client.execute(ctx, sql, .read);
+            var response = if (self.read_result_rows) |limit| try client.executeBounded(ctx, sql, limit, .read) else try client.execute(ctx, sql, .read);
             defer response.deinit(ctx.alloc);
             try std.testing.expectEqual(@as(u16, 200), response.status);
             var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
@@ -138,7 +139,7 @@ pub const SourceCampaign = struct {
 
     pub fn verifyRows(self: *@This(), ctx: *fixture.Context) !void {
         for (self.entry.tables) |table| {
-            var response = try client.execute(ctx, table.read, .read);
+            var response = if (self.read_result_rows) |limit| try client.executeBounded(ctx, table.read, limit, .read) else try client.execute(ctx, table.read, .read);
             defer response.deinit(ctx.alloc);
             if (response.status != 200) std.debug.print("source mutation read original={s} table={s} status={d} body={s}\n", .{ self.entry.id, table.name, response.status, response.body });
             try std.testing.expectEqual(@as(u16, 200), response.status);

@@ -113,7 +113,7 @@ fn expectResult(result: wire.SQLResponse, expected: []const []const Cell) !void 
     }
 }
 
-fn waitPublication(ctx: *fixture.Context, table_id: u64, phase: policies.Publication.Phase, after_generation: u64) !u64 {
+pub fn waitPublication(ctx: *fixture.Context, table_id: u64, phase: policies.Publication.Phase, after_generation: u64) !u64 {
     const source = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
     const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
     while (platform.time.monotonicNs() < deadline) {
