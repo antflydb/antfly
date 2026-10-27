@@ -46,6 +46,13 @@ test('persisted diagnostics reject sampling, changing counts, repeated cursors a
  await assert.rejects(collectPersistedWindow(run,'app',token,time,fixture(rows,{transform:result=>result.events?{...result,events:undefined,calculations:[]}:result})),/EventsSchemaUnknown/);
  const empty=await collectPersistedWindow(run,'app',token,time,fixture([],{sampleInterval:0}));assert.equal(empty.events,0);assert.equal(empty.qualification,false);assert.equal(empty.reconciled,true);
 });
+test('persisted event identities retain colliding console IDs from separate invocations without dropping errors',async()=>{
+ const a=row('shared',{$metadata:{id:'shared',requestId:'invocation-a',service:run.id,type:'cf-worker'},source:{event:'antfly.operation',op:'lookup',elapsed_ms:1}}),b=row('shared',{$metadata:{id:'shared',requestId:'invocation-b',service:run.id,type:'cf-worker'},source:{event:'antfly.resource_failure',failure_code:'MemoryLimitExceeded'}});
+ const result=await collectPersistedWindow(run,'app',token,time,fixture([a,b]));assert.equal(result.schema,3);assert.equal(result.events,2);assert.notEqual(result.rows[0].event_id_sha256,result.rows[1].event_id_sha256);assert.ok(result.resource_failures>0);
+ await assert.rejects(collectPersistedWindow(run,'app',token,time,fixture([a,{...b,$metadata:{...b.$metadata,requestId:'invocation-a'}}])),/CursorRepeated/);
+ await assert.rejects(collectPersistedWindow(run,'app',token,time,fixture([a,b],{pages:[[a],[a]]})),/CursorRepeated/);
+});
+
 test('persisted event parsing rejects wrong scope and unknown outcomes and retains late resource failures',async()=>{
  for(const value of[row('wrong',{$metadata:{id:'wrong',service:'production'}}),row('late',{timestamp:2001}),row('unknown',{$workers:{outcome:'new-platform-outcome'}})])assert.throws(()=>sanitizePersistedEvent(value,run.id,time));
  const log=row('late-resource',{$metadata:{id:'late-resource',service:run.id,type:'cf-worker',requestId:'request-first'},$workers:{scriptName:run.id},source:JSON.stringify({event:'antfly.resource_failure',failure_code:'SQLITE_NOMEM secret-must-not-persist'})});

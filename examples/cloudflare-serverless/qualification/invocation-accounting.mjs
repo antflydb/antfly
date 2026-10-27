@@ -43,7 +43,7 @@ export function reconcileInvocations(run,ledger,windows,{roleCounts,timeframe}={
   const rows=[],ranges=[];
   if(!windows.some(w=>w.role===role))failures.push('InvocationRoleMissing');
   for(const window of windows.filter(w=>w.role===role)){
-   if(window.schema!==2||!window.reconciled||!validRange(window.timeframe)||!Array.isArray(window.rows)||window.worker!==run.id+(role==='app'?'':'-'+role)){failures.push('InvocationWindowInvalid');continue;}
+   if(![2,3].includes(window.schema)||!window.reconciled||!validRange(window.timeframe)||!Array.isArray(window.rows)||window.worker!==run.id+(role==='app'?'':'-'+role)){failures.push('InvocationWindowInvalid');continue;}
    ranges.push(window.timeframe);
    for(const row of window.rows){if(!Number.isSafeInteger(row.timestamp)||row.timestamp<window.timeframe.from||row.timestamp>window.timeframe.to||!['event_id_sha256','invocation_id_sha256'].every(k=>/^[a-f0-9]{64}$/.test(row[k]??''))){failures.push('InvocationRowInvalid');continue;}const key=role+'/'+row.event_id_sha256,encoded=JSON.stringify(row);if(seen.has(key)){if(seen.get(key)!==encoded)failures.push('InvocationDuplicateConflict');continue;}seen.set(key,encoded);if(!row.invocation)continue;if(!(run.accepted_versions?.[role]??[run.versions?.[role]]).includes(row.version_id))failures.push('InvocationVersionMismatch');if(!invocationTypes.has(row.event_type)||row.event_type==='unknown')failures.push('InvocationTypeMissing');rows.push(row);}
   }

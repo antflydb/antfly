@@ -68,7 +68,7 @@ export function sanitizePersistedEvent(row, worker, timeframe) {
     // field names as a CPU-limit failure.
     ...(typeof metadata.error==='string'?{exceptions:[{name:'Error',message:metadata.error}]}:{}),
   }) ?? {};
-  return {event_id_sha256: digest(metadata.id), invocation_id_sha256: digest(requestId), timestamp: row.timestamp, invocation, event,
+  return {event_id_sha256: digest(JSON.stringify([requestId,metadata.id])), invocation_id_sha256: digest(requestId), timestamp: row.timestamp, invocation, event,
     ray_id_sha256:rayIdentity(metadata.rayId),version_id:versionIdentity(context?.scriptVersion?.id),
     attempt_id_sha256:requestAttemptIdentity(metadata.url??context?.event?.request?.url??row.source?.request?.url),
     event_type:invocationTypes.has(context?.eventType)?context.eventType:'unknown'};
@@ -140,7 +140,7 @@ export async function collectPersistedWindow(run, role, token, timeframe, {fetch
   const coverage = new DiagnosticCoverage([run]);
   for (const row of rows) coverage.observe(run.id, role, row.event);
   const observed = coverage.stream(run.id, role);
-  return {schema: 2, qualification: false, worker, role, timeframe: {...timeframe},
+  return {schema: 3, qualification: false, worker, role, timeframe: {...timeframe},
     collected_started_at,collected_finished_at:clock(),
     reconciled: true, events: rows.length, invocations: rows.filter(row => row.invocation).length,
     invocation_errors:rows.filter(row=>row.invocation&&row.event.outcome!=='ok').length,

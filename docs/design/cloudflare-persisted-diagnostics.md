@@ -214,5 +214,12 @@ mixed-case base64 redaction shapes without requesting unredacted headers. The
 decoder validates range and canonical encoding before producing the same hashed
 UUID identity. Old failed UUID-tagged reports remain unchanged. See Cloudflare's
 [redaction rules](https://developers.cloudflare.com/workers/runtime-apis/handlers/tail/#tailrequest).
-Repeated provider event IDs remain fatal, including repeats within one complete
-page; count agreement cannot make an ambiguous event identity acceptable.
+The live source also returns console events with the same metadata event ID
+and timestamp in two distinct invocations, with distinct payloads. Schema three
+therefore hashes the tuple `(requestId, metadata.id)` as the event identity,
+retaining both events and their resource signals. Repetition of that tuple
+remains fatal; it never deduplicates divergent rows or decreases expected counts.
+The verifier preserves schema-one and schema-two compatibility. Pagination still
+uses the documented raw metadata cursor and fails closed if a repeated or
+incomplete page cannot reconcile the exact population. This identity correction
+does not repair ingestion sampling.
