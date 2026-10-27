@@ -726,3 +726,55 @@ zero physical hydration calls across field/score ordering, projected/hidden
 highlight fields and restart. Counter assertions wait for the health endpoint's
 asynchronous metrics refresh. This proves the delivery path and eliminated
 physical reads, without a separate multi-pack latency or throughput claim.
+
+
+### Typed source columns and Boolean driver costing
+
+The [source-column and Boolean-cost observation](native-source-columns-and-boolean-cost-v1-observation.json)
+qualifies two gaps found in the delivery implementation. Sparse required Boolean
+queries now use a conservative prepared candidate ceiling when choosing an
+optional ordered driver. Exact membership and counts remain authoritative. All
+18 Boolean samples examine 64 text candidates with zero speculative ordered
+references, versus 2,304 references on the anti-correlated reviewed cases.
+
+Stored-source recipe v3 persists independently compressed typed source columns
+instead of a monolithic JSON body. A five-byte marker replaces the ordinary body;
+there is no second persisted JSON copy. Native projection and hidden highlight
+fields use four request-owned field cursors, each retaining one decoded chunk.
+Append and sorted compaction preserve the columns through deletion and ordinal
+remapping. Whole-document readers explicitly reconstruct JSON. A nested path
+still reads its containing top-level JSON column.
+
+| Case | Reviewed warm median | Final warm median |
+|---|---:|---:|
+| Boolean metadata order, anti-correlated forward | 336.09 ms | 27.46 ms |
+| Boolean metadata order, anti-correlated reverse | 340.01 ms | 26.35 ms |
+| Boolean metadata order, aligned forward | 44.64 ms | 26.61 ms |
+| Small projection, 1 MiB unrequested payload per row | 391.57 ms | 33.93 ms |
+| Same projection with physical source delivery | 26.58 ms | 29.83 ms |
+| Wide-key ordered control | 696.82 ms | 545.97 ms |
+| Native-order control, forward | 20.26 ms | 22.77 ms |
+| Native-order control, reverse | 19.72 ms | 22.72 ms |
+
+Each case/cache mode has three samples. All 48 paired pages preserve complete
+hit objects exactly, including scores; total-count contracts are recorded
+separately. Definition, Parquet, configuration and requests match within every
+pair. The physical-delivery control intentionally changes `store_source` and
+therefore the pack layout. The wide-key control retains its 129-reference bound;
+native-order controls retain 64 candidates and zero ordered references.
+
+These are sequential local Debug observations on a shared machine, with E2E
+activity overlapping candidate measurements. The small native controls' timing
+increases are retained alongside the demonstrated work reduction and projection
+gains. No causal latency, empty-cache, cloud transport or full-archive throughput
+claim follows. Restarts retain persistent and OS caches and readiness warming.
+
+The production build succeeds with Zig 0.17.0. All 256 targeted native/owner tests
+pass with no leaks and one declared benchmark skip; all 34 selected real
+Parquet/Iceberg E2Es pass without skips. Source-column tests include exhaustive
+allocation failures, sparse/deleted rows, both compaction orders, nested paths,
+exact integers above 2^53 and explicit whole-source reconstruction. Main
+`55d97ce423` is merged, with the canonical job projection ABI 84 and no duplicate
+facade. The additional release-only merge preserves the frozen executable hash.
+Benchmark tooling, formatting/lint, syntax, license, Apache boundary and diff
+checks also pass.

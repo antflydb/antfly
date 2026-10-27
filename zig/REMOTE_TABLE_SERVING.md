@@ -1636,8 +1636,9 @@ Parquet object unavailable.
 Optional ordered demand uses a conservative prepared text candidate ceiling,
 including required Boolean intersections and minimum-should-match unions. Required
 children take the minimum ceiling; required disjunctions sum child ceilings before
-dividing by their minimum match count. Unrestricted, unknown and phrase producers
-retain the corpus ceiling, and exclusions never increase selectivity. This ceiling
+dividing by their minimum match count. Unrestricted and unknown producers,
+including phrase leaves, retain the corpus ceiling; required term children in a
+lowered phrase can still provide a bound. Exclusions never increase selectivity. This ceiling
 only chooses a driver: exact counts, eligibility, scoring, authorization and cursor
 proofs continue to use their authoritative implementations. A postings choice
 survives pack routing and the downstream collector even without profiling.
