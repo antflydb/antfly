@@ -289,9 +289,15 @@ test "external lake bounded window profiles ranked sidecar hydration reuses boun
             try std.testing.expect(hydrator.blocks.live_bytes <= 1024 * 1024);
             var row: std.json.Value = .{ .object = .empty };
             defer local.storage_db_types.deinitJsonValue(alloc, &row);
-            try std.testing.expectError(error.ExternalLakeSnapshotMismatch, hydrator.append(alloc, snapshot, 0, "three", &.{"body"}, &row));
+            if (hydrator.append(alloc, snapshot, 0, "three", &.{"body"}, &row)) |_| return error.ExpectedIdentityMismatch else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expect(err == error.ExternalLakeSnapshotMismatch);
+            }
             try std.testing.expectEqual(@as(usize, 0), row.object.count());
-            try std.testing.expectError(error.InvalidNativeLakeTextCorpus, hydrator.append(alloc, snapshot, 99, "missing", &.{"body"}, &row));
+            if (hydrator.append(alloc, snapshot, 99, "missing", &.{"body"}, &row)) |_| return error.ExpectedInvalidOrdinal else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expect(err == error.InvalidNativeLakeTextCorpus);
+            }
         }
     };
     try Run.run(a, writer.snapshot(), 16);
@@ -415,7 +421,7 @@ test "external lake bounded window profiles field-major returned rows reuse chun
     for (&documents, 0..) |*doc, i| {
         var value: std.json.ObjectMap = .empty;
         for (fields, 0..) |field, column_| try value.put(sa, field, .{ .integer = @intCast(9007199254740993 + i * 8 + column_) });
-        doc.* = .{ .id = try std.fmt.allocPrint(sa, "row-{d:0>4}", .{i}), .stored_data = "", .stored_source = .{ .object = value }, .text_fields = &.{} };
+        doc.* = .{ .id = try std.fmt.allocPrint(sa, "row-{d:0>4}", .{i}), .stored_data = "", .stored_source = .{ .object = value }, .typed_source = .{ .object = value }, .stored_source_bytes = try local.storage_typed_json.encodedSize(.{ .object = value }), .text_fields = &.{} };
     }
     for (&ordinals, &keys, 0..) |*doc, *key, i| {
         doc.* = @intCast(count - i - 1);

@@ -357,16 +357,20 @@ test "external lake bounded window profiles covering stripes prune wide columns 
     const Probe = struct {
         var active: *@This() = undefined;
         original: *const stores.ArtifactStore.VTable,
+        pack: []const u8,
         calls: usize = 0,
         max_length: usize = 0,
         fn get(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, cancel: Token) ![]u8 {
             const self = active;
-            self.calls += 1;
-            self.max_length = @max(self.max_length, length);
+            if (std.mem.eql(u8, id, self.pack)) {
+                self.calls += 1;
+                self.max_length = @max(self.max_length, length);
+            }
             return if (self.original.get_range_alloc_with_cancellation) |read| read(raw, alloc, id, offset, length, cancel) else self.original.get_range_alloc(raw, alloc, id, offset, length);
         }
     };
-    var probe: Probe = .{ .original = store.vtable };
+    const proof = try readDirectory(ia, store, ref, .none);
+    var probe: Probe = .{ .original = store.vtable, .pack = proof.pack.artifact_id };
     Probe.active = &probe;
     var traced = store.vtable.*;
     traced.get_range_alloc_with_cancellation = Probe.get;
