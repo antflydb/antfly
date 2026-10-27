@@ -194,3 +194,33 @@ test "decision provider shared Cloudflare extraction preserves exact numbers and
 test "api query contract native scalar indexed array source receipt" {
     try @import("antfly_local_sources").api_query_contract.testing.expectNativeScalarArraySource();
 }
+
+test "api query contract native retrieval borrows the admitted scalar program" {
+    const std = @import("std");
+    const local = @import("antfly_local_sources");
+    const query = local.api_query_contract;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try local.storage_db_mod.DB.open(a, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const padding = try a.alloc(u8, 32768);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const json = try std.fmt.allocPrint(a, "{{\"arr\":[{{\"n\":1}},{{\"n\":2}}],\"payload\":\"{s}\"}}", .{padding});
+    defer a.free(json);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = json }}, .sync_level = .full_index });
+    var owned = try query.parseQueryRequest(a, null, "docs", "{\"fields\":[\"arr.1.n\"],\"select\":{\"value\":{\"case\":[{\"when\":{\"literal\":true},\"then\":{\"field\":\"payload\"}}]},\"n\":{\"field\":\"arr.1.n\"}}}");
+    defer owned.deinit(a);
+    try std.testing.expect(owned.req.field_projection_plan.?.get(owned.req.field_projection_json).? == owned.projection_plan.?);
+    var result = try db.search(a, owned.req);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("{\"arr\":[{\"n\":2}]}", result.hits[0].stored_data.?);
+    var computed = try std.json.parseFromSlice(std.json.Value, a, result.hits[0].computed_json.?, .{});
+    defer computed.deinit();
+    try std.testing.expectEqualStrings(padding, computed.value.object.get("value").?.string);
+    try std.testing.expectEqual(@as(i64, 2), computed.value.object.get("n").?.integer);
+}
