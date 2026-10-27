@@ -79,7 +79,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Independently funded snapshots import shared legacy memory roots.
 // Retained memory-run materialization preserves output visibility and lineage.
 // Physical checkpoint join observations survive metadata and issuer lifetimes.
-pub const abi_version: u32 = 209;
+// Maintenance rounds carry bounded-selection continuation state.
+pub const abi_version: u32 = 210;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

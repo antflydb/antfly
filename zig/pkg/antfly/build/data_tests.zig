@@ -22,6 +22,7 @@ const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_s
 pub const AddTestsOptions = struct {
     target: std.Build.ResolvedTarget,
     data_runtime_test_mod: *std.Build.Module,
+    maintenance_selection_module: *std.Build.Module,
     data_implementation_module: *std.Build.Module,
     data_storage_test_mod: *std.Build.Module,
 };
@@ -63,6 +64,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     status_admission_run.addArg("--require-no-skips");
     b.step("antfly-data-status-refresh-admission-test", "Verify original queued refresh authority, activity polling and publication fences")
         .dependOn(&status_admission_run.step);
+    const maintenance_selection_tests = b.addTest(.{
+        .name = "data-maintenance-selection-tests",
+        .root_module = options.maintenance_selection_module,
+        .filters = &.{ "data runtime maintenance bounded selection", "data runtime background maintenance is due for dense posting cadence without lsm debt" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 7 * 1024 * 1024 * 1024,
+    });
+    const maintenance_selection_run = b.addRunArtifact(maintenance_selection_tests);
+    maintenance_selection_run.addArg("--require-no-skips");
+    b.step("antfly-data-maintenance-selection-test", "Verify bounded empty selection windows continue across worker wake budgets")
+        .dependOn(&maintenance_selection_run.step);
     const lib_data_runtime_default_filters = [_][]const u8{
         "data runtime status paging",
         "runtime status refresh cursor",

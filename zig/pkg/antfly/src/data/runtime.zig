@@ -5889,6 +5889,7 @@ pub const DataServer = struct {
     dense_publication_rounds: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_stop: std.atomic.Value(bool) = .init(false),
     lsm_maintenance_wake: std.atomic.Value(bool) = .init(false),
+    lsm_maintenance_selection_pending: std.atomic.Value(bool) = .init(false),
     lsm_maintenance_active: std.atomic.Value(bool) = .init(false),
     lsm_maintenance_started: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_completed: std.atomic.Value(u64) = .init(0),
@@ -10258,6 +10259,7 @@ pub const DataServer = struct {
 
     fn backgroundMaintenanceDue(self: *DataServer, now_ns: u64) bool {
         if (!self.hotStandbyOwnerJobCanRun(.compaction_publish)) return false;
+        if (self.lsm_maintenance_selection_pending.load(.acquire)) return true;
         const live_write_source = self.liveRuntimeWriteSource();
         if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
             self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
@@ -10451,9 +10453,8 @@ pub const DataServer = struct {
                     _ = self.lsm_maintenance_failed.fetchAdd(1, .monotonic);
                     break;
                 };
-                const observed_score = live_write_source.lsmMaintenanceScoreBestEffort();
-                const force_fair_turn = observed_score >= lsm_maintenance_fair_turn_score and
-                    consecutive_lock_deferrals >= lsm_maintenance_fair_turn_deferrals;
+                const force_fair_turn = consecutive_lock_deferrals >= lsm_maintenance_fair_turn_deferrals and
+                    live_write_source.lsmMaintenanceScoreBestEffort() >= lsm_maintenance_fair_turn_score;
                 const maintenance = (if (force_fair_turn)
                     live_write_source.runLsmMaintenanceRoundDetailed()
                 else
@@ -10469,7 +10470,19 @@ pub const DataServer = struct {
                     _ = self.lsm_maintenance_failed.fetchAdd(1, .monotonic);
                     break;
                 };
+                self.lsm_maintenance_selection_pending.store(maintenance.selection_pending, .release);
                 if (!maintenance.progressed) {
+                    if (maintenance.group_id != null) {
+                        _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
+                        consecutive_lock_deferrals +|= 1;
+                        self.deferLsmMaintenance(self.backgroundMonotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                        completed = true;
+                        break;
+                    }
+                    if (maintenance.selection_pending) {
+                        consecutive_lock_deferrals = 0;
+                        continue;
+                    }
                     if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
                         consecutive_lock_deferrals +|= 1;
@@ -10499,7 +10512,9 @@ pub const DataServer = struct {
                 }
             }
             if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
-                if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
+                if (self.lsm_maintenance_selection_pending.load(.acquire)) {
+                    self.deferLsmMaintenance(self.backgroundMonotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                } else if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                     self.deferLsmMaintenance(self.backgroundMonotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
                 } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                     if (delay_ns > 0) self.deferLsmObsoleteReclaim(self.backgroundMonotonicNs(), delay_ns);
@@ -45761,6 +45776,103 @@ fn consumerTests() type {
             try std.testing.expect(server.backgroundMaintenanceDue(100));
             try std.testing.expect(server.backgroundMaintenanceDue(101));
             try std.testing.expect(!server.backgroundMaintenanceDue(99));
+        }
+
+        test "data runtime maintenance bounded selection crosses wake budget without global rescans" {
+            const root = @import("antfly_source_root");
+            if (comptime !control_only_storage_sources or !@hasDecl(root, "MaintenanceSelectionProbe")) return error.SkipZigTest;
+            const Scenario = enum { due, shutdown, step_error };
+            for ([_]Scenario{ .due, .shutdown, .step_error }) |scenario| {
+                const Source = @import("../api/kernel_owner_source.zig").ProvisionedKernelOwnerSource;
+                const width = @import("../api/maintenance_selection.zig").Scan.inspection_limit;
+                const count = DataServer.lsm_maintenance_worker_max_steps_per_wake * width + 1;
+                const alloc = std.testing.allocator;
+                const catalog = antfly.public_api.table_catalog.emptyCatalogSource();
+                var source = Source.init(alloc, "/unused", catalog, antfly.raft.read_gate.alreadyReadSafeBarrier());
+                defer source.entries.deinit(alloc);
+                const probes = try alloc.alloc(root.MaintenanceSelectionProbe, count);
+                defer alloc.free(probes);
+                @memset(probes, .{});
+                const Entry = @typeInfo(@TypeOf(source.entries.items[0])).pointer.child;
+                const entries = try alloc.alloc(Entry, count);
+                defer alloc.free(entries);
+                for (entries, probes, 0..) |*entry, *probe, i| {
+                    entry.* = .{
+                        .group_id = i + 1,
+                        .table_name = @constCast("table"),
+                        .generation = 1,
+                        .identity = .{ .table_id = i + 1, .shard_id = i + 1, .range_id = i + 1 },
+                        .schema_json = @constCast("{}"),
+                        .indexes_json = @constCast("{}"),
+                        .restore_bootstrap_json = @constCast(""),
+                        .initial_child_bootstrap_json = @constCast(""),
+                        .owner = .{ .handle = @ptrCast(probe) },
+                        .resident = true,
+                    };
+                    try source.entries.append(alloc, entry);
+                }
+                var server: DataServer = .{
+                    .alloc = alloc,
+                    .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+                    .read_source = antfly.public_api.ProvisionedTableReadSource.init("/unused", catalog, antfly.raft.read_gate.alreadyReadSafeBarrier()),
+                    .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/unused", catalog),
+                    .status_source = undefined,
+                    .api_server_cfg = .{},
+                    .query_async_limit = .limited(8),
+                    .listener_cfg = undefined,
+                };
+                defer server.deinit();
+                const Stop = struct {
+                    fn step(raw: ?*anyopaque) void {
+                        const owner: *DataServer = @ptrCast(@alignCast(raw.?));
+                        owner.lsm_maintenance_stop.store(true, .release);
+                    }
+                };
+                probes[count - 1] = .{ .due = true, .hook_ctx = &server, .step_hook = Stop.step, .fail_step = scenario == .step_error };
+                if (scenario == .shutdown) {
+                    probes[0].hook_ctx = &server;
+                    probes[0].inspect_hook = Stop.step;
+                }
+                server.write_source.storage_maintenance_source = source.maintenanceSource();
+                server.vector_block_maintenance_next_eligible_ns.store(std.math.maxInt(u64), .release);
+                server.dense_posting_maintenance_next_eligible_ns.store(std.math.maxInt(u64), .release);
+                const io = try server.ensureBackgroundWorkerIo(.maintenance);
+                server.lsm_maintenance_wake.store(true, .release);
+                var task = try io.concurrent(DataServer.lsmMaintenanceWorkerMain, .{&server});
+                var joined = false;
+                defer if (!joined) {
+                    server.lsm_maintenance_stop.store(true, .release);
+                    task.await(io);
+                };
+                const deadline = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+                var timed_out = false;
+                while (!server.lsm_maintenance_stop.load(.acquire)) {
+                    if (platform_time.monotonicNs() >= deadline) {
+                        timed_out = true;
+                        server.lsm_maintenance_stop.store(true, .release);
+                        break;
+                    }
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+                task.await(io);
+                joined = true;
+                try std.testing.expect(!timed_out);
+                // Real registry -> production write facade -> real worker. Eight
+                // empty windows exhaust one wake budget; the next wake must reach
+                // the due owner without rescanning any preceding registry entry.
+                for (probes, entries, 0..) |probe, entry, i| {
+                    const inspected = scenario != .shutdown or i < width;
+                    try std.testing.expectEqual(@as(usize, @intFromBool(inspected)), probe.inspections);
+                    try std.testing.expectEqual(@as(usize, @intFromBool(scenario != .shutdown and i == count - 1)), probe.steps);
+                    try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+                }
+                try std.testing.expectEqual(@as(u64, if (scenario == .shutdown) 1 else 2), server.lsm_maintenance_started.load(.acquire));
+                try std.testing.expectEqual(@as(u64, @intFromBool(scenario == .step_error)), server.lsm_maintenance_failed.load(.acquire));
+                try std.testing.expectEqual(scenario != .due, server.lsm_maintenance_selection_pending.load(.acquire));
+                try std.testing.expectEqual(@as(u64, 0), server.provisioned_storage.resource_manager.sliceStats(.lsm_compaction_work).used_bytes);
+                try std.testing.expect(!server.lsm_maintenance_active.load(.acquire));
+                try std.testing.expect(!source.lsm_selection_claim.load(.acquire));
+            }
         }
 
         test "system catalog join planning retained acquisition workload" {

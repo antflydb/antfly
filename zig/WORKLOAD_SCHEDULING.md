@@ -7,7 +7,9 @@ clients and the root Go Antfly/inference SDK clients also have bounded local
 FIFO admission. Native session, H1/H2 dispatch, outbound reuse, and particular
 retained-state paths have focused checks. Owned remote-read families remain
 disabled by default; complete operator eligibility, distributed ownership,
-resource-progress and default-policy qualification remain open. See
+resource-progress and default-policy qualification remain open. Production
+maintenance selection uses bounded rotating registry windows and carries partial
+scan continuation through the write facade and background worker. See
 [implementation scope and restrictions](WORKLOAD_POOLING_IMPLEMENTATION.md).
 
 Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
@@ -17,7 +19,7 @@ branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 implementation evidence are recorded in the implementation ledger.
 The branch includes main through `d8344ac981` (#1303), integrated by `40bf358747`.
 
-Private native ABI 149 and kernel-owner ABI 209 fence the current manager,
+Private native ABI 150 and kernel-owner ABI 210 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
 retirement, allocator-host acquisition, publication-resource and registered source-ancestry and yieldable physical output retirement and registered writer-root contracts. Durable reader epochs and peer feature
 barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;

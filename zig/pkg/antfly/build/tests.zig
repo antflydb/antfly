@@ -755,13 +755,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // physical DB (not just the ABI owner boundary), which pulls the vector
     // index engine in directly.
     data_consumer_module.addImport("antfly_vectorindex", vectorindex_mod);
+    const maintenance_selection_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/maintenance_selection_worker_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, maintenance_selection_module);
+    @import("../../../build_support/embedded/storage.zig").configureLmdb(b, maintenance_selection_module, lmdb_engine_mod, true);
+    maintenance_selection_module.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
+    maintenance_selection_module.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
     const data_implementation_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_runtime_implementation_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
     test_imports.configure(b, data_implementation_module, true, true);
-    for ([_]*std.Build.Module{ data_consumer_module, data_implementation_module }) |module| {
+    for ([_]*std.Build.Module{ data_consumer_module, data_implementation_module, maintenance_selection_module }) |module| {
         module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
         const auth = b.createModule(.{
             .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
@@ -3540,6 +3549,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_tests_addTests_result = data_tests.addTests(b, .{
         .target = target,
         .data_runtime_test_mod = data_consumer_module,
+        .maintenance_selection_module = maintenance_selection_module,
         .data_implementation_module = data_implementation_module,
         .data_storage_test_mod = data_storage_test_mod,
     });

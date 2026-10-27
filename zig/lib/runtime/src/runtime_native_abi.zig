@@ -138,7 +138,8 @@ const builtin = @import("builtin");
 // Independently funded snapshots import shared legacy memory roots.
 // Retained memory-run materialization preserves output visibility and lineage.
 // Physical checkpoint join observations survive metadata and issuer lifetimes.
-pub const abi_version: u32 = 149;
+// Maintenance rounds carry bounded-selection continuation state.
+pub const abi_version: u32 = 150;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

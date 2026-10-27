@@ -4,6 +4,61 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Bounded production table selection (2026-10-26)
+
+The production storage-owner selector now limits each candidate-selection
+window to 64 registry positions. It retains the winning physical lease, checks its eligibility under
+the registry mutex, and releases the selection claim before storage dispatch.
+Existing lease retirement and physical-close ownership are preserved.
+Selection needs neither an allocated table-name copy nor a second registry walk.
+The claim prevents concurrent inspections from consuming scheduling windows
+without recording a winner; contending selectors return a continuation hint.
+
+For larger registries, whole sweeps alternate pressure and oldest-served policy.
+Alternating by window would permanently assign pressure policy to some windows
+when a sweep has an even number of windows. For a stable N-owner registry, let
+Q = ceil(N / 64). Continuously observable eligible owners receive an attempt
+within 2 * 64 * Q rounds. Registries of at most 64 retain the previous 2N
+selection bound. Busy probes, registry churn and physical step duration are
+outside these stable-registry bounds. The local cache retains its existing
+whole-registry selection contract and 2N bound.
+
+A round now reports unfinished selection separately from physical progress.
+The production write facade preserves that hint; the DataServer worker continues
+empty partial windows within its existing eight-round wake budget, then defers
+and resumes without an intervening global score scan. Work-cost charges,
+resource reservations, pressure gates, leadership checks and retry delays still
+apply. A selected storage step that makes no progress retains the short retry
+and lock-deferral behavior. Completing an empty sweep still permits the existing
+global score and wake probes.
+
+The coupled worker fixture runs the real owner registry, production write facade,
+DataServer worker, helper runtime, worker reservations and shutdown. With 513
+owners, eight empty windows exhaust the first wake budget; the next wake reaches
+the due owner without inspecting any preceding owner twice. Shutdown during an
+empty window and a failing selected storage step must release every registry
+pin, selection claim and compaction reservation. Physical owner replies are
+deterministic; unused table/WAL/status provider calls fail closed. This fixture
+qualifies production scheduling and lifecycle flow, not physical DB maintenance
+or storage-engine durability. Its target is
+`antfly-data-maintenance-selection-test`; registry fairness and allocation checks
+remain in `antfly-maintenance-selection-test`.
+
+Qualification on 2026-10-27 passes both focused targets in Debug and ReleaseFast,
+72/72 build steps per mode, with zero skips, failures or leaks. The two final
+receipts, `bounded-selection-v10-debug` and `bounded-selection-v10-fast`, bind the
+same 5,766 native/schema inputs. The existing native ABI five-case receipt is
+reused only after checking its unchanged source. Earlier stopped provider builds
+and failed harness attempts are separate diagnostics, not passing evidence.
+This completes the bounded-selection worker milestone; it does not complete the
+full workload design.
+
+This bounds table selection, not the duration of owner inspection, physical
+maintenance, global status collection or legacy-cache scans. Original admission
+and retained storage jobs still need integration into the normal maintenance
+path before the full default execution contract can be claimed. Full GNU/Linux
+qualification remains waived.
+
 ## Maintenance table selection (2026-10-25)
 
 Both production maintenance selectors now alternate pressure-priority selection
@@ -17,20 +72,21 @@ local due reclamation retains its preexisting eligibility during bulk sessions.
 
 Each registry owns one counter and each entry one last-service stamp. New entries
 and entries transferred between local caches join at the destination's current
-counter. Attempts count even when storage reports no progress or fails. For a
+counter. Attempts count even when storage reports no progress or fails. For whole-registry selection over a
 stable set of N continuously observed eligible owners, oldest-served turns give
 each owner an attempt within 2N selections while reserving half the selections for
-pressure priority. This is a selection-count guarantee, not a physical duration
+pressure priority. Wider production registries now use the windowed bound above.
+This is a selection-count guarantee, not a physical duration
 or CPU-quantum guarantee. Busy/unobserved owners and registry mutation remain
 subject to the existing probe and scan behavior.
 
-The typed source inspects one pinned owner at a time, releases inspection pins,
-then revalidates the chosen generation and exclusion flags under the registry
-mutex. A concurrent winning round invalidates the scan's counter snapshot.
-Only a validated selected lease advances the counter; storage runs after the
-mutex is released. The local cache selects and pins under its existing local
-registry lock, then runs storage after unlocking. No new wait queue, retained
-request payload, durable format or maintenance wire method is introduced.
+The typed source inspects owners through physical leases and revalidates the
+winner's scheduling epoch and exclusion flags under the registry mutex. Only a
+validated selected lease advances the counter; storage runs after the mutex is
+released. The bounded selector described above retains that winner directly.
+The local cache selects and pins under its existing local registry lock, then
+runs storage after unlocking. No new wait queue, retained request payload,
+durable format or maintenance wire method is introduced.
 
 Focused Debug and ReleaseFast qualification passes the policy's persistent
 hot/due debt, arrival and counter-wrap cases, production typed dispatch with

@@ -17,33 +17,9 @@
 //! This fixture does not claim to qualify a physical DB's maintenance step.
 pub const antfly_sources = @import("source_owner_control.zig");
 pub const consumer_tests_only = true;
-pub const MaintenanceSelectionProbe = struct {
-    score: u64 = 0,
-    due: bool = false,
-    fail_step: bool = false,
-    inspections: usize = 0,
-    steps: usize = 0,
-};
+const fixture = @import("maintenance_selection_fixture.zig");
+pub const MaintenanceSelectionProbe = fixture.Probe;
 const abi = @import("kernel_owner_abi");
-fn maintenance(raw: ?*anyopaque, request: *const abi.MaintenanceRequest, out: *abi.MaintenanceResult) callconv(.c) abi.Status {
-    if (request.version != abi.abi_version) return .invalid_abi;
-    const probe: *MaintenanceSelectionProbe = @ptrCast(@alignCast(raw orelse return .invalid_argument));
-    out.* = .{};
-    switch (@as(abi.MaintenanceAction, @fromBackingInt(@intCast(request.action)))) {
-        .inspect, .inspect_best_effort => {
-            probe.inspections += 1;
-            out.maintenance_score = probe.score;
-            out.has_next_wake_delay = @intFromBool(probe.due);
-            out.next_wake_delay_ns = 0;
-        },
-        .lsm_step, .lsm_step_best_effort => {
-            probe.steps += 1;
-            if (probe.fail_step) return .busy;
-        },
-        else => return .invalid_argument,
-    }
-    return .ok;
-}
 fn close(_: ?*anyopaque) callconv(.c) void {
     @panic("maintenance selection must not close a resident owner");
 }
@@ -52,7 +28,7 @@ fn drain(_: ?*anyopaque, _: *const abi.CloseDrainRequest) callconv(.c) abi.Statu
 }
 comptime {
     @export(&drain, .{ .name = "antfly_storage_owner_drain_close" });
-    @export(&maintenance, .{ .name = "antfly_storage_owner_maintenance" });
+    @export(&fixture.maintenance, .{ .name = "antfly_storage_owner_maintenance" });
     @export(&close, .{ .name = "antfly_storage_owner_close" });
 }
 test {

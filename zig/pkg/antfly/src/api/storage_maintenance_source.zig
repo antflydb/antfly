@@ -20,6 +20,9 @@
 pub const PostingRefreshProgress = @import("antfly_local_sources").storage_posting_refresh_progress.Progress;
 
 pub const RoundResult = struct {
+    /// A bounded window or a peer selection is unfinished; absence of progress
+    /// must not be interpreted as a complete no-work observation.
+    selection_pending: bool = false,
     progressed: bool = false,
     group_id: ?u64 = null,
 };

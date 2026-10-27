@@ -56,6 +56,37 @@ pub const Policy = struct {
     }
 };
 
+/// One bounded registry window per round. Wide registries alternate pressure
+/// and fair policy by whole sweep; alternating by window would permanently
+/// assign the same policy to each window when the window count is even.
+pub const Scan = struct {
+    pub const inspection_limit = 64;
+    cursor: usize = 0,
+    fair_sweep: bool = false,
+    pub const Window = struct {
+        start: usize,
+        limit: usize,
+        more: bool,
+        policy: Policy,
+    };
+    /// Caller serializes selection, including advancing past failed/no-work
+    /// windows. Registry churn is re-observed at the next bounded round.
+    pub fn next(self: *Scan, count: usize, policy: Policy) Window {
+        if (count <= inspection_limit) {
+            self.cursor = 0;
+            return .{ .start = 0, .limit = count, .more = false, .policy = policy };
+        }
+        if (self.cursor >= count) self.cursor = 0;
+        const start = self.cursor;
+        const limit = start + @min(inspection_limit, count - start);
+        var selected_policy = policy;
+        selected_policy.fair_turn = self.fair_sweep;
+        self.cursor = if (limit == count) 0 else limit;
+        if (limit == count) self.fair_sweep = !self.fair_sweep;
+        return .{ .start = start, .limit = limit, .more = limit < count, .policy = selected_policy };
+    }
+};
+
 fn choose(policy: Policy, candidates: []const Policy.Candidate) ?usize {
     var selected: ?usize = null;
     for (candidates, 0..) |candidate, i| {

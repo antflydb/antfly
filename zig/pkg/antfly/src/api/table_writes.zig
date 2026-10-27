@@ -15026,6 +15026,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub const LsmMaintenanceRoundResult = struct {
+        selection_pending: bool = false,
         progressed: bool = false,
         group_id: ?u64 = null,
     };
@@ -15038,7 +15039,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return .{};
             const result = try maintenance_source.runLsmRound(false);
-            return .{ .progressed = result.progressed, .group_id = result.group_id };
+            return .{ .progressed = result.progressed, .group_id = result.group_id, .selection_pending = result.selection_pending };
         }
         var primary_only = false;
         var leased = blk: {
@@ -15079,7 +15080,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return .{};
             const result = try maintenance_source.runLsmRound(true);
-            return .{ .progressed = result.progressed, .group_id = result.group_id };
+            return .{ .progressed = result.progressed, .group_id = result.group_id, .selection_pending = result.selection_pending };
         }
         if (!self.local_db_mutex.tryLock()) return .{};
         var primary_only = false;
