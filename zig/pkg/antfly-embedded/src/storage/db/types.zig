@@ -1958,6 +1958,9 @@ pub const SearchRequest = struct {
     /// Normalized final projection, owning selected source paths, expressions
     /// and data parameters. Pure output does not affect retrieval membership.
     field_projection_json: []const u8 = "",
+    /// Request-owned immutable IR, borrowed only while its exact input remains
+    /// live. Never serialized; created locally after expression validation.
+    field_projection_plan: ?@import("../../api/field_projection.zig").BorrowedPlan = null,
     /// Trusted private worker delivery, never accepted at public ingress.
     field_projection_transport: bool = false,
     evaluation_json: []const u8 = "",
@@ -2146,6 +2149,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 const hierarchy_children_supported_internal_fields = [_][]const u8{
     // Conditional delivery runs after child authorization and retrieval.
     "field_projection_json",
+    "field_projection_plan",
     "field_projection_transport",
     "value_search_work",
     "value_search_scope",

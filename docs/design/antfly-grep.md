@@ -929,3 +929,15 @@ still checks revision, content proof, directory binding, ancestry, kind, length
 and raw digest. It avoids canonicalizing an unchanged large array/object during
 metadata updates, while continuing to validate and rewrite the incoming primary
 row. No zero-cost or universal throughput guarantee follows from this change.
+
+
+Projection admission now retains the bound program for the request lifetime.
+Hydration and response encoding borrow it only when the encoded input has the
+same immutable address and length; copied or transported inputs bind locally.
+The parsed-request owner releases the plan separately from `SearchRequest`
+value copies. Borrowers never release it, and the handle is never serialized.
+The program holds its own data parameters; sharing is limited to that one
+request. This removes repeated admission/output binding without a global plan
+cache or cross-request parameter state. Failure injection verifies cleanup and
+cloned-parameter isolation. Manually constructed requests retain owned local
+preparation, so older workers and non-parser consumers preserve their behavior.

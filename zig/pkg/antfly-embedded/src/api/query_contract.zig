@@ -2351,11 +2351,16 @@ fn freeOwnedMutableStrings(alloc: std.mem.Allocator, values: [][]u8) void {
 }
 
 pub const OwnedQueryRequest = struct {
+    projection_plan: ?*field_projection.Plan = null,
     fields: [][]const u8 = &.{},
     req: db_mod.types.SearchRequest = .{},
     native_cut: ?std.json.Parsed(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child) = null,
 
     pub fn deinit(self: *OwnedQueryRequest, alloc: std.mem.Allocator) void {
+        if (self.projection_plan) |plan| {
+            plan.deinit();
+            alloc.destroy(plan);
+        }
         if (self.fields.len > 0) {
             for (self.fields) |field| alloc.free(field);
             alloc.free(self.fields);
@@ -2452,6 +2457,7 @@ fn applyCommonSearchRequestOptions(
     alloc: std.mem.Allocator,
     request: anytype,
     req: *db_mod.types.SearchRequest,
+    projection_owner: *?*field_projection.Plan,
 ) !void {
     if (request.limit) |limit| req.limit = @intCast(limit);
     if (comptime @hasField(@TypeOf(request), "evaluate")) {
@@ -2481,15 +2487,16 @@ fn applyCommonSearchRequestOptions(
     };
     if (comptime @hasField(@TypeOf(request), "select")) {
         if (request.select) |selection| {
-            req.field_projection_json = field_projection.encode(alloc, request.fields orelse &.{}, selection, request.params orelse .{ .object = .empty }) catch |err| return if (err == error.InvalidSqlParameters) error.InvalidQueryRequest else err;
+            const prepared = field_projection.encodePrepared(alloc, request.fields orelse &.{}, selection, request.params orelse .{ .object = .empty }) catch |err| return if (err == error.InvalidSqlParameters) error.InvalidQueryRequest else err;
+            projection_owner.* = prepared.plan;
+            req.field_projection_json = prepared.json;
+            req.field_projection_plan = .{ .plan = prepared.plan, .encoded = prepared.json };
             if (req.evaluation_json.len != 0) {
                 var scratch = std.heap.ArenaAllocator.init(alloc);
                 defer scratch.deinit();
                 const raw = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), req.evaluation_json, .{});
                 const compute = if (raw.object.get("compute")) |value| if (value == .object) value.object else return error.InvalidQueryRequest else std.json.ObjectMap.empty;
-                var plan = try field_projection.decode(scratch.allocator(), req.field_projection_json);
-                defer plan.deinit();
-                for (plan.bindings) |binding| if (compute.contains(binding.name)) return error.InvalidQueryRequest;
+                for (prepared.plan.bindings) |binding| if (compute.contains(binding.name)) return error.InvalidQueryRequest;
             }
         } else if (request.params != null) return error.InvalidQueryRequest;
     }
@@ -3032,7 +3039,7 @@ fn parseQueryRequestWithDeadlineCore(
         alloc,
         body_for_contract,
         .{ .parse_numbers = false },
-    ) catch return classifyPublicFilterContractErrorAlloc(alloc, effective_body);
+    ) catch |err| return if (err == error.OutOfMemory) err else classifyPublicFilterContractErrorAlloc(alloc, effective_body);
     defer parsed.deinit();
     try ensureQueryDeadline(execution_deadline_ns);
     var request = parsed.value;
@@ -3048,7 +3055,12 @@ fn parseQueryRequestWithDeadlineCore(
     var req: db_mod.types.SearchRequest = .{};
     errdefer freeSearchRequest(alloc, &req);
 
-    try applyCommonSearchRequestOptions(alloc, request, &req);
+    var projection_owner: ?*field_projection.Plan = null;
+    errdefer if (projection_owner) |plan| {
+        plan.deinit();
+        alloc.destroy(plan);
+    };
+    try applyCommonSearchRequestOptions(alloc, request, &req, &projection_owner);
     req.field_projection_transport = worker_projection_fields != null;
     if (request.execution) |execution| if (execution.value_verification) |policy| {
         req.value_search_execution = .{
@@ -3149,6 +3161,7 @@ fn parseQueryRequestWithDeadlineCore(
     try validateScoreSortHasScoreBearingSource(req);
 
     return .{
+        .projection_plan = projection_owner,
         .fields = fields,
         .req = req,
     };
@@ -3466,8 +3479,8 @@ fn classifyPublicFilterContractErrorAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) anyerror {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
-        return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err|
+        return if (err == error.OutOfMemory) err else error.InvalidQueryRequest;
     defer parsed.deinit();
     const request = switch (parsed.value) {
         .object => |object| object,
@@ -3558,7 +3571,12 @@ fn buildPreflightSearchRequestAlloc(
     var req: db_mod.types.SearchRequest = .{};
     errdefer freeSearchRequest(alloc, &req);
 
-    try applyCommonSearchRequestOptions(alloc, request, &req);
+    var projection_owner: ?*field_projection.Plan = null;
+    errdefer if (projection_owner) |plan| {
+        plan.deinit();
+        alloc.destroy(plan);
+    };
+    try applyCommonSearchRequestOptions(alloc, request, &req, &projection_owner);
 
     if (request.search_after != null and request.search_before != null) return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
 
@@ -3616,6 +3634,7 @@ fn buildPreflightSearchRequestAlloc(
     try validateScoreSortHasScoreBearingSource(req);
 
     return .{
+        .projection_plan = projection_owner,
         .fields = fields,
         .req = req,
     };
@@ -3953,17 +3972,17 @@ fn hasColumnSources(hits: []const db_mod.types.SearchHit) bool {
 // Storage-finalized conditional sources are already publicly projected. Keep
 // them as spans through the wire boundary, stripping private transport fields
 // with the same strict selector engine instead of materializing another DOM.
-fn canStreamFinalizedSource(req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, _: ?*field_projection.Plan) bool {
+fn canStreamFinalizedSource(req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, _: ?*const field_projection.Plan) bool {
     if (!req.include_stored or req.document_authority_mode != .none) return false;
     return hasFinalizedPublicSource(hit);
 }
 fn hasFinalizedPublicSource(hit: db_mod.types.SearchHit) bool {
     return hit.finalized_source != null and hit.finalized_source.?.matches(hit.stored_data orelse return false) and hit.source_value == null and hit.column_source == null;
 }
-fn preparedComputedOutput(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*field_projection.Plan) !?ant_json.RawObject {
+fn preparedComputedOutput(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !?ant_json.RawObject {
     return if (projection) |plan| (if (hit.computed_json) |bytes| try plan.wireOutput(a, bytes, req.field_projection_transport) else null) else null;
 }
-fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: *db_mod.types.SearchHit, projection: ?*field_projection.Plan) !metadata_openapi.QueryHit {
+fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: *db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !metadata_openapi.QueryHit {
     const ready = try preparedComputedOutput(a, req, hit.*, projection);
     if (ready != null and (field_projection.storageEligible(req) or field_projection.hydrationEligible(req)) and hit.source_value == null and hit.column_source == null) {
         if (hit.stored_data) |bytes| hit.finalized_source = .{ .bytes = bytes };
@@ -3972,7 +3991,7 @@ fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hi
     // Reuse the validated output, rather than scanning large payloads twice.
     return toOpenApiHitPreparedSource(a, req, hit.*, projection, canStreamFinalizedSource(req, hit.*, projection), ready);
 }
-fn hasFinalizedWireSources(req: db_mod.types.SearchRequest, hits: []const db_mod.types.SearchHit, projection: ?*field_projection.Plan) bool {
+fn hasFinalizedWireSources(req: db_mod.types.SearchRequest, hits: []const db_mod.types.SearchHit, projection: ?*const field_projection.Plan) bool {
     for (hits) |hit| if (canStreamFinalizedSource(req, hit, projection)) return true;
     return false;
 }
@@ -4156,7 +4175,7 @@ fn ColumnWireResult(comptime T: type) type {
         base: T,
         hits: []db_mod.types.SearchHit,
         req: db_mod.types.SearchRequest,
-        projection: ?*field_projection.Plan,
+        projection: ?*const field_projection.Plan,
         scratch: *std.heap.ArenaAllocator,
         alloc: std.mem.Allocator,
         failure: *?anyerror,
@@ -4266,7 +4285,7 @@ fn writeWireField(w: *std.json.Stringify, comptime name: []const u8, value: anyt
     try w.objectField(name);
     try w.write(value);
 }
-fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req: db_mod.types.SearchRequest, base: anytype, hits: []db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize, projection: ?*field_projection.Plan) ![]u8 {
+fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req: db_mod.types.SearchRequest, base: anytype, hits: []db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize, projection: ?*const field_projection.Plan) ![]u8 {
     var failure: ?anyerror = null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
@@ -4351,8 +4370,9 @@ pub fn encodeQueryResponsesWithDelivery(
     const arena = arena_impl.allocator();
 
     const emitted_hits = if (req.count_only) result.hits[0..0] else result.hits;
-    const projection = try prepareFieldProjection(arena, req);
-    defer if (projection) |plan| plan.deinit();
+    const lease = try prepareFieldProjection(arena, req);
+    defer if (lease) |value| value.deinit(arena);
+    const projection = if (lease) |value| value.plan else null;
     const hits = try arena.alloc(metadata_openapi.QueryHit, emitted_hits.len);
     for (emitted_hits, 0..) |*hit, i| {
         hits[i] = try toOpenApiHitForWire(arena, req, hit, projection);
@@ -4446,25 +4466,33 @@ pub fn encodeQueryResponsesWithDelivery(
     };
 }
 
-fn prepareFieldProjection(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) !?*field_projection.Plan {
+const ProjectionLease = struct {
+    plan: *const field_projection.Plan,
+    owned: ?*field_projection.Plan = null,
+    fn deinit(self: ProjectionLease, a: std.mem.Allocator) void {
+        if (self.owned) |plan| {
+            plan.deinit();
+            a.destroy(plan);
+        }
+    }
+};
+fn prepareFieldProjection(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) !?ProjectionLease {
     if (req.field_projection_json.len == 0 or req.document_authority_mode != .none) return null;
+    if (req.field_projection_plan) |shared| if (shared.get(req.field_projection_json)) |plan| return .{ .plan = plan };
     const plan = try alloc.create(field_projection.Plan);
     errdefer alloc.destroy(plan);
     plan.* = try field_projection.decode(alloc, req.field_projection_json);
-    return plan;
+    return .{ .plan = plan, .owned = plan };
 }
 fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !metadata_openapi.QueryHit {
-    const projection = try prepareFieldProjection(alloc, req);
-    defer if (projection) |plan| {
-        plan.deinit();
-        alloc.destroy(plan);
-    };
-    return toOpenApiHitPrepared(alloc, req, hit, projection);
+    const lease = try prepareFieldProjection(alloc, req);
+    defer if (lease) |value| value.deinit(alloc);
+    return toOpenApiHitPrepared(alloc, req, hit, if (lease) |value| value.plan else null);
 }
-fn toOpenApiHitPrepared(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*field_projection.Plan) !metadata_openapi.QueryHit {
+fn toOpenApiHitPrepared(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !metadata_openapi.QueryHit {
     return toOpenApiHitPreparedSource(alloc, req, hit, projection, false, try preparedComputedOutput(alloc, req, hit, projection));
 }
-fn toOpenApiHitPreparedSource(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*field_projection.Plan, skip_source: bool, ready_computed: ?ant_json.RawObject) !metadata_openapi.QueryHit {
+fn toOpenApiHitPreparedSource(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*const field_projection.Plan, skip_source: bool, ready_computed: ?ant_json.RawObject) !metadata_openapi.QueryHit {
     try validateOpenApiHitSortTuple(req, hit);
 
     // A normalized worker/local query response may have crossed an ownership
@@ -13539,10 +13567,7 @@ fn freeTextQuery(alloc: std.mem.Allocator, query: db_mod.types.TextQuery) void {
 }
 
 fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try std.json.Stringify.value(value, .{}, &out.writer);
-    return try alloc.dupe(u8, out.written());
+    return std.json.Stringify.valueAlloc(alloc, value, .{});
 }
 
 pub const consumer_tests = consumerTests();
@@ -20168,4 +20193,46 @@ test "api query contract worker projection receipt preserves compacted array sou
     hits[0].finalized_source = null;
     const wire = try toOpenApiHit(temp, request.req, hits[0]);
     try std.testing.expectEqual(@as(i64, 2), wire._source.?.map.get("arr").?.array.items[0].object.get("n").?.integer);
+}
+
+test "api query contract projection preparation is request owned and cloned params are isolated" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var owned = try parseQueryRequest(a, null, "docs", "{\"query\":{\"match_all\":{}},\"fields\":[],\"select\":{\"c\":{\"param\":\"n\"}},\"params\":{\"n\":1}}");
+            defer owned.deinit(a);
+            const shared = (try prepareFieldProjection(a, owned.req)).?;
+            defer shared.deinit(a);
+            try std.testing.expect(shared.owned == null);
+            try std.testing.expect(shared.plan == owned.projection_plan.?);
+            const clone = try a.dupe(u8, owned.req.field_projection_json);
+            defer a.free(clone);
+            const at = std.mem.lastIndexOf(u8, clone, "\"n\":1").?;
+            clone[at + 4] = '2';
+            var req = owned.req;
+            req.field_projection_json = clone;
+            try std.testing.expect(req.field_projection_plan.?.get(clone) == null);
+            const separate = (try prepareFieldProjection(a, req)).?;
+            defer separate.deinit(a);
+            try std.testing.expect(separate.owned != null);
+            try std.testing.expectEqual(@as(i64, 1), shared.plan.params.object.get("n").?.integer);
+            try std.testing.expectEqual(@as(i64, 2), separate.plan.params.object.get("n").?.integer);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try Fixture.run(probe.allocator());
+    // Parser and arena warm paths may use fewer allocations on subsequent
+    // calls. Check every observed failure point without requiring equal counts.
+    var induced: usize = 0;
+    for (0..probe.alloc_index + 16) |index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        if (Fixture.run(failing.allocator())) |_| {
+            try std.testing.expect(!failing.has_induced_failure);
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+            induced += 1;
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    try std.testing.expect(induced > 0);
 }

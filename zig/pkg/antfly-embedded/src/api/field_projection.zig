@@ -50,7 +50,18 @@ pub fn validateInput(a: A, value: V) !void {
 }
 /// Normalize the stable string field mask and named scalar expressions once.
 /// The encoded plan is internal request ownership, not a new public protocol.
+pub const Encoding = struct { json: []u8, plan: *Plan };
 pub fn encode(a: A, fields: []const []const u8, selected: V, params: V) ![]u8 {
+    const encoded = try encodePrepared(a, fields, selected, params);
+    defer {
+        encoded.plan.deinit();
+        a.destroy(encoded.plan);
+    }
+    return encoded.json;
+}
+/// Admission owns the program; synchronous consumers borrow it with an exact
+/// encoded-input witness. Transported or cloned inputs prepare their own plan.
+pub fn encodePrepared(a: A, fields: []const []const u8, selected: V, params: V) !Encoding {
     if (selected != .object or selected.object.count() == 0 or selected.object.count() > 64 or params != .object or params.object.count() > 1024) return error.InvalidQueryRequest;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -70,9 +81,11 @@ pub fn encode(a: A, fields: []const []const u8, selected: V, params: V) ![]u8 {
         try values.append(temp, .{ .object = object });
     }
     const request: Request = .{ .fields = values.items, .params = params };
-    var checked = try Plan.init(temp, request);
-    defer checked.deinit();
-    return std.json.Stringify.valueAlloc(a, request, .{});
+    const checked = try a.create(Plan);
+    errdefer a.destroy(checked);
+    checked.* = try Plan.init(a, request);
+    errdefer checked.deinit();
+    return .{ .json = try std.json.Stringify.valueAlloc(a, request, .{}), .plan = checked };
 }
 pub fn decode(a: A, encoded: []const u8) !Plan {
     var request = try std.json.parseFromSlice(Request, a, encoded, .{});
@@ -189,6 +202,13 @@ pub const Source = struct {
 };
 const Dependency = union(enum) { field: []const u8, binding: usize };
 const Binding = struct { name: []const u8, expression: V, state: enum { unseen, visiting, ready } = .unseen, program: ?sql.Program = null, dependencies: []const Dependency = &.{}, height: usize = 0 };
+pub const BorrowedPlan = struct {
+    encoded: []const u8,
+    plan: *const Plan,
+    pub fn get(self: BorrowedPlan, encoded: []const u8) ?*const Plan {
+        return if (self.encoded.ptr == encoded.ptr and self.encoded.len == encoded.len) self.plan else null;
+    }
+};
 pub const Plan = struct {
     arena: *std.heap.ArenaAllocator,
     source_fields: []const []const u8 = &.{},

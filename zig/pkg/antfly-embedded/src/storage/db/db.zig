@@ -41718,11 +41718,13 @@ pub const DB = struct {
         const protocol = @import("../../api/field_projection.zig");
         var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer arena.deinit();
-        var plan = try protocol.decode(arena.allocator(), req.field_projection_json);
-        defer plan.deinit();
+        const borrowed = if (req.field_projection_plan) |shared| shared.get(req.field_projection_json) else null;
+        var owned_plan: ?protocol.Plan = if (borrowed == null) try protocol.decode(arena.allocator(), req.field_projection_json) else null;
+        defer if (owned_plan) |*owned| owned.deinit();
+        const plan = borrowed orelse &owned_plan.?;
         var public_plan = try @import("document_query.zig").PublicPlan.init(arena.allocator(), .{ .fields = req.fields, .include_all_fields = req.include_all_fields });
         defer public_plan.deinit();
-        const operands = try @import("field_projection_source.zig").OperandPlans.init(arena.allocator(), &plan);
+        const operands = try @import("field_projection_source.zig").OperandPlans.init(arena.allocator(), plan);
         var schema = self.core.acquireSchemaView();
         defer if (schema) |*view| view.release();
         var start: usize = 0;
@@ -41788,11 +41790,14 @@ pub const DB = struct {
         var scalar_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer scalar_arena.deinit();
         const native_json = if (schema_view) |view| view.tableSchema().storage_mode != .relational and view.tableSchema().external_base_source == null else true;
-        var scalar_plan: ?scalar.Plan = if (native_json and scalar.hydrationEligible(req)) try scalar.decode(scalar_arena.allocator(), req.field_projection_json) else null;
-        defer if (scalar_plan) |*plan| plan.deinit();
+        const scalar_eligible = native_json and scalar.hydrationEligible(req);
+        const borrowed_scalar = if (scalar_eligible) (if (req.field_projection_plan) |shared| shared.get(req.field_projection_json) else null) else null;
+        var owned_scalar: ?scalar.Plan = if (scalar_eligible and borrowed_scalar == null) try scalar.decode(scalar_arena.allocator(), req.field_projection_json) else null;
+        defer if (owned_scalar) |*plan| plan.deinit();
+        const scalar_plan: ?*const scalar.Plan = borrowed_scalar orelse (if (owned_scalar) |*plan| plan else null);
         var scalar_public_plan = if (scalar_plan != null) try @import("document_query.zig").PublicPlan.init(scalar_arena.allocator(), .{ .fields = req.fields, .include_all_fields = req.include_all_fields }) else null;
         defer if (scalar_public_plan) |*plan| plan.deinit();
-        const scalar_operands = if (scalar_plan) |*plan| try @import("field_projection_source.zig").OperandPlans.init(scalar_arena.allocator(), plan) else null;
+        const scalar_operands = if (scalar_plan) |plan| try @import("field_projection_source.zig").OperandPlans.init(scalar_arena.allocator(), plan) else null;
         var scalar_authorities: @import("../conditional_source.zig").Window = .{};
         var scalar_metadata_rows: usize = 0;
         var scalar_certificate_rows: usize = 0;
@@ -41894,7 +41899,7 @@ pub const DB = struct {
                     primary_window.get(&read.?, store_key, primary_bytes) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
             }
             if (!projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = projection_scratch.reset(.free_all);
-            var projected: ?types.LookupResult = if (scalar_plan) |*plan| lazy: {
+            var projected: ?types.LookupResult = if (scalar_plan) |plan| lazy: {
                 const a = projection_scratch.allocator();
                 var row: @import("field_projection_source.zig").Row = .{ .a = a, .txn = &read.?, .physical = store_key, .id = hit.id, .req = req, .authority = scalar_authorities.rows[index % 64], .full_bytes = raw_primary, .public_plan = if (scalar_public_plan) |*public| public else null, .operands = if (scalar_operands) |*operands| operands else null };
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
