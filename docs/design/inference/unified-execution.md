@@ -3269,3 +3269,9 @@ expansions, measured performance and transferred byte-identical CUDA evidence.
 Q8 family for blocks, panels and fused SDOT, with preserved scale-load and
 publication order. It also records the fractional-timing correction, retained
 failed prototypes and explicit full-kernel instruction audits.
+
+### AC native CPU Q6 panel consolidation
+
+[The AC outcome register](unified-execution-ac-outcomes.md) records one native
+Q6 panel8 owner for ordinary and fused row variants, preserved accumulation
+schedules, signed-extrema oracle coverage and fixed performance comparisons.

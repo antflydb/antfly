@@ -30755,65 +30755,67 @@ inline fn q6KPanel8ReduceWeighted8(acc: [8]I32x4) I32x8 {
     };
 }
 
-inline fn dotQ6KPreparedQ8KPanel8VecFusedSdot(q8_block: []const u8, panel_block: []const u8) F32x8 {
-    std.debug.assert(q8_block.len == 292);
-    std.debug.assert(panel_block.len == prepared_q6_k_panel8_block_bytes);
-
-    const qx = q8_block[4..260];
-    const final_scale = @as(F32x8, @splat(readF32Le(q8_block[0..4]))) * q6KPanel8WeightScale(panel_block);
-    var weighted: [8]I32x4 = @as([8]I32x4, @splat(@splat(0)));
-    inline for (0..16) |sub| {
-        const raw_x: U8x16 = qx[sub * 16 ..][0..16].*;
-        const values_base = q6KPanel8ValuesBase(sub);
-        const scales = q6KPanel8ScaleI32(panel_block, sub);
-        inline for (0..prepared_k_panel8_nr) |lane| {
-            const raw_w: U8x16 = panel_block[values_base + lane * 16 ..][0..16].*;
-            weighted[lane] = q6KPanel8ScaledSdot16(weighted[lane], raw_x, raw_w, scales[lane]);
+/// Compile-time row ownership; fused MR4 deliberately retains two MR2 tiles.
+inline fn q6KPanel8Rows(comptime mr: usize, comptime fused: bool, inputs: [mr][]const u8, panel: []const u8) [mr]F32x8 {
+    comptime std.debug.assert(mr == 1 or mr == 2 or (!fused and mr == 4));
+    inline for (inputs) |input| std.debug.assert(input.len == 292);
+    std.debug.assert(panel.len == prepared_q6_k_panel8_block_bytes);
+    const weight_scale = q6KPanel8WeightScale(panel);
+    var final_scale: [mr]F32x8 = undefined;
+    inline for (0..mr) |row| final_scale[row] = @as(F32x8, @splat(readF32Le(inputs[row][0..4]))) * weight_scale;
+    const Accumulator = if (fused) [8]I32x4 else I32x8;
+    var weighted: [mr]Accumulator = if (fused) @splat(@splat(@splat(0))) else @splat(@splat(0));
+    // Preserve full unrolling only for the existing fused schedule.
+    const traversal = if (fused) 16 else 1;
+    inline for (0..traversal) |tile| {
+        for (0..16 / traversal) |step| {
+            const sub = tile + step;
+            const off = 4 + sub * 16;
+            const base = q6KPanel8ValuesBase(sub);
+            if (comptime fused) {
+                var x: [mr]U8x16 = undefined;
+                inline for (0..mr) |row| x[row] = inputs[row][off..][0..16].*;
+                const scales = q6KPanel8ScaleI32(panel, sub);
+                inline for (0..8) |col| {
+                    const w: U8x16 = panel[base + col * 16 ..][0..16].*;
+                    inline for (0..mr) |row| weighted[row][col] = q6KPanel8ScaledSdot16(weighted[row][col], x[row], w, scales[col]);
+                }
+            } else {
+                var w: [8]*const [16]u8 = undefined;
+                inline for (0..8) |col| w[col] = panel[base + col * 16 ..][0..16];
+                const dots = if (mr == 1)
+                    [1]I32x8{dotI8I8Block8_16Vec(inputs[0][off..][0..16], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])}
+                else if (mr == 2) blk: {
+                    const d = dotI8I8Block8MR2RowsVec16(inputs[0][off..][0..16], inputs[1][off..][0..16], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                    break :blk [2]I32x8{ d.r0, d.r1 };
+                } else blk: {
+                    const d = dotI8I8Block8MR4RowsVec16(inputs[0][off..][0..16], inputs[1][off..][0..16], inputs[2][off..][0..16], inputs[3][off..][0..16], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                    break :blk [4]I32x8{ d.r0, d.r1, d.r2, d.r3 };
+                };
+                const scales = q6KPanel8ScaleI32(panel, sub);
+                inline for (0..mr) |row| weighted[row] += dots[row] * scales;
+            }
         }
     }
-    return final_scale * @as(F32x8, @floatFromInt(q6KPanel8ReduceWeighted8(weighted)));
+    var output: [mr]F32x8 = undefined;
+    inline for (0..mr) |row| output[row] = final_scale[row] * @as(F32x8, @floatFromInt(if (fused) q6KPanel8ReduceWeighted8(weighted[row]) else weighted[row]));
+    return output;
+}
+
+inline fn dotQ6KPreparedQ8KPanel8VecFusedSdot(q8_block: []const u8, panel_block: []const u8) F32x8 {
+    const rows = q6KPanel8Rows(1, true, .{q8_block}, panel_block);
+    return rows[0];
 }
 
 inline fn dotQ6KPreparedQ8KPanel8MR2VecFusedSdot(q8_block_r0: []const u8, q8_block_r1: []const u8, panel_block: []const u8) Panel8MR2VecSums {
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    std.debug.assert(panel_block.len == prepared_q6_k_panel8_block_bytes);
-
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const weight_scale = q6KPanel8WeightScale(panel_block);
-    const final_scale0 = @as(F32x8, @splat(readF32Le(q8_block_r0[0..4]))) * weight_scale;
-    const final_scale1 = @as(F32x8, @splat(readF32Le(q8_block_r1[0..4]))) * weight_scale;
-    var weighted0: [8]I32x4 = @as([8]I32x4, @splat(@splat(0)));
-    var weighted1: [8]I32x4 = @as([8]I32x4, @splat(@splat(0)));
-    inline for (0..16) |sub| {
-        const q_off = sub * 16;
-        const raw_x0: U8x16 = qx0[q_off..][0..16].*;
-        const raw_x1: U8x16 = qx1[q_off..][0..16].*;
-        const values_base = q6KPanel8ValuesBase(sub);
-        const scales = q6KPanel8ScaleI32(panel_block, sub);
-        inline for (0..prepared_k_panel8_nr) |lane| {
-            const raw_w: U8x16 = panel_block[values_base + lane * 16 ..][0..16].*;
-            weighted0[lane] = q6KPanel8ScaledSdot16(weighted0[lane], raw_x0, raw_w, scales[lane]);
-            weighted1[lane] = q6KPanel8ScaledSdot16(weighted1[lane], raw_x1, raw_w, scales[lane]);
-        }
-    }
-    return .{
-        .r0 = final_scale0 * @as(F32x8, @floatFromInt(q6KPanel8ReduceWeighted8(weighted0))),
-        .r1 = final_scale1 * @as(F32x8, @floatFromInt(q6KPanel8ReduceWeighted8(weighted1))),
-    };
+    const rows = q6KPanel8Rows(2, true, .{ q8_block_r0, q8_block_r1 }, panel_block);
+    return .{ .r0 = rows[0], .r1 = rows[1] };
 }
 
-inline fn dotQ6KPreparedQ8KPanel8MR4VecFusedSdot(
-    q8_block_r0: []const u8,
-    q8_block_r1: []const u8,
-    q8_block_r2: []const u8,
-    q8_block_r3: []const u8,
-    panel_block: []const u8,
-) Panel8MR4VecSums {
-    const rows01 = dotQ6KPreparedQ8KPanel8MR2VecFusedSdot(q8_block_r0, q8_block_r1, panel_block);
-    const rows23 = dotQ6KPreparedQ8KPanel8MR2VecFusedSdot(q8_block_r2, q8_block_r3, panel_block);
-    return .{ .r0 = rows01.r0, .r1 = rows01.r1, .r2 = rows23.r0, .r3 = rows23.r1 };
+inline fn dotQ6KPreparedQ8KPanel8MR4VecFusedSdot(q8_block_r0: []const u8, q8_block_r1: []const u8, q8_block_r2: []const u8, q8_block_r3: []const u8, panel_block: []const u8) Panel8MR4VecSums {
+    const first = dotQ6KPreparedQ8KPanel8MR2VecFusedSdot(q8_block_r0, q8_block_r1, panel_block);
+    const last = dotQ6KPreparedQ8KPanel8MR2VecFusedSdot(q8_block_r2, q8_block_r3, panel_block);
+    return .{ .r0 = first.r0, .r1 = first.r1, .r2 = last.r0, .r3 = last.r1 };
 }
 
 const Panel8MR2VecSums = struct {
@@ -30830,29 +30832,9 @@ const Panel8MR4VecSums = struct {
 
 inline fn dotQ6KPreparedQ8KPanel8Vec(q8_block: []const u8, panel_block: []const u8) F32x8 {
     // quant-kernel-codegen:begin CPU panel dot dotQ6KPreparedQ8KPanel8Vec
-    std.debug.assert(q8_block.len == 292);
-    std.debug.assert(panel_block.len == prepared_q6_k_panel8_block_bytes);
     if (q6KPanel8FusedSdotEnabled()) return dotQ6KPreparedQ8KPanel8VecFusedSdot(q8_block, panel_block);
-    const qx = q8_block[4..260];
-    const final_scale = @as(F32x8, @splat(readF32Le(q8_block[0..4]))) * q6KPanel8WeightScale(panel_block);
-    var weighted: I32x8 = @splat(0);
-    for (0..16) |sub| {
-        const q_off = sub * 16;
-        const values_base = q6KPanel8ValuesBase(sub);
-        const dots = dotI8I8Block8_16Vec(
-            qx[q_off..][0..16],
-            panel_block[values_base..][0..16],
-            panel_block[values_base + 16 ..][0..16],
-            panel_block[values_base + 2 * 16 ..][0..16],
-            panel_block[values_base + 3 * 16 ..][0..16],
-            panel_block[values_base + 4 * 16 ..][0..16],
-            panel_block[values_base + 5 * 16 ..][0..16],
-            panel_block[values_base + 6 * 16 ..][0..16],
-            panel_block[values_base + 7 * 16 ..][0..16],
-        );
-        weighted += dots * q6KPanel8ScaleI32(panel_block, sub);
-    }
-    return final_scale * @as(F32x8, @floatFromInt(weighted));
+    const rows = q6KPanel8Rows(1, false, .{q8_block}, panel_block);
+    return rows[0];
     // quant-kernel-codegen:end CPU panel dot dotQ6KPreparedQ8KPanel8Vec
 }
 
@@ -30862,36 +30844,11 @@ inline fn dotQ6KPreparedQ8KPanel8(q8_block: []const u8, panel_block: []const u8)
 
 inline fn dotQ6KPreparedQ8KPanel8MR2Vec(q8_block_r0: []const u8, q8_block_r1: []const u8, panel_block: []const u8) Panel8MR2VecSums {
     // quant-kernel-codegen:begin CPU panel dot dotQ6KPreparedQ8KPanel8MR2Vec
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    std.debug.assert(panel_block.len == prepared_q6_k_panel8_block_bytes);
     if (q6KPanel8FusedSdotEnabled()) return dotQ6KPreparedQ8KPanel8MR2VecFusedSdot(q8_block_r0, q8_block_r1, panel_block);
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const weight_scale = q6KPanel8WeightScale(panel_block);
-    const final_scale0 = @as(F32x8, @splat(readF32Le(q8_block_r0[0..4]))) * weight_scale;
-    const final_scale1 = @as(F32x8, @splat(readF32Le(q8_block_r1[0..4]))) * weight_scale;
-    var weighted0: I32x8 = @splat(0);
-    var weighted1: I32x8 = @splat(0);
-    for (0..16) |sub| {
-        const q_off = sub * 16;
-        const values_base = q6KPanel8ValuesBase(sub);
-        const w0 = panel_block[values_base..][0..16];
-        const w1 = panel_block[values_base + 16 ..][0..16];
-        const w2 = panel_block[values_base + 2 * 16 ..][0..16];
-        const w3 = panel_block[values_base + 3 * 16 ..][0..16];
-        const w4 = panel_block[values_base + 4 * 16 ..][0..16];
-        const w5 = panel_block[values_base + 5 * 16 ..][0..16];
-        const w6 = panel_block[values_base + 6 * 16 ..][0..16];
-        const w7 = panel_block[values_base + 7 * 16 ..][0..16];
-        const dots = dotI8I8Block8MR2RowsVec16(qx0[q_off..][0..16], qx1[q_off..][0..16], w0, w1, w2, w3, w4, w5, w6, w7);
-        const scales = q6KPanel8ScaleI32(panel_block, sub);
-        weighted0 += dots.r0 * scales;
-        weighted1 += dots.r1 * scales;
-    }
+    const rows = q6KPanel8Rows(2, false, .{ q8_block_r0, q8_block_r1 }, panel_block);
     return .{
-        .r0 = final_scale0 * @as(F32x8, @floatFromInt(weighted0)),
-        .r1 = final_scale1 * @as(F32x8, @floatFromInt(weighted1)),
+        .r0 = rows[0],
+        .r1 = rows[1],
     };
     // quant-kernel-codegen:end CPU panel dot dotQ6KPreparedQ8KPanel8MR2Vec
 }
@@ -30909,48 +30866,13 @@ inline fn dotQ6KPreparedQ8KPanel8MR4Vec(
     panel_block: []const u8,
 ) Panel8MR4VecSums {
     // quant-kernel-codegen:begin CPU panel dot dotQ6KPreparedQ8KPanel8MR4Vec
-    std.debug.assert(q8_block_r0.len == 292);
-    std.debug.assert(q8_block_r1.len == 292);
-    std.debug.assert(q8_block_r2.len == 292);
-    std.debug.assert(q8_block_r3.len == 292);
-    std.debug.assert(panel_block.len == prepared_q6_k_panel8_block_bytes);
     if (q6KPanel8FusedSdotEnabled()) return dotQ6KPreparedQ8KPanel8MR4VecFusedSdot(q8_block_r0, q8_block_r1, q8_block_r2, q8_block_r3, panel_block);
-    const qx0 = q8_block_r0[4..260];
-    const qx1 = q8_block_r1[4..260];
-    const qx2 = q8_block_r2[4..260];
-    const qx3 = q8_block_r3[4..260];
-    const weight_scale = q6KPanel8WeightScale(panel_block);
-    const final_scale0 = @as(F32x8, @splat(readF32Le(q8_block_r0[0..4]))) * weight_scale;
-    const final_scale1 = @as(F32x8, @splat(readF32Le(q8_block_r1[0..4]))) * weight_scale;
-    const final_scale2 = @as(F32x8, @splat(readF32Le(q8_block_r2[0..4]))) * weight_scale;
-    const final_scale3 = @as(F32x8, @splat(readF32Le(q8_block_r3[0..4]))) * weight_scale;
-    var weighted0: I32x8 = @splat(0);
-    var weighted1: I32x8 = @splat(0);
-    var weighted2: I32x8 = @splat(0);
-    var weighted3: I32x8 = @splat(0);
-    for (0..16) |sub| {
-        const q_off = sub * 16;
-        const values_base = q6KPanel8ValuesBase(sub);
-        const w0 = panel_block[values_base..][0..16];
-        const w1 = panel_block[values_base + 16 ..][0..16];
-        const w2 = panel_block[values_base + 2 * 16 ..][0..16];
-        const w3 = panel_block[values_base + 3 * 16 ..][0..16];
-        const w4 = panel_block[values_base + 4 * 16 ..][0..16];
-        const w5 = panel_block[values_base + 5 * 16 ..][0..16];
-        const w6 = panel_block[values_base + 6 * 16 ..][0..16];
-        const w7 = panel_block[values_base + 7 * 16 ..][0..16];
-        const dots = dotI8I8Block8MR4RowsVec16(qx0[q_off..][0..16], qx1[q_off..][0..16], qx2[q_off..][0..16], qx3[q_off..][0..16], w0, w1, w2, w3, w4, w5, w6, w7);
-        const scales = q6KPanel8ScaleI32(panel_block, sub);
-        weighted0 += dots.r0 * scales;
-        weighted1 += dots.r1 * scales;
-        weighted2 += dots.r2 * scales;
-        weighted3 += dots.r3 * scales;
-    }
+    const rows = q6KPanel8Rows(4, false, .{ q8_block_r0, q8_block_r1, q8_block_r2, q8_block_r3 }, panel_block);
     return .{
-        .r0 = final_scale0 * @as(F32x8, @floatFromInt(weighted0)),
-        .r1 = final_scale1 * @as(F32x8, @floatFromInt(weighted1)),
-        .r2 = final_scale2 * @as(F32x8, @floatFromInt(weighted2)),
-        .r3 = final_scale3 * @as(F32x8, @floatFromInt(weighted3)),
+        .r0 = rows[0],
+        .r1 = rows[1],
+        .r2 = rows[2],
+        .r3 = rows[3],
     };
     // quant-kernel-codegen:end CPU panel dot dotQ6KPreparedQ8KPanel8MR4Vec
 }
@@ -51850,6 +51772,92 @@ test "Q8 four column families independent oracle and benchmark" {
             for (&samples) |*sample| sample.* = state.measure(mr, kind);
             std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
             std.debug.print("q8_four mr={d} kind={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=20001\n", .{ mr, kind, @as(f64, @floatFromInt(samples[10])) / 20001.0, @as(f64, @floatFromInt(samples[19])) / 20001.0, samples[10], samples[19] });
+        };
+    }
+}
+
+test "Q6 panel8 row families independent oracle and benchmark" {
+    @setEvalBranchQuota(500_000);
+    const State = struct {
+        inputs: [4][292]u8 align(64) = @splat(@splat(0)),
+        panel: [prepared_q6_k_panel8_block_bytes]u8 align(64) = @splat(0),
+        fn initialize(self: *@This(), seed: usize) void {
+            for (&self.inputs, 0..) |*input, row| {
+                const scale: f32 = if ((seed + row) % 2 == 0) 0.125 else -0.25;
+                std.mem.writeInt(u32, input[0..4], @bitCast(scale), .little);
+                for (0..256) |i| {
+                    const value: i8 = if (seed == 0) 0 else if (seed == 1) (if (i % 2 == 0) -128 else 127) else @intCast(@as(i32, @intCast((i * 17 + row * 37 + seed * 11) % 256)) - 128);
+                    input[4 + i] = @bitCast(value);
+                }
+            }
+            for (0..8) |col| {
+                const scale: f32 = if ((seed + col) % 2 == 0) 0.0625 else -0.125;
+                std.mem.writeInt(u32, self.panel[prepared_q6_k_panel8_d_offset + col * 4 ..][0..4], @bitCast(scale), .little);
+                for (0..16) |sub| {
+                    const qscale: i8 = if (seed == 1) (if (col % 2 == 0) -128 else 127) else @intCast(@as(i32, @intCast((sub * 23 + col * 31 + seed * 7) % 256)) - 128);
+                    self.panel[prepared_q6_k_panel8_scales_offset + sub * 8 + col] = @bitCast(qscale);
+                    for (0..16) |i| {
+                        const weight: i8 = if (seed == 1) (if (i % 2 == 0) -32 else 31) else @intCast(@as(i32, @intCast((i * 7 + col * 13 + sub * 19 + seed * 3) % 64)) - 32);
+                        self.panel[prepared_q6_k_panel8_values_offset + (sub * 8 + col) * 16 + i] = @bitCast(weight);
+                    }
+                }
+            }
+        }
+        noinline fn run(self: *@This(), comptime mr: usize, comptime kind: usize) [mr]F32x8 {
+            if (comptime kind == 1 and native_aarch64_dotprod) {
+                if (comptime mr == 1) return .{dotQ6KPreparedQ8KPanel8VecFusedSdot(&self.inputs[0], &self.panel)};
+                if (comptime mr == 2) {
+                    const d = dotQ6KPreparedQ8KPanel8MR2VecFusedSdot(&self.inputs[0], &self.inputs[1], &self.panel);
+                    return .{ d.r0, d.r1 };
+                }
+                const d = dotQ6KPreparedQ8KPanel8MR4VecFusedSdot(&self.inputs[0], &self.inputs[1], &self.inputs[2], &self.inputs[3], &self.panel);
+                return .{ d.r0, d.r1, d.r2, d.r3 };
+            }
+            if (comptime mr == 1) return .{dotQ6KPreparedQ8KPanel8Vec(&self.inputs[0], &self.panel)};
+            if (comptime mr == 2) {
+                const d = dotQ6KPreparedQ8KPanel8MR2Vec(&self.inputs[0], &self.inputs[1], &self.panel);
+                return .{ d.r0, d.r1 };
+            }
+            const d = dotQ6KPreparedQ8KPanel8MR4Vec(&self.inputs[0], &self.inputs[1], &self.inputs[2], &self.inputs[3], &self.panel);
+            return .{ d.r0, d.r1, d.r2, d.r3 };
+        }
+        noinline fn measure(self: *@This(), comptime mr: usize, comptime kind: usize) u64 {
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (0..20001) |_| {
+                self.inputs[0][4] +%= 1;
+                std.mem.doNotOptimizeAway(self.run(mr, kind));
+            }
+            return @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds - start);
+        }
+    };
+    // The ordinary entry must exercise its original non-fused schedule.
+    setQ6KPanel8FusedSdotOverrideForBench(false);
+    defer setQ6KPanel8FusedSdotOverrideForBench(null);
+    var state: State = .{};
+    for (0..4) |seed| {
+        state.initialize(seed);
+        inline for (.{ 1, 2, 4 }) |mr| inline for (.{ 0, 1 }) |kind| {
+            const output = state.run(mr, kind);
+            for (0..mr) |row| for (0..8) |col| {
+                var sum: f64 = 0;
+                for (0..16) |sub| {
+                    var dot: f64 = 0;
+                    for (0..16) |i| dot += @as(f64, @floatFromInt(@as(i8, @bitCast(state.inputs[row][4 + sub * 16 + i])))) * @as(f64, @floatFromInt(@as(i8, @bitCast(state.panel[prepared_q6_k_panel8_values_offset + (sub * 8 + col) * 16 + i]))));
+                    sum += dot * @as(f64, @floatFromInt(@as(i8, @bitCast(state.panel[prepared_q6_k_panel8_scales_offset + sub * 8 + col]))));
+                }
+                const expected: f32 = @floatCast(@as(f64, readF32Le(state.inputs[row][0..4])) * @as(f64, readF32Le(state.panel[prepared_q6_k_panel8_d_offset + col * 4 ..][0..4])) * sum);
+                try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(f32x8ToArray(output[row])[col])));
+            };
+        };
+    }
+    if (platform.env.getenvBool("ANTFLY_Q6_PANEL_BENCH")) {
+        state.initialize(3);
+        inline for (.{ 1, 2, 4 }) |mr| inline for (.{ 0, 1 }) |kind| {
+            for (0..10) |_| _ = state.measure(mr, kind);
+            var samples: [21]u64 = undefined;
+            for (&samples) |*sample| sample.* = state.measure(mr, kind);
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            std.debug.print("q6_panel mr={d} kind={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=20001\n", .{ mr, kind, @as(f64, @floatFromInt(samples[10])) / 20001.0, @as(f64, @floatFromInt(samples[19])) / 20001.0, samples[10], samples[19] });
         };
     }
 }
