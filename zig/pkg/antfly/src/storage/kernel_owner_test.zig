@@ -4471,11 +4471,15 @@ test "opaque metadata durable job state reads preserve group cursor and ownershi
     const key = "documents/compiled-job-state";
     const value = "{\"owner\":\"compiled\",\"state\":\"queued\"}";
     try std.testing.expect((try store.getJobState(a, 41, key)) == null);
+    try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 41, "compiled"));
     try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = "", .value = value } });
     {
         const found = (try store.getJobState(a, 41, key)).?;
         defer a.free(found);
         try std.testing.expectEqualStrings(value, found);
+        try std.testing.expectEqual(@as(u64, 1), try store.getJobOwnerCount(a, 41, "compiled"));
+        try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 42, "compiled"));
+        try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 41, "other"));
         try std.testing.expect((try store.getJobState(a, 42, key)) == null);
         const bytes = try store.scanJobState(a, 41, null);
         defer a.free(bytes);

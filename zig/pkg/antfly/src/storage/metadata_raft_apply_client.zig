@@ -270,6 +270,10 @@ pub const RaftApplyStore = struct {
         _ = try self.projection(bool, .{ .kind = .migrate_standalone_restore_jobs, .key = .fromSlice(encoded.written()) });
     }
 
+    pub fn getJobOwnerCount(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, owner: []const u8) !u64 {
+        return self.projectionWithAllocator(u64, alloc, .{ .kind = .job_owner_count, .group_id = group_id, .key = .fromSlice(owner) });
+    }
+
     pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .job_state, .group_id = group_id, .key = .fromSlice(key) });
     }
