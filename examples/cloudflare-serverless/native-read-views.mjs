@@ -30,15 +30,15 @@ export class NativeReadViews {
   this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readKernel:observation,cache,onMetrics,remoteCache:edgeCacheForEnv(env,{background})});
  }
  open(options={}){
-  return this.cohorts.run(options.version??"latest",async(traceIds,close)=>{
+  return this.cohorts.run(options.version??"latest",async(traceIds,close,publish)=>{
    const authority=await this.authorityAdmission.get();
    if(authority.descriptor.mode!=="r2"){this.authorityAdmission.value=null;throw Error("CoordinatorMigrationRequired");}
    const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
    return this.store.readOnly(async tx=>{
     const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
     if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
-    return captureReadView(tx,keys,options,this.clock);
+    const view=await captureReadView(tx,keys,options,this.clock);publish(view);return view;
    },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background});
-  },options.trace_id,{untilAdmission:true});
+  },options.trace_id,{untilAdmission:true,onPrepared:options.onPrepared});
  }
 }

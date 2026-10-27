@@ -130,6 +130,17 @@ export class R2CoordinatorStore {
     while(this.rows.size>=256||this.rowBytes+this.hintBytes+bytes>512*1024){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
     this.rows.set(key,{value:structuredClone(value),bytes});this.rowBytes+=bytes;
   }
+  // A preparation hint only. It carries no freshness claim; callers must
+  // validate its dependencies inside their final authoritative native commit.
+  speculativeEntries(names){
+    if(!this.acquired||this.recovering||this.ioDrain||this.running||!this.state?.root)return null;
+    const root=JSON.parse(this.state.root);if(root.format!==3)return null;
+    const map=new Map((root.read_rows?.exact??[]).map(row=>[row.key,row.value]));
+    if(root.wal)map.set(root.wal.key,root.wal.value);
+    if(root.read_rows?.selected)map.set(root.read_rows.selected.key,root.read_rows.selected.value);
+    if(names.some(name=>!map.has(name)))return null;
+    return new Map([...map].map(([key,value])=>[key,value==null?undefined:JSON.parse(value,(_,v)=>v&&Object.keys(v).length===1&&typeof v.__antfly_utf8==="string"?utf8.encode(v.__antfly_utf8):v&&Object.keys(v).length===1&&Array.isArray(v.__antfly_bytes)?Uint8Array.from(v.__antfly_bytes):v)]));
+  }
   async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background}={}){
     if(this.ownerReady)await this.ownerReady;
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");

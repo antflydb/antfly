@@ -85,6 +85,7 @@ export class GateClient {
     if(BigInt(value.published_lsn??0)>=BigInt('0x'+receipt.slice(-16)))break;
     await new Promise(r=>setTimeout(r,500));
    }
+   await this.onSeedProgress?.({tenant,published_documents:Math.min(documents,start+64)});
   }
   this.converged=true;
  }

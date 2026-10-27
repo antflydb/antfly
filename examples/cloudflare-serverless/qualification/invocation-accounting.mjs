@@ -28,7 +28,7 @@ export function requestAttemptIdentity(value){try{const parameter=new URL(value)
 export class InvocationLedger{
  constructor({limit=20000,clock=Date.now}={}){if(!Number.isInteger(limit)||limit<1||limit>20000||typeof clock!=="function")throw Error("InvalidInvocationLedgerLimit");this.limit=limit;this.clock=clock;this.rows=[];this.overflow=false;}
  begin({phase,op,tenant}){if(this.rows.length>=this.limit){this.overflow=true;return null;}const row={id:crypto.randomUUID(),phase:/^[a-z][a-z-]{0,31}$/.test(phase)?phase:'other',op:/^[a-z_]{1,32}$/.test(op??'')?op:'other',tenant:['a','b','c','d'].includes(tenant)?tenant:'other',started_at:this.clock(),response_at:null,finished_at:null,status:null,ray_id_sha256:null,version_id:null,transport_error:false};this.rows.push(row);return row;}
- response(row,response){if(!row)return;row.response_at=this.clock();row.status=response.status;row.ray_id_sha256=rayIdentity(response.headers.get('cf-ray'));row.version_id=versionIdentity(response.headers.get('X-Antfly-Version'));}
+ response(row,response){if(!row)return;row.response_at=this.clock();row.status=response.status;row.ray_id_sha256=rayIdentity(response.headers.get('cf-ray'));row.version_id=versionIdentity(response.headers.get('X-Antfly-Version'));const placement=response.headers.get("cf-placement");if(/^(local|remote)-[A-Z]{3}$/.test(placement??""))row.compute_placement=placement;}
  finish(row,{transportError=false}={}){if(row){row.finished_at=this.clock();row.transport_error=transportError;}}
  report(){return{schema:1,overflow:this.overflow,attempts:this.rows.map(row=>({...row}))};}
 }

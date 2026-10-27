@@ -78,6 +78,22 @@ pub const Reader = struct {
         return facts.lookup(self.alloc, self.cache.store(), self.root, id) catch |err| return readFailure(err);
     }
 
+    /// Consume a borrowed inline payload while its cursor still owns the leaf.
+    pub fn lookupBodyAlloc(self: *Reader, id: []const u8) !?[]u8 {
+        try self.session.checkCancellation();
+        if (id.len == 0) return null;
+        if (id.len > tree.max_key_bytes) return error.InvalidDocumentFact;
+        var cursor = try tree.Cursor.init(self.alloc, self.cache.store(), self.root.page, id, null);
+        defer cursor.deinit();
+        const record = (try cursor.next()) orelse return null;
+        if (!std.mem.eql(u8, record.key, id)) return null;
+        if (!self.root.inline_records and facts.inlineBody(record.value) != null) return error.InvalidDocumentFact;
+        const fact = try Fact.decode(record.value);
+        if (fact.last_lsn > self.root.wal_end_lsn) return error.InvalidDocumentFact;
+        if (facts.inlineBody(record.value)) |body| return try self.alloc.dupe(u8, body);
+        return try self.readBodyAlloc(fact);
+    }
+
     pub fn readBodyAlloc(self: *Reader, fact: Fact) ![]u8 {
         try self.session.checkCancellation();
         if (fact.body.bytes > max_materialized_bytes) return error.QueryCandidateBudgetExceeded;

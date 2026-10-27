@@ -27,6 +27,7 @@ import {metadataKernel,readObservationKernel,buildKernel,sharedCache,boundRows,k
 import {MaintenanceTickets} from "./maintenance-tickets.mjs";
 import {compactionIdentity,readCompactionReceipt,beginCompactionReceipt,finishCompactionReceipt} from "./compaction-receipt.mjs";
 import {PreparedWal} from "./prepared-wal.mjs";
+import {OptimisticWal} from "./optimistic-wal.mjs";
 import {metadataKeys} from "./read-view.mjs";
 import {MutationGroups} from "./mutation-groups.mjs";
 import {metadataCollectionDue} from "./maintenance-policy.mjs";
@@ -248,31 +249,44 @@ export class R2CommitCoordinator extends DurableObject {
     // retain the full native variant and its exclusive 32 MiB reservation.
     const compactWal=inputs.length===1&&inputs[0].mutations?.length===1&&new TextEncoder().encode(JSON.stringify(inputs[0])).byteLength<=16384;
     const walWorkingBytes=compactWal?Math.min(8*1024*1024,Number(this.env.WORKING_SET_BYTES??20*1024*1024)):Number(this.env.WORKING_SET_BYTES??20*1024*1024);
+    this.optimisticWal??=new OptimisticWal();
     for(let attempt=0;attempt<3;attempt++){
       // The shared durable generation pin protects the manifest read during
       // preparation. New publication can only make admission more conservative.
-      const view=await trace.span("prepare_snapshot",()=>this.openReadView({trace_id:trace.id,immutable:false})),prepared=new PreparedWal(keys.wal,view.entries);
+      if(attempt===0&&this.env.OPTIMISTIC_WAL==="true"){
+        const local=this.store.speculativeEntries([keys.head,keys.wal,keys.floor]);
+        if(local)try{const view=await captureReadView({getMany:async names=>names.map(key=>structuredClone(local.get(key))),get:async key=>structuredClone(local.get(key)),put:()=>{throw Error("PreparationNeedsPin");}},keys,{immutable:false});this.optimisticWal.remember(view,keys.wal);}catch(error){if(error?.message!=="PreparationNeedsPin")throw error;this.optimisticWal.clear();}
+      }
+      const retained=attempt===0&&this.env.OPTIMISTIC_WAL==="true"&&this.store.acquired&&!this.store.ioDrain?this.optimisticWal.prepare():null;
+      const view=retained??await trace.span("prepare_snapshot",()=>this.openReadView({trace_id:trace.id,immutable:false})),prepared=new PreparedWal(keys.wal,view.entries);
+      const dependencies=retained?this.optimisticWal.dependencies(view,keys.wal,encode):[];
       const transport=this.store.dataCache.wrap(withCommitCoordinator(edgeCacheForEnv(this.env,{background:promise=>this.ctx.waitUntil(promise),budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical)),prepared),this.env.ANTFLY_INCARNATION);
 
-      const result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:walWorkingBytes,mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));
+      let result;try{result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:walWorkingBytes,mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));}catch(error){if(retained&&/^(FileNotFound|ObjectNotFound)$/.test(error?.message)){this.optimisticWal.clear();continue;}throw error;}
+      // Replays still take fresh authority admission; a cached receipt never
+      // substitutes for current namespace/fencing validation.
+      if(retained&&!prepared.head){this.optimisticWal.clear();continue;}
       let maximum=0n;for(const item of result.results)maximum=BigInt("0x"+item.visibility.slice(-16))>maximum?BigInt("0x"+item.visibility.slice(-16)):maximum;
       let committed;
       if(prepared.head&&this.env.NATIVE_WAL_COMMIT!=="false"){
         if(this.authority.descriptor.mode!=="r2")throw new Error("CoordinatorMigrationRequired");
         if(Date.now()>=deadline)throw new Error("DeadlineExceeded");
-        const native=await trace.span("durable_commit",()=>this.store.commitWal({wal_key:keys.wal,expected_etag:prepared.original?.etag??null,value:encode(prepared.head),publication_key:"__antfly_maintenance/publication",watermark:String(maximum),now_ms:Date.now(),id:crypto.randomUUID(),migration_required:this.env.COORDINATOR_MIGRATION_REQUIRED==="true"},{deadlineMs:deadline,traceId:trace.id}));
+        const native=await trace.span("durable_commit",()=>this.store.commitWal({...(retained?{dependencies}:{}),wal_key:keys.wal,expected_etag:prepared.original?.etag??null,value:encode(prepared.head),publication_key:"__antfly_maintenance/publication",watermark:String(maximum),now_ms:Date.now(),id:crypto.randomUUID(),migration_required:this.env.COORDINATOR_MIGRATION_REQUIRED==="true"},{deadlineMs:deadline,traceId:trace.id}));
         committed=native.applied?native.publication:null;
       }else committed=await trace.span("durable_commit",()=>this.transaction(async tx=>{
         if(Date.now()>=deadline)throw new Error("DeadlineExceeded");
+        for(const dependency of dependencies)if(((await tx.get(dependency.key))?encode(await tx.get(dependency.key)):null)!==dependency.value)return null;
         if(!await prepared.commit(tx,(...args)=>this.objectCallInTransaction(...args)))return null;
         return await this.publication.reserve(tx,String(maximum));
       }));
       if(committed){
+        if(this.env.OPTIMISTIC_WAL==="true")this.optimisticWal.remember(view,keys.wal,prepared.head);
         trace.publicationId=committed.id;
         if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,prepare_attempts:attempt+1,physical_r2:physical}));
         trace.emit(this.env.LOG_METRICS==="true");
         return result.results.map((item,i)=>({...item,__publication:i===0?committed:{...committed,enqueue:false}}));
       }
+      this.optimisticWal.clear();
     }
     throw new Error("WalCommitContended");
   }

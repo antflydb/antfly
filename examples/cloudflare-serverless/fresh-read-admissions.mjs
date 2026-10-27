@@ -19,20 +19,25 @@
 const waiters={read:0,commit:0},limits={read:64,commit:16};
 export class FreshReadAdmissions {
  constructor({delayMs=2,maxGroups=64,maxMembers=64}={}){if(!Number.isInteger(delayMs)||delayMs<0||delayMs>10)throw Error("InvalidReadAdmissionDelay");if(!Number.isInteger(maxMembers)||maxMembers<1||maxMembers>64)throw Error("InvalidReadAdmissionLimit");this.delayMs=delayMs;this.maxGroups=maxGroups;this.maxMembers=maxMembers;this.pending=new Map();}
- run(key,read,traceId,{untilAdmission=false,admissionClass="read"}={}){
+ run(key,read,traceId,{untilAdmission=false,admissionClass="read",onPrepared}={}){
   if(!Object.hasOwn(limits,admissionClass)||waiters[admissionClass]>=limits[admissionClass])return Promise.reject(Error("CoordinatorCommitBusy"));
   let group=this.pending.get(key);
   if(group&&group.members>=this.maxMembers||!group&&this.pending.size>=this.maxGroups)return Promise.reject(Error("CoordinatorCommitBusy"));
   if(!group){
-   group={traceIds:new Set(),ids:[],members:0};this.pending.set(key,group);
+   group={traceIds:new Set(),ids:[],members:0,callbacks:[]};this.pending.set(key,group);
    const close=()=>{if(this.pending.get(key)===group)this.pending.delete(key);};
    group.promise=new Promise((resolve,reject)=>setTimeout(()=>{
     if(!untilAdmission)close();
-    Promise.resolve().then(()=>read(group.ids,close)).then(view=>{close();resolve(view);},error=>{close();reject(error);});
+    Promise.resolve().then(()=>read(group.ids,close,view=>{for(const publish of group.callbacks)publish(view);})).then(view=>{close();resolve(view);},error=>{close();reject(error);});
    },this.delayMs));
   }
+  // Register the continuation in this submitting request, never in the
+  // cohort owner's context. Only promise resolution crosses that boundary.
+  const prepared={error:null};let publish,notified=false;
+  const early=onPrepared?new Promise(resolve=>publish=resolve).then(view=>{try{onPrepared(view);}catch(error){prepared.error=error;}}):null;
+  if(onPrepared)group.callbacks.push(view=>{notified=true;publish(structuredClone(view));});
   group.members++;waiters[admissionClass]++;
   if(traceId&&!group.traceIds.has(traceId)){group.traceIds.add(traceId);group.ids.push(traceId);}
-  return group.promise.then(view=>structuredClone(view)).finally(()=>{waiters[admissionClass]--;});
+  return group.promise.then(async view=>{if(early&&notified)await early;if(prepared.error)throw prepared.error;return structuredClone(view);}).finally(()=>{waiters[admissionClass]--;});
  }
 }

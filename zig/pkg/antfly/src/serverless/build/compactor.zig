@@ -46,6 +46,7 @@ pub const CompactionResult = struct {
 };
 
 pub const Compactor = struct {
+    probe_only: bool = false,
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
     manifests: *manifest_mod.ManifestStore,
@@ -142,6 +143,7 @@ pub const Compactor = struct {
                     return owned;
                 }
             }
+            if (self.probe_only) return error.CompactionNeedsPublicationLease;
             var owner_bytes: [16]u8 = undefined;
             io.random(&owner_bytes);
             const owner = std.fmt.bytesToHex(&owner_bytes, .lower);

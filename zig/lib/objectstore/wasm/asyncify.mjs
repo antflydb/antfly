@@ -19,9 +19,10 @@ import { ObjectStoreError } from "./r2.mjs";
 import { validatePutBatch, executePutBatch } from "./batch.mjs";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now, refreshClock = (delayMs = 0) => new Promise(resolve => setTimeout(resolve, delayMs)) } = {}) {
+export async function instantiateHost(module, transport, { batchConcurrency = 4, stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now, refreshClock = (delayMs = 0) => new Promise(resolve => setTimeout(resolve, delayMs)) } = {}) {
   if (!(module instanceof WebAssembly.Module)) throw new TypeError("a precompiled WebAssembly.Module is required");
   if (!Number.isSafeInteger(stackBytes) || stackBytes < 4096 || stackBytes > 8 * 1024 * 1024) throw new TypeError("invalid suspension stack size");
+  if(!Number.isInteger(batchConcurrency)||batchConcurrency<1||batchConcurrency>4)throw new TypeError("invalid batch concurrency");
   let wasm, pending, completed, activeTransport, activeOptions, operations, inferenceCalls, transferred, draining = null, busy = false, poisoned = false;
   const bytes = (ptr, len) => new Uint8Array(wasm.memory.buffer, ptr, len);
   function allocate(value) {
@@ -64,7 +65,7 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
         if (options.signal?.aborted) throw new ObjectStoreError(5, "canceled upload batch");
         if (clock() >= options.deadlineMs) throw new ObjectStoreError(9, "upload batch deadline");
       };
-      pending = Promise.resolve().then(() => batch ? executePutBatch(handler, request, body, check) : handler(request, body)).then(
+      pending = Promise.resolve().then(() => batch ? executePutBatch(handler, request, body, check, batchConcurrency) : handler(request, body)).then(
         value => ({ status: 0, value }),
         error => { if (!(error instanceof ObjectStoreError) || error.status >= 6) onTransportError(error, request.op); return { status: error instanceof ObjectStoreError ? error.status : /10058/.test(String(error)) ? 6 : 7, value: {} }; },
       );

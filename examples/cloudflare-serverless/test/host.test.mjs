@@ -974,3 +974,12 @@ test("pooled host waits out small frozen clock gaps at admission and I/O resumpt
 test("pooled host rejects a clock still behind after bounded fresh I/O",async()=>{
  let now=10000;const waits=[],{host}=await setup(new Bucket(),undefined,{clock:()=>now,refreshClock:async delay=>waits.push(delay)});await host.request(request('mutate',{operation_id:'clock-rollback',mutations:[{kind:'upsert',doc_id:'a',body:'{"text":"clock"}'}]}));await host.request(request('publish'));await host.request(request('count'));now-=1000;await assert.rejects(host.request(request('count')),/ManifestReadLeaseExpired/);assert.deepEqual(waits,[50]);assert.equal(host.usable(),false);
 });
+
+test("inline point bodies preserve exact results and survive disabling new writes",async()=>{
+ const{host,bucket}=await setup();const body=JSON.stringify({text:"inline",payload:"x".repeat(1024)});
+ await host.request(request("mutate",{operation_id:"inline-source",mutations:[{kind:"upsert",doc_id:"small",body}]}));
+ await host.request(request("publish",{paged_text:true,inline_point_bodies:true}));
+ assert.ok([...bucket.objects.values()].some(o=>new TextDecoder().decode(o.body.subarray(0,8))==="AFDFACTB"));
+ const cold=(await setup(bucket)).host;assert.equal((await cold.request(request("lookup",{doc_id:"small"}))).body,body);
+ await cold.request(request("mutate",{operation_id:"inline-update",mutations:[{kind:"upsert",doc_id:"small",body:'{"text":"updated"}'}]}));await cold.request(request("publish",{paged_text:true,inline_point_bodies:false}));assert.equal((await cold.request(request("lookup",{doc_id:"small"}))).body,'{"text":"updated"}');
+});

@@ -47,7 +47,12 @@ pub const BodyRef = struct {
     }
 };
 
+pub const max_inline_body_bytes = 1536;
+const inline_magic = "AFDINL01";
+
 pub const Fact = struct {
+    /// Borrowed only by an encoder; decoders never return page-owned slices.
+    inline_payload: ?[]const u8 = null,
     body: BodyRef,
     body_has_dependencies: bool = false,
     media_audit: ?BodyRef = null,
@@ -100,9 +105,29 @@ pub const Fact = struct {
             std.mem.writeInt(u32, out[180..184], pack.offset, .little);
         }
         _ = try Fact.decode(out);
+        if (self.inline_payload) |payload| {
+            if (payload.len > max_inline_body_bytes or self.body.bytes != payload.len + body_header_bytes or !std.mem.eql(u8, &bodyDigest(payload), &self.body.digest)) return error.InvalidDocumentFact;
+            const wrapped = try alloc.alloc(u8, @max(185, 16 + out.len + payload.len));
+            @memset(wrapped, 0);
+            @memcpy(wrapped[0..8], inline_magic);
+            std.mem.writeInt(u32, wrapped[8..12], @intCast(out.len), .little);
+            std.mem.writeInt(u32, wrapped[12..16], @intCast(payload.len), .little);
+            @memcpy(wrapped[16..][0..out.len], out);
+            @memcpy(wrapped[16 + out.len ..][0..payload.len], payload);
+            alloc.free(out);
+            return wrapped;
+        }
         return out;
     }
     pub fn decode(bytes: []const u8) !Fact {
+        if (bytes.len > 184 and std.mem.eql(u8, bytes[0..8], inline_magic) and inlineBody(bytes) == null) return error.InvalidDocumentFact;
+        if (inlineBody(bytes)) |payload| {
+            const base_len = std.mem.readInt(u32, bytes[8..12], .little);
+            const fact = try Fact.decode(bytes[16..][0..base_len]);
+            if (fact.body.bytes != payload.len + body_header_bytes or !std.mem.eql(u8, &bodyDigest(payload), &fact.body.digest)) return error.InvalidDocumentFact;
+            return fact;
+        }
+
         const legacy_pack = bytes.len == 120;
         if (bytes.len != 80 and bytes.len != 120 and bytes.len != 136 and bytes.len != 144 and bytes.len != 184) return error.InvalidDocumentFact;
         if (bytes[72] > 7 or bytes[73] > 15) return error.InvalidDocumentFact;
@@ -136,7 +161,23 @@ pub const Fact = struct {
     }
 };
 
+/// Returns only a bounded borrowed payload; callers must validate Fact.decode.
+pub fn inlineBody(bytes: []const u8) ?[]const u8 {
+    if (bytes.len <= 184 or !std.mem.eql(u8, bytes[0..8], inline_magic)) return null;
+    const base = std.mem.readInt(u32, bytes[8..12], .little);
+    if (base != 80 and base != 120 and base != 136 and base != 144 and base != 184) return null;
+    const length = std.mem.readInt(u32, bytes[12..16], .little);
+    if (length > max_inline_body_bytes or bytes.len != @max(185, 16 + base + length)) return null;
+    if (!std.mem.allEqual(u8, bytes[16 + base + length ..], 0)) return null;
+    return bytes[16 + base ..][0..length];
+}
+fn indexValue(bytes: []const u8) []const u8 {
+    if (inlineBody(bytes) != null) return bytes[16..][0..std.mem.readInt(u32, bytes[8..12], .little)];
+    return bytes;
+}
+
 pub const Root = struct {
+    inline_records: bool = false,
     domain: [32]u8,
     policy_fingerprint: [32]u8,
     wal_end_lsn: u64 = 0,
@@ -150,13 +191,13 @@ pub const Root = struct {
     counts: [7]u64 = @splat(0),
 
     pub const encoded_bytes = 576;
-    pub const metadata_version = 10;
+    pub const metadata_version = 11;
     pub fn eql(a: Root, b: Root) bool {
         return std.mem.eql(u8, &a.encode(), &b.encode());
     }
     pub fn encode(self: Root) [encoded_bytes]u8 {
         var out = @as([encoded_bytes]u8, @splat(0));
-        @memcpy(out[0..8], "AFDFACTA");
+        @memcpy(out[0..8], if (self.inline_records) "AFDFACTB" else "AFDFACTA");
         @memcpy(out[16..48], &self.domain);
         @memcpy(out[48..80], &self.policy_fingerprint);
         std.mem.writeInt(u64, out[80..88], self.wal_end_lsn, .little);
@@ -176,10 +217,11 @@ pub const Root = struct {
     }
     pub fn decode(bytes: []const u8) !Root {
         const legacy = bytes.len == 512 and (std.mem.eql(u8, bytes[0..8], "AFDFACT3") or std.mem.eql(u8, bytes[0..8], "AFDFACT4"));
-        if (!legacy and (bytes.len != encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7") and !std.mem.eql(u8, bytes[0..8], "AFDFACT8") and !std.mem.eql(u8, bytes[0..8], "AFDFACT9") and !std.mem.eql(u8, bytes[0..8], "AFDFACTA")))) return error.InvalidDocumentFactsRoot;
+        if (!legacy and (bytes.len != encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7") and !std.mem.eql(u8, bytes[0..8], "AFDFACT8") and !std.mem.eql(u8, bytes[0..8], "AFDFACT9") and !std.mem.eql(u8, bytes[0..8], "AFDFACTA") and !std.mem.eql(u8, bytes[0..8], "AFDFACTB")))) return error.InvalidDocumentFactsRoot;
         if (bytes[8] > (if (legacy) @as(u8, 31) else 63) or !std.mem.allEqual(u8, bytes[9..16], 0) or
             !std.mem.allEqual(u8, bytes[if (legacy) @as(usize, 472) else 536..], 0)) return error.InvalidDocumentFactsRoot;
         var root = Root{
+            .inline_records = std.mem.eql(u8, bytes[0..8], "AFDFACTB"),
             .domain = bytes[16..48].*,
             .policy_fingerprint = bytes[48..80].*,
             .wal_end_lsn = std.mem.readInt(u64, bytes[80..88], .little),
@@ -218,6 +260,7 @@ pub fn lookup(alloc: Allocator, store: tree.Store, root: Root, id: []const u8) !
     defer cursor.deinit();
     const record = (try cursor.next()) orelse return null;
     if (!std.mem.eql(u8, record.key, id)) return null;
+    if (!root.inline_records and inlineBody(record.value) != null) return error.InvalidDocumentFact;
     const fact = try Fact.decode(record.value);
     if (fact.last_lsn > root.wal_end_lsn) return error.InvalidDocumentFact;
     return fact;
@@ -364,6 +407,7 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
             };
         }
         if (replacement.value) |fact| {
+            next.inline_records = next.inline_records or fact.inline_payload != null;
             if (fact.last_lsn > next_wal_lsn) return error.DocumentFactsSourceChanged;
             next.document_count = std.math.add(u64, next.document_count, 1) catch return error.InvalidDocumentFactsRoot;
             for (&next.counts, 0..) |*count, i| if (fact.bits() & (@as(u7, 1) << @intCast(i)) != 0) {
@@ -380,7 +424,7 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
         };
         if (prior) |fact| if (replacement.value == null or fact.last_lsn != replacement.value.?.last_lsn)
             try appendPendingChange(alloc, &pending[4], fact.last_lsn, replacement.id, null);
-        if (replacement.value) |fact| try appendPendingChange(alloc, &pending[4], fact.last_lsn, replacement.id, value);
+        if (replacement.value) |fact| try appendPendingChange(alloc, &pending[4], fact.last_lsn, replacement.id, if (value) |bytes| indexValue(bytes) else null);
         // The main change now owns these bytes, including on a later error.
         for (0..4) |i| {
             const items = &pending[i];
@@ -390,7 +434,7 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
             if (was_pending and (!is_pending or prior.?.last_lsn != replacement.value.?.last_lsn))
                 try appendPendingChange(alloc, items, prior.?.last_lsn, replacement.id, null);
             if (is_pending)
-                try appendPendingChange(alloc, items, replacement.value.?.last_lsn, replacement.id, value);
+                try appendPendingChange(alloc, items, replacement.value.?.last_lsn, replacement.id, if (value) |bytes| indexValue(bytes) else null);
         }
     }
     std.mem.sort(tree.Mutation, changes.items, {}, struct {
@@ -695,7 +739,7 @@ pub fn readStoredBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: 
 }
 
 pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef) !Root {
-    if (source.kind != .document_facts or !(((source.metadata_version == 3 or source.metadata_version == 4) and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == 8 or source.metadata_version == 9 or source.metadata_version == Root.metadata_version) and source.byte_len == Root.encoded_bytes)))
+    if (source.kind != .document_facts or !(((source.metadata_version == 3 or source.metadata_version == 4) and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == 8 or source.metadata_version == 9 or (source.metadata_version == 10 or source.metadata_version == Root.metadata_version)) and source.byte_len == Root.encoded_bytes)))
         return error.InvalidDocumentFactsRoot;
     try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
     const scope = (try artifacts.uploadScopeFromArtifactId(source.artifact_id)) orelse return error.InvalidDocumentFactsRoot;
@@ -716,6 +760,7 @@ pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.Art
         8 => "AFDFACT8",
         9 => "AFDFACT9",
         10 => "AFDFACTA",
+        11 => "AFDFACTB",
         else => return error.InvalidDocumentFactsRoot,
     };
     if (!std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidDocumentFactsRoot;
@@ -734,7 +779,7 @@ pub fn publishRoot(alloc: Allocator, pages: *page_store.PageStore, root: Root) !
     const id = try body.identity(root.domain);
     const owned_id = try alloc.dupe(u8, &id);
     errdefer alloc.free(owned_id);
-    return .{ .kind = .document_facts, .artifact_id = owned_id, .checksum = try alloc.dupe(u8, id[7..71]), .byte_len = bytes.len, .metadata_version = Root.metadata_version };
+    return .{ .kind = .document_facts, .artifact_id = owned_id, .checksum = try alloc.dupe(u8, id[7..71]), .byte_len = bytes.len, .metadata_version = if (root.inline_records) Root.metadata_version else 10 };
 }
 
 pub fn retainRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef, retained: *std.StringHashMapUnmanaged(void)) !void {
@@ -1297,4 +1342,31 @@ test "serverless merged facts preserve packed bodies media audit provenance and 
         @memcpy(root[0..8], magic);
         try std.testing.expect(empty.eql(try Root.decode(&root)));
     }
+}
+
+test "serverless document facts inline bodies encode bounded authenticated payloads without returning borrowed decoder memory" {
+    const a = std.testing.allocator;
+    const body = "{\"text\":\"inline\"}";
+    const fact = Fact{ .body = .{ .digest = bodyDigest(body), .attempt = @splat(1), .bytes = body.len + body_header_bytes }, .inline_payload = body, .last_lsn = 1, .last_timestamp_ns = 2 };
+    const bytes = try fact.encodeAlloc(a);
+    defer a.free(bytes);
+    var legacy = fact;
+    legacy.inline_payload = null;
+    @memcpy(legacy.body.digest[0..8], inline_magic);
+    const legacy_bytes = try legacy.encodeAlloc(a);
+    defer a.free(legacy_bytes);
+    try std.testing.expectEqual(legacy.body, (try Fact.decode(legacy_bytes)).body);
+    const decoded = try Fact.decode(bytes);
+    try std.testing.expect(decoded.inline_payload == null);
+    try std.testing.expectEqualStrings(body, inlineBody(bytes).?);
+    try std.testing.expectEqual(fact.body, decoded.body);
+    try std.testing.expectEqualDeep(decoded, try Fact.decode(indexValue(bytes)));
+    bytes[bytes.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidDocumentFact, Fact.decode(bytes));
+    bytes[bytes.len - 1] ^= 1;
+    std.mem.writeInt(u32, bytes[8..12], 81, .little);
+    try std.testing.expectError(error.InvalidDocumentFact, Fact.decode(bytes));
+    var invalid = fact;
+    invalid.inline_payload = &(@as([max_inline_body_bytes + 1]u8, @splat('x')));
+    try std.testing.expectError(error.InvalidDocumentFact, invalid.encodeAlloc(a));
 }

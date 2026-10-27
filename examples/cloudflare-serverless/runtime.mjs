@@ -46,10 +46,20 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     // has its original 30-second deadline and metadata/WAL grace bound. Prepare
     // independent views before scarce WASM admission. Publication leases remain
     // inside admission because their lifetime is only thirty seconds.
-    readAdmission??=await prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground});
-    const execute=host=>run(env,input,signal,collection,host,trace,readAdmission,requestOptions),options={signal,fairKey:env.ANTFLY_INCARNATION,priority:["publish","enrich"].includes(input.op)?"publication":["compact","collect","collect_metadata","reindex"].includes(input.op)?"maintenance":"interactive",onStage:sample=>trace.stage(sample)};
-    const small=pointReadLanes&&env.DIRECT_READS==="true"&&input.op==="lookup"&&!input.cursor&&readAdmission?.view&&JSON.stringify(input).length<=4096;
-    try{return await (small?withPointReadLane(kernel,execute,{...options,onPromote:()=>trace.stage({name:"point_read_capacity_promotion",duration_ms:0})}):kernel.withHost(execute,options));}finally{if(ownedTrace)trace.emit(env.LOG_METRICS==="true");}
+    let pending;
+    const launch=admission=>{
+      if(pending)return pending;
+      const execute=host=>run(env,input,signal,collection,host,trace,admission,requestOptions),options={signal,fairKey:env.ANTFLY_INCARNATION,priority:["publish","enrich"].includes(input.op)?"publication":["compact","collect","collect_metadata","reindex"].includes(input.op)?"maintenance":"interactive",onStage:sample=>trace.stage(sample)};
+      const small=pointReadLanes&&env.DIRECT_READS==="true"&&input.op==="lookup"&&!input.cursor&&admission?.view&&JSON.stringify(input).length<=4096;
+      pending=small?withPointReadLane(kernel,execute,{...options,onPromote:()=>trace.stage({name:"point_read_capacity_promotion",duration_ms:0})}):kernel.withHost(execute,options);
+      pending.catch(()=>{});return pending;
+    };
+    const deferred=[];if(env.FUSED_READS==="true"&&input.op==="lookup")requestOptions={...requestOptions,deferMetrics:emit=>deferred.push(emit)};
+    try{
+      readAdmission??=await prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground,...(env.FUSED_READS==="true"&&input.op==="lookup"?{onPrepared:admission=>launch(admission)}:{})});
+      return await launch(readAdmission);
+    }catch(error){if(pending)await Promise.allSettled([pending]);throw error;}
+    finally{for(const emit of deferred)try{emit();}catch{}if(ownedTrace)trace.emit(env.LOG_METRICS==="true");}
   }
   const role = ["reindex", "publish", "compact", "enrich", "gc_prepare", "gc_trace", "gc_wal"].includes(input.op) ? "maintenance" : "interactive";
   const actorMutation=env.COORDINATOR_BACKEND==="r2"&&input.op==="mutate"&&(env.SPLIT_RUNTIME==="true"||env.COORDINATOR_RPC_FALLBACK!=="true");
@@ -105,6 +115,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       publication_lease:preparedPublication?.lease??null,
       reindex_records: Math.min(64, publicationBudget),
       enrichment_documents: Number(env.ENRICHMENT_DOCUMENTS ?? 1),
+      ...(env.INLINE_POINT_BODIES === "true"?{inline_point_bodies:true}:{}),
       pack_small_bodies: env.COORDINATOR_BACKEND === "r2" && env.PACK_SMALL_BODIES !== "false",
       paged_text: env.PAGED_TEXT === "true" || env.PAGED_PROJECTIONS === "true",
       paged_projections: env.PAGED_PROJECTIONS === "true",
@@ -120,22 +131,36 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
     };
     if(actorMutation){try{return await trace.span("writer_rpc",()=>stub.mutateBatch({...input,...settings,__trace_id:trace.id}));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
-    const result=await lane.request({ ...input, ...settings, bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),
+    const {inline_point_bodies:ignoredInline,compaction_probe_only:ignoredProbe,...nativeInput}=input;
+    const plannedCompact=env.NATIVE_COMPACTION_PLAN==="true"&&env.COORDINATOR_BACKEND==="r2"&&input.op==="compact"&&input.operation_id===undefined&&env.BATCHED_PUBLICATION!=="false";
+    const compactDeadline=Date.now()+30000;let probeOperations=0,probeBytes=0;
+    const executeNative=probe=>lane.request({ ...nativeInput, ...settings,...(plannedCompact?{compaction_probe_only:probe,publication_lease:preparedPublication?.lease??null}:{}), bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,...(plannedCompact?{deadlineMs:compactDeadline,maxOperations:1024-probeOperations,maxTransferBytes:32*1024*1024-probeBytes}:{}),...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),
       onMetrics: metrics => {
         nativeMetrics=metrics;
         emitOperationMetrics=()=>{if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: "antfly.operation", trace_id:trace.id, op: input.op, exact_scan:input.exact_scan===true, role, ...metrics, operation_outcome:operationSucceeded?"ok":"error", operation_elapsed_ms:performance.now()-runtimeStarted, physical,
           ...resources(),cache_retained_bytes: cache.retainedBytes(), wasm_linear_total_bytes: kernel?kernel.memoryBytes(): Object.values(lanes).reduce((sum, instance) => sum + (instance?.memoryBytes() ?? 0), 0)}));};
       } });
+    let result;
+    try{result=await executeNative(plannedCompact);}catch(error){
+      if(!plannedCompact||error?.message!=="CompactionNeedsPublicationLease")throw error;
+      if(!Number.isSafeInteger(nativeMetrics?.operations)||!Number.isSafeInteger(nativeMetrics?.transferred_bytes))throw Error("CompactionPlanAccountingMissing");
+      probeOperations=nativeMetrics.operations;probeBytes=nativeMetrics.transferred_bytes;
+      if(probeOperations>=1024||probeBytes>=32*1024*1024)throw Error("ObjectIoBudgetExceeded");
+      if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.compaction_plan",trace_id:trace.id,operations:probeOperations,transferred_bytes:probeBytes}));
+      publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16));preparedPublication=new PreparedPublication(publicationView);publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
+      transport=withCommitCoordinator(transport,preparedPublication,collection);
+      result=await executeNative(false);
+    }
     if(preparedPublication){const batch=preparedPublication.batch(),head=batch.writes.find(([key])=>key===`antfly/progress/${env.ANTFLY_INCARNATION}/HEAD`),hints=head?readHints?.forHead({op:"put",key:head[0]},head[1].body):undefined;
-      if(input.op==="compact")await rpc("finalizeCompaction",input.operation_id,batch,result,hints);
-      else await rpc("finalizePublication",batch,{records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes},hints);publicationFinalized=true;}
+      if(input.op==="compact"&&input.operation_id!==undefined)await rpc("finalizeCompaction",input.operation_id,batch,result,hints);
+      else await rpc("finalizePublication",batch,input.op==="publish"?{records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes}:undefined,hints);publicationFinalized=true;}
     operationSucceeded=true;return result;
   } catch (error) {
     if (/IntegrityMismatch/.test(String(error))) cache.clear();
     throw preparedPublication?publicationExecutionFailure(error,nativeMetrics):error;
   } finally {
     if(abortPublication&&!publicationFinalized)try{await abortPublication();}catch(error){console.error("Antfly publication lease cleanup deferred",String(error));}
-    try{emitOperationMetrics?.();}catch{}
+    try{if(requestOptions.deferMetrics&&emitOperationMetrics)requestOptions.deferMetrics(emitOperationMetrics);else emitOperationMetrics?.();}catch{}
     // Linear memory cannot shrink. Recycle between requests before allocator
     // size-class churn consumes the cap despite a small live working set.
     // Durable state and the immutable JS cache survive lane replacement.

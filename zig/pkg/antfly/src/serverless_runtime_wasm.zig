@@ -134,6 +134,8 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     const Request = struct {
         op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex, coordinate, publication_acquire, publication_validate, publication_release },
         pack_small_bodies: bool = false,
+        inline_point_bodies: bool = false,
+        compaction_probe_only: bool = false,
         wal_inline_tail: bool = false,
         publication_owner: []const u8 = "",
         publication_lease: ?@import("serverless/hosted_publication.zig").Lease = null,
@@ -203,6 +205,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     var object_artifacts = try @import("serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, host.client(), req.bucket, artifact_prefix);
     var artifacts = object_artifacts.artifactStore();
     artifacts.pack_document_bodies = req.pack_small_bodies;
+    artifacts.inline_point_bodies = req.inline_point_bodies;
     defer artifacts.deinit();
     const manifest_prefix = try std.fmt.allocPrint(a, "{s}/manifests", .{req.prefix});
     defer a.free(manifest_prefix);
@@ -337,6 +340,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             else => return err,
         };
         var compactor = @import("serverless/build/compactor.zig").Compactor.init(a, &artifacts, &manifests, &progress);
+        compactor.probe_only = req.compaction_probe_only;
         compactor.max_documents = req.compaction_max_documents;
         compactor.max_artifact_bytes = req.compaction_max_artifact_bytes;
         var result = try compactor.compactHeadGuardedUntil(req.namespace, if (held) |*lease| lease.guard() else null, if (held) |*lease| lease.cancellation(.{ .io = host_io, .cooperative = cancellation }) else .{ .io = host_io, .cooperative = cancellation });

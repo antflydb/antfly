@@ -53,7 +53,9 @@ pub const InlineReadSet = struct {
         if (self.prefix) |prefix| if (prefix.len == 0 or prefix.len > 1024 or !std.unicode.utf8ValidateSlice(prefix)) return error.InvalidCoordinatorReadSet;
     }
 };
+pub const WalDependency = struct { key: []const u8, value: ?[]const u8 = null };
 pub const WalCommit = struct {
+    dependencies: []const WalDependency = &.{},
     wal_key: []const u8,
     expected_etag: ?[]const u8 = null,
     value: []const u8,
@@ -318,6 +320,19 @@ pub const Context = struct {
                 const phase = (try std.json.parseFromSlice(struct { phase: []const u8 }, m, value, .{ .ignore_unknown_fields = true })).value.phase;
                 if (!std.mem.eql(u8, phase, "active")) return error.CoordinatorMigrationRequired;
             } else if (commit.migration_required) return error.CoordinatorMigrationRequired;
+            if (commit.dependencies.len > 4) return error.InvalidCoordinatorWalCommit;
+            var dependency_bytes: usize = 0;
+            for (commit.dependencies, 0..) |dependency, i| {
+                if (dependency.key.len == 0 or dependency.key.len > 1024 or std.mem.eql(u8, dependency.key, commit.wal_key) or std.mem.eql(u8, dependency.key, commit.publication_key)) return error.InvalidCoordinatorWalCommit;
+                for (commit.dependencies[0..i]) |prior| if (std.mem.eql(u8, prior.key, dependency.key)) return error.InvalidCoordinatorWalCommit;
+                if (dependency.value) |value| {
+                    if (value.len > 8192) return error.InvalidCoordinatorWalCommit;
+                    dependency_bytes += value.len;
+                    if (dependency_bytes > 16384) return error.InvalidCoordinatorWalCommit;
+                }
+                const current = try root.get(m, self.alloc, cache.store(), dependency.key);
+                if ((current == null) != (dependency.value == null) or (current != null and !std.mem.eql(u8, current.?, dependency.value.?))) return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = false, .state = state }, .{});
+            }
             const previous = try root.get(m, self.alloc, cache.store(), commit.wal_key);
             const previous_etag = if (previous) |value| (try std.json.parseFromSlice(struct { etag: []const u8 }, m, value, .{ .ignore_unknown_fields = true })).value.etag else null;
             const matches = if (commit.expected_etag) |expected| (if (previous_etag) |etag| std.mem.eql(u8, expected, etag) else false) else previous_etag == null;

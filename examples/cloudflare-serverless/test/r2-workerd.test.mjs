@@ -30,6 +30,11 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
     export class R2CommitCoordinator extends R2Base {
       commitMutations(inputs,deadline){this.groupSizes??=[];this.groupSizes.push(inputs.length);return super.commitMutations(inputs,deadline);}
       mutationDiagnostics(){return this.groupSizes??[];}
+      openReadView(options){this.views=(this.views??0)+1;return super.openReadView(options);}
+      beginPublication(...args){this.begins=(this.begins??0)+1;return super.beginPublication(...args);}
+      finalizePublication(...args){this.finals=(this.finals??0)+1;return super.finalizePublication(...args);}
+      publicationCall(...args){this.legacyCalls=(this.legacyCalls??0)+1;return super.publicationCall(...args);}
+      latencyDiagnostics(){return{views:this.views??0,begins:this.begins??0,finals:this.finals??0,legacy:this.legacyCalls??0};}
       loseMaintenanceFinish(){this.loseFinish=true;return true;}
       finishMaintenance(kind,ticket){if(this.loseFinish){this.loseFinish=false;throw Error("InjectedMaintenanceFinishLoss");}return super.finishMaintenance(kind,ticket);}
       rootFormat(){return this.store.transaction(tx=>JSON.parse(tx.snapshot().root).format??0);}
@@ -43,6 +48,7 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
     export default {async fetch(request,env,ctx){
       const path=new URL(request.url).pathname,stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION),source=(env.LEGACY_COMMITS??env.COMMITS).getByName(env.ANTFLY_INCARNATION);
       if(path==="/runtime-capabilities"){for(const [binding,op] of [["READERS","mutate"],["BUILDERS","lookup"]]){try{await env[binding].getByName(JSON.stringify(["runtime-v1",env.ANTFLY_INCARNATION,0])).execute({op});return Response.json({rejected:false});}catch(error){if(!String(error).includes("RuntimeCapabilityUnsupported"))throw error;}}return Response.json({rejected:true});}
+      if(path==="/latency-counts")return Response.json(await stub.latencyDiagnostics());
       if(path==="/mutation-groups"){const tenant=request.headers.get("X-Antfly-Tenant"),name=tenant?JSON.parse(env.ANTFLY_TENANTS)[tenant].incarnation:env.ANTFLY_INCARNATION;return Response.json(await env.COMMITS.getByName(name).mutationDiagnostics());}
       if(path==="/wipe-platform"){await stub.erasePlatformStorage();return Response.json({done:true});}
       if(path==="/advance"){await source.advanceMigration();return Response.json({done:true});}
@@ -60,16 +66,16 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
   let mf;
   const reopen=async()=>{if(mf)await mf.dispose();mf=new Miniflare(convertV4MiniflareOptions(options));};
   const call=async(body,path="/api",allowed=200,tenant)=>{
-    for(let attempt=0;attempt<20;attempt++){
+    let lastError;for(let attempt=0;attempt<20;attempt++){
       const response=await mf.dispatchFetch("https://test.invalid"+path,{method:"POST",headers:{Authorization:"Bearer test-r2",...(tenant?{"X-Antfly-Tenant":tenant}:{})},body:JSON.stringify(body)});
-      const result=await response.json();
+      const result=await response.json();lastError=result.error;
       if(response.status===503&&/CoordinatorRecovering|ObjectStoreTransportFailed/.test(result.error)&&allowed===200){continue;}
       assert.equal(response.status,allowed,JSON.stringify(result));return result;
     }
-    throw new Error("recovery did not converge");
+    throw new Error("recovery did not converge: "+lastError);
   };
   await reopen();
-  return {options,reopen,call,close:async()=>{if(mf)await mf.dispose();await rm(persist,{recursive:true,force:true});}};
+  return {options,reopen,call,bucket:()=>mf.getR2Bucket("DATABASE"),close:async()=>{if(mf)await mf.dispose();await rm(persist,{recursive:true,force:true});}};
 }
 test('native read capsules activate after compatible readers and survive erased platform storage',{timeout:120000},async()=>{
  const f=await fixture('capsule-rollout');
@@ -80,6 +86,31 @@ test('native read capsules activate after compatible readers and survive erased 
   f.options.bindings.INLINE_METADATA_ROOTS='true';await f.reopen();
   const after={op:'mutate',operation_id:'after-capsules',mutations:[{kind:'upsert',doc_id:'after',body:'{"text":"after"}'}]},second=await f.call(after);assert.equal(JSON.parse((await f.call({op:'lookup',doc_id:'after',required_visibility:second.visibility})).body).text,'after');while((await f.call({op:'publish'})).has_more){}assert.equal(await f.call({},'/native-root'),3);
   await f.call({},'/wipe-platform');await f.reopen();assert.equal((await f.call({op:'count'})).count,'2');assert.equal((await f.call(before)).visibility,first.visibility);assert.equal((await f.call(after)).visibility,second.visibility);assert.equal(await f.call({},'/native-root'),3);
+ }finally{await f.close();}
+});
+
+test('HTTP callers cannot activate experimental inline formats or compaction probes',{timeout:120000},async()=>{
+ const f=await fixture('internal-latency-settings',false,true);
+ try{f.options.bindings.PAGED_TEXT='false';f.options.bindings.PAGED_PROJECTIONS='false';await f.reopen();await f.call({op:'mutate',operation_id:'seed',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"durable"}'}]});while((await f.call({op:'publish',inline_point_bodies:true})).has_more){}
+  const bucket=await f.bucket();for(const row of(await bucket.list({prefix:'antfly/artifacts/',limit:1000})).objects){const object=await bucket.get(row.key),bytes=new Uint8Array(await object.arrayBuffer());assert.notEqual(new TextDecoder().decode(bytes.subarray(0,8)),'AFDFACTB');}
+  assert.equal((await f.call({op:'compact',compaction_probe_only:true})).published,true);assert.equal((await f.call({op:'lookup',doc_id:'one'})).body,'{"text":"durable"}');
+ }finally{await f.close();}
+});
+
+for(const paged of[false,true])test(`native compaction plan preserves the no-op and stages actual publication (paged=${paged})`,{timeout:120000},async()=>{
+ const f=await fixture('planned-compact-'+paged,false,true);
+ try{f.options.bindings.PAGED_TEXT=String(paged);f.options.bindings.PAGED_PROJECTIONS=String(paged);f.options.bindings.NATIVE_COMPACTION_PLAN='true';await f.reopen();
+  await f.call({op:'mutate',operation_id:'seed',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"durable"}'}]});while((await f.call({op:'publish'})).has_more){}
+  const before=await f.call({},'/latency-counts'),result=await f.call({op:'compact'}),after=await f.call({},'/latency-counts');assert.equal(result.published,!paged);assert.equal(after.begins-before.begins,paged?0:1);assert.equal(after.finals-before.finals,paged?0:1);assert.equal(after.legacy-before.legacy,0);
+  await f.call({op:'publish'});await f.call({},'/wipe-platform');await f.reopen();assert.equal((await f.call({op:'lookup',doc_id:'one'})).body,'{"text":"durable"}');
+ }finally{await f.close();}
+});
+
+test('optimistic mutation preparation skips a second snapshot while final native commit fences source changes',{timeout:120000},async()=>{
+ const f=await fixture('optimistic-wal',false,true);
+ try{f.options.bindings.OPTIMISTIC_WAL='true';await f.reopen();await f.call({op:'mutate',operation_id:'seed',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"first"}'}]});while((await f.call({op:'publish'})).has_more){}
+  const before=await f.call({},'/latency-counts');const mutation={op:'mutate',operation_id:'second',mutations:[{kind:'upsert',doc_id:'two',body:'{"text":"second"}'}]},receipt=await f.call(mutation),after=await f.call({},'/latency-counts');assert.equal(after.views,before.views,'retained committed capsule is only a preparation hint');
+  assert.equal((await f.call(mutation)).visibility,receipt.visibility);while((await f.call({op:'publish'})).has_more){}await f.call({},'/wipe-platform');await f.reopen();assert.equal((await f.call({op:'count'})).count,'2');assert.equal((await f.call(mutation)).visibility,receipt.visibility);
  }finally{await f.close();}
 });
 
@@ -119,6 +150,7 @@ test('compaction queue redelivery recovers its completed receipt after ticket co
 test("R2-native coordination survives eviction, both collectors, reindex and erased platform storage",{timeout:240000},async()=>{
   const f=await fixture("r2-native-fixture",false,true);
   try {
+    f.options.bindings.INLINE_POINT_BODIES="true";await f.reopen();
     const mutation={op:"mutate",operation_id:"native-source",mutations:Array.from({length:40},(_,i)=>({kind:"upsert",doc_id:`doc/${i}`,body:JSON.stringify({text:"durable native",embedding:[1,i/40],sparse_embedding:{durable:1}})}))};
     const receipt=await f.call(mutation);
     while((await f.call({op:"publish"})).has_more){}

@@ -79,8 +79,7 @@ pub const Session = struct {
             session: *Session,
             pub fn lookupAlloc(base: @This(), _: A, key: []const u8) !?[]u8 {
                 const reader = base.session.reader orelse return null;
-                const fact = (try reader.lookup(key)) orelse return null;
-                return try reader.readBodyAlloc(fact);
+                return try reader.lookupBodyAlloc(key);
             }
         };
         return self.view.lookupAlloc(id, Base{ .session = self });

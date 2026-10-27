@@ -30,8 +30,9 @@ export function validatePutBatch(request, bodyLength) {
 
 // Join every started upload before returning an error. Partially successful
 // immutable uploads are orphans; callers never publish a partial batch.
-export async function executePutBatch(transport, request, body, check = () => {}) {
+export async function executePutBatch(transport, request, body, check = () => {}, concurrency = 4) {
   validatePutBatch(request, body.byteLength);
+  if(!Number.isInteger(concurrency)||concurrency<1||concurrency>4)throw new ObjectStoreError(3,"invalid upload concurrency");
   const results = Array(request.items.length);
   let next = 0, failure;
   async function upload() {
@@ -44,7 +45,7 @@ export async function executePutBatch(transport, request, body, check = () => {}
       } catch (error) { failure ??= error instanceof Error ? error : new Error(String(error)); }
     }
   }
-  await Promise.all(Array.from({length: Math.min(4, request.items.length)}, upload));
+  await Promise.all(Array.from({length: Math.min(concurrency, request.items.length)}, upload));
   if (failure) throw failure;
   check();
   return {json: {results}};
