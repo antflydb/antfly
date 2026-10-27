@@ -1161,6 +1161,16 @@ class RuntimeCacheTest(unittest.TestCase):
         )
         failure = self.build("cache-finetune-registry", succeeds=False)
         self.assertIn("received undeclared import undeclared-test-import", failure)
+        document_import = '            module.addImport("antfly_document_runs", ctx.document_runs_mod);'
+        self.assertIn(document_import, contents)
+        for replacement in (
+            "",
+            document_import.replace("ctx.document_runs_mod", "ctx.jinja_mod"),
+        ):
+            with self.subTest(document_run_import=replacement):
+                common.write_text(contents.replace(document_import, replacement, 1))
+                failure = self.build("cache-finetune-registry", succeeds=False)
+                self.assertIn("command lost its shared document-run identity", failure)
         common.write_text(
             contents.replace(
                 '            module.addImport("antfly_runtime_abi", ctx.runtime_abi_mod);',
