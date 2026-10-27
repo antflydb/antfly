@@ -729,3 +729,27 @@ The audit-tool and partition-tool Python checks also passed (eight tests).
 profiles, the shutdown-wakeable durable-job reaper, three additional trace-free
 fixtures, and rebalancing of the existing DB-core execution lanes. Original
 fixture sizes and scale exclusions are preserved.
+
+## October 26: dictionary sort and unit watchdog follow-up
+
+Main run `40426718976` reached the 5,402-second overall unit watchdog while
+compilation remained active. The captured compiler had run for 2:34 and used
+about 5 GiB RSS; this evidence does not identify a hung individual test.
+The same run exposed incomplete durable-job snapshot registration, missing
+checkpoint test discovery, and outdated index-sort assertions, fixed separately.
+
+A three-second sample of the unchanged 180 KiB schema-projection/spill fixture
+found substantial CPU in the stable block sort used to order dictionary keys.
+Both dictionary encoders now use in-place PDQ sorting: keys come from a hash
+map and are unique, so equal-key stability cannot affect serialized order.
+A regression checks canonical bytes under reversed insertion order for both
+encoders, ordered iteration, and exact lookups, including prefix and binary keys.
+The full reader suite passed 493 tests (2 skips); introducer passed 49 (1 skip).
+
+Two alternating-order local Debug trials, with the same fixtures and limits,
+measured the three large postings fixtures at 31.41/31.38 seconds before and
+30.22/30.66 seconds after, about 3% less combined runtime. This is a modest
+CPU improvement, not a solution to the whole unit job's duration. An earlier
+experiment disabling stack capture on fixture allocations showed little benefit
+and was reverted. The corpus sizes, spill assertions, memory budgets, allocator
+diagnostics, and job timeout are retained. Other builds were running on the host.
