@@ -1,0 +1,64 @@
+{
+  "name": "@antfly/langchain",
+  "version": "0.1.0",
+  "description": "Antfly vector storage, embeddings, hybrid retrieval and reranking for LangChain.js",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "VALIDATION.md",
+    "validation"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --maxWorkers=2",
+    "test:live": "ANTFLY_LIVE=1 vitest run test/live.test.ts --maxWorkers=1",
+    "lint": "biome check .",
+    "prepublishOnly": "pnpm typecheck && pnpm lint && pnpm build && pnpm test",
+    "test:package": "node scripts/verify-package.mjs"
+  },
+  "dependencies": {
+    "@antfly/sdk": "workspace:^"
+  },
+  "peerDependencies": {
+    "@langchain/core": ">=1.3.0 <2"
+  },
+  "devDependencies": {
+    "@langchain/core": "1.3.0",
+    "@langchain/classic": "1.0.56",
+    "@types/node": "^25.9.3",
+    "tsup": "^8.5.1",
+    "tsx": "^4.22.4",
+    "vitest": "^4.1.9",
+    "@langchain/openai": "1.7.1"
+  },
+  "engines": {
+    "node": ">=24.0"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/langchain"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

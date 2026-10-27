@@ -11,6 +11,10 @@ allowBuilds:
   msw: true
   sharp: true
 
+minimumReleaseAgeExclude:
+  - '@langchain/classic@1.0.56'
+  - '@langchain/openai@1.7.1'
+
 onlyBuiltDependencies:
   - "@tailwindcss/oxide"
   - canvas

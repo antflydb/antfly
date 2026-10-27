@@ -1,0 +1,1 @@
+Verified persisted documents and retrieval without re-ingestion.

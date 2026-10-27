@@ -1,0 +1,41 @@
+packages/cli-linux-arm64                 | [WARN] Unsupported platform: wanted: {"cpu":["arm64"],"os":["linux"],"libc":["glibc"]} (current: {"os":"darwin","cpu":"arm64","libc":"unknown"})
+packages/cli-linux-x64                   | [WARN] Unsupported platform: wanted: {"cpu":["x64"],"os":["linux"],"libc":["glibc"]} (current: {"os":"darwin","cpu":"arm64","libc":"unknown"})
+packages/embedded-linux-arm64            | [WARN] Unsupported platform: wanted: {"cpu":["arm64"],"os":["linux"],"libc":["glibc"]} (current: {"os":"darwin","cpu":"arm64","libc":"unknown"})
+packages/embedded-linux-x64              | [WARN] Unsupported platform: wanted: {"cpu":["x64"],"os":["linux"],"libc":["glibc"]} (current: {"os":"darwin","cpu":"arm64","libc":"unknown"})
+Scope: 2 of 18 workspace projects
+packages/sdk build$ tsup
+packages/sdk build: CLI Building entry: src/index.ts
+packages/sdk build: CLI Using tsconfig: tsconfig.json
+packages/sdk build: CLI tsup v8.5.1
+packages/sdk build: CLI Using tsup config: /Users/drewlanenga/Code/github.com/antflydb/antfly/.worktrees/feat-langchain-js/ts/packages/sdk/tsup.config.ts
+packages/sdk build: CLI Target: es2020
+packages/sdk build: CLI Cleaning output folder
+packages/sdk build: CJS Build start
+packages/sdk build: ESM Build start
+packages/sdk build: CJS dist/index.cjs 266.91 KB
+packages/sdk build: CJS ⚡️ Build success in 30ms
+packages/sdk build: ESM dist/index.js 261.15 KB
+packages/sdk build: ESM ⚡️ Build success in 32ms
+packages/sdk build: DTS Build start
+packages/sdk build: DTS ⚡️ Build success in 2991ms
+packages/sdk build: DTS dist/index.d.cts 2.40 MB
+packages/sdk build: DTS dist/index.d.ts  2.40 MB
+packages/sdk build: Done
+packages/langchain build$ tsup
+packages/langchain build: CLI Building entry: src/index.ts
+packages/langchain build: CLI Using tsconfig: tsconfig.json
+packages/langchain build: CLI tsup v8.5.1
+packages/langchain build: CLI Using tsup config: /Users/drewlanenga/Code/github.com/antflydb/antfly/.worktrees/feat-langchain-js/ts/packages/langchain/tsup.config.ts
+packages/langchain build: CLI Target: es2022
+packages/langchain build: CLI Cleaning output folder
+packages/langchain build: ESM Build start
+packages/langchain build: CJS Build start
+packages/langchain build: CJS dist/index.cjs 26.28 KB
+packages/langchain build: CJS ⚡️ Build success in 13ms
+packages/langchain build: ESM dist/index.js 24.88 KB
+packages/langchain build: ESM ⚡️ Build success in 13ms
+packages/langchain build: DTS Build start
+packages/langchain build: DTS ⚡️ Build success in 3247ms
+packages/langchain build: DTS dist/index.d.ts  6.65 KB
+packages/langchain build: DTS dist/index.d.cts 6.65 KB
+packages/langchain build: Done
