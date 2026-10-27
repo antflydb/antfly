@@ -19,7 +19,9 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 83;
+// Version 84 adds durable job-state, scheduling and owner-quota projections.
+// Older owners must reject their operation identifiers before dispatch.
+pub const abi_version: u32 = 84;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

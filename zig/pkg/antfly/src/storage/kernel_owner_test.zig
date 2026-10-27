@@ -4470,6 +4470,11 @@ test "opaque metadata durable job state reads preserve group cursor and ownershi
     defer store.deinit();
     const key = "documents/compiled-job-state";
     const value = "{\"owner\":\"compiled\",\"state\":\"queued\"}";
+    var previous: abi.MetadataProjectionRequest = .{ .kind = .job_state };
+    previous.version = abi.abi_version - 1;
+    var rejected: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_projection(null, &previous, &rejected));
+    try std.testing.expectEqual(@as(u64, 0), rejected.len);
     try std.testing.expect((try store.getJobState(a, 41, key)) == null);
     try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 41, "compiled"));
     try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = "", .value = value } });
