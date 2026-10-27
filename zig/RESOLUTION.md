@@ -2693,3 +2693,10 @@ full-profile loads or compiled-graph leases. Each two-key query visits at most
 two rows and retains less than 128 KiB of arena capacity. Native head changes
 invalidate an already prepared query, and missing readiness still exercises a
 single exact legacy load before returning to the indexed path.
+
+The document-inference integration preserves main's published job-state wire
+command (tag 79); resolver namespace advancement uses tag 80, gated by topology
+version 59. The shared snapshot registry retains document job bodies, owner quota
+counts and due-order scheduling entries together. A replay/snapshot-install test
+checks that a queued job remains discoverable and counts against its owner after
+restoration, without leaking into another metadata group.

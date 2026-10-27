@@ -16,16 +16,23 @@
 //! Versioned, immutable decision specifications stored by asset enrichment.
 const std = @import("std");
 const d = @import("decisions.zig");
+const embeddings = @import("antfly_embeddings");
+const providers = @import("../common/provider_registry.zig");
 pub const Specification = struct {
     version: []const u8,
     decider: d.DeciderConfig,
     questions: d.Json,
+    /// Frozen provider dependencies travel with the durable specification.
+    /// Names resolve here, never against mutable process configuration.
+    embedders: d.Json = .null,
 };
 pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Specification) {
     var parsed = try std.json.parseFromSlice(Specification, a, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     _ = try d.text(.{ .string = parsed.value.version });
     try parsed.value.decider.validate();
+    var dependencies = try registry(a, parsed.value);
+    defer dependencies.deinit();
     parsed.value.questions = if (parsed.value.decider.decision_method == .generated) try d.generatedQuestions(parsed.arena.allocator(), parsed.value.questions, parsed.value.decider.instructions) else try d.publicQuestions(parsed.arena.allocator(), parsed.value.questions);
     try d.validateQuestions(parsed.value.questions, parsed.value.decider.resolvedCapabilities());
     if (parsed.value.decider.generator) |generator| if (generator.provider != .antfly) {
@@ -34,6 +41,23 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Specifica
     };
     return parsed;
 }
+pub fn registry(a: std.mem.Allocator, spec: Specification) !providers.Registry {
+    var root = d.jsonObject();
+    defer root.object.deinit(a);
+    if (spec.embedders != .null) {
+        if (spec.decider.embedder == null or spec.embedders != .object or spec.embedders.object.count() != 1) return error.InvalidDecisionSpecification;
+        try d.put(a, &root, "embedders", spec.embedders);
+    }
+    var result = try providers.Registry.parseFromValue(a, root);
+    errdefer result.deinit();
+    try result.registerDeciderConfig("materialized", spec.decider);
+    if (spec.decider.embedder) |name| {
+        const cfg = try result.getEmbedderConfig(name);
+        if ((cfg.sparse orelse false) or (cfg.dimensions orelse cfg.dimension orelse return error.InvalidDeciderConfig) != (spec.decider.embedding_options orelse d.EmbeddingOptions{}).dimensions) return error.InvalidDeciderConfig;
+    }
+    return result;
+}
+
 pub fn provenance(a: std.mem.Allocator, spec: Specification, source_fingerprint: ?[]const u8) !d.Json {
     return provenanceWithRevision(a, spec, source_fingerprint, null);
 }
@@ -43,7 +67,22 @@ pub fn provenanceWithRevision(a: std.mem.Allocator, spec: Specification, source_
     const bytes = try std.json.Stringify.valueAlloc(a, .{ .model_revision = revision, .generator = generator, .instructions = spec.decider.instructions, .output = spec.decider.output, .probabilities = spec.decider.probabilities, .batch = spec.decider.batch, .version = spec.version, .provider = spec.decider.provider, .decision_method = spec.decider.decision_method, .model = spec.decider.modelName(), .model_identity = spec.decider.model_identity, .embedding_options = spec.decider.embedding_options, .url = spec.decider.baseUrl(), .questions = spec.questions }, .{});
     defer a.free(bytes);
     var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+    if (spec.decider.embedder) |name| {
+        var dependencies = try registry(a, spec);
+        defer dependencies.deinit();
+        var config = try dependencies.getEmbedderConfig(name);
+        config.api_key = null;
+        config.gateway_id = null;
+        config.rate_limit = null;
+        config.credentials_path = "";
+        const dependency = try embeddings.stringifyAlloc(a, config);
+        defer a.free(dependency);
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update(bytes);
+        digest.update("antfly-frozen-embedder-v1");
+        digest.update(dependency);
+        digest.final(&hash);
+    } else std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
     var value = d.jsonObject();
     if (revision) |actual| try d.put(a, &value, "model_revision", actual);
     try d.put(a, &value, "version", .{ .string = spec.version });

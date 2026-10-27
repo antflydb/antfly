@@ -6021,6 +6021,7 @@ pub const TransitionCommand = union(enum) {
     remove_shuffle_join_lease: struct {
         job_id: u64,
     },
+    compare_and_set_job_state: struct { key: []const u8, expected_hash: []const u8, value: []const u8 },
     upsert_restore_job: RestoreJobWrite,
     create_restore_job: RestoreJobWrite,
     create_restore_job_with_staging: RestoreJobWithStaging,
@@ -6159,6 +6160,11 @@ pub const TransitionCommand = union(enum) {
                 alloc.free(record.extension_name);
                 alloc.free(record.required_extension_name);
                 alloc.free(record.package_name);
+            },
+            .compare_and_set_job_state => |record| {
+                alloc.free(record.key);
+                alloc.free(record.expected_hash);
+                alloc.free(record.value);
             },
             .upsert_restore_job, .create_restore_job => |record| {
                 alloc.free(record.key);
@@ -6400,6 +6406,10 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             try group_ids.requireDataGroupId(record.receiver_group_id);
         },
         .upsert_shuffle_join_lease => |record| try group_ids.requireDataGroupId(record.owner_group_id),
+        .compare_and_set_job_state => |record| {
+            try @import("../job_state.zig").validateKey(record.key);
+            if ((record.expected_hash.len != 0 and record.expected_hash.len != 32) or record.value.len == 0 or record.value.len > 512 * 1024) return error.InvalidDocumentCheckpoint;
+        },
         .upsert_restore_job, .create_restore_job => |record| {
             try validateRestoreJobLogicalKey(record.key);
             if (record.value.len == 0 or record.value.len > max_restore_job_value_bytes) return error.InvalidRestoreJobRecord;
@@ -17511,6 +17521,56 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    pub fn getJobOwnerCount(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, owner: []const u8) !u64 {
+        var buf: [256]u8 = undefined;
+        const value = self.store.get(a, try jobOwnerKeyForGroup(&buf, group, owner)) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        defer a.free(value);
+        if (value.len != 8) return error.InvalidDocumentCheckpoint;
+        return std.mem.readInt(u64, value[0..8], .big);
+    }
+    pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
+        var buf: [256]u8 = undefined;
+        return self.store.get(alloc, try jobStateKeyForGroup(&buf, group_id, logical_key)) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+    pub fn scanJobState(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, after: ?[]const u8) ![]u8 {
+        const contract = @import("../job_state.zig");
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const work = scratch.allocator();
+        var base_buf: [128]u8 = undefined;
+        const base = try jobSchedulePrefixForGroup(&base_buf, group);
+        if (after) |cursor| if (cursor.len < 19 or cursor.len > 160 or (cursor[0] != '0' and cursor[0] != '1') or cursor[1] != ':') return error.InvalidDocumentCheckpoint;
+        var rows: std.ArrayList(contract.Row) = .empty;
+        var next: ?[]const u8 = null;
+        const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+        const first_phase: u8 = if (after) |cursor| cursor[0] - '0' else 0;
+        for (first_phase..2) |phase| {
+            const prefix = try std.fmt.allocPrint(work, "{s}{d}:", .{ base, phase });
+            const cursor = if (after) |value| if (value[0] - '0' == phase) try std.mem.concat(work, u8, &.{ base, value }) else null else null;
+            const page = try self.store.scanPrefixPage(work, prefix, cursor, contract.max_page_rows - rows.items.len);
+            for (page) |entry| {
+                const suffix = entry.key[base.len..];
+                if (suffix.len < 19 or suffix[18] != ':') return error.InvalidDocumentCheckpoint;
+                const due = std.fmt.parseInt(u64, suffix[2..18], 16) catch return error.InvalidDocumentCheckpoint;
+                if (due > now_ms) break;
+                const value = (try self.getJobState(work, group, entry.value)) orelse return error.InvalidDocumentCheckpoint;
+                try rows.append(work, .{ .key = entry.value, .value = value });
+                if (rows.items.len == contract.max_page_rows) {
+                    next = suffix;
+                    break;
+                }
+            }
+            if (next != null) break;
+        }
+        return std.json.Stringify.valueAlloc(a, contract.Page{ .rows = rows.items, .next = next }, .{});
+    }
+
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
         var key_buf: [256]u8 = undefined;
         const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
@@ -17724,6 +17784,9 @@ pub const RaftApplyStore = struct {
 
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
     const MetadataSnapshotProjection = enum {
+        job_state,
+        job_owner,
+        job_schedule,
         secret_collection,
         system_catalog,
         relation_writer,
@@ -17791,6 +17854,9 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .job_state, .key = .{ .prefix = jobStatePrefixForGroup } },
+        .{ .projection = .job_owner, .key = .{ .prefix = jobOwnerPrefixForGroup } },
+        .{ .projection = .job_schedule, .key = .{ .prefix = jobSchedulePrefixForGroup } },
         .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
@@ -17861,6 +17927,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         const mask = switch (tag) {
+            .compare_and_set_job_state => metadataSnapshotProjectionBit(.job_state) | metadataSnapshotProjectionBit(.job_owner) | metadataSnapshotProjectionBit(.job_schedule),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) |
                 metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.topology_activation) | metadataSnapshotProjectionBit(.metadata_incarnation),
@@ -20816,6 +20883,63 @@ pub const RaftApplyStore = struct {
             },
             .compare_and_set_backup_cohort => |record| {
                 try self.applyBackupCohortTxn(txn, group_id, record);
+            },
+            .compare_and_set_job_state => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try jobStateKeyForGroup(&key_buf, group_id, record.key);
+                const current = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (current) |bytes| {
+                    if (record.expected_hash.len != 32) return;
+                    const hash = @import("../job_state.zig").digest(bytes);
+                    if (!std.mem.eql(u8, &hash, record.expected_hash)) return;
+                } else if (record.expected_hash.len != 0) return;
+                if (std.mem.startsWith(u8, record.key, "documents/")) {
+                    const contract = @import("../job_state.zig");
+                    var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                    defer scratch.deinit();
+                    const next = try contract.ownerState(scratch.allocator(), record.value);
+                    const old = if (current) |bytes| try contract.ownerState(scratch.allocator(), bytes) else null;
+                    if (old) |previous| if (!std.mem.eql(u8, previous.owner, next.owner)) return;
+                    var quota_buf: [256]u8 = undefined;
+                    const quota_key = try jobOwnerKeyForGroup(&quota_buf, group_id, next.owner);
+                    const count_bytes = txn.get(quota_key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    var count: u64 = if (count_bytes) |bytes| if (bytes.len == 8) std.mem.readInt(u64, bytes[0..8], .big) else return error.InvalidDocumentCheckpoint else 0;
+                    const was_active = if (old) |previous| contract.active(previous) else false;
+                    if (contract.active(next) and !was_active) {
+                        if (count >= contract.max_active_per_owner) return;
+                        count += 1;
+                    }
+                    if (!contract.active(next) and was_active) {
+                        if (count == 0) return error.InvalidDocumentCheckpoint;
+                        count -= 1;
+                    }
+                    var old_schedule_buf: [320]u8 = undefined;
+                    if (old) |previous| if (try jobScheduleKeyForGroup(&old_schedule_buf, group_id, record.key, previous)) |old_key| {
+                        txn.delete(old_key) catch |err| switch (err) {
+                            error.NotFound => {},
+                            else => return err,
+                        };
+                        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = old_key });
+                    };
+                    var schedule_buf: [320]u8 = undefined;
+                    if (try jobScheduleKeyForGroup(&schedule_buf, group_id, record.key, next)) |schedule_key| {
+                        try txn.put(schedule_key, record.key);
+                        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = schedule_key });
+                    }
+                    var encoded_count: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &encoded_count, count, .big);
+                    try txn.put(quota_key, &encoded_count);
+                    self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = quota_key });
+                }
+                try txn.put(key, record.value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
             },
             .upsert_restore_job, .create_restore_job => |record| {
                 var key_buf: [256]u8 = undefined;
@@ -27115,7 +27239,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
-    advance_resolver_namespace = 79,
+    advance_resolver_namespace = 80,
     apply_resolver_authority = 78,
     apply_relation_reconciliation = 76,
     mutate_lake_index_lifecycle = 75,
@@ -27194,6 +27318,7 @@ const TransitionTag = enum(u8) {
     compare_and_set_online_merge = 62,
     admit_online_merge = 63,
     create_restore_job_with_staging = 64,
+    compare_and_set_job_state = 79,
 };
 
 fn appendInitialPlacementProof(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), proof: fk_generation_publication.InitialPlacementProof) !void {
@@ -27622,6 +27747,18 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try appendRequiredString(alloc, &out, record.value);
             try out.append(alloc, if (record.seal != null) 1 else 0);
             if (record.seal) |seal| try appendJsonRecord(alloc, &out, seal);
+        },
+        .compare_and_set_job_state => |record| {
+            try validateTransitionCommandDataGroupIds(command);
+            if (std.mem.startsWith(u8, record.key, "documents/")) {
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                _ = try @import("../job_state.zig").ownerState(scratch.allocator(), record.value);
+            }
+            try out.append(alloc, @backingInt(TransitionTag.compare_and_set_job_state));
+            try appendRequiredString(alloc, &out, record.key);
+            try appendRequiredString(alloc, &out, record.expected_hash);
+            try appendRequiredString(alloc, &out, record.value);
         },
         .upsert_restore_job, .create_restore_job => |record| {
             try out.append(alloc, @backingInt(if (command == .create_restore_job) TransitionTag.create_restore_job else TransitionTag.upsert_restore_job));
@@ -28159,6 +28296,22 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             if (pos != encoded.len or value.len == 0 or value.len > max_restore_job_value_bytes or plan.len == 0 or plan.len > restore_staging.max_encoded_bytes) return error.InvalidMetadataTransitionEncoding;
             try validateRestoreJobLogicalKey(key);
             break :blk .{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan } };
+        },
+        .compare_and_set_job_state => blk: {
+            const key = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(key);
+            const expected = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(expected);
+            const value = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(value);
+            const command: TransitionCommand = .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected, .value = value } };
+            try validateTransitionCommandDataGroupIds(command);
+            if (std.mem.startsWith(u8, key, "documents/")) {
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                _ = try @import("../job_state.zig").ownerState(scratch.allocator(), value);
+            }
+            break :blk command;
         },
         .upsert_restore_job => .{
             .upsert_restore_job = .{
@@ -42818,4 +42971,181 @@ test "resolver curation namespace propagation render fences one destination whil
     try store.applyStandaloneCommand(group, .{ .upsert_table = source });
     try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, render_verify));
     std.debug.print("RENDER EXECUTION siblings=1000 admission_destination_reads=1 verification_destination_reads=1 resolve_destinations=1000 unused_head_and_schema=independent selected_head_and_labels=fenced\n", .{});
+}
+
+fn jobStatePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:job_state:{d}:", .{group_id});
+}
+fn jobStateKeyForGroup(buf: []u8, group_id: u64, key: []const u8) ![]const u8 {
+    try @import("../job_state.zig").validateKey(key);
+    const prefix = try jobStatePrefixForGroup(buf, group_id);
+    if (prefix.len + key.len > buf.len) return error.NoSpaceLeft;
+    @memcpy(buf[prefix.len..][0..key.len], key);
+    return buf[0 .. prefix.len + key.len];
+}
+
+test "metadata durable job state CAS rejects stale owners across replay and reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/durable-job-state", .{tmp.sub_path});
+    defer a.free(root);
+    const key = "documents/test-run";
+    const contract = @import("../job_state.zig");
+    const first = contract.digest("{\"owner\":\"alice\",\"state\":\"running\",\"value\":\"attempt-1\"}");
+    const second = contract.digest("{\"owner\":\"alice\",\"state\":\"running\",\"value\":\"attempt-2\"}");
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        const cases = [_]struct { expected: []const u8, value: []const u8, want: []const u8 }{
+            .{ .expected = "", .value = "{\"owner\":\"alice\",\"state\":\"running\",\"value\":\"attempt-1\"}", .want = "{\"owner\":\"alice\",\"state\":\"running\",\"value\":\"attempt-1\"}" },
+            .{ .expected = "", .value = "{\"owner\":\"alice\",\"state\":\"running\",\"value\":\"duplicate-create\"}", .want = "{\"owner\":\"alice\",\"state\":\"running\",\"value\":\"attempt-1\"}" },
+            .{ .expected = &first, .value = "{\"owner\":\"alice\",\"state\":\"running\",\"value\":\"attempt-2\"}", .want = "{\"owner\":\"alice\",\"state\":\"running\",\"value\":\"attempt-2\"}" },
+            .{ .expected = &first, .value = "{\"owner\":\"alice\",\"state\":\"running\",\"value\":\"stale-result\"}", .want = "{\"owner\":\"alice\",\"state\":\"running\",\"value\":\"attempt-2\"}" },
+            .{ .expected = &second, .value = "{\"owner\":\"alice\",\"state\":\"cancelled\",\"value\":\"cancelled-tombstone\"}", .want = "{\"owner\":\"alice\",\"state\":\"cancelled\",\"value\":\"cancelled-tombstone\"}" },
+        };
+        for (cases, 1..) |case, index| {
+            const wire = try encodeTransitionCommand(a, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = case.expected, .value = case.value } });
+            defer a.free(wire);
+            var command = (try decodeTransitionCommand(a, wire)).?;
+            defer command.deinit(a);
+            try std.testing.expect(command == .compare_and_set_job_state);
+            var applied = try MetadataReplayTest.apply(&store, 41, &.{.{ .term = if (index < 3) 1 else 2, .index = index, .data = wire }});
+            defer applied.deinit();
+            const current = (try store.getJobState(a, 41, key)).?;
+            defer a.free(current);
+            try std.testing.expectEqualStrings(case.want, current);
+        }
+    }
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        const current = (try store.getJobState(a, 41, key)).?;
+        defer a.free(current);
+        try std.testing.expectEqualStrings("{\"owner\":\"alice\",\"state\":\"cancelled\",\"value\":\"cancelled-tombstone\"}", current);
+        const bytes = try store.scanJobState(a, 41, null);
+        defer a.free(bytes);
+        const page = try std.json.parseFromSlice(contract.Page, a, bytes, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 0), page.value.rows.len);
+    }
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, encodeTransitionCommand(a, .{ .compare_and_set_job_state = .{ .key = "../escape", .expected_hash = "", .value = "x" } }));
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, encodeTransitionCommand(a, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = "short", .value = "x" } }));
+}
+
+fn jobOwnerPrefixForGroup(buf: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:job_owner:{d}:", .{group});
+}
+fn jobOwnerKeyForGroup(buf: []u8, group: u64, owner: []const u8) ![]const u8 {
+    const hash = @import("../job_state.zig").digest(owner);
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:job_owner:{d}:{s}", .{ group, std.fmt.bytesToHex(&hash, .lower) });
+}
+
+fn jobSchedulePrefixForGroup(buf: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:job_schedule:{d}:", .{group});
+}
+fn jobScheduleKeyForGroup(buf: []u8, group: u64, key: []const u8, state: @import("../job_state.zig").OwnerState) !?[]const u8 {
+    const active = @import("../job_state.zig").active(state);
+    if (!active and state.expires_at_ms == 0) return null;
+    const execution_due = @max(state.created_at_ms, @max(state.not_before_ms, state.lease_until_ms));
+    const due = if (active) @min(execution_due, if (state.expires_at_ms == 0) std.math.maxInt(u64) else state.expires_at_ms) else @max(state.expires_at_ms, state.maintenance_not_before_ms);
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = try jobSchedulePrefixForGroup(&prefix_buf, group);
+    return try std.fmt.bufPrint(buf, "{s}{d}:{x:0>16}:{s}", .{ prefix, @as(u8, if (active) 0 else 1), due, key });
+}
+
+test "metadata durable job state keeps quotas and due indexes atomic and paged" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/job-schedule", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const Fixture = struct {
+        fn apply(s: *RaftApplyStore, index: u64, key: []const u8, expected: []const u8, value: []const u8) !void {
+            const wire = try encodeTransitionCommand(std.testing.allocator, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected, .value = value } });
+            defer std.testing.allocator.free(wire);
+            var result = try MetadataReplayTest.apply(s, 41, &.{.{ .term = 1, .index = index, .data = wire }});
+            defer result.deinit();
+        }
+    };
+    for (0..40) |index| {
+        const key = try std.fmt.allocPrint(a, "documents/owner-{d}", .{index});
+        defer a.free(key);
+        const value = try std.fmt.allocPrint(a, "{{\"owner\":\"owner-{d}\",\"state\":\"queued\"}}", .{index});
+        defer a.free(value);
+        try Fixture.apply(&store, index + 1, key, "", value);
+    }
+    const queued = "{\"owner\":\"bounded\",\"state\":\"queued\"}";
+    for (0..17) |index| {
+        const key = try std.fmt.allocPrint(a, "documents/bounded-{d}", .{index});
+        defer a.free(key);
+        try Fixture.apply(&store, index + 41, key, "", queued);
+    }
+    try std.testing.expectEqual(@as(u64, 16), try store.getJobOwnerCount(a, 41, "bounded"));
+    try std.testing.expect((try store.getJobState(a, 41, "documents/bounded-16")) == null);
+    const contract = @import("../job_state.zig");
+    const first_bytes = try store.scanJobState(a, 41, null);
+    defer a.free(first_bytes);
+    const first = try std.json.parseFromSlice(contract.Page, a, first_bytes, .{});
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 32), first.value.rows.len);
+    const rest_bytes = try store.scanJobState(a, 41, first.value.next);
+    defer a.free(rest_bytes);
+    const rest = try std.json.parseFromSlice(contract.Page, a, rest_bytes, .{});
+    defer rest.deinit();
+    try std.testing.expectEqual(@as(usize, 24), rest.value.rows.len);
+    const future = try std.fmt.allocPrint(a, "{{\"owner\":\"bounded\",\"state\":\"cancelled\",\"expires_at_ms\":1,\"maintenance_not_before_ms\":{d}}}", .{@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000});
+    defer a.free(future);
+    const hash = contract.digest(queued);
+    try Fixture.apply(&store, 58, "documents/bounded-0", &hash, future);
+    try std.testing.expectEqual(@as(u64, 15), try store.getJobOwnerCount(a, 41, "bounded"));
+    // A queued successor uses the released quota in the same authoritative store.
+    try Fixture.apply(&store, 59, "documents/bounded-16", "", queued);
+    try std.testing.expectEqual(@as(u64, 16), try store.getJobOwnerCount(a, 41, "bounded"));
+    // The old queued index was removed; future retention work is not runnable.
+    const after_bytes = try store.scanJobState(a, 41, null);
+    defer a.free(after_bytes);
+    const after = try std.json.parseFromSlice(contract.Page, a, after_bytes, .{});
+    defer after.deinit();
+    for (after.value.rows) |row| try std.testing.expect(!std.mem.eql(u8, row.key, "documents/bounded-0"));
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, "../bad-cursor"));
+}
+
+test "resolver curation namespace propagation snapshot registry retains document jobs and scheduling" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const source_root = try std.fmt.allocPrint(a, "{s}/source", .{root});
+    defer a.free(source_root);
+    const target_root = try std.fmt.allocPrint(a, "{s}/target", .{root});
+    defer a.free(target_root);
+    var source = try RaftApplyStore.init(a, .{ .root_dir = source_root });
+    defer source.deinit();
+    const value = "{\"owner\":\"alice\",\"state\":\"queued\"}";
+    const wire = try encodeTransitionCommand(a, .{ .compare_and_set_job_state = .{ .key = "documents/snapshot", .expected_hash = "", .value = value } });
+    defer a.free(wire);
+    var applied = try MetadataReplayTest.apply(&source, 41, &.{.{ .term = 1, .index = 1, .data = wire }});
+    defer applied.deinit();
+    var read = try source.store.beginReadTxn();
+    const snapshot = try source.buildMetadataSnapshotTxn(a, &read, 41, null);
+    read.abort();
+    defer a.free(snapshot);
+    var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+    defer target.deinit();
+    try RaftApplyStore.installSnapshotFromRaft(&target, a, 41, 1, snapshot);
+    const restored = (try target.getJobState(a, 41, "documents/snapshot")).?;
+    defer a.free(restored);
+    try std.testing.expectEqualStrings(value, restored);
+    try std.testing.expectEqual(@as(u64, 1), try target.getJobOwnerCount(a, 41, "alice"));
+    const scheduled = try target.scanJobState(a, 41, null);
+    defer a.free(scheduled);
+    const page = try std.json.parseFromSlice(@import("../job_state.zig").Page, a, scheduled, .{});
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
+    try std.testing.expectEqualStrings("documents/snapshot", page.value.rows[0].key);
+    try std.testing.expect((try target.getJobState(a, 42, "documents/snapshot")) == null);
 }

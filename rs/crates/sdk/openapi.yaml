@@ -13158,6 +13158,108 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /ai/v1/read/execute:
+    post:
+      operationId: executeReadDocumentRemote
+      summary: Execute a durable document task over a duplex persistence channel
+      description: Internal versioned peer protocol. The caller retains storage and lease authority. This
+        single-use exchange must never be buffered, replayed, retried or redirected by intermediaries.
+        X-Antfly-Document-Model selects the routing model and must match the initial request frame.
+      parameters:
+        - name: X-Antfly-Document-Model
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 2048
+        - name: X-Antfly-Document-Token-Budget
+          in: header
+          required: true
+          description: Remaining physical model token ceiling for this attempt, independently enforced
+            and measured by the executor.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Duplex framed checkpoint RPC and one terminal task response
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/extract/execute:
+    post:
+      operationId: executeExtractDocumentRemote
+      summary: Execute a durable document task over a duplex persistence channel
+      description: Internal versioned peer protocol. The caller retains storage and lease authority. This
+        single-use exchange must never be buffered, replayed, retried or redirected by intermediaries.
+        X-Antfly-Document-Model selects the routing model and must match the initial request frame.
+      parameters:
+        - name: X-Antfly-Document-Model
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 2048
+        - name: X-Antfly-Document-Token-Budget
+          in: header
+          required: true
+          description: Remaining physical model token ceiling for this attempt, independently enforced
+            and measured by the executor.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Duplex framed checkpoint RPC and one terminal task response
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/generate/context/checkpoint:
     post:
       summary: Prepare a portable native KV checkpoint
@@ -15464,6 +15566,412 @@ paths:
           description: Invalid or unsupported synthesis options
         '502':
           description: Upstream synthesis failure
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/read/jobs:
+    post:
+      operationId: createReadDocumentJob
+      summary: Submit a durable read job
+      description: Unified Antfly API only. Persists the request before returning. Jobs continue after
+        the submitting client disconnects. Sources and accepted stages are immutable snapshots; ambiguous
+        calls remain charged on retry. Retention is absolute and is not extended by polling or resuming.
+      tags:
+        - Documents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceDocumentJobRequest'
+      responses:
+        '202':
+          description: Durable job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceDocumentJob'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/read/jobs/{job_id}:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getReadDocumentJob
+      summary: Get principal-scoped document job status
+      tags:
+        - Documents
+      responses:
+        '200':
+          description: Job status without source bytes or internal artifact references
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceDocumentJob'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/read/jobs/{job_id}/result:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: resultReadDocumentJob
+      summary: Atomic final response
+      description: Atomic final response; unavailable until the whole job succeeds
+      tags:
+        - Documents
+      responses:
+        '200':
+          description: Atomic final response; unavailable until the whole job succeeds
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/read/jobs/{job_id}/events:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: eventsReadDocumentJob
+      summary: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after
+        that sequence. Disconnecting only detaches the subscriber.
+      description: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after
+        that sequence. Disconnecting only detaches the subscriber.
+      tags:
+        - Documents
+      responses:
+        '200':
+          description: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes
+            after that sequence. Disconnecting only detaches the subscriber.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/read/jobs/{job_id}/resume:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: resumeReadDocumentJob
+      summary: Requeue an interrupted job without resetting its budget or retention
+      description: Requeue an interrupted job without resetting its budget or retention
+      tags:
+        - Documents
+      responses:
+        '200':
+          description: Requeue an interrupted job without resetting its budget or retention
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceDocumentJob'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/read/jobs/{job_id}/cancel:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: cancelReadDocumentJob
+      summary: Fence the current attempt and cancel the job
+      description: Fence the current attempt and cancel the job
+      tags:
+        - Documents
+      responses:
+        '200':
+          description: Fence the current attempt and cancel the job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceDocumentJob'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/extract/jobs:
+    post:
+      operationId: createExtractDocumentJob
+      summary: Submit a durable extract job
+      description: Unified Antfly API only. Persists the request before returning. Jobs continue after
+        the submitting client disconnects. Sources and accepted stages are immutable snapshots; ambiguous
+        calls remain charged on retry. Retention is absolute and is not extended by polling or resuming.
+      tags:
+        - Documents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceDocumentJobRequest'
+      responses:
+        '202':
+          description: Durable job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceDocumentJob'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/extract/jobs/{job_id}:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getExtractDocumentJob
+      summary: Get principal-scoped document job status
+      tags:
+        - Documents
+      responses:
+        '200':
+          description: Job status without source bytes or internal artifact references
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceDocumentJob'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/extract/jobs/{job_id}/result:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: resultExtractDocumentJob
+      summary: Atomic final response
+      description: Atomic final response; unavailable until the whole job succeeds
+      tags:
+        - Documents
+      responses:
+        '200':
+          description: Atomic final response; unavailable until the whole job succeeds
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/extract/jobs/{job_id}/events:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: eventsExtractDocumentJob
+      summary: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after
+        that sequence. Disconnecting only detaches the subscriber.
+      description: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after
+        that sequence. Disconnecting only detaches the subscriber.
+      tags:
+        - Documents
+      responses:
+        '200':
+          description: Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes
+            after that sequence. Disconnecting only detaches the subscriber.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/extract/jobs/{job_id}/resume:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: resumeExtractDocumentJob
+      summary: Requeue an interrupted job without resetting its budget or retention
+      description: Requeue an interrupted job without resetting its budget or retention
+      tags:
+        - Documents
+      responses:
+        '200':
+          description: Requeue an interrupted job without resetting its budget or retention
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceDocumentJob'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/extract/jobs/{job_id}/cancel:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: cancelExtractDocumentJob
+      summary: Fence the current attempt and cancel the job
+      description: Fence the current attempt and cancel the job
+      tags:
+        - Documents
+      responses:
+        '200':
+          description: Fence the current attempt and cancel the job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceDocumentJob'
         '401':
           description: Authentication is enabled and valid credentials were not supplied
           content:
@@ -23384,6 +23892,7 @@ components:
     EmbedderProvider:
       type: string
       enum:
+        - cloudflare
         - gemini
         - vertex
         - ollama
@@ -23590,6 +24099,7 @@ components:
         - Batch processing embeddings offline before ingestion
       allOf:
         - oneOf:
+            - $ref: '#/components/schemas/CloudflareEmbedderConfig'
             - $ref: '#/components/schemas/GoogleEmbedderConfig'
             - $ref: '#/components/schemas/VertexEmbedderConfig'
             - $ref: '#/components/schemas/OllamaEmbedderConfig'
@@ -23691,6 +24201,7 @@ components:
 
         namespace.
       oneOf:
+        - $ref: '#/components/schemas/CloudflareEmbedderConfig'
         - $ref: '#/components/schemas/OllamaEmbedderConfig'
         - $ref: '#/components/schemas/OpenAIEmbedderConfig'
         - $ref: '#/components/schemas/OpenRouterEmbedderConfig'
@@ -23702,6 +24213,7 @@ components:
       discriminator:
         propertyName: provider
         mapping:
+          cloudflare: '#/components/schemas/CloudflareEmbedderConfig'
           ollama: '#/components/schemas/OllamaEmbedderConfig'
           openai: '#/components/schemas/OpenAIEmbedderConfig'
           openrouter: '#/components/schemas/OpenRouterEmbedderConfig'
@@ -35013,6 +35525,7 @@ components:
     RerankerProvider:
       type: string
       enum:
+        - cloudflare
         - antfly
         - cohere
         - vertex
@@ -35032,6 +35545,43 @@ components:
 
         - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to
         be in [0,1].
+    CloudflareEmbedderConfig:
+      type: object
+      description: Cloudflare Workers AI embedding. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum:
+            - cloudflare
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: '@cf/baai/bge-base-en-v1.5'
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+        dimensions:
+          type: integer
+          minimum: 1
+          description: Expected fixed model output dimension; the adapter validates returned vectors and
+            never requests unsupported resizing.
+        dimension:
+          type: integer
+          minimum: 1
+          description: Alias of dimensions.
+      required:
+        - provider
+        - account_id
+        - model
     EmbeddingRetrievalConfig:
       type: object
       additionalProperties: false
@@ -36066,6 +36616,57 @@ components:
         text:
           target_tokens: 500
           overlap_tokens: 50
+    CloudflareGeneratorConfig:
+      type: object
+      description: Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum:
+            - cloudflare
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+        max_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        frequency_penalty:
+          type: number
+          format: float
+          minimum: -2
+          maximum: 2
+        presence_penalty:
+          type: number
+          format: float
+          minimum: -2
+          maximum: 2
+      required:
+        - provider
+        - account_id
+        - model
     GoogleGeneratorConfig:
       type: object
       description: >
@@ -36504,6 +37105,7 @@ components:
     GeneratorProvider:
       type: string
       enum:
+        - cloudflare
         - gemini
         - vertex
         - bedrock
@@ -36520,6 +37122,7 @@ components:
         A unified configuration for a generative AI provider.
       allOf:
         - oneOf:
+            - $ref: '#/components/schemas/CloudflareGeneratorConfig'
             - $ref: '#/components/schemas/GoogleGeneratorConfig'
             - $ref: '#/components/schemas/VertexGeneratorConfig'
             - $ref: '#/components/schemas/BedrockGeneratorConfig'
@@ -36806,6 +37409,26 @@ components:
                 - string
                 - list
                 - array
+                - text
+                - number
+                - date
+                - estimate
+            decimals:
+              type: integer
+              minimum: 0
+              maximum: 15
+              description: Decimal precision for compatible hosted number fields.
+            unit:
+              type: string
+            min:
+              type: number
+              description: Minimum of a hosted estimate distribution.
+            max:
+              type: number
+            step:
+              type: number
+              minimum: 0
+              exclusiveMinimum: true
             enum:
               type: array
               minItems: 2
@@ -37997,6 +38620,7 @@ components:
     STTProvider:
       type: string
       enum:
+        - cloudflare
         - openai
         - vertex
         - antfly
@@ -38179,11 +38803,13 @@ components:
           allOf:
             - $ref: '#/components/schemas/EnrichmentProducerConfig'
           writeOnly: true
-          description: Write-only producer configuration. Cannot be combined with producer_json or transcriber.
-            Decision producers use type=decision and config={version, decider, questions}, where decider
-            is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification
-            hash, version, and source fingerprint. Change version or specification to rebuild through
-            the enrichment lifecycle.
+          description: 'Write-only producer configuration. Cannot be combined with producer_json or transcriber.
+            Decision producers use type=decision and config={version, decider, questions}. A named-embedder
+            similarity decider also requires embedders={name: frozen EmbedderConfig}; the dependency travels
+            with the specification for deterministic replay instead of resolving mutable node configuration.
+            Credentials use secret references or environment defaults. Outputs include answers, usage,
+            resolved model, specification hash, version, and source fingerprint. Change version or specification
+            to rebuild through the enrichment lifecycle.'
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -38893,6 +39519,7 @@ components:
             - antfly
             - jev
             - openai
+            - cloudflare
         decision_method:
           type: string
           enum:
@@ -38918,17 +39545,31 @@ components:
           $ref: '#/components/schemas/ConstrainedGenerationBatch'
         model:
           type: string
-          description: Required for Antfly and OpenAI; Jev defaults to jev-latest.
+          description: Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare
+            uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
+        account_id:
+          type: string
+          description: Required with the cloudflare provider; Workers AI account identifier.
+        gateway_id:
+          type: string
+          description: Optional Cloudflare AI Gateway identifier.
         model_identity:
           type: string
           pattern: ^[0-9a-f]{64}$
           description: Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
+        embedder:
+          type: string
+          minLength: 1
+          description: Named dense embedder for provider-neutral embedding_similarity routing. Specify
+            matching embedding_options.dimensions. Native fitted calibrations require the original Antfly
+            model path; hosted routes use explicit thresholds and estimated token admission.
         embedding_options:
           type: object
           additionalProperties: false
-          description: EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto
-            each question and can be overridden per question. Other models reject these options. Raw cosine
-            similarities never represent probabilities.
+          description: Geometry and acceptance defaults for embedding_similarity decisions. Named embedders
+            require dimensions matching their configured dense output. Direct Antfly model routes support
+            EmbeddingGemma 2 dimensions and fitted calibrations. Acceptance is serialized onto each question
+            and can be overridden per question. Raw cosine similarities never represent probabilities.
           properties:
             calibration_id:
               type: string
@@ -38944,12 +39585,11 @@ components:
               default: CLUSTERING
             dimensions:
               type: integer
-              enum:
-                - 768
-                - 512
-                - 256
-                - 128
+              minimum: 1
+              maximum: 65535
               default: 768
+              description: Must match the named embedder's configured dimensions. Without embedder, the
+                direct EmbeddingGemma 2 route accepts only 768, 512, 256 or 128.
             min_similarity:
               type: number
               minimum: -1
@@ -45601,6 +46241,34 @@ components:
           type: number
           format: double
           description: RRF k constant (1/(k+rank)). Defaults to 60.0.
+    CloudflareRerankerConfig:
+      type: object
+      description: Cloudflare Workers AI reranking. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum:
+            - cloudflare
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: '@cf/baai/bge-reranker-base'
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+      required:
+        - provider
+        - account_id
+        - model
     AntflyRerankerConfig:
       type: object
       description: Configuration for the Antfly inference reranking provider.
@@ -45715,12 +46383,17 @@ components:
       discriminator:
         propertyName: provider
         mapping:
+          cloudflare: '#/components/schemas/CloudflareRerankerConfig'
           antfly: '#/components/schemas/AntflyRerankerConfig'
           cohere: '#/components/schemas/CohereRerankerConfig'
           vertex: '#/components/schemas/VertexRerankerConfig'
       allOf:
         - type: object
           properties:
+            account_id:
+              type: string
+            gateway_id:
+              type: string
             rate_limit:
               x-go-type-skip-optional-pointer: false
               $ref: '#/components/schemas/RateLimitConfig'
@@ -45766,6 +46439,7 @@ components:
           required:
             - provider
         - oneOf:
+            - $ref: '#/components/schemas/CloudflareRerankerConfig'
             - $ref: '#/components/schemas/AntflyRerankerConfig'
             - $ref: '#/components/schemas/CohereRerankerConfig'
             - $ref: '#/components/schemas/VertexRerankerConfig'
@@ -50072,12 +50746,29 @@ components:
       type: object
       required:
         - model
+      description: Read exactly one of images or documents. The server rejects absent or simultaneous
+        input forms before inference.
+      x-antfly-exactly-one-of:
         - images
+        - documents
       properties:
         model:
           type: string
           description: Name of reader model from models_dir/readers/
           example: microsoft/trocr-base-printed
+        retain_artifact:
+          type: boolean
+          default: false
+          description: Request an opaque, process-local reading handle for extraction reuse. Retention
+            is best effort; inspect document.artifact_id and artifact_ttl_ms.
+        documents:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Complete documents, mutually exclusive with images. Each source is independent;
+            selected pages are read in original source order.
+          items:
+            $ref: '#/components/schemas/DocumentSource'
         images:
           type: array
           minItems: 1
@@ -50122,16 +50813,61 @@ components:
         - text
         - bbox
       properties:
+        id:
+          type: integer
+          minimum: 0
+          description: Region identity within its parent; nested regions use qualified paths.
+        origin:
+          type: string
+          enum:
+            - native
+            - transcription
+            - interpretation
+            - derived
+            - estimated
+          description: Default provenance of this region; nested region origins override it.
+        text_start:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Start UTF-8 byte offset in the containing page text; null when unmapped.
+        text_end:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Exclusive end UTF-8 byte offset in the containing page text.
+        children:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Accepted subregions in the same source coordinate space and page text offsets.
+        tables:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Tables owned by this region, including cells and provenance.
+        fields:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Structured output owned by this region.
         text:
           type: string
           description: Recognized text within the region
         bbox:
           type: array
+          nullable: true
           items:
             type: number
           minItems: 4
           maxItems: 4
-          description: Bounding box [x1, y1, x2, y2] in pixel coordinates
+          description: Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels
+            for ordinary image requests. Null when source geometry cannot be established, including unsupported
+            vertical PDF writing.
         confidence:
           type: number
           description: Recognition confidence score (0-1)
@@ -50143,12 +50879,76 @@ components:
       required:
         - text
       properties:
+        source_id:
+          type: string
+          description: Original document source ID.
+        number:
+          type: integer
+          minimum: 1
+          description: One-based original page or slide number.
+        kind:
+          type: string
+          enum:
+            - page
+            - slide
+            - image
+        inherited_parts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Native layout/master content, source part identity, and visibility/coverage metadata;
+            unsupported composition remains unresolved.
+        native_text:
+          type: string
+        notes:
+          type: string
+          description: Speaker notes, separate from slide text.
+        status:
+          type: string
+          enum:
+            - complete
+            - unresolved
+            - truncated
+        origin:
+          type: string
+          enum:
+            - native
+            - transcription
+            - interpretation
+            - derived
+            - estimated
+          description: Default provenance for page text; mapped region origins override it.
+        coordinate_space:
+          type: string
+          description: Coordinate space of regions; PDF points, slide EMUs or image pixels.
+        transform:
+          type: object
+          additionalProperties: true
+          description: Projective source transform.
+        raster_to_source:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Mapping from rendered pixels to original source coordinates, including page rotation
+            and actual render DPI.
+        tables:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Tables and cells in source coordinates with provenance.
+        findings:
+          type: array
+          items:
+            type: string
         text:
           type: string
           description: Extracted text from the image
           example: 'Invoice Total: $123.45'
         fields:
           type: object
+          nullable: true
           additionalProperties:
             type: string
           description: >
@@ -50186,6 +50986,18 @@ components:
           items:
             $ref: '#/components/schemas/InferenceReadObject'
           description: Read result objects, one per input image.
+        document:
+          type: object
+          additionalProperties: true
+          description: Versioned reading metadata containing status, source fingerprints, definition fingerprint,
+            pinned model identities, adapter version and optional artifact retention handle.
+        events:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Bounded progress and audit events. These contain model names and source IDs, never
+            credentials.
         model:
           type: string
           description: Name of model used for reading
@@ -52046,6 +52858,30 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        model_calls:
+          type: integer
+          minimum: 0
+          description: Cumulative logical child invocations for a document run.
+        physical_model_calls:
+          type: integer
+          minimum: 0
+          description: Physical child operation invocations, separate from logical composite calls.
+        rendered_pixels:
+          type: integer
+          minimum: 0
+          description: Cumulative rendered or decoded pixels charged by document work.
+        output_bytes:
+          type: integer
+          minimum: 0
+          description: Cumulative document text bytes charged before envelope serialization.
+        completed_pages:
+          type: integer
+          minimum: 0
+          description: Selected pages completed successfully.
+        visited_pages:
+          type: integer
+          minimum: 0
+          description: Selected pages visited, including unresolved work.
         cached_prompt_tokens:
           type: integer
           description: Prompt tokens served from inference-native prefix KV cache
@@ -52846,6 +53682,63 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used
+    InferenceDocumentJobRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - request
+      description: Durable document execution on the unified Antfly API. Requires configured durable job
+        storage and local inference orchestration. The request uses the ordinary read or extract schema.
+        Credentials must use server connections, environment variables, or secret references.
+      properties:
+        request:
+          type: object
+          additionalProperties: true
+        retention_seconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          default: 86400
+    InferenceDocumentJob:
+      type: object
+      required:
+        - id
+        - operation
+        - state
+        - attempt
+        - sequence
+        - expires_at_ms
+        - usage
+      properties:
+        id:
+          type: string
+        operation:
+          type: string
+          enum:
+            - read
+            - extract
+        state:
+          type: string
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+            - cancelled
+        attempt:
+          type: integer
+          format: int64
+        sequence:
+          type: integer
+          format: int64
+        expires_at_ms:
+          type: integer
+          format: int64
+        usage:
+          type: object
+          additionalProperties: true
+        error:
+          type: string
     InferenceSynthesisRequest:
       type: object
       required:
@@ -64441,6 +65334,64 @@ components:
       description: Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task
         schemas, per-input replacements and explicit offsets; the selected model/runtime must support
         every requested feature.
+    DocumentSource:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - url
+        - media_type
+      properties:
+        quadrilateral:
+          type: array
+          minItems: 4
+          maxItems: 4
+          description: Image-only perspective correction. Four clockwise corners in original image-edge
+            pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original
+            source coordinates.
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items:
+              type: number
+              format: double
+        id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Unique source identity within the request. Separate sources are never implicitly
+            merged.
+        url:
+          type: string
+          description: Inline data URI or location allowed by the deployment content security policy.
+        media_type:
+          type: string
+          enum:
+            - application/pdf
+            - application/vnd.openxmlformats-officedocument.presentationml.presentation
+            - image/png
+            - image/jpeg
+            - image/webp
+        pages:
+          type: array
+          minItems: 1
+          maxItems: 1024
+          uniqueItems: true
+          description: Optional one-based page/slide selection, returned in original source order. Omission
+            selects every visible page/slide.
+          items:
+            type: integer
+            minimum: 1
+        include_notes:
+          type: boolean
+          default: false
+          description: Include slide speaker notes as separate evidence, never silently as visible slide
+            text.
+        include_hidden:
+          type: boolean
+          default: false
+          description: Include hidden slides.
     ExtractionToken:
       type: object
       required:
@@ -64483,12 +65434,15 @@ components:
           x-go-type-skip-optional-pointer: false
     ExtractionRequest:
       type: object
-      description: Atomic extraction request. Every input is validated before inference; failures return
-        no partial data.
+      description: Atomic extraction request. Supply exactly one of inputs, documents or read_artifact.
+        Every input is validated before inference; failures return no partial data.
       required:
         - model
-        - inputs
         - schema
+      x-antfly-exactly-one-of:
+        - inputs
+        - documents
+        - read_artifact
       properties:
         model:
           type: string
@@ -64497,6 +65451,20 @@ components:
           allOf:
             - $ref: '#/components/schemas/ExtractionSchemaVersion'
           x-go-type-skip-optional-pointer: false
+        read_artifact:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs
+            and documents. Reuses the immutable complete reading without downloading or running OCR again.
+            Handles expire and are local to the serving process.
+        documents:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction
+            share document adapters and preserve independent source grouping.
+          items:
+            $ref: '#/components/schemas/DocumentSource'
         inputs:
           type: array
           minItems: 1

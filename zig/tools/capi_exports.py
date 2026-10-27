@@ -145,8 +145,6 @@ def link_macho(args: argparse.Namespace) -> None:
         command.extend(["-map", str(args.map)])
     for name in args.exports.read_text().splitlines():
         command.extend(["-u", name])
-    if link_map := getattr(args, "map", None):
-        command.extend(["-map", str(link_map)])
     subprocess.run(command, check=True)
 
 

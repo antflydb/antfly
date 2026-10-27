@@ -31,6 +31,7 @@ pub const InvocationContext = struct {
     deadline_ns: ?u64 = null,
     cancellation: CancellationToken = .none,
     max_response_bytes: ?usize = null,
+    document_checkpoints: ?@import("antfly_readers").document_rpc.Factory = null,
     progress: ?request_context.ProgressSink = null,
 
     pub fn check(self: InvocationContext) !void {

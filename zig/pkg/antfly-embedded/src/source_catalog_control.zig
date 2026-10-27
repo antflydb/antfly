@@ -360,6 +360,7 @@ pub const storage_db_enrichment_asset_producer = @import("storage/db/enrichment/
 pub const storage_db_enrichment_chunker = @import("storage/db/enrichment/chunker.zig");
 pub const storage_db_enrichment_chunker_stub = @import("storage/db/enrichment/chunker_stub.zig");
 pub const storage_db_enrichment_config_validation = @import("storage/db/enrichment/config_validation.zig");
+pub const storage_db_enrichment_document_checkpoints = @import("storage/db/enrichment/document_checkpoints.zig");
 pub const storage_db_enrichment_document_extraction = @import("storage/db/enrichment/document_extraction.zig");
 pub const storage_db_enrichment_document_extraction_client = @import("storage/db/enrichment/document_extraction_client.zig");
 pub const storage_db_enrichment_document_unit_fingerprint = @import("storage/db/enrichment/document_unit_fingerprint.zig");
