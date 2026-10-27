@@ -143,7 +143,7 @@ fn appendStoredValue(a: A, id: []const u8, data: []const u8, expected_key: []con
     }
 }
 
-test "external lake sidecar coverage keeps unrelated source fields on Parquet" {
+test "external lake bounded window profiles sidecar coverage keeps unrelated source fields on Parquet" {
     const a = std.testing.allocator;
     const projection = try plan(a, &.{ "label", "body", "nested.text", "nested", "counter" }, &.{ "body", "nested.text" });
     defer a.free(projection.parquet);
@@ -152,7 +152,7 @@ test "external lake sidecar coverage keeps unrelated source fields on Parquet" {
     try std.testing.expectEqualSlices([]const u8, &.{ "body", "nested.text" }, projection.sidecar);
 }
 
-test "external lake sidecar hydration binds identities and preserves typed fields under allocation faults" {
+test "external lake bounded window profiles sidecar hydration binds identities and preserves typed fields under allocation faults" {
     const a = std.testing.allocator;
     const encoded = (try local.storage_db_document_mapper.buildTextSegmentFromDocuments(a, &.{.{ .key = "row", .value = "{\"body\":\"a needle\",\"nested\":{\"text\":\"detail\"},\"counter\":9007199254740993}" }}, .{}, null)).?;
     defer a.free(encoded);
@@ -182,7 +182,7 @@ test "external lake sidecar hydration binds identities and preserves typed field
     try std.testing.expectError(error.InvalidNativeLakeTextCorpus, appendStored(a, writer.snapshot(), 0, "row", &.{"missing"}, &row));
 }
 
-test "external lake ranked sidecar hydration reuses bounded decoded blocks across segments" {
+test "external lake bounded window profiles ranked sidecar hydration reuses bounded decoded blocks across segments" {
     const a = std.testing.allocator;
     const first = (try local.storage_db_document_mapper.buildTextSegmentFromDocuments(a, &.{
         .{ .key = "one", .value = "{\"body\":\"first needle\"}" },
