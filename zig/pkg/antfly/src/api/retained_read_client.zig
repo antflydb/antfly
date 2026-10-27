@@ -94,13 +94,17 @@ pub const Client = struct {
     }
 
     fn call(self: *Client, request: rpc.Request) !http.HttpResponse {
+        return self.callAlloc(self.alloc, request);
+    }
+
+    fn callAlloc(self: *Client, a: std.mem.Allocator, request: rpc.Request) !http.HttpResponse {
         const cleanup = request.operation == .close or request.operation == .cancel;
         if (self.poisoned and !cleanup) return error.RetainedReadRestartRequired;
         const now = time.monotonicNs();
         if (now >= self.deadline_ns and !cleanup) return error.DeadlineExceeded;
         const timeout: u32 = if (cleanup) 100 else @intCast(@max(1, @min(5000, (self.deadline_ns -| now) / std.time.ns_per_ms)));
-        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
-        defer self.alloc.free(body);
+        const body = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(body);
         if (body.len > rpc.max_request_bytes) return error.InvalidRetainedReadQuery;
         var timeout_buffer: [16]u8 = undefined;
         const headers = [_]http.RequestHeader{
@@ -110,11 +114,11 @@ pub const Client = struct {
         };
         // NEVER retry: capture/open may have allocated a capability; next may
         // already have advanced. Unknown handles are bounded by owner expiry.
-        var response = self.executor.execute(self.alloc, .{ .method = .POST, .uri = self.uri, .headers = &headers, .content_type = "application/json", .body = body, .timeout_ms = timeout, .max_response_bytes = rpc.max_response_bytes }) catch |err| {
+        var response = self.executor.execute(a, .{ .method = .POST, .uri = self.uri, .headers = &headers, .content_type = "application/json", .body = body, .timeout_ms = timeout, .max_response_bytes = rpc.max_response_bytes }) catch |err| {
             self.poisoned = true;
             return err;
         };
-        errdefer response.deinit(self.alloc);
+        errdefer response.deinit(a);
         // This negative capability response is safe to classify without a
         // success acknowledgement. It authorizes no cursor/page reuse: the
         // caller must release captures and explicitly activate via Raft.
@@ -192,8 +196,14 @@ pub const Client = struct {
     }
     fn invokeGraph(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8) ![]u8 {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        var response = try self.call(.{ .operation = .graph_invoke, .schema_version = self.schema_version, .token = self.token, .graph_body = body });
-        defer response.deinit(self.alloc);
+        var response = try self.callAlloc(alloc, .{ .operation = .graph_invoke, .schema_version = self.schema_version, .token = self.token, .graph_body = body });
+        defer response.deinit(alloc);
+        const owner = response.owner_allocator orelse alloc;
+        if (owner.ptr == alloc.ptr and owner.vtable == alloc.vtable) {
+            const bytes = response.body;
+            response.body = &.{};
+            return bytes;
+        }
         return alloc.dupe(u8, response.body);
     }
 
@@ -357,6 +367,44 @@ fn consumerTests() type {
             }
             try std.testing.expectEqual(@as(u16, 400), rpc.errorStatus(error.CypherTypeMismatch));
             try std.testing.expectEqual(@as(u16, 503), rpc.errorStatus(error.EnrichmentRetryInProgress));
+        }
+
+        test "retained read client scopes graph RPC allocations to the worker" {
+            const Fixture = struct {
+                expected: std.mem.Allocator,
+                independent: bool = false,
+                fail: bool = false,
+                body_address: usize = 0,
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(a.ptr == self.expected.ptr and a.vtable == self.expected.vtable);
+                    if (self.fail) return error.ConnectionResetByPeer;
+                    const owner = if (self.independent) std.testing.allocator else a;
+                    const headers = try owner.alloc(http.Header, 1);
+                    headers[0] = .{ .name = try owner.dupe(u8, metadata.catalog_route_fence_ack_header), .value = try owner.dupe(u8, metadata.catalog_route_fence_ack_value) };
+                    const body = try owner.dupe(u8, "graph-response");
+                    self.body_address = @intFromPtr(body.ptr);
+                    return .{ .status = 200, .owner_allocator = owner, .headers = headers, .body = body };
+                }
+            };
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var fixture: Fixture = .{ .expected = a };
+            const client = try Client.create(std.testing.allocator, .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "rows", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+            defer client.destroy();
+            client.token = .{ .incarnation = 1, .sequence = 1, .slot = 0 };
+            for ([_]bool{ false, true }) |independent| {
+                fixture.independent = independent;
+                const bytes = try Client.invokeGraph(client, a, "{}");
+                try std.testing.expectEqualStrings("graph-response", bytes);
+                try std.testing.expectEqual(!independent, @intFromPtr(bytes.ptr) == fixture.body_address);
+                try std.testing.expect(client.alloc.ptr == std.testing.allocator.ptr);
+            }
+            fixture.fail = true;
+            try std.testing.expectError(error.ConnectionResetByPeer, Client.invokeGraph(client, a, "{}"));
+            try std.testing.expect(client.alloc.ptr == std.testing.allocator.ptr);
+            try std.testing.expect(client.poisoned);
         }
 
         test "retained read client round trips owned snapshots and exact typed pages" {

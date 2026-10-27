@@ -14137,6 +14137,9 @@ const Engine = struct {
     }
     const AdjacencyCache = struct {
         const Page = backend_mod.Page(*const v.Relationship);
+        // Adjacency needs payload and continuation only; ordered-scan metadata
+        // must not inflate every cached sparse graph page.
+        const StoredPage = struct { items: []const *const v.Relationship, next: ?[]const u8 };
         const Key = struct { mapping: usize, node: v.Identity, direction: ast.Direction, cursor: ?[]const u8 };
         const Context = struct {
             pub fn hash(_: @This(), key: Key) u64 {
@@ -14154,7 +14157,7 @@ const Engine = struct {
         };
         budget: Budget,
         arena: ?std.heap.ArenaAllocator = null,
-        pages: std.HashMapUnmanaged(Key, Page, Context, std.hash_map.default_max_load_percentage) = .empty,
+        pages: std.HashMapUnmanaged(Key, StoredPage, Context, std.hash_map.default_max_load_percentage) = .empty,
         disabled: bool = false,
         fn put(self: *@This(), key: Key, page: Page) !void {
             if (self.arena == null) self.arena = .init(self.budget.allocator());
@@ -14175,7 +14178,7 @@ const Engine = struct {
     fn lowerPage(self: *Engine, mapping: usize, node: v.Identity, direction: ast.Direction, cursor: ?[]const u8) !backend_mod.Page(*const v.Relationship) {
         try self.checkpoint();
         const key: AdjacencyCache.Key = .{ .mapping = mapping, .node = node, .direction = direction, .cursor = cursor };
-        if (self.adjacency_cache) |cache| if (cache.pages.get(key)) |page| return page;
+        if (self.adjacency_cache) |cache| if (cache.pages.get(key)) |page| return .{ .items = page.items, .next = page.next };
         const page = try self.backend.vtable.expand(self.backend.ptr, self.a, self.graph.relationships[mapping], node, direction, cursor, 128);
         try self.accountEdges(page);
         if (self.adjacency_cache) |cache| if (!cache.disabled) {

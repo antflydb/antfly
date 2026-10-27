@@ -3778,3 +3778,90 @@ regression instead proves the constant metadata-call count and per-label stale
 identity rejection. Search-merge CPU results above exclude network and owner
 search time; their benchmark removes the work cap to measure the complete
 merge, while production enforces the newly accounted coordinator work budget.
+
+
+Ordered membership unions retain one shared position vector plus one update per
+emitted row. The private page/RPC contract carries this trace separately from
+legacy scalar cursor arrays. Consumers materialize a full continuation only at
+the boundary they actually consume, including singleton coordinator envelopes.
+Baseline strings belong to the receiving page allocation, never a reclaimed
+proof arena; decoding rejects duplicate/out-of-range owners, invalid update
+slots, resurrection of a finished stream, and contradictory cursor formats.
+This removes the eight-domain cutoff while retaining the existing bounded
+membership proof, exact scalar disjointness, residual predicates, tie handling,
+and statement work/memory/anchor admission. ORDER-compatible equality-prefix
+indexes take precedence over broad sort indexes, with expression-key guards.
+Adjacency caches retain only payload/continuation rather than ordered metadata.
+
+Owner setup has bounded I/O waves (at most 16, additionally capped by host I/O
+configuration). All read-index admissions finish before capture; the complete
+cohort is captured before snapshot forks. A busy or failed capture joins its
+wave and releases every successful fence before retrying. Fork failures close
+all successful snapshots. Native cancellation stops later dispatches; cleanup
+still visits every retained capability. Hosts explicitly mark movable remote
+capabilities; retained local fences/snapshots stay on the controller thread.
+The statement-owned allocation lock covers allocation operations, not owner
+RPCs, and outlives all capabilities allocated through it.
+
+Distributed search groups remote owners into bounded waves with independent
+arenas and counters. It reserves disjoint work and candidate ceilings before
+dispatch, retaining sequential admission for tight ceilings and local
+capabilities. Budget failures report consumed work and candidate progress over
+the private RPC. After joining and charging all attempts, an owner constrained
+by its reservation can retry once serially using unused capacity. The first
+attempt is never refunded. Worker memory admission retains quota-failure
+provenance across concurrent allocations; ordinary allocator flags keep their
+per-call behavior. Remote graph RPC request/reply buffers use the worker's
+allocator; reply bodies transfer when ownership matches, otherwise copy with
+the transport's independent ownership respected. Capability allocation remains
+separate so cleanup can release it even after query quota exhaustion.
+
+Search merging borrows worker payloads until the wave joins, then promotes only
+its surviving top-k into independently reclaimable heap slots. Eviction frees
+the old slot, and final output transfers only retained payloads into caller
+storage. Payload retention is bounded by active owner pages plus top-k rather
+than all intermediate heap replacements. Owner-local scoring still sets the
+existing approximate flag for multi-owner search.
+
+Controlled probes inject five milliseconds at each owner boundary. Admission,
+capture and fork for 8/16 owners take 18/37 ms versus 149/305 ms before. Search
+for 8/16/64 owners takes 6/12/50 ms versus a sequential 49/96/385 ms with equal
+results. These isolate scheduling under injected latency, not production
+network, storage or scorer performance.
+
+This implementation includes origin/main at 809b5d8be027. The merged private
+failure ABI is version 66: existing Cypher failure identities remain stable,
+and main's unsupported-exact-sort failure gets a distinct appended identity.
+The Go SDK and embedded workbench assets were regenerated from the merged
+contracts and frontend sources.
+
+The final public library's 4,096-document membership probe returns identical
+top-ten rows for eight alternatives and the same domain plus one absent value.
+Both now scan 17 anchors and pass a 64-anchor ceiling; previously the ninth
+alternative scanned 2,048 anchors and failed that ceiling. Three warmed samples
+give medians of 0.60/0.81 ms for eight/nine alternatives, versus 1.09/8.58 ms
+before. Reported memory is 68,336/68,764 bytes versus 99,980/1,119,912 bytes
+before. These shared-host timings support the deterministic scan/memory result;
+they are not a general production latency guarantee.
+The existing 13,000-document, 256-domain top-1,000 regression now also runs
+under a 4,096-anchor ceiling and its original 4 MiB memory limit in both
+storage modes. It scans 3,040 anchors instead of the former full 13,000-row
+fallback; its assertion now enforces the bounded access path.
+
+Qualification of the final library covers all 1,156 public Cypher/performance
+cases: the full run passes 1,154 cases and identifies two obsolete full-scan
+expectations; both corrected bounded-scan cases pass on rerun. The new compact
+membership regression also passes independently in both storage modes.
+Native Cypher passes 481/481 tests. The combined SQL, graph transport,
+admission and retained-cut qualification succeeds in all 87 build steps,
+including 1,309 SQL cases and 10 transport cases. The final shared library
+passes all 50 build/export-check steps. Generated Go SDK tests and the merged
+workbench frontend build pass as well.
+The final production server/library/export build succeeds in all 88 steps.
+Authenticated qualification passes all 10 selected cases across the full run
+and the property-campaign rerun: replicated-owner execution, all eight search
+cases, and the complete property/SQL GRAPH_TABLE campaign. The latter creates
+both ordered indexes before its fully indexed 64,000-row ingestion, avoiding
+an unrelated late-backfill race. Its nine-/32-alternative queries retain the
+strict 64-anchor ceiling and at-most-16-scans assertion. An isolated
+authenticated 64,000-row probe returns the same top ten using 12 scans.

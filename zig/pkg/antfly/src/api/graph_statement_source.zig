@@ -34,6 +34,7 @@ pub const Plan = struct {
 };
 pub const Statement = struct {
     a: std.mem.Allocator,
+    shared: ?cypher.backend.FanoutAllocator = null,
     arena: std.heap.ArenaAllocator,
     input: port.GraphStatement,
     graph: cypher.catalog.Graph,
@@ -41,7 +42,7 @@ pub const Statement = struct {
     versions: []const cypher.rpc.Version,
     plans: []const Plan,
     set: cypher.distributed.ReadSet,
-    pub fn create(a: std.mem.Allocator, input: port.GraphStatement, plans: []const Plan) !port.GraphRead {
+    pub fn create(a: std.mem.Allocator, input: port.GraphStatement, plans: []const Plan, io: ?std.Io, width: usize) !port.GraphRead {
         const self = try a.create(Statement);
         errdefer a.destroy(self);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -80,9 +81,15 @@ pub const Statement = struct {
         // inventory is no longer needed after routes have been prepared.
         owned_input.tables = &.{};
         self.* = .{ .a = a, .arena = arena, .input = owned_input, .graph = try local.system_catalog_domain.graphForExecution(owned, record), .graphs = graphs, .versions = versions, .plans = copied, .set = undefined };
+        // Capabilities retain this allocator beyond acquisition. Its lock
+        // serializes caller-arena access without serializing owner RPCs.
+        if (io) |runtime_io| {
+            self.shared = .{ .backing = a, .io = runtime_io };
+            self.a = self.shared.?.allocator();
+        }
         const targets = try owned.alloc(cypher.distributed.Target, plans.len);
-        for (copied, targets) |plan, *target| target.* = .{ .table = plan.table.name, .table_id = plan.table.table_id, .group_id = plan.fence.route.group_id, .ranges = plan.ranges };
-        self.set = try cypher.distributed.ReadSet.acquire(a, .{ .ptr = self, .checkpoint = checkpoint, .admit = admit, .capture = capture }, targets);
+        for (copied, targets) |plan, *target| target.* = .{ .parallel = plan.route == .remote, .table = plan.table.name, .table_id = plan.table.table_id, .group_id = plan.fence.route.group_id, .ranges = plan.ranges };
+        self.set = try cypher.distributed.ReadSet.acquire(self.a, .{ .fanout_io = io, .fanout_width = width, .ptr = self, .checkpoint = checkpoint, .admit = admit, .capture = capture }, targets);
         self.set.partial_graph = input.partial_graph;
         errdefer self.set.deinit();
         const backend = self.set.backend();
@@ -256,6 +263,7 @@ pub const Statement = struct {
         const self = cast(ptr);
         self.set.deinit();
         self.arena.deinit();
-        self.a.destroy(self);
+        const backing = if (self.shared) |shared| shared.backing else self.a;
+        backing.destroy(self);
     }
 };

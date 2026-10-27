@@ -22,8 +22,12 @@ const v = @import("value.zig");
 const catalog = @import("catalog.zig");
 const ast = @import("ast.zig");
 const A = std.mem.Allocator;
+const fanout = @import("fanout.zig");
 pub const KeyRange = struct { start: []const u8 = "", end: ?[]const u8 = null };
 pub const Target = struct {
+    /// Opt-in source admission is movable; retained local owner capabilities
+    /// may still require their original controller thread.
+    parallel: bool = true,
     table: []const u8,
     table_id: u64,
     group_id: u64,
@@ -51,6 +55,10 @@ pub const Snapshot = struct {
 };
 pub const Fence = struct { ptr: *anyopaque, validate: *const fn (*anyopaque) anyerror!void, fork: *const fn (*anyopaque, A) anyerror!Snapshot, release: *const fn (*anyopaque) void };
 pub const Source = struct {
+    /// Opt in only when callbacks and their retained allocator support parallel
+    /// calls for different targets. No owner is called twice in the same wave.
+    fanout_io: ?std.Io = null,
+    fanout_width: usize = 8,
     ptr: *anyopaque,
     checkpoint: *const fn (*anyopaque) anyerror!void,
     admit: *const fn (*anyopaque, Target) anyerror!void,
@@ -79,38 +87,32 @@ pub const ReadSet = struct {
                 if (std.mem.eql(u8, target.table, other.table) and target.table_id != other.table_id) return error.CatalogGenerationChanged;
             }
         }
-        for (targets) |target| {
-            try source.checkpoint(source.ptr);
-            try source.admit(source.ptr, target);
+        const slots = try a.alloc(AcquireSlot, targets.len);
+        defer a.free(slots);
+        for (slots, targets) |*slot, target| slot.* = .{ .target = target };
+        var phase: AcquirePhase = .{ .a = a, .source = source, .slots = slots, .kind = .admit };
+        defer phase.releaseFences();
+        errdefer phase.closeSnapshots();
+        try phase.run();
+        // Capture never waits on a busy participant. Join the entire wave,
+        // release every successful capture, and only then retry the cohort.
+        for (0..4) |_| {
+            phase.kind = .capture;
+            try phase.run();
+            const complete = for (slots) |slot| {
+                if (slot.fence == null) break false;
+            } else true;
+            if (complete) break;
+            phase.releaseFences();
         }
-        const fences = try a.alloc(Fence, targets.len);
-        defer a.free(fences);
+        for (slots) |slot| if (slot.fence == null) return error.Backpressured;
+        phase.kind = .fork;
+        try phase.run();
+        phase.kind = .validate;
+        try phase.run();
         const snapshots = try a.alloc(Snapshot, targets.len);
         errdefer a.free(snapshots);
-        var captured: usize = 0;
-        defer for (fences[0..captured]) |fence| fence.release(fence.ptr);
-        var forked: usize = 0;
-        errdefer for (snapshots[0..forked]) |snapshot| snapshot.close(snapshot.ptr);
-        // A busy participant requires releasing the entire earlier cohort.
-        // Never wait for transaction resolution while blocking another owner.
-        for (0..4) |_| {
-            for (targets) |target| {
-                try source.checkpoint(source.ptr);
-                const fence = (try source.capture(source.ptr, a, target)) orelse break;
-                fences[captured] = fence;
-                captured += 1;
-            }
-            if (captured == targets.len) break;
-            for (fences[0..captured]) |fence| fence.release(fence.ptr);
-            captured = 0;
-        }
-        if (captured != targets.len) return error.Backpressured;
-        for (fences, snapshots) |fence, *snapshot| {
-            try source.checkpoint(source.ptr);
-            snapshot.* = try fence.fork(fence.ptr, a);
-            forked += 1;
-        }
-        for (fences) |fence| try fence.validate(fence.ptr);
+        for (slots, snapshots) |slot, *snapshot| snapshot.* = slot.snapshot.?;
         const owned = try a.alloc(Target, targets.len);
         errdefer a.free(owned);
         var copied: usize = 0;
@@ -140,6 +142,60 @@ pub const ReadSet = struct {
         for (snapshots) |snapshot| if (!snapshot.validation_covered_by_source) try validations.append(a, snapshot);
         return .{ .a = a, .source = source, .targets = owned, .snapshots = snapshots, .independent_validations = try validations.toOwnedSlice(a) };
     }
+    const AcquireSlot = struct { target: Target, fence: ?Fence = null, snapshot: ?Snapshot = null, err: ?anyerror = null };
+    const AcquirePhase = struct {
+        a: A,
+        source: Source,
+        slots: []AcquireSlot,
+        kind: enum { admit, capture, fork, validate },
+        fn call(self: *@This(), index: usize) void {
+            self.invoke(&self.slots[index]) catch |err| {
+                self.slots[index].err = err;
+            };
+        }
+        fn invoke(self: *@This(), slot: *AcquireSlot) !void {
+            try self.source.checkpoint(self.source.ptr);
+            switch (self.kind) {
+                .admit => try self.source.admit(self.source.ptr, slot.target),
+                .capture => slot.fence = try self.source.capture(self.source.ptr, self.a, slot.target),
+                .fork => slot.snapshot = try slot.fence.?.fork(slot.fence.?.ptr, self.a),
+                .validate => try slot.fence.?.validate(slot.fence.?.ptr),
+            }
+        }
+        fn release(self: *@This(), index: usize) void {
+            const slot = &self.slots[index];
+            if (slot.fence) |fence| {
+                fence.release(fence.ptr);
+                slot.fence = null;
+            }
+        }
+        fn close(self: *@This(), index: usize) void {
+            const slot = &self.slots[index];
+            if (slot.snapshot) |snapshot| {
+                snapshot.close(snapshot.ptr);
+                slot.snapshot = null;
+            }
+        }
+        fn movable(self: *@This(), index: usize) bool {
+            return self.kind == .admit or self.slots[index].target.parallel;
+        }
+        fn retainedMovable(self: *@This(), index: usize) bool {
+            return self.slots[index].target.parallel;
+        }
+        fn releaseFences(self: *@This()) void {
+            _ = fanout.selected(self.source.fanout_io, self.source.fanout_width, self.slots.len, self, release, retainedMovable, true);
+        }
+        fn closeSnapshots(self: *@This()) void {
+            _ = fanout.selected(self.source.fanout_io, self.source.fanout_width, self.slots.len, self, close, retainedMovable, true);
+        }
+        fn run(self: *@This()) !void {
+            for (self.slots) |*slot| slot.err = null;
+            const canceled = fanout.selected(self.source.fanout_io, self.source.fanout_width, self.slots.len, self, call, movable, false);
+            for (self.slots) |slot| if (slot.err) |err| return err;
+            if (canceled) return error.Canceled;
+            try self.source.checkpoint(self.source.ptr);
+        }
+    };
     fn freeTarget(a: A, target: Target) void {
         a.free(target.table);
         for (target.ranges) |range| {
@@ -148,8 +204,15 @@ pub const ReadSet = struct {
         }
         a.free(target.ranges);
     }
+    fn closeSnapshot(self: *ReadSet, index: usize) void {
+        const snapshot = self.snapshots[index];
+        snapshot.close(snapshot.ptr);
+    }
+    fn movableSnapshot(self: *ReadSet, index: usize) bool {
+        return self.targets[index].parallel;
+    }
     pub fn deinit(self: *ReadSet) void {
-        for (self.snapshots) |snapshot| snapshot.close(snapshot.ptr);
+        _ = fanout.selected(self.source.fanout_io, self.source.fanout_width, self.snapshots.len, self, closeSnapshot, movableSnapshot, true);
         for (self.targets) |target| freeTarget(self.a, target);
         self.a.free(self.targets);
         self.a.free(self.snapshots);
@@ -215,16 +278,26 @@ pub const ReadSet = struct {
         try checkpoint(ptr);
         return .{ .items = page.items, .examined = page.examined, .unfiltered = page.unfiltered, .next = try self.next(a, table, position, page.next) };
     }
-    const OrderedPosition = struct { exact_keys: bool = false, coarse: bool = false, owner: usize, batched: bool = false, after: ?[]const u8 = null, finished: bool = false };
+    const OrderedPosition = @import("cursor_trace.zig").Position;
     const OrderedHead = struct { node: *const v.Node, after: ?[]const u8 };
     const OrderedSlot = struct {
         position: OrderedPosition,
         head: ?OrderedHead = null,
         buffer: []const *const v.Node = &.{},
         cursors: ?[]const ?[]const u8 = null,
+        trace: ?*const b.CursorTrace = null,
+        consumed: usize = 0,
         offset: usize = 0,
         next: ?[]const u8 = null,
         primed: bool = false,
+        fn saved(self: OrderedSlot, a: A, work: ?b.Work) !OrderedPosition {
+            var position = self.position;
+            if (self.trace) |trace| if (self.consumed != 0) {
+                position.after = if (self.consumed == self.buffer.len) self.next else try trace.materialize(a, self.consumed, work);
+                position.finished = position.after == null;
+            };
+            return position;
+        }
     };
     const OrderedMerge = struct {
         read_set: *ReadSet,
@@ -250,6 +323,11 @@ pub const ReadSet = struct {
                     slot.head = .{ .node = slot.buffer[index], .after = if (slot.cursors) |positions| positions[index] else slot.next };
                     return;
                 }
+                if (slot.trace != null) {
+                    slot.position.after = slot.next;
+                    slot.trace = null;
+                    slot.consumed = 0;
+                }
                 if (self.examined == self.max_examined) return error.CypherAnchorBudgetExceeded;
                 // Prime one head per owner before speculating. Refills scale
                 // with the remaining output demand, not the entire table.
@@ -265,9 +343,15 @@ pub const ReadSet = struct {
                     if (page.cursors) |positions| {
                         if (positions.len != page.items.len or (positions[positions.len - 1] == null and page.next != null)) return error.CypherInvalidBackendPage;
                         for (positions[0 .. positions.len - 1]) |position| if (position == null) return error.CypherInvalidBackendPage;
-                    } else if (page.items.len > 1) return error.CypherInvalidBackendPage;
+                    } else if (page.cursor_trace == null and page.items.len > 1) return error.CypherInvalidBackendPage;
+                    if (page.cursor_trace) |trace| {
+                        if (page.cursors != null) return error.CypherInvalidBackendPage;
+                        try trace.validate(page.items.len);
+                    }
                     slot.buffer = page.items;
                     slot.cursors = page.cursors;
+                    slot.trace = page.cursor_trace;
+                    slot.consumed = 0;
                     slot.offset = 0;
                     slot.next = page.next;
                     continue;
@@ -332,13 +416,14 @@ pub const ReadSet = struct {
             };
             if (encoded != null and (position.coarse == page.stable_ties or position.exact_keys != page.exact_keys)) return error.CypherInvalidBackendPage;
             try checkpoint(ptr);
-            const cursors = if (page.cursors) |positions| blk: {
+            const cursors = if (page.cursor_trace == null) (if (page.cursors) |positions| blk: {
                 if (positions.len != page.items.len) return error.CypherInvalidBackendPage;
                 const saved = try a.alloc(?[]const u8, positions.len);
                 for (positions, saved) |position_after, *out| out.* = if (position_after) |after| try std.json.Stringify.valueAlloc(a, &.{OrderedPosition{ .exact_keys = page.exact_keys, .coarse = !page.stable_ties, .owner = index, .after = after }}, .{}) else null;
                 break :blk saved;
-            } else null;
-            return .{ .exact_keys = page.exact_keys, .stable_ties = page.stable_ties, .encounter_owners = page.encounter_owners, .items = page.items, .cursors = cursors, .examined = page.examined, .next = if (page.next) |after| try std.json.Stringify.valueAlloc(a, &.{OrderedPosition{ .exact_keys = page.exact_keys, .coarse = !page.stable_ties, .owner = index, .after = after }}, .{}) else null };
+            } else null) else null;
+            const trace = if (page.cursor_trace) |value| try value.wrap(a, .{ .owner = index, .exact_keys = page.exact_keys, .coarse = !page.stable_ties }) else null;
+            return .{ .cursor_trace = trace, .exact_keys = page.exact_keys, .stable_ties = page.stable_ties, .encounter_owners = page.encounter_owners, .items = page.items, .cursors = cursors, .examined = page.examined, .next = if (page.next) |after| try std.json.Stringify.valueAlloc(a, &.{OrderedPosition{ .exact_keys = page.exact_keys, .coarse = !page.stable_ties, .owner = index, .after = after }}, .{}) else null };
         }
         var arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer arena.deinit();
@@ -353,7 +438,7 @@ pub const ReadSet = struct {
                 const read = snapshot.backend.vtable.scan_ordered orelse return null;
                 const proof = (try read(snapshot.backend.ptr, temporary, table, filters, order, null, 0, 0)) orelse return null;
                 if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
-                try positions.append(temporary, .{ .exact_keys = proof.exact_keys, .coarse = !proof.stable_ties, .owner = owner, .after = proof.next, .batched = proof.cursors != null });
+                try positions.append(temporary, .{ .exact_keys = proof.exact_keys, .coarse = !proof.stable_ties, .owner = owner, .after = proof.next, .batched = proof.cursors != null or proof.cursor_trace != null });
             }
         }
         var count: usize = 0;
@@ -385,24 +470,29 @@ pub const ReadSet = struct {
         }
         var output: std.ArrayList(*const v.Node) = .empty;
         var encounter_owners: std.ArrayList(usize) = .empty;
-        var cursors: std.ArrayList(?[]const u8) = .empty;
+        const base: []OrderedPosition = if (self.ordered_item_cursors) try a.alloc(OrderedPosition, slots.len) else &.{};
+        if (self.ordered_item_cursors) for (base, slots) |*position, slot| {
+            position.* = try slot.saved(a, self.work);
+            if (position.after) |bytes| position.after = try a.dupe(u8, bytes);
+        };
+        var steps: std.ArrayList(@import("cursor_trace.zig").Step) = .empty;
         while (output.items.len < limit and heap.items.len != 0) {
             const selected = heap.items[0];
             const slot = &slots[selected];
             try output.append(a, slot.head.?.node);
             if (!stable_ties) try encounter_owners.append(a, slot.position.owner);
-            slot.position.after = slot.head.?.after;
-            slot.position.finished = slot.position.after == null;
+            if (slot.trace != null) {
+                slot.consumed = slot.offset;
+                slot.position.finished = slot.offset == slot.buffer.len and slot.next == null;
+            } else {
+                slot.position.after = slot.head.?.after;
+                slot.position.finished = slot.position.after == null;
+            }
             slot.head = null;
             if (self.ordered_item_cursors) {
-                var more = false;
-                for (slots, positions.items) |current, *position| {
-                    position.* = current.position;
-                    more = more or !position.finished;
-                }
-                const saved = if (more) try std.json.Stringify.valueAlloc(a, positions.items, .{}) else null;
-                try OrderedMerge.charge(&merge, count + if (saved) |bytes| bytes.len / 64 else @as(usize, 0));
-                try cursors.append(a, saved);
+                const saved = try slot.saved(a, self.work);
+                try OrderedMerge.charge(&merge, 1);
+                try steps.append(a, .{ .slot = selected, .after = saved.after });
             }
             if (output.items.len == limit) break;
             merge.demand = limit - output.items.len;
@@ -415,13 +505,12 @@ pub const ReadSet = struct {
         }
         var more = false;
         for (slots, positions.items) |slot, *position| {
-            position.* = slot.position;
+            position.* = try slot.saved(a, self.work);
             more = more or !position.finished;
         }
         try checkpoint(ptr);
         const continuation = if (more) try std.json.Stringify.valueAlloc(a, positions.items, .{}) else null;
-        if (cursors.items.len != 0) cursors.items[cursors.items.len - 1] = continuation;
-        return .{ .exact_keys = exact_keys, .stable_ties = stable_ties, .encounter_owners = if (!stable_ties) encounter_owners.items else null, .items = try output.toOwnedSlice(a), .cursors = if (self.ordered_item_cursors) cursors.items else null, .examined = merge.examined, .next = continuation };
+        return .{ .exact_keys = exact_keys, .stable_ties = stable_ties, .encounter_owners = if (!stable_ties) encounter_owners.items else null, .items = try output.toOwnedSlice(a), .cursor_trace = if (self.ordered_item_cursors) try b.CursorTrace.create(a, .{ .base = base, .steps = steps.items }) else null, .examined = merge.examined, .next = continuation };
     }
     fn populationUpperBound(ptr: *anyopaque, a: A, table: []const u8) !?u64 {
         const self = cast(ptr);
@@ -531,7 +620,7 @@ pub const ReadSet = struct {
         best: std.ArrayList(b.Seed) = .empty,
         // Backward-shift index deletion avoids tombstone accumulation during
         // continuous top-k eviction; cached hashes also avoid rehashing keys.
-        identities: std.ArrayHashMapUnmanaged(v.Identity, void, IdentityContext, true) = .empty,
+        identities: std.ArrayHashMapUnmanaged(v.Identity, ?*std.heap.ArenaAllocator, IdentityContext, true) = .empty,
         const IdentityContext = struct {
             pub fn hash(_: @This(), identity: v.Identity) u32 {
                 return @truncate((v.Identity.Context{}).hash(identity));
@@ -561,14 +650,46 @@ pub const ReadSet = struct {
                 parent = child;
             }
         }
+        fn deinit(self: *@This()) void {
+            for (self.identities.values()) |arena| if (arena) |owned| {
+                owned.deinit();
+                b.reclaimingAllocator(self.a).destroy(owned);
+            };
+            self.identities.deinit(self.a);
+            self.best.deinit(self.a);
+        }
+        fn retain(self: *@This(), seed: b.Seed, own: bool) !b.Seed {
+            if (!own) {
+                try self.identities.put(self.a, seed.node.identity, null);
+                return seed;
+            }
+            const allocator = b.reclaimingAllocator(self.a);
+            const arena = try allocator.create(std.heap.ArenaAllocator);
+            errdefer allocator.destroy(arena);
+            arena.* = .init(allocator);
+            errdefer arena.deinit();
+            if (self.read.work) |work| try work.value(work.ptr, .{ .node = seed.node });
+            const copy = try (v.Value{ .node = seed.node }).clone(arena.allocator());
+            const entry = try self.identities.getOrPut(self.a, copy.node.identity);
+            entry.key_ptr.* = copy.node.identity;
+            entry.value_ptr.* = arena;
+            return .{ .node = copy.node, .score = seed.score };
+        }
+        fn promote(self: *@This()) !void {
+            // All worker pages remain alive until the wave joins. Copy only
+            // the surviving top-k, once per wave, into reclaimable heap slots.
+            for (self.best.items) |*seed| if (self.identities.get(seed.node.identity).? == null) {
+                seed.* = try self.retain(seed.*, true);
+            };
+        }
         fn add(self: *@This(), seed: b.Seed) !void {
             const identity = seed.node.identity;
             // Hashing and key comparisons are physical coordinator work too.
             try self.charge(1 +| 3 *| ((identity.table.len +| identity.key.len) / 64 +| 1));
             if (self.identities.contains(identity)) return error.CypherOverlappingOwners;
             if (self.best.items.len < self.limit) {
-                try self.identities.put(self.a, identity, {});
-                try self.best.append(self.a, seed);
+                const retained = try self.retain(seed, false);
+                try self.best.append(self.a, retained);
                 var child = self.best.items.len - 1;
                 while (child != 0) {
                     const parent = (child - 1) / 2;
@@ -579,9 +700,15 @@ pub const ReadSet = struct {
             } else if (try self.better(seed, self.best.items[0])) {
                 const old = self.best.items[0].node.identity;
                 try self.charge((old.table.len +| old.key.len) / 64 +| 1);
+                const arena = self.identities.get(old).?;
                 _ = self.identities.swapRemove(old);
-                try self.identities.put(self.a, identity, {});
-                self.best.items[0] = seed;
+                if (arena) |owned| {
+                    owned.deinit();
+                    b.reclaimingAllocator(self.a).destroy(owned);
+                }
+                // An allocation failure aborts the query; no dangling heap key
+                // is consulted during cleanup.
+                self.best.items[0] = try self.retain(seed, false);
                 try self.sift(self.best.items.len);
             }
         }
@@ -594,9 +721,153 @@ pub const ReadSet = struct {
                 std.mem.swap(b.Seed, &self.best.items[0], &self.best.items[length]);
                 try self.sift(length);
             }
+            for (self.best.items) |*seed| if (self.identities.get(seed.node.identity).? != null) {
+                if (self.read.work) |work| try work.value(work.ptr, .{ .node = seed.node });
+                seed.node = (try (v.Value{ .node = seed.node }).clone(self.a)).node;
+            };
             return self.best.toOwnedSlice(self.a);
         }
     };
+    const SearchSlot = struct {
+        owner: b.Backend,
+        parent_work: ?b.Work,
+        arena: std.heap.ArenaAllocator,
+        meter: b.Meter = undefined,
+        input: b.SearchInput,
+        table: []const u8,
+        usage: b.SearchUsage = .{},
+        page: ?b.SearchPage = null,
+        err: ?anyerror = null,
+        fn run(slots: []SearchSlot, index: usize) void {
+            const self = &slots[index];
+            self.owner.vtable.set_work.?(self.owner.ptr, self.meter.work());
+            defer self.owner.vtable.set_work.?(self.owner.ptr, self.parent_work);
+            var input = self.input;
+            input.usage = &self.usage;
+            self.page = self.owner.vtable.search.?(self.owner.ptr, self.arena.allocator(), self.table, input) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    fn absorb(merge: *SearchMerge, page: b.SearchPage, table: []const u8) !void {
+        if (page.seeds.len > merge.limit) return error.CypherInvalidSearchResult;
+        for (page.seeds) |seed| {
+            if (!std.math.isFinite(seed.score) or !std.mem.eql(u8, seed.node.identity.table, table)) return error.CypherInvalidSearchResult;
+            try merge.add(seed);
+        }
+    }
+    fn searchConcurrent(self: *ReadSet, a: A, table: []const u8, input: b.SearchInput, merge: *SearchMerge) !b.SearchPage {
+        const io = self.source.fanout_io.?;
+        var matching: std.ArrayList(usize) = .empty;
+        defer matching.deinit(a);
+        // Preserve local capability affinity and collect remote owners into
+        // contiguous waves even when routing interleaves local/remote ranges.
+        for ([_]bool{ false, true }) |movable| for (self.targets, 0..) |target, index| {
+            if (target.parallel == movable and std.mem.eql(u8, target.table, table)) try matching.append(a, index);
+        };
+        if (matching.items.len == 0) return error.UndefinedGraphTable;
+        var examined: usize = 0;
+        defer if (input.usage) |usage| {
+            usage.examined = examined;
+        };
+        var approximate = false;
+        var start: usize = 0;
+        while (start < matching.items.len) {
+            try checkpoint(self);
+            const work_left = if (self.work) |work| work.remaining.?(work.ptr) else 1_000_000;
+            // Small ceilings keep ordinary sequential admission. Speculative
+            // waves reserve disjoint ceilings and leave room for merging.
+            const width = @max(1, @min(self.source.fanout_width, 16, matching.items.len - start, work_left / @max(1, merge.limit *| 64), (input.max_examined -| examined) / merge.limit));
+            var count: usize = 0;
+            while (count < width) : (count += 1) {
+                if (!self.targets[matching.items[start + count]].parallel) break;
+                const owner = self.snapshots[matching.items[start + count]].backend;
+                if (owner.vtable.search == null) return error.CypherSearchUnavailable;
+                if (owner.vtable.set_work == null) break;
+            }
+            if (count <= 1) {
+                const owner = self.snapshots[matching.items[start]].backend;
+                const callback = owner.vtable.search orelse return error.CypherSearchUnavailable;
+                var demand = input;
+                demand.max_examined = input.max_examined -| examined;
+                var usage: b.SearchUsage = .{};
+                demand.usage = &usage;
+                const page = callback(owner.ptr, a, table, demand) catch |err| {
+                    examined += @min(demand.max_examined, usage.examined orelse demand.max_examined);
+                    return err;
+                };
+                if (page.examined > demand.max_examined) return error.CypherAnchorBudgetExceeded;
+                examined += page.examined;
+                approximate = approximate or page.approximate;
+                try absorb(merge, page, table);
+                start += 1;
+                continue;
+            }
+            // Worker arenas and counters are independent. Only allocator
+            // operations cross the shared memory-accounting lock.
+            var shared: fanout.Allocator = .{ .backing = b.reclaimingAllocator(a), .io = io };
+            var storage: [16]SearchSlot = undefined;
+            const slots = storage[0..count];
+            for (slots, matching.items[start..][0..count]) |*slot, index| {
+                var demand = input;
+                demand.max_examined = (input.max_examined - examined) / count;
+                slot.* = .{ .owner = self.snapshots[index].backend, .parent_work = self.work, .arena = .init(shared.allocator()), .input = demand, .table = table };
+                slot.meter = .{ .a = slot.arena.allocator(), .backend = slot.owner, .limit = work_left / (count + 1) };
+            }
+            defer for (slots) |*slot| slot.arena.deinit();
+            const canceled = fanout.run(io, count, count, slots, SearchSlot.run);
+            // Charge every completed attempt before a retry or result merge.
+            // Budget failures carry actual work and native candidate progress;
+            // unknown custom backends conservatively consume their reservation.
+            for (slots) |slot| {
+                if (self.work) |work| try work.charge(work.ptr, slot.meter.units);
+                const used = if (slot.page) |page| page.examined else slot.usage.examined orelse slot.input.max_examined;
+                if (used > slot.input.max_examined) return error.CypherAnchorBudgetExceeded;
+                examined += used;
+            }
+            if (canceled) return error.Canceled;
+            try checkpoint(self);
+            for (slots) |slot| if (slot.err) |err| {
+                if (err != error.CypherStateBudgetExceeded and err != error.CypherAnchorBudgetExceeded and err != error.OutOfMemory) return err;
+            };
+            for (slots) |slot| if (slot.err) |err| {
+                if (err == error.OutOfMemory) {
+                    if (shared.quota_exhausted.load(.acquire)) return error.CypherMemoryBudgetExceeded;
+                    return error.OutOfMemory;
+                }
+            };
+            for (slots) |*slot| {
+                if (slot.page) |page| {
+                    approximate = approximate or page.approximate;
+                    try absorb(merge, page, table);
+                    continue;
+                }
+                const err = slot.err.?;
+                if (err != error.CypherStateBudgetExceeded and err != error.CypherAnchorBudgetExceeded) return err;
+                if (self.work) |work| if (work.remaining.?(work.ptr) == 0) return err;
+                if (examined == input.max_examined and err == error.CypherAnchorBudgetExceeded) return err;
+                // Reuse unused reservations after skewed owner work. The
+                // aborted attempt stays charged; there is at most one retry.
+                var demand = input;
+                demand.max_examined = input.max_examined - examined;
+                var usage: b.SearchUsage = .{};
+                demand.usage = &usage;
+                const page = slot.owner.vtable.search.?(slot.owner.ptr, slot.arena.allocator(), table, demand) catch |retry_error| {
+                    examined += @min(demand.max_examined, usage.examined orelse demand.max_examined);
+                    return retry_error;
+                };
+                if (page.examined > demand.max_examined) return error.CypherAnchorBudgetExceeded;
+                examined += page.examined;
+                approximate = approximate or page.approximate;
+                try absorb(merge, page, table);
+            }
+            try merge.promote();
+            start += count;
+        }
+        try checkpoint(self);
+        return .{ .seeds = try merge.finish(), .examined = examined, .approximate = approximate or matching.items.len > 1 };
+    }
     fn search(ptr: *anyopaque, a: A, table: []const u8, input: b.SearchInput) !b.SearchPage {
         const self = cast(ptr);
         try checkpoint(ptr);
@@ -605,10 +876,19 @@ pub const ReadSet = struct {
         const requested = parameters.property("limit");
         const limit: usize = if (requested == .null) 10 else if (requested == .integer and requested.integer > 0 and requested.integer <= 1024) @intCast(requested.integer) else return error.CypherInvalidSearchLimit;
         var merge: SearchMerge = .{ .read = self, .a = a, .limit = limit };
-        defer merge.identities.deinit(a);
-        errdefer merge.best.deinit(a);
+        defer merge.deinit();
+        if (self.source.fanout_io != null and self.source.fanout_width > 1 and (self.work == null or self.work.?.remaining != null)) {
+            var movable: usize = 0;
+            for (self.targets) |target| if (target.parallel and std.mem.eql(u8, target.table, table)) {
+                movable += 1;
+            };
+            if (movable > 1) return self.searchConcurrent(a, table, input, &merge);
+        }
         var found = false;
         var examined: usize = 0;
+        defer if (input.usage) |usage| {
+            usage.examined = examined;
+        };
         var approximate = false;
         var searched_owners: usize = 0;
         for (self.targets, self.snapshots) |target, snapshot| {
@@ -619,7 +899,12 @@ pub const ReadSet = struct {
             const callback = snapshot.backend.vtable.search orelse return error.CypherSearchUnavailable;
             var demand = input;
             demand.max_examined = input.max_examined -| examined;
-            const page = try callback(snapshot.backend.ptr, a, table, demand);
+            var usage: b.SearchUsage = .{};
+            demand.usage = &usage;
+            const page = callback(snapshot.backend.ptr, a, table, demand) catch |err| {
+                examined += @min(demand.max_examined, usage.examined orelse demand.max_examined);
+                return err;
+            };
             if (page.examined > demand.max_examined) return error.CypherAnchorBudgetExceeded;
             examined += page.examined;
             approximate = approximate or page.approximate;
@@ -1002,8 +1287,9 @@ test "ordered RPC buffers keep calls bounded and resume every unconsumed item" {
     const backend = set.backend();
     while (true) {
         const page = (try backend.vtable.scan_ordered.?(backend.ptr, arena.allocator(), "docs", &.{}, &.{.{ .property = "score", .descending = true }}, after, 17, 4096)).?;
-        try std.testing.expectEqual(page.items.len, page.cursors.?.len);
-        if (ordinal == 0) for (page.cursors.?, 0..) |position, index| {
+        try std.testing.expectEqual(page.items.len, page.cursor_trace.?.steps.len);
+        if (ordinal == 0) for (page.items, 0..) |_, index| {
+            const position = try page.cursor_trace.?.materialize(arena.allocator(), index + 1, @as(?b.Work, null));
             const resumed = (try backend.vtable.scan_ordered.?(backend.ptr, arena.allocator(), "docs", &.{}, &.{.{ .property = "score", .descending = true }}, position, 1, 4096)).?;
             try std.testing.expectEqual(@as(i64, 1022) - @as(i64, @intCast(index)), resumed.items[0].properties[0].value.integer);
         };
@@ -1038,7 +1324,7 @@ test "distributed search heap meters ranking hashes sorting and revocation" {
     var fixture: Fixture = .{};
     var read: ReadSet = .{ .a = a, .targets = &.{}, .snapshots = &.{}, .independent_validations = &.{}, .source = .{ .ptr = &fixture, .checkpoint = Fixture.checkpoint, .admit = undefined, .capture = undefined }, .work = .{ .ptr = &fixture, .charge = Fixture.charge, .value = Fixture.value } };
     var merge: ReadSet.SearchMerge = .{ .read = &read, .a = a, .limit = 17 };
-    defer merge.identities.deinit(a);
+    defer merge.deinit();
     var reference: std.ArrayList(b.Seed) = .empty;
     for (0..1024) |ordinal| {
         const index = ordinal * 359 % 1024;

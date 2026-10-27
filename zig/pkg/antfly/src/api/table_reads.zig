@@ -4179,7 +4179,7 @@ pub const ProvisionedTableReadSource = struct {
                 try routes.append(alloc, route);
             }
         }
-        return factory.Statement.create(alloc, input, plans.items);
+        return factory.Statement.create(alloc, input, plans.items, if (self.io_impl) |io| io.io() else null, if (self.io_impl) |io| ioAsyncLimitCap(io) else 1);
     }
 
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {

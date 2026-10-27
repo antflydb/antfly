@@ -47,7 +47,7 @@ pub const Request = struct {
     include_relationships: bool = false,
 };
 pub const Projection = struct { node: ?*const v.Node, relationships: []const *const v.Relationship = &.{} };
-const Reply = struct { exact_keys: bool = false, stable_ties: bool = true, encounter_owners: ?[]const usize = null, cursors: ?[]const ?[]const u8 = null, ordered: bool = false, estimate: ?usize = null, population: ?u64 = null, unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
+const Reply = struct { search_failure: ?enum { work, anchors } = null, exact_keys: bool = false, stable_ties: bool = true, encounter_owners: ?[]const usize = null, cursors: ?[]const ?[]const u8 = null, cursor_trace: ?b.CursorTrace = null, ordered: bool = false, estimate: ?usize = null, population: ?u64 = null, unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
 pub const Channel = struct { ptr: *anyopaque, call: *const fn (*anyopaque, A, []const u8) anyerror![]u8, checkpoint: ?*const fn (*anyopaque) anyerror!void = null };
 pub const Version = struct { incarnation: u64, revision: u64 };
 pub const Client = struct {
@@ -82,6 +82,7 @@ pub const Client = struct {
         defer a.free(response);
         if (response.len > 32 << 20) return error.CypherResponseTooLarge;
         const reply = try std.json.parseFromSliceLeaky(Reply, a, response, .{ .allocate = .alloc_always });
+        if (reply.work > bounded.max_work) return error.CypherInvalidBackendPage;
         if (self.work) |work| try work.charge(work.ptr, reply.work);
         return reply;
     }
@@ -184,15 +185,17 @@ pub const Client = struct {
         for (order, encoded_order) |input, *out| out.* = .{ .property = input.property, .descending = input.descending, .exclude_null = input.exclude_null, .after = if (input.after) |key| .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, key, .{}), .{ .parse_numbers = false }) } else null };
         const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .order = encoded_order, .operation = .scan_ordered, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = after, .limit = limit, .max_examined = max_examined });
         if (!reply.ordered) {
-            if (reply.values.len != 0 or reply.cursors != null or reply.next != null or after != null) return error.CypherInvalidBackendPage;
+            if (reply.values.len != 0 or reply.cursors != null or reply.cursor_trace != null or reply.next != null or after != null) return error.CypherInvalidBackendPage;
             return null;
         }
+        if (reply.values.len > limit or (reply.cursor_trace != null and reply.cursors != null)) return error.CypherInvalidBackendPage;
         const nodes = try a.alloc(*const v.Node, reply.values.len);
         for (reply.values, nodes) |input, *out| {
             const value = try wire.transport(a, input);
             if (value != .node or !std.mem.eql(u8, value.node.identity.table, table)) return error.CypherInvalidBackendPage;
             out.* = value.node;
         }
+        if (reply.cursor_trace) |trace| try trace.validate(nodes.len);
         const cursors = if (reply.cursors) |positions| blk: {
             if (positions.len != nodes.len) return error.CypherInvalidBackendPage;
             const saved = try a.alloc(?[]const u8, positions.len);
@@ -200,7 +203,7 @@ pub const Client = struct {
             break :blk saved;
         } else null;
         if (reply.encounter_owners) |owners| if (owners.len != nodes.len) return error.CypherInvalidBackendPage;
-        return .{ .stable_ties = reply.stable_ties, .exact_keys = reply.exact_keys, .encounter_owners = if (reply.encounter_owners) |owners| try a.dupe(usize, owners) else null, .items = nodes, .cursors = cursors, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined };
+        return .{ .cursor_trace = if (reply.cursor_trace) |trace| try trace.clone(a) else null, .stable_ties = reply.stable_ties, .exact_keys = reply.exact_keys, .encounter_owners = if (reply.encounter_owners) |owners| try a.dupe(usize, owners) else null, .items = nodes, .cursors = cursors, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined };
     }
     fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         const self = cast(ptr);
@@ -258,6 +261,15 @@ pub const Client = struct {
         if (request != .map) return error.CypherTypeMismatch;
         const encoded = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, wire.Value{ .value = request }, .{}), .{});
         const reply = try self.invoke(temporary, .{ .operation = .search, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .search = encoded, .prepared_search_json = input.prepared_json, .max_examined = input.max_examined });
+        if (input.usage) |usage| usage.examined = reply.examined;
+        if (reply.examined) |examined| if (examined > input.max_examined) return error.CypherInvalidSearchResult;
+        if (reply.search_failure) |failure| {
+            if (reply.values.len != 0 or reply.scores.len != 0 or reply.next != null) return error.CypherInvalidBackendPage;
+            return switch (failure) {
+                .work => error.CypherStateBudgetExceeded,
+                .anchors => error.CypherAnchorBudgetExceeded,
+            };
+        }
         if (reply.values.len != reply.scores.len or reply.values.len > 1024) return error.CypherInvalidBackendPage;
         const seeds = try a.alloc(b.Seed, reply.values.len);
         for (reply.values, reply.scores, seeds) |encoded_value, score, *out| {
@@ -353,7 +365,7 @@ pub const Owner = struct {
                 const page = if (self.backend.vtable.scan_ordered) |read| try read(self.backend.ptr, scratch, request.table, filters, order, request.after, request.limit, request.max_examined) else null;
                 if (page) |ordered| {
                     for (ordered.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
-                    return std.json.Stringify.valueAlloc(a, .{ .ordered = true, .stable_ties = ordered.stable_ties, .exact_keys = ordered.exact_keys, .encounter_owners = ordered.encounter_owners, .values = values.items, .cursors = ordered.cursors, .next = ordered.next, .examined = ordered.examined, .work = meter.units }, .{});
+                    return std.json.Stringify.valueAlloc(a, .{ .ordered = true, .stable_ties = ordered.stable_ties, .exact_keys = ordered.exact_keys, .encounter_owners = ordered.encounter_owners, .values = values.items, .cursors = ordered.cursors, .cursor_trace = ordered.cursor_trace, .next = ordered.next, .examined = ordered.examined, .work = meter.units }, .{});
                 }
                 return std.json.Stringify.valueAlloc(a, .{ .ordered = false, .work = meter.units }, .{});
             },
@@ -403,7 +415,16 @@ pub const Owner = struct {
                 const search_fn = self.backend.vtable.search orelse return error.CypherSearchUnavailable;
                 const parameters = try wire.parameter(scratch, request.search orelse return error.InvalidCypherWireValue);
                 if (parameters != .map) return error.CypherTypeMismatch;
-                const page = try search_fn(self.backend.ptr, scratch, request.table, .{ .parameters = parameters, .prepared_json = request.prepared_search_json, .max_examined = request.max_examined });
+                var usage: b.SearchUsage = .{};
+                const page = search_fn(self.backend.ptr, scratch, request.table, .{ .parameters = parameters, .prepared_json = request.prepared_search_json, .max_examined = request.max_examined, .usage = &usage }) catch |err| {
+                    const failure: @typeInfo(@FieldType(Reply, "search_failure")).optional.child = switch (err) {
+                        error.CypherStateBudgetExceeded => .work,
+                        error.CypherAnchorBudgetExceeded => .anchors,
+                        else => return err,
+                    };
+                    try self.backend.vtable.checkpoint(self.backend.ptr);
+                    return std.json.Stringify.valueAlloc(a, .{ .search_failure = failure, .work = meter.units, .examined = usage.examined }, .{});
+                };
                 const seeds = page.seeds;
                 examined = page.examined;
                 approximate = page.approximate;
@@ -472,4 +493,47 @@ test "bounded owner estimates retain authority and propagate planning work" {
     try std.testing.expectEqual(@as(?usize, 128), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", filters, 128));
     fixture.invalid = true;
     try std.testing.expectError(error.CypherInvalidBackendPage, backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", filters, 32));
+}
+
+test "search quota failures return charged work and candidate progress through RPC" {
+    const Fixture = struct {
+        work: ?b.Work = null,
+        anchors: bool = false,
+        revoked: bool = false,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.revoked) return error.Forbidden;
+        }
+        fn configure(ptr: *anyopaque, work: ?b.Work) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.work = work;
+        }
+        fn search(ptr: *anyopaque, _: A, _: []const u8, input: b.SearchInput) !b.SearchPage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (input.usage) |usage| usage.examined = 3;
+            for (0..8) |_| if (self.work) |work| try work.charge(work.ptr, 1);
+            return error.CypherAnchorBudgetExceeded;
+        }
+        const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
+        fn call(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
+            const owner: Owner = .{ .backend = .{ .ptr = ptr, .vtable = &.{ .bind = undefined, .checkpoint = check, .scan = undefined, .get = undefined, .expand = undefined, .search = search, .set_work = configure } }, .graph = graph, .table = "docs" };
+            return owner.execute(a, body);
+        }
+    };
+    var fixture: Fixture = .{};
+    const leaf: b.Backend = .{ .ptr = &fixture, .vtable = &.{ .bind = undefined, .checkpoint = Fixture.check, .scan = undefined, .get = undefined, .expand = undefined } };
+    var meter: b.Meter = .{ .a = std.testing.allocator, .backend = leaf, .limit = 5 };
+    var client: Client = .{ .channel = .{ .ptr = &fixture, .call = Fixture.call }, .incarnation = 1, .revision = 1, .work = meter.work() };
+    var usage: b.SearchUsage = .{};
+    const input: b.SearchInput = .{ .parameters = .{ .map = &.{} }, .max_examined = 10, .usage = &usage };
+    try std.testing.expectError(error.CypherStateBudgetExceeded, client.backend().vtable.search.?(&client, std.testing.allocator, "docs", input));
+    try std.testing.expectEqual(@as(usize, 5), meter.units);
+    try std.testing.expectEqual(@as(?usize, 3), usage.examined);
+    meter.units = 0;
+    meter.limit = 20;
+    try std.testing.expectError(error.CypherAnchorBudgetExceeded, client.backend().vtable.search.?(&client, std.testing.allocator, "docs", input));
+    try std.testing.expectEqual(@as(usize, 8), meter.units);
+    try std.testing.expectEqual(@as(?usize, 3), usage.examined);
+    fixture.revoked = true;
+    try std.testing.expectError(error.Forbidden, client.backend().vtable.search.?(&client, std.testing.allocator, "docs", input));
 }

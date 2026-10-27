@@ -370,11 +370,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             };
             var work = self.valueWork(temporary);
             const unique = (try orderedMembershipDomain(temporary, &work, filters, chosen, kind)) orelse return null;
-            // Per-item continuations retain every partition position for
-            // nested RPC paging. Admit only a small fanout: wider domains
-            // keep sparse seeks/top-k instead of multiplying cursor work by
-            // the output cardinality and exhausting the default state budget.
-            if (unique.len == 0 or unique.len > 8) return null;
+            // Cursor traces retain one baseline and one update per emitted
+            // row. Domain admission follows the existing bounded membership
+            // proof and statement work/memory/anchor budgets.
+            if (unique.len == 0) return null;
             // Preserve the sparse-seek plan when the global ceiling cannot
             // cover even the merge's required owner heads and lookahead.
             if (encoded == null and limit != 0 and max_examined < limit +| (unique.len - 1)) return null;
@@ -463,6 +462,17 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         const key = alternative.tuple.keys[0];
                         if (key.expression != null or key.fold_ascii) continue;
                         if (try self.filterStrength(filters, schema.tableSchema().relational_columns[key.ordinal].name, key.column_type) > strength) continue :candidates;
+                    }
+                }
+                if (partition and cursor == null) {
+                    const leading = index.tuple.keys[0];
+                    const strength = try self.filterStrength(filters, schema.tableSchema().relational_columns[leading.ordinal].name, leading.column_type);
+                    for (indexes.plan.boundIndexes()) |alternative| {
+                        if (alternative.tuple.keys.len == 0) continue;
+                        const key = alternative.tuple.keys[0];
+                        if (key.expression != null or key.fold_ascii) continue;
+                        if (try self.filterStrength(filters, schema.tableSchema().relational_columns[key.ordinal].name, key.column_type) <= strength) continue;
+                        if (try self.orderedIndexPrefix(schema, alternative, filters, order, coarse, reverse) != null) continue :candidates;
                     }
                 }
                 const authorization = try self.readAuthorization(temporary, table);

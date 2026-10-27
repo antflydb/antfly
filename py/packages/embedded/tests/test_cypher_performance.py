@@ -7807,11 +7807,11 @@ def test_wide_ordered_in_domains_keep_bounded_planning_cost(graph_db):
         {
             "query": "MATCH (n:D) WHERE n.id IN $ids RETURN n.score ORDER BY n.score DESC LIMIT 1000",
             "parameters": {"ids": [f"b{i}" for i in range(256)]},
-            "limits": {"memory_bytes": 4 << 20},
+            "limits": {"memory_bytes": 4 << 20, "scanned_anchors": 4096},
         },
     )
     assert [int(row[0]["value"]) for row in result["rows"]] == list(range(12999, 11999, -1))
-    assert result["stats"]["scanned_anchors"] == 13000
+    assert result["stats"]["scanned_anchors"] <= 4096
     assert result["stats"]["intermediate_states"] < 1_000_000
 
 
@@ -9142,3 +9142,30 @@ def test_sql_group_costing_and_prefix_skip_preserve_order_and_reducer_values(gra
         "HAVING min(score)%2=0 ORDER BY id OFFSET 999 LIMIT 3"
     )
     assert graph_db.sql(query)["rows"] == graph_db.sql(query.replace("ORDER BY id", "ORDER BY id||''"))["rows"]
+
+
+def test_ordered_membership_uses_compact_continuations_beyond_eight_domains(graph_db):
+    db = graph_db
+    db.sql("CREATE INDEX folded_key ON docs (lower(id)) WHERE score > 0")
+    db.sql("CREATE INDEX broad_order ON docs(id)")
+    db.sql("CREATE INDEX partition_order ON docs(score,id)")
+    for start in range(0, 4096, 256):
+        db.sql(
+            "INSERT INTO docs (_id,id,score) VALUES "
+            + ",".join(f"('k{i:06}','k{i:06}',{i % 16})" for i in range(start, start + 256))
+        )
+    query = "MATCH(n:D) WHERE n.score IN $values RETURN n.id ORDER BY n.id LIMIT 10"
+    expected = [f"k{i:06}" for i in [*range(8), 16, 17]]
+    for width in (8, 9, 32, 128, 256):
+        values = [*range(8), *range(999, 999 + width - 8)]
+        result = db.cypher_json(
+            "g",
+            {
+                "query": query,
+                "parameters": {"values": values},
+                "limits": {"scanned_anchors": max(64, width + 10)},
+            },
+        )
+        assert [row[0]["value"] for row in result["rows"]] == expected
+        assert result["stats"]["scanned_anchors"] <= 20
+        assert result["stats"]["memory_bytes"] < 2 << 20

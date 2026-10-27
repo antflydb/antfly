@@ -35,12 +35,15 @@ pub fn reclaimingAllocator(input: std.mem.Allocator) std.mem.Allocator {
 /// authorized table, without restricting it to the supplied property filters.
 /// An index/predicate-restricted scan must leave it false. Consumers still apply
 /// all label/predicate checks; the certificate only enables a reusable lookup.
+pub const FanoutAllocator = @import("fanout.zig").Allocator;
+pub const CursorTrace = @import("cursor_trace.zig").Trace;
 pub fn Page(comptime T: type) type {
     return struct {
         items: []const T,
         /// Optional exact continuation after each emitted item. An empty slice
         /// on a zero-row capability probe certifies batched resumability.
         cursors: ?[]const ?[]const u8 = null,
+        cursor_trace: ?*const CursorTrace = null,
         next: ?[]const u8 = null,
         examined: ?usize = null,
         unfiltered: bool = false,
@@ -67,7 +70,8 @@ pub const PropertyOrder = struct {
     exclude_null: bool = false,
 };
 pub const Seed = struct { node: *const v.Node, score: f64 };
-pub const SearchInput = struct { parameters: v.Value, prepared_json: []const u8 = "", max_examined: usize = 1_000_000 };
+pub const SearchUsage = struct { examined: ?usize = null };
+pub const SearchInput = struct { usage: ?*SearchUsage = null, parameters: v.Value, prepared_json: []const u8 = "", max_examined: usize = 1_000_000 };
 pub const SearchPage = struct { seeds: []const Seed, examined: usize = 0, approximate: bool = false };
 pub const StartupWork = struct { scanned_anchors: usize = 0, explored_edges: usize = 0, intermediate_states: usize = 0 };
 /// Statement-owned execution accounting. Adapters may retain this capability

@@ -39,6 +39,7 @@ pub const regex = @import("regex.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const mutations = @import("mutations.zig");
 test {
+    _ = @import("fanout_test.zig");
     _ = dependencies;
     _ = integer_affine;
     _ = @import("compiler_test.zig");

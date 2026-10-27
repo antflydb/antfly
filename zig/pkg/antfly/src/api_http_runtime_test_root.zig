@@ -39,6 +39,7 @@ test {
     _ = @import("api/protected_future.zig");
     _ = @import("api/sql_graph_overlay_test.zig");
     _ = @import("api/graph_execution.zig");
+    _ = @import("api/retained_read_client.zig").consumer_tests;
     _ = @import("api/sql_connection_record.zig");
     _ = @import("api/sql_connections.zig");
     _ = @import("api/kernel_owner_source.zig");

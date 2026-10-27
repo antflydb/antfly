@@ -176,6 +176,7 @@ pub fn Snapshot(comptime DB: type) type {
             }
         };
         fn search(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, input: cypher.backend.SearchInput) !cypher.backend.SearchPage {
+            if (input.usage) |usage| usage.examined = 0;
             const self = cast(ptr);
             if (!std.mem.eql(u8, table, self.input.table)) return error.Forbidden;
             if (input.prepared_json.len == 0) return error.CypherSearchPreparationRequired;
@@ -209,11 +210,16 @@ pub fn Snapshot(comptime DB: type) type {
             } else false;
             var membership: SearchMembership = .{ .snapshot = self, .table = table, .max_examined = input.max_examined };
             defer membership.deinit();
+            defer if (input.usage) |usage| {
+                usage.examined = @max(usage.examined orelse 0, membership.examined);
+            };
             if (!unrestricted or self.input.filter_query_json.len != 0 or self.db.core.table_catalog.row_policy_phase == .active)
                 request.native_key_predicate = .{ .ptr = &membership, .allows = SearchMembership.allows };
             request.include_stored = false;
             var result = try self.db.searchCypherCut(a, request, authorization.proof, authorization.database);
             defer result.deinit();
+            if (result.hits.len > input.max_examined) return error.CypherAnchorBudgetExceeded;
+            if (input.usage) |usage| usage.examined = result.hits.len;
             var seeds: std.ArrayList(cypher.backend.Seed) = .empty;
             const backend = self.adapter.backend();
             for (result.hits) |hit| {

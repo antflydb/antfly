@@ -920,6 +920,12 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 "statement": f"CREATE INDEX {ordered_table}_keys ON {ordered_table}(id,score DESC)"
             },
         )
+        call(
+            "/sql",
+            {
+                "statement": f"CREATE INDEX {ordered_table}_partition ON {ordered_table}(score,id)"
+            },
+        )
         for start in range(0, 64000, 4000):
             call(
                 f"/tables/{ordered_table}/batch",
@@ -943,6 +949,20 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             },
             wait_for_index=True,
         )
+        for width in (9, 32):
+            partitioned = call(
+                f"/graphs/{ordered_table}/query",
+                {
+                    "query": "MATCH(n:D) WHERE n.score IN $values RETURN n.id ORDER BY n.id LIMIT 10",
+                    "parameters": {"values": [0, 1, 2, *range(999, 999 + width - 3)]},
+                    "limits": {"scanned_anchors": 64},
+                },
+                wait_for_index=True,
+            )
+            assert [row[0]["value"] for row in partitioned["rows"]] == [
+                f"k{i:06}" for i in range(10)
+            ]
+            assert partitioned["stats"]["scanned_anchors"] <= 16
         ordered_source = f"GRAPH_TABLE({ordered_table} MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
         ordered_queries = []
         expected_groups = [[f"k{i:06}", "1"] for i in (7, 10, 13, 16, 19)]

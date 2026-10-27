@@ -23,6 +23,15 @@ exhausted: bool = false,
 pub fn allocator(self: *Budget) std.mem.Allocator {
     return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
 }
+/// Inspect a recognized statement allocator while its caller holds allocation
+/// admission. Cross-worker wrappers use this to retain failure provenance even
+/// if another successful allocation resets the ordinary per-call flag.
+pub fn allocatorExhausted(a: std.mem.Allocator) bool {
+    var probe: Budget = undefined;
+    if (a.vtable != probe.allocator().vtable) return false;
+    const budget: *Budget = @ptrCast(@alignCast(a.ptr));
+    return budget.exhausted;
+}
 fn admit(self: *Budget, growth: usize) bool {
     if (growth > self.limit -| self.live) {
         self.exhausted = true;
