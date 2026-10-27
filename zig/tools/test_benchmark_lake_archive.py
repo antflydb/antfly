@@ -36,10 +36,10 @@ else:
 
 
 class QualificationTest(unittest.TestCase):
-    def test_input_identity_rejects_replacement_in_place_edits_and_removal(self):
+    def test_input_identity_rejects_replacement_size_changes_and_removal(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "binary"
-            for mutation in ("replace", "edit", "remove"):
+            for mutation in ("replace", "resize", "remove"):
                 path.write_bytes(b"versionA")
                 identity = bench.VerifiedInput(path)
                 identity.verify(content=True)
@@ -47,12 +47,29 @@ class QualificationTest(unittest.TestCase):
                     replacement = path.with_suffix(".new")
                     replacement.write_bytes(b"versionB")
                     os.replace(replacement, path)
-                elif mutation == "edit":
-                    path.write_bytes(b"versionB")
+                elif mutation == "resize":
+                    # The cheap check cannot promise same-size edit detection
+                    # on filesystems whose timestamps have coarse resolution.
+                    path.write_bytes(b"versionB-longer")
                 else:
                     path.unlink()
                 with self.assertRaisesRegex(RuntimeError, "Qualification input"):
                     identity.verify()
+
+    def test_final_content_check_rejects_edits_with_unchanged_metadata(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "binary"
+            path.write_bytes(b"versionA")
+            identity = bench.VerifiedInput(path)
+            path.write_bytes(b"versionB")
+            # Model a coarse timestamp filesystem deterministically rather
+            # than relying on whether two writes land in the same clock tick.
+            with mock.patch.object(
+                identity, "signature", return_value=identity.identity
+            ):
+                identity.verify()
+                with self.assertRaisesRegex(RuntimeError, "Qualification input"):
+                    identity.verify(content=True)
 
     def test_restart_cannot_accept_samples_from_a_replaced_binary(self):
         with tempfile.TemporaryDirectory() as root:
@@ -60,7 +77,9 @@ class QualificationTest(unittest.TestCase):
             path.write_bytes(b"versionA")
             identity = bench.VerifiedInput(path)
             client = mock.Mock()
-            client.server.restart.side_effect = lambda: path.write_bytes(b"versionB")
+            client.server.restart.side_effect = lambda: path.write_bytes(
+                b"versionB-longer"
+            )
             with mock.patch.object(bench, "MemorySample"):
                 with self.assertRaisesRegex(RuntimeError, "input changed"):
                     bench.run_queries(
