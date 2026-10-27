@@ -4490,6 +4490,10 @@ test "metadata durable job facade preserves state owner counts and bounded scan 
         try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = "", .value = queued } });
     }
     try std.testing.expectEqual(limit, try store.getJobOwnerCount(a, 41, "alice"));
-    try std.testing.expectError(error.TooManyActiveJobs, store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = "documents/over-quota", .expected_hash = "", .value = queued } }));
+    // Raft apply rejects quota conflicts as deterministic no-ops; the service
+    // reports TooManyActiveJobs before proposal using this owner-count read.
+    try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = "documents/over-quota", .expected_hash = "", .value = queued } });
     try std.testing.expect((try store.getJobState(a, 41, "documents/over-quota")) == null);
+    try std.testing.expectEqual(limit, try store.getJobOwnerCount(a, 41, "alice"));
+    try std.testing.expectError(error.TooManyActiveJobs, error_identity.statusToError(error_identity.statusFromError(error.TooManyActiveJobs)));
 }
