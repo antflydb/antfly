@@ -869,6 +869,8 @@ class AntflyClient:
             if response.status_code >= 400 or (
                 _expected_status is not None and response.status_code != _expected_status
             ):
+                if path.startswith("/ai/v1/"):
+                    _raise_inference_error(response)
                 body, truncated = _read_limited_response(response, self.max_error_response_bytes)
                 if truncated:
                     msg = (
