@@ -1078,6 +1078,10 @@ pub const Owner = struct {
             defer {
                 if (!gate_locked) self.gate.mutex.lockUncancelable(io);
                 foreground.maintenance_references -= 1;
+                // The proof reader's later defer has already released its
+                // borrowed allocator and executor. A foreground replacement
+                // must not retain this now-unpinned runtime until another call.
+                self.collectRetired();
                 if (!gate_locked) self.gate.mutex.unlock(io);
             }
             const reader = try foreground_file.captureAllocatorVerificationSnapshot(&self.verification_cancel);
