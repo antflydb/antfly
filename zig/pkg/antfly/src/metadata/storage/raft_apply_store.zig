@@ -24472,13 +24472,14 @@ pub const RaftApplyStore = struct {
         return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:job:", .{group_id});
     }
     fn resolverNamespaceReadReady(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) !bool {
-        // v13 adds owner-maintained pin postings. Existing v12 directory,
-        // declaration and profile proofs remain valid during that backfill.
+        // v14 adds static pin membership and resumable owner paths. Existing
+        // v12/v13 declaration and profile proofs remain valid during backfill.
         if (try stagingGet(txn, try resolverNamespaceBootstrapKey(a, group)) != null) return true;
+        if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v13", .{group})) != null) return true;
         return try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v12", .{group})) != null;
     }
     fn resolverNamespaceBootstrapKey(a: std.mem.Allocator, group_id: u64) ![]const u8 {
-        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v13", .{group_id});
+        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v14", .{group_id});
     }
     fn resolverConfigs(a: std.mem.Allocator, root: std.json.Value) ![]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig {
         const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
@@ -24961,9 +24962,9 @@ pub const RaftApplyStore = struct {
         const first = (try nextResolverNamespaceJobTxn(a, &txn, group)) orelse return null;
         var job = try std.json.parseFromSliceLeaky(ResolverNamespaceJob, a, first.value, .{});
         if (job.retire) return null;
-        if ((!job.bootstrap or job.bootstrap_generation != 13) and try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group)) == null) {
+        if ((!job.bootstrap or job.bootstrap_generation != 14) and try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group)) == null) {
             job.bootstrap = true;
-            job.bootstrap_generation = 13;
+            job.bootstrap_generation = 14;
             job.after = null;
             job.ownership_turn = 0;
         }
@@ -25055,9 +25056,9 @@ pub const RaftApplyStore = struct {
         defer cursor.close();
         const first = (try nextResolverNamespaceJobTxn(a, &txn, group_id)) orelse return alloc.alloc(metadata.TableRecord, 0);
         var job = try std.json.parseFromSliceLeaky(ResolverNamespaceJob, a, first.value, .{});
-        if ((!job.bootstrap or job.bootstrap_generation != 13) and try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group_id)) == null) {
+        if ((!job.bootstrap or job.bootstrap_generation != 14) and try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group_id)) == null) {
             job.bootstrap = true;
-            job.bootstrap_generation = 13;
+            job.bootstrap_generation = 14;
             job.after = null;
             job.ownership_turn = 0;
         }
@@ -25108,9 +25109,9 @@ pub const RaftApplyStore = struct {
         };
         var job = try std.json.parseFromSliceLeaky(ResolverNamespaceJob, a, raw, .{});
         try txn.put(try resolverScheduleKey(a, group_id), job_key);
-        if ((!job.bootstrap or job.bootstrap_generation != 13) and try stagingGet(txn, try resolverNamespaceBootstrapKey(a, group_id)) == null) {
+        if ((!job.bootstrap or job.bootstrap_generation != 14) and try stagingGet(txn, try resolverNamespaceBootstrapKey(a, group_id)) == null) {
             job.bootstrap = true;
-            job.bootstrap_generation = 13;
+            job.bootstrap_generation = 14;
             job.after = null;
             job.ownership_turn = 0;
         }
@@ -42559,7 +42560,9 @@ test "resolver curation namespace propagation query profile references reuse can
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = &.{cfg} }, .{}) } });
     var turns: usize = 0;
     while (try store.pendingResolverNamespaceWork(a, group, true)) |work| {
-        try std.testing.expect(turns < 8);
+        // Static membership now backfills 2,001 pin postings in 128-work
+        // pages, in addition to directory enrollment and binding publication.
+        try std.testing.expect(turns < (pairs.len * 2 + 1 + 127) / 128 + 8);
         try store.applyStandaloneCommand(group, .{ .advance_resolver_namespace = work.advance });
         turns += 1;
     }
@@ -42777,7 +42780,7 @@ test "resolver curation namespace propagation shared query producers serialize o
     try std.testing.expectError(error.NotFound, txn.get(producer_key));
 }
 
-test "resolver curation namespace propagation v13 readiness waits for bounded ownership backfill" {
+test "resolver curation namespace propagation v14 readiness waits for bounded ownership backfill" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -42954,7 +42957,7 @@ test "resolver curation namespace propagation compact execution admits bounded p
     var verify = request;
     verify.expected_query_fingerprint = compact.query_fingerprint;
     try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, verify));
-    std.debug.print("COMPACT QUERY aliases=10000 suppression_entries=100000 response_bytes={d} arena_bytes={d} hydrated_aliases=0 readiness=fenced backfill=v13\n", .{ bytes.len, bounded.queryCapacity() });
+    std.debug.print("COMPACT QUERY aliases=10000 suppression_entries=100000 response_bytes={d} arena_bytes={d} hydrated_aliases=0 readiness=fenced backfill=v14\n", .{ bytes.len, bounded.queryCapacity() });
 }
 
 test "resolver curation namespace propagation render fences one destination while retaining sibling declarations" {
@@ -43220,7 +43223,7 @@ test "resolver curation namespace propagation snapshot registry retains document
     try std.testing.expect((try target.getJobState(a, 42, "documents/snapshot")) == null);
 }
 
-test "resolver curation namespace propagation v12 read proofs remain ready during v13 pin backfill" {
+test "resolver curation namespace propagation v12 read proofs remain ready during v14 pin backfill" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -43241,6 +43244,10 @@ test "resolver curation namespace propagation v12 read proofs remain ready durin
     try std.testing.expect(try RaftApplyStore.resolverNamespaceReadReady(temporary, &txn, group));
     try std.testing.expect((try RaftApplyStore.bootstrapResolverNamespaceJobTxn(temporary, &txn, group)) != null);
     try std.testing.expectError(error.NotFound, txn.get(current));
+    try txn.delete(try std.fmt.allocPrint(temporary, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v12", .{group}));
+    try txn.put(try std.fmt.allocPrint(temporary, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v13", .{group}), "1");
+    try std.testing.expect(try RaftApplyStore.resolverNamespaceReadReady(temporary, &txn, group));
+    try std.testing.expect((try RaftApplyStore.bootstrapResolverNamespaceJobTxn(temporary, &txn, group)) != null);
     txn.abort();
 }
 

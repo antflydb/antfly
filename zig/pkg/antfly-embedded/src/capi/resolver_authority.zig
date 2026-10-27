@@ -747,7 +747,7 @@ fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection 
 /// Build one current namespace outside writer leases and publish all local
 /// consumers atomically. Missing/recreated destinations retract old projections
 /// immediately, independent of physical cleanup of the retired authority.
-const query_pins_owner_marker = prefix ++ "query-pins-owner-enrolled-v1";
+const query_pins_owner_marker = prefix ++ "query-pins-owner-enrolled-v2";
 fn queryPinsWorkPossible(database: *h.db_mod.DB, a: A) !bool {
     if (!database.core.index_manager.hasResolverDefinitions()) return false;
     _ = database.core.store.get(a, query_pins_owner_marker) catch |err| return if (err == error.NotFound) true else err;
@@ -1368,7 +1368,7 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"pin_distinct\":true}"), &out));
     api.antfly_buffer_free(&out);
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
-    try std.testing.expectEqualStrings("21", try root.db.core.store.get(a, catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings("22", try root.db.core.store.get(a, catalog.minimum_reader_key));
 }
 
 test "capi resolver curation static directory fences consumers enrolled after discovery" {
@@ -1864,11 +1864,11 @@ test "capi resolver curation owner materializes graph fenced root pins and reope
     const cfg: h.db_mod.ResolverConfig = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .promote = false, .aliases = &.{.{ .key = "entity/alias", .target = "entity/root" }} };
     try root.db.addResolver(cfg);
     const id = try (native.static_profiles.Definition{ .key_template = cfg.key_template, .aliases = cfg.aliases }).identity(a);
-    _ = try entity(root, a, "entities", "entity/native", .{ .action = .merge, .into = "entity/root" }, .{});
     _ = try entity(root, a, "entities", "entity/root", .{ .action = .distinct, .into = "entity/other" }, .{});
-    for (0..3) |phase| {
-        if (phase == 2) _ = try entity(root, a, "entities", "entity/native", .{ .action = .unmerge }, .{});
-        if (phase == 1) {
+    for (0..4) |phase| {
+        if (phase == 3) _ = try entity(root, a, "entities", "entity/native", .{ .action = .unmerge }, .{});
+        if (phase == 1) _ = try entity(root, a, "entities", "entity/native", .{ .action = .merge, .into = "entity/root" }, .{});
+        if (phase == 2) {
             api.antfly_db_close(handle);
             root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null);
             handle = try api.publishHandle(root);
@@ -1889,6 +1889,6 @@ test "capi resolver curation owner materializes graph fenced root pins and reope
         defer prepared.release();
         const page = try authority.queryExecutionPrepared(prepared, &.{"entity/root"}, &.{}, true);
         try std.testing.expectEqual(@as(usize, 1), page.namespace.state.distinct.len);
-        try std.testing.expectEqualStrings("21", try root.db.core.store.get(a, catalog.minimum_reader_key));
+        try std.testing.expectEqualStrings("22", try root.db.core.store.get(a, catalog.minimum_reader_key));
     }
 }

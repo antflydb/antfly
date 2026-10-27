@@ -2709,32 +2709,38 @@ boundaries worth canonicalizing. The same join handles alternating configured
 and native edges, removed configured aliases and native-only pin branches.
 Ordinary native overrides with zero pin weight do not participate.
 
-Uncurated graphs seek each requested static component directly, then intersect
-only that component's nodes with native pin weights. They never build a
-profile-wide pin projection. Curated graphs use destination-owned durable
+Static and curated graphs use destination-owned durable
 `query-pins-v1/<namespace>/<profile>/member/<root>/<boundary>` postings. A
 `state` row binds complete membership to the immutable profile identity and
-native graph fingerprint. Reads seek the requested roots' posting prefixes
-before following their pin-bearing native branches. No cache lease or entry-size
-budget participates in this ready path.
+native graph fingerprint. Ready reads seek only the requested roots' posting
+prefixes before following their pin-bearing native branches. Static component
+seeks remain an exact fallback during backfill, rather than a permanent repeated
+intersection with unrelated namespace pins. No cache lease or entry-size budget
+participates in the ready path.
 
-Only owner maintenance builds membership. A turn reads at most 128 native
-pin-count postings and publishes at most 129 member/state writes in the same
-native transaction. Cursor/path scratch and path-compression memo have separate
-bounded ownership. Redirect, removed-alias and distinct edits change the graph
-fingerprint and immediately exclude the previous generation. A replacement
-first clears its old members in bounded pages, then builds new postings; only
-the final page publishes readiness. Text-only edits reuse the same graph cut.
+Only owner maintenance builds membership. One shared budget limits a turn to
+128 posting skips, forward hops, path-compression steps and member publications,
+with at most 129 derived/state writes. Each hop resets reusable scratch; a durable
+walk cursor stores only its boundary, current node, hop count and optional resolved
+root. Complete configured paths never accumulate in a turn's arena. Static-only
+graphs jump directly through immutable scalar canonical nodes. Curated walks
+publish graph-fenced `path/<node>` canonical shortcuts during a bounded second
+pass, so later converging boundaries reuse completed paths across owner turns.
+The cursor, shortcuts, members and readiness share one native transaction.
+Redirect, removed-alias and distinct edits immediately fence the whole generation,
+including paused walks and shortcuts. A replacement clears its old members and
+paths in bounded pages; only the final build page publishes readiness. Text-only
+edits reuse the same graph cut.
 A profile enrollment epoch also drives bounded retirement cleanup, so replacing
 immutable profiles does not accumulate their obsolete membership generations.
 Namespace retirement uses the existing bounded native-prefix cleanup.
 
 Metadata namespace replay advances these pages before acknowledging a source
 binding. Partial work yields to pending sibling namespaces and retains each
-namespace's source cursor and dirty state. Bootstrap v13 discovers historical
-curated profiles even in an idle catalog. Already-certified v12 declaration,
+namespace's source cursor and dirty state. Bootstrap v14 discovers historical
+static and curated profiles even in an idle catalog. Already-certified v12/v13 declaration,
 consumer and profile proofs remain usable during this backfill; pin readiness
-is a separate graph-specific watermark. Metadata topology version 60 gates the
+is a separate graph-specific watermark. Metadata topology version 61 gates the
 new durable owner work. Lite maintenance uses the same generation builder under
 its destination writer grant, retains the source work item until complete, and
 preserves ready postings on reopen. Historical Lite sources enroll their scopes
@@ -2742,13 +2748,13 @@ in the existing fair work queue; partial pin pages advance its observation curso
 without deleting the pending work. Scoped admission identities reuse cached
 profile hashes and avoid cloning unrelated alias declarations. The physical
 profile-enrollment cut is revalidated after writer admission before member or
-retirement publication. Lite reader version 21 fences the additional
+retirement publication. Lite reader version 22 fences the additional
 native records and enrollment epochs. An existing ready directory needs only
 a reader-floor update, not a wholesale rebuild; read-only files do not attempt
 that update. Source documents, native heads and final authorization keep their
 independent live fences.
 
-Legacy or not-yet-materialized curated profiles retain the exact bounded-scratch
+Legacy or not-yet-materialized profiles retain the exact bounded-scratch
 sparse-join fallback until owner work completes. Foreground reads never publish
 projections or advance backfill. Ready root postings make read work proportional
 to requested roots and their returned boundaries, even when the complete profile
@@ -2766,3 +2772,11 @@ regression remains bounded. The independent full-composition reference checks
 membership and exact legacy fallback across alternating paths and removed aliases.
 Metadata replay and Lite reopen tests verify the service adapters use this shared
 contract.
+
+The dense-component regression has 1,000 and 6,000 unrelated pins and equally
+many unpinned aliases in the queried component. Three repeated indexed reads
+return no pairs in four scans at both sizes (previously 1,366 and 7,992 scans
+per request). A 16,000-edge configured-chain regression checks bounded durable
+resume, invalidation during a paused walk, converging-boundary shortcut reuse,
+portable state validation and final readiness without scratch exhaustion. Lite
+owner tests exercise static materialization, curation, reopen and unmerge.
