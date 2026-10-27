@@ -1909,6 +1909,7 @@ const RaftTableApplyStateMachine = struct {
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
         storage_owner_descriptor: ?kernel_owner_descriptor.Descriptor,
+        document_reader_format: u32,
     ) !void {
         if (@import("builtin").is_test) {
             self.test_faults.document_apply_attempts += 1;
@@ -1933,7 +1934,7 @@ const RaftTableApplyStateMachine = struct {
                 }
             }
         }
-        const entry: antfly.db.types.OrderedApplyReceipt = .{ .term = entry_term, .index = entry_index };
+        const entry: antfly.db.types.OrderedApplyReceipt = .{ .term = entry_term, .index = entry_index, .document_reader_format = document_reader_format };
         if (comptime linked_storage) {
             const owner_source = self.kernel_owner_source orelse
                 return error.StorageKernelOwnerUnavailable;
@@ -1953,7 +1954,7 @@ const RaftTableApplyStateMachine = struct {
                 if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
                 return;
             };
-            try owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+            try owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntryWithDocumentReaders(
                 self.alloc,
                 group_id,
                 table_name,
@@ -1961,6 +1962,7 @@ const RaftTableApplyStateMachine = struct {
                 req,
                 entry.term,
                 entry.index,
+                document_reader_format,
             );
             // The descriptor-pinned owner call intentionally bypasses the
             // ProvisionedTableWriteSource mutation vtable. Publish the
@@ -2236,7 +2238,7 @@ const RaftTableApplyStateMachine = struct {
                         // Advance the native marker without its effects before
                         // publishing the same typed outcome to the proposer.
                         if (batchRequiresDocumentDbApply(decoded.batch.req)) {
-                            self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null) catch |err| switch (err) {
+                            self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null, decoded.document_reader_format) catch |err| switch (err) {
                                 error.RaftApplyWriterUnavailable, error.RetainedEffectsFull, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
                                 else => return err,
                             };
@@ -2267,6 +2269,7 @@ const RaftTableApplyStateMachine = struct {
                         decoded.table_name,
                         decoded.batch.req,
                         if (decoded.storage_owner_descriptor) |*value| value.view() else null,
+                        decoded.document_reader_format,
                     ) catch |err| {
                         if (ExpectedApplyFailure.forRequest(err, decoded.batch.req)) |failure| {
                             // Transaction conflicts are deterministic command
@@ -3900,6 +3903,7 @@ const DataRaftProtocolActivationEntry = struct {
     /// until the durable apply-store marker is visible.
     pending_term: std.atomic.Value(u64) = .init(0),
     pending_version: std.atomic.Value(u16) = .init(0),
+    document_probe_after_ns: std.atomic.Value(u64) = .init(0),
 
     fn retain(self: *@This()) void {
         const previous = self.ref_count.fetchAdd(1, .monotonic);
@@ -12995,32 +12999,32 @@ pub const DataServer = struct {
         };
     }
 
+    fn preferredDocumentProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        // The first eligible write upgrades automatically. Small/write-once
+        // tables do not trigger extra negotiation or a storage rewrite.
+        if (req.transforms.len != 0) return @import("../common/data_raft_protocol.zig").batch_document_fields_protocol_version;
+        for (req.writes) |write| if (write.value.len >= 65536)
+            return @import("../common/data_raft_protocol.zig").batch_document_fields_protocol_version;
+        return 0;
+    }
+
     fn dataRaftBatchProtocolPreflight(
         self: *DataServer,
         alloc: std.mem.Allocator,
         plan: DataRaftProtocolProbePlan,
         required_version: u16,
+        preferred_version: u16,
         deadline_ns: u64,
         cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
     ) DataRaftBatchProtocolPreflight {
         if (!plan.routes_complete) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
-        const minimum_peer_version = if (required_version >= data_raft_batch.merge_transition_protocol_version)
-            required_version
-        else
-            data_raft_batch.activation_barrier_protocol_version;
+        var common = preferred_version;
         for (plan.peers) |peer| {
-            if (self.probeDataRaftBatchProtocolVersion(
-                alloc,
-                peer.node_id,
-                peer.raft_url,
-                deadline_ns,
-                cancellation,
-            ) < minimum_peer_version) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+            const version = self.probeDataRaftBatchProtocolVersion(alloc, peer.node_id, peer.raft_url, deadline_ns, cancellation);
+            if (version < @max(required_version, data_raft_batch.activation_barrier_protocol_version)) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+            common = @min(common, version);
         }
-        return .{
-            .conf_state_fingerprint = plan.conf_state_fingerprint,
-            .activatable_version = required_version,
-        };
+        return .{ .conf_state_fingerprint = plan.conf_state_fingerprint, .activatable_version = common };
     }
 
     fn proposeRaftBatchGroupWithLeaderWait(
@@ -13042,6 +13046,7 @@ pub const DataServer = struct {
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
         const required_protocol_version = requiredRaftBatchProtocolVersion(req);
+        const preferred_protocol_version = @max(required_protocol_version, preferredDocumentProtocolVersion(req));
         const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
         try ensureDataRaftBatchRouteActive(route);
         try self.reachDataRequestLifecycle(.{
@@ -13104,7 +13109,9 @@ pub const DataServer = struct {
                 }
                 const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
                 protocol_activation_entry = activation_entry;
-                if (activation_entry.protocol_version.load(.acquire) >= required_protocol_version) {
+                if (activation_entry.protocol_version.load(.acquire) >= preferred_protocol_version or
+                    (activation_entry.protocol_version.load(.acquire) >= required_protocol_version and self.dataRaftMonotonicNs() < activation_entry.document_probe_after_ns.load(.acquire)))
+                {
                     protocol_preflight.activatable_version = activation_entry.protocol_version.load(.acquire);
                 } else {
                     // An in-flight capability probe is not evidence that the
@@ -13142,7 +13149,10 @@ pub const DataServer = struct {
                             else => return err,
                         }
                     };
-                    if (durable_version >= required_protocol_version) {
+                    activation_entry.protocol_version.store(durable_version, .release);
+                    if (durable_version >= preferred_protocol_version or
+                        (durable_version >= required_protocol_version and self.dataRaftMonotonicNs() < activation_entry.document_probe_after_ns.load(.acquire)))
+                    {
                         activation_entry.protocol_version.store(durable_version, .release);
                         activation_entry.pending_term.store(0, .release);
                         activation_entry.pending_version.store(0, .release);
@@ -13156,13 +13166,17 @@ pub const DataServer = struct {
                             // accepted barrier orders every later proposal.
                             // Until that barrier applies, concurrent requests
                             // use legacy encoding without repeating probes.
-                            if (activation_entry.pending_term.load(.acquire) == status.hard.current_term and
-                                activation_entry.pending_version.load(.acquire) >= required_protocol_version)
-                            {
-                                break :preflight .{};
+                            if (activation_entry.pending_term.load(.acquire) == status.hard.current_term) {
+                                const pending = activation_entry.pending_version.load(.acquire);
+                                if (pending >= preferred_protocol_version or
+                                    (pending >= required_protocol_version and self.dataRaftMonotonicNs() < activation_entry.document_probe_after_ns.load(.acquire))) break :preflight .{};
+                                // A lower accepted barrier still orders this
+                                // term's proposals. Keep it while probing a
+                                // higher optional upgrade; never regress it.
+                            } else {
+                                activation_entry.pending_term.store(0, .release);
+                                activation_entry.pending_version.store(0, .release);
                             }
-                            activation_entry.pending_term.store(0, .release);
-                            activation_entry.pending_version.store(0, .release);
                             break :preflight try self.dataRaftProtocolProbePlanLocked(
                                 alloc,
                                 raft,
@@ -13176,9 +13190,15 @@ pub const DataServer = struct {
                             alloc,
                             protocol_plan,
                             required_protocol_version,
+                            preferred_protocol_version,
                             deadline_ns,
                             route.cancellation,
                         );
+                        if (protocol_preflight.activatable_version < preferred_protocol_version) {
+                            // Negative evidence only delays this optional upgrade;
+                            // it never authorizes a reader or a new command.
+                            activation_entry.document_probe_after_ns.store(self.dataRaftMonotonicNs() +| 5 * std.time.ns_per_s, .release);
+                        }
                     }
                 }
                 try ensureDataRaftBatchRouteActive(route);
@@ -13275,14 +13295,14 @@ pub const DataServer = struct {
                                 protocol_activation_entry.?.pending_version.load(.acquire),
                             );
                         }
-                        if (active_protocol_version < required_protocol_version and
+                        if (active_protocol_version < protocol_preflight.activatable_version and
                             protocol_preflight.activatable_version >= required_protocol_version and
                             protocol_preflight.conf_state_fingerprint == dataRaftConfStateFingerprint(status.conf_state))
                         {
                             const barrier = try data_raft_batch.encodeProtocolBarrier(
                                 alloc,
                                 table_name,
-                                required_protocol_version,
+                                protocol_preflight.activatable_version,
                             );
                             defer alloc.free(barrier);
                             var barrier_index: ?u64 = null;
@@ -13305,8 +13325,8 @@ pub const DataServer = struct {
                                 }
                             };
                             if (barrier_index != null) {
-                                active_protocol_version = required_protocol_version;
-                                protocol_activation_entry.?.pending_version.store(required_protocol_version, .release);
+                                active_protocol_version = protocol_preflight.activatable_version;
+                                protocol_activation_entry.?.pending_version.store(active_protocol_version, .release);
                                 protocol_activation_entry.?.pending_term.store(status.hard.current_term, .release);
                             }
                         }
@@ -13328,15 +13348,13 @@ pub const DataServer = struct {
                             self.dataRaftRealtimeNs(),
                         );
                         const proposal_term = status.hard.current_term;
-                        const encoded = if (comptime linked_storage)
-                            try data_raft_batch.encodeWithStorageOwnerDescriptor(
-                                alloc,
-                                table_name,
-                                proposal_req,
-                                if (restore_owner_descriptor) |*descriptor| descriptor.view() else storage_owner_descriptor.?.view(),
-                            )
-                        else
-                            try data_raft_batch.encode(alloc, table_name, proposal_req);
+                        const encoded = try data_raft_batch.encodeWithDocumentReaders(
+                            alloc,
+                            table_name,
+                            proposal_req,
+                            if (comptime linked_storage) (if (restore_owner_descriptor) |*descriptor| descriptor.view() else storage_owner_descriptor.?.view()) else null,
+                            if (active_protocol_version >= @import("../common/data_raft_protocol.zig").batch_document_fields_protocol_version) 29 else 0,
+                        );
                         defer alloc.free(encoded);
                         var accepted_index: ?u64 = null;
                         raft.host.http_host.proposeWithReceipt(group_id, encoded, &accepted_index) catch |err| {
@@ -41988,6 +42006,57 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(.{
                 .restore_staging = .{ .finish = .{ .scope = @splat(4), .phase = .validated } },
             }));
+        }
+
+        test "raft batch protocol optional reader upgrade probes once and preserves mixed-version writes" {
+            const a = std.testing.allocator;
+            const http = antfly.raft.transport.http_common;
+            const Fixture = struct {
+                second_version: u16 = 24,
+                calls: usize = 0,
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http.HttpRequest) anyerror!http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    const version: u16 = if (std.mem.indexOf(u8, request.uri, "node-2") != null) self.second_version else 25;
+                    return .{ .status = 200, .body = try std.fmt.allocPrint(alloc, "{{\"data_raft_batch_protocol_version\":{d}}}", .{version}) };
+                }
+            };
+            var fixture: Fixture = .{};
+            var host: antfly.raft.HttpHost = undefined;
+            host.request_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } };
+            var raft: antfly.raft.ManagedHttpHostService = undefined;
+            raft.host.http_host = &host;
+            var server: DataServer = undefined;
+            server.alloc = a;
+            server.backend_runtime = null;
+            server.data_raft = &raft;
+            server.api_server_cfg.internal_service_secret = null;
+            server.api_server_cfg.internal_service_issuer = null;
+            server.data_raft_protocol_capability_mutex = .unlocked;
+            server.data_raft_protocol_capabilities = .empty;
+            defer {
+                var it = server.data_raft_protocol_capabilities.valueIterator();
+                while (it.next()) |entry| a.destroy(entry.*);
+                server.data_raft_protocol_capabilities.deinit(a);
+            }
+            const peers = [_]DataRaftProtocolPeer{ .{ .node_id = 1, .raft_url = "http://node-1" }, .{ .node_id = 2, .raft_url = "http://node-2" } };
+            const plan: DataRaftProtocolProbePlan = .{ .routes_complete = true, .conf_state_fingerprint = 99, .peers = &peers };
+            const old_command = server.dataRaftBatchProtocolPreflight(a, plan, 1, 25, std.math.maxInt(u64), null);
+            try std.testing.expectEqual(@as(u16, 24), old_command.activatable_version);
+            try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+            // A v24 command still succeeds when the optional v25 upgrade cannot.
+            const required = server.dataRaftBatchProtocolPreflight(a, plan, 24, 25, std.math.maxInt(u64), null);
+            try std.testing.expectEqual(@as(u16, 24), required.activatable_version);
+            try std.testing.expectEqual(@as(usize, 4), fixture.calls);
+            const unavailable = server.dataRaftBatchProtocolPreflight(a, plan, 25, 25, std.math.maxInt(u64), null);
+            try std.testing.expectEqual(@as(u16, 0), unavailable.activatable_version);
+            fixture.second_version = 25;
+            const ready = server.dataRaftBatchProtocolPreflight(a, plan, 1, 25, std.math.maxInt(u64), null);
+            try std.testing.expectEqual(@as(u16, 25), ready.activatable_version);
+            // Timestamp v1 is legitimate after peers prove the v2 barrier
+            // decoder; the requested version is distinct from that decoder floor.
+            const timestamp = server.dataRaftBatchProtocolPreflight(a, plan, 1, 1, std.math.maxInt(u64), null);
+            try std.testing.expectEqual(@as(u16, 1), timestamp.activatable_version);
         }
 
         test "raft batch protocol preflight fingerprint fences every applying replica set" {

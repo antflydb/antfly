@@ -91,11 +91,14 @@ pub const CompiledTableValidator = struct {
     /// Borrowed names from the immutable parsed schema; only the slice is owned.
     uuid_columns: []const []const u8,
     owns_schema: bool,
+    rule_fingerprint: ?[32]u8 = null,
 
     pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
         var schema = try parseValidatedTableSchema(alloc, schema_json);
         errdefer schema.deinit(alloc);
-        return takeParsed(alloc, schema);
+        var compiled = try takeParsed(alloc, schema);
+        compiled.rule_fingerprint = @import("../storage/document_validation.zig").fingerprint(schema_json);
+        return compiled;
     }
 
     pub fn initParsed(alloc: std.mem.Allocator, schema: ParsedTableSchema) !CompiledTableValidator {
@@ -138,6 +141,15 @@ pub const CompiledTableValidator = struct {
     pub fn validateValue(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
         try impl.validateDocumentValueWithPlan(alloc, self.schema, value, self.physical_fields, &self.execution);
         try self.requireCanonicalUuid(value.*);
+    }
+
+    pub fn supportsRootValidationReuse(self: CompiledTableValidator) bool {
+        return self.rule_fingerprint != null and self.uuid_columns.len == 0 and impl.supportsRootValidationReuse(self.schema, &self.execution);
+    }
+
+    pub fn validateChangedRoots(self: CompiledTableValidator, a: std.mem.Allocator, shadow: *std.json.Value, unchanged: *const std.StringHashMapUnmanaged(void)) !void {
+        if (!self.supportsRootValidationReuse()) return error.Unsupported;
+        return impl.validateChangedRootsWithPlan(a, self.schema, shadow, self.physical_fields, &self.execution, unchanged);
     }
 
     pub fn prepareValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value) !void {

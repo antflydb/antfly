@@ -2055,7 +2055,7 @@ pub const RaftApplyStore = struct {
             .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
             .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
             .merge_page_fence => |payload| alloc.free(payload),
-            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
+            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .require_batch_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
         }
     }
 
@@ -2109,7 +2109,7 @@ pub const RaftApplyStore = struct {
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
                 .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
                 .merge_page_fence => |payload| alloc.free(payload),
-                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
+                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .require_batch_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
             };
             operations.deinit(alloc);
         }
@@ -2416,6 +2416,7 @@ pub const RaftApplyStore = struct {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
             return;
         }
+        if (decoded.document_reader_format != 0) try operations.append(alloc, .{ .require_batch_protocol = @import("../../common/data_raft_protocol.zig").batch_document_fields_protocol_version });
         const native_transfer = decoded.batch.req.restore_staging != null or
             (if (decoded.batch.req.merge_page) |page| page.source.integrity != null else false) or
             (if (decoded.batch.req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| source.integrity != null else false else false);
@@ -5803,4 +5804,17 @@ test "data apply store replay is idempotent when applied watermark lags WAL stat
         try std.testing.expectEqual(@as(u64, 1), normal_entries[0].index);
         try std.testing.expectEqual(@as(u64, 2), normal_entries[1].index);
     }
+}
+
+test "raft batch protocol document reader permission retains its raw apply guard" {
+    const a = std.testing.allocator;
+    const bytes = try data_raft_batch.encodeWithDocumentReaders(a, "docs", .{}, null, 29);
+    defer a.free(bytes);
+    var operations: std.ArrayListUnmanaged(shard_state_store.DataOperation) = .empty;
+    defer {
+        for (operations.items) |operation| RaftApplyStore.freeDataOperation(a, operation);
+        operations.deinit(a);
+    }
+    try RaftApplyStore.appendDataOperations(a, 3, bytes, &operations, true);
+    try std.testing.expectEqual(@as(u16, 25), operations.items[0].require_batch_protocol);
 }

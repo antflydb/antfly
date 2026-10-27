@@ -16,6 +16,7 @@
 //! Local document materialization and owned result collection. Callers retain
 //! storage/catalog fences; these functions borrow stores and managers only.
 const std = @import("std");
+const source_claim = @import("../index_source_claim.zig");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const mapper = @import("document_mapper.zig");
@@ -82,9 +83,17 @@ pub const CollectedTextDocumentWrites = struct {
     // docs remain stable after the read transaction and this result move.
     document_bytes: []u8 = &.{},
     materialized_documents: std.ArrayListUnmanaged(index_manager_mod.IndexManager.MaterializedStoredDocument) = .empty,
+    source_read: ?*docstore_mod.DocStore.Txn = null,
+    source_observations: []source_claim.ObservedSource = &.{},
     missing_required: usize = 0,
 
     pub fn deinit(self: *@This()) void {
+        for (self.source_observations) |*source| source.deinit(self.alloc);
+        self.alloc.free(self.source_observations);
+        if (self.source_read) |read| {
+            read.abort();
+            self.alloc.destroy(read);
+        }
         for (self.materialized_documents.items) |*doc| doc.deinit(self.alloc);
         self.materialized_documents.deinit(self.alloc);
         for (self.owned_values.items) |value| self.alloc.free(value);
@@ -313,7 +322,27 @@ pub fn collectTextDocumentWritesForIndex(
     var schema_views = index_manager_mod.IndexManager.SchemaViewSet.init(index_manager);
     defer schema_views.deinit();
 
-    const trust_inline = if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
+    // Only an admitted JSON-source table retains observations. Legacy tables
+    // keep the current-probe and trusted inline fast paths unchanged.
+    if (store.documentLayoutEnabled() and !opts.relational_base_rows and !chunk_backed and
+        @import("../schema.zig").maximum_reader_format_version >= 28)
+    {
+        const read = try alloc.create(docstore_mod.DocStore.Txn);
+        errdefer alloc.destroy(read);
+        read.* = try store.beginReadTxn();
+        errdefer read.abort();
+        const raw_schema: ?[]const u8 = read.getPhysical(@import("../schema.zig").schema_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (if (raw_schema) |bytes| try @import("../schema.zig").serializedReaderFormat(bytes) >= 28 else false) {
+            result.source_read = read;
+        } else {
+            read.abort();
+            alloc.destroy(read);
+        }
+    }
+    const trust_inline = result.source_read == null and if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
         store.nextReplaySequence(sequence + 1) == sequence + 1
     else
         false;
@@ -364,8 +393,9 @@ pub fn collectTextDocumentWritesForIndex(
 
     if (pending.items.len == 0) return result;
 
-    var txn = try store.beginProbeTxn();
-    defer txn.abort();
+    var probe = if (result.source_read == null) try store.beginProbeTxn() else null;
+    defer if (probe) |*read| read.abort();
+    const txn = result.source_read orelse &probe.?;
     const SortContext = struct {};
     std.mem.sort(PendingTextWrite, pending.items, SortContext{}, struct {
         fn lessThan(_: SortContext, lhs: PendingTextWrite, rhs: PendingTextWrite) bool {
@@ -380,6 +410,19 @@ pub fn collectTextDocumentWritesForIndex(
 
     for (pending.items, 0..) |item, i| {
         read_keys[i] = item.store_key;
+    }
+    if (result.source_read) |read| {
+        const ordinary = for (pending.items) |item| {
+            if (!ordinaryTextDocument(item.doc_key, item.store_key)) break false;
+        } else true;
+        if (ordinary) if (try source_claim.ObservedSource.readSortedOwned(alloc, read, read_keys)) |observations| {
+            result.source_observations = observations;
+            try result.docs.ensureUnusedCapacity(alloc, observations.len);
+            for (pending.items, observations) |item, *source| {
+                result.docs.appendAssumeCapacity(.{ .key = item.doc_key, .value = source.produced, .source_bytes = source.produced.len, .source_observation = source });
+            }
+            return result;
+        };
     }
     try txn.getManySorted(read_keys, read_values);
 
@@ -417,7 +460,7 @@ pub fn collectTextDocumentWritesForIndex(
 
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse item.inline_value orelse {
-            if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
+            if (try replayDocumentIsDurablyDeleted(alloc, txn, item.doc_key)) continue;
             if (opts.tolerate_missing_replay_documents) {
                 std.log.warn(
                     "full-text replay giving up on a document with no visible content after bounded retries index={s} key={s}",
@@ -482,6 +525,35 @@ pub fn collectTextDocumentWritesForIndex(
             removed.deinit(alloc);
             return err;
         };
+    }
+
+    if (result.source_read) |read| {
+        const observations = try alloc.alloc(source_claim.ObservedSource, result.docs.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (observations[0..initialized]) |*source| source.deinit(alloc);
+            alloc.free(observations);
+        }
+        for (result.docs.items) |*doc| {
+            // Artifact and typed rows require their own producer observations.
+            // Never label a transformed source as an exact primary afterimage.
+            if (internal_keys.isInternalUserKey(doc.key) or doc.root != null) continue;
+            const physical = try internal_keys.documentKeyAlloc(alloc, doc.key);
+            defer alloc.free(physical);
+            observations[initialized] = try source_claim.ObservedSource.capture(alloc, read, physical, doc.value);
+            doc.source_observation = &observations[initialized];
+            initialized += 1;
+        }
+        // Keep the allocation's original capacity for exact allocator ownership.
+        // Skipped rows use a separate initialized count represented by shrinking.
+        result.source_observations = try alloc.realloc(observations, initialized);
+        for (result.docs.items) |*doc| doc.source_observation = null;
+        var ordinal: usize = 0;
+        for (result.docs.items) |*doc| {
+            if (internal_keys.isInternalUserKey(doc.key) or doc.root != null) continue;
+            doc.source_observation = &result.source_observations[ordinal];
+            ordinal += 1;
+        }
     }
 
     return result;

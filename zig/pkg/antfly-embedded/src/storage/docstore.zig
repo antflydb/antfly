@@ -34,6 +34,7 @@ const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
 const retained_effects = @import("retained_effects.zig");
 const artifact_payload = @import("artifact_payload.zig");
+const document_payload = @import("document_payload.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
@@ -470,6 +471,23 @@ pub const DocStore = struct {
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),
+    // Internal qualification gate for legacy promotion, not a user opt-in.
+    // DBCore also sets this before publication when opening an already-admitted
+    // native schema, preserving its read/retirement semantics after restart.
+    // New promotion still requires reader/peer cohort qualification.
+    document_payload_prototype: bool = false,
+    /// Experimental admission is explicit and owner-local. Reader capability
+    /// alone must not migrate an ordinary table before workload qualification.
+    /// Already-admitted stores retain their required read/retirement semantics.
+    experimental_document_migration: bool = false,
+    /// All readers of this owner were qualified by an ordered cluster barrier,
+    /// or by the single-owner execution path. Never set from a public request.
+    document_reader_cohort: std.atomic.Value(u32) = .init(0),
+    document_native_active: std.atomic.Value(bool) = .init(false),
+    document_payload_inline: bool = false,
+    document_values_possible: std.atomic.Value(u8) = .init(0),
+    document_prepared_stages: std.atomic.Value(u64) = .init(0),
+    document_manifest_cache: std.atomic.Value(?*document_payload.ManifestCache) = .init(null),
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
     owned_lsm_backend: ?lsm_backend.BackendHandle,
@@ -492,6 +510,34 @@ pub const DocStore = struct {
     // transactions. Packing both into one atomic makes reader admission versus
     // publication closure a single indivisible transition.
     portable_import_reader_state: std.atomic.Value(usize) = .init(0),
+
+    pub fn qualifyDocumentReaders(self: *DocStore, minimum: u32) !void {
+        if (minimum != 29 or minimum > @import("schema.zig").maximum_reader_format_version) return error.UnsupportedVersion;
+        self.document_reader_cohort.store(minimum, .release);
+    }
+
+    pub fn documentLayoutEnabled(self: *const DocStore) bool {
+        return self.document_payload_prototype or self.document_native_active.load(.acquire);
+    }
+
+    pub fn documentMigrationEnabled(self: *const DocStore) bool {
+        return self.documentLayoutEnabled() or (self.experimental_document_migration and self.document_reader_cohort.load(.acquire) != 0);
+    }
+
+    pub fn adoptDocumentReaderFormat(self: *DocStore, minimum: u32) !void {
+        try self.qualifyDocumentReaders(minimum);
+        self.document_native_active.store(true, .release);
+    }
+
+    pub fn documentMinimumReader(self: *const DocStore) u32 {
+        return @max(@as(u32, 26), self.document_reader_cohort.load(.acquire));
+    }
+
+    pub fn configureDocumentCapture(self: *const DocStore, capture: *@import("document_mutation_revision.zig").Capture) void {
+        capture.logical_commitments = self.documentMigrationEnabled();
+        capture.logical_minimum_bytes = @import("document_projection.zig").minimum_bytes;
+        capture.minimum_reader_format = self.documentMinimumReader();
+    }
 
     const replay_index_unknown: u8 = 0;
     const replay_index_missing: u8 = 1;
@@ -516,6 +562,7 @@ pub const DocStore = struct {
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
         mutation_capture: ?*@import("txn_mutation_capture.zig").Capture = null,
         payload_session: ?*artifact_payload.Session = null,
+        document_arena: ?std.heap.ArenaAllocator = null,
         alloc: Allocator,
         read: ?backend_erased.ReadTxn = null,
         probe: ?backend_erased.ProbeTxn = null,
@@ -574,6 +621,7 @@ pub const DocStore = struct {
         });
 
         pub fn abort(self: *Txn) void {
+            if (self.document_arena) |*arena| arena.deinit();
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
@@ -592,6 +640,13 @@ pub const DocStore = struct {
             }
             self.* = undefined;
             if (reader_owner) |owner| owner.releasePortableImportReader();
+        }
+
+        /// A compound metadata operation must not be committed after any of
+        /// its fallible stages failed, even if its caller catches the error.
+        pub fn poison(self: *Txn) void {
+            self.retained.poisoned = true;
+            self.document_revisions.poisoned = true;
         }
 
         pub fn commit(self: *Txn) !void {
@@ -627,6 +682,7 @@ pub const DocStore = struct {
                 session.committed = true;
                 session.release();
             }
+            if (self.document_arena) |*arena| arena.deinit();
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
@@ -635,8 +691,21 @@ pub const DocStore = struct {
             if (reader_owner) |owner| owner.releasePortableImportReader();
         }
 
+        pub fn documentAllocator(self: *Txn) Allocator {
+            if (self.document_arena == null) self.document_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(self.alloc));
+            return self.document_arena.?.allocator();
+        }
         pub fn get(self: *Txn, key: []const u8) ![]const u8 {
             const value = try self.getPhysical(key);
+            if (internal_keys.isStoredDocumentRowKey(key) and document_payload.isManifest(value)) {
+                if (self.probe != null) {
+                    const owner = self.portable_import_reader_owner orelse return error.Unsupported;
+                    var pinned = try owner.beginReadTxn();
+                    defer pinned.abort();
+                    return try self.documentAllocator().dupe(u8, try pinned.get(key));
+                }
+                return document_payload.read(self.documentAllocator(), self, key, value);
+            }
             if (self.payload_session) |session| return try session.get(key, value);
             // A live probe admitted before migration may observe a later
             // reference. Retry with a new source lease; never leak its encoding
@@ -672,11 +741,31 @@ pub const DocStore = struct {
             return metadata;
         }
 
-        fn getPhysical(self: *Txn, key: []const u8) ![]const u8 {
+        pub fn usesLogicalDocumentIdentity(self: *Txn) !bool {
+            const owner = self.columnar_owner orelse self.portable_import_reader_owner orelse return false;
+            if (!owner.documentLayoutEnabled()) return false;
+            var scope = try self.openReadScope(self.alloc);
+            defer scope.close();
+            return scope.usesLogicalDocumentIdentity();
+        }
+
+        pub fn documentManifestCache(self: *Txn) ?*document_payload.ManifestCache {
+            const owner = self.columnar_owner orelse self.portable_import_reader_owner orelse return null;
+            return owner.documentManifestCache();
+        }
+
+        pub fn getPhysical(self: *Txn, key: []const u8) ![]const u8 {
             if (self.write) |*write| return try write.get(key);
             if (self.probe) |*probe| return try probe.get(key);
             if (self.current_scan != null) return error.Unsupported;
             return try self.read.?.get(key);
+        }
+
+        /// Raw immutable bytes for a caller holding their native lifetime
+        /// proof. This does not materialize current document/asset references.
+        pub fn getLeasedPhysical(self: *Txn, key: []const u8) ![]const u8 {
+            if (self.probe) |*probe| return probe.getLeased(key);
+            return self.getPhysical(key);
         }
 
         /// Short-lived value lease, released when this transaction aborts.
@@ -684,6 +773,7 @@ pub const DocStore = struct {
         pub fn getLeased(self: *Txn, key: []const u8) ![]const u8 {
             if (self.probe) |*probe| {
                 const value = try probe.getLeased(key);
+                if (internal_keys.isStoredDocumentRowKey(key) and document_payload.isManifest(value)) return self.get(key);
                 if (self.payload_session) |session| return try session.get(key, value);
                 if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(value))
                     return error.VectorMigrationReadEpochChanged;
@@ -695,13 +785,43 @@ pub const DocStore = struct {
         /// Block-scoped values from this exact snapshot. Close scopes before
         /// aborting the transaction (which also owns the portable-import fence).
         pub fn openReadScope(self: *Txn, alloc: Allocator) !backend_erased.ReadScope {
-            if (self.read) |*read| return read.openReadScope(alloc);
-            if (self.write) |*write| return write.openReadScope(alloc);
-            return error.ReadOnly;
+            var scope = if (self.read) |*read| try read.openReadScope(alloc) else if (self.write) |*write| try write.openReadScope(alloc) else return error.ReadOnly;
+            const owner = self.columnar_owner orelse self.portable_import_reader_owner;
+            scope.logical_documents = if (owner) |store| store.documentLayoutEnabled() else false;
+            if (scope.logical_documents) scope.document_manifest_cache = .{ .context = owner.?, .get = DocStore.documentManifestCachePort };
+            return scope;
         }
 
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             try self.getManySortedPhysical(keys, values);
+            const manifests = for (keys, values) |key, value| {
+                if (internal_keys.isStoredDocumentRowKey(key) and value != null and document_payload.isManifest(value.?)) break true;
+            } else false;
+            if (manifests) {
+                const a = self.documentAllocator();
+                if (self.probe != null) {
+                    const owner = self.portable_import_reader_owner orelse return error.Unsupported;
+                    var pinned = try owner.beginReadTxn();
+                    defer pinned.abort();
+                    for (keys, values) |key, *value| {
+                        const raw = pinned.get(key) catch |err| {
+                            if (err == error.NotFound) {
+                                value.* = null;
+                                continue;
+                            }
+                            return err;
+                        };
+                        value.* = try a.dupe(u8, raw);
+                    }
+                    return;
+                }
+                for (values) |*value| if (value.*) |raw| {
+                    value.* = try a.dupe(u8, raw);
+                };
+                for (keys, values) |key, *value| if (value.*) |raw| {
+                    value.* = try document_payload.read(a, self, key, raw);
+                };
+            }
             if (self.payload_session) |session| {
                 for (keys, values) |key, *value| if (value.*) |raw| {
                     value.* = try session.get(key, raw);
@@ -736,6 +856,7 @@ pub const DocStore = struct {
         /// cache. Callers should use this only when they retain a decoded or
         /// otherwise more useful representation of every returned value.
         pub fn getManySortedTransient(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
+            for (keys) |key| if (internal_keys.isStoredDocumentRowKey(key)) return self.getManySorted(keys, values);
             if (self.probe) |*probe| {
                 try probe.getManySortedWithBlockCacheAdmission(keys, values, .transient);
                 if (self.payload_session) |session| {
@@ -769,6 +890,19 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) anyerror!void {
+            const prepared = if (self.columnar_owner != null and self.columnar_owner.?.documentLayoutEnabled() and internal_keys.isPrimaryDocumentKey(key))
+                if (self.artifact_inputs.participant) |participant|
+                    if (participant.document_preparations) |documents| documents.find(documents.ptr, key) else null
+                else
+                    null
+            else
+                null;
+            return self.putPreparedDocument(key, value, prepared);
+        }
+        pub fn putPreparedDocument(self: *Txn, key: []const u8, value: []const u8, prepared: ?*const document_payload.PreparedWrite) anyerror!void {
+            const qualified = if (self.columnar_owner != null and self.columnar_owner.?.documentLayoutEnabled() and prepared != null and try prepared.?.qualifies(self, key, value)) prepared else null;
+            if (self.columnar_owner != null and self.columnar_owner.?.documentLayoutEnabled()) try document_payload.requireReaderFence(self, key, value);
+            if (self.columnar_owner) |owner| if (owner.documentLayoutEnabled()) document_payload.observeFormatWrite(&owner.document_values_possible, key, value);
             try updateGraphOwningTable(self, key, value);
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
             if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked) {
@@ -782,7 +916,15 @@ pub const DocStore = struct {
             if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
 
             try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-            try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
+            if (self.columnar_owner) |owner| owner.configureDocumentCapture(&self.document_revisions);
+            if (self.document_revisions.logical_commitments and internal_keys.isPrimaryDocumentKey(key) and value.len >= self.document_revisions.logical_minimum_bytes) {
+                self.document_revisions.logical_commitments = try document_payload.admitForWrite(self.alloc, &self.write.?, &self.document_revisions.document_format, self.document_revisions.minimum_reader_format, value.len, !self.columnar_owner.?.document_payload_prototype);
+                // Publish the hint before the physical root can commit. A
+                // reader pins its root first and still checks that root's floor.
+                if (self.document_revisions.logical_commitments) self.columnar_owner.?.document_native_active.store(true, .release);
+            }
+            if (qualified) |receipt| try self.document_revisions.touchMetadataPatch(self.alloc, key, receipt.patch) else try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
+            try self.document_revisions.recordValidation(self.alloc, key, value, self.artifact_inputs.participant);
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -791,12 +933,70 @@ pub const DocStore = struct {
             try self.markColumnarDirty(key, value);
             try self.invalidateColumns(key);
 
-            const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-            try self.write.?.put(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
+            errdefer self.document_revisions.poisoned = true;
+            var document: ?[]u8 = if (qualified) |receipt| try self.alloc.dupe(u8, receipt.patch.manifest) else null;
+            defer if (document) |bytes| self.alloc.free(bytes);
+            if (qualified) |receipt| {
+                _ = self.columnar_owner.?.document_prepared_stages.fetchAdd(1, .monotonic);
+                self.document_revisions.markManifest(key, document);
+                self.document_revisions.document_payload_stats.manifest_bytes += receipt.patch.manifest.len;
+                self.document_revisions.document_payload_stats.blob_bytes_reused += receipt.patch.reused_payload_bytes;
+            }
+            if (qualified == null and self.columnar_owner != null and self.columnar_owner.?.documentLayoutEnabled() and !self.columnar_owner.?.document_payload_inline) if (self.document_revisions.sourcePublication(key)) |publication| {
+                const removed_before = self.document_revisions.document_payload_stats.current_values_removed;
+                if (try document_payload.shouldStage(self, &self.columnar_owner.?.document_values_possible, publication, value.len))
+                    document = try document_payload.stage(self.alloc, &self.write.?, key, value, publication, &self.document_revisions.document_format, &self.document_revisions.document_payload_stats);
+                if (document != null) self.columnar_owner.?.document_values_possible.store(2, .release);
+                if (document == null and self.document_revisions.document_payload_stats.current_values_removed != removed_before) self.document_revisions.notePriorExternal(key);
+                self.document_revisions.markManifest(key, document);
+            };
+            const stored = document orelse if (self.payload_session) |session| try session.put(key, value) else value;
+            try self.write.?.put(key, if (self.payload_session) |session| if (document == null) session.primaryValue(value, stored) else stored else stored);
             if (self.payload_session) |session| try session.recordOwnership(&self.write.?, key, stored);
         }
 
+        /// Bounded storage-level metadata patch. Like put(), callers own derived
+        /// index maintenance; this is not a shortcut around DB batch admission.
+        /// Unsupported layouts fall back before any mutation is staged.
+        pub fn patchMetadata(self: *Txn, key: []const u8, updates: []const document_payload.MetadataUpdate) !void {
+            if (self.write == null) return error.ReadOnly;
+            if (self.columnar_owner == null or !self.columnar_owner.?.documentLayoutEnabled()) return error.Unsupported;
+            if (!internal_keys.isStoredDocumentRowKey(key) or self.artifact_inputs.participant != null) return error.Unsupported;
+            const a = self.documentAllocator();
+            const revisions = @import("document_mutation_revision.zig");
+            const revision_key = revisions.keyForPhysical(key).?;
+            const current = self.document_revisions.sourcePublication(key);
+            var proof = if (current) |value| value.proof else (try revisions.loadContent(self, key)) orelse return error.Unsupported;
+            if (proof.algorithm != .logical_json_v1) return error.Unsupported;
+            const raw = try a.dupe(u8, try self.getPhysical(key));
+            if (!document_payload.isManifest(raw)) return error.Unsupported;
+            proof.manifest = true;
+            const manifest = try document_payload.Manifest.decode(a, raw);
+            defer a.free(manifest.parts);
+            const navigation = try manifest.navigation(a, proof.kind);
+            defer if (navigation) |value| value.deinit(a);
+            const paths = if (navigation) |value| value.directory else if (current) |value| value.directory orelse return error.Unsupported else try a.dupe(u8, try self.getPhysical(&@import("document_projection.zig").keyForRevision(revision_key)));
+            const identities = if (navigation) |value| value.certificate else if (current) |value| value.identities orelse return error.Unsupported else try a.dupe(u8, try self.getPhysical(&@import("source_value_identity.zig").keyForRevision(revision_key)));
+            const patch = try document_payload.prepareMetadataPatch(self.alloc, raw, proof, paths, identities, updates);
+            defer patch.deinit(self.alloc);
+            errdefer self.document_revisions.poisoned = true;
+            try self.document_revisions.touchMetadataPatch(self.alloc, key, patch);
+            try self.artifact_footprint.touch(key, patch.manifest);
+            try self.range_mutation.touch(self, key);
+            try self.artifact_inputs.touch(self.alloc, self, key, patch.manifest);
+            try self.retained.touch(self.alloc, self, key, true, if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
+            if (self.mutation_capture) |capture| try capture.touch(key);
+            try self.write.?.put(key, patch.manifest);
+            self.document_revisions.document_payload_stats.manifest_bytes += patch.manifest.len;
+            self.document_revisions.document_payload_stats.blob_bytes_reused += patch.reused_payload_bytes;
+        }
+
         pub fn delete(self: *Txn, key: []const u8) anyerror!void {
+            if (self.columnar_owner) |owner| owner.configureDocumentCapture(&self.document_revisions);
+            if (self.columnar_owner != null and self.columnar_owner.?.documentLayoutEnabled()) if (self.write) |*write| {
+                errdefer self.document_revisions.poisoned = true;
+                if (try document_payload.valuesPossible(self, &self.columnar_owner.?.document_values_possible)) try document_payload.retire(self.alloc, write, key, &self.document_revisions.document_payload_stats);
+            };
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
             try removeGraphRetirementReference(self, self.alloc, key, &self.graph_retirements_maybe);
             if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
@@ -844,14 +1044,23 @@ pub const DocStore = struct {
         }
 
         fn openCursorAdapter(self: *Txn) !CursorAdapter {
+            return self.openDocumentCursorAdapter(false);
+        }
+        fn openDocumentCursorAdapter(self: *Txn, physical_vectors: bool) !CursorAdapter {
             var cursor_adapter = try self.openPhysicalCursorAdapter();
             errdefer cursor_adapter.close();
-            return try wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session, self.current_scan != null or self.probe != null);
+            const owner = self.columnar_owner orelse self.portable_import_reader_owner;
+            const documents = if (owner) |store| store.documentLayoutEnabled() else false;
+            if (!documents) {
+                if (physical_vectors) return cursor_adapter;
+                return wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session, self.current_scan != null or self.probe != null, null, null, null, false);
+            }
+            return try wrapPayloadCursor(self.alloc, cursor_adapter, if (physical_vectors) null else self.payload_session, self.current_scan != null or self.probe != null, if (self.read) |*read| try read.forkRead() else null, self.write, null, physical_vectors);
         }
 
         pub fn hasPrefix(self: *Txn, prefix: []const u8) !bool {
             if (self.write) |*write| return try write.hasPrefix(prefix);
-            var cursor = try self.openPhysicalCursorAdapter();
+            var cursor = try self.openPhysicalKeyCursorAdapter();
             defer cursor.close();
             const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
             return std.mem.startsWith(u8, row.key, prefix);
@@ -887,6 +1096,7 @@ pub const DocStore = struct {
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
         columnar_owner: ?*DocStore = null,
         payload_session: ?*artifact_payload.Session = null,
+        document_arena: ?std.heap.ArenaAllocator = null,
         alloc: Allocator,
         columns_invalidated: bool = false,
         columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
@@ -906,7 +1116,16 @@ pub const DocStore = struct {
             artifact_footprint: *@import("artifact_footprint.zig").Capture,
             document_revisions: *@import("document_mutation_revision.zig").Capture,
             retained_cache: ?*std.atomic.Value(u8) = null,
+            document_payload_prototype: bool = false,
+            document_payload_inline: bool = false,
+            automatic_document_layout: bool = false,
+            document_layout_owner: ?*DocStore = null,
+            minimum_reader_format: u32 = 26,
+            logical_minimum_bytes: usize = @import("document_projection.zig").minimum_bytes,
+            document_values_possible: ?*std.atomic.Value(u8) = null,
+            document_prepared_stages: ?*std.atomic.Value(u64) = null,
             payload_session: ?*artifact_payload.Session = null,
+            document_arena: *?std.heap.ArenaAllocator,
             alloc: Allocator,
             columns_invalidated: *bool,
             columnar_mutation: *?internal_keys.ColumnarMutationToken,
@@ -927,8 +1146,21 @@ pub const DocStore = struct {
                 return stats;
             }
 
+            fn documentAllocator(self: @This()) Allocator {
+                if (self.document_arena.* == null) self.document_arena.* = .init(@import("antfly_platform").allocator.reclaimingScratch(self.alloc));
+                return self.document_arena.*.?.allocator();
+            }
+            pub fn poison(self: @This()) void {
+                self.retained.poisoned = true;
+                self.document_revisions.poisoned = true;
+            }
+
+            pub fn getPhysical(self: @This(), key: []const u8) ![]const u8 {
+                return self.runtime.?.get(key);
+            }
             pub fn get(self: @This(), key: []const u8) ![]const u8 {
                 const value = try self.runtime.?.get(key);
+                if (internal_keys.isStoredDocumentRowKey(key) and document_payload.isManifest(value)) return document_payload.read(self.documentAllocator(), &self, key, value);
                 if (self.payload_session) |session| return try session.get(key, value);
                 // A live probe admitted before migration may observe a later
                 // reference. Retry with a new source lease; never leak its encoding
@@ -943,6 +1175,18 @@ pub const DocStore = struct {
                 @memset(values, null);
 
                 try self.runtime.?.getManySorted(keys, values);
+                const manifests = for (keys, values) |key, value| {
+                    if (internal_keys.isStoredDocumentRowKey(key) and value != null and document_payload.isManifest(value.?)) break true;
+                } else false;
+                if (manifests) {
+                    const a = self.documentAllocator();
+                    for (values) |*value| if (value.*) |raw| {
+                        value.* = try a.dupe(u8, raw);
+                    };
+                    for (keys, values) |key, *value| if (value.*) |raw| {
+                        value.* = try document_payload.read(a, &self, key, raw);
+                    };
+                }
                 if (self.payload_session) |session| {
                     for (keys, values) |key, *value| if (value.*) |raw| {
                         value.* = try session.get(key, raw);
@@ -951,6 +1195,19 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) anyerror!void {
+                const prepared = if (self.document_payload_prototype and internal_keys.isPrimaryDocumentKey(key))
+                    if (self.artifact_inputs.participant) |participant|
+                        if (participant.document_preparations) |documents| documents.find(documents.ptr, key) else null
+                    else
+                        null
+                else
+                    null;
+                return self.putPreparedDocument(key, value, prepared);
+            }
+            pub fn putPreparedDocument(self: @This(), key: []const u8, value: []const u8, prepared: ?*const document_payload.PreparedWrite) anyerror!void {
+                const qualified = if (self.document_payload_prototype and prepared != null and try prepared.?.qualifies(self, key, value)) prepared else null;
+                if (self.document_payload_prototype) try document_payload.requireReaderFence(self, key, value);
+                if (self.document_payload_prototype) document_payload.observeFormatWrite(self.document_values_possible, key, value);
                 try updateGraphOwningTable(self, key, value);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
                 if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked.*) {
@@ -964,7 +1221,15 @@ pub const DocStore = struct {
                 if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-                try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
+                self.document_revisions.logical_commitments = self.document_payload_prototype;
+                self.document_revisions.logical_minimum_bytes = self.logical_minimum_bytes;
+                self.document_revisions.minimum_reader_format = self.minimum_reader_format;
+                if (self.document_payload_prototype and internal_keys.isPrimaryDocumentKey(key) and value.len >= self.logical_minimum_bytes) {
+                    self.document_revisions.logical_commitments = try document_payload.admitForWrite(self.alloc, self.runtime.?, &self.document_revisions.document_format, self.minimum_reader_format, value.len, self.automatic_document_layout);
+                    if (self.document_revisions.logical_commitments) if (self.document_layout_owner) |owner| owner.document_native_active.store(true, .release);
+                }
+                if (qualified) |receipt| try self.document_revisions.touchMetadataPatch(self.alloc, key, receipt.patch) else try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
+                try self.document_revisions.recordValidation(self.alloc, key, value, self.artifact_inputs.participant);
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -972,8 +1237,25 @@ pub const DocStore = struct {
                 try self.markColumnarDirty(key, value);
                 try self.invalidateColumns(key);
 
-                const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-                try self.runtime.?.put(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
+                errdefer self.document_revisions.poisoned = true;
+                var document: ?[]u8 = if (qualified) |receipt| try self.alloc.dupe(u8, receipt.patch.manifest) else null;
+                defer if (document) |bytes| self.alloc.free(bytes);
+                if (qualified) |receipt| {
+                    if (self.document_prepared_stages) |counter| _ = counter.fetchAdd(1, .monotonic);
+                    self.document_revisions.markManifest(key, document);
+                    self.document_revisions.document_payload_stats.manifest_bytes += receipt.patch.manifest.len;
+                    self.document_revisions.document_payload_stats.blob_bytes_reused += receipt.patch.reused_payload_bytes;
+                }
+                if (qualified == null and self.document_payload_prototype and !self.document_payload_inline) if (self.document_revisions.sourcePublication(key)) |publication| {
+                    const removed_before = self.document_revisions.document_payload_stats.current_values_removed;
+                    if (try document_payload.shouldStage(self, self.document_values_possible, publication, value.len))
+                        document = try document_payload.stage(self.alloc, self.runtime.?, key, value, publication, &self.document_revisions.document_format, &self.document_revisions.document_payload_stats);
+                    if (document != null) if (self.document_values_possible) |hint| hint.store(2, .release);
+                    if (document == null and self.document_revisions.document_payload_stats.current_values_removed != removed_before) self.document_revisions.notePriorExternal(key);
+                    self.document_revisions.markManifest(key, document);
+                };
+                const stored = document orelse if (self.payload_session) |session| try session.put(key, value) else value;
+                try self.runtime.?.put(key, if (self.payload_session) |session| if (document == null) session.primaryValue(value, stored) else stored else stored);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
@@ -982,6 +1264,15 @@ pub const DocStore = struct {
             }
 
             fn appendPutChecked(self: @This(), key: []const u8, value: []const u8, retirement_checked: bool) anyerror!void {
+                self.document_revisions.logical_commitments = self.document_payload_prototype;
+                self.document_revisions.logical_minimum_bytes = self.logical_minimum_bytes;
+                self.document_revisions.minimum_reader_format = self.minimum_reader_format;
+                if (self.document_payload_prototype and internal_keys.isPrimaryDocumentKey(key) and value.len >= self.logical_minimum_bytes) {
+                    self.document_revisions.logical_commitments = try document_payload.admitForWrite(self.alloc, self.runtime.?, &self.document_revisions.document_format, self.minimum_reader_format, value.len, self.automatic_document_layout);
+                    if (self.document_revisions.logical_commitments) if (self.document_layout_owner) |owner| owner.document_native_active.store(true, .release);
+                }
+                if (self.document_payload_prototype) try document_payload.requireReaderFence(self, key, value);
+                if (self.document_payload_prototype) document_payload.observeFormatWrite(self.document_values_possible, key, value);
                 if (std.mem.startsWith(u8, key, internal_keys.graph_endpoint_cleanup_prefix) and self.unordered_bulk_append_puts) return error.Unsupported;
                 try updateGraphOwningTable(self, key, value);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
@@ -1002,6 +1293,7 @@ pub const DocStore = struct {
 
                 try maintainGraphIncoming(self, self.alloc, key, value, true, retirement_checked);
                 if (self.unordered_bulk_append_puts) try self.document_revisions.touchValue(self.alloc, key, value) else try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
+                try self.document_revisions.recordValidation(self.alloc, key, value, self.artifact_inputs.participant);
                 try self.artifact_footprint.touch(key, value);
                 // Active tracking requires point updates for bucket counters.
                 // Restore bulk writers publish into a fresh identity; they may
@@ -1022,12 +1314,28 @@ pub const DocStore = struct {
                 }
                 try self.invalidateColumns(key);
 
-                const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-                try self.runtime.?.appendPut(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
+                errdefer self.document_revisions.poisoned = true;
+                var document: ?[]u8 = null;
+                defer if (document) |bytes| self.alloc.free(bytes);
+                if (self.document_payload_prototype and !self.document_payload_inline and !self.unordered_bulk_append_puts) if (self.document_revisions.sourcePublication(key)) |publication| {
+                    const removed_before = self.document_revisions.document_payload_stats.current_values_removed;
+                    if (try document_payload.shouldStage(self, self.document_values_possible, publication, value.len))
+                        document = try document_payload.stage(self.alloc, self.runtime.?, key, value, publication, &self.document_revisions.document_format, &self.document_revisions.document_payload_stats);
+                    if (document != null) if (self.document_values_possible) |hint| hint.store(2, .release);
+                    if (document == null and self.document_revisions.document_payload_stats.current_values_removed != removed_before) self.document_revisions.notePriorExternal(key);
+                    self.document_revisions.markManifest(key, document);
+                };
+                const stored = document orelse if (self.payload_session) |session| try session.put(key, value) else value;
+                if (document != null) try self.runtime.?.put(key, stored) else try self.runtime.?.appendPut(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
             pub fn delete(self: @This(), key: []const u8) anyerror!void {
+                self.document_revisions.logical_commitments = self.document_payload_prototype;
+                self.document_revisions.logical_minimum_bytes = self.logical_minimum_bytes;
+                self.document_revisions.minimum_reader_format = self.minimum_reader_format;
+                errdefer self.document_revisions.poisoned = true;
+                if (self.document_payload_prototype and try document_payload.valuesPossible(self, self.document_values_possible)) try document_payload.retire(self.alloc, self.runtime.?, key, &self.document_revisions.document_payload_stats);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
                 try removeGraphRetirementReference(self, self.alloc, key, self.graph_retirements_maybe);
                 if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
@@ -1076,7 +1384,7 @@ pub const DocStore = struct {
             pub fn openCursor(self: @This()) !backend_erased.Cursor {
                 var physical = try self.runtime.?.openCursor();
                 errdefer physical.close();
-                return try wrapPayloadCursor(self.alloc, physical, self.payload_session, false);
+                return try wrapPayloadCursor(self.alloc, physical, self.payload_session, false, null, null, if (self.document_payload_prototype) self.runtime.?.* else null, false);
             }
 
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
@@ -1100,6 +1408,7 @@ pub const DocStore = struct {
         }
 
         pub fn abort(self: *Batch) void {
+            if (self.document_arena) |*arena| arena.deinit();
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
@@ -1139,6 +1448,7 @@ pub const DocStore = struct {
                 session.committed = true;
                 session.release();
             }
+            if (self.document_arena) |*arena| arena.deinit();
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
@@ -1154,7 +1464,16 @@ pub const DocStore = struct {
                 .artifact_footprint = &self.artifact_footprint,
                 .document_revisions = &self.document_revisions,
                 .retained_cache = if (self.columnar_owner) |owner| &owner.retained_effects_cache else null,
+                .document_payload_prototype = if (self.columnar_owner) |owner| owner.documentMigrationEnabled() else false,
+                .document_layout_owner = self.columnar_owner,
+                .automatic_document_layout = if (self.columnar_owner) |owner| !owner.document_payload_prototype else false,
+                .minimum_reader_format = if (self.columnar_owner) |owner| owner.documentMinimumReader() else 26,
+                .logical_minimum_bytes = @import("document_projection.zig").minimum_bytes,
+                .document_payload_inline = if (self.columnar_owner) |owner| owner.document_payload_inline else false,
+                .document_values_possible = if (self.columnar_owner) |owner| &owner.document_values_possible else null,
+                .document_prepared_stages = if (self.columnar_owner) |owner| &owner.document_prepared_stages else null,
                 .payload_session = self.payload_session,
+                .document_arena = &self.document_arena,
                 .alloc = self.alloc,
                 .columns_invalidated = &self.columns_invalidated,
                 .columnar_mutation = &self.columnar_mutation,
@@ -1230,7 +1549,28 @@ pub const DocStore = struct {
         };
     }
 
+    fn documentManifestCachePort(context: *anyopaque) ?*document_payload.ManifestCache {
+        const self: *DocStore = @ptrCast(@alignCast(context));
+        return self.documentManifestCache();
+    }
+    fn documentManifestCache(self: *DocStore) ?*document_payload.ManifestCache {
+        if (!self.documentLayoutEnabled()) return null;
+        if (self.document_manifest_cache.load(.acquire)) |cache| return cache;
+        self.lockPayloadPolicy();
+        defer self.unlockPayloadPolicy();
+        if (self.document_manifest_cache.load(.acquire) == null) {
+            const a = @import("antfly_platform").allocator.reclaimingScratch(self.alloc);
+            const cache = a.create(document_payload.ManifestCache) catch return null;
+            cache.* = .init(a);
+            self.document_manifest_cache.store(cache, .release);
+        }
+        return self.document_manifest_cache.load(.acquire);
+    }
     pub fn close(self: *DocStore) void {
+        if (self.document_manifest_cache.load(.acquire)) |cache| {
+            cache.deinit();
+            @import("antfly_platform").allocator.reclaimingScratch(self.alloc).destroy(cache);
+        }
         self.source_certificates.deinit(self.alloc);
         if (self.owns_runtime_store) self.runtime_store.deinit();
         if (self.owned_lsm_backend) |*backend| backend.close();
@@ -1259,50 +1599,100 @@ pub const DocStore = struct {
         physical: backend_erased.Cursor,
         session: ?*artifact_payload.Session,
         arena: std.heap.ArenaAllocator,
-
+        reader: ?backend_erased.ReadTxn = null,
+        writer: ?backend_erased.WriteTxn = null,
+        batch: ?backend_erased.Batch = null,
+        physical_vectors: bool = false,
+        keys_only: bool = false,
+        pub fn getPhysical(self: *@This(), key: []const u8) ![]const u8 {
+            if (self.reader) |*reader| return reader.get(key);
+            if (self.writer) |*writer| return writer.get(key);
+            if (self.batch) |*batch| return batch.get(key);
+            return error.Unsupported;
+        }
+        pub fn setKeysOnly(self: *@This()) void {
+            self.keys_only = true;
+            self.physical.setKeysOnly();
+        }
         pub fn close(self: *@This()) void {
             self.physical.close();
+            if (self.reader) |*reader| reader.abort();
             self.arena.deinit();
             if (self.session) |session| session.release();
         }
         fn resolve(self: *@This(), entry: ?backend_erased.Entry) !?backend_erased.Entry {
             _ = self.arena.reset(.retain_capacity);
             const value = entry orelse return null;
+            // Some adapters have no key-only operation. Preserve its logical
+            // contract locally without decoding a returned native descriptor.
+            if (self.keys_only) return .{ .key = value.key, .value = &.{} };
+            if (document_payload.isManifest(value.value) and internal_keys.isStoredDocumentRowKey(value.key)) {
+                if (self.reader == null and self.writer == null and self.batch == null) return error.Unsupported;
+                const key = try self.arena.allocator().dupe(u8, value.key);
+                return .{ .key = key, .value = try document_payload.read(self.arena.allocator(), self, key, value.value) };
+            }
             if (self.session) |session| return .{ .key = value.key, .value = try session.getAlloc(self.arena.allocator(), value.key, value.value) };
-            if (artifact_payload.isEmbeddingKey(value.key) and artifact_payload.isReference(value.value))
+            if (!self.physical_vectors and artifact_payload.isEmbeddingKey(value.key) and artifact_payload.isReference(value.value))
                 return error.VectorMigrationReadEpochChanged;
             return value;
         }
+        fn visible(self: *@This(), entry: ?backend_erased.Entry, reverse: bool) !?backend_erased.Entry {
+            var current = entry;
+            while (current) |value| {
+                // Private ownership records stay private independently of the
+                // payload-reader configuration. Ordinary rows avoid every
+                // private-prefix probe on this common scan path.
+                if (!std.mem.startsWith(u8, value.key, "\x00\x00__metadata__:")) break;
+                const prefix = document_payload.ownership.privatePrefix(value.key) orelse @import("index_source_claim.zig").privatePrefix(value.key) orelse break;
+                if (reverse) {
+                    current = if (std.mem.eql(u8, value.key, prefix)) try self.physical.prev() else try self.physical.seekAtOrBefore(prefix);
+                } else {
+                    var upper: [128]u8 = undefined;
+                    @memcpy(upper[0..prefix.len], prefix);
+                    upper[prefix.len - 1] += 1;
+                    current = try self.physical.seekAtOrAfter(upper[0..prefix.len]);
+                }
+            }
+            return self.resolve(current);
+        }
         pub fn first(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.first());
+            return self.visible(try self.physical.first(), false);
         }
         pub fn last(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.last());
+            return self.visible(try self.physical.last(), true);
         }
         pub fn next(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.next());
+            return self.visible(try self.physical.next(), false);
         }
         pub fn prev(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.prev());
+            return self.visible(try self.physical.prev(), true);
         }
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_erased.Entry {
-            return self.resolve(try self.physical.seekAtOrAfter(key));
+            return self.visible(try self.physical.seekAtOrAfter(key), false);
         }
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_erased.Entry {
-            return self.resolve(try self.physical.seekAtOrBefore(key));
+            return self.visible(try self.physical.seekAtOrBefore(key), true);
         }
         pub fn setUpperBound(self: *@This(), upper: ?[]const u8) void {
             self.physical.setUpperBound(upper);
         }
     };
 
-    fn wrapPayloadCursor(alloc: Allocator, physical: backend_erased.Cursor, session: ?*artifact_payload.Session, live: bool) !backend_erased.Cursor {
-        if (session == null and !live) return physical;
+    fn wrapPayloadCursor(alloc: Allocator, physical: backend_erased.Cursor, session: ?*artifact_payload.Session, live: bool, read: ?backend_erased.ReadTxn, write: ?backend_erased.WriteTxn, batch: ?backend_erased.Batch, physical_vectors: bool) !backend_erased.Cursor {
+        // Logical cursors always enforce metadata privacy, including during
+        // startup/import before a native payload reader is configured.
+        _ = live;
+        var reader = read;
+        errdefer if (reader) |*owned| owned.abort();
         if (session) |owner| owner.retain();
         errdefer if (session) |owner| owner.release();
         return try backend_erased.cursorFrom(alloc, PayloadCursor{
             .physical = physical,
             .session = session,
+            .reader = reader,
+            .writer = write,
+            .batch = batch,
+            .physical_vectors = physical_vectors,
             .arena = std.heap.ArenaAllocator.init(alloc),
         });
     }
@@ -1350,6 +1740,10 @@ pub const DocStore = struct {
         self.lockPayloadPolicy();
         defer self.unlockPayloadPolicy();
         return try self.createPayloadSession();
+    }
+
+    pub fn prefersImmutablePointReads(self: *DocStore, point_lookups: usize) bool {
+        return self.runtime_store.prefersImmutablePointReads(point_lookups);
     }
 
     pub fn beginReadTxn(self: *DocStore) !Txn {
@@ -2161,6 +2555,7 @@ pub const DocStore = struct {
     pub fn finishPortableImportPublication(self: *DocStore) void {
         self.source_certificates.end();
         self.retained_effects_cache.store(0, .release);
+        self.document_values_possible.store(0, .release);
         std.debug.assert(self.portable_import_reader_state.load(.monotonic) == portable_import_publication_bit);
         self.portable_import_reader_state.store(0, .release);
     }
@@ -2186,16 +2581,38 @@ pub const DocStore = struct {
 
     /// Get a value by key. Caller owns the returned slice.
     pub fn get(self: *DocStore, alloc: Allocator, key: []const u8) ![]u8 {
+        // A positive hint only selects the I/O strategy. Always reload the row
+        // under a fresh pinned snapshot, including after overwrite or deletion.
+        if (internal_keys.isPrimaryDocumentKey(key)) if (self.document_manifest_cache.load(.acquire)) |cache| if (cache.knowsRow(key)) {
+            var pinned = try self.beginReadTxn();
+            defer pinned.abort();
+            const raw = pinned.getPhysical(key) catch |err| {
+                if (err == error.NotFound) cache.forgetRow(key);
+                return err;
+            };
+            if (document_payload.isManifest(raw)) return @constCast(try document_payload.read(alloc, &pinned, key, raw));
+            cache.forgetRow(key);
+            return alloc.dupe(u8, raw);
+        };
         // A one-key lookup has no multi-operation snapshot to preserve, and
         // the result is copied before this function returns. Use the live
         // point-probe contract so the runtime LSM does not clone its complete
         // mutable generation for every metadata/artifact lookup.
         var txn = try self.beginProbeTxn();
         defer txn.abort();
-        const val = txn.get(key) catch |err| switch (err) {
-            error.NotFound => return error.NotFound,
-            else => return err,
-        };
+        if (internal_keys.isStoredDocumentRowKey(key)) {
+            const raw = try txn.getPhysical(key);
+            if (!document_payload.isManifest(raw)) return alloc.dupe(u8, raw);
+            // A live probe cannot combine a manifest and values from different
+            // commits. Retry under one snapshot and reconstruct directly into
+            // the caller allocator, avoiding two additional full-body copies.
+            var pinned = try self.beginReadTxn();
+            defer pinned.abort();
+            const stable = try pinned.getPhysical(key);
+            if (!document_payload.isManifest(stable)) return alloc.dupe(u8, stable);
+            return @constCast(try document_payload.read(alloc, &pinned, key, stable));
+        }
+        const val = try txn.get(key);
         return try alloc.dupe(u8, val);
     }
 
@@ -3014,7 +3431,7 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
-        var cur = try txn.openPhysicalCursorAdapter();
+        var cur = try txn.openPhysicalKeyCursorAdapter();
         defer cur.close();
 
         var results = std.ArrayListUnmanaged([]u8).empty;
@@ -3089,7 +3506,7 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
-        var cur = try txn.openPhysicalCursorAdapter();
+        var cur = try txn.openPhysicalKeyCursorAdapter();
         defer cur.close();
         cur.setUpperBound(if (upper.len > 0) upper else null);
 
@@ -3329,7 +3746,7 @@ pub const DocStore = struct {
         callback: ScanWithContextCallback,
     ) !void {
         _ = self;
-        var cur = if (options.physical_payloads) try txn.openPhysicalCursorAdapter() else try txn.openCursor();
+        var cur = if (options.physical_payloads) try txn.openDocumentCursorAdapter(true) else try txn.openCursor();
         defer cur.close();
         if (!options.reverse) {
             cur.setUpperBound(if (upper.len > 0) upper else null);
@@ -3436,6 +3853,8 @@ fn countVisibleRange(
 ) !usize {
     var cur = try txn.openCursor();
     defer cur.close();
+    cur.setKeysOnly();
+    cur.setUpperBound(if (upper.len > 0) upper else null);
 
     const first = if (lower.len == 0)
         (try cur.first()) orelse return 0
@@ -3470,6 +3889,8 @@ fn copyVisibleKeyAtIndex(
 ) ![]u8 {
     var cur = try txn.openCursor();
     defer cur.close();
+    cur.setKeysOnly();
+    cur.setUpperBound(if (upper.len > 0) upper else null);
 
     var entry = if (lower.len == 0)
         (try cur.first()) orelse return error.NotFound
@@ -3669,6 +4090,11 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test {
+    _ = @import("document_input.zig");
+    _ = @import("index_source_claim_test.zig");
 }
 
 test "docstore put/get/delete" {
@@ -6484,4 +6910,1031 @@ test "logical source certificates invalidate transaction and batch mutations inc
     try std.testing.expect(store.source_certificates.capture() == null);
     try store.finishBulkIngestSessionWithOptions(.{});
     try std.testing.expect(store.source_certificates.capture() != null);
+}
+
+test "document payload automatic reuse retains snapshots reads and bounded physical writes" {
+    const a = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    store.document_payload_prototype = true;
+    const schema = @import("schema.zig");
+    const encoded = try schema.serializeSchema(a, .{});
+    defer a.free(encoded);
+    try store.put(schema.schema_key, encoded);
+    const key = try internal_keys.documentKeyAlloc(a, "large");
+    defer a.free(key);
+    const payload = try a.alloc(u8, 256 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const first = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{payload});
+    defer a.free(first);
+    const second = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":2}}", .{payload});
+    defer a.free(second);
+    try store.put(key, first);
+    var old = try store.beginReadTxn();
+    defer old.abort();
+    try std.testing.expect(!document_payload.isManifest(try old.getPhysical(key)));
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(key, second);
+        try std.testing.expectEqual(payload.len + 2, write.document_revisions.document_payload_stats.blob_bytes_written);
+        try write.commit();
+    }
+    var migrated = try store.beginReadTxn();
+    defer migrated.abort();
+    try std.testing.expect(document_payload.isManifest(try migrated.getPhysical(key)));
+    try std.testing.expectEqualStrings(first, try old.get(key));
+    try std.testing.expectEqualStrings(second, try migrated.get(key));
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(key, first);
+        try std.testing.expectEqual(@as(usize, 0), write.document_revisions.document_payload_stats.blob_bytes_written);
+        try std.testing.expectEqual(payload.len + 2, write.document_revisions.document_payload_stats.blob_bytes_reused);
+        try std.testing.expect(write.document_revisions.document_payload_stats.manifest_bytes < 512);
+        try write.commit();
+    }
+    try std.testing.expectEqualStrings(second, try migrated.get(key));
+    {
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        var values: [1]?[]const u8 = undefined;
+        try current.getManySorted(&.{key}, &values);
+        try std.testing.expectEqualStrings(first, values[0].?);
+        var scope = try current.openReadScope(a);
+        defer scope.close();
+        try std.testing.expectEqualStrings(first, try scope.get(key));
+        var cursor = try current.openCursor();
+        defer cursor.close();
+        try std.testing.expectEqualStrings(first, (try cursor.seekAtOrAfter(key)).?.value);
+    }
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.patchMetadata(key, &.{.{ .name = "metadata", .value_json = "3" }});
+        // A second patch observes the first publication in this transaction.
+        try write.patchMetadata(key, &.{.{ .name = "added", .value_json = "true" }});
+        try std.testing.expectEqual(@as(usize, 0), write.document_revisions.document_payload_stats.blob_bytes_written);
+        try std.testing.expect(write.document_revisions.document_payload_stats.manifest_bytes < 1024);
+        try write.commit();
+    }
+    {
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        const actual = try current.get(key);
+        const expected = try std.fmt.allocPrint(a, "{{\"added\":true,\"body\":\"{s}\",\"metadata\":3}}", .{payload});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, actual);
+        const proof = (try revisionForPayloadTest(&current, key)).?;
+        const physical = try a.dupe(u8, try current.getPhysical(key));
+        defer a.free(physical);
+        const parsed = try document_payload.Manifest.decode(a, physical);
+        defer a.free(parsed.parts);
+        try std.testing.expect(parsed.rooted);
+        try std.testing.expectEqualSlices(u8, &proof.digest, &parsed.logical_digest);
+        const revision_key = @import("document_mutation_revision.zig").keyForPhysical(key).?;
+        const paths = try a.dupe(u8, try current.getPhysical(&@import("document_projection.zig").keyForRevision(revision_key)));
+        defer a.free(paths);
+        const directory = (try @import("document_projection.zig").Directory.open(a, paths, proof)).?;
+        defer a.free(directory.fields);
+        const field = directory.find("metadata").?;
+        var scope = try current.openReadScope(a);
+        defer scope.close();
+        var values: [1][]const u8 = undefined;
+        try document_payload.readSelected(a, &scope, key, proof, &.{field}, &values);
+        defer a.free(values[0]);
+        try std.testing.expectEqualStrings("3", values[0]);
+    }
+    // Disposable proof loss must rebuild the tagged manifest commitment,
+    // rather than installing SHA256(reconstructed JSON) with an inline hint.
+    {
+        const revisions = @import("document_mutation_revision.zig");
+        try store.delete(&revisions.contentKey(revisions.keyForPhysical(key).?));
+        var page = (try revisions.BackfillPage.prepare(a, &store, true)).?;
+        defer page.deinit();
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try std.testing.expectEqual(@as(usize, 1), try page.stage(&write));
+        try write.commit();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const rebuilt = (try revisions.loadContent(&read, key)).?;
+        try std.testing.expect(rebuilt.manifest);
+        try std.testing.expectEqualSlices(u8, &document_payload.publishedCommitment(try read.getPhysical(key)), &rebuilt.digest);
+    }
+    {
+        var write = try store.beginWriteTxn();
+        defer write.abort();
+        try std.testing.expectError(error.Unsupported, write.patchMetadata(key, &.{.{ .name = "body", .value_json = "\"replacement\"" }}));
+        try write.patchMetadata(key, &.{.{ .name = "metadata", .value_json = "4" }});
+        // Abort must leave both the manifest and all payload references intact.
+    }
+    try store.delete(key);
+    try std.testing.expectError(error.NotFound, store.get(a, key));
+    try std.testing.expectEqualStrings(second, try migrated.get(key));
+}
+
+fn revisionForPayloadTest(txn: anytype, key: []const u8) !?@import("document_mutation_revision.zig").Content {
+    return @import("document_mutation_revision.zig").loadContent(txn, key);
+}
+
+test "document payload persistent metadata patches bound WAL writes and survive reopen" {
+    const a = std.testing.allocator;
+    const schema = @import("schema.zig");
+    const revision = @import("document_mutation_revision.zig");
+    const key = try internal_keys.documentKeyAlloc(a, "large");
+    defer a.free(key);
+    for ([_]usize{ 64 * 1024, 1024 * 1024 }) |length| {
+        const payload = try a.alloc(u8, length);
+        defer a.free(payload);
+        @memset(payload, 'x');
+        const first = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{payload});
+        defer a.free(first);
+        const second = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":2}}", .{payload});
+        defer a.free(second);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        for (0..2) |pass| {
+            var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 16 * 1024 * 1024 });
+            defer backend.close();
+            var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+            defer store.close();
+            store.document_payload_prototype = true;
+            if (pass == 0) {
+                const encoded = try schema.serializeSchema(a, .{});
+                defer a.free(encoded);
+                // ASCH25 and ASCH26 have the same schema fields. Seed a legacy
+                // schema through the physical backend, as an old binary would.
+                std.mem.writeInt(u32, encoded[4..8], 25, .little);
+                try store.put(schema.schema_key, encoded);
+                {
+                    var untouched = try store.beginReadTxn();
+                    defer untouched.abort();
+                    try std.testing.expectEqual(@as(u32, 25), std.mem.readInt(u32, (try untouched.get(schema.schema_key))[4..8], .little));
+                }
+                try store.put(key, first);
+                const read_rounds = 16;
+                const inline_read_start = @import("antfly_platform").time.monotonicNs();
+                for (0..read_rounds) |_| {
+                    const value = try store.get(a, key);
+                    defer a.free(value);
+                    try std.testing.expectEqual(first.len, value.len);
+                }
+                const inline_read_ns = @import("antfly_platform").time.monotonicNs() - inline_read_start;
+                try store.put(key, second);
+                const rounds = 8;
+                const before_put = backend.snapshotWriteStats();
+                const put_start = @import("antfly_platform").time.monotonicNs();
+                for (0..rounds) |i| try store.put(key, if (i % 2 == 0) first else second);
+                const put_ns = @import("antfly_platform").time.monotonicNs() - put_start;
+                const before_patch = backend.snapshotWriteStats();
+                const patch_start = @import("antfly_platform").time.monotonicNs();
+                for (0..rounds) |i| {
+                    var write = try store.beginWriteTxn();
+                    errdefer write.abort();
+                    try write.patchMetadata(key, &.{.{ .name = "metadata", .value_json = if (i % 2 == 0) "1" else "2" }});
+                    try std.testing.expectEqual(@as(usize, 0), write.document_revisions.document_payload_stats.blob_bytes_written);
+                    try write.commit();
+                }
+                const patch_ns = @import("antfly_platform").time.monotonicNs() - patch_start;
+                const after_patch = backend.snapshotWriteStats();
+                const wal_patch = after_patch.wal_append_bytes - before_patch.wal_append_bytes;
+                try std.testing.expect(wal_patch > 0 and wal_patch < 8192 * rounds);
+                std.debug.print("DOCUMENT_PATCH_STORAGE payload_bytes={d} rounds={d} full_put_ns={d} patch_ns={d} full_put_wal_bytes={d} patch_wal_bytes={d}\n", .{ length, rounds, put_ns / rounds, patch_ns / rounds, (before_patch.wal_append_bytes - before_put.wal_append_bytes) / rounds, wal_patch / rounds });
+                const manifest_read_start = @import("antfly_platform").time.monotonicNs();
+                for (0..read_rounds) |_| {
+                    const value = try store.get(a, key);
+                    defer a.free(value);
+                    try std.testing.expectEqual(second.len, value.len);
+                }
+                const manifest_read_ns = @import("antfly_platform").time.monotonicNs() - manifest_read_start;
+                std.debug.print("DOCUMENT_PATCH_READ payload_bytes={d} rounds={d} inline_ns={d} manifest_ns={d}\n", .{ length, read_rounds, inline_read_ns / read_rounds, manifest_read_ns / read_rounds });
+                try std.testing.expectError(error.UnsupportedVersion, store.put(schema.schema_key, encoded));
+                try store.sync(true);
+            }
+            if (pass == 1) {
+                const started = @import("antfly_platform").time.monotonicNs();
+                const recovered = try store.get(a, key);
+                defer a.free(recovered);
+                const elapsed = @import("antfly_platform").time.monotonicNs() - started;
+                try std.testing.expectEqualStrings(second, recovered);
+                std.debug.print("DOCUMENT_REOPEN_READ payload_bytes={d} elapsed_ns={d} backend_cache=cold os_cache=uncontrolled\n", .{ length, elapsed });
+            }
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualStrings(second, try read.get(key));
+            try std.testing.expectEqual(@as(u32, 26), std.mem.readInt(u32, (try read.get(schema.schema_key))[4..8], .little));
+            try std.testing.expect((try revision.loadContent(&read, key)).?.manifest);
+            // Ordinary export contains complete logical JSON and no private
+            // document blobs. A physical checkpoint keeps the underlying keys.
+            const exported = try store.scanRange(a, "", "");
+            defer DocStore.freeResults(a, exported);
+            for (exported) |entry| {
+                try std.testing.expect(document_payload.ownership.privatePrefix(entry.key) == null);
+                if (std.mem.eql(u8, entry.key, key)) try std.testing.expectEqualStrings(second, entry.value);
+            }
+        }
+    }
+}
+
+test "document payload unsupported directories stay inline and shrinking retires only owned values" {
+    const a = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    store.document_payload_prototype = true;
+    const schema = @import("schema.zig");
+    const encoded = try schema.serializeSchema(a, .{});
+    defer a.free(encoded);
+    try store.put(schema.schema_key, encoded);
+    const key = try internal_keys.documentKeyAlloc(a, "wide");
+    defer a.free(key);
+    var body: std.Io.Writer.Allocating = .init(a);
+    defer body.deinit();
+    try body.writer.writeByte('{');
+    for (0..600) |i| try body.writer.print("\"field{d}\":1,", .{i});
+    try body.writer.writeAll("\"large\":\"");
+    try body.writer.splatByteAll('x', 128 * 1024);
+    try body.writer.writeAll("\"}");
+    try store.put(key, body.written());
+    try store.put(key, body.written());
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(!document_payload.isManifest(try read.getPhysical(key)));
+        try std.testing.expectEqualStrings(body.written(), try read.get(key));
+    }
+    body.clearRetainingCapacity();
+    try body.writer.writeAll("{\"large\":\"");
+    try body.writer.splatByteAll('x', 128 * 1024);
+    try body.writer.writeAll("\",\"metadata\":1}");
+    try store.put(key, body.written());
+    try store.put(key, body.written());
+    var pinned = try store.beginReadTxn();
+    defer pinned.abort();
+    try std.testing.expect(document_payload.isManifest(try pinned.getPhysical(key)));
+    try store.put(key, "{}");
+    var current = try store.beginReadTxn();
+    defer current.abort();
+    try std.testing.expectEqualStrings("{}", try current.get(key));
+    try std.testing.expectEqualStrings(body.written(), try pinned.get(key));
+    var cursor = try current.openPhysicalCursorAdapter();
+    defer cursor.close();
+    const owner_prefix = document_payload.blobKey(key, @splat(0))[0 .. document_payload.prefix.len + 32].*;
+    if (try cursor.seekAtOrAfter(&owner_prefix)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.key, &owner_prefix));
+}
+
+test "document payload logical authorities agree across inline and external layouts" {
+    const a = std.testing.allocator;
+    const schema = @import("schema.zig");
+    const revision = @import("document_mutation_revision.zig");
+    const key = try internal_keys.documentKeyAlloc(a, "doc");
+    defer a.free(key);
+    const payload = try a.alloc(u8, 128 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const body = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{payload});
+    defer a.free(body);
+    var authorities: [2][32]u8 = undefined;
+    for (0..2) |arm| {
+        var backend = lsm_backend.Backend.init(a, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        store.document_payload_prototype = true;
+        store.document_payload_inline = arm == 0;
+        const encoded = try schema.serializeSchema(a, .{});
+        defer a.free(encoded);
+        try store.put(schema.schema_key, encoded);
+        try store.put(key, body);
+        try store.put(key, body);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const proof = (try revision.loadContent(&read, key)).?;
+        try std.testing.expectEqual(arm == 1, proof.manifest);
+        try std.testing.expectEqualStrings(body, try read.get(key));
+        authorities[arm] = proof.digest;
+        if (arm == 0) {
+            try std.testing.expectEqual(@as(u32, 26), std.mem.readInt(u32, (try read.get(schema.schema_key))[4..8], .little));
+            var write = try store.beginWriteTxn();
+            defer write.abort();
+            try std.testing.expectError(error.Unsupported, write.patchMetadata(key, &.{.{ .name = "metadata", .value_json = "2" }}));
+        }
+    }
+    try std.testing.expectEqualSlices(u8, &authorities[0], &authorities[1]);
+}
+
+test "document payload authority recovery obeys the pinned schema capability rather than cache presence" {
+    const a = std.testing.allocator;
+    const revisions = @import("document_mutation_revision.zig");
+    const schema = @import("schema.zig");
+    var backend = lsm_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const encoded = try schema.serializeSchema(a, .{});
+    defer a.free(encoded);
+    try store.put(schema.schema_key, encoded);
+    const key = try internal_keys.documentKeyAlloc(a, "old");
+    defer a.free(key);
+    const other = try internal_keys.documentKeyAlloc(a, "new");
+    defer a.free(other);
+    const payload = try a.alloc(u8, 128 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const body = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\"}}", .{payload});
+    defer a.free(body);
+    try store.put(key, body);
+    var before = try store.beginReadTxn();
+    defer before.abort();
+    const legacy = (try revisions.loadContent(&before, key)).?;
+    try std.testing.expectEqual(revisions.Algorithm.sha256_json, legacy.algorithm);
+    store.document_payload_prototype = true;
+    try store.put(other, body);
+    // An existing pinned cut retains its original protocol and cache meaning.
+    try std.testing.expectEqual(revisions.Algorithm.sha256_json, (try revisions.loadContent(&before, key)).?.algorithm);
+    {
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expect((try revisions.loadContent(&current, key)) == null);
+    }
+    var page = (try revisions.BackfillPage.prepare(a, &store, true)).?;
+    defer page.deinit();
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        _ = try page.stage(&write);
+        try write.commit();
+    }
+    var expected: [32]u8 = undefined;
+    {
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        const rebuilt = (try revisions.loadContent(&current, key)).?;
+        try std.testing.expectEqual(revisions.Algorithm.logical_json_v1, rebuilt.algorithm);
+        try std.testing.expectEqual(legacy.revision, rebuilt.revision);
+        try std.testing.expect(!rebuilt.manifest);
+        expected = rebuilt.digest;
+    }
+    try store.delete(&revisions.contentKey(revisions.keyForPhysical(key).?));
+    for (0..8) |attempt| {
+        var again = (try revisions.BackfillPage.prepare(a, &store, attempt == 0)).?;
+        defer again.deinit();
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        _ = try again.stage(&write);
+        try write.commit();
+        if (again.complete) break;
+    }
+    var current = try store.beginReadTxn();
+    defer current.abort();
+    try std.testing.expectEqualSlices(u8, &expected, &(try revisions.loadContent(&current, key)).?.digest);
+    try std.testing.expectEqual(revisions.Algorithm.sha256_json, (try revisions.loadContent(&before, key)).?.algorithm);
+}
+
+test "document payload retained references survive restart overwrite and bounded reclamation" {
+    const a = std.testing.allocator;
+    const frame_mod = @import("retained_frame.zig");
+    const reference = @import("retained_reference.zig");
+    const schema = @import("schema.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const key = try internal_keys.documentKeyAlloc(a, "retained");
+    defer a.free(key);
+    const body = try a.alloc(u8, 1024 * 1024 + 37);
+    defer a.free(body);
+    @memset(body, 'x');
+    const first = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{body});
+    defer a.free(first);
+    const second = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":2}}", .{body});
+    defer a.free(second);
+    var blob_key: document_payload.BlobKey = undefined;
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 16 * 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        store.document_payload_prototype = true;
+        if (pass == 0) {
+            const encoded = try schema.serializeSchema(a, .{});
+            defer a.free(encoded);
+            try store.put(schema.schema_key, encoded);
+            try store.put(&internal_keys.identity_namespace_key, &@as(retained_effects.Namespace, @splat(1)));
+            try store.put(key, first);
+            try store.put(key, second);
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                const manifest = try document_payload.Manifest.decode(a, try read.getPhysical(key));
+                defer a.free(manifest.parts);
+                const values = try document_payload.immutableValues(a, manifest);
+                defer a.free(values);
+                try std.testing.expectEqual(@as(usize, 1), values.len);
+                blob_key = document_payload.blobKey(key, values[0].digest);
+            }
+            {
+                var write = try store.beginWriteTxn();
+                errdefer write.abort();
+                _ = try retained_effects.admitWithCapabilities(&write, @splat(1), 1, @splat(3), retained_effects.default_limit, false, true);
+                try write.commit();
+            }
+            for (0..2) |index| {
+                var write = try store.beginWriteTxn();
+                errdefer write.abort();
+                try write.patchMetadata(key, &.{.{ .name = "metadata", .value_json = if (index == 0) "3" else "4" }});
+                try write.commit();
+            }
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const state = (try retained_effects.load(&read)).?;
+            var stored: usize = 0;
+            for (1..3) |seq| {
+                const raw = try read.get(&retained_effects.recordKey(seq));
+                try std.testing.expect(reference.isRecord(raw));
+                try std.testing.expect(raw.len < 2048);
+                stored += raw.len;
+            }
+            try std.testing.expectEqual(@as(u64, body.len + 2 + stored), state.retained_bytes);
+            std.debug.print("DOCUMENT_RETAINED payload_bytes={d} frames=2 frame_bytes={d} charged_bytes={d} unique_payloads=1\n", .{ body.len + 2, stored, state.retained_bytes });
+        } else {
+            // Replacing the current row releases its ownership, but retained
+            // frames still own their exact immutable afterimages.
+            try store.put(key, "{\"metadata\":5}");
+            var historical = try store.beginReadTxn();
+            defer historical.abort();
+            const scratch = try a.alloc(u8, frame_mod.chunk_bytes);
+            defer a.free(scratch);
+            var cache: frame_mod.View.ChunkCache = .{ .bytes = scratch };
+            const frame = (try retained_effects.readFrame(&historical, @splat(1), 1, @splat(3), 0, &cache)).?;
+            const view = frame.chunked;
+            const effect = try view.effectAt(0, &cache);
+            const reconstructed = try a.alloc(u8, effect.value_len.?);
+            defer a.free(reconstructed);
+            try std.testing.expectEqual(reconstructed.len, try view.readAt(effect.value_offset, reconstructed, &cache));
+            const expected = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":3}}", .{body});
+            defer a.free(expected);
+            try std.testing.expectEqualStrings(expected, reconstructed);
+            // A valid backend record with wrong immutable bytes must not be
+            // legitimized by computing fresh transport hashes over corruption.
+            const original_blob = try a.dupe(u8, try historical.getPhysical(&blob_key));
+            defer a.free(original_blob);
+            const corrupt_blob = try a.dupe(u8, original_blob);
+            defer a.free(corrupt_blob);
+            corrupt_blob[1] = 'z';
+            try store.put(&blob_key, corrupt_blob);
+            {
+                var damaged = try store.beginReadTxn();
+                defer damaged.abort();
+                cache.invalidate();
+                try std.testing.expectError(error.InvalidDocumentManifest, retained_effects.readFrame(&damaged, @splat(1), 1, @splat(3), 0, &cache));
+            }
+            try store.put(&blob_key, original_blob);
+            // GC is atomic and reference-counted, including across reopen.
+            {
+                var write = try store.beginWriteTxn();
+                errdefer write.abort();
+                try retained_effects.acknowledge(&write, @splat(1), 1, @splat(3), 0, 2);
+                try std.testing.expectEqual(@as(usize, 1), try retained_effects.reclaim(&write, @splat(1), 1, 1));
+                try write.commit();
+            }
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectEqual(body.len + 2, (try read.getPhysical(&blob_key)).len);
+            }
+            {
+                var write = try store.beginWriteTxn();
+                errdefer write.abort();
+                try std.testing.expectEqual(@as(usize, 1), try retained_effects.reclaim(&write, @splat(1), 1, 1));
+                try write.commit();
+            }
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectError(error.NotFound, read.getPhysical(&blob_key));
+            }
+            // A reader predating GC retains its MVCC payload cut.
+            cache.invalidate();
+            try std.testing.expectEqual(reconstructed.len, try view.readAt(effect.value_offset, reconstructed, &cache));
+            try std.testing.expectEqualStrings(expected, reconstructed);
+        }
+    }
+}
+
+// Advisory eviction is confined to closed, private benchmark files. It does
+// not drop a host-wide cache or touch another table's pages. Success means the
+// kernel accepted advice, not proof that every storage layer is physically cold.
+fn advisePayloadFixtureCold(path: []const u8) !bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const Walk = struct {
+        fn apply(dir: std.Io.Dir, runtime_io: std.Io, depth: usize) anyerror!void {
+            if (depth > 32) return error.ResourceLimitExceeded;
+            var iterator = dir.iterate();
+            while (try iterator.next(runtime_io)) |entry| switch (entry.kind) {
+                .file => {
+                    var file = try dir.openFile(runtime_io, entry.name, .{});
+                    defer file.close(runtime_io);
+                    try file.sync(runtime_io);
+                    if (std.os.linux.errno(std.os.linux.fadvise(file.handle, 0, 0, std.os.linux.POSIX_FADV.DONTNEED)) != .SUCCESS) return error.ColdAdviceFailed;
+                },
+                .directory => {
+                    var child = try dir.openDir(runtime_io, entry.name, .{ .iterate = true });
+                    defer child.close(runtime_io);
+                    try apply(child, runtime_io, depth + 1);
+                },
+                else => {},
+            };
+        }
+    };
+    var directory = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer directory.close(io);
+    try Walk.apply(directory, io, 0);
+    return true;
+}
+
+test "document payload mixed workload qualification compares inline and adaptive layouts" {
+    if (!@import("builtin").link_libc or std.c.getenv("ANTFLY_BENCH_DOCUMENT_MIXED") == null) return error.SkipZigTest;
+    const allocation_mode: []const u8 = if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_ALLOCATOR")) |raw| std.mem.span(raw) else "production";
+    if (!std.mem.eql(u8, allocation_mode, "production") and !std.mem.eql(u8, allocation_mode, "checked")) return error.InvalidArgument;
+    const a = if (std.mem.eql(u8, allocation_mode, "checked")) std.testing.allocator else @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator);
+    const schema = @import("schema.zig");
+    const row_count: usize = if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_ROWS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 1;
+    if (row_count == 0 or row_count > 256) return error.InvalidArgument;
+    const row_keys = try a.alloc([]u8, row_count);
+    defer a.free(row_keys);
+    var initialized: usize = 0;
+    defer for (row_keys[0..initialized]) |key| a.free(key);
+    for (row_keys) |*key| {
+        const id = try std.fmt.allocPrint(a, "mixed-{d}", .{initialized});
+        defer a.free(id);
+        key.* = try internal_keys.documentKeyAlloc(a, if (row_count == 1) "mixed" else id);
+        initialized += 1;
+    }
+    const encoded = try schema.serializeSchema(a, .{});
+    defer a.free(encoded);
+    const rounds: usize = if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_ROUNDS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 6;
+    if (rounds < 2 or rounds > 1024) return error.InvalidArgument;
+    const selected_bytes: ?usize = if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_BYTES")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else null;
+    const selected_reads: ?usize = if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_READS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else null;
+    const reverse = std.c.getenv("ANTFLY_BENCH_DOCUMENT_REVERSE") != null;
+    for ([_]usize{ 4 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024 }) |length| {
+        if (selected_bytes != null and selected_bytes.? != length) continue;
+        const body = try a.alloc(u8, length);
+        defer a.free(body);
+        if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_ENTROPY") != null) {
+            var random = std.Random.DefaultPrng.init(0x41464c59);
+            random.random().bytes(body);
+            for (body) |*byte| byte.* = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[byte.* & 63];
+        } else @memset(body, 'x');
+        const first = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{body});
+        defer a.free(first);
+        const second = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":2}}", .{body});
+        defer a.free(second);
+        const changed = try a.dupe(u8, first);
+        defer a.free(changed);
+        changed[10] = if (changed[10] == 'y') 'z' else 'y';
+        const changed_second = try a.dupe(u8, second);
+        defer a.free(changed_second);
+        changed_second[10] = if (changed_second[10] == 'y') 'z' else 'y';
+        for ([_]usize{ 0, 8, 64 }) |reads_per_write| for ([_]usize{ 0, 1, 2 }) |change_mode| for (0..3) |slot| {
+            if (selected_reads != null and selected_reads.? != reads_per_write) continue;
+            const changing = change_mode != 0;
+            const arm = if (reverse) 2 - slot else slot;
+            const layout = switch (arm) {
+                0 => "production",
+                1 => "inline",
+                else => "adaptive",
+            };
+            if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_LAYOUT")) |selected| if (!std.mem.eql(u8, std.mem.span(selected), layout)) continue;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+            {
+                var backend = try lsm_backend.Backend.open(a, path, .{ .backend = .{ .durability = .full }, .flush_threshold_bytes = 16 * 1024 * 1024 });
+                defer backend.close();
+                var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+                defer store.close();
+                store.document_payload_prototype = arm != 0;
+                store.document_payload_inline = arm == 1;
+                try store.put(schema.schema_key, encoded);
+                for (row_keys) |key| {
+                    try store.put(key, first);
+                    try store.put(key, second);
+                }
+                // The fixture has no background executor. Drive the ordinary
+                // admitted maintenance path explicitly for multi-row workloads.
+                if (row_count > 1) {
+                    var steps: usize = 0;
+                    while (try backend.runMaintenanceStep()) {
+                        steps += 1;
+                        if (steps > 1024) return error.ResourceLimitExceeded;
+                    }
+                }
+                const before = backend.snapshotWriteStats();
+                const begin = @import("antfly_platform").time.monotonicNs();
+                var patched: usize = 0;
+                var commit_syncs: usize = 0;
+                for (0..rounds) |operation| {
+                    const key = row_keys[operation % row_count];
+                    const round = operation / row_count;
+                    const sync_before = backend.snapshotWriteStats().wal_sync_records;
+                    if (arm == 2 and !changing and length >= document_payload.minimum_value_bytes) {
+                        var write = try store.beginWriteTxn();
+                        var finished = false;
+                        defer if (!finished) write.abort();
+                        if (write.patchMetadata(key, &.{.{ .name = "metadata", .value_json = if (round % 2 == 0) "1" else "2" }})) |_| {
+                            try write.commit();
+                            finished = true;
+                            patched += 1;
+                        } else |err| {
+                            write.abort();
+                            finished = true;
+                            if (err != error.Unsupported) return err;
+                            try store.put(key, if (round % 2 == 0) first else second);
+                        }
+                    } else try store.put(key, if (change_mode == 2)
+                        (if ((round / 3) % 2 == 0) (if (round % 2 == 0) changed else changed_second) else if (round % 2 == 0) first else second)
+                    else if (changing) (if (round % 2 == 0) changed else first) else if (round % 2 == 0) first else second);
+                    try std.testing.expect(backend.snapshotWriteStats().wal_sync_records > sync_before);
+                    commit_syncs += 1;
+                    if (row_count > 1) _ = try backend.runMaintenanceStep();
+                    for (0..reads_per_write) |_| {
+                        const result = try store.get(a, key);
+                        defer a.free(result);
+                        try std.testing.expectEqual(first.len, result.len);
+                    }
+                }
+                const elapsed = @import("antfly_platform").time.monotonicNs() - begin;
+                const after = backend.snapshotWriteStats();
+                try std.testing.expectEqual(rounds, commit_syncs);
+                try std.testing.expect(after.wal_sync_records - before.wal_sync_records >= rounds);
+                const sync_begin = @import("antfly_platform").time.monotonicNs();
+                try store.sync(true);
+                if (row_count > 1) {
+                    var steps: usize = 0;
+                    while (try backend.runMaintenanceStep()) {
+                        steps += 1;
+                        if (steps > 1024) return error.ResourceLimitExceeded;
+                    }
+                }
+                const sync_ns = @import("antfly_platform").time.monotonicNs() - sync_begin;
+                const durable = backend.snapshotWriteStats();
+                std.debug.print("DOCUMENT_MIXED layout={s} allocator={s} payload={d} changing={d} reads_per_write={d} rounds={d} row_count={d} commit_syncs={d} elapsed_ns={d} wal_bytes={d} table_bytes={d} sync_ns={d} patches={d} wal_syncs={d} compactions={d} compaction_bytes={d}\n", .{
+                    layout,                                           allocation_mode,                                    length,  change_mode, reads_per_write,                                  rounds,                                   row_count,                                                        commit_syncs, elapsed,
+                    after.wal_append_bytes - before.wal_append_bytes, durable.table_file_bytes - before.table_file_bytes, sync_ns, patched,     after.wal_sync_records - before.wal_sync_records, durable.compactions - before.compactions, durable.compaction_output_bytes - before.compaction_output_bytes,
+                });
+            }
+            // Separate engine lifetime: no block cache or decoded manifest
+            // survives. OS cache state is reported explicitly, not called cold.
+            const advised_cold = if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_COLD") != null) try advisePayloadFixtureCold(path) else false;
+            const cold_begin = @import("antfly_platform").time.monotonicNs();
+            var recovered_backend = try lsm_backend.Backend.open(a, path, .{ .backend = .{ .durability = .full }, .flush_threshold_bytes = 16 * 1024 * 1024 });
+            defer recovered_backend.close();
+            var recovered_store = try DocStore.openRuntime(a, try recovered_backend.runtimeStore(a, .{}));
+            defer recovered_store.close();
+            recovered_store.document_payload_prototype = arm != 0;
+            const recovered_value = try recovered_store.get(a, row_keys[(rounds - 1) % row_count]);
+            defer a.free(recovered_value);
+            const cold_elapsed = @import("antfly_platform").time.monotonicNs() - cold_begin;
+            try std.testing.expectEqual(first.len, recovered_value.len);
+            std.debug.print("DOCUMENT_COLD layout={s} allocator={s} payload={d} changing={d} reads_per_write={d} row_count={d} elapsed_ns={d} engine_cache=cold os_cache={s} operation=reopen_and_read\n", .{ layout, allocation_mode, length, change_mode, reads_per_write, row_count, cold_elapsed, if (advised_cold) "advised_cold" else "uncontrolled" });
+        };
+    }
+}
+
+test "document payload provider observation preserves pinned source revisions" {
+    const input = @import("document_input.zig");
+    const schema = @import("schema.zig");
+    const benchmark = builtin.link_libc and std.c.getenv("ANTFLY_BENCH_DOCUMENT_INPUT") != null;
+    const a = if (benchmark) platform.allocator.processAllocator(std.heap.page_allocator) else std.testing.allocator;
+    const length: usize = if (benchmark) 1024 * 1024 else 128 * 1024;
+    for ([_]bool{ false, true }) |entropy| {
+        var backend = lsm_backend.Backend.init(a, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        store.document_payload_prototype = true;
+        const encoded = try schema.serializeSchema(a, .{});
+        defer a.free(encoded);
+        try store.put(schema.schema_key, encoded);
+        const key = try internal_keys.documentKeyAlloc(a, "provider\x00row");
+        defer a.free(key);
+        const body = try a.alloc(u8, length);
+        defer a.free(body);
+        if (entropy) {
+            var random = std.Random.DefaultPrng.init(0x41464c59);
+            random.random().bytes(body);
+            for (body) |*byte| byte.* = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[byte.* & 63];
+        } else @memset(body, 'x');
+        const first = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{body});
+        defer a.free(first);
+        const second = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":2}}", .{body});
+        defer a.free(second);
+        try store.put(key, first);
+        try store.put(key, second);
+        {
+            var verify = try store.beginReadTxn();
+            defer verify.abort();
+            try std.testing.expect(document_payload.isManifest(try verify.getPhysical(key)));
+        }
+        const Materialize = struct {
+            fn copy(_: *anyopaque, alloc: Allocator, _: []const u8, bytes: []const u8, observed: []const u8) !void {
+                const logical = try alloc.dupe(u8, bytes);
+                defer alloc.free(logical);
+                if (!std.mem.eql(u8, logical, observed)) return error.EnrichmentSourceChanged;
+            }
+            fn borrow(_: *anyopaque, _: Allocator, _: []const u8, bytes: []const u8, observed: []const u8) !void {
+                if (!std.mem.eql(u8, bytes, observed)) return error.EnrichmentSourceChanged;
+            }
+        };
+        const port: input.Verifier = .{ .ptr = &store, .verify = Materialize.copy };
+        var expected: input.Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(second, &expected, .{});
+        var pinned = try store.beginReadTxn();
+        defer pinned.abort();
+        try std.testing.expectEqualDeep(expected, try input.Qualification.nativeDigest(a, &pinned, key, second, port));
+        // Neither a new commit nor a demotion/replacement of the current row
+        // changes the source bound to an already captured immutable view.
+        try store.put(key, first);
+        try std.testing.expectEqualDeep(expected, try input.Qualification.nativeDigest(a, &pinned, key, second, port));
+        try std.testing.expectError(error.EnrichmentSourceChanged, input.Qualification.nativeDigest(a, &pinned, key, first, port));
+        if (benchmark) {
+            const LogicalOnly = struct {
+                reader: *DocStore.Txn,
+                pub fn get(self: *@This(), candidate: []const u8) ![]const u8 {
+                    return self.reader.get(candidate);
+                }
+            };
+            // Alternate order to expose warm-cache/order effects. This is a
+            // focused input-check benchmark, not a whole provider workload.
+            for (0..7) |trial| {
+                var timings: [3]u64 = undefined;
+                for (0..3) |pass| {
+                    const mode = (trial + pass) % 3;
+                    const started = platform_time.monotonicNs();
+                    for (0..32) |_| {
+                        var read = try store.beginReadTxn();
+                        defer read.abort();
+                        const actual = if (mode == 0) blk: {
+                            var logical = LogicalOnly{ .reader = &read };
+                            break :blk try input.captureDigest(a, &logical, key, first, port);
+                        } else if (mode == 1) try input.Qualification.nativeDigest(a, &read, key, first, port) else try input.captureDigest(a, &read, key, first, .{ .ptr = &store, .verify = Materialize.borrow });
+                        std.mem.doNotOptimizeAway(actual);
+                    }
+                    timings[mode] = platform_time.monotonicNs() - started;
+                }
+                std.debug.print("DOCUMENT_INPUT allocator=production dataset={s} trial={d} bytes={d} rounds=32 logical_ns={d} manifest_ns={d} borrow_ns={d}\n", .{ if (entropy) "entropy" else "repeated", trial, length, timings[0], timings[1], timings[2] });
+            }
+        }
+    }
+}
+
+test "document payload admission hysteresis persists through changing and reused values" {
+    const a = std.testing.allocator;
+    const schema = @import("schema.zig");
+    var backend = lsm_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    store.document_payload_prototype = true;
+    const encoded = try schema.serializeSchema(a, .{});
+    defer a.free(encoded);
+    try store.put(schema.schema_key, encoded);
+    const key = try internal_keys.documentKeyAlloc(a, "cooldown");
+    defer a.free(key);
+    const small = try internal_keys.documentKeyAlloc(a, "small");
+    defer a.free(small);
+    try store.put(small, "{\"a\":1}");
+    try std.testing.expectEqual(@as(u8, 1), store.document_values_possible.load(.acquire));
+    const body = try a.alloc(u8, 128 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    for (0..7) |step| {
+        if (step >= 2) body[0] = 'y';
+        const source = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":{d}}}", .{ body, step });
+        defer a.free(source);
+        try store.put(key, source);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const proof = (try revisionForPayloadTest(&read, key)).?;
+        try std.testing.expectEqual(step == 1 or step == 6, proof.manifest);
+        try std.testing.expectEqual(@as(u2, if (step >= 2 and step <= 4) @intCast(5 - step) else 0), proof.layout_cooldown);
+        try std.testing.expectEqualStrings(source, try read.get(key));
+        if (step >= 1) try std.testing.expectEqual(@as(u8, 2), store.document_values_possible.load(.acquire));
+    }
+    // Dropping a positive hint after a generation replacement must reload the
+    // upgraded format, rather than infer that this particular small row is safe.
+    store.document_values_possible.store(0, .release);
+    try store.put(small, "{\"a\":2}");
+    try std.testing.expectEqual(@as(u8, 2), store.document_values_possible.load(.acquire));
+}
+
+test "document payload prepared logical writes preserve observers and fallback after input changes" {
+    const a = std.testing.allocator;
+    const schema = @import("schema.zig");
+    var backend = lsm_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    store.document_payload_prototype = true;
+    const encoded = try schema.serializeSchema(a, .{});
+    defer a.free(encoded);
+    try store.put(schema.schema_key, encoded);
+    const key = try internal_keys.documentKeyAlloc(a, "prepared");
+    defer a.free(key);
+    const body = try a.alloc(u8, 128 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    const first = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{body});
+    defer a.free(first);
+    const second = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":2}}", .{body});
+    defer a.free(second);
+    const next = try std.fmt.allocPrint(a, "{{\"metadata\":3,\"body\":\"{s}\"}}", .{body});
+    defer a.free(next);
+    try store.put(key, first);
+    try store.put(key, second);
+    const revisions = @import("document_mutation_revision.zig");
+    const cache_key = revisions.contentKey(revisions.keyForPhysical(key).?);
+    const stale = try store.get(a, &cache_key);
+    defer a.free(stale);
+    stale[16] &= ~@as(u8, 0x80);
+    try store.put(&cache_key, stale);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const source = (try document_payload.SourceMetadata.capture(a, &read, key)).?;
+    defer source.deinit(a);
+    const prepared = (try source.prepare(a, second, next, &.{.{ .name = "metadata", .value_json = "3" }}, &.{ "metadata", "body" })).?;
+    defer prepared.deinit(a);
+    // The logical root is unchanged by framing, but the old raw references
+    // belong to one exact manifest. Such a rewrite must decline the receipt.
+    const reframed = try std.fmt.allocPrint(a, "{{ \"body\":\"{s}\", \"metadata\":2 }}", .{body});
+    defer a.free(reframed);
+    try store.put(key, reframed);
+    {
+        var changed_layout = try store.beginReadTxn();
+        defer changed_layout.abort();
+        const proof = (try revisions.loadContent(&changed_layout, key)).?;
+        try std.testing.expectEqualSlices(u8, &source.proof.digest, &proof.digest);
+        try std.testing.expect(!try prepared.qualifies(&changed_layout, key, next));
+    }
+    try store.put(key, second);
+    const Observer = struct {
+        key: []const u8,
+        expected: []const u8,
+        saw_source: bool = false,
+        prepared: *const document_payload.PreparedWrite,
+        pub fn find(ptr: *const anyopaque, name: []const u8) ?*const document_payload.PreparedWrite {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            return if (std.mem.eql(u8, name, self.key)) self.prepared else null;
+        }
+        pub fn reset(_: *anyopaque) void {}
+        pub fn observe(ptr: *anyopaque, name: []const u8, value: ?[]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, name, self.key)) self.saw_source = value != null and std.mem.eql(u8, value.?, self.expected);
+        }
+        pub fn stage(_: *anyopaque, _: @import("commit_participant.zig").View, _: []const u8) !void {}
+    };
+    var observer: Observer = .{ .key = key, .expected = next, .prepared = &prepared };
+    const participant = @import("commit_participant.zig").Participant.withDocumentPreparations(
+        .{ .ptr = &observer, .reset = Observer.reset, .observe = Observer.observe, .stage = Observer.stage },
+        .{ .ptr = &observer, .find = Observer.find },
+    );
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.artifact_inputs.attach(participant);
+        try write.put(key, next);
+        try std.testing.expect(observer.saw_source);
+        try std.testing.expectEqual(@as(usize, 0), write.document_revisions.identity_reuse.canonical_bytes);
+        try std.testing.expectEqual(@as(usize, 0), write.document_revisions.document_payload_stats.blob_bytes_written);
+        try write.commit();
+    }
+    const actual = try store.get(a, key);
+    defer a.free(actual);
+    try std.testing.expectEqualStrings(next, actual);
+    const wire = try std.json.Stringify.valueAlloc(a, KVPair{ .key = key, .value = next }, .{});
+    defer a.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "prepared_document") == null);
+    const changed = try std.fmt.allocPrint(a, "{{\"metadata\":4,\"body\":\"{s}\"}}", .{body});
+    defer a.free(changed);
+    observer.expected = changed;
+    observer.saw_source = false;
+    try store.putBatchWithReplayAndParticipant(null, &.{.{ .key = key, .value = changed }}, &.{}, null, .{}, participant);
+    try std.testing.expect(observer.saw_source);
+    const fallback = try store.get(a, key);
+    defer a.free(fallback);
+    try std.testing.expectEqualStrings(changed, fallback);
+    const final_cache = try store.get(a, &cache_key);
+    defer a.free(final_cache);
+    final_cache[16] &= ~@as(u8, 0x80);
+    try store.put(&cache_key, final_cache);
+    const prior_manifest = try document_payload.Manifest.decode(a, source.manifest);
+    defer a.free(prior_manifest.parts);
+    const blob = for (prior_manifest.parts) |part| {
+        if (part == .blob) break document_payload.blobKey(key, part.blob.digest);
+    } else return error.TestUnexpectedResult;
+    try store.put(key, "{\"metadata\":0}");
+    var retired = try store.beginReadTxn();
+    defer retired.abort();
+    try std.testing.expectError(error.NotFound, retired.getPhysical(&blob));
+}
+
+test "document payload keys-only logical cursors never resolve values from fallback adapters" {
+    const a = std.testing.allocator;
+    const physical_key = try internal_keys.documentKeyAlloc(a, "fallback");
+    defer a.free(physical_key);
+    const Fallback = struct {
+        key: []const u8,
+        value: []const u8,
+        closed: *usize,
+        pub fn close(self: *@This()) void {
+            self.closed.* += 1;
+        }
+        pub fn first(self: *@This()) !?backend_erased.Entry {
+            return .{ .key = self.key, .value = self.value };
+        }
+        pub const last = first;
+        pub fn next(_: *@This()) !?backend_erased.Entry {
+            return null;
+        }
+        pub const prev = next;
+        pub fn seekAtOrAfter(self: *@This(), _: []const u8) !?backend_erased.Entry {
+            return self.first();
+        }
+        pub const seekAtOrBefore = seekAtOrAfter;
+        // Intentionally has no setKeysOnly: the logical adapter must still
+        // return empty values without requiring a native source reader.
+    };
+    for ([_][]const u8{ document_payload.magic, "ordinary inline value" }, 0..) |raw, index| {
+        var closed: usize = 0;
+        {
+            var physical = try backend_erased.cursorFrom(a, Fallback{ .key = physical_key, .value = raw, .closed = &closed });
+            var cursor = DocStore.wrapPayloadCursor(a, physical, null, false, null, null, null, false) catch |err| {
+                physical.close();
+                return err;
+            };
+            defer cursor.close();
+            if (index == 0) try std.testing.expectError(error.Unsupported, cursor.first());
+            cursor.setKeysOnly();
+            for ([_]?backend_erased.Entry{ try cursor.first(), try cursor.last(), try cursor.seekAtOrAfter(physical_key), try cursor.seekAtOrBefore(physical_key) }) |entry| {
+                try std.testing.expectEqualStrings(physical_key, entry.?.key);
+                try std.testing.expectEqual(@as(usize, 0), entry.?.value.len);
+            }
+            try std.testing.expect(try cursor.next() == null);
+            try std.testing.expect(try cursor.prev() == null);
+        }
+        try std.testing.expectEqual(@as(usize, 1), closed);
+    }
+}
+
+test "document payload native receipts cannot be constructed through JSON codecs" {
+    const a = std.testing.allocator;
+    const wire = "{\"key\":\"doc\",\"value\":\"{}\"}";
+    var decoded = try std.json.parseFromSlice(KVPair, a, wire, .{});
+    defer decoded.deinit();
+    try std.testing.expect(!@hasField(KVPair, "prepared_document"));
+    try std.testing.expectEqual(2 * @sizeOf([]const u8), @sizeOf(KVPair));
+    try std.testing.expectEqualStrings("doc", decoded.value.key);
+    const injected = "{\"key\":\"doc\",\"value\":\"{}\",\"prepared_document\":{\"expected_json\":\"forged\"}}";
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(KVPair, a, injected, .{}));
+    var ignored = try @import("antfly-json").parseFromSlice(KVPair, a, injected, .{ .ignore_unknown_fields = true });
+    defer ignored.deinit();
+    try std.testing.expectEqualStrings("{}", ignored.value.value);
+    var tree = try std.json.parseFromSlice(std.json.Value, a, injected, .{});
+    defer tree.deinit();
+    try std.testing.expectError(error.UnknownField, std.json.parseFromValue(KVPair, a, tree.value, .{}));
+    var ignored_tree = try std.json.parseFromValue(KVPair, a, tree.value, .{ .ignore_unknown_fields = true });
+    defer ignored_tree.deinit();
+    try std.testing.expectEqualStrings("doc", ignored_tree.value.key);
+    try std.testing.expectEqualStrings("{}", ignored_tree.value.value);
+}
+
+test "document payload experimental admission requires explicit permission even with qualified readers" {
+    const a = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    try store.qualifyDocumentReaders(29);
+    try std.testing.expect(!store.documentLayoutEnabled());
+    try std.testing.expect(!store.documentMigrationEnabled());
+    store.experimental_document_migration = true;
+    try std.testing.expect(store.documentMigrationEnabled());
+    store.experimental_document_migration = false;
+    try std.testing.expect(!store.documentMigrationEnabled());
+    // Reopening an admitted format must remain readable without granting
+    // permission to migrate previously unadmitted owners.
+    try store.adoptDocumentReaderFormat(29);
+    try std.testing.expect(store.documentLayoutEnabled());
+    try std.testing.expect(store.documentMigrationEnabled());
 }

@@ -324,7 +324,7 @@ pub fn stagePinned(txn: anytype, scope: Scope, seal_digest: [32]u8) !void {
 /// marker and outbox. For final_fence it must additionally check transaction
 /// drainage under that same apply fence before calling stage.
 fn admitRetention(txn: anytype, scope: Scope, limit: u64, binding: ?@import("artifact_inventory.zig").Binding) !u64 {
-    if (binding) |expected| if (expected.effect_protocol == 16) {
+    if (binding) |expected| if (expected.supportsGroupedSources()) {
         var ordered = (try @import("artifact_inventory.zig").load(std.heap.page_allocator, txn)) orelse return error.ArtifactCatalogDrift;
         defer ordered.deinit();
         if (!std.meta.eql(ordered.value.command.binding, expected)) return error.ArtifactCatalogDrift;

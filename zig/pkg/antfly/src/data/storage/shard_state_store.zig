@@ -92,6 +92,8 @@ pub const DataOperation = union(enum) {
     set_raft_batch_protocol: u16,
     /// Source effects execute only in the native delegate, after this guard.
     require_source_pin_protocol: void,
+    /// Ordered command decoder floor, checked against this exact raw fold.
+    require_batch_protocol: u16,
     topology_guard: @import("online_topology_arbitration.zig").Guard,
     topology_end: void,
     /// Internal apply boundary. Split deltas use the committed Raft index as
@@ -2795,7 +2797,7 @@ pub fn appendOperationEffects(
     defer if (merge_receiver_state) |*state| state.deinit(alloc);
     var needs_raft_batch_protocol = false;
     for (operations) |op| switch (op) {
-        .set_raft_batch_protocol, .require_source_pin_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence, .merge_page_fence => needs_raft_batch_protocol = true,
+        .set_raft_batch_protocol, .require_source_pin_protocol, .require_batch_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence, .merge_page_fence => needs_raft_batch_protocol = true,
         else => {},
     };
     var raft_batch_protocol_version: u16 = if (needs_raft_batch_protocol)
@@ -2862,6 +2864,7 @@ pub fn appendOperationEffects(
                 }
             },
             .require_source_pin_protocol => if (raft_batch_protocol_version < data_raft_protocol.batch_source_pin_protocol_version) return error.UnsupportedBatchProtocolVersion,
+            .require_batch_protocol => |minimum| if (minimum == 0 or minimum > data_raft_protocol.batch_protocol_version or raft_batch_protocol_version < minimum) return error.UnsupportedBatchProtocolVersion,
             .merge_page_fence => |encoded| {
                 var parsed = try std.json.parseFromSlice(db_types.BatchRequest, alloc, encoded, .{});
                 defer parsed.deinit();
@@ -4873,4 +4876,35 @@ test "shard state store captures right-hand split handoff and filters delta catc
     try std.testing.expectEqualStrings("right-1", dst_state[0].value);
     try std.testing.expectEqualStrings("doc:x", dst_state[1].key);
     try std.testing.expectEqualStrings("right-2", dst_state[1].value);
+}
+
+test "raft batch protocol document migration requires an earlier committed barrier" {
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/document-reader-protocol", .{temporary.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore.DocStore.open(a, path.ptr, .{});
+    defer store.close();
+    var writes: std.ArrayListUnmanaged(docstore.OwnedKVPair) = .empty;
+    defer freeOwnedWrites(a, &writes);
+    var deletes: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (deletes.items) |key| a.free(key);
+        deletes.deinit(a);
+    }
+    const guard = [_]DataOperation{.{ .require_batch_protocol = data_raft_protocol.batch_document_fields_protocol_version }};
+    try std.testing.expectError(error.UnsupportedBatchProtocolVersion, appendOperationEffects(&store, a, 9, &guard, &writes, &deletes));
+    const protocol_key = try groupRaftBatchProtocolKeyAlloc(a, 9);
+    defer a.free(protocol_key);
+    var protocol: [2]u8 = undefined;
+    std.mem.writeInt(u16, &protocol, 24, .little);
+    try store.put(protocol_key, &protocol);
+    try std.testing.expectError(error.UnsupportedBatchProtocolVersion, appendOperationEffects(&store, a, 9, &guard, &writes, &deletes));
+    // Barrier and mutation can occur in the same ordered raw apply fold.
+    const admitted = [_]DataOperation{ .{ .set_raft_batch_protocol = 25 }, guard[0] };
+    try appendOperationEffects(&store, a, 9, &admitted, &writes, &deletes);
+    for (writes.items) |write| try store.put(write.key, write.value);
+    try std.testing.expectEqual(@as(u16, 25), try currentRaftBatchProtocolVersion(&store, a, 9));
+    try appendOperationEffects(&store, a, 9, &guard, &writes, &deletes);
 }

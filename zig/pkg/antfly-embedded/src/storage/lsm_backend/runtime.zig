@@ -678,6 +678,22 @@ pub fn BoundStore(comptime BackendType: type) type {
             };
         }
 
+        /// Avoid point leases when a snapshot is already cached or when run
+        /// lookup/layout retention dominates. Unknown backend shapes decline.
+        /// Compare sparse binary lookups with copying the mutable entry set.
+        pub fn prefersImmutablePointReads(self: *@This(), point_lookups: usize) bool {
+            if (comptime !@hasField(BackendType, "mutable_read_snapshot") or !@hasField(BackendType, "immutable_memtables") or !@hasField(BackendType, "runs")) return false;
+            const locked = lockBackend(BackendType, self.backend);
+            defer unlockBackend(BackendType, self.backend, locked);
+            if (self.backend.mutable_read_snapshot != null or self.backend.runs.count() != 0 or
+                self.backend.immutable_memtables.items.len != self.backend.immutable_head) return false;
+            const entries = self.backend.mutable.entryCount();
+            if (entries == 0 or point_lookups == 0) return false;
+            const depth = std.math.log2_int(usize, entries) + 1;
+            const point_work = std.math.mul(usize, point_lookups, depth) catch return false;
+            return point_work < entries;
+        }
+
         pub fn beginRead(self: *@This()) !LocalReadTxn {
             return try LocalReadTxn.open(self.backend, self.namespace);
         }

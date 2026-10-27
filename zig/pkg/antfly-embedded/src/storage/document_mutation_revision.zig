@@ -20,11 +20,13 @@ const std = @import("std");
 const keys = @import("internal_keys.zig");
 const projection = @import("document_projection.zig");
 const value_identity = @import("source_value_identity.zig");
+const logical = @import("document_commitment.zig");
+pub const Algorithm = logical.Algorithm;
 const prefix = "\x00\x00__metadata__:document_mutation_revision_v1:";
 pub const Key = [prefix.len + 32]u8;
 const content_prefix = "\x00\x00__metadata__:document_content_authority_v1:";
 pub const ContentKey = [content_prefix.len + 32]u8;
-pub const Content = struct { revision: u64, bytes: u64, kind: u8, digest: [32]u8 };
+pub const Content = struct { revision: u64, bytes: u64, kind: u8, digest: [32]u8, manifest: bool = false, layout_cooldown: u2 = 0, algorithm: Algorithm = .sha256_json };
 pub fn contentKey(key: Key) ContentKey {
     var result: ContentKey = undefined;
     @memcpy(result[0..content_prefix.len], content_prefix);
@@ -33,7 +35,7 @@ pub fn contentKey(key: Key) ContentKey {
 }
 fn decodeContent(raw: []const u8) !Content {
     if (raw.len != 49) return error.InvalidDocumentContentAuthority;
-    return .{ .revision = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little), .kind = raw[16], .digest = raw[17..49].* };
+    return .{ .revision = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little), .kind = raw[16] & 0x17, .layout_cooldown = @intCast(((raw[16] >> 3) & 1) | (((raw[16] >> 5) & 1) << 1)), .digest = raw[17..49].*, .manifest = raw[16] & 0x80 != 0, .algorithm = if (raw[16] & 0x40 != 0) .logical_json_v1 else .sha256_json };
 }
 /// The existing mutation revision is also the compatibility fence. Older
 /// writers advance it without refreshing this cache, forcing a primary read.
@@ -46,8 +48,60 @@ pub fn loadContent(txn: anytype, physical: []const u8) !?Content {
     };
     const value = try decodeContent(raw);
     if (value.kind != physical[physical.len - 1] or value.revision != try load(txn, key)) return null;
+    const T = switch (@typeInfo(@TypeOf(txn))) {
+        .pointer => |ptr| ptr.child,
+        else => @TypeOf(txn),
+    };
+    if (comptime @hasDecl(T, "usesLogicalDocumentIdentity")) if (value.algorithm == .sha256_json and value.bytes >= projection.minimum_bytes and keys.isPrimaryDocumentKey(physical) and try txn.usesLogicalDocumentIdentity()) return null;
     return value;
 }
+/// Verify cached roots against current mutation revisions in one sorted read.
+/// Fixed windows carry only metadata and decode every borrowed value before the
+/// next read can retire it. Duplicate owners are supported; no body is fetched.
+pub fn loadContentWindow(txn: anytype, revision_keys: []const Key, contents: []?Content, mutation_revisions: []u64) !void {
+    if (revision_keys.len != contents.len or mutation_revisions.len != contents.len or revision_keys.len > 64) return error.InvalidArgument;
+    @memset(contents, null);
+    @memset(mutation_revisions, 0);
+    if (revision_keys.len == 0) return;
+    const Entry = struct {
+        key: [@max(@sizeOf(Key), @sizeOf(ContentKey))]u8,
+        length: u8,
+        row: u8,
+        content: bool,
+        fn bytes(self: *const @This()) []const u8 {
+            return self.key[0..self.length];
+        }
+        fn less(_: void, left: @This(), right: @This()) bool {
+            return std.mem.order(u8, left.bytes(), right.bytes()) == .lt;
+        }
+    };
+    var entries: [128]Entry = undefined;
+    const count = revision_keys.len * 2;
+    for (revision_keys, 0..) |key, row| {
+        entries[row * 2] = .{ .key = undefined, .length = @sizeOf(Key), .row = @intCast(row), .content = false };
+        @memcpy(entries[row * 2].key[0..@sizeOf(Key)], &key);
+        entries[row * 2 + 1] = .{ .key = undefined, .length = @sizeOf(ContentKey), .row = @intCast(row), .content = true };
+        @memcpy(entries[row * 2 + 1].key[0..@sizeOf(ContentKey)], &contentKey(key));
+    }
+    std.mem.sort(Entry, entries[0..count], {}, Entry.less);
+    var names: [128][]const u8 = undefined;
+    var values: [128]?[]const u8 = undefined;
+    for (entries[0..count], names[0..count]) |*entry, *name| name.* = entry.bytes();
+    @memset(values[0..count], null);
+    try txn.getManySorted(names[0..count], values[0..count]);
+    for (entries[0..count], values[0..count]) |entry, raw| if (raw) |bytes| {
+        if (entry.content) {
+            contents[entry.row] = decodeContent(bytes) catch null;
+        } else {
+            if (bytes.len != 8) return error.InvalidDocumentMutationRevision;
+            mutation_revisions[entry.row] = std.mem.readInt(u64, bytes[0..8], .little);
+        }
+    };
+    for (contents, 0..) |*content, i| if (content.*) |cached| {
+        if (cached.revision != mutation_revisions[i]) content.* = null;
+    };
+}
+
 /// Decode a bounded proof window from one sorted, deduplicated metadata read.
 /// Values are reduced to owned scalars before any primary read can retire them.
 pub fn loadWindow(txn: anytype, a: std.mem.Allocator, physical: []const []const u8, ids: []const []const u8, contents: []?Content, timestamps: []u64) !void {
@@ -119,6 +173,13 @@ pub fn loadWindowWithRevisions(txn: anytype, a: std.mem.Allocator, physical: []c
     if (mutation_revisions) |out| @memcpy(out, revisions[0..out.len]);
     for (contents, physical, 0..) |*content, row, i| if (content.*) |cached| {
         if (!keys.isStoredDocumentRowKey(row) or cached.kind != row[row.len - 1] or cached.revision != revisions[i]) content.* = null;
+        const T = switch (@typeInfo(@TypeOf(txn))) {
+            .pointer => |ptr| ptr.child,
+            else => @TypeOf(txn),
+        };
+        if (comptime @hasDecl(T, "usesLogicalDocumentIdentity")) {
+            if (cached.algorithm == .sha256_json and cached.bytes >= projection.minimum_bytes and keys.isPrimaryDocumentKey(row) and try txn.usesLogicalDocumentIdentity()) content.* = null;
+        }
     };
 }
 
@@ -126,7 +187,7 @@ fn encodeContent(value: Content) [49]u8 {
     var raw: [49]u8 = undefined;
     std.mem.writeInt(u64, raw[0..8], value.revision, .little);
     std.mem.writeInt(u64, raw[8..16], value.bytes, .little);
-    raw[16] = value.kind;
+    raw[16] = value.kind | @as(u8, if (value.layout_cooldown & 1 != 0) 0x08 else 0) | @as(u8, if (value.layout_cooldown & 2 != 0) 0x20 else 0) | @as(u8, if (value.manifest) 0x80 else 0) | @as(u8, if (value.algorithm == .logical_json_v1) 0x40 else 0);
     @memcpy(raw[17..49], &value.digest);
     return raw;
 }
@@ -331,7 +392,26 @@ pub const BackfillPage = struct {
                     const raw = try primary.get(last);
                     const content = cached orelse blk: {
                         std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
-                        break :blk Content{ .revision = try load(&metadata, keyForPhysical(last).?), .bytes = raw.len, .kind = last[last.len - 1], .digest = digest };
+                        var rebuilt: Content = .{ .revision = try load(&metadata, keyForPhysical(last).?), .bytes = raw.len, .kind = last[last.len - 1], .digest = digest };
+                        const T = @TypeOf(primary);
+                        if (comptime @hasDecl(T, "getPhysical")) {
+                            const physical = try primary.getPhysical(last);
+                            const payload = @import("document_payload.zig");
+                            if (payload.isManifest(physical)) {
+                                const manifest = try payload.Manifest.decode(a, physical);
+                                rebuilt.manifest = true;
+                                rebuilt.algorithm = .logical_json_v1;
+                                rebuilt.bytes = manifest.logical_bytes;
+                                rebuilt.digest = manifest.logical_digest;
+                            }
+                        }
+                        if (!rebuilt.manifest) {
+                            if (comptime @hasField(@TypeOf(primary), "logical_documents")) if (raw.len >= projection.minimum_bytes and keys.isPrimaryDocumentKey(last) and try primary.usesLogicalDocumentIdentity()) {
+                                rebuilt.digest = try logical.compute(a, raw);
+                                rebuilt.algorithm = .logical_json_v1;
+                            };
+                        }
+                        break :blk rebuilt;
                     };
                     const publication = try value_identity.buildAuthority(a, raw, content.kind, content.digest);
                     const directory = publication.directory;
@@ -375,9 +455,16 @@ pub const BackfillPage = struct {
 /// One revision per affected document per transaction, including artifact-only
 /// commits. Capture fixed keys rather than retaining every artifact key.
 pub const Capture = struct {
-    const Change = union(enum) { unchanged, deleted, written: struct { proof: Content, directory: ?[]u8, identities: ?[]u8 = null } };
+    const Change = union(enum) { unchanged, deleted, written: struct { proof: Content, directory: ?[]u8, prior_manifest: ?bool = null, reused_bytes: usize = 0, identities: ?[]u8 = null, logical_record: ?[]u8 = null } };
     documents: std.AutoHashMapUnmanaged(Key, Change) = .empty,
+    validations: std.AutoHashMapUnmanaged(Key, struct { certificate: @import("document_validation.zig").Certificate, key: [32]u8, physical: []u8 }) = .empty,
     staged: bool = false,
+    document_format: @import("document_payload.zig").Admission = .unchecked,
+    logical_commitments: bool = false,
+    logical_minimum_bytes: usize = projection.minimum_bytes,
+    minimum_reader_format: u32 = 26,
+    validation_allocator: ?std.mem.Allocator = null,
+    document_payload_stats: @import("document_payload.zig").Stats = .{},
     identity_reuse: value_identity.ReuseStats = .{},
     poisoned: bool = false,
 
@@ -386,8 +473,32 @@ pub const Capture = struct {
         while (values.next()) |value| if (value.* == .written) {
             if (value.written.directory) |directory| alloc.free(directory);
             if (value.written.identities) |identities| alloc.free(identities);
+            if (value.written.logical_record) |record| alloc.free(record);
         };
         self.documents.deinit(alloc);
+        var validations = self.validations.valueIterator();
+        while (validations.next()) |validated| alloc.free(validated.physical);
+        self.validations.deinit(alloc);
+    }
+
+    /// The common writer binds a native validation result to the actual source
+    /// commitment it just captured, never to a caller-supplied digest.
+    pub fn recordValidation(self: *Capture, a: std.mem.Allocator, physical: []const u8, value: []const u8, participant: ?@import("commit_participant.zig").Participant) !void {
+        const provider = (participant orelse return).document_validations orelse return;
+        const stamp = provider.find(provider.ptr, physical, value) orelse return;
+        const publication = self.sourcePublication(physical) orelse return;
+        if (publication.proof.algorithm != .logical_json_v1) return;
+        errdefer self.poisoned = true;
+        const certificate: @import("document_validation.zig").Certificate = .{ .root = publication.proof.digest, .rules = stamp.rules, .schema_version = stamp.schema_version, .physical = @splat(0) };
+        if (self.validations.getPtr(keyForPhysical(physical).?)) |prior| {
+            prior.certificate = certificate;
+            prior.key = stamp.key;
+            return;
+        }
+        self.validation_allocator = a;
+        const owned = try a.dupe(u8, physical);
+        errdefer a.free(owned);
+        try self.validations.put(a, keyForPhysical(physical).?, .{ .certificate = certificate, .key = stamp.key, .physical = owned });
     }
 
     pub fn touch(self: *Capture, alloc: std.mem.Allocator, physical_key: []const u8) !void {
@@ -407,6 +518,54 @@ pub const Capture = struct {
     /// The writer's snapshot qualifies prior metadata before any primary write.
     /// Fresh/unsupported rows require no primary-body read. Repeated writes use
     /// this transaction's most recent publication rather than the older snapshot.
+    pub const SourcePublication = struct { proof: Content, directory: ?[]const u8, identities: ?[]const u8, logical_record: ?[]const u8, prior_manifest: ?bool, reused_bytes: usize };
+    pub fn sourcePublication(self: *Capture, physical: []const u8) ?SourcePublication {
+        const key = keyForPhysical(physical) orelse return null;
+        const entry = self.documents.get(key) orelse return null;
+        if (entry != .written) return null;
+        return .{ .proof = entry.written.proof, .directory = entry.written.directory, .identities = entry.written.identities, .logical_record = entry.written.logical_record, .prior_manifest = entry.written.prior_manifest, .reused_bytes = entry.written.reused_bytes };
+    }
+    /// Adopt a writer-prepared publication without re-reading immutable values.
+    pub fn touchMetadataPatch(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, patch: @import("document_payload.zig").MetadataPatch) !void {
+        try self.touch(alloc, physical);
+        errdefer self.poisoned = true;
+        const directory = try alloc.dupe(u8, patch.directory);
+        errdefer alloc.free(directory);
+        const identities = try alloc.dupe(u8, patch.identities);
+        errdefer alloc.free(identities);
+        const logical_record = try alloc.dupe(u8, patch.logical_record);
+        const entry = self.documents.getPtr(keyForPhysical(physical).?).?;
+        if (entry.* == .written) {
+            if (entry.written.directory) |value| alloc.free(value);
+            if (entry.written.identities) |value| alloc.free(value);
+            if (entry.written.logical_record) |value| alloc.free(value);
+        }
+        entry.* = .{ .written = .{ .proof = patch.proof, .directory = directory, .identities = identities, .logical_record = logical_record, .prior_manifest = true } };
+    }
+
+    pub fn notePriorExternal(self: *Capture, physical: []const u8) void {
+        const key = keyForPhysical(physical) orelse return;
+        const entry = self.documents.getPtr(key) orelse return;
+        if (entry.* == .written) entry.written.prior_manifest = true;
+    }
+
+    pub fn markManifest(self: *Capture, physical: []const u8, manifest: ?[]const u8) void {
+        const key = keyForPhysical(physical) orelse return;
+        const entry = self.documents.getPtr(key) orelse return;
+        if (entry.* != .written) return;
+        if (manifest != null) entry.written.proof.layout_cooldown = 0 else if (entry.written.prior_manifest == true) {
+            entry.written.proof.layout_cooldown = 3;
+        } else if (entry.written.reused_bytes >= @max(@as(u64, @import("document_payload.zig").minimum_value_bytes), entry.written.proof.bytes / 2)) {
+            // Require consecutive stable reuses after churn. The two-bit hint
+            // shares the existing authority record; it adds no admission key.
+            entry.written.proof.layout_cooldown -|= 1;
+        } else if (entry.written.proof.layout_cooldown != 0) {
+            entry.written.proof.layout_cooldown = 3;
+        }
+        entry.written.proof.manifest = manifest != null;
+        if (manifest) |raw| std.debug.assert(std.mem.eql(u8, &entry.written.proof.digest, &@import("document_payload.zig").publishedCommitment(raw)));
+    }
+
     pub fn touchValueWithReader(self: *Capture, alloc: std.mem.Allocator, reader: anytype, physical: []const u8, value: ?[]const u8) !void {
         try self.touch(alloc, physical);
         if (!keys.isStoredDocumentRowKey(physical) or value == null or value.?.len < projection.minimum_bytes)
@@ -436,7 +595,7 @@ pub const Capture = struct {
             return err;
         };
         if (raw_certificate.len > value_identity.maximum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
-        return self.touchValuePrepared(alloc, physical, value, .{ .bytes = proof.bytes, .kind = proof.kind, .digest = proof.digest, .directory = directory, .identities = raw_certificate });
+        return self.touchValuePrepared(alloc, physical, value, .{ .bytes = proof.bytes, .kind = proof.kind, .manifest = proof.manifest, .layout_cooldown = proof.layout_cooldown, .digest = proof.digest, .directory = directory, .identities = raw_certificate });
     }
 
     fn touchValuePrepared(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, value: ?[]const u8, prior: ?value_identity.Prior) !void {
@@ -446,22 +605,38 @@ pub const Capture = struct {
         errdefer self.poisoned = true;
         const next: Change = if (value) |bytes| blk: {
             var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            var logical_record: ?[]u8 = null;
+            errdefer if (logical_record) |record| alloc.free(record);
+            const logical_mode = self.logical_commitments and keys.isPrimaryDocumentKey(physical) and bytes.len >= self.logical_minimum_bytes;
+            if (logical_mode) digest = @splat(0) else std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
             const kind = physical[physical.len - 1];
             const previous: ?value_identity.Prior = if (entry.* == .written and entry.written.directory != null and entry.written.identities != null)
-                .{ .bytes = entry.written.proof.bytes, .kind = entry.written.proof.kind, .digest = entry.written.proof.digest, .directory = entry.written.directory.?, .identities = entry.written.identities.? }
+                .{ .bytes = entry.written.proof.bytes, .kind = entry.written.proof.kind, .manifest = entry.written.proof.manifest, .layout_cooldown = entry.written.proof.layout_cooldown, .digest = entry.written.proof.digest, .directory = entry.written.directory.?, .identities = entry.written.identities.? }
             else
                 prior;
             var reuse: value_identity.ReuseStats = .{};
             const publication = if (previous) |qualified| try value_identity.buildAuthorityReusing(alloc, bytes, kind, digest, qualified, &reuse) else try value_identity.buildAuthority(alloc, bytes, kind, digest);
+            errdefer if (publication.directory) |directory| alloc.free(directory);
+            errdefer if (publication.identities) |identities| alloc.free(identities);
+            if (logical_mode) {
+                const root = (try logical.fromPublication(alloc, bytes, kind, digest, publication)) orelse try logical.build(alloc, bytes);
+                defer root.deinit(alloc);
+                try value_identity.rebindPublication(publication, digest, root.digest);
+                digest = root.digest;
+                logical_record = logical.encode(alloc, root) catch |err| switch (err) {
+                    error.InvalidDocumentCommitment => null,
+                    else => return err,
+                };
+            }
             self.identity_reuse.reused_bytes +|= reuse.reused_bytes;
             self.identity_reuse.reused_leaves +|= reuse.reused_leaves;
             self.identity_reuse.canonical_bytes +|= reuse.canonical_bytes;
-            break :blk .{ .written = .{ .proof = .{ .revision = 0, .bytes = bytes.len, .kind = kind, .digest = digest }, .directory = publication.directory, .identities = publication.identities } };
+            break :blk .{ .written = .{ .proof = .{ .revision = 0, .bytes = bytes.len, .kind = kind, .digest = digest, .layout_cooldown = if (previous) |p| p.layout_cooldown else 0, .algorithm = if (logical_mode) .logical_json_v1 else .sha256_json }, .logical_record = logical_record, .directory = publication.directory, .prior_manifest = if (previous) |p| p.manifest else null, .reused_bytes = reuse.reused_bytes, .identities = publication.identities } };
         } else .deleted;
         if (entry.* == .written) {
             if (entry.written.directory) |directory| alloc.free(directory);
             if (entry.written.identities) |identities| alloc.free(identities);
+            if (entry.written.logical_record) |record| alloc.free(record);
         }
         entry.* = next;
     }
@@ -516,6 +691,38 @@ pub const Capture = struct {
                 },
                 .unchanged => {},
             }
+            const validation = @import("document_validation.zig");
+            if (entry.value_ptr.* == .deleted and self.logical_commitments) {
+                // Avoid an absent-key tombstone for rows never carrying a
+                // validation certificate. Low-level/native deletes also prune
+                // stale or malformed certificates without authenticating them.
+                const present = @import("document_payload.zig").rawGet(txn, &validation.keyForRevision(key)) catch |err| blk: {
+                    if (err == error.NotFound) break :blk null;
+                    return err;
+                };
+                if (present != null) try txn.delete(&validation.keyForRevision(key));
+            } else if (cached) |current| if (self.validations.get(key)) |validated| {
+                // A later unvalidated PUT may have replaced this transaction's
+                // source. A proof for earlier bytes must never follow it.
+                if (validated.certificate.matches(current, validated.certificate.rules, validated.certificate.schema_version, validated.certificate.physical)) {
+                    // Content.manifest is a disposable hint. Authenticate the
+                    // final physical afterimage in this writer, including a
+                    // possible later PUT/appendPUT of the same logical source.
+                    const payload = @import("document_payload.zig");
+                    const physical = try payload.rawGet(txn, validated.physical);
+                    if (payload.isManifest(physical)) {
+                        const a = self.validation_allocator orelse return error.InvalidBatch;
+                        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+                        defer arena.deinit();
+                        const manifest = try payload.Manifest.decode(arena.allocator(), physical);
+                        if (std.mem.eql(u8, &manifest.logical_digest, &current.digest)) {
+                            var certificate = validated.certificate;
+                            certificate.physical = manifest.physical_commitment;
+                            try txn.put(&validation.keyForRevision(key), &certificate.encode(validated.key, validation.keyForRevision(key)));
+                        }
+                    }
+                }
+            };
             var raw: [8]u8 = undefined;
             std.mem.writeInt(u64, &raw, next, .little);
             try txn.put(&key, &raw);
@@ -1059,4 +1266,172 @@ test "document mutation revision reused publications release every allocation on
     };
     try Case.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "document payload validation publication owns failures and binds actual manifests without cache hints" {
+    const validation = @import("document_validation.zig");
+    const payload = @import("document_payload.zig");
+    const participation = @import("commit_participant.zig");
+    const Case = struct {
+        const Provider = struct {
+            row: []const u8,
+            value: []const u8,
+            stamp: validation.Stamp,
+            fn find(raw: *const anyopaque, physical: []const u8, value: []const u8) ?validation.Stamp {
+                const self: *const @This() = @ptrCast(@alignCast(raw));
+                if (!std.mem.eql(u8, physical, self.row) or !std.mem.eql(u8, value, self.value)) return null;
+                return self.stamp;
+            }
+        };
+        const Writer = struct {
+            row: []const u8,
+            manifest: []const u8,
+            stamp: validation.Stamp,
+            root: [32]u8,
+            certificates: usize = 0,
+            fail_certificate: bool = false,
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return self.getPhysical(key);
+            }
+            pub fn getPhysical(self: *@This(), key: []const u8) ![]const u8 {
+                return if (std.mem.eql(u8, key, self.row)) self.manifest else error.NotFound;
+            }
+            pub fn delete(_: *@This(), _: []const u8) !void {
+                return error.NotFound;
+            }
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                const row = validation.keyForPhysical(self.row).?;
+                if (!std.mem.eql(u8, key, &row)) return;
+                if (self.fail_certificate) return error.SyntheticCertificateFailure;
+                const certificate = validation.Certificate.decode(value, self.stamp.key, row) orelse return error.InvalidTestCertificate;
+                try std.testing.expectEqualSlices(u8, &self.root, &certificate.root);
+                try std.testing.expectEqualSlices(u8, self.manifest[self.manifest.len - 32 ..], &certificate.physical);
+                try std.testing.expectEqualSlices(u8, &self.stamp.rules, &certificate.rules);
+                self.certificates += 1;
+            }
+        };
+        fn run(a: std.mem.Allocator, fail_certificate: bool) !void {
+            return runInner(a, fail_certificate) catch |err| switch (err) {
+                error.WriteFailed => error.OutOfMemory,
+                else => err,
+            };
+        }
+        fn runInner(a: std.mem.Allocator, fail_certificate: bool) !void {
+            const row = try keys.documentKeyAlloc(a, "doc\x00id");
+            defer a.free(row);
+            const body = try a.alloc(u8, payload.minimum_value_bytes + 2);
+            defer a.free(body);
+            @memset(body, 'x');
+            body[0] = '\"';
+            body[body.len - 1] = '\"';
+            const value = try std.fmt.allocPrint(a, "{{\"body\":{s},\"metadata\":1}}", .{body});
+            defer a.free(value);
+            var capture: Capture = .{ .logical_commitments = true };
+            defer capture.deinit(a);
+            try capture.touchValue(a, row, value);
+            const source = capture.sourcePublication(row).?;
+            try std.testing.expect(!source.proof.manifest);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+            const manifest = try payload.encodeLogical(a, &.{ .{ .inline_json = "{\"body\":" }, .{ .blob = .{ .length = body.len, .digest = digest } }, .{ .inline_json = ",\"metadata\":1}" } }, source.proof.digest, source.logical_record.?);
+            defer a.free(manifest);
+            const provider: Provider = .{ .row = row, .value = value, .stamp = .{ .rules = @splat(0x23), .schema_version = 7, .key = @splat(0x45) } };
+            const participant = participation.Participant.withDocumentValidations(null, .{ .ptr = &provider, .find = Provider.find });
+            try capture.recordValidation(a, row, "unvalidated different bytes", participant);
+            try std.testing.expectEqual(@as(usize, 0), capture.validations.count());
+            try capture.recordValidation(a, row, value, participant);
+            try capture.recordValidation(a, row, value, participant);
+            try std.testing.expectEqual(@as(usize, 1), capture.validations.count());
+            var writer: Writer = .{ .row = row, .manifest = manifest, .stamp = provider.stamp, .root = source.proof.digest, .fail_certificate = fail_certificate };
+            if (fail_certificate) {
+                if (capture.stage(&writer)) |_| return error.ExpectedCertificateFailure else |err| switch (err) {
+                    error.SyntheticCertificateFailure => {},
+                    else => return err,
+                }
+                try std.testing.expect(capture.poisoned);
+                try std.testing.expectError(error.RetainedEffectsTransactionFailed, capture.stage(&writer));
+            } else {
+                try capture.stage(&writer);
+                try std.testing.expectEqual(@as(usize, 1), writer.certificates);
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{false});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{true});
+}
+
+test "document payload validation root windows batch sorted metadata and fence every owner" {
+    const Fake = struct {
+        revision_keys: [64]Key,
+        content_keys: [64]ContentKey,
+        proofs: [64][49]u8,
+        revisions: [64][8]u8,
+        missing_content: ?usize = null,
+        malformed_content: ?usize = null,
+        malformed_revision: ?usize = null,
+        calls: usize = 0,
+        pub fn getManySorted(self: *@This(), names: []const []const u8, values: []?[]const u8) !void {
+            self.calls += 1;
+            for (names, values, 0..) |name, *value, i| {
+                if (i != 0) try std.testing.expect(std.mem.order(u8, names[i - 1], name) != .gt);
+                value.* = null;
+                for (self.revision_keys, self.content_keys, 0..) |revision, content, row| {
+                    if (std.mem.eql(u8, name, &revision)) {
+                        value.* = if (self.malformed_revision == row) "bad" else &self.revisions[row];
+                        break;
+                    }
+                    if (std.mem.eql(u8, name, &content)) {
+                        value.* = if (self.missing_content == row) null else if (self.malformed_content == row) "bad" else &self.proofs[row];
+                        break;
+                    }
+                } else return error.UnexpectedMetadataKey;
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = undefined;
+    fake.missing_content = null;
+    fake.malformed_content = null;
+    fake.malformed_revision = null;
+    fake.calls = 0;
+    for (0..64) |i| {
+        var id: [32]u8 = undefined;
+        const physical = try keys.documentKeyAlloc(a, try std.fmt.bufPrint(&id, "doc-{d}", .{i}));
+        defer a.free(physical);
+        fake.revision_keys[i] = keyForPhysical(physical).?;
+        fake.content_keys[i] = contentKey(fake.revision_keys[i]);
+        fake.proofs[i] = encodeContent(.{ .revision = 100 + i, .bytes = 1000 + i, .kind = keys.primary_kind, .digest = @splat(@intCast(i)), .algorithm = .logical_json_v1 });
+        std.mem.writeInt(u64, &fake.revisions[i], 100 + i, .little);
+    }
+    var contents: [64]?Content = undefined;
+    var revisions: [64]u64 = undefined;
+    try loadContentWindow(&fake, &fake.revision_keys, &contents, &revisions);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    for (contents, revisions, 0..) |content, revision, i| {
+        try std.testing.expectEqual(@as(u64, 100 + i), revision);
+        try std.testing.expectEqual(revision, content.?.revision);
+        try std.testing.expectEqual(@as(u64, 1000 + i), content.?.bytes);
+    }
+    const duplicates = [_]Key{ fake.revision_keys[3], fake.revision_keys[0], fake.revision_keys[3] };
+    try loadContentWindow(&fake, &duplicates, contents[0..3], revisions[0..3]);
+    try std.testing.expectEqual(@as(u64, 103), contents[0].?.revision);
+    try std.testing.expectEqual(@as(u64, 100), contents[1].?.revision);
+    try std.testing.expectEqual(contents[0].?, contents[2].?);
+    fake.missing_content = 0;
+    fake.malformed_content = 2;
+    fake.proofs[1][0] ^= 1;
+    try loadContentWindow(&fake, &fake.revision_keys, &contents, &revisions);
+    try std.testing.expect(contents[0] == null and contents[1] == null and contents[2] == null);
+    try std.testing.expectEqual(@as(u64, 102), revisions[2]);
+    try std.testing.expect(contents[3] != null);
+    fake.malformed_revision = 3;
+    try std.testing.expectError(error.InvalidDocumentMutationRevision, loadContentWindow(&fake, &fake.revision_keys, &contents, &revisions));
+    const calls = fake.calls;
+    try loadContentWindow(&fake, &.{}, contents[0..0], revisions[0..0]);
+    try std.testing.expectEqual(calls, fake.calls);
+    var oversized: [65]Key = undefined;
+    var invalid_contents: [65]?Content = undefined;
+    var invalid_revisions: [65]u64 = undefined;
+    try std.testing.expectError(error.InvalidArgument, loadContentWindow(&fake, &oversized, &invalid_contents, &invalid_revisions));
+    try std.testing.expectEqual(calls, fake.calls);
 }

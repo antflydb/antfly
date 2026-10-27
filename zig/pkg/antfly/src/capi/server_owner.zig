@@ -135,7 +135,9 @@ pub const scraping = antfly.scraping;
 pub const raft_catalog = antfly.raft_catalog;
 pub const kernel_runtime_services = antfly.kernel_runtime_services;
 
+pub const SourceReaderBroker = @FieldType(@FieldType(db_mod.OpenOptions, "index_backends"), "source_reader_broker");
 pub const StorageOwnerContext = struct {
+    source_reader_broker: SourceReaderBroker = .local(),
     native_queries: ?*@import("../api/native_query_repository.zig").Repository = null,
     allocator_bridge: ?kernel_runtime_services.memory.Allocator = null,
     io_receiver: ?kernel_runtime_services.executor.Receiver = null,
@@ -778,8 +780,23 @@ pub fn storageOwnerContextCreateWithRuntime(
     out_context: *?*anyopaque,
 ) callconv(.c) kernel_owner_abi.Status {
     out_context.* = null;
-    if (request.version != kernel_runtime_services.abi_version or request._reserved != 0 or request.context.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    out_context.* = createStorageOwnerContext(request.*) catch |err| return storageOwnerStatusFromError(err);
+    if ((request.version != 1 and request.version != kernel_runtime_services.abi_version) or request._reserved != 0 or request.context.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    // Read only the stable v1 prefix when an older caller supplied that size.
+    const received: kernel_runtime_services.Request = if (request.version == 1) .{
+        .context = request.context,
+        .memory_limit_bytes = request.memory_limit_bytes,
+        .allocator = request.allocator,
+        .io = request.io,
+    } else request.*;
+    if (received.source_reader_broker) |port| {
+        _ = SourceReaderBroker.receive(port.*) catch return .invalid_abi;
+    }
+    out_context.* = createStorageOwnerContext(received) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerSourceReaderBroker(out: *kernel_runtime_services.SourceReaderBrokerPort) callconv(.c) kernel_owner_abi.Status {
+    out.* = SourceReaderBroker.local().port;
     return .ok;
 }
 
@@ -787,6 +804,7 @@ pub fn storageOwnerContextCreateWithRuntime(
 /// an ABI function returns a scalar failure status.
 pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*StorageOwnerContext {
     const request = services.context;
+    const source_reader_broker = if (services.source_reader_broker) |port| try SourceReaderBroker.receive(port.*) else SourceReaderBroker.local();
     const bridge = if (services.allocator) |value| blk: {
         if (!value.valid()) return error.InvalidArgument;
         break :blk value.*;
@@ -796,6 +814,7 @@ pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*St
     const context = try bootstrap_alloc.create(StorageOwnerContext);
     errdefer bootstrap_alloc.destroy(context);
     context.* = .{
+        .source_reader_broker = source_reader_broker,
         .allocator_bridge = bridge,
         .io_receiver = receiver,
         .alloc = undefined,
@@ -3440,7 +3459,10 @@ pub fn storageOwnerOpen(
         // Reconcile the authoritative resolver catalog before autonomous
         // replay can hold its catalog fence or invoke distributed callbacks.
         .start_resolver_workers = false,
-        .index_backends = .{ .dense_native_migration_policy_source = if (runtime_hooks) |value| value.nativeMigrationPolicy() else null },
+        .index_backends = .{
+            .source_reader_broker = if (owner_context) |context| context.source_reader_broker else .local(),
+            .dense_native_migration_policy_source = if (runtime_hooks) |value| value.nativeMigrationPolicy() else null,
+        },
         .secret_store = if (owner_context) |context| context.secret_store else null,
         .remote_content = if (owner_context) |context| context.remoteContent() else null,
         .start_optional_runtimes = restore_bootstrap == null and initial_child_bootstrap == null,
@@ -4051,6 +4073,7 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
     if (request.raft_term == 0 or request.raft_index == 0) return .invalid_argument;
+    if (request.document_reader_format != 0 and request.document_reader_format != 29) return .invalid_argument;
     var response: capi.Buffer = .{};
     const status = replicatedBatchStorageKernelJsonAtRaftEntry(handle, .{
         .ptr = request.request_json.ptr,
@@ -4058,6 +4081,7 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
     }, .{
         .term = request.raft_term,
         .index = request.raft_index,
+        .document_reader_format = request.document_reader_format,
     }, &response);
     if (status != .ok) return status;
     out_response.* = .{

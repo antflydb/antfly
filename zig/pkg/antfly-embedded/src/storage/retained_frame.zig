@@ -40,8 +40,11 @@ pub const Source = struct {
     /// A local disposable spool can request retransfer on physical damage;
     /// durable source chunks retain the terminal corruption classification.
     corruption_error: anyerror = error.RetainedEffectsCorrupt,
+    reference_context: ?*anyopaque = null,
+    read_reference: ?*const fn (*anyopaque, *anyopaque, u64, u32, []u8) anyerror!usize = null,
 
     pub fn readChunk(self: Source, sequence: u64, ordinal: u32, out: []u8) !usize {
+        if (self.reference_context) |reference| return (self.read_reference orelse return error.RetainedEffectsCorrupt)(self.context, reference, sequence, ordinal, out);
         return self.read_chunk(self.context, sequence, ordinal, out);
     }
 };

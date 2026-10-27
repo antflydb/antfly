@@ -80,6 +80,7 @@ comptime {
     exportInternal(&@import("antfly_local_sources").storage_db_enrichment_enrichment_types.interactiveActivity, "antfly_storage_interactive_activity");
     exportInternal(&storage_kernel_exports.storageOwnerContextCreate, "antfly_storage_context_create");
     exportInternal(&storage_kernel_exports.storageOwnerContextCreateWithRuntime, "antfly_storage_context_create_with_runtime");
+    exportInternal(&storage_kernel_exports.storageOwnerSourceReaderBroker, "antfly_storage_source_reader_broker");
     exportInternal(&storage_kernel_exports.storageOwnerContextDestroy, "antfly_storage_context_destroy");
     exportInternal(&storage_kernel_exports.storageContextAttachInferenceProvider, "antfly_storage_context_attach_inference_provider");
     exportInternal(&storage_kernel_exports.storageOwnerContextConfigureSecrets, "antfly_storage_context_configure_secrets");

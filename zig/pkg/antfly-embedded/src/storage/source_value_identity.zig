@@ -83,6 +83,9 @@ const canonical_abi: [32]u8 = abi: {
     std.crypto.hash.sha2.Sha256.hash("antfly.source.canonical-json/1", &digest, .{});
     break :abi digest;
 };
+pub fn semanticAbi() [32]u8 {
+    return canonical_abi;
+}
 const header_bytes = 111;
 const record_bytes = 34;
 pub const maximum_bytes = header_bytes + projection.maximum_fields * record_bytes;
@@ -108,7 +111,7 @@ pub fn build(a: std.mem.Allocator, body: []const u8, kind: u8, digest: [32]u8, d
     }
     return try collector.encode(a, body.len, kind, digest, directory);
 }
-const Record = struct { index: u16, digest: [32]u8 };
+pub const Record = struct { index: u16, digest: [32]u8 };
 const Collector = struct {
     a: std.mem.Allocator,
     records: [projection.maximum_fields]Record = undefined,
@@ -152,9 +155,23 @@ pub fn buildAuthority(a: std.mem.Allocator, body: []const u8, kind: u8, digest: 
         null else null;
     return .{ .directory = directory, .identities = identities };
 }
+/// Rebind disposable writer certificates after deriving a layout-independent
+/// logical root from their already validated scalar children. Field offsets,
+/// raw hashes, canonical ABI and projection coverage do not change.
+pub fn rebindPublication(publication: Publication, previous: [32]u8, next: [32]u8) !void {
+    if (publication.directory) |directory| {
+        if (directory.len < 45 or !std.mem.eql(u8, directory[12..44], &previous)) return error.InvalidArgument;
+        if (publication.identities) |identities| {
+            if (identities.len < header_bytes or !std.mem.eql(u8, identities[12..44], &previous)) return error.InvalidArgument;
+            @memcpy(identities[12..44], &next);
+            @memcpy(directory[12..44], &next);
+            std.crypto.hash.sha2.Sha256.hash(directory, identities[45..77], .{});
+        } else @memcpy(directory[12..44], &next);
+    }
+}
 /// Qualified prior publication from the same writer snapshot. No document body
 /// is retained or read: directories certify raw leaf digests and exact ancestry.
-pub const Prior = struct { bytes: u64, kind: u8, digest: [32]u8, directory: []const u8, identities: []const u8 };
+pub const Prior = struct { bytes: u64, kind: u8, manifest: bool = false, layout_cooldown: u2 = 0, digest: [32]u8, directory: []const u8, identities: []const u8 };
 pub const ReuseStats = struct { reused_bytes: usize = 0, canonical_bytes: usize = 0, reused_leaves: usize = 0 };
 pub fn buildAuthorityReusing(a: std.mem.Allocator, body: []const u8, kind: u8, digest: [32]u8, prior: Prior, stats: *ReuseStats) !Publication {
     var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
@@ -242,3 +259,15 @@ pub const Certificate = struct {
         return null;
     }
 };
+
+/// Trusted writer publication, preserving canonical leaf identities from the
+/// same snapshot when payload bytes are intentionally not loaded.
+pub fn encodeRecords(a: std.mem.Allocator, bytes: usize, kind: u8, digest: [32]u8, directory: []const u8, records: []const Record) ![]u8 {
+    if (records.len > projection.maximum_fields) return error.InvalidArgument;
+    var collector: Collector = .{ .a = a, .count = records.len };
+    for (records, 0..) |record, i| {
+        if (record.index >= projection.maximum_fields or (i != 0 and records[i - 1].index >= record.index)) return error.InvalidArgument;
+        collector.records[i] = record;
+    }
+    return collector.encode(a, bytes, kind, digest, directory);
+}

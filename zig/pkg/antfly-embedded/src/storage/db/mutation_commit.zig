@@ -277,6 +277,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
             if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
+            // Ordered authority travels with this exact committed entry. A
+            // standalone owner has no other applying reader to negotiate with.
+            // Replication mirrors and restored/imported commands stay fenced.
+            const cohort_store = S.ownerField(self, "core").*.store;
+            if (opts.ordered_apply_receipt) |entry| {
+                if (entry.document_reader_format != 0 and
+                    S.ownerField(self, "local_execution").*.replication_async_batch_mirror == null and
+                    S.ownerField(self, "local_execution").*.replication_async_effect_mirror == null)
+                    try cohort_store.qualifyDocumentReaders(entry.document_reader_format);
+            } else if (!opts.bypass_replication_write_gate and opts.replication_applied_lsn_marker == null and opts.restore_staging == null and
+                S.ownerField(self, "physical_root_mode").* == .filesystem_managed and
+                S.ownerField(self, "local_execution").*.replication_write_gate == null and
+                S.ownerField(self, "local_execution").*.replication_async_batch_mirror == null and
+                S.ownerField(self, "local_execution").*.replication_async_effect_mirror == null)
+            {
+                try cohort_store.qualifyDocumentReaders(29);
+            }
             const total_start_ns = monotonicTimeNs();
             var schedule_replication_recovery_on_exit = false;
             defer {
@@ -323,6 +340,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &transform_snapshot,
             );
             defer effective_ops.deinit(preparation_alloc);
+            var prepared_document_patches = try self.prepareDocumentPatches(preparation_alloc, effective_ops.writes, req.transforms, &transform_snapshot);
+            defer prepared_document_patches.deinit(preparation_alloc);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
 
             if (req.reject_graph_transform_projections and
@@ -419,6 +438,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (req.schema_version) |version| {
                 const view = request_schema_view orelse return error.PreparedGenerationChanged;
                 if (view.version() != version) return error.PreparedGenerationChanged;
+            }
+            // Native document admission uses the same immutable schema epoch as
+            // transforms and publication. Committed Raft entries already carry
+            // leader admission; do not reinterpret them under today's schema.
+            var document_validations: @import("document_validation_preparation.zig").Prepared = .{};
+            defer document_validations.deinit(preparation_alloc);
+            var native_document_validation = false;
+            if (S.ownerField(self, "core").*.store.documentLayoutEnabled() and
+                opts.ordered_apply_receipt == null and opts.transaction_resolution == null and effective_ops.writes.len != 0)
+            {
+                if (request_schema_view) |view| if (view.storageMode() == .document) if (view.validator()) |compiled| {
+                    const large_source = for (effective_ops.writes) |write| {
+                        if (!isMetadataKey(write.key) and write.value.len >= @import("../document_projection.zig").minimum_bytes) break true;
+                    } else false;
+                    const authority = if (large_source and compiled.supportsRootValidationReuse() and S.ownerField(self, "physical_root_mode").* == .filesystem_managed and S.ownerField(self, "root_incarnation").* != 0)
+                        try S.ownerField(self, "document_validation_authority").get(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.index_manager.checkpointIo(), S.ownerField(self, "core").*.path, S.ownerField(self, "root_incarnation").*)
+                    else
+                        null;
+                    document_validations = try @import("document_validation_preparation.zig").prepare(preparation_alloc, compiled, view.version(), authority, S.ownerField(self, "core").*.store, isMetadataKey, effective_ops.writes, &prepared_document_patches, &transform_snapshot);
+                    native_document_validation = true;
+                };
             }
             // Only authenticated hot-standby replay may supply final scoped metadata effects
             // without local participant intents. Scope, key kinds, owner range and
@@ -719,7 +759,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             extracted_rows_initialized += 1;
                             continue;
                         }
-                        extracted_rows[i] = try mapper.extractWrite(preparation_alloc, write.key, write.value);
+                        extracted_rows[i] = try mapper.extractPreparedWrite(preparation_alloc, write.key, write.value, prepared_document_patches.forKey(write.key));
                         extracted_rows_initialized += 1;
                         if (doc_plan_needs_parse) {
                             var parsed = try std.json.parseFromSlice(std.json.Value, preparation_alloc, write.value, .{});
@@ -857,7 +897,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         effective_req.relational_topology.?.action != .release_initial_child and
                         effective_req.relational_topology.?.action != .cancel_initial_child)))
                 return error.InitialChildNotPublished;
-            if (req.schema_version != null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            if (req.schema_version != null or native_document_validation) try self.validatePreparedSchemaViewLocked(request_schema_view);
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (live_replication_apply) {
                 var integrity_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
@@ -1548,7 +1588,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 extracted[i] = if (prepared_relational) |*prepared|
                     prepared.takeExtracted()
                 else
-                    try mapper.extractWrite(S.ownerField(self, "alloc").*, write.key, write.value);
+                    try mapper.extractPreparedWrite(S.ownerField(self, "alloc").*, write.key, write.value, prepared_document_patches.forKey(write.key));
                 // Ownership has transferred even if a later graph/vector consumer
                 // rejects this row. Include it in error cleanup immediately.
                 extracted_initialized += 1;
@@ -1742,21 +1782,47 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.sort.pdq(OverwriteProbeEntry, overwrite_probe_entries.items, {}, overwriteProbeLessThan);
                 const probe_keys = overwrite_probe_keys[0..overwrite_probe_entries.items.len];
                 const probe_values = overwrite_probe_values[0..overwrite_probe_entries.items.len];
-                for (overwrite_probe_entries.items, 0..) |entry, i| {
-                    probe_keys[i] = entry.key;
-                }
+                const has_prepared_patches = prepared_document_patches.items.len != 0;
+                const qualified_patches: []bool = if (has_prepared_patches) try preparation_alloc.alloc(bool, overwrite_probe_entries.items.len) else &.{};
+                defer preparation_alloc.free(qualified_patches);
+                @memset(qualified_patches, false);
+                const fallback_indexes: []usize = if (has_prepared_patches) try preparation_alloc.alloc(usize, overwrite_probe_entries.items.len) else &.{};
+                defer preparation_alloc.free(fallback_indexes);
                 const overwrite_probe_admission: backend_types.Namespace.BlockCacheAdmission = if (opts.store_batch_options.mode == .bulk_ingest or self.bulkSessionActive()) .transient else .retain;
                 var overwrite_probe_txn = try S.ownerField(self, "core").*.store.beginProbeTxnWithBlockCacheAdmission(overwrite_probe_admission);
                 defer overwrite_probe_txn.abort();
-                try overwrite_probe_txn.getManySorted(probe_keys, probe_values);
+                var fallback_count: usize = 0;
                 for (overwrite_probe_entries.items, 0..) |entry, i| {
-                    const existing = probe_values[i] orelse continue;
+                    if (has_prepared_patches) if (prepared_document_patches.forKey(effective_req.writes[entry.write_index].key)) |receipt| {
+                        if (try receipt.qualifies(&overwrite_probe_txn, entry.key, entry.value)) {
+                            qualified_patches[i] = true;
+                            continue;
+                        }
+                    };
+                    probe_keys[fallback_count] = entry.key;
+                    if (has_prepared_patches) fallback_indexes[fallback_count] = i;
+                    fallback_count += 1;
+                }
+                if (fallback_count != 0) try overwrite_probe_txn.getManySorted(probe_keys[0..fallback_count], probe_values[0..fallback_count]);
+                // Expand backwards: packed fallback indices never exceed their
+                // destination, so no source lease is overwritten before use.
+                var remaining = fallback_count;
+                while (has_prepared_patches and remaining > 0) {
+                    remaining -= 1;
+                    probe_values[fallback_indexes[remaining]] = probe_values[remaining];
+                }
+                for (overwrite_probe_entries.items, 0..) |entry, i| {
+                    const existing = if (has_prepared_patches and qualified_patches[i]) @as(?[]const u8, null) else probe_values[i];
+                    if ((!has_prepared_patches or !qualified_patches[i]) and existing == null) continue;
                     overwritten_flags[entry.write_index] = true;
                     const extracted_write = extracted[entry.write_index];
-                    const values_equal = if (entry.semantic_hash) |expected_hash| blk: {
-                        const stored_hash = try relational_store.rowSemanticHash(existing);
+                    const values_equal = if (has_prepared_patches and qualified_patches[i]) equal: {
+                        const receipt = prepared_document_patches.forKey(effective_req.writes[entry.write_index].key).?;
+                        break :equal std.mem.eql(u8, &receipt.before.digest, &receipt.patch.proof.digest);
+                    } else if (entry.semantic_hash) |expected_hash| blk: {
+                        const stored_hash = try relational_store.rowSemanticHash(existing.?);
                         break :blk std.mem.eql(u8, &expected_hash, &stored_hash);
-                    } else storedDocumentValuesEqual(S.ownerField(self, "alloc").*, existing, entry.value);
+                    } else storedDocumentValuesEqual(S.ownerField(self, "alloc").*, existing.?, entry.value);
                     if (unchanged_derived_targets_serviceable and
                         values_equal and
                         extracted_write.dense_embeddings.len == 0 and
@@ -2321,13 +2387,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
                     if (!ready) {
                         try @import("artifact_catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
-                        const ordered = if (status.ready and status.ordered.?.effect_protocol == 16) blk: {
+                        const ordered = if (status.ready and status.ordered.?.supportsGroupedSources()) blk: {
                             var installed = (try inventory.load(group_alloc, &group_overlay)).?;
                             defer installed.deinit();
                             var current = installed.value.command;
                             current.catalogs = catalogs;
                             break :blk current;
-                        } else inventory.Command{ .namespace = namespace, .previous = status.ordered, .catalogs = catalogs, .binding = .{ .epoch = try std.math.add(u64, if (status.ordered) |previous| previous.epoch else 0, 1), .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(group_alloc), .effect_protocol = 16 } };
+                        } else inventory.Command{ .namespace = namespace, .previous = status.ordered, .catalogs = catalogs, .binding = .{ .epoch = try std.math.add(u64, if (status.ordered) |previous| previous.epoch else 0, 1), .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(group_alloc), .effect_protocol = @max(16, if (status.ordered) |previous| previous.effect_protocol else 16) } };
                         try inventory.stageOrdered(group_alloc, &group_overlay, ordered, entry.index);
                     }
                 } else if (command.action == .retire) {
@@ -3015,6 +3081,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 store_writes.items,
             );
             defer authored_acceptance.deinit();
+            const authored_participant = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null;
+            const prepared_participant = if (prepared_document_patches.items.len != 0)
+                @import("../commit_participant.zig").Participant.withDocumentPreparations(authored_participant, prepared_document_patches.documentPreparations())
+            else
+                authored_participant;
+            const commit_participant = if (document_validations.entries.len != 0)
+                @import("../commit_participant.zig").Participant.withDocumentValidations(prepared_participant, document_validations.provider())
+            else
+                prepared_participant;
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
                 const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
@@ -3022,7 +3097,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     resolution.status,
                     resolution.commit_version,
                     .{
-                        .commit_participant = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                        .commit_participant = commit_participant,
                         .writes = store_writes.items,
                         .deletes = delete_keys.items,
                         .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
@@ -3046,7 +3121,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     delete_keys.items,
                     replay_append,
                     store_batch_options,
-                    if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                    commit_participant,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };

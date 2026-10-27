@@ -333,6 +333,32 @@ pub const Directory = struct {
     pub fn find(self: Directory, name: []const u8) ?Field {
         return self.within(0, self.root_count, name);
     }
+    pub const Selection = struct { field: Field, covered: usize };
+    pub const Location = struct { value: ?Selection = null, objects: usize = 0 };
+    /// Structural paths preserve literal dots and empty object keys. Opaque
+    /// ancestors retain their subtree. Proven absence also retains complete
+    /// object ancestry, needed by ordinary projection's empty-object behavior.
+    pub fn locate(self: Directory, parts: []const []const u8) Location {
+        if (parts.len == 0) return .{};
+        var field = self.find(parts[0]) orelse return .{};
+        var covered: usize = 1;
+        var objects: usize = 0;
+        while (covered < parts.len) {
+            switch (field.kind) {
+                .subtree => return .{ .value = .{ .field = field, .covered = covered }, .objects = objects },
+                .leaf => return .{ .objects = objects },
+                .object => {
+                    objects = covered;
+                    field = self.within(field.first_child, field.child_count, parts[covered]) orelse return .{ .objects = objects };
+                },
+            }
+            covered += 1;
+        }
+        return .{ .value = .{ .field = field, .covered = covered }, .objects = objects };
+    }
+    pub fn select(self: Directory, parts: []const []const u8) ?Selection {
+        return self.locate(parts).value;
+    }
     /// Logical dot paths descend through proven objects. Arrays, legacy roots,
     /// and bounded opaque objects retain their entire subtree and boundaries.
     pub fn resolve(self: Directory, path: []const u8) ?Field {
@@ -425,4 +451,45 @@ test "logical value nested authority bounds depth width corruption and allocatio
     try Fixture.run(std.testing.allocator);
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try @import("antfly_platform").allocator.checkAllAllocationFailures(failing.allocator(), Fixture.run, .{});
+}
+
+/// Encode a bounded root directory from already validated field values. Used
+/// by immutable-payload patches, which cannot rescan absent large JSON bytes.
+pub fn encodeRoots(a: A, bytes: usize, kind: u8, digest: [32]u8, fields: []const Field) ![]u8 {
+    for (fields) |field| if (field.parent != no_parent or field.kind == .object) return error.InvalidArgument;
+    return encodeFields(a, bytes, kind, digest, fields);
+}
+/// Packed breadth-first fields, including complete retained object branches.
+/// All offsets and parent/child relationships are checked before publication.
+pub fn encodeFields(a: A, bytes: usize, kind: u8, digest: [32]u8, fields: []const Field) ![]u8 {
+    if (fields.len > maximum_fields) return error.ProjectionDirectoryTooLarge;
+    var size: usize = header_size;
+    for (fields) |field| {
+        if (field.name.len > std.math.maxInt(u16)) return error.InvalidArgument;
+        size = try std.math.add(usize, size, 50 + field.name.len);
+    }
+    if (size > maximum_bytes) return error.ProjectionDirectoryTooLarge;
+    const out = try a.alloc(u8, size);
+    errdefer a.free(out);
+    @memcpy(out[0..4], "DPD2");
+    std.mem.writeInt(u64, out[4..12], bytes, .little);
+    @memcpy(out[12..44], &digest);
+    out[44] = kind;
+    std.mem.writeInt(u16, out[45..47], @intCast(fields.len), .little);
+    var pos: usize = header_size;
+    for (fields) |field| {
+        std.mem.writeInt(u16, out[pos..][0..2], @intCast(field.name.len), .little);
+        pos += 2;
+        @memcpy(out[pos..][0..field.name.len], field.name);
+        pos += field.name.len;
+        if (field.offset > offset_mask) return error.InvalidArgument;
+        const descriptor = field.offset | (@as(u64, field.parent) << 53) | (@as(u64, @backingInt(field.kind)) << 62);
+        std.mem.writeInt(u64, out[pos..][0..8], descriptor, .little);
+        std.mem.writeInt(u64, out[pos + 8 ..][0..8], field.length, .little);
+        @memcpy(out[pos + 16 ..][0..32], &field.digest);
+        pos += 48;
+    }
+    const checked = (try Directory.open(a, out, .{ .bytes = @as(u64, bytes), .kind = kind, .digest = digest })) orelse return error.InvalidArgument;
+    a.free(checked.fields);
+    return out;
 }

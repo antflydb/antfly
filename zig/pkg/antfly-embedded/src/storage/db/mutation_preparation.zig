@@ -175,11 +175,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             entries: []Entry = &.{},
             positions: std.StringHashMapUnmanaged(usize) = .empty,
+            payloads: std.AutoHashMapUnmanaged(usize, @import("../document_payload.zig").SourceMetadata) = .empty,
+            // Sparse, request-owned complete results and bounded physical plans.
+            // Positive plans need no materialized old document; default requests
+            // keep the ordinary per-entry representation and allocate no map.
+            changes: std.AutoHashMapUnmanaged(usize, @import("../document_payload.zig").PreparedWrite) = .empty,
 
             pub fn deinit(self: *@This(), alloc: Allocator) void {
-                for (self.entries) |entry| if (entry.value) |value| alloc.free(value);
+                for (self.entries) |entry| {
+                    if (entry.value) |value| alloc.free(value);
+                }
                 if (self.entries.len > 0) alloc.free(self.entries);
                 self.positions.deinit(alloc);
+                var payloads = self.payloads.valueIterator();
+                while (payloads.next()) |payload| payload.deinit(alloc);
+                self.payloads.deinit(alloc);
+                var changes = self.changes.valueIterator();
+                while (changes.next()) |change| {
+                    alloc.free(change.expected_json);
+                    change.deinit(alloc);
+                }
+                self.changes.deinit(alloc);
                 self.* = .{};
             }
 
@@ -188,6 +204,190 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return self.entries[index].value;
             }
         };
+
+        pub const PreparedDocumentPatches = struct {
+            const Payload = @import("../document_payload.zig");
+            const Item = struct { key: []const u8, prepared: Payload.PreparedWrite, borrowed: bool = false };
+            items: []Item = &.{},
+            pub fn deinit(self: *@This(), a: Allocator) void {
+                for (self.items) |item| if (!item.borrowed) item.prepared.deinit(a);
+                if (self.items.len != 0) a.free(self.items);
+                self.* = .{};
+            }
+            pub fn forKey(self: *const @This(), key: []const u8) ?*const Payload.PreparedWrite {
+                var low: usize = 0;
+                var high = self.items.len;
+                while (low < high) {
+                    const mid = low + (high - low) / 2;
+                    switch (std.mem.order(u8, key, self.items[mid].key)) {
+                        .lt => high = mid,
+                        .gt => low = mid + 1,
+                        .eq => return &self.items[mid].prepared,
+                    }
+                }
+                return null;
+            }
+            pub fn documentPreparations(self: *const @This()) @import("../commit_participant.zig").DocumentPreparations {
+                const Bridge = struct {
+                    fn compare(logical: []const u8, encoded: []const u8) ?std.math.Order {
+                        var cursor: usize = 0;
+                        for (logical) |byte| {
+                            if (cursor >= encoded.len) return .gt;
+                            const candidate = encoded[cursor];
+                            cursor += 1;
+                            if (candidate == 0) {
+                                if (cursor >= encoded.len or encoded[cursor] != 0xff) return null;
+                                cursor += 1;
+                            }
+                            const order = std.math.order(byte, candidate);
+                            if (order != .eq) return order;
+                        }
+                        return if (cursor == encoded.len) .eq else .lt;
+                    }
+                    fn find(ptr: *const anyopaque, key: []const u8) ?*const Payload.PreparedWrite {
+                        const owner: *const PreparedDocumentPatches = @ptrCast(@alignCast(ptr));
+                        if (!internal_keys.isPrimaryDocumentKey(key)) return null;
+                        const body = key[1 .. key.len - 3];
+                        if ((internal_keys.decodeBodyView(body) catch return null)) |logical| return owner.forKey(logical);
+                        // Escaped NUL identifiers remain allocation-free and
+                        // logarithmic; no scratch/decode error can abort a PUT.
+                        var low: usize = 0;
+                        var high = owner.items.len;
+                        while (low < high) {
+                            const mid = low + (high - low) / 2;
+                            switch (compare(owner.items[mid].key, body) orelse return null) {
+                                .lt => low = mid + 1,
+                                .gt => high = mid,
+                                .eq => return &owner.items[mid].prepared,
+                            }
+                        }
+                        return null;
+                    }
+                };
+                return .{ .ptr = self, .find = Bridge.find };
+            }
+        };
+        /// Physical optimization only. Full logical values and the established
+        /// optimistic source/schema/index fences remain in the public pipeline.
+        pub fn prepareDocumentPatches(self: anytype, a: Allocator, writes: []const types.BatchWrite, transforms: []const types.DocumentTransform, snapshot: *const TransformReadSnapshot) !PreparedDocumentPatches {
+            _ = self;
+            if (transforms.len == 0 or snapshot.payloads.count() == 0) return .{};
+            const Payload = @import("../document_payload.zig");
+            // Small batches use the allocation-free direct scan. For wide
+            // batches, group applicable transforms once instead of scanning
+            // every transform again for every prepared document.
+            const grouped = snapshot.changes.count() != snapshot.payloads.count() and snapshot.payloads.count() > 8 and transforms.len > 32 and writes.len > 8;
+            var transform_order: std.ArrayList(usize) = .empty;
+            defer transform_order.deinit(a);
+            if (grouped) {
+                for (transforms, 0..) |transform, i| {
+                    const position = snapshot.positions.get(transform.key) orelse continue;
+                    if (snapshot.payloads.contains(position)) try transform_order.append(a, i);
+                }
+                std.mem.sort(usize, transform_order.items, transforms, struct {
+                    fn less(context: []const types.DocumentTransform, left: usize, right: usize) bool {
+                        return std.mem.order(u8, context[left].key, context[right].key) == .lt;
+                    }
+                }.less);
+            }
+            var items: std.ArrayList(PreparedDocumentPatches.Item) = .empty;
+            errdefer {
+                for (items.items) |item| if (!item.borrowed) item.prepared.deinit(a);
+                items.deinit(a);
+            }
+            for (writes) |write| {
+                const index = snapshot.positions.get(write.key) orelse continue;
+                if (snapshot.changes.get(index)) |change| {
+                    if (change.sameInput(write.value)) {
+                        try items.append(a, .{ .key = write.key, .prepared = change, .borrowed = true });
+                        continue;
+                    }
+                    // This source deliberately has no old full JSON. A caller
+                    // modifying the coalesced value loses only the optimization.
+                    continue;
+                }
+                const entry = snapshot.entries[index];
+                const source = snapshot.payloads.get(index) orelse continue;
+                var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+                defer arena.deinit();
+                const temp = arena.allocator();
+                var roots: std.ArrayList([]const u8) = .empty;
+                var eligible = true;
+                var cursor: usize = 0;
+                var limit = transforms.len;
+                if (grouped) {
+                    var upper = transform_order.items.len;
+                    while (cursor < upper) {
+                        const mid = cursor + (upper - cursor) / 2;
+                        if (std.mem.order(u8, transforms[transform_order.items[mid]].key, write.key) == .lt) cursor = mid + 1 else upper = mid;
+                    }
+                    limit = cursor;
+                    while (limit < transform_order.items.len and std.mem.eql(u8, transforms[transform_order.items[limit]].key, write.key)) : (limit += 1) {}
+                }
+                while (cursor < limit) : (cursor += 1) {
+                    const transform = transforms[if (grouped) transform_order.items[cursor] else cursor];
+                    if (!std.mem.eql(u8, transform.key, write.key)) continue;
+                    for (transform.operations) |operation| {
+                        const name = try transform_mod.rootPath(operation.path);
+                        if (name.len == 0 or name[0] == '_' or roots.items.len >= 128) {
+                            eligible = false;
+                            break;
+                        }
+                        const found = for (roots.items) |prior| {
+                            if (std.mem.eql(u8, prior, name)) break true;
+                        } else false;
+                        if (!found) try roots.append(temp, name);
+                    }
+                    if (!eligible) break;
+                }
+                if (!eligible or roots.items.len == 0) continue;
+                const Collector = struct {
+                    a: Allocator,
+                    updates: []Payload.MetadataUpdate,
+                    order: std.ArrayList([]const u8) = .empty,
+                    bytes: usize = 0,
+                    eligible: bool = true,
+                    fn member(ptr: *anyopaque, name: []const u8, raw: []const u8) !void {
+                        const collector: *@This() = @ptrCast(@alignCast(ptr));
+                        if (!collector.eligible) return;
+                        if (collector.order.items.len >= 512) {
+                            collector.eligible = false;
+                            return;
+                        }
+                        try collector.order.append(collector.a, try collector.a.dupe(u8, name));
+                        for (collector.updates) |*update| if (std.mem.eql(u8, update.name, name)) {
+                            collector.bytes = std.math.add(usize, collector.bytes, raw.len) catch {
+                                collector.eligible = false;
+                                return;
+                            };
+                            if (collector.bytes > 32 * 1024) {
+                                collector.eligible = false;
+                                return;
+                            }
+                            update.value_json = raw;
+                        };
+                    }
+                };
+                const updates = try temp.alloc(Payload.MetadataUpdate, roots.items.len);
+                for (roots.items, updates) |name, *update| update.* = .{ .name = name, .value_json = null };
+                var collector: Collector = .{ .a = temp, .updates = updates };
+                var scanner = std.json.Scanner.initCompleteInput(temp, write.value);
+                defer scanner.deinit();
+                if (try scanner.peekNextTokenType() != .object_begin) continue;
+                try ant_json.scanValue(temp, &scanner, write.value.len, .{ .ctx = &collector, .member_fn = Collector.member });
+                if (try scanner.next() != .end_of_document) return error.InvalidArgument;
+                if (!collector.eligible) continue;
+                const prepared = (try source.prepare(a, entry.value.?, write.value, updates, collector.order.items)) orelse continue;
+                errdefer prepared.deinit(a);
+                try items.append(a, .{ .key = write.key, .prepared = prepared });
+            }
+            std.mem.sort(PreparedDocumentPatches.Item, items.items, {}, struct {
+                fn less(_: void, left: PreparedDocumentPatches.Item, right: PreparedDocumentPatches.Item) bool {
+                    return std.mem.order(u8, left.key, right.key) == .lt;
+                }
+            }.less);
+            return .{ .items = try items.toOwnedSlice(a) };
+        }
 
         pub fn captureGeneratedWriteReadSnapshot(self: anytype, alloc: Allocator, writes: []const types.BatchWrite) !GeneratedWriteReadSnapshot {
             const revisions = GeneratedWriteReadSnapshot.revisions;
@@ -241,19 +441,83 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.items.len);
             var initialized: usize = 0;
             errdefer {
-                for (entries[0..initialized]) |entry| if (entry.value) |value| alloc.free(value);
+                for (entries[0..initialized]) |entry| {
+                    if (entry.value) |value| alloc.free(value);
+                }
                 alloc.free(entries);
             }
             try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.items.len) orelse
                 return error.InvalidBatchRequest);
+            var transform_order: std.ArrayList(usize) = .empty;
+            defer transform_order.deinit(alloc);
+            const grouped = S.ownerField(self, "core").*.store.documentLayoutEnabled() and keys.items.len > 8 and transforms.len > 32;
             for (keys.items, 0..) |key, index| {
                 const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
                 defer alloc.free(store_key);
-                const raw = read_txn.get(store_key) catch |err| switch (err) {
+                const primary = internal_keys.isPrimaryDocumentKey(store_key);
+                const raw = (if (primary) read_txn.getPhysical(store_key) else read_txn.get(store_key)) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
-                const value = if (raw) |stored| blk: {
+                const payload = if (S.ownerField(self, "core").*.store.documentLayoutEnabled() and primary and raw != null)
+                    try @import("../document_payload.zig").SourceMetadata.capturePhysical(alloc, &read_txn, store_key, raw.?)
+                else
+                    null;
+                if (payload) |metadata| {
+                    // Group lazily: ordinary inline rows pay no sorting cost.
+                    if (grouped and transform_order.items.len == 0) {
+                        errdefer metadata.deinit(alloc);
+                        try transform_order.ensureTotalCapacity(alloc, transforms.len);
+                        for (transforms, 0..) |_, i| transform_order.appendAssumeCapacity(i);
+                        std.mem.sort(usize, transform_order.items, transforms, struct {
+                            fn less(context: []const types.DocumentTransform, left: usize, right: usize) bool {
+                                const order = std.mem.order(u8, context[left].key, context[right].key);
+                                return order == .lt or (order == .eq and left < right);
+                            }
+                        }.less);
+                    }
+                    result.payloads.put(alloc, index, metadata) catch |err| {
+                        metadata.deinit(alloc);
+                        return err;
+                    };
+                    var operations: std.ArrayList(types.TransformOp) = .empty;
+                    defer operations.deinit(alloc);
+                    var cursor: usize = 0;
+                    var limit = transforms.len;
+                    if (grouped) {
+                        var high = transform_order.items.len;
+                        while (cursor < high) {
+                            const mid = cursor + (high - cursor) / 2;
+                            if (std.mem.order(u8, transforms[transform_order.items[mid]].key, key) == .lt) cursor = mid + 1 else high = mid;
+                        }
+                        limit = cursor;
+                        while (limit < transform_order.items.len and std.mem.eql(u8, transforms[transform_order.items[limit]].key, key)) : (limit += 1) {}
+                    }
+                    while (cursor < limit) : (cursor += 1) {
+                        const transform = transforms[if (grouped) transform_order.items[cursor] else cursor];
+                        if (!std.mem.eql(u8, transform.key, key)) continue;
+                        if (transform.operations.len > 128 -| operations.items.len) {
+                            operations.clearRetainingCapacity();
+                            break;
+                        }
+                        try operations.appendSlice(alloc, transform.operations);
+                    }
+                    if (try @import("document_change.zig").prepare(alloc, metadata, operations.items)) |plan| {
+                        var transferred = false;
+                        defer if (!transferred) plan.deinit(alloc);
+                        const change = try plan.materialize(alloc, &read_txn, store_key);
+                        errdefer alloc.free(change.expected_json);
+                        try result.changes.put(alloc, index, change);
+                        transferred = true;
+                    }
+                }
+                const value = if (result.changes.contains(index)) null else if (raw) |stored| blk: {
+                    if (primary and @import("../document_payload.zig").isManifest(stored)) {
+                        // Reconstruct directly into the request-owned source.
+                        // A transaction-owned logical buffer followed by dupe
+                        // retains another full payload for each captured row.
+                        break :blk @constCast(try @import("../document_payload.zig").read(alloc, &read_txn, store_key, stored));
+                    }
                     if (!internal_keys.isRelationalRowKey(store_key))
                         break :blk try alloc.dupe(u8, stored);
                     const version = try relational_store.rowSchemaVersion(stored);
@@ -380,6 +644,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             for (transforms) |transform| {
+                if (transform_snapshot) |snapshot| if (snapshot.positions.get(transform.key)) |source_index| {
+                    if (snapshot.changes.get(source_index)) |change| {
+                        const gop = try positions.getOrPut(alloc, transform.key);
+                        if (!gop.found_existing) {
+                            gop.value_ptr.* = order.items.len;
+                            try order.append(alloc, .{ .key = transform.key, .value = change.expected_json, .kind = .write });
+                        }
+                        continue;
+                    }
+                };
                 const maybe_index = positions.get(transform.key);
                 const base_json = blk: {
                     if (maybe_index) |entry_index| {
@@ -736,6 +1010,46 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 error.VersionConflict => return error.PreparedReadSetChanged,
                 else => return err,
             };
+            if (read_snapshot.payloads.count() == 0) return;
+            const revisions = @import("../document_mutation_revision.zig");
+            var read = try S.ownerField(self, "core").*.store.beginProbeTxn();
+            defer read.abort();
+            var sources = read_snapshot.payloads.iterator();
+            while (true) {
+                var keys: [64]revisions.Key = undefined;
+                var before: [64]revisions.Content = undefined;
+                var positions: [64]usize = undefined;
+                var count: usize = 0;
+                while (count < 64) {
+                    const source = sources.next() orelse break;
+                    keys[count] = source.value_ptr.revision_key orelse return error.PreparedReadSetChanged;
+                    before[count] = source.value_ptr.proof;
+                    positions[count] = source.key_ptr.*;
+                    count += 1;
+                }
+                if (count == 0) break;
+                var current: [64]?revisions.Content = undefined;
+                var actual_revisions: [64]u64 = undefined;
+                try revisions.loadContentWindow(&read, keys[0..count], current[0..count], actual_revisions[0..count]);
+                for (before[0..count], current[0..count], positions[0..count], actual_revisions[0..count]) |old, cached, position, revision| {
+                    if (revision != old.revision) return error.PreparedReadSetChanged;
+                    if (cached) |now| if (now.algorithm == .logical_json_v1 and now.kind == old.kind) {
+                        if (now.bytes == old.bytes and std.mem.eql(u8, &now.digest, &old.digest)) continue;
+                    };
+                    // Missing disposable metadata may not force an infinite
+                    // retry. Verify the small physical manifest, never its body.
+                    const logical_key = read_snapshot.entries[position].key;
+                    const owned = if (!internal_keys.isPrimaryDocumentKey(logical_key)) try internal_keys.documentKeyAlloc(S.ownerField(self, "alloc").*, logical_key) else null;
+                    defer if (owned) |key| S.ownerField(self, "alloc").*.free(key);
+                    const payload = @import("../document_payload.zig");
+                    const raw = payload.rawGet(&read, owned orelse logical_key) catch |err| return if (err == error.NotFound) error.PreparedReadSetChanged else err;
+                    if (!payload.isManifest(raw)) return error.PreparedReadSetChanged;
+                    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(S.ownerField(self, "alloc").*));
+                    defer arena.deinit();
+                    const manifest = try payload.Manifest.decode(arena.allocator(), raw);
+                    if (manifest.logical_bytes != old.bytes or !std.mem.eql(u8, &manifest.logical_digest, &old.digest)) return error.PreparedReadSetChanged;
+                }
+            }
         }
 
         pub fn attachPreparedUpsertDocumentProjections(

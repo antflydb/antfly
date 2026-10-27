@@ -87,6 +87,9 @@ pub const Plan = struct {
     digest: publication.Digest,
     nodes: []const Node,
     providers: []const u32,
+    /// Closed read sets compiled from the same immutable executable templates.
+    /// They are derived planner state, excluded from Node/wire identities.
+    document_inputs: []const ?@import("producer_input_revision.zig").Dependency,
     definitions: std.AutoHashMapUnmanaged(publication.Digest, u32),
     unit_children: std.StringHashMapUnmanaged(u32) = .empty,
     enrichment_kinds: std.StringHashMapUnmanaged(enrichments.EnrichmentType) = .empty,
@@ -118,6 +121,13 @@ pub const Plan = struct {
         const definition = @import("artifact_producer_input.zig").definitionDigest(request);
         const index = self.definitions.get(definition) orelse return error.ArtifactCatalogDrift;
         return &self.nodes[index];
+    }
+
+    pub fn closedDocumentInput(self: *const Plan, node: *const Node) !?@import("producer_input_revision.zig").Dependency {
+        const index = self.definitions.get(node.definition) orelse return error.ArtifactCatalogDrift;
+        if (node != &self.nodes[index]) return error.ArtifactCatalogDrift;
+        if (self.document_inputs.len == 0) return null;
+        return self.document_inputs[node.template.?];
     }
 
     pub fn unitChild(self: *const Plan, name: []const u8) !*const Node {
@@ -336,6 +346,17 @@ fn compileWithChildren(alloc: std.mem.Allocator, catalog: publication.Digest, te
         if (entry.found_existing) return error.ArtifactCatalogCorrupt;
         entry.value_ptr.* = @intCast(index);
     };
+    const has_closed_inputs = for (templates) |request| {
+        if (@import("producer_input_revision.zig").compile(request) != null) break true;
+    } else false;
+    const document_inputs: []?@import("producer_input_revision.zig").Dependency = if (has_closed_inputs) try a.alloc(?@import("producer_input_revision.zig").Dependency, templates.len) else &.{};
+    @memset(document_inputs, null);
+    for (templates, 0..) |request, ordinal| {
+        if (!has_closed_inputs) break;
+        if (@import("producer_input_revision.zig").compile(request)) |dependency| {
+            document_inputs[ordinal] = .{ .field = try a.dupe(u8, dependency.field) };
+        }
+    }
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly:artifact-completion-plan:v2:");
     hash.update(&catalog);
@@ -368,7 +389,7 @@ fn compileWithChildren(alloc: std.mem.Allocator, catalog: publication.Digest, te
     const native_requirement = for (requirements, 0..) |node, index| {
         if (node.kind == .native_effects) break @as(u32, @intCast(index));
     } else return error.ArtifactCatalogCorrupt;
-    return .{ .arena = arena, .catalog = catalog, .digest = digest, .nodes = requirements, .providers = providers, .definitions = definitions, .unit_children = unit_children, .enrichment_kinds = enrichment_kinds, .root_chunk_scopes = root_chunk_scopes, .native_requirement = native_requirement, .has_projection_requirements = indexes.len != 0 };
+    return .{ .arena = arena, .catalog = catalog, .digest = digest, .nodes = requirements, .providers = providers, .document_inputs = document_inputs, .definitions = definitions, .unit_children = unit_children, .enrichment_kinds = enrichment_kinds, .root_chunk_scopes = root_chunk_scopes, .native_requirement = native_requirement, .has_projection_requirements = indexes.len != 0 };
 }
 
 test "ordered artifact inventory completion plan retains extraction-owned children without worker templates" {
@@ -546,4 +567,24 @@ test "ordered artifact inventory completion requirements page without catalog pa
     }
     try std.testing.expectEqual(@as(usize, 4), count);
     try std.testing.expect(pages >= 3);
+}
+
+test "producer input revision dependencies come from the immutable completion plan" {
+    const a = std.testing.allocator;
+    const templates = [_]requests.GeneratedEnrichmentRequest{
+        .{ .kind = .dense_embedding, .index_name = "dense", .doc_key = "", .source_field = "body" },
+        .{ .kind = .sparse_embedding, .index_name = "sparse", .doc_key = "", .source_field = "title" },
+        .{ .kind = .dense_embedding, .index_name = "templated", .doc_key = "", .source_field = "body", .source_template = "{{title}} {{body}}" },
+    };
+    var plan = try compile(a, @splat(1), &templates, &.{}, &.{});
+    defer plan.deinit();
+    try std.testing.expectEqualStrings("body", (try plan.closedDocumentInput(try plan.providerFor(templates[0]))).?.field);
+    try std.testing.expectEqualStrings("title", (try plan.closedDocumentInput(try plan.providerFor(templates[1]))).?.field);
+    try std.testing.expect(try plan.closedDocumentInput(try plan.providerFor(templates[2])) == null);
+    var narrower = templates[2];
+    narrower.source_template = "";
+    try std.testing.expectError(error.ArtifactCatalogDrift, plan.providerFor(narrower));
+    var foreign = try compile(a, @splat(1), &templates, &.{}, &.{});
+    defer foreign.deinit();
+    try std.testing.expectError(error.ArtifactCatalogDrift, plan.closedDocumentInput(try foreign.providerFor(templates[0])));
 }

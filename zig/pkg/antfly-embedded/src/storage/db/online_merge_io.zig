@@ -173,7 +173,7 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
     const artifact_ready = if (artifact_preview) |preview| try db.artifactMaterializationsReady(&txn, preview.catalogs) else false;
     if (request.scope.authority == .raft and request.scope.fence.role == .merge_source) {
         eligible = eligible and artifact_ready;
-        if (artifact_preview) |preview| if (preview.binding.effect_protocol == 16) {
+        if (artifact_preview) |preview| if (preview.binding.supportsGroupedSources()) {
             const active = try @import("artifact_publication.zig").authority(&txn);
             const baseline = try @import("artifact_producer_obligations.zig").load(&txn);
             eligible = eligible and active != null and baseline != null and baseline.?.baseline_complete and active.?.epoch == preview.binding.epoch and std.mem.eql(u8, &active.?.catalog_digest, &preview.binding.digest);

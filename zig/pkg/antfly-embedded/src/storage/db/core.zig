@@ -81,6 +81,7 @@ pub const CoreOpenOptions = db_config.CoreOpenOptions;
 pub const PreparedSchemaMetadata = struct {
     alloc: Allocator,
     encoded: []u8,
+    reader_format: u32,
     resident_schema: ?schema_mod.TableSchema,
     epoch: ?*schema_registry_mod.Epoch,
     publication: ?schema_registry_mod.Registry.PublishReservation = null,
@@ -97,8 +98,9 @@ pub const PreparedSchemaMetadata = struct {
         alloc: Allocator,
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
+        reader_format: u32,
     ) !PreparedSchemaMetadata {
-        const encoded = try schema_mod.serializeSchema(alloc, table_schema);
+        const encoded = try schema_mod.serializeSchemaWithMinimumFormat(alloc, table_schema, reader_format);
         errdefer alloc.free(encoded);
         const resident_schema = try schema_mod.deserializeSchema(alloc, encoded);
         errdefer schema_mod.freeSchema(alloc, resident_schema);
@@ -123,6 +125,7 @@ pub const PreparedSchemaMetadata = struct {
         return .{
             .alloc = alloc,
             .encoded = encoded,
+            .reader_format = reader_format,
             .resident_schema = resident_schema,
             .epoch = epoch,
             .combined_writes = combined_writes,
@@ -1299,6 +1302,15 @@ pub const DBCore = struct {
         return (try ttl_mod.readTimestamp(self.store, alloc, key)) orelse 0;
     }
 
+    fn currentReaderFormat(self: *DBCore) !u32 {
+        const raw = (try self.getStoreValue(self.alloc, schema_mod.schema_key)) orelse return schema_mod.storage_format_version;
+        defer self.alloc.free(raw);
+        if (raw.len < 8 or !std.mem.eql(u8, raw[0..4], "ASCH")) return error.InvalidSchemaUpdateRequest;
+        const version = @max(schema_mod.storage_format_version, std.mem.readInt(u32, raw[4..8], .little));
+        if (version > schema_mod.maximum_reader_format_version) return error.UnsupportedVersion;
+        return version;
+    }
+
     pub fn setSchema(self: *DBCore, table_schema: schema_mod.TableSchema) !void {
         _ = try self.commitSchemaMetadata(table_schema, &.{}, &.{}, null);
         // Refresh even when the durable value is unchanged. An index may have
@@ -1361,7 +1373,7 @@ pub const DBCore = struct {
         expected_version: ?u32,
     ) !PreparedSchemaMetadata {
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, &.{});
-        var prepared = try PreparedSchemaMetadata.init(self.alloc, table_schema, metadata_writes);
+        var prepared = try PreparedSchemaMetadata.init(self.alloc, table_schema, metadata_writes, try self.currentReaderFormat());
         errdefer prepared.deinit();
         prepared.base_schema_view = self.schema_registry.acquire();
         if (expected_version) |expected| {
@@ -1371,7 +1383,7 @@ pub const DBCore = struct {
         prepared.base_relational_indexes = self.relational_indexes.acquire();
         if (prepared.base_schema_view) |view| {
             if (view.version() == table_schema.version) {
-                const base_encoded = try schema_mod.serializeSchema(self.alloc, view.tableSchema().*);
+                const base_encoded = try schema_mod.serializeSchemaWithMinimumFormat(self.alloc, view.tableSchema().*, prepared.reader_format);
                 defer self.alloc.free(base_encoded);
                 prepared.same_version_layout_matches = std.mem.eql(u8, base_encoded, prepared.encoded);
                 // Released distributed owners may have only ASCH v12 locally;
@@ -1423,7 +1435,11 @@ pub const DBCore = struct {
             (table_schema.storage_mode == .relational or !std.mem.allEqual(u8, &checks_digest, 0))))
         {
             var digest: [32]u8 = undefined;
-            std.crypto.hash.Blake3.hash(prepared.encoded, &digest, .{});
+            // Physical reader activation is root-local; integrity/schema IDs
+            // must remain identical on replicas with different physical layouts.
+            const logical_schema = try schema_mod.serializeSchema(self.alloc, table_schema);
+            defer self.alloc.free(logical_schema);
+            std.crypto.hash.Blake3.hash(logical_schema, &digest, .{});
             prepared.integrity_catalog = try integrity_catalog_mod.prepareWithChecks(
                 self.alloc,
                 previous_integrity,
@@ -1537,6 +1553,9 @@ pub const DBCore = struct {
         } else if (self.schema != null) {
             return error.PreparedGenerationChanged;
         }
+        // A document write may have promoted the physical format after schema
+        // preparation. Rebuild the prepared schema/catalog hashes on retry.
+        if (try self.currentReaderFormat() > prepared.reader_format) return error.PreparedGenerationChanged;
         const table_schema = prepared.schema().*;
         const same_active_epoch = if (self.schema) |current|
             current.version == table_schema.version and prepared.same_version_layout_matches
@@ -1581,7 +1600,7 @@ pub const DBCore = struct {
         next_catalog.active_schema_version = table_schema.version;
         // This transaction publishes the current runtime schema encoding and
         // its capability requirement together, including same-epoch retries.
-        next_catalog.schema_format_version = schema_mod.storage_format_version;
+        next_catalog.schema_format_version = prepared.reader_format;
         if (reconciled_row_count) |row_count| next_catalog.row_count = @intFromBool(row_count != 0);
         next_catalog.reconciled = true;
         const same_index_catalog = if (prepared.relational_indexes) |indexes|
@@ -1933,6 +1952,20 @@ pub const DBCore = struct {
 
     pub fn saveSchemaCloneTo(self: *DBCore, dest_store: *docstore_mod.DocStore) !void {
         try schema_mod.copySchemas(self.store, dest_store, self.alloc);
+        // This unpublished store has no workers yet. Adopt its actual copied
+        // reader fence before split cursors or residual indexing open; the
+        // source core's cached logical schema may predate physical admission.
+        const copied = try schema_mod.loadSchema(dest_store, self.alloc);
+        defer if (copied) |loaded| schema_mod.freeSchema(self.alloc, loaded);
+        if (copied) |loaded| {
+            if (loaded.storage_mode == .document and loaded.decoded_format_version >= 26) {
+                if (loaded.decoded_format_version >= 29) {
+                    try dest_store.adoptDocumentReaderFormat(29);
+                } else {
+                    dest_store.document_payload_prototype = true;
+                }
+            }
+        }
     }
 
     pub fn pruneSplitRangeFromPrimaryIndexes(
@@ -3149,6 +3182,16 @@ pub fn openCoreResourcesFromPrimaryStore(
 
     const schema = try schema_mod.loadSchema(store, alloc);
     errdefer if (schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+    // An already-admitted on-disk format owns its read/retirement semantics.
+    // Infer this before the core becomes visible to workers; no runtime flag
+    // race, extra schema lookup or new admission of a legacy table is needed.
+    if (schema) |loaded| if (loaded.storage_mode == .document and loaded.decoded_format_version >= 26) {
+        if (loaded.decoded_format_version >= 29) {
+            try store.adoptDocumentReaderFormat(29);
+        } else {
+            store.document_payload_prototype = true;
+        }
+    };
     const table_catalog = try loadTableCatalogForSchema(alloc, store, schema);
 
     owned_path = null;
@@ -3217,23 +3260,11 @@ fn loadArtifactCleanupMaybe(alloc: Allocator, store: *docstore_mod.DocStore) !bo
 }
 
 fn hasAnyUserNamespaceKey(store: *docstore_mod.DocStore) !bool {
-    const State = struct {
-        found: bool = false,
-
-        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
-            _ = key;
-            _ = value;
-            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            state.found = true;
-            return .stop;
-        }
-    };
-
-    const lower = [_]u8{internal_keys.user_namespace};
-    const upper = [_]u8{internal_keys.user_namespace + 1};
-    var state = State{};
-    try store.scanWithContext(lower[0..], upper[0..], .{}, &state, State.scanEntry);
-    return state.found;
+    // Startup has not installed schema-derived payload readers yet. Presence
+    // depends on keys alone; never resolve a document or a retained value here.
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return txn.hasPrefix(&.{internal_keys.user_namespace});
 }
 
 pub fn clearAllKeysFromStore(alloc: Allocator, store: *docstore_mod.DocStore) !void {

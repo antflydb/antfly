@@ -30,6 +30,7 @@ const Wire = struct {
     producer_artifact_name: []const u8 = "",
     producer_scope_key: []const u8 = "",
     sources: []const publication.Source,
+    input_scopes: []const @import("scoped_producer_inputs.zig").Guard = &.{},
     artifact_sources: []const publication.ArtifactSource = &.{},
     mutation_preconditions: []const publication.ArtifactSource = &.{},
     mutations: []const WireMutation,
@@ -45,35 +46,37 @@ comptime {
 pub fn write(command: publication.Command, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
     inline for (comptime std.meta.fieldNames(publication.Command)) |reflected_name| {
-        try stream.objectField(reflected_name);
-        if (comptime std.mem.eql(u8, reflected_name, "mutations")) {
-            try stream.beginArray();
-            for (command.mutations) |effect| {
-                try stream.beginObject();
-                try stream.objectField("family");
-                try stream.write(@tagName(effect.family));
-                try stream.objectField("key");
-                try binary.write(effect.key, stream);
-                try stream.objectField("source_index");
-                try stream.write(effect.source_index);
-                try stream.objectField("value_base64");
-                if (effect.value) |value| {
-                    try stream.beginWriteRaw();
-                    try stream.writer.writeByte('"');
-                    var scratch: [4096]u8 = undefined;
-                    var offset: usize = 0;
-                    while (offset < value.len) {
-                        const end = @min(value.len, offset + 3072);
-                        try stream.writer.writeAll(std.base64.standard.Encoder.encode(&scratch, value[offset..end]));
-                        offset = end;
-                    }
-                    try stream.writer.writeByte('"');
-                    stream.endWriteRaw();
-                } else try stream.write(null);
-                try stream.endObject();
-            }
-            try stream.endArray();
-        } else try binary.write(@field(command, reflected_name), stream);
+        if (!command.nativeJsonSkipField(reflected_name)) {
+            try stream.objectField(reflected_name);
+            if (comptime std.mem.eql(u8, reflected_name, "mutations")) {
+                try stream.beginArray();
+                for (command.mutations) |effect| {
+                    try stream.beginObject();
+                    try stream.objectField("family");
+                    try stream.write(@tagName(effect.family));
+                    try stream.objectField("key");
+                    try binary.write(effect.key, stream);
+                    try stream.objectField("source_index");
+                    try stream.write(effect.source_index);
+                    try stream.objectField("value_base64");
+                    if (effect.value) |value| {
+                        try stream.beginWriteRaw();
+                        try stream.writer.writeByte('"');
+                        var scratch: [4096]u8 = undefined;
+                        var offset: usize = 0;
+                        while (offset < value.len) {
+                            const end = @min(value.len, offset + 3072);
+                            try stream.writer.writeAll(std.base64.standard.Encoder.encode(&scratch, value[offset..end]));
+                            offset = end;
+                        }
+                        try stream.writer.writeByte('"');
+                        stream.endWriteRaw();
+                    } else try stream.write(null);
+                    try stream.endObject();
+                }
+                try stream.endArray();
+            } else try binary.write(@field(command, reflected_name), stream);
+        }
     }
     try stream.endObject();
 }
@@ -87,6 +90,8 @@ fn fromWire(alloc: std.mem.Allocator, wire: Wire) std.json.ParseFromValueError!p
     if (wire.sources.len > publication.max_source_documents or wire.artifact_sources.len > publication.max_source_documents or wire.mutations.len > publication.max_mutations) return error.LengthMismatch;
     if (wire.mutation_preconditions.len > publication.max_source_documents - wire.artifact_sources.len) return error.LengthMismatch;
     var remaining: usize = publication.max_payload_bytes;
+    const scope_bytes = @import("scoped_producer_inputs.zig").validate(wire.input_scopes, wire.sources.len) catch return error.LengthMismatch;
+    remaining = std.math.sub(usize, remaining, scope_bytes) catch return error.LengthMismatch;
     if (wire.baseline) |page| page.validate() catch return error.LengthMismatch;
     if (wire.validation) |page| page.validate() catch return error.LengthMismatch;
     if (wire.census) |page| page.validate() catch return error.LengthMismatch;

@@ -198,6 +198,7 @@ const derived_executor_mod = @import("derived/derived_executor.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
 const persistent_mod = @import("../persistent.zig");
+const db_document_query = @import("document_query.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const sparse_mod = if (builtin.os.tag == .freestanding)
     @import("sparse_stub.zig")
@@ -3096,6 +3097,7 @@ pub const DB = struct {
     owned_row_policy_authority_secret: ?[]u8 = null,
     owned_row_policy_authority_issuer: ?[]u8 = null,
     owned_row_policy_table_name: ?[]u8 = null,
+    document_validation_authority: @import("document_validation_authority.zig").Authority = .{},
     rewrite_program_cache: @import("../rewrite_program_cache.zig").Cache = .{},
     rewrite_tail_cache: @import("../rewrite_tail_spool.zig").Cache = .{},
     restore_decoder_cache: @import("../restore_decoder_cache.zig").Cache = .{},
@@ -9296,6 +9298,7 @@ pub const DB = struct {
             );
             defer targeted.deinit();
             if (targeted.found) {
+                if (targeted.waiting) return .idle;
                 if (!targeted.completed) return .progressed;
                 return try finalizeClaimedRetiredIndexCleanup(ctx, &cleanup_locked, targeted.index_name, targeted.key);
             }
@@ -9304,6 +9307,7 @@ pub const DB = struct {
         var result = try ctx.index_manager.drainGeneratedArtifactCleanupOutboxPage(ctx.store);
         defer result.deinit();
         if (!result.found) return .idle;
+        if (result.waiting) return .idle;
         if (!result.completed) return .progressed;
         return try finalizeClaimedRetiredIndexCleanup(ctx, &cleanup_locked, result.index_name, result.key);
     }
@@ -9316,6 +9320,11 @@ pub const DB = struct {
     ) !GeneratedArtifactCleanupAdvanceResult {
         if (!ctx.index_artifact_finalization_mutex.tryLock()) return .busy;
         defer ctx.index_artifact_finalization_mutex.unlock();
+
+        // Page arbitration can be released while another finalizer performs
+        // I/O. Its tombstone may disappear before this lease is acquired;
+        // never delete a newly staged namespace using that stale page result.
+        if (!try ctx.index_manager.retiredIndexCleanupReady(ctx.store, cleanup_key)) return .progressed;
 
         // Repair issues describe one concrete consumer generation. A
         // same-name replacement has different artifact identities and cannot
@@ -9686,6 +9695,7 @@ pub const DB = struct {
     pub const TransformReadSnapshot = local_mutation.TransformReadSnapshot;
 
     pub const captureTransformReadSnapshot = local_mutation.captureTransformReadSnapshot;
+    pub const prepareDocumentPatches = local_mutation.prepareDocumentPatches;
 
     pub const GeneratedWriteReadSnapshot = local_mutation.GeneratedWriteReadSnapshot;
 
@@ -9730,7 +9740,8 @@ pub const DB = struct {
             try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             return null;
         };
-        defer alloc.free(raw);
+        var raw_owned = true;
+        defer if (raw_owned) alloc.free(raw);
         if (!internal_keys.isInternalUserKey(key)) {
             const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
             if (ttl_duration_ns != 0) {
@@ -9744,7 +9755,8 @@ pub const DB = struct {
                 }
             }
         }
-        const result = try self.core.index_manager.materializeStoredValueWithPinnedSchemaAlloc(alloc, store_key, raw, schema_view);
+        raw_owned = false;
+        const result = try self.core.index_manager.materializeOwnedStoredValueWithPinnedSchemaAlloc(alloc, store_key, raw, schema_view);
         errdefer alloc.free(result);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
@@ -26430,7 +26442,7 @@ pub const DB = struct {
             // Reject known stale work before allocating a local replay
             // reservation. The final writer guard repeats this against the
             // exact write snapshot; provider input never grants write access.
-            publication.validateSources(self.alloc, &read, command.namespace, command.sources) catch |err| switch (err) {
+            publication.validateCommandSources(self.alloc, &read, command, try command.outputSources()) catch |err| switch (err) {
                 error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held),
                 else => return err,
             };
@@ -26532,7 +26544,7 @@ pub const DB = struct {
             upload: ?@import("artifact_publication_transport.zig").Finalization,
             pub fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
                 const guard: *@This() = @ptrCast(@alignCast(ptr));
-                try publication.validateSources(alloc, txn, guard.command.namespace, guard.command.sources);
+                try publication.validateCommandSources(alloc, txn, guard.command, try guard.command.outputSources());
                 try publication.validateArtifactSources(alloc, txn, guard.command.namespace, guard.command.sources, guard.command.artifact_sources);
                 try publication.validateArtifactSources(alloc, txn, guard.command.namespace, guard.command.sources, guard.command.mutation_preconditions);
                 if (guard.chunk_fence) |fence| try fence.requireCurrent(txn);
@@ -31884,10 +31896,22 @@ pub const DB = struct {
     }
 
     fn runArtifactRepairMetadataMaintenanceAfterScan(self: *DB) !bool {
+        var resume_source_cleanup = false;
+        defer if (resume_source_cleanup) self.scheduleGeneratedArtifactCleanup();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
 
         var more = try self.core.index_manager.runGraphOwnershipCleanupStep();
+        more = (try self.core.index_manager.runSourceOwnershipMaintenanceStep(self.core.store)) or more;
+        // Cleanup's normal driver takes this mutex before requesting apply;
+        // never wait for it while holding apply in metadata maintenance.
+        if (self.async_context.index_artifact_cleanup_mutex.tryLock()) {
+            defer self.async_context.index_artifact_cleanup_mutex.unlock();
+            const progressed = try self.core.index_manager.runRetiredSourceOwnershipMaintenanceStep(self.core.store);
+            resume_source_cleanup = progressed;
+            more = progressed or more;
+        }
+        more = self.core.index_manager.sourceOwnershipMaintenancePending() or more;
         more = (try self.rebuildArtifactRepairSummaryIfMissing(self.alloc)) or more;
         more = (try self.rebuildArtifactRepairKindIndexIfMissing(self.alloc)) or more;
         if (self.local_execution.source_vectors.load(.acquire)) |source| {
@@ -32011,8 +32035,13 @@ pub const DB = struct {
     fn independentMaintenanceActivity(ptr: *anyopaque) independent_maintenance.Owner.Activity {
         const self: *DB = @ptrCast(@alignCast(ptr));
         const source = self.local_execution.source_vectors.load(.acquire);
+        const source_ownership_pending = blk: {
+            var lease = self.tryAcquireIndexCatalogReadLease() orelse break :blk true;
+            defer lease.release();
+            break :blk self.core.index_manager.sourceOwnershipMaintenancePending();
+        };
         return .{
-            .artifacts = (replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate) and (self.local_source_recovery_pending or self.document_authority_backfill_active.load(.acquire) or self.document_authority_backfill_requested.load(.acquire) or self.document_authority_repairs.pending.load(.acquire))) or self.hasPendingGraphReplacements() or self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
+            .artifacts = (replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate) and (self.local_source_recovery_pending or self.document_authority_backfill_active.load(.acquire) or self.document_authority_backfill_requested.load(.acquire) or self.document_authority_repairs.pending.load(.acquire))) or self.hasPendingGraphReplacements() or self.artifact_repair_metadata_pending or source_ownership_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
             .producers = self.artifact_producer_scheduler.active(self.independentMaintenanceNowNs()),
             .indexes = self.local_execution.relational_index_maintenance_sweep.isPending() and platform_time.monotonicNs() >= self.local_execution.relational_index_retry_after_ns.load(.acquire),
             .columns = self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire),
@@ -41285,6 +41314,12 @@ pub const DB = struct {
 
     fn searchLockedWithExecutionContextImpl(self: *DB, alloc: Allocator, req: types.SearchRequest, exec_ctx: types.ExecutionContext, externalize_artifact_ids: bool, dense_profile_sink: ?*db_query_search.DenseSearchProfile) !types.SearchResult {
         var request = req;
+        // Reconstruct native corpus selection at the DB boundary; a borrowed
+        // context from another DB/table or a caller never supplies authority.
+        request.source_query_context = null;
+        const source_plan = try @import("query/source_context.zig").Plan.create(alloc, self.core.index_manager, request);
+        defer if (source_plan) |plan| plan.deinit();
+        if (source_plan) |plan| request.source_query_context = &plan.context;
         // A caller cannot promote a mutable DB into an immutable cache scope.
         request.value_search_scope = self.retained_value_scope;
         if (requestHasLogicalValues(req)) if (self.core.textIndexEntry(req.index_name)) |entry| {
@@ -41362,12 +41397,75 @@ pub const DB = struct {
         if (conditional_source) request.include_stored = false;
         var result = try self.searchLockedWithExecutionContextRaw(alloc, request, exec_ctx, externalize_artifact_ids, dense_profile_sink);
         errdefer result.deinit();
+        if (source_plan) |plan| plan.finishRanking();
         if (conditional_source) try self.hydrateConditionalSource(alloc, req, &result);
+        var delivery_req = request;
+        delivery_req.include_stored = req.include_stored;
+        try finishIndexedSources(alloc, delivery_req, &result);
         if (req.profile and req.value_search_work == null) {
             result.value_search_profile_json = try value_work.profileAlloc(alloc);
         }
         try self.attachDistributedDocumentAuthority(alloc, req, &result);
         return result;
+    }
+
+    /// Resolve only final selected rows, then release every native DB-borrowing
+    /// handle before a public result can outlive this synchronous DB query.
+    fn finishIndexedSources(alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
+        try finishIndexedHits(alloc, result.stored_data_allocator orelse alloc, req, result.hits);
+        for (result.graph_results) |*graph| try finishIndexedHits(alloc, alloc, req, graph.hits);
+    }
+    fn finishIndexedHits(alloc: Allocator, output: Allocator, req: types.SearchRequest, hits: []types.SearchHit) !void {
+        for (hits) |*hit| if (hit.indexed_source) |source| {
+            try db_query_search.checkSearchRequestDeadline(req);
+            // Current-primary distributed authority is a different domain.
+            // Never certify an old indexed body with a current-row token.
+            if (req.document_authority_mode != .none) return error.UnsupportedSourcePublication;
+            if (req.include_stored and !req.count_only and hit.finalized_source == null) {
+                const options: types.LookupOptions = .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields, .output_exact = req.document_output_exact };
+                if (hit.stored_data != null and options.fields.len == 0 and options.include_all_fields) {
+                    source.deinit();
+                    hit.indexed_source = null;
+                    continue;
+                }
+                const value = if (hit.stored_data) |full| projected: {
+                    if (req.document_projection_plan) |prepared| if (prepared.matches(options))
+                        break :projected try db_document_query.lookupJsonWithSourcesPolicy(alloc, output, full, prepared.plan, &.{}, options.output_exact);
+                    break :projected try db_document_query.lookupJsonWithOutput(alloc, output, full, options);
+                } else try source.lookup(output, options);
+                if (hit.stored_data) |previous| output.free(previous);
+                hit.stored_data = null;
+                hit.clearSource(alloc);
+                hit.stored_data = value.json;
+            } else if (!req.include_stored or req.count_only) {
+                if (hit.stored_data) |previous| output.free(previous);
+                hit.stored_data = null;
+                hit.clearSource(alloc);
+            }
+            source.deinit();
+            hit.indexed_source = null;
+        };
+    }
+    fn hydrateIndexedConditional(alloc: Allocator, temp: Allocator, req: types.SearchRequest, prepared: @import("../../api/source_projection.zig").Prepared, hit: *types.SearchHit) !void {
+        const protocol = @import("../../api/source_projection.zig");
+        const source = hit.indexed_source orelse return error.InvalidArgument;
+        if (try source.lookupConditional(alloc, hit.id, .{ .fields = req.fields, .include_all_fields = req.include_all_fields }, prepared)) |value| {
+            hit.clearSource(alloc);
+            hit.stored_data = value.source;
+            hit.source_projection_json = value.identities;
+            hit.finalized_source = .{ .bytes = value.source };
+            return;
+        }
+        const value = try source.lookup(temp, .{ .fields = req.fields, .include_all_fields = req.include_all_fields });
+        var parsed = try std.json.parseFromSliceLeaky(std.json.Value, temp, value.json, .{ .allocate = .alloc_always });
+        const identities = try protocol.apply(false, temp, prepared, hit.id, &parsed);
+        const body = try std.json.Stringify.valueAlloc(alloc, parsed, .{});
+        errdefer alloc.free(body);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identities, .{ .emit_null_optional_fields = false });
+        hit.clearSource(alloc);
+        hit.stored_data = body;
+        hit.source_projection_json = encoded;
+        hit.finalized_source = .{ .bytes = body };
     }
 
     /// Runs before releasing search's publication/apply lease. Each bounded
@@ -41386,7 +41484,21 @@ pub const DB = struct {
         var certificate_hits: usize = 0;
         var full_fallbacks: usize = 0;
         while (start < result.hits.len) {
-            const end = @min(result.hits.len, start + 64);
+            var positions: [64]usize = undefined;
+            var row_count: usize = 0;
+            while (start < result.hits.len and row_count < positions.len) : (start += 1) {
+                const hit = &result.hits[start];
+                if (hit.indexed_source != null) {
+                    var native_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+                    defer native_scratch.deinit();
+                    try hydrateIndexedConditional(alloc, native_scratch.allocator(), req, prepared, hit);
+                    certificate_hits += 1;
+                } else {
+                    positions[row_count] = start;
+                    row_count += 1;
+                }
+            }
+            if (row_count == 0) continue;
             var window = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
             defer window.deinit();
             var txn = try self.core.store.beginReadTxn();
@@ -41406,7 +41518,8 @@ pub const DB = struct {
             const authenticated = self.core.store.valuesAreAuthenticated() and conditional_mod.exactSelectedValues(req.fields, parsed);
             if (authenticated) {
                 try db_query_search.checkSearchRequestDeadline(req);
-                for (result.hits[start..end], 0..) |hit, i| {
+                for (positions[0..row_count], 0..) |position, i| {
+                    const hit = result.hits[position];
                     physical_keys[i] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, window.allocator(), hit.id, schema);
                     ids[i] = hit.id;
                 }
@@ -41414,8 +41527,8 @@ pub const DB = struct {
                 {
                     var scope = try txn.openReadScope(window.allocator());
                     defer scope.close();
-                    authorities = try conditional_mod.Window.prepare(window.allocator(), &scope, physical_keys[0 .. end - start], ids[0 .. end - start]);
-                    if (end - start == 1) {
+                    authorities = try conditional_mod.Window.prepare(window.allocator(), &scope, physical_keys[0..row_count], ids[0..row_count]);
+                    if (row_count == 1) {
                         conditional_rows = try alloc.alloc(?conditional_mod.Result, 1);
                         conditional_rows.?[0] = null;
                         conditional_rows.?[0] = try conditional_mod.loadPrepared(alloc, window.allocator(), &scope, physical_keys[0], ids[0], req.fields, prepared, authorities.rows[0], &repairs[0]);
@@ -41427,20 +41540,23 @@ pub const DB = struct {
                         try db_query_search.checkSearchRequestDeadline(request.*);
                     }
                 };
-                if (end - start != 1) conditional_rows = try conditional_mod.loadPreparedWindow(alloc, window.allocator(), &txn, physical_keys[0 .. end - start], ids[0 .. end - start], req.fields, prepared, authorities.rows[0 .. end - start], repairs[0 .. end - start], .{ .ctx = &req, .run = Guard.check });
+                if (row_count != 1) conditional_rows = try conditional_mod.loadPreparedWindow(alloc, window.allocator(), &txn, physical_keys[0..row_count], ids[0..row_count], req.fields, prepared, authorities.rows[0..row_count], repairs[0..row_count], .{ .ctx = &req, .run = Guard.check });
             }
             var fallback_keys: [64][]const u8 = undefined;
             var fallback_slots: [64]usize = undefined;
             var count: usize = 0;
-            for (result.hits[start..end], start..) |*hit, i| {
+            for (positions[0..row_count], 0..) |i, slot| {
+                const hit = &result.hits[i];
                 try db_query_search.checkSearchRequestDeadline(req);
-                if (repairs[i - start]) self.document_authority_backfill_requested.store(true, .release);
-                if (conditional_rows) |rows| if (rows[i - start]) |value| {
+                if (repairs[slot]) self.document_authority_backfill_requested.store(true, .release);
+                if (conditional_rows) |rows| if (rows[slot]) |value| {
                     hit.clearSource(alloc);
                     hit.stored_data = value.source;
                     hit.source_projection_json = value.identities;
+                    // The producer has normalized the entire projected object.
+                    // storageEligible admits only positive public object paths.
                     hit.finalized_source = .{ .bytes = value.source };
-                    rows[i - start] = null;
+                    rows[slot] = null;
                     certificate_hits += 1;
                     continue;
                 };
@@ -41458,7 +41574,6 @@ pub const DB = struct {
                     row.* = null;
                 }
             }
-            start = end;
         }
         if (benchQueryProfileEnabled()) std.log.info("antfly_bench_conditional_source certificate_hits={d} full_fallbacks={d}", .{ certificate_hits, full_fallbacks });
     }
@@ -41529,20 +41644,46 @@ pub const DB = struct {
                     primary_window.finishRow(cached == null);
             }
             var digest: [32]u8 = undefined;
+            var algorithm: @import("../document_mutation_revision.zig").Algorithm = .sha256_json;
             const primary_bytes = if (cached) |content| cached: {
                 digest = content.digest;
+                algorithm = content.algorithm;
                 break :cached content.bytes;
             } else legacy: {
                 const raw = primary_window.get(&read.?, store_key, null) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
                 raw_primary = raw;
-                std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
                 const revision = mutation_revisions[index % 64];
-                if (!self.document_authority_repairs.enqueue(self.alloc, store_key, .{ .revision = revision, .bytes = raw.len, .kind = store_key[store_key.len - 1], .digest = digest }))
+                var repaired: @import("../document_mutation_revision.zig").Content = .{ .revision = revision, .bytes = raw.len, .kind = store_key[store_key.len - 1], .digest = undefined };
+                {
+                    // A missing disposable proof does not turn a manifest root
+                    // into the legacy SHA256 of reconstructed JSON. Rebuild the
+                    // tagged commitment from this same pinned primary view.
+                    var scope = try read.?.openReadScope(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+                    defer scope.close();
+                    const stored = try scope.getPhysical(store_key);
+                    const payload = @import("../document_payload.zig");
+                    if (payload.isManifest(stored)) {
+                        var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+                        defer scratch.deinit();
+                        const manifest = try payload.Manifest.decode(scratch.allocator(), stored);
+                        repaired.manifest = true;
+                        repaired.algorithm = .logical_json_v1;
+                        repaired.digest = manifest.logical_digest;
+                        repaired.bytes = manifest.logical_bytes;
+                    } else if (raw.len >= @import("../document_projection.zig").minimum_bytes and internal_keys.isPrimaryDocumentKey(store_key) and try scope.usesLogicalDocumentIdentity()) {
+                        repaired.digest = try @import("../document_commitment.zig").compute(@import("antfly_platform").allocator.reclaimingScratch(alloc), raw);
+                        repaired.algorithm = .logical_json_v1;
+                    } else std.crypto.hash.sha2.Sha256.hash(raw, &repaired.digest, .{});
+                }
+                digest = repaired.digest;
+                algorithm = repaired.algorithm;
+                if (!self.document_authority_repairs.enqueue(self.alloc, store_key, repaired))
                     self.document_authority_backfill_requested.store(true, .release);
-                break :legacy raw.len;
+                break :legacy repaired.bytes;
             };
             const version = versions[index % 64];
-            const authority: types.document_authority.Authority = .{ .group = req.document_authority_group, .version = version, .digest = digest };
+            const authority: types.document_authority.Authority = .{ .group = req.document_authority_group, .version = version, .digest = digest, .algorithm = algorithm };
+            if (algorithm == .logical_json_v1) result.document_authority_version = 2;
             // Small pages stay in one round trip; large candidates travel
             // as proofs until their global window has been selected.
             const eager = req.document_authority_mode == .candidates and primary_bytes <= 8 * 1024 and primary_bytes <= 64 * 1024 -| eager_bytes;
@@ -41599,7 +41740,7 @@ pub const DB = struct {
             hit.document_authority = owned_authority;
             hit.stored_data = document_bytes;
         }
-        result.document_authority_version = 1;
+        if (result.document_authority_version == 0) result.document_authority_version = 1;
     }
 
     fn searchLockedWithExecutionContextRaw(
@@ -41689,6 +41830,33 @@ pub const DB = struct {
         return base;
     }
 
+    fn indexedHighlightPaths(a: Allocator, fields: []const []const u8) !?[]const []const []const u8 {
+        if (fields.len == 0 or fields.len > 64) return null;
+        var paths: std.ArrayListUnmanaged([]const []const u8) = .empty;
+        for (fields) |field| {
+            if (field.len == 0) return null;
+            const literal = try a.alloc([]const u8, 1);
+            literal[0] = field;
+            try paths.append(a, literal);
+            if (std.mem.indexOfScalar(u8, field, '.') != null) {
+                var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+                var remaining = field;
+                while (remaining.len != 0) {
+                    if (std.mem.indexOfScalar(u8, remaining, '.')) |dot| {
+                        try parts.append(a, remaining[0..dot]);
+                        remaining = remaining[dot + 1 ..];
+                    } else {
+                        try parts.append(a, remaining);
+                        break;
+                    }
+                }
+                if (parts.items.len == 0 or parts.items.len > 128) return null;
+                try paths.append(a, parts.items);
+            }
+        }
+        return paths.items;
+    }
+
     /// Attach `_highlights` to hits that carry stored source when the request
     /// asked for them. This runs on the node that owns the stored documents;
     /// a distributed coordinator only relays what its shards computed.
@@ -41707,23 +41875,57 @@ pub const DB = struct {
         const needs_full_documents = !req.include_stored or (!req.include_all_fields and !req.defer_stored_projection);
         var sources: ?[]?[]u8 = null;
         defer if (sources) |items| freeOptionalOwnedBytes(alloc, items);
-        if (needs_full_documents) {
-            const keys = try alloc.alloc([]const u8, result.hits.len);
-            defer alloc.free(keys);
-            for (result.hits, keys) |hit, *key| key.* = hit.id;
-            const loaded = try loadStoredSearchDocumentsMany(self, alloc, keys, null);
+        const has_indexed_sources = for (result.hits) |hit| {
+            if (hit.indexed_source != null) break true;
+        } else false;
+        var dependency_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer dependency_scratch.deinit();
+        const closed_highlight_paths = if (has_indexed_sources) try indexedHighlightPaths(dependency_scratch.allocator(), options.fields) else null;
+        const full_delivery = req.include_stored and (req.defer_stored_projection or (req.fields.len == 0 and req.include_all_fields));
+        if (needs_full_documents or has_indexed_sources) {
+            const loaded = try alloc.alloc(?[]u8, result.hits.len);
+            @memset(loaded, null);
             sources = loaded;
-            // Graph hydration can surface hits that live in another table;
-            // their ids must not be resolved against this table's store.
-            for (result.hits, loaded) |hit, *source| {
-                if (hit.source_table == null) continue;
-                if (source.*) |owned| alloc.free(owned);
-                source.* = null;
+            var cursor: usize = 0;
+            while (cursor < result.hits.len) {
+                var keys: [64][]const u8 = undefined;
+                var positions: [64]usize = undefined;
+                var count: usize = 0;
+                while (cursor < result.hits.len and count < keys.len) : (cursor += 1) {
+                    const hit = &result.hits[cursor];
+                    try db_query_search.checkSearchRequestDeadline(req);
+                    if (hit.indexed_source) |source| {
+                        // Closed highlight dependencies avoid unrelated large
+                        // payloads. Complete delivery keeps its one full read.
+                        if (hit.stored_data == null) {
+                            if (!full_delivery and closed_highlight_paths != null) {
+                                loaded[cursor] = (try source.lookupLogicalPaths(alloc, closed_highlight_paths.?)).json;
+                            } else {
+                                const full = (try source.lookup(alloc, .{ .output_exact = true })).json;
+                                if (req.include_stored) hit.stored_data = full else loaded[cursor] = full;
+                            }
+                        }
+                    } else if (needs_full_documents and hit.source_table == null) {
+                        keys[count] = hit.id;
+                        positions[count] = cursor;
+                        count += 1;
+                    }
+                }
+                if (count != 0) {
+                    const legacy = try loadStoredSearchDocumentsMany(self, alloc, keys[0..count], null);
+                    defer alloc.free(legacy);
+                    for (legacy, positions[0..count]) |value, position| loaded[position] = value;
+                }
             }
         }
 
         var indexed_queries = std.ArrayListUnmanaged(db_query_search.HighlightQuery).empty;
         defer indexed_queries.deinit(alloc);
+        var selected_pins: std.ArrayListUnmanaged(db_query_search.PinnedTextSource) = .empty;
+        defer {
+            for (selected_pins.items) |*pin| pin.deinit();
+            selected_pins.deinit(alloc);
+        }
         var locked_entries = std.ArrayListUnmanaged(*index_manager_mod.IndexManager.TextIndex).empty;
         defer {
             for (locked_entries.items) |entry| entry.unlockAnalysisShared();
@@ -41732,6 +41934,22 @@ pub const DB = struct {
         if (req.full_text_queries.len > 0) {
             // Composed search executes named queries on their own indexes.
             for (req.full_text_queries) |named| {
+                if (req.source_query_context) |context| {
+                    const cached = for (selected_pins.items) |pin| {
+                        if (std.mem.eql(u8, pin.name, named.index_name)) break pin;
+                    } else null;
+                    if (cached) |pin| {
+                        try indexed_queries.append(alloc, .{ .query = named.query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema });
+                        continue;
+                    }
+                    var pin = (try context.acquire(context.ptr, named.index_name)) orelse return error.IndexNotFound;
+                    selected_pins.append(alloc, pin) catch |err| {
+                        pin.deinit();
+                        return err;
+                    };
+                    try indexed_queries.append(alloc, .{ .query = named.query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema });
+                    continue;
+                }
                 const entry = self.core.textIndexEntry(named.index_name) orelse continue;
                 var already_locked = false;
                 for (locked_entries.items) |locked| {
@@ -41748,15 +41966,24 @@ pub const DB = struct {
                 });
             }
         } else if (req.full_text) |query| {
-            const entry = self.core.textIndexEntry(req.primary_text_index_name orelse req.index_name) orelse
-                self.core.textIndexEntry(null) orelse return;
-            try locked_entries.append(alloc, entry);
-            entry.lockAnalysisShared();
-            try indexed_queries.append(alloc, .{
-                .query = query,
-                .text_analysis = entry.text_analysis,
-                .runtime_schema = entry.runtime_schema,
-            });
+            if (req.source_query_context) |context| {
+                var pin = (try context.acquire(context.ptr, req.index_name)) orelse return error.IndexNotFound;
+                selected_pins.append(alloc, pin) catch |err| {
+                    pin.deinit();
+                    return err;
+                };
+                try indexed_queries.append(alloc, .{ .query = query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema });
+            } else {
+                const entry = self.core.textIndexEntry(req.primary_text_index_name orelse req.index_name) orelse
+                    self.core.textIndexEntry(null) orelse return;
+                try locked_entries.append(alloc, entry);
+                entry.lockAnalysisShared();
+                try indexed_queries.append(alloc, .{
+                    .query = query,
+                    .text_analysis = entry.text_analysis,
+                    .runtime_schema = entry.runtime_schema,
+                });
+            }
         }
         if (indexed_queries.items.len == 0) return;
         try db_query_search.attachHighlightsWithIndexQueries(
@@ -42515,12 +42742,14 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.SearchRequest,
     ) anyerror!?doc_set.ResolvedDocFilter {
+        if (req.source_query_context != null) return null;
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (try self.composedRequestTouchesChunkBackedMemberModeArm(alloc, req)) return null;
         return try db_query_search.resolveStructuredDocFilterForComposedAlloc(alloc, req, .{
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .open_logical_sources = openStoredLogicalSourcesCallback,
+            .open_indexed_sources = openStoredIndexedSourcesCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42537,12 +42766,14 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.SearchRequest,
     ) anyerror!?db_query_search.ResolvedTextDocNumFilter {
+        if (req.source_query_context != null) return null;
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (try self.composedRequestTouchesChunkBackedMemberModeArm(alloc, req)) return null;
         return try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, req, .{
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .open_logical_sources = openStoredLogicalSourcesCallback,
+            .open_indexed_sources = openStoredIndexedSourcesCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42886,7 +43117,7 @@ pub const DB = struct {
                 }
             }
         }
-        const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
+        const needs_algebraic_doc_filter = req.source_query_context == null and (req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution);
         var algebraic_filter = if (needs_algebraic_doc_filter)
             try self.searchRequestWithAlgebraicDocFilterAlloc(req)
         else
@@ -42938,13 +43169,14 @@ pub const DB = struct {
             if (execution_req.filter_text != null) execution_req.filter_text = null;
             if (execution_req.exclusion_text != null) execution_req.exclusion_text = null;
         }
-        const maybe_resolved_text_filter = if (suppress_text_doc_num_filter)
+        const maybe_resolved_text_filter = if (suppress_text_doc_num_filter or execution_req.source_query_context != null)
             null
         else
             try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
                 .load_stored = loadStoredSearchDocumentCallback,
                 .load_many_stored_values = loadStoredSearchDocumentManyCallback,
                 .open_logical_sources = openStoredLogicalSourcesCallback,
+                .open_indexed_sources = openStoredIndexedSourcesCallback,
                 .ctx = self,
                 .text_index_entry = textIndexEntryCallback,
                 .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42981,6 +43213,7 @@ pub const DB = struct {
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .open_logical_sources = openStoredLogicalSourcesCallback,
+            .open_indexed_sources = openStoredIndexedSourcesCallback,
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .is_expired_key = isNonvisibleStoredSearchKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -44299,10 +44532,12 @@ pub const DB = struct {
     }
 
     fn searchRequestWithDynamicStructuredDocFilterAlloc(self: *DB, req: types.SearchRequest) !?AlgebraicDocFilterRequest {
+        if (req.source_query_context != null) return null;
         var resolved = (try db_query_search.resolveStructuredDocFilterForComposedAlloc(self.alloc, req, .{
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .open_logical_sources = openStoredLogicalSourcesCallback,
+            .open_indexed_sources = openStoredIndexedSourcesCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -132292,6 +132527,157 @@ const StoredLogicalSources = struct {
         return rows;
     }
 };
+/// An internal synchronous query owner. Only decoded JSON escapes the frame;
+/// primary/index owners remain borrowed until close, never in public hits.
+const StoredIndexedSources = struct {
+    a: Allocator,
+    frame: persistent_mod.PersistentIndex.SourceReadFrame(*docstore_mod.DocStore),
+    mutex: std.atomic.Mutex = .unlocked,
+    source_pin: ?db_query_search.PinnedTextSource = null,
+    response_plans: @import("indexed_projection.zig").Cache = .{},
+    refs: std.atomic.Value(usize) = .init(1),
+    fn lock(self: *@This()) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+    }
+    fn retain(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const before = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(before != 0 and before != std.math.maxInt(usize));
+    }
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const before = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(before != 0);
+        if (before != 1) return;
+        self.response_plans.deinit();
+        self.frame.deinit();
+        if (self.source_pin) |*pin| pin.deinit();
+        const a = self.a;
+        a.destroy(self);
+    }
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        self.frame.finishCapture();
+        self.mutex.unlock();
+        release(raw);
+    }
+    fn lookupCaptured(raw: *anyopaque, alloc: Allocator, captured: *const @import("../index_source_claim.zig").CapturedSource, request: @import("indexed_source.zig").ReadRequest) !types.LookupResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        const read = try captured.immutableReader(try self.frame.immutableReadView());
+        const options = switch (request) {
+            .projection => |options| options,
+            .logical_paths => |paths| {
+                var session = try captured.openRead(alloc, read);
+                defer session.deinit();
+                const source = try session.readLogicalPaths(alloc, paths, .{});
+                return .{ .json = source.bytes };
+            },
+        };
+        if (try self.response_plans.get(self.a, options)) |plan| {
+            return try db_document_query.lookupClaimedSourceWithPlan(alloc, alloc, captured, read, plan, options.output_exact);
+        }
+        const full = try captured.read(alloc, read);
+        defer full.deinit(alloc);
+        return try db_document_query.lookupJsonWithOutput(alloc, alloc, full.bytes, options);
+    }
+    fn conditional(raw: *anyopaque, alloc: Allocator, captured: *const @import("../index_source_claim.zig").CapturedSource, id: []const u8, options: types.LookupOptions, prepared: @import("../../api/source_projection.zig").Prepared) !?@import("indexed_conditional.zig").Result {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer arena.deinit();
+        var source = try captured.openRead(arena.allocator(), try captured.immutableReader(try self.frame.immutableReadView()));
+        defer source.deinit();
+        return try @import("indexed_conditional.zig").loadWithPlan(alloc, arena.allocator(), &source, id, options, prepared, try self.response_plans.get(self.a, options));
+    }
+    fn select(raw: *anyopaque, alloc: Allocator, segment: usize, documents: []const u32) ![]types.IndexedSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (documents.len == 0 or documents.len > 64) return error.InvalidBatch;
+        self.lock();
+        defer self.mutex.unlock();
+        const rows = try alloc.alloc(types.IndexedSource, documents.len);
+        errdefer alloc.free(rows);
+        var selected: [64]bool = @splat(false);
+        errdefer for (selected[0..rows.len], 0..) |ready, i| if (ready) rows[i].deinit();
+        var references: [64]@import("../index_source_claim.zig").Reference = undefined;
+        var grouped: [64]u32 = undefined;
+        var positions: [64]usize = undefined;
+        for (documents, 0..) |document, i| {
+            if (selected[i]) continue;
+            const cohort = (try self.frame.sourceCohortAt(segment, document)) orelse return error.InvalidIndexSourceMap;
+            var count: usize = 0;
+            for (documents, 0..) |candidate, position| {
+                if (!selected[position] and candidate >= cohort.first and candidate - cohort.first < cohort.count) {
+                    grouped[count] = candidate;
+                    positions[count] = position;
+                    count += 1;
+                }
+            }
+            const root = (try self.frame.captureReferencesAt(segment, grouped[0..count], references[0..count])) orelse return error.InvalidIndexSourceMap;
+            const page = try @import("indexed_source.zig").Page.create(@import("../../sql/memory_budget.zig").reclaimingAllocator(alloc), root, .{ .ptr = self, .retain = retain, .release = release, .lookup = lookupCaptured, .conditional = conditional }, references[0..count]);
+            defer page.release();
+            for (positions[0..count], 0..) |position, entry| {
+                rows[position] = page.row(entry);
+                selected[position] = true;
+            }
+        }
+        return rows;
+    }
+    fn identity(raw: *anyopaque, segment: usize, document: u32) ![32]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        return (try self.frame.identityAt(segment, document)) orelse error.InvalidIndexSourceMap;
+    }
+    fn publicationRoot(raw: *anyopaque, segment: usize) ![32]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        return (try self.frame.publicationRootAt(segment)) orelse error.InvalidIndexSourceMap;
+    }
+    fn load(raw: *anyopaque, alloc: Allocator, segment: usize, documents: []const u32, paths: []const []const u8) ![]db_query_search.LogicalSourceRow {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (documents.len > 64 or paths.len > 64) return error.InvalidBatch;
+        self.lock();
+        defer self.mutex.unlock();
+        var plan = try db_document_query.SpanProjectionPlan.initLogicalPaths(alloc, paths);
+        defer plan.deinit();
+        const rows = try alloc.alloc(db_query_search.LogicalSourceRow, documents.len);
+        errdefer alloc.free(rows);
+        var initialized: usize = 0;
+        errdefer for (rows[0..initialized]) |row| if (row.bytes) |bytes| alloc.free(bytes);
+        const logical_paths = try alloc.alloc([]const []const u8, plan.paths.len);
+        defer alloc.free(logical_paths);
+        for (plan.paths, logical_paths) |path, *parts| parts.* = path.parts;
+        const read = try self.frame.immutableReadView();
+        for (documents, rows) |document, *row| {
+            var captured = (try self.frame.captureAt(segment, document)) orelse return error.InvalidIndexSourceMap;
+            defer captured.deinit();
+            var source = try captured.openRead(alloc, try captured.immutableReader(read));
+            defer source.deinit();
+            const loaded = try source.readLogicalPaths(alloc, logical_paths, .{});
+            row.* = .{ .bytes = loaded.bytes, .original_bytes = loaded.original_bytes, .projected = loaded.projected };
+            initialized += 1;
+        }
+        return rows;
+    }
+};
+fn openStoredIndexedSourcesCallback(ctx: ?*anyopaque, a: Allocator, index_name: ?[]const u8, snapshot: *const index_mod.IndexSnapshot, source: *db_query_search.PinnedTextSource) anyerror!?db_query_search.IndexedSourceReader {
+    const db: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const entry = db.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+    if (source.snapshot != snapshot or !std.mem.eql(u8, source.name, entry.config.name)) return error.PreparedReadSetChanged;
+    var frame = (try entry.persistent.openSourceReadFrame(a, db.core.store, @constCast(snapshot))) orelse return null;
+    errdefer frame.deinit();
+    var pinned = try source.retainForDelivery(a);
+    errdefer if (pinned) |*pin| pin.deinit();
+    const owner = try a.create(StoredIndexedSources);
+    owner.* = .{ .a = a, .frame = frame, .source_pin = pinned };
+    return .{ .ctx = owner, .identity = StoredIndexedSources.identity, .publication_root = StoredIndexedSources.publicationRoot, .select = StoredIndexedSources.select, .load = StoredIndexedSources.load, .close = StoredIndexedSources.close };
+}
+
 fn openStoredLogicalSourcesCallback(ctx: ?*anyopaque, a: Allocator) anyerror!?db_query_search.LogicalSourceReader {
     const db: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     if (getenv("ANTFLY_BENCH_VALUE_SOURCE_FULL_READ")) |v| if (std.mem.eql(u8, v, "1")) return null;
@@ -142514,7 +142900,202 @@ test "logical source certificates skip revision reads across unrelated writes an
     try std.testing.expectEqual(@as(usize, 1), db.core.store.source_certificates.entries.count());
 }
 
-test "analyzed contributions preserve exact postings across analyzers and reclamation" {
+fn documentPayloadMemoryCheckpoint(phase: []const u8, db: *DB) void {
+    if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_MEMORY") == null) return;
+    const memory = process_memory_mod.pressureSnapshot();
+    const backend = db.core.primary_store_owner.lsmBackend().?;
+    const maintenance = backend.snapshotMaintenanceStats();
+    const cache = backend.snapshotCacheStats();
+    const resources = if (db.owned_resource_manager) |manager| manager.snapshot() else null;
+    const manifest_cache = if (db.core.store.document_manifest_cache.load(.acquire)) |value| value.retainedBytes() else 0;
+    std.debug.print("DOCUMENT_MEMORY phase={s} available={d} linux_pages={d} rss={d} peak_rss={d} footprint={d} anonymous={d} private_dirty={d} nonanonymous={d} cache={d} cache_peak={d} mutable={d} immutable={d} snapshot_clone_total={d} snapshot_clone_peak={d} managed={d} managed_peak={d} manifest_cache={d}\n", .{
+        phase,                                                                                @intFromBool(memory.available),             @intFromBool(builtin.os.tag == .linux and memory.available), memory.resident_bytes,     memory.peak_resident_bytes,  memory.footprint_bytes,                         memory.anonymous_bytes,                        memory.private_dirty_bytes,
+        if (builtin.os.tag == .linux) memory.resident_bytes -| memory.anonymous_bytes else 0, if (cache) |value| value.used_bytes else 0, if (cache) |value| value.peak_used_bytes else 0,             maintenance.mutable_bytes, maintenance.immutable_bytes, maintenance.mutable_snapshot_clone_bytes_total, maintenance.mutable_snapshot_clone_peak_bytes, if (resources) |value| value.memory.used_bytes else 0,
+        if (resources) |value| value.memory.peak_bytes else 0,                                manifest_cache,
+    });
+}
+
+test "document payload public transforms preserve indexed queries and stage prepared publications" {
+    const benchmark = std.c.getenv("ANTFLY_BENCH_DOCUMENT_PUBLIC") != null;
+    const allocation_mode: []const u8 = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_ALLOCATOR")) |raw| std.mem.span(raw) else "production") else "checked";
+    if (!std.mem.eql(u8, allocation_mode, "production") and !std.mem.eql(u8, allocation_mode, "checked")) return error.InvalidArgument;
+    const a = if (std.mem.eql(u8, allocation_mode, "checked")) std.testing.allocator else @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator);
+    const preflight = !benchmark or std.c.getenv("ANTFLY_BENCH_DOCUMENT_PREFLIGHT") != null;
+    const layout: []const u8 = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_LAYOUT")) |raw| std.mem.span(raw) else "adaptive") else "adaptive";
+    if (!std.mem.eql(u8, layout, "production") and !std.mem.eql(u8, layout, "inline") and !std.mem.eql(u8, layout, "adaptive") and !std.mem.eql(u8, layout, "fields")) return error.InvalidArgument;
+    const length: usize = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_BYTES")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 128 * 1024) else 128 * 1024;
+    if (length < 4096 or length > 1024 * 1024) return error.InvalidArgument;
+    const eligible = !std.mem.eql(u8, layout, "inline") and length >= @import("../document_payload.zig").minimum_value_bytes;
+    var directory = try TestDirectory.init("document-patch-public");
+    defer directory.cleanup();
+    const path = directory.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    db.core.store.document_payload_prototype = !std.mem.eql(u8, layout, "production");
+    db.core.store.document_payload_inline = std.mem.eql(u8, layout, "inline");
+    const physical_schema = @import("../schema.zig");
+    const encoded = if (std.mem.eql(u8, layout, "fields")) try physical_schema.serializeSchemaWithMinimumFormat(a, .{}, 29) else try physical_schema.serializeSchema(a, .{});
+    defer a.free(encoded);
+    try db.core.store.put(physical_schema.schema_key, encoded);
+    const body = try a.alloc(u8, length);
+    defer a.free(body);
+    if (benchmark and std.c.getenv("ANTFLY_BENCH_DOCUMENT_ENTROPY") != null) {
+        var random = std.Random.DefaultPrng.init(0x41464c59);
+        random.random().bytes(body);
+        for (body) |*byte| byte.* = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[byte.* & 63];
+    } else @memset(body, 'x');
+    // Exercise postings rather than a single oversized token discarded by
+    // ordinary analyzers. Both corpora retain the same byte length/seed.
+    var word_boundary: usize = 31;
+    while (word_boundary < body.len) : (word_boundary += 32) body[word_boundary] = ' ';
+    const first = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":\"one\"}}", .{body});
+    defer a.free(first);
+    const second = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":\"two\"}}", .{body});
+    defer a.free(second);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = first }}, .sync_level = .full_index });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = second }}, .sync_level = .full_index });
+    if (std.mem.eql(u8, layout, "fields")) try std.testing.expect(db.core.index_manager.text_indexes.items[0].persistent.sourceFieldsEnabled());
+    const key = try internal_keys.documentKeyAlloc(a, "doc");
+    defer a.free(key);
+    if (eligible) {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(@import("../document_payload.zig").isManifest(try read.getPhysical(key)));
+        const captured = try @import("../document_payload.zig").SourceMetadata.capture(a, &read, key);
+        defer if (captured) |metadata| metadata.deinit(a);
+        try std.testing.expect(captured != null);
+    }
+    if (benchmark) documentPayloadMemoryCheckpoint("seed", &db);
+    const transforms = [_]types.DocumentTransform{.{ .key = "doc", .operations = &.{.{ .op = .set, .path = "metadata", .value_json = "\"three\"" }} }};
+    if (eligible and preflight) {
+        var snapshot = try db.captureTransformReadSnapshot(a, types.BatchWrite, &.{}, &.{}, &transforms);
+        defer snapshot.deinit(a);
+        try std.testing.expect(snapshot.payloads.get(0) != null);
+        try std.testing.expect(snapshot.changes.contains(0));
+        try std.testing.expect(snapshot.entries[0].value == null);
+        var effective = try db.coalesceKeyValueRequest(a, types.BatchWrite, &.{}, &.{}, &transforms, &snapshot);
+        defer effective.deinit(a);
+        var prepared = try db.prepareDocumentPatches(a, effective.writes, &transforms, &snapshot);
+        defer prepared.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), prepared.items.len);
+    }
+    if (benchmark) documentPayloadMemoryCheckpoint("preflight", &db);
+    const rounds: usize = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_ROUNDS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 6) else 1;
+    if (rounds == 0 or rounds > 1024) return error.InvalidArgument;
+    const reads: usize = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_READS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 0) else 0;
+    if (reads > 64) return error.InvalidArgument;
+    const per_batch: usize = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_TRANSFORMS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 1) else 1;
+    if (per_batch == 0 or per_batch > 128) return error.InvalidArgument;
+    const repeated: []types.DocumentTransform = if (per_batch > 1) try a.alloc(types.DocumentTransform, per_batch) else &.{};
+    defer a.free(repeated);
+    const backend = db.core.primary_store_owner.lsmBackend().?;
+    const stats_before = backend.snapshotWriteStats();
+    const prepared_before = db.core.store.document_prepared_stages.load(.acquire);
+    const avoided_before = db.core.index_manager.text_indexes.items[0].field_compilations_avoided.load(.monotonic);
+    const started = platform_time.monotonicNs();
+    for (0..rounds) |round| {
+        const operand: []const u8 = if (round % 2 == 0) "\"three\"" else "\"four\"";
+        const operations = [_]types.TransformOp{.{ .op = .set, .path = "metadata", .value_json = operand }};
+        const change = types.DocumentTransform{ .key = "doc", .operations = &operations };
+        for (repeated) |*item| item.* = change;
+        try db.batch(.{ .transforms = if (per_batch > 1) repeated else &.{change}, .sync_level = .full_index });
+        for (0..reads) |_| {
+            const value = (try db.get(a, "doc")).?;
+            defer a.free(value);
+            try std.testing.expect(value.len >= length);
+        }
+    }
+    const elapsed = platform_time.monotonicNs() - started;
+    if (benchmark) documentPayloadMemoryCheckpoint("updates", &db);
+    const prepared_count = db.core.store.document_prepared_stages.load(.acquire) - prepared_before;
+    try std.testing.expectEqual(@as(u64, if (eligible) @intCast(rounds) else 0), prepared_count);
+    const avoided_count = db.core.index_manager.text_indexes.items[0].field_compilations_avoided.load(.monotonic) - avoided_before;
+    if (eligible) try std.testing.expect(avoided_count >= rounds);
+    const stats_after = backend.snapshotWriteStats();
+    try std.testing.expect(stats_after.wal_sync_records - stats_before.wal_sync_records >= rounds);
+    const sync_started = platform_time.monotonicNs();
+    try backend.sync(true);
+    const sync_ns = platform_time.monotonicNs() - sync_started;
+    const durable = backend.snapshotWriteStats();
+    const expected: []const u8 = if (rounds % 2 == 1) "three" else "four";
+    const value = (try db.get(a, "doc")).?;
+    defer a.free(value);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, value, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(expected, parsed.value.object.get("metadata").?.string);
+    try std.testing.expectEqualStrings(body, parsed.value.object.get("body").?.string);
+    var result = try db.search(a, .{ .query = .{ .match_all = {} }, .include_all_fields = true, .limit = 10 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    var indexed = try std.json.parseFromSlice(std.json.Value, a, result.hits[0].stored_data.?, .{});
+    defer indexed.deinit();
+    try std.testing.expectEqualStrings(expected, indexed.value.object.get("metadata").?.string);
+    if (!benchmark) {
+        const body_hits = try db.core.index_manager.text_indexes.items[0].persistent.snapshot().search(a, "body", &.{body[0..31]}, 10);
+        defer a.free(body_hits.hits);
+        try std.testing.expectEqual(@as(u64, 1), body_hits.total_count);
+        const read_budget = try a.alloc(u8, value.len + 64 * 1024);
+        defer a.free(read_budget);
+        var fixed = std.heap.FixedBufferAllocator.init(read_budget);
+        const bounded = (try db.get(fixed.allocator(), "doc")).?;
+        defer fixed.allocator().free(bounded);
+        try std.testing.expectEqualStrings(value, bounded);
+        // The owned materializer consumes malformed typed input on error too.
+        // Checked allocation makes a missing release fail this public test.
+        const invalid_row_key = try internal_keys.relationalRowKeyAlloc(a, "invalid-owned-row");
+        defer a.free(invalid_row_key);
+        const invalid_row = try a.dupe(u8, "invalid row");
+        try std.testing.expectError(error.InvalidRelationalRow, db.core.index_manager.materializeOwnedStoredValueWithPinnedSchemaAlloc(a, invalid_row_key, invalid_row, null));
+        // Unsorted owners and interleaved, owner-specific changes exercise the
+        // wide-batch grouping path and binary receipt lookup. A fallback would
+        // preserve JSON but fail the prepared-publication count assertion.
+        const ids = [_][]const u8{ "g8", "g0", "g\x004", "g1", "g7", "g2", "g6", "g3", "g5" };
+        var seeds: [ids.len]types.BatchWrite = undefined;
+        for (ids, &seeds) |id, *write| write.* = .{ .key = id, .value = first };
+        try db.batch(.{ .writes = &seeds, .sync_level = .full_index });
+        for (&seeds) |*write| write.value = second;
+        try db.batch(.{ .writes = &seeds, .sync_level = .full_index });
+        var changes: [128]types.DocumentTransform = undefined;
+        var operands: [128][2]types.TransformOp = undefined;
+        var expected_counts: [ids.len]i64 = @splat(0);
+        for (&changes, &operands, 0..) |*change, *ops, i| {
+            const owner = i % ids.len;
+            ops.* = .{
+                if (owner % 2 == 0)
+                    .{ .op = .set, .path = "extra", .value_json = "1" }
+                else
+                    .{ .op = .set, .path = "metadata", .value_json = "\"five\"" },
+                if (i % 2 == 0)
+                    .{ .op = .set, .path = "counter", .value_json = "2" }
+                else
+                    .{ .op = .inc, .path = "counter", .value_json = "1" },
+            };
+            expected_counts[owner] = if (i % 2 == 0) 2 else expected_counts[owner] + 1;
+            change.* = .{ .key = ids[owner], .operations = ops };
+        }
+        const grouped_before = db.core.store.document_prepared_stages.load(.acquire);
+        try db.batch(.{ .transforms = &changes, .sync_level = .full_index });
+        try std.testing.expectEqual(grouped_before + ids.len, db.core.store.document_prepared_stages.load(.acquire));
+        for (ids, 0..) |id, i| {
+            const source = (try db.get(a, id)).?;
+            defer a.free(source);
+            var doc = try std.json.parseFromSlice(std.json.Value, a, source, .{});
+            defer doc.deinit();
+            try std.testing.expectEqualStrings(if (i % 2 == 0) "two" else "five", doc.value.object.get("metadata").?.string);
+            try std.testing.expectEqual(expected_counts[i], doc.value.object.get("counter").?.integer);
+            if (i % 2 == 0) try std.testing.expectEqual(@as(i64, 1), doc.value.object.get("extra").?.integer) else try std.testing.expect(doc.value.object.get("extra") == null);
+        }
+    }
+    if (benchmark) documentPayloadMemoryCheckpoint("verification", &db);
+    if (benchmark) std.debug.print("DOCUMENT_PUBLIC layout={s} allocator={s} preflight={d} transforms={d} payload={d} changing=0 reads_per_write={d} rounds={d} elapsed_ns={d} sync_ns={d} wal_syncs={d} wal_bytes={d} table_bytes={d} patches={d} compactions={d} compaction_bytes={d} field_compilations_avoided={d}\n", .{
+        layout,                                                       allocation_mode,                                              @intFromBool(preflight),                                  per_batch,      length,                                         reads,                                                                  rounds,                                                                                                   elapsed, sync_ns,
+        stats_after.wal_sync_records - stats_before.wal_sync_records, stats_after.wal_append_bytes - stats_before.wal_append_bytes, durable.table_file_bytes - stats_before.table_file_bytes, prepared_count, durable.compactions - stats_before.compactions, durable.compaction_output_bytes - stats_before.compaction_output_bytes, db.core.index_manager.text_indexes.items[0].field_compilations_avoided.load(.monotonic) - avoided_before,
+    });
+}
+
+test "document payload admitted compiled contributions preserve exact postings across analyzers and reclamation" {
     const a = std.testing.allocator;
     const intro = @import("../../introducer.zig");
     const analysis = @import("../../search/analysis.zig");
@@ -142580,10 +143161,11 @@ test "analyzed contributions preserve exact postings across analyzers and reclam
     try std.testing.expect(!iterator.read(&decoded));
 }
 
-test "analyzed contributions workload survives reordered sparse updates and compaction" {
+test "document payload admitted contribution workload survives reordered sparse updates and compaction" {
     const benchmark = std.c.getenv("ANTFLY_BENCH_CONTRIBUTIONS") != null;
     const a = if (benchmark) @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator) else std.testing.allocator;
     const reference = benchmark and std.c.getenv("ANTFLY_BENCH_CONTRIBUTIONS_REFERENCE") != null;
+    const inline_layout = benchmark and std.c.getenv("ANTFLY_BENCH_CONTRIBUTIONS_INLINE") != null;
     const count: usize = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_ROWS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 8) else 4;
     const length: usize = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_BYTES")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 64 * 1024) else 64 * 1024;
     const rounds: usize = if (benchmark) (if (std.c.getenv("ANTFLY_BENCH_DOCUMENT_ROUNDS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 16) else 3;
@@ -142596,9 +143178,17 @@ test "analyzed contributions workload survives reordered sparse updates and comp
     defer cleanupTempDir(path);
     var db = try DB.open(a, std.mem.span(path), .{});
     defer db.close();
-    try db.setSchema(.{});
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
     db.core.index_manager.analysis_contributions_enabled = !reference;
+    const physical_schema = @import("../schema.zig");
+    db.core.store.document_payload_inline = inline_layout;
+    const encoded = if (inline_layout) try physical_schema.serializeSchema(a, .{}) else try physical_schema.serializeSchemaWithMinimumFormat(a, .{}, 29);
+    defer a.free(encoded);
+    try db.core.store.put(physical_schema.schema_key, encoded);
+    // This fixture starts from an already-admitted/reopened table. Adopt its
+    // durable reader floor, rather than setting a prototype/permission flag.
+    if (!inline_layout) try db.core.store.adoptDocumentReaderFormat(29);
+
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -142636,6 +143226,40 @@ test "analyzed contributions workload survives reordered sparse updates and comp
     // A different metadata value avoids no-op elision while keeping body
     // identity stable, which is the real physical-admission trigger.
     try db.batch(.{ .writes = seeds, .sync_level = .full_index });
+    var native_rows: usize = 0;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        for (seeds) |seed| {
+            const physical = try internal_keys.documentKeyAlloc(a, seed.key);
+            defer a.free(physical);
+            if (@import("../document_payload.zig").isManifest(try read.getPhysical(physical))) native_rows += 1;
+        }
+    }
+    if (!inline_layout and length >= @import("../document_payload.zig").minimum_value_bytes) try std.testing.expectEqual(count, native_rows);
+    if (inline_layout) try std.testing.expectEqual(@as(usize, 0), native_rows);
+    if (!benchmark) {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const key = try internal_keys.documentKeyAlloc(a, seeds[0].key);
+        defer a.free(key);
+        const owned = (try @import("../index_source_claim.zig").ObservedSource.readSortedOwned(a, &read, &.{key})).?;
+        defer {
+            for (owned) |*source| source.deinit(a);
+            a.free(owned);
+        }
+        var proof_arena = std.heap.ArenaAllocator.init(a);
+        defer proof_arena.deinit();
+        const scope = (try @import("../text_value_identity.zig").Scope.capture(proof_arena.allocator(), &owned[0], owned[0].produced)).?;
+        const text = scope.root().object.get("body").?.string;
+        const identity = scope.bind("body", text).?;
+        try std.testing.expect(identity.digest(text) != null);
+        const copy = try a.dupe(u8, text);
+        defer a.free(copy);
+        try std.testing.expect(identity.digest(copy) == null);
+        try std.testing.expect(scope.bind("metadata", text) == null);
+        try std.testing.expectError(error.PreparedReadSetChanged, @import("../text_value_identity.zig").Scope.capture(proof_arena.allocator(), &owned[0], copy));
+    }
     const first_compact_started = platform_time.monotonicNs();
     try db.core.index_manager.forceCompactAllTextIndexes();
     const initial_compaction_ns = platform_time.monotonicNs() - first_compact_started;
@@ -142679,19 +143303,6 @@ test "analyzed contributions workload survives reordered sparse updates and comp
     try backend.sync(true);
     const sync_ns = platform_time.monotonicNs() - sync_started;
     try std.testing.expect(stats_after.wal_sync_records - stats_before.wal_sync_records >= rounds);
-    {
-        var read = try db.core.store.beginReadTxn();
-        defer read.abort();
-        const schema_storage = @import("../schema.zig");
-        const encoded = try read.get(schema_storage.schema_key);
-        try std.testing.expectEqual(@as(u32, 25), std.mem.readInt(u32, encoded[4..8], .little));
-        for (seeds) |seed| {
-            const physical = try internal_keys.documentKeyAlloc(a, seed.key);
-            defer a.free(physical);
-            const raw = try read.get(physical);
-            try std.testing.expect(raw.len != 0 and raw[0] == '{');
-        }
-    }
     // Stored afterimages and query visibility survive both repartitioning and
     // reordered batches. Read every body, not just a checksum/count.
     for (seeds, bodies, 0..) |seed, body, i| {
@@ -142728,5 +143339,369 @@ test "analyzed contributions workload survives reordered sparse updates and comp
         defer matches.deinit();
         try std.testing.expectEqual(expected_hits, matches.hits.len);
     };
-    if (benchmark) std.debug.print("DOCUMENT_CONTRIBUTIONS fast={d} code={d} entropy={d} reference={d} rows={d} payload={d} sparse={d} changing={d} rounds={d} elapsed_ns={d} sync_ns={d} initial_compaction_ns={d} compaction_ns={d} wal_syncs={d} wal_bytes={d} cache_hits={d} reused_tokens={d}\n", .{ @intFromBool(builtin.mode == .fast), @intFromBool(corpus != null), @intFromBool(entropy), @intFromBool(reference), count, length, @intFromBool(sparse), @intFromBool(changing), rounds, elapsed_ns, sync_ns, initial_compaction_ns, compaction_ns, stats_after.wal_sync_records - stats_before.wal_sync_records, stats_after.wal_append_bytes - stats_before.wal_append_bytes, if (!reference and held_cache != null) held_cache.?.hits.load(.monotonic) - hits_before else 0, if (!reference and held_cache != null) held_cache.?.tokens_reused.load(.monotonic) - tokens_before else 0 });
+    if (benchmark) std.debug.print("DOCUMENT_CONTRIBUTIONS native_rows={d} fast={d} code={d} entropy={d} inline={d} reference={d} rows={d} payload={d} sparse={d} changing={d} rounds={d} elapsed_ns={d} sync_ns={d} initial_compaction_ns={d} compaction_ns={d} wal_syncs={d} wal_bytes={d} cache_hits={d} reused_tokens={d}\n", .{ native_rows, @intFromBool(builtin.mode == .fast), @intFromBool(corpus != null), @intFromBool(entropy), @intFromBool(inline_layout), @intFromBool(reference), count, length, @intFromBool(sparse), @intFromBool(changing), rounds, elapsed_ns, sync_ns, initial_compaction_ns, compaction_ns, stats_after.wal_sync_records - stats_before.wal_sync_records, stats_after.wal_append_bytes - stats_before.wal_append_bytes, if (!reference and held_cache != null) held_cache.?.hits.load(.monotonic) - hits_before else 0, if (!reference and held_cache != null) held_cache.?.tokens_reused.load(.monotonic) - tokens_before else 0 });
+}
+
+test "document payload admitted relational roots retain their storage semantics after reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("document-admitted-relational-reopen");
+    defer directory.cleanup();
+    const options: OpenOptions = .{ .start_index_workers = false, .start_optional_runtimes = false };
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        const encoded = try schema_mod.serializeSchemaWithMinimumFormat(a, db.core.schema.?, 27);
+        defer a.free(encoded);
+        try db.core.store.put(schema_mod.schema_key, encoded);
+    }
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try std.testing.expectEqual(schema_mod.StorageMode.relational, db.core.schema.?.storage_mode);
+        try std.testing.expect(!db.core.store.document_payload_prototype);
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"body\":\"kept\"}" }} });
+    }
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try std.testing.expect(!db.core.store.document_payload_prototype);
+        const bytes = (try db.get(a, "row")).?;
+        defer a.free(bytes);
+        var row = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer row.deinit();
+        try std.testing.expectEqualStrings("kept", row.value.object.get("body").?.string);
+    }
+}
+
+test "document validation provenance binds validation to source and schema across restart" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("document-validation-provenance");
+    defer directory.cleanup();
+    const json_schema =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","required":["body","metadata"],"properties":{"body":{"type":"string","minLength":65536},"metadata":{"type":"integer","minimum":0},"dependent":{"type":"boolean"}},"dependentRequired":{"dependent":["metadata"]},"additionalProperties":false}}}}
+    ;
+    const certificate = @import("../document_validation.zig");
+    const body = try a.alloc(u8, 65536);
+    defer a.free(body);
+    @memset(body, 'x');
+    const json = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{body});
+    defer a.free(json);
+    const second_json = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":0}}", .{body});
+    defer a.free(second_json);
+    const physical = try internal_keys.documentKeyAlloc(a, "doc\x00id");
+    defer a.free(physical);
+    var root_key: [32]u8 = undefined;
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_index_workers = false });
+        defer db.close();
+        try db.setSchemaJson(a, json_schema);
+        try std.testing.expect(!db.core.store.document_payload_prototype);
+        db.core.store.document_payload_prototype = true;
+        // Full validation establishes provenance. The second write can choose
+        // immutable values; preparation itself never manufactures a proof.
+        try db.batch(.{ .writes = &.{.{ .key = "doc\x00id", .value = json }} });
+        try db.batch(.{ .writes = &.{.{ .key = "doc\x00id", .value = second_json }} });
+        try std.testing.expectError(error.InvalidBatchRequest, @import("../write.zig").validateTableBatchAgainstLocalSchema(a, &db, &.{}, &.{}, &.{.{ .key = "doc\x00id", .operations = &.{.{ .op = .set, .path = "metadata", .value_json = "-1" }} }}));
+        root_key = try db.document_validation_authority.get(a, db.core.index_manager.checkpointIo(), db.core.path, db.root_incarnation);
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        const proof = (try @import("../document_mutation_revision.zig").loadContent(&read, physical)).?;
+        const raw_manifest = try read.getPhysical(physical);
+        try std.testing.expect(@import("../document_payload.zig").isManifest(raw_manifest));
+        const physical_digest = raw_manifest[raw_manifest.len - 32 ..][0..32].*;
+        const saved = (try certificate.load(&read, physical, root_key)).?;
+        try std.testing.expect(saved.matches(proof, certificate.fingerprint(json_schema), 1, physical_digest));
+        try std.testing.expect(try certificate.load(&read, physical, @splat(0x77)) == null);
+    }
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_index_workers = false });
+        defer db.close();
+        // Reopening an admitted root needs no process-local qualification flag.
+        try std.testing.expect(db.core.store.documentLayoutEnabled());
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var scope = try read.openReadScope(a);
+            defer scope.close();
+            try std.testing.expect(try scope.usesLogicalDocumentIdentity());
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            const row = (try cursor.seekAtOrAfter(physical)).?;
+            try std.testing.expectEqualStrings(physical, row.key);
+            try std.testing.expect(row.value.len > 0 and row.value[0] == '{');
+            try std.testing.expect(!@import("../document_payload.zig").isManifest(row.value));
+        }
+        const key = try db.document_validation_authority.get(a, db.core.index_manager.checkpointIo(), db.core.path, db.root_incarnation);
+        try std.testing.expectEqualSlices(u8, &root_key, &key);
+        const change = [_]types.DocumentTransform{.{ .key = "doc\x00id", .operations = &.{.{ .op = .set, .path = "metadata", .value_json = "2" }} }};
+        var snapshot = try db.captureTransformReadSnapshot(a, types.BatchWrite, &.{}, &.{}, &change);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.payloads.count());
+        var effective = try db.coalesceKeyValueRequest(a, types.BatchWrite, &.{}, &.{}, &change, &snapshot);
+        defer effective.deinit(a);
+        var patches = try db.prepareDocumentPatches(a, effective.writes, &change, &snapshot);
+        defer patches.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), patches.items.len);
+        var view = db.core.acquireSchemaView().?;
+        defer view.release();
+        var prepared = try @import("document_validation_preparation.zig").prepare(a, view.validator().?, view.version(), key, db.core.store, isMetadataKey, effective.writes, &patches, &snapshot);
+        defer prepared.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), prepared.reused);
+        try std.testing.expectEqual(@as(usize, 0), prepared.full);
+        try db.batch(.{ .transforms = &change });
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .transforms = &.{.{ .key = "doc\x00id", .operations = &.{.{ .op = .set, .path = "metadata", .value_json = "-1" }} }} }));
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .transforms = &.{.{ .key = "doc\x00id", .operations = &.{.{ .op = .unset, .path = "metadata" }} }} }));
+        const value = (try db.get(a, "doc\x00id")).?;
+        defer a.free(value);
+        try std.testing.expect(std.mem.endsWith(u8, value, "\"metadata\":2}"));
+        // A malformed/imported proof is only a cache miss, never authority.
+        try db.core.store.put(&certificate.keyForPhysical(physical).?, "forged");
+        var missed = try @import("document_validation_preparation.zig").prepare(a, view.validator().?, view.version(), key, db.core.store, isMetadataKey, effective.writes, &patches, &snapshot);
+        defer missed.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), missed.reused);
+        try std.testing.expectEqual(@as(usize, 1), missed.full);
+        // Restoring a valid old certificate cannot credit a new schema. The
+        // unchanged body must now be checked under its stricter length rule.
+        const stricter =
+            \\{"version":2,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string","minLength":65537},"metadata":{"type":"integer"}}}}}}
+        ;
+        try db.setSchemaJson(a, stricter);
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .transforms = &change }));
+        try db.batch(.{ .deletes = &.{"doc\x00id"} });
+        var deleted = try db.core.store.beginProbeTxn();
+        defer deleted.abort();
+        try std.testing.expect(try certificate.load(&deleted, physical, key) == null);
+        try std.testing.expectError(error.NotFound, deleted.getPhysical(&certificate.keyForPhysical(physical).?));
+    }
+    {
+        // DDL and restart must retain the promoted physical reader fence,
+        // independently of the new logical schema version.
+        var db = try DB.open(a, directory.path(), .{ .start_index_workers = false });
+        defer db.close();
+        try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
+        try std.testing.expectEqual(@as(u32, 29), db.core.table_catalog.schema_format_version);
+        const encoded = (try db.core.getStoreValue(a, @import("../schema.zig").schema_key)).?;
+        defer a.free(encoded);
+        try std.testing.expectEqual(@as(u32, 29), std.mem.readInt(u32, encoded[4..8], .little));
+    }
+}
+
+test "document validation provenance rejects changed sources with identical timestamps" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("document-root-read-fence");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    db.core.store.document_payload_prototype = true;
+    const schema = @import("../schema.zig");
+    const encoded = try schema.serializeSchema(a, .{});
+    defer a.free(encoded);
+    try db.core.store.put(schema.schema_key, encoded);
+    const body = try a.alloc(u8, 65536);
+    defer a.free(body);
+    @memset(body, 'x');
+    const first = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{body});
+    defer a.free(first);
+    const second = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":2}}", .{body});
+    defer a.free(second);
+    const competing = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":3}}", .{body});
+    defer a.free(competing);
+    try db.batch(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "doc", .value = first }} });
+    try db.batch(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "doc", .value = second }} });
+    const changes = [_]types.DocumentTransform{.{ .key = "doc", .operations = &.{.{ .op = .set, .path = "metadata", .value_json = "4" }} }};
+    var snapshot = try db.captureTransformReadSnapshot(a, types.BatchWrite, &.{}, &.{}, &changes);
+    defer snapshot.deinit(a);
+    var effective = try db.coalesceKeyValueRequest(a, types.BatchWrite, &.{}, &.{}, &changes, &snapshot);
+    defer effective.deinit(a);
+    var patches = try db.prepareDocumentPatches(a, effective.writes, &changes, &snapshot);
+    defer patches.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), patches.items.len);
+    // Disposable root-cache damage or absence does not imply a changed source.
+    const source = snapshot.payloads.get(0).?;
+    const cache_key = @import("../document_mutation_revision.zig").contentKey(source.revision_key.?);
+    const cached = try db.core.store.get(a, &cache_key);
+    defer a.free(cached);
+    const damaged = try a.dupe(u8, cached);
+    defer a.free(damaged);
+    damaged[20] ^= 1;
+    try db.core.store.put(&cache_key, damaged);
+    try db.validateTransformReadSnapshot(snapshot);
+    try db.core.store.delete(&cache_key);
+    try db.validateTransformReadSnapshot(snapshot);
+    try db.core.store.put(&cache_key, cached);
+    try db.batch(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "doc", .value = competing }} });
+    try std.testing.expectEqual(@as(u64, 100), try db.core.readTimestamp(a, "doc"));
+    try std.testing.expectError(error.PreparedReadSetChanged, db.validateTransformReadSnapshot(snapshot));
+    const key = try internal_keys.documentKeyAlloc(a, "doc");
+    defer a.free(key);
+    var read = try db.core.store.beginProbeTxn();
+    defer read.abort();
+    try std.testing.expectError(error.PreparedReadSetChanged, patches.forKey("doc").?.qualifies(&read, key, effective.writes[0].value));
+    const stored = (try db.get(a, "doc")).?;
+    defer a.free(stored);
+    try std.testing.expectEqualStrings(competing, stored);
+    // Returning to identical JSON with the same timestamp still changes the
+    // source revision; an ABA must not revive a previously prepared read set.
+    try db.batch(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "doc", .value = second }} });
+    try std.testing.expectError(error.PreparedReadSetChanged, db.validateTransformReadSnapshot(snapshot));
+}
+
+test "persistent source publication stale finalization page cannot delete a recreated staging namespace" {
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/stale-source-finalization", .{temporary.sub_path});
+    defer a.free(path);
+    var db = try DB.open(a, path, .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    try db.addIndex(config);
+    // Capture the completed page, then let a different driver finish it and
+    // delete its primary tombstone before the captured finalizer takes a lease.
+    try std.testing.expect(try db.core.index_manager.remove(db.core.store, config.name));
+    const stale_key = blk: {
+        var turns: usize = 0;
+        while (true) : (turns += 1) {
+            if (turns == 16) return error.CleanupDidNotReachFinalization;
+            var page = try db.core.index_manager.drainGeneratedArtifactCleanupForIndexPage(db.core.store, config.name);
+            defer page.deinit();
+            try std.testing.expect(page.found);
+            if (page.completed) break :blk try a.dupe(u8, page.key);
+        }
+    };
+    defer a.free(stale_key);
+    try std.testing.expectEqual(DB.GeneratedArtifactCleanupAdvanceResult.progressed, try db.advanceGeneratedArtifactCleanupPage(config.name));
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, stale_key));
+    const candidate = try std.fmt.allocPrint(a, "{s}/indexes/text", .{path});
+    defer a.free(candidate);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, candidate);
+    const sentinel = try std.fmt.allocPrint(a, "{s}/candidate-owned", .{candidate});
+    defer a.free(sentinel);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sentinel, .data = "new incarnation" });
+    try std.testing.expect(db.async_context.index_artifact_cleanup_mutex.tryLock());
+    var locked = true;
+    defer if (locked) db.async_context.index_artifact_cleanup_mutex.unlock();
+    try std.testing.expectEqual(DB.GeneratedArtifactCleanupAdvanceResult.progressed, try DB.finalizeClaimedRetiredIndexCleanup(db.async_context, &locked, config.name, stale_key));
+    try std.Io.Dir.cwd().access(std.testing.io, sentinel, .{});
+}
+
+test "document payload automatic migration follows committed reader authority and survives reopen" {
+    const a = std.testing.allocator;
+    const payload = @import("../document_payload.zig");
+    const physical_schema = @import("../schema.zig");
+    var directory = try TestDirectory.init("document-automatic-cohort");
+    defer directory.cleanup();
+    const body = try a.alloc(u8, 65536);
+    defer a.free(body);
+    @memset(body, 'q');
+    const first = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{body});
+    defer a.free(first);
+    const second = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":2}}", .{body});
+    defer a.free(second);
+    const key = try internal_keys.documentKeyAlloc(a, "doc");
+    defer a.free(key);
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_index_workers = false });
+        defer db.close();
+        db.core.store.experimental_document_migration = true;
+        try db.setSchemaJson(a, "{}");
+        // An old envelope remains old, even when the local binary can decode
+        // the new format. Replaying it cannot manufacture cohort permission.
+        try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = first }} }, .{ .term = 1, .index = 1 }, true);
+        try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = second }} }, .{ .term = 1, .index = 2 }, true);
+        try std.testing.expect(!db.core.store.documentLayoutEnabled());
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u32, 25), try physical_schema.serializedReaderFormat(try read.getPhysical(physical_schema.schema_key)));
+            try std.testing.expect(!payload.isManifest(try read.getPhysical(key)));
+        }
+        const medium_body = try a.alloc(u8, 2 * @import("../document_projection.zig").minimum_bytes);
+        defer a.free(medium_body);
+        @memset(medium_body, 'm');
+        const medium = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\"}}", .{medium_body});
+        defer a.free(medium);
+        try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "medium", .value = medium }} }, .{ .term = 1, .index = 3 }, true);
+        // Every member decoded the v25 barrier before this ordered entry.
+        try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = first }} }, .{ .term = 2, .index = 4, .document_reader_format = 29 }, true);
+        try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = second }} }, .{ .term = 2, .index = 5, .document_reader_format = 29 }, true);
+        // The same committed mutation remains idempotent across retries.
+        try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = second }} }, .{ .term = 2, .index = 5, .document_reader_format = 29 }, true);
+        const medium_next = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":1}}", .{medium_body});
+        defer a.free(medium_next);
+        try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "medium", .value = medium_next }} }, .{ .term = 2, .index = 6, .document_reader_format = 29 }, true);
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 29), try physical_schema.serializedReaderFormat(try read.getPhysical(physical_schema.schema_key)));
+        try std.testing.expect(payload.isManifest(try read.getPhysical(key)));
+        const medium_key = try internal_keys.documentKeyAlloc(a, "medium");
+        defer a.free(medium_key);
+        const proof = (try @import("../document_mutation_revision.zig").loadContent(&read, medium_key)).?;
+        try std.testing.expect(proof.algorithm == .logical_json_v1);
+        try std.testing.expect(!payload.isManifest(try read.getPhysical(medium_key)));
+    }
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_index_workers = false });
+        defer db.close();
+        try std.testing.expect(db.core.store.documentLayoutEnabled());
+        try std.testing.expect(!db.core.store.document_payload_prototype);
+        const found = (try db.get(a, "doc")).?;
+        defer a.free(found);
+        try std.testing.expectEqualStrings(second, found);
+        // Logical DDL changes preserve the admitted physical reader floor.
+        try db.setSchemaJson(a, "{\"version\":2,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}}}");
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 29), try physical_schema.serializedReaderFormat(try read.getPhysical(physical_schema.schema_key)));
+    }
+}
+
+test "document payload automatic standalone admission keeps small rows inline" {
+    const a = std.testing.allocator;
+    const physical_schema = @import("../schema.zig");
+    var directory = try TestDirectory.init("document-automatic-small");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    db.core.store.experimental_document_migration = true;
+    try db.setSchemaJson(a, "{}");
+    try db.batch(.{ .writes = &.{.{ .key = "small", .value = "{\"body\":\"small\"}" }} });
+    try std.testing.expect(!db.core.store.documentLayoutEnabled());
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u32, 25), try physical_schema.serializedReaderFormat(try read.getPhysical(physical_schema.schema_key)));
+    const key = try internal_keys.documentKeyAlloc(a, "small");
+    defer a.free(key);
+    try std.testing.expectEqualStrings("{\"body\":\"small\"}", try read.getPhysical(key));
+}
+
+test "document payload automatic migration stays disabled for ordinary large indexed writes" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("document-experiment-default-off");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{});
+    defer db.close();
+    try db.setSchemaJson(a, "{}");
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const body = try a.alloc(u8, 65536);
+    defer a.free(body);
+    @memset(body, 'q');
+    for (0..2) |metadata| {
+        const value = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":{d}}}", .{ body, metadata });
+        defer a.free(value);
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .full_index });
+        const stored = (try db.get(a, "doc")).?;
+        defer a.free(stored);
+        try std.testing.expectEqualStrings(value, stored);
+    }
+    try std.testing.expect(!db.core.store.documentLayoutEnabled());
+    const schema_storage = @import("../schema.zig");
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u32, 25), try schema_storage.serializedReaderFormat(try read.getPhysical(schema_storage.schema_key)));
+    const entry = db.core.index_manager.textIndexEntry("text").?;
+    try std.testing.expect(!entry.persistent.sourceFamiliesEnabled());
+    try std.testing.expect(!entry.persistent.sourceFieldsEnabled());
 }

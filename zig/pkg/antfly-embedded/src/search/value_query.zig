@@ -111,6 +111,8 @@ pub const Sources = struct {
     budget: @import("../sql/memory_budget.zig") = .{ .backing = undefined, .limit = 8 * 1024 * 1024 },
     initialized: bool = false,
     context: ?*anyopaque = null,
+    context_initialized: bool = false,
+    indexed: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
     mutex: std.atomic.Mutex = .unlocked,
     fn lock(self: *Sources) void {
@@ -120,7 +122,7 @@ pub const Sources = struct {
         if (!self.enabled.load(.acquire) or !self.populated.load(.acquire)) return null;
         self.lock();
         defer self.mutex.unlock();
-        if (!self.initialized or self.context != context) return null;
+        if (!self.context_initialized or self.context != context) return null;
         return if (self.entries.get(id)) |entry| entry.value else null;
     }
     pub fn remember(self: *Sources, a: A, context: ?*anyopaque, id: []const u8, bytes: []const u8) !?std.json.Value {
@@ -129,12 +131,15 @@ pub const Sources = struct {
         defer self.mutex.unlock();
         if (!self.initialized) {
             self.budget.backing = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
-            self.context = context;
             self.initialized = true;
+        }
+        if (!self.context_initialized) {
+            self.context = context;
+            self.context_initialized = true;
         }
         if (self.context != context) return null;
         if (self.entries.get(id)) |entry| return entry.value;
-        if (self.entries.count() >= 4096 or bytes.len > (self.budget.limit - self.budget.live) / 4) return null;
+        if (self.entries.count() + self.indexed.count() >= 4096 or bytes.len > (self.budget.limit - self.budget.live) / 4) return null;
         const ca = self.budget.allocator();
         var parsed = std.json.parseFromSlice(std.json.Value, ca, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
             error.OutOfMemory => return null,
@@ -152,6 +157,37 @@ pub const Sources = struct {
         self.populated.store(true, .release);
         return parsed.value;
     }
+    /// The native source owner supplies the authenticated immutable snapshot
+    /// identity, never a public document ID or a mutable loader address. This
+    /// memo stores decoded values only; a hit grants no source-read authority.
+    pub fn getIndexed(self: *Sources, snapshot: [32]u8) ?std.json.Value {
+        if (!self.enabled.load(.acquire) or !self.populated.load(.acquire)) return null;
+        self.lock();
+        defer self.mutex.unlock();
+        return if (self.indexed.get(snapshot)) |entry| entry.value else null;
+    }
+    pub fn rememberIndexed(self: *Sources, a: A, snapshot: [32]u8, bytes: []const u8) !?std.json.Value {
+        if (!self.enabled.load(.acquire)) return null;
+        self.lock();
+        defer self.mutex.unlock();
+        if (!self.initialized) {
+            self.budget.backing = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
+            self.initialized = true;
+        }
+        if (self.indexed.get(snapshot)) |entry| return entry.value;
+        if (self.entries.count() + self.indexed.count() >= 4096 or bytes.len > (self.budget.limit - self.budget.live) / 4) return null;
+        const ca = self.budget.allocator();
+        var parsed = std.json.parseFromSlice(std.json.Value, ca, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return null,
+            else => return err,
+        };
+        self.indexed.put(ca, snapshot, parsed) catch {
+            parsed.deinit();
+            return null;
+        };
+        self.populated.store(true, .release);
+        return parsed.value;
+    }
     fn deinit(self: *Sources) void {
         if (!self.initialized) return;
         const ca = self.budget.allocator();
@@ -161,6 +197,9 @@ pub const Sources = struct {
             ca.free(entry.key_ptr.*);
         }
         self.entries.deinit(ca);
+        var indexed = self.indexed.valueIterator();
+        while (indexed.next()) |entry| entry.deinit();
+        self.indexed.deinit(ca);
         std.debug.assert(self.budget.live == 0);
     }
 };
@@ -185,6 +224,26 @@ test "logical value decoded sources are owned bounded and loader scoped" {
     defer scoped.deinit();
     _ = try scoped.remember(arena.allocator(), null, "owned", "{\"body\":\"needle\"}");
     try std.testing.expectEqual(@as(usize, 0), arena.queryCapacity());
+}
+
+test "logical value indexed source memo separates revisions and shares one allocation budget" {
+    const a = std.testing.allocator;
+    var sources: Sources = .{ .enabled = .init(true) };
+    defer sources.deinit();
+    const old: [32]u8 = @splat(1);
+    const next: [32]u8 = @splat(2);
+    const bytes = try a.dupe(u8, "{\"body\":\"indexed original\"}");
+    _ = (try sources.rememberIndexed(a, old, bytes)).?;
+    a.free(bytes);
+    _ = (try sources.rememberIndexed(a, next, "{\"body\":\"indexed newer\"}")).?;
+    try std.testing.expectEqualStrings("indexed original", sources.getIndexed(old).?.object.get("body").?.string);
+    try std.testing.expectEqualStrings("indexed newer", sources.getIndexed(next).?.object.get("body").?.string);
+    var primary: u8 = 0;
+    _ = (try sources.remember(a, &primary, "same-public-id", "{\"body\":\"current primary\"}")).?;
+    try std.testing.expectEqualStrings("current primary", sources.get(&primary, "same-public-id").?.object.get("body").?.string);
+    sources.budget.limit = sources.budget.live;
+    try std.testing.expect(try sources.rememberIndexed(a, @splat(3), "{}") == null);
+    try std.testing.expectEqualStrings("indexed original", (try sources.rememberIndexed(a, old, "{}")).?.object.get("body").?.string);
 }
 
 /// Prepared once per leaf, with span-only scratch reused across documents.

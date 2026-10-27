@@ -48,16 +48,20 @@ pub const Context = struct {
     }
 
     pub fn ensureWith(self: *Context, request: abi.ContextRequest) !void {
-        if (self.handle != null) return;
-        var handle: ?*anyopaque = null;
-        try statusToError(abi.antfly_storage_context_create(&request, &handle));
-        self.handle = handle orelse return error.StorageKernelFailure;
+        return self.ensureWithRuntime(.{ .context = request });
     }
 
     pub fn ensureWithRuntime(self: *Context, request: @import("kernel_runtime_services.zig").Request) !void {
         if (self.handle != null) return;
+        const services = @import("kernel_runtime_services.zig");
+        var canonical: services.SourceReaderBrokerPort = undefined;
+        var effective = request;
+        if (effective.source_reader_broker == null) {
+            try statusToError(services.antfly_storage_source_reader_broker(&canonical));
+            effective.source_reader_broker = &canonical;
+        }
         var handle: ?*anyopaque = null;
-        try statusToError(@import("kernel_runtime_services.zig").antfly_storage_context_create_with_runtime(&request, &handle));
+        try statusToError(services.antfly_storage_context_create_with_runtime(&effective, &handle));
         self.handle = handle orelse return error.StorageKernelFailure;
     }
 
@@ -540,6 +544,18 @@ pub const Owner = struct {
         raft_term: u64,
         raft_index: u64,
     ) !Response {
+        return self.replicatedBatchAtRaftEntryWithDocumentReadersJson(table_name, request_json, raft_term, raft_index, 0);
+    }
+
+    pub fn replicatedBatchAtRaftEntryWithDocumentReadersJson(
+        self: *Owner,
+        table_name: []const u8,
+        request_json: []const u8,
+        raft_term: u64,
+        raft_index: u64,
+        document_reader_format: u32,
+    ) !Response {
+        if (document_reader_format != 0 and document_reader_format != 29) return error.UnsupportedVersion;
         if (raft_term == 0 or raft_index == 0) return error.InvalidArgument;
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_replicated_batch_at_raft_entry_json(
@@ -549,6 +565,7 @@ pub const Owner = struct {
                 .request_json = .fromSlice(request_json),
                 .raft_term = raft_term,
                 .raft_index = raft_index,
+                .document_reader_format = document_reader_format,
             },
             &response.buffer,
         ));

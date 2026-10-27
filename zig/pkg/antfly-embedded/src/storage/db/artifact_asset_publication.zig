@@ -32,7 +32,7 @@ pub fn authorize(alloc: std.mem.Allocator, txn: anytype, request: requests.Gener
     return bound;
 }
 
-pub fn capture(alloc: std.mem.Allocator, txn: anytype, request: requests.GeneratedEnrichmentRequest, plan: *const manager.IndexManager.WritePlanSnapshot, source_key: []const u8, observed: ?[]const u8, materializer: producer_input.Materializer) !?context.Token {
+pub fn capture(alloc: std.mem.Allocator, txn: anytype, request: requests.GeneratedEnrichmentRequest, plan: *const manager.IndexManager.WritePlanSnapshot, source_key: []const u8, observed: ?[]const u8, verifier: producer_input.Verifier) !?context.Token {
     const authorized = (try authorize(alloc, txn, request, plan)) orelse return null;
     const authority = authorized.authority;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -49,9 +49,7 @@ pub fn capture(alloc: std.mem.Allocator, txn: anytype, request: requests.Generat
             error.NotFound => return error.EnrichmentSourceChanged,
             else => return err,
         };
-        const logical = try materializer.materialize(materializer.ptr, alloc, source_key, raw);
-        defer alloc.free(logical);
-        if (!std.mem.eql(u8, expected, logical)) return error.EnrichmentSourceChanged;
+        try verifier.verify(verifier.ptr, alloc, source_key, raw, expected);
     } else if (observed != null) return error.EnrichmentSourceChanged;
     const name = if (request.artifact_name.len != 0) request.artifact_name else request.index_name;
     const owned_name = try owned.dupe(u8, name);
