@@ -19,6 +19,7 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>
+#include "metal_compile_options.h"
 // Use libdispatch's exported implementation: the SDK inline fast path's
 // completion-state assumption trips Zig 0.17's C sanitizer on macOS.
 #undef dispatch_once
@@ -30291,7 +30292,7 @@ static void termite_metal_initialize_lightonocr3_mpp(termite_metal_decode_runtim
     if (@available(macOS 26.1, *)) {
         MTLCompileOptions *tensor_options = [MTLCompileOptions new];
         tensor_options.languageVersion = MTLLanguageVersion4_0;
-        tensor_options.mathMode = MTLMathModeSafe;
+        termite_metal_set_precise_math(tensor_options);
         NSError *tensor_error = nil;
         id<MTLLibrary> tensor_library = [device newLibraryWithSource:termite_metal_lightonocr3_tensor_source()
                                                              options:tensor_options
@@ -30350,7 +30351,7 @@ static void termite_metal_initialize_lightonocr3_recurrent(termite_metal_decode_
     MTLCompileOptions *options = [MTLCompileOptions new];
     options.languageVersion = MTLLanguageVersion3_1;
     if (![options respondsToSelector:@selector(setMathMode:)]) return;
-    options.mathMode = MTLMathModeSafe;
+    termite_metal_set_precise_math(options);
     NSError *error = nil;
     id<MTLLibrary> library = [runtime->device newLibraryWithSource:termite_metal_lightonocr3_recurrent_source()
                                                         options:options error:&error];
@@ -41682,7 +41683,7 @@ static void termite_metal_initialize_lighton_prefill_ffn(termite_metal_decode_ru
     if (@available(macOS 26.1, *)) {
         MTLCompileOptions *options = [MTLCompileOptions new];
         options.languageVersion = MTLLanguageVersion4_0;
-        options.mathMode = MTLMathModeSafe;
+        termite_metal_set_precise_math(options);
         NSError *error = nil;
         id<MTLLibrary> library = [r->device newLibraryWithSource:termite_metal_lighton_prefill_ffn_source()
                                                        options:options error:&error];
