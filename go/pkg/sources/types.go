@@ -32,6 +32,9 @@ const (
 	ProviderGoogleDrive        = "google_drive"
 	ProviderGCS                = "gcs"
 	ProviderS3                 = "s3"
+	ProviderSlack              = "slack"
+	ProviderDiscord            = "discord"
+	ProviderGoogleWorkspace    = "google_workspace"
 	ImportModeSource           = "source"
 	maxImportSourceObjects     = 10000
 	maxImportSourceObjectBytes = 32 << 20
@@ -50,6 +53,8 @@ type Request struct {
 	RetrySourceKeys []string
 }
 type Item struct {
+	// ContentRef is a private acquisition checkpoint, never document metadata.
+	ContentRef                                              string `json:",omitempty"`
 	ID, Path, Filename, Revision, URL, SourceKind, ReadMode string
 	Size                                                    int64
 	Metadata                                                map[string]any
@@ -61,6 +66,7 @@ type Diagnostic struct {
 	Source              *DiagnosticSource
 }
 type Inventory struct {
+	ProviderState  map[string]string `json:",omitempty"`
 	SourceRevision string
 	Authoritative  bool
 	Objects        []Item

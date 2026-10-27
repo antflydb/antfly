@@ -765,7 +765,7 @@ pub const Owner = struct {
         while (i < self.retired.items.len) {
             const retired = self.retired.items[i];
             const retained = retained: {
-                if (retired.query_borrows > 0 or retired.maintenance_references != 0) break :retained true;
+                if (retired.query_borrows > 0 or retired.maintenance_references != 0 or retired.allocator_verification_references != 0) break :retained true;
                 for (self.connections.items) |connection| {
                     // attach moves this connection's registry onto the current
                     // root. Inspect its actual owner during query resume too.
@@ -1104,10 +1104,14 @@ pub const Owner = struct {
             // pool first, without holding the connection or path-writer gate.
             // Pin the originating runtime: the reader borrows its allocator
             // and optional page-cache resource manager through completion.
-            foreground.maintenance_references += 1;
+            foreground.allocator_verification_references += 1;
             defer {
                 if (!gate_locked) self.gate.mutex.lockUncancelable(io);
-                foreground.maintenance_references -= 1;
+                foreground.allocator_verification_references -= 1;
+                // The proof reader's later defer has already released its
+                // borrowed allocator and executor. A foreground replacement
+                // must not retain this now-unpinned runtime until another call.
+                self.collectRetired();
                 if (!gate_locked) self.gate.mutex.unlock(io);
             }
             const reader = try foreground_file.captureAllocatorVerificationSnapshot(&self.verification_cancel);
