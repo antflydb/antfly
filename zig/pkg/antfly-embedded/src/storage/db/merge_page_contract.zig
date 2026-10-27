@@ -37,7 +37,7 @@ pub fn artifactKeyAllowed(source: Source, key_bytes: []const u8) bool {
     if (!binding.valid()) return false;
     return @import("online_vector_artifacts.zig").isKey(key_bytes) or
         (binding.effect_protocol >= 15 and @import("online_graph_artifacts.zig").isKey(key_bytes)) or
-        (binding.effect_protocol == 16 and @import("group_source_transfer.zig").isKey(key_bytes));
+        (binding.supportsGroupedSources() and @import("group_source_transfer.zig").isKey(key_bytes));
 }
 
 pub fn validateArtifactEffect(source: Source, key_bytes: []const u8, value: ?[]const u8) !void {

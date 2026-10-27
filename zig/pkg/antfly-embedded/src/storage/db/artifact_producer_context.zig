@@ -17,6 +17,7 @@
 //! retains no storage snapshot; ordered publication revalidates every input.
 const std = @import("std");
 const publication = @import("artifact_publication.zig");
+const scoped = @import("scoped_producer_inputs.zig");
 
 pub const Token = struct {
     arena: std.heap.ArenaAllocator,
@@ -29,6 +30,7 @@ pub const Token = struct {
     artifact_name: []const u8,
     source: publication.Source,
     inherited_sources: std.ArrayList(publication.Source) = .empty,
+    input_scopes: []const scoped.Guard = &.{},
     producer_scope_key: []const u8 = "",
     reads: std.ArrayList(publication.ArtifactSource) = .empty,
     preconditions: std.ArrayList(publication.ArtifactSource) = .empty,
@@ -53,7 +55,7 @@ pub const Token = struct {
         return error.ArtifactCatalogCorrupt;
     }
 
-    pub fn inheritSources(self: *Token, incoming: []const publication.Source) !void {
+    fn inheritWholeSources(self: *Token, incoming: []const publication.Source) !void {
         const owned = self.arena.allocator();
         const previous = self.sources();
         var cursor: usize = 0;
@@ -99,6 +101,109 @@ pub const Token = struct {
         self.read_key_bytes += added_bytes;
     }
 
+    pub fn inheritSources(self: *Token, incoming: []const publication.Source) !void {
+        return self.inheritScopedSources(incoming, &.{});
+    }
+
+    /// Form a conjunction before changing any live ordinals. Whole-source
+    /// predicates dominate scoped predicates, but never erase their terms.
+    pub fn inheritScopedSources(self: *Token, incoming: []const publication.Source, guards: []const scoped.Guard) !void {
+        if (self.input_scopes.len == 0 and guards.len == 0) return self.inheritWholeSources(incoming);
+        _ = try scoped.validate(guards, incoming.len);
+        _ = try scoped.validate(self.input_scopes, self.sources().len);
+        for (incoming, 0..) |value, index| {
+            if (index > 0 and std.mem.order(u8, incoming[index - 1].document_key, value.document_key) != .lt) return error.ArtifactCatalogCorrupt;
+        }
+        const previous = self.sources();
+        // Already-inherited proofs are common in shared upstream graphs. A
+        // repeated conjunction must neither grow the arena nor remap guards.
+        var included = true;
+        for (incoming, 0..) |value, index| {
+            const ordinal = self.sourceIndex(value.document_key) catch {
+                included = false;
+                break;
+            };
+            const actual = previous[ordinal];
+            const existing = scoped.forSource(self.input_scopes, ordinal);
+            const expected = scoped.forSource(guards, index);
+            if (actual.exists != value.exists) {
+                included = false;
+                break;
+            }
+            if (expected == null or expected.?.require_whole_source) {
+                if ((existing != null and !existing.?.require_whole_source) or actual.timestamp != value.timestamp or
+                    !std.meta.eql(actual.content_digest, value.content_digest) or !std.meta.eql(actual.input_position, value.input_position))
+                {
+                    included = false;
+                    break;
+                }
+            }
+            if (expected) |guard| {
+                if (existing) |current| {
+                    scoped.requireIncluded(guard.*, current.*) catch {
+                        included = false;
+                        break;
+                    };
+                } else {
+                    included = false;
+                    break;
+                }
+            }
+        }
+        if (included) return;
+        const owned = self.arena.allocator();
+        var merged: std.ArrayList(publication.Source) = .empty;
+        var scopes: std.ArrayList(scoped.Guard) = .empty;
+        const ordinals = try owned.alloc(u32, previous.len);
+        var old: usize = 0;
+        var next: usize = 0;
+        var added_bytes: usize = 0;
+        while (old < previous.len or next < incoming.len) {
+            const order = if (old == previous.len) .gt else if (next == incoming.len) .lt else std.mem.order(u8, previous[old].document_key, incoming[next].document_key);
+            const left = if (order != .gt) scoped.forSource(self.input_scopes, old) else null;
+            const right = if (order != .lt) scoped.forSource(guards, next) else null;
+            var source = if (order == .gt) incoming[next] else previous[old];
+            var guard: ?scoped.Guard = if (left) |value| value.* else if (right) |value| value.* else null;
+            var guard_owned = left != null;
+            if (order == .eq) {
+                const left_whole = left == null or left.?.require_whole_source;
+                const right_whole = right == null or right.?.require_whole_source;
+                if (previous[old].exists != incoming[next].exists) return error.EnrichmentSourceChanged;
+                if (left_whole and right_whole and
+                    (source.timestamp != incoming[next].timestamp or !std.meta.eql(source.content_digest, incoming[next].content_digest) or
+                        !std.meta.eql(source.input_position, incoming[next].input_position))) return error.EnrichmentSourceChanged;
+                if (right_whole and !left_whole) source = incoming[next];
+                if (left != null and right != null) {
+                    guard = try scoped.conjoinIntoArena(owned, left.?.*, right.?.*);
+                    guard_owned = true;
+                }
+                if (guard) |*value| value.require_whole_source = left_whole or right_whole;
+            }
+            if (order == .gt) {
+                added_bytes +|= source.document_key.len;
+                source.document_key = try owned.dupe(u8, source.document_key);
+            }
+            if (merged.items.len >= publication.max_source_documents or self.read_key_bytes +| added_bytes > 1024 * 1024) return error.ResourceBudgetExceeded;
+            if (guard) |value| {
+                var retained = if (guard_owned) value else (try scoped.cloneIntoArena(owned, (&value)[0..1]))[0];
+                retained.source_index = @intCast(merged.items.len);
+                try scopes.append(owned, retained);
+            }
+            if (order != .gt) {
+                ordinals[old] = @intCast(merged.items.len);
+                old += 1;
+            }
+            if (order != .lt) next += 1;
+            try merged.append(owned, source);
+        }
+        _ = try scoped.validate(scopes.items, merged.items.len);
+        for (self.reads.items) |*guard| guard.source_index = ordinals[guard.source_index];
+        for (self.preconditions.items) |*guard| guard.source_index = ordinals[guard.source_index];
+        self.inherited_sources = merged;
+        self.input_scopes = scopes.items;
+        self.read_key_bytes += added_bytes;
+    }
+
     /// Retain the causal input set of an accepted upstream result, not just
     /// its current bytes. A neighbor update must invalidate downstream work
     /// even while the stale upstream artifact awaits regeneration.
@@ -106,7 +211,7 @@ pub const Token = struct {
         try proof.validate();
         if (proof.authority_epoch != self.epoch or !std.mem.eql(u8, &proof.namespace, &self.namespace) or
             !std.mem.eql(u8, &proof.catalog_digest, &self.catalog_digest)) return error.ArtifactCatalogDrift;
-        try self.inheritSources(proof.sources);
+        try self.inheritScopedSources(proof.sources, proof.input_scopes);
         for (proof.artifact_sources) |guard| {
             if (guard.source_index >= proof.sources.len) return error.ArtifactCatalogCorrupt;
             try self.observeDigest(false, guard.key, guard.content_digest, guard.input_position, try self.sourceIndex(proof.sources[guard.source_index].document_key));
@@ -133,7 +238,7 @@ pub const Token = struct {
     /// Returning ownership avoids resolving and decoding the same proof twice.
     pub fn acceptedProof(self: *Token, alloc: std.mem.Allocator, txn: anytype) !?@import("artifact_producer_provenance.zig").Accepted {
         const selector = try self.command(&.{});
-        return @import("artifact_producer_provenance.zig").readCurrentForSource(alloc, txn, selector, self.source) catch |err| switch (err) {
+        return @import("artifact_producer_provenance.zig").readCurrentForSource(alloc, txn, selector, self.sources()[try self.sourceIndex(self.source.document_key)]) catch |err| switch (err) {
             error.EnrichmentSourceChanged => return null,
             else => return err,
         };
@@ -197,6 +302,7 @@ pub const Token = struct {
             .producer_artifact_name = self.artifact_name,
             .producer_scope_key = self.producer_scope_key,
             .sources = self.sources(),
+            .input_scopes = self.input_scopes,
             .artifact_sources = self.reads.items,
             .mutation_preconditions = self.preconditions.items,
             .mutations = effects,
@@ -215,7 +321,22 @@ pub const Token = struct {
         const current = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
         if (current.epoch != self.epoch or !std.mem.eql(u8, &current.namespace, &self.namespace) or
             !std.mem.eql(u8, &current.catalog_digest, &self.catalog_digest)) return error.ArtifactCatalogDrift;
-        try publication.validateSources(alloc, txn, self.namespace, self.sources());
+        // There are no outputs at capture time. Authority and each inherited
+        // dependency still validate against the active catalog and incarnation.
+        const command_value: publication.Command = .{
+            .namespace = self.namespace,
+            .authority_epoch = self.epoch,
+            .catalog_digest = self.catalog_digest,
+            .producer_name = self.producer_name,
+            .producer_kind = self.producer_kind,
+            .producer_generation = self.producer_generation,
+            .producer_artifact_name = self.artifact_name,
+            .sources = self.sources(),
+            .input_scopes = self.input_scopes,
+            .mutations = &.{},
+            .publication_digest = @splat(0),
+        };
+        try publication.validateCommandSources(alloc, txn, command_value, std.StaticBitSet(publication.max_source_documents).empty);
         try publication.validateArtifactSources(alloc, txn, self.namespace, self.sources(), self.reads.items);
     }
 };

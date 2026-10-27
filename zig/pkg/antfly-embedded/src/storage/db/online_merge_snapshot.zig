@@ -273,7 +273,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
             const value = try owned.alloc(u8, descriptor.value_len);
             try descriptor.read(&reader, 0, value);
             if (@import("group_source_transfer.zig").isKey(key)) {
-                if (effect_protocol != 16) return error.SourceSnapshotCorrupt;
+                if (effect_protocol < 16 or effect_protocol > 17) return error.SourceSnapshotCorrupt;
                 try @import("group_source_transfer.zig").validate(owned, key, value);
             } else if (raw_graph) try @import("online_graph_artifacts.zig").validate(key, value) else try @import("online_vector_artifacts.zig").validate(key, value);
             if (vectors.items.len != 0 and std.mem.order(u8, vectors.items[vectors.items.len - 1].key, key) != .lt) return error.SourceSnapshotCorrupt;

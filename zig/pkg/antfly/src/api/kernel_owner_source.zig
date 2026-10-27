@@ -1653,6 +1653,20 @@ pub const ProvisionedKernelOwnerSource = struct {
         raft_term: u64,
         raft_index: u64,
     ) !void {
+        return self.applyPreparedReplicatedBatchGroupLocalAtRaftEntryWithDocumentReaders(alloc, group_id, table_name, descriptor, req, raft_term, raft_index, 0);
+    }
+
+    pub fn applyPreparedReplicatedBatchGroupLocalAtRaftEntryWithDocumentReaders(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        req: db_types.BatchRequest,
+        raft_term: u64,
+        raft_index: u64,
+        document_reader_format: u32,
+    ) !void {
         // The Raft progress driver owns the committed entry and its retry
         // checkpoint. Yield admission conflicts to it immediately: waiting for
         // another owner lease here stalls unrelated groups and can deadlock a
@@ -1673,11 +1687,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
-        var response = try lease.owner().replicatedBatchAtRaftEntryJson(
+        var response = try lease.owner().replicatedBatchAtRaftEntryWithDocumentReadersJson(
             table_name,
             request_json,
             raft_term,
             raft_index,
+            document_reader_format,
         );
         defer response.deinit();
     }

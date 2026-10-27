@@ -59,6 +59,7 @@ pub const OwnedReplicatedBatch = struct {
     batch: batch_api.OwnedBatchRequest,
     storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null,
     protocol_barrier_version: ?u16 = null,
+    document_reader_format: u32 = 0,
 
     pub fn deinit(self: *OwnedReplicatedBatch, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -96,6 +97,17 @@ pub fn encodeWithStorageOwnerDescriptor(
     req: db_mod.types.BatchRequest,
     descriptor: ?descriptor_contract.Descriptor,
 ) ![]u8 {
+    return encodeWithDocumentReaders(alloc, table_name, req, descriptor, 0);
+}
+
+pub fn encodeWithDocumentReaders(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: db_mod.types.BatchRequest,
+    descriptor: ?descriptor_contract.Descriptor,
+    document_reader_format: u32,
+) ![]u8 {
+    if (document_reader_format != 0 and document_reader_format != 29) return error.UnsupportedRaftBatchProtocolVersion;
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
 
@@ -106,6 +118,7 @@ pub fn encodeWithStorageOwnerDescriptor(
     if (descriptor) |value| {
         try writer.print(",\"storage_owner\":{f}", .{std.json.fmt(value, .{})});
     }
+    if (document_reader_format != 0) try writer.print(",\"document_reader_format\":{d}", .{document_reader_format});
     try writer.writeAll(",\"batch\":");
     try writer.writeAll(batch_json);
     try writer.writeByte('}');
@@ -172,6 +185,10 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
             .protocol_barrier_version = version,
         };
     }
+    const document_reader_format: u32 = if (root.get("document_reader_format")) |value| reader: {
+        if (value != .integer or value.integer != 29) return error.UnsupportedRaftBatchProtocolVersion;
+        break :reader 29;
+    } else 0;
     const batch_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(batch_value, .{})});
     defer alloc.free(batch_json);
     var batch = try batch_api.parseInternalBatchRequest(alloc, batch_json);
@@ -194,6 +211,7 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
         .table_name = table_name,
         .batch = batch,
         .storage_owner_descriptor = storage_owner_descriptor,
+        .document_reader_format = document_reader_format,
     };
 }
 
@@ -224,6 +242,22 @@ fn consumerTests() type {
                 .merge_proof_adoption = request.merge_proof_adoption,
                 .deletes = &.{"doc"},
             }));
+        }
+
+        test "raft batch protocol document reader authority is explicit in the ordered envelope" {
+            const a = std.testing.allocator;
+            const legacy = try encode(a, "docs", .{});
+            defer a.free(legacy);
+            var old = try decode(a, legacy);
+            defer old.deinit(a);
+            try std.testing.expectEqual(@as(u32, 0), old.document_reader_format);
+            const current = try encodeWithDocumentReaders(a, "docs", .{}, null, 29);
+            defer a.free(current);
+            var decoded = try decode(a, current);
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(@as(u32, 29), decoded.document_reader_format);
+            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, decode(a, "{\"table\":\"docs\",\"batch\":{},\"document_reader_format\":30}"));
+            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encodeWithDocumentReaders(a, "docs", .{}, null, 30));
         }
 
         test "raft protocol barrier is fail closed for legacy batch parsers" {

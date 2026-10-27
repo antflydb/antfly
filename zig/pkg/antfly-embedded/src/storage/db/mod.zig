@@ -202,6 +202,7 @@ test {
     _ = @import("artifact_publication_transport.zig");
     _ = @import("artifact_publication_transport_codec.zig");
     _ = @import("root_signing_identity.zig");
+    _ = @import("../document_validation.zig");
     _ = types;
     _ = merge_state;
     _ = docstore;

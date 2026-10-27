@@ -9007,7 +9007,7 @@ fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, r
             }
             if (slot.err) |err| return err;
             const hydrated = &slot.result.?;
-            if (hydrated.identity_read_generation != generations[slot.ordinal] or hydrated.document_authority_version != 1) return error.StorageReadTemporarilyUnavailable;
+            if (hydrated.identity_read_generation != generations[slot.ordinal] or (hydrated.document_authority_version != 1 and hydrated.document_authority_version != 2)) return error.StorageReadTemporarilyUnavailable;
             if (!merge_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = merge_scratch.reset(.free_all);
             const scratch = merge_scratch.allocator();
             var by_id = std.StringHashMapUnmanaged(usize).empty;
@@ -15789,7 +15789,7 @@ fn queryRemoteWithScratch(
     errdefer parsed.deinit();
     parsed.identity_read_generation = result.identity_read_generation orelse return error.InvalidQueryRequest;
     if (req.document_authority_mode != .none) {
-        if (parsed.document_authority_version != 1) {
+        if (parsed.document_authority_version != 1 and parsed.document_authority_version != 2) {
             if (req.document_authority_mode != .candidates) return error.StorageReadTemporarilyUnavailable;
             var legacy = req;
             legacy.document_authority_mode = .none;

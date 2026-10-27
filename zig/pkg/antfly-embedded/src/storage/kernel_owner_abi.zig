@@ -1176,7 +1176,7 @@ pub const JsonOperationRequest = extern struct {
 /// non-idempotent transforms and transaction state transitions.
 pub const ReplicatedBatchAtRaftEntryRequest = extern struct {
     version: u32 = abi_version,
-    _reserved0: u32 = 0,
+    document_reader_format: u32 = 0,
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
     raft_term: u64 = 0,

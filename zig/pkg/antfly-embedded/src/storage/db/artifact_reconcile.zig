@@ -28,9 +28,9 @@ pub fn validateDesired(alloc: std.mem.Allocator, command: inventory.Command) !vo
     defer types.freeIndexConfigs(alloc, desired);
     const producers = try desiredProducers(alloc, command.catalogs);
     defer freeProducers(alloc, producers);
-    for (producers) |config| if (command.binding.effect_protocol != 16 and (command.binding.effect_protocol < 15 or !indexes.onlineBaseEmbeddingProducer(config))) return error.OnlineMergeArtifactTailsUnsupported;
+    for (producers) |config| if (!command.binding.supportsGroupedSources() and (command.binding.effect_protocol < 15 or !indexes.onlineBaseEmbeddingProducer(config))) return error.OnlineMergeArtifactTailsUnsupported;
     for (desired) |config| {
-        if (config.kind == .full_text or command.binding.effect_protocol == 16) continue;
+        if (config.kind == .full_text or command.binding.supportsGroupedSources()) continue;
         if (@import("online_vector_artifacts.zig").isEnabled() and try indexes.onlineDirectVectorConfig(alloc, config)) continue;
         if (command.binding.effect_protocol >= 15 and try indexes.onlineBaseGeneratedVectorConfig(alloc, config, producers)) continue;
         return error.OnlineMergeArtifactTailsUnsupported;

@@ -20,7 +20,7 @@ const std = @import("std");
 const inventory = @import("artifact_inventory.zig");
 const publication = @import("artifact_publication.zig");
 pub fn stage(a: std.mem.Allocator, txn: anytype, command: inventory.Command) !void {
-    if (command.binding.effect_protocol != 16) return;
+    if (!command.binding.supportsGroupedSources()) return;
     const active = try publication.authority(txn);
     if (active) |value| if (value.epoch == command.binding.epoch and std.mem.eql(u8, &value.namespace, &command.namespace) and std.mem.eql(u8, &value.catalog_digest, &command.binding.digest)) return;
     var activation = publication.Command{ .mode = .activate, .namespace = command.namespace, .authority_epoch = command.binding.epoch, .catalog_digest = command.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };

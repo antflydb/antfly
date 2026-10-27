@@ -4845,3 +4845,6 @@ and content before provider delivery. Expanded-image admission limits still
 apply; a reference is not a read grant. The default inline transport remains
 available for ordinary decision endpoints. This uses the existing document
 format.
+
+The experimental implementation is described in the
+[format proposal](../../../docs/design/immutable-document-format.md).

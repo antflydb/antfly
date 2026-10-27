@@ -23,13 +23,17 @@ const identity = @import("doc_identity.zig");
 const keys = @import("../internal_keys.zig");
 const requests = @import("enrichment/enrichment_types.zig");
 
-pub const Materializer = struct {
-    ptr: *anyopaque,
-    materialize: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror![]u8,
-};
+pub const Verifier = @import("../document_input.zig").Verifier;
 
-pub const DocumentAuthority = struct { authority: publication.Authority, generation: u64, requirement: publication.Digest };
-pub const TemplateAuthority = struct { authority: publication.Authority, requirement: *const @import("artifact_completion_plan.zig").Node };
+pub const DocumentAuthority = struct {
+    authority: publication.Authority,
+    generation: u64,
+    requirement: publication.Digest,
+    /// Planning only until versioned scoped proofs replace whole-source guards.
+    input: ?@import("producer_input_revision.zig").Dependency,
+    effect_protocol: u16,
+};
+pub const TemplateAuthority = struct { authority: publication.Authority, requirement: *const @import("artifact_completion_plan.zig").Node, effect_protocol: u16 };
 
 /// Exact immutable provider definition shared by execution and completion.
 /// Scope-specific callers must still establish that their scope set is closed.
@@ -57,7 +61,7 @@ fn bindTemplate(alloc: std.mem.Allocator, txn: anytype, request: requests.Genera
     // Preserve pending debt until an ordered protocol upgrade; this is not
     // evidence of catalog corruption and never authorizes legacy outputs.
     if (!binding.supportsProducerWitnesses()) return error.OnlineMergeArtifactTailsUnsupported;
-    return .{ .authority = authority, .requirement = requirement };
+    return .{ .authority = authority, .requirement = requirement, .effect_protocol = binding.effect_protocol };
 }
 
 /// Shared authorization for document-wide provider execution and completion.
@@ -72,7 +76,7 @@ pub fn authorizeDocument(alloc: std.mem.Allocator, txn: anytype, request: reques
     const requirement = bound.requirement;
     const generation = plan.coverageGeneration(request.index_name) orelse return error.ArtifactCatalogDrift;
     if (generation == 0 or requirement.scope != .document) return error.ArtifactCatalogDrift;
-    return .{ .authority = authority, .generation = generation, .requirement = requirement.id };
+    return .{ .authority = authority, .generation = generation, .requirement = requirement.id, .input = try plan.completion_plan.?.closedDocumentInput(requirement), .effect_protocol = bound.effect_protocol };
 }
 
 pub const Token = struct {
@@ -85,8 +89,10 @@ pub const Token = struct {
     producer_generation: u64,
     artifact_name: []u8,
     source: publication.Source,
+    scoped: ?*@import("scoped_producer_inputs.zig").Captured = null,
 
     pub fn deinit(self: *@This()) void {
+        if (self.scoped) |captured| captured.deinit(self.alloc);
         self.alloc.free(self.producer_name);
         self.alloc.free(self.artifact_name);
         self.alloc.free(@constCast(self.source.document_key));
@@ -104,6 +110,7 @@ pub const Token = struct {
             .producer_generation = self.producer_generation,
             .producer_artifact_name = self.artifact_name,
             .sources = (&self.source)[0..1],
+            .input_scopes = if (self.scoped) |captured| captured.guards else &.{},
             .mutations = mutations,
             .publication_digest = @splat(0),
         };
@@ -229,21 +236,23 @@ pub fn capture(
     plan: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot,
     source_store_key: []const u8,
     observed_logical_input: []const u8,
-    materializer: ?Materializer,
+    verifier: ?Verifier,
 ) !?Token {
     const authorized = (try authorizeDocument(alloc, txn, request, plan)) orelse return null;
     try @import("artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, txn, request.doc_key, requests.requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
     if (root == 0) return error.DurableRootIncarnationUnavailable;
     const authority = authorized.authority;
     const producer_generation = authorized.generation;
+    const scoped_input = if (authorized.effect_protocol >= 17 and authorized.input != null and keys.isPrimaryDocumentKey(source_store_key))
+        try @import("scoped_producer_inputs.zig").capture(alloc, txn, (plan.artifact_catalogs orelse return error.ArtifactCatalogDrift), authority.namespace, request)
+    else
+        null;
+    errdefer if (scoped_input) |captured| captured.deinit(alloc);
 
-    const raw = txn.get(source_store_key) catch |err| switch (err) {
+    const content_digest = @import("../document_input.zig").captureDigest(alloc, txn, source_store_key, observed_logical_input, verifier) catch |err| switch (err) {
         error.NotFound => return error.EnrichmentSourceChanged,
         else => return err,
     };
-    const logical = if (materializer) |reader| try reader.materialize(reader.ptr, alloc, source_store_key, raw) else null;
-    defer if (logical) |value| alloc.free(value);
-    if (!std.mem.eql(u8, logical orelse raw, observed_logical_input)) return error.EnrichmentSourceChanged;
     if (request.sequence != 0 and !keys.isGroupSourceRowKey(source_store_key)) {
         const ordinal = (try identity.lookupOrdinalTxn(alloc, txn, request.doc_key)) orelse return error.EnrichmentSourceChanged;
         const state = (try identity.lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
@@ -264,9 +273,8 @@ pub fn capture(
     errdefer alloc.free(artifact_name);
     const doc_key = try alloc.dupe(u8, request.doc_key);
     errdefer alloc.free(doc_key);
-    var source: publication.Source = .{ .document_key = doc_key, .content_digest = undefined, .timestamp = timestamp, .input_position = try publication.inputRevision(txn, authority.namespace, request.doc_key) };
-    std.crypto.hash.sha2.Sha256.hash(raw, &source.content_digest, .{});
-    return .{ .alloc = alloc, .root = root, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = producer_name, .producer_generation = producer_generation, .artifact_name = artifact_name, .source = source };
+    const source: publication.Source = .{ .document_key = doc_key, .content_digest = content_digest, .timestamp = timestamp, .input_position = try publication.inputRevision(txn, authority.namespace, request.doc_key) };
+    return .{ .alloc = alloc, .root = root, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = producer_name, .producer_generation = producer_generation, .artifact_name = artifact_name, .source = source, .scoped = scoped_input };
 }
 
 test "ordered artifact inventory producer template binds every inference field" {

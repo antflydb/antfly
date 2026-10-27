@@ -141,6 +141,16 @@ pub const PinnedTextSource = struct {
     /// Consume this pin into shared query ownership. Ranking and deferred
     /// delivery keep the same native document-number space and authority;
     /// only the final owner quiesces the source and releases provider metadata.
+    pub fn requiresDeliveryLease(self: PinnedTextSource) bool {
+        return self.shared_owner != null or self.read_context != null or self.provider_metadata != null or self.snapshot.read_context != null or self.snapshot.read_context_check != null or self.snapshot.text_statistics != null;
+    }
+    /// Promote only a guarded/provider source to shared ownership. Physical
+    /// local sources retain their allocation-free, short analysis lease.
+    pub fn retainForDelivery(self: *PinnedTextSource, allocator: Allocator) !?PinnedTextSource {
+        if (!self.requiresDeliveryLease()) return null;
+        self.* = try self.share(allocator);
+        return try self.clone();
+    }
     pub fn share(self: PinnedTextSource, allocator: Allocator) !PinnedTextSource {
         if (self.shared_owner != null) return self;
         const owner = try allocator.create(Shared);
@@ -201,7 +211,21 @@ pub const LogicalSourceReader = struct {
 };
 pub const LogicalSourceOpener = *const fn (?*anyopaque, Allocator) anyerror!?LogicalSourceReader;
 
+/// Native segment/document coordinates stay bound to one retained corpus.
+/// Identities are immutable snapshot fingerprints for decoded-value memoization,
+/// not access grants. Providers retain their source roots until close.
+pub const IndexedSourceReader = struct {
+    ctx: *anyopaque,
+    identity: *const fn (*anyopaque, usize, u32) anyerror![32]u8,
+    publication_root: *const fn (*anyopaque, usize) anyerror![32]u8,
+    select: ?*const fn (*anyopaque, Allocator, usize, []const u32) anyerror![]types.IndexedSource = null,
+    load: *const fn (*anyopaque, Allocator, usize, []const u32, []const []const u8) anyerror![]LogicalSourceRow,
+    close: *const fn (*anyopaque) void,
+};
+pub const IndexedSourceOpener = *const fn (?*anyopaque, Allocator, ?[]const u8, *const index_mod.IndexSnapshot, *PinnedTextSource) anyerror!?IndexedSourceReader;
+
 pub const SearchTextQueryExecutor = struct {
+    open_indexed_sources: ?IndexedSourceOpener = null,
     open_logical_sources: ?LogicalSourceOpener = null,
     load_many_stored_values: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
 
@@ -1856,6 +1880,7 @@ const NativeDocIdConstraints = struct {
 };
 
 pub const StructuredFilterResolverExecutor = struct {
+    open_indexed_sources: ?IndexedSourceOpener = null,
     open_logical_sources: ?LogicalSourceOpener = null,
     load_many_stored_values: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
 
@@ -6964,7 +6989,7 @@ fn searchHitSortStoredJsonAlloc(
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
 ) !std.json.Parsed(std.json.Value) {
     if (hit.stored_data == null) {
-        hit.stored_data = (try load_stored(load_ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
+        hit.stored_data = if (hit.indexed_source) |source| (try source.lookup(alloc, .{ .output_exact = true })).json else (try load_stored(load_ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
     }
     return try std.json.parseFromSlice(std.json.Value, alloc, hit.stored_data.?, .{});
 }
@@ -8990,7 +9015,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     const snapshot_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     const snapshot = text_entry.persistent.acquireSnapshot();
     defer snapshot.release();
-    var values = ValueExecution{ .a = alloc, .snapshot = snapshot, .req = if (logical) |l| l.request else .{}, .load_ctx = executor.ctx, .load = executor.load_stored, .load_many = executor.load_many_stored_values, .open_projected = executor.open_logical_sources };
+    var values = ValueExecution{ .source_domain = .primary, .a = alloc, .snapshot = snapshot, .req = if (logical) |l| l.request else .{}, .load_ctx = executor.ctx, .load = executor.load_stored, .load_many = executor.load_many_stored_values, .open_projected = executor.open_logical_sources, .open_indexed = executor.open_indexed_sources, .source_index_name = text_entry.config.name };
     defer values.deinit();
     const search_query = if (logical) |l| try textQueryToSearchQueryWithValues(arena_alloc, l.query, text_entry.text_analysis, text_entry.runtime_schema, &values) else unresolved_query;
 
@@ -12003,7 +12028,9 @@ pub fn searchTextQuery(
     const collect_score_profile = collect_sort_profile and textQueryIsScoreBearing(text_query);
     const collect_score_timing = bench_query_profile or collect_score_profile;
     const total_start_ns = if (bench_query_profile or collect_score_profile) platform_time.monotonicNs() else 0;
-    var text_source = (if (executor.acquire_text_source) |acquire|
+    var text_source = (if (effective_req.source_query_context) |context|
+        try context.acquire(context.ptr, effective_req.index_name)
+    else if (executor.acquire_text_source) |acquire|
         try acquire(executor.ctx, effective_req.index_name)
     else local_source: {
         const entry = (try executor.text_index_entry(executor.ctx, effective_req.index_name)) orelse break :local_source null;
@@ -12018,6 +12045,7 @@ pub fn searchTextQuery(
         else => error.IndexNotFound,
     };
     defer text_source.deinit();
+    if (effective_req.source_query_context == null and text_source.snapshot.hasSourceReferences()) return error.IndexRebuilding;
     if (effective_req.index_name == null) effective_req.index_name = text_source.name;
     const chunk_backed = try executor.text_index_is_chunk_backed(executor.ctx, alloc, effective_req.index_name);
     if (returnModeRequiresUnitGrouping(effective_req.return_mode)) {
@@ -12046,9 +12074,23 @@ pub fn searchTextQuery(
     // The trusted lake coordinator prepared this exact text query once under
     // the pinned index configuration. Borrow its analyzer and syntax identities
     // across windows; subsequent predicate/key transformations remain local.
-    var value_execution = ValueExecution{ .a = alloc, .snapshot = text_source.snapshot, .req = effective_req, .load_ctx = executor.ctx, .load = executor.load_stored, .load_many = executor.load_many_stored_values, .open_projected = executor.open_logical_sources };
+    var value_execution = ValueExecution{ .a = alloc, .snapshot = text_source.snapshot, .req = effective_req, .load_ctx = executor.ctx, .load = executor.load_stored, .load_many = executor.load_many_stored_values, .open_projected = executor.open_logical_sources, .open_indexed = executor.open_indexed_sources, .source_index_name = text_source.name, .source_pin = &text_source };
     defer value_execution.deinit();
     var base_search_query = if (effective_req.text_navigation_plan) |prepared| prepared.query else try textQueryToSearchQueryWithValues(arena_alloc, text_query, text_source.text_analysis, text_source.runtime_schema, &value_execution);
+    if (text_source.snapshot.hasSourceReferences() and (effective_req.filter_text != null or effective_req.exclusion_text != null)) {
+        const must = try arena_alloc.alloc(search_mod.SearchQuery, if (effective_req.filter_text != null) 2 else 1);
+        must[0] = base_search_query;
+        if (effective_req.filter_text) |filter| {
+            const clause = try arena_alloc.alloc(search_mod.SearchQuery, 1);
+            clause[0] = try textQueryToSearchQueryWithValues(arena_alloc, filter, text_source.text_analysis, text_source.runtime_schema, &value_execution);
+            must[1] = .{ .bool_query = .{ .must = clause, .boost = 0 } };
+        }
+        const exclusions = try arena_alloc.alloc(search_mod.SearchQuery, if (effective_req.exclusion_text != null) 1 else 0);
+        if (effective_req.exclusion_text) |exclude| exclusions[0] = try textQueryToSearchQueryWithValues(arena_alloc, exclude, text_source.text_analysis, text_source.runtime_schema, &value_execution);
+        base_search_query = .{ .bool_query = .{ .must = must, .must_not = exclusions } };
+        effective_req.filter_text = null;
+        effective_req.exclusion_text = null;
+    }
     if (executor.native_key) |native_key| base_search_query = try projectTextQueryKeys(arena_alloc, executor.ctx, native_key, base_search_query);
     // Full-text projection publishes replacement snapshots independently of
     // query execution. Pin this generation for the entire request: a borrowed
@@ -12085,6 +12127,12 @@ pub fn searchTextQuery(
         constraint_req.filter_query_json = "";
     };
     if (indexed_exclude != null) constraint_req.exclusion_query_json = "";
+    if (snapshot.hasSourceReferences()) {
+        // Source-dependent predicates remain residual unless the provider
+        // proves them against this exact native corpus above.
+        constraint_req.filter_query_json = "";
+        constraint_req.exclusion_query_json = "";
+    }
     constraint_req.resolved_doc_filter = null;
     constraint_req.full_text = null;
     if (suppress_native_resolved_doc_filter) {
@@ -12244,14 +12292,14 @@ pub fn searchTextQuery(
                 defer alloc.free(doc_nums);
                 var doc_values_plan = docValuesCollectorPlanForSelectiveFilter(field_sort_plan);
                 applySortCostModelDecision(&doc_values_plan, cost_decision);
-                return try sortAndPageTextDocValueDocNumsAlloc(
+                return try value_execution.attachIndexedResult(alloc, try sortAndPageTextDocValueDocNumsAlloc(
                     alloc,
                     effective_req,
                     snapshot,
                     doc_nums,
                     executor,
                     doc_values_plan,
-                );
+                ));
             }
 
             var sorted_plan = field_sort_plan;
@@ -12292,12 +12340,14 @@ pub fn searchTextQuery(
                 &membership,
             );
             errdefer out.deinit();
+            try value_execution.attachIndexedSources(alloc, out.hits);
             if (effective_req.include_stored) {
                 const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
                 applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
                 logBenchProjectedSourceLoadProfile(effective_req, sorted_plan, "text", source_profile);
                 try dropMissingStoredSearchHits(alloc, &out, "text");
             }
+            try value_execution.attachIndexedSources(alloc, out.hits);
             return out;
         }
     }
@@ -12320,9 +12370,11 @@ pub fn searchTextQuery(
             else => return err,
         };
         if (doc_value_filter) |filter| {
+            var selected_req = effective_req;
+            if (snapshot.hasSourceReferences()) selected_req.include_stored = false;
             var out = try sortAndPageTextDocValueFilterAlloc(
                 alloc,
-                effective_req,
+                selected_req,
                 snapshot,
                 filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }),
                 executor,
@@ -12345,6 +12397,11 @@ pub fn searchTextQuery(
                 defer scores.deinit(alloc);
                 for (scored.hits) |hit| try scores.put(alloc, hit.doc_id, hit.score);
                 for (out.hits) |*hit| hit.score = scores.get(hit.native_text_doc_id.?) orelse return error.StoredDocMissing;
+            }
+            try value_execution.attachIndexedSources(alloc, out.hits);
+            if (effective_req.include_stored and !selected_req.include_stored) {
+                _ = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
+                try dropMissingStoredSearchHits(alloc, &out, "text");
             }
             return out;
         }
@@ -12521,6 +12578,7 @@ pub fn searchTextQuery(
         }
         if (collect_score_timing) hits_ns += platform_time.monotonicNs() - hits_start_ns;
 
+        try value_execution.attachIndexedSources(alloc, hits);
         owns_hits = false;
         const postprocess_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         const exhaustive_candidate_window = candidate_limit >= full_candidate_limit and
@@ -16358,7 +16416,7 @@ fn loadMissingProjectedHitBatches(
         const end = cursor + @min(hits.len - cursor, projected_source_batch_size);
         var count: usize = 0;
         while (cursor < end) : (cursor += 1) {
-            if (hits[cursor].stored_data != null) continue;
+            if (hits[cursor].stored_data != null or hits[cursor].indexed_source != null) continue;
             keys[count] = hits[cursor].id;
             positions[count] = cursor;
             count += 1;
@@ -16421,7 +16479,7 @@ fn loadMissingProjectedHitDocuments(
     try checkSearchRequestDeadline(req);
     var missing_count: usize = 0;
     for (hits) |hit| {
-        if (hit.stored_data == null) missing_count += 1;
+        if (hit.stored_data == null and hit.indexed_source == null) missing_count += 1;
     }
     profile.requested_count = missing_count;
     if (missing_count == 0) {
@@ -16430,7 +16488,7 @@ fn loadMissingProjectedHitDocuments(
     }
 
     for (hits, 0..) |*hit, i| {
-        if (hit.stored_data != null) continue;
+        if (hit.stored_data != null or hit.indexed_source != null) continue;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         // Orphaned posting (issue #929): the index still points at this
         // key but its stored row is gone. Leave stored_data null and count
@@ -18757,6 +18815,15 @@ const ValueExecution = struct {
     producers: std.ArrayListUnmanaged(*ValueProducer) = .empty,
     local_work: value_query.Work = .{},
     load_many: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
+    open_indexed: ?IndexedSourceOpener = null,
+    source_index_name: ?[]const u8 = null,
+    source_pin: ?*PinnedTextSource = null,
+    source_domain: enum { primary, indexed } = .indexed,
+    indexed_reader: ?IndexedSourceReader = null,
+    indexed_attempted: std.atomic.Value(bool) = .init(false),
+    memo_producers: std.atomic.Value(usize) = .init(0),
+    memo_projection: [32]u8 = undefined,
+    memo_mutex: std.atomic.Mutex = .unlocked,
     open_projected: ?LogicalSourceOpener = null,
     projected_reader: ?LogicalSourceReader = null,
     projected_unavailable: bool = false,
@@ -18776,6 +18843,115 @@ const ValueExecution = struct {
     cohorts: std.ArrayListUnmanaged(Cohort) = .empty,
     active_cohort: ?usize = null,
     literals_checked: bool = false,
+    fn indexedForSegment(self: *@This(), segment: usize) !?IndexedSourceReader {
+        if (self.source_domain == .primary or !self.snapshot.segments[segment].hasSourceReferences()) return null;
+        if (!self.indexed_attempted.load(.acquire)) {
+            @import("antfly_platform").sync.lockYielding(&self.memo_mutex);
+            defer self.memo_mutex.unlock();
+            if (!self.indexed_attempted.load(.monotonic)) {
+                const open = self.open_indexed orelse return error.UnsupportedSourcePublication;
+                self.indexed_reader = (try open(self.load_ctx, @import("../../../sql/memory_budget.zig").reclaimingAllocator(self.a), self.source_index_name orelse self.req.index_name, self.snapshot, self.source_pin orelse return error.UnsupportedSourcePublication)) orelse return error.UnsupportedSourcePublication;
+                self.indexed_attempted.store(true, .release);
+            }
+        }
+        return self.indexed_reader.?;
+    }
+    /// Selected row evidence is bounded to 64 candidates at a time. Group
+    /// coordinates by physical segment/page without a corpus-sized hash map;
+    /// no source body is loaded until a consumer or final winner needs it.
+    fn attachIndexedSources(self: *@This(), alloc: Allocator, hits: []types.SearchHit) !void {
+        if (hits.len == 0 or !@constCast(self.snapshot).hasSourceReferences()) return;
+        const Coordinate = struct { segment: usize, document: u32, position: usize };
+        var cursor: usize = 0;
+        while (cursor < hits.len) {
+            var coordinates: [64]Coordinate = undefined;
+            var count: usize = 0;
+            const end = cursor + @min(hits.len - cursor, coordinates.len);
+            while (cursor < end) : (cursor += 1) {
+                if (hits[cursor].indexed_source != null) continue;
+                const global = hits[cursor].native_text_doc_id orelse return error.MissingMergeDocumentIdentity;
+                const location = self.snapshot.resolveDocId(global) orelse return error.InvalidArgument;
+                if (!self.snapshot.segments[location.seg_idx].hasSourceReferences()) continue;
+                coordinates[count] = .{ .segment = location.seg_idx, .document = location.local_id, .position = cursor };
+                count += 1;
+            }
+            std.mem.sort(Coordinate, coordinates[0..count], {}, struct {
+                fn less(_: void, left: Coordinate, right: Coordinate) bool {
+                    return left.segment < right.segment or (left.segment == right.segment and left.document < right.document);
+                }
+            }.less);
+            var first: usize = 0;
+            while (first < count) {
+                var finish = first + 1;
+                while (finish < count and coordinates[finish].segment == coordinates[first].segment) finish += 1;
+                var documents: [64]u32 = undefined;
+                for (coordinates[first..finish], documents[0 .. finish - first]) |coordinate, *document| document.* = coordinate.document;
+                const reader = (try self.indexedForSegment(coordinates[first].segment)).?;
+                const select = reader.select orelse return error.UnsupportedSourcePublication;
+                const rows = try select(reader.ctx, alloc, coordinates[first].segment, documents[0 .. finish - first]);
+                defer alloc.free(rows);
+                if (rows.len != finish - first) {
+                    for (rows) |row| row.deinit();
+                    return error.InvalidArgument;
+                }
+                for (coordinates[first..finish], rows) |coordinate, row| {
+                    hits[coordinate.position].clearSource(alloc);
+                    hits[coordinate.position].indexed_source = row;
+                }
+                first = finish;
+            }
+        }
+    }
+    fn attachIndexedResult(self: *@This(), alloc: Allocator, result: types.SearchResult) !types.SearchResult {
+        var owned = result;
+        errdefer owned.deinit();
+        try self.attachIndexedSources(alloc, owned.hits);
+        return owned;
+    }
+    fn memoProjection(self: *@This()) [32]u8 {
+        const count = self.producers.items.len + 1;
+        if (self.memo_producers.load(.acquire) == count) return self.memo_projection;
+        @import("antfly_platform").sync.lockYielding(&self.memo_mutex);
+        defer self.memo_mutex.unlock();
+        if (self.memo_producers.load(.acquire) != count) {
+            var fields: [64][]const u8 = undefined;
+            const selected = self.paths(&fields);
+            std.mem.sort([]const u8, fields[0..selected.len], {}, struct {
+                fn less(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.order(u8, left, right) == .lt;
+                }
+            }.less);
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("antfly.indexed-source.memo-paths/1\x00");
+            for (fields[0..selected.len]) |path| {
+                var length: [8]u8 = undefined;
+                std.mem.writeInt(u64, &length, path.len, .little);
+                hash.update(&length);
+                hash.update(path);
+            }
+            self.memo_projection = hash.finalResult();
+            self.memo_producers.store(count, .release);
+        }
+        return self.memo_projection;
+    }
+    fn sourceIdentity(self: *@This(), segment: usize, document: u32) !?[32]u8 {
+        if (try self.indexedForSegment(segment)) |reader| {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("antfly.indexed-source.memo/1\x00");
+            hash.update(&try reader.identity(reader.ctx, segment, document));
+            hash.update(&self.memoProjection());
+            return hash.finalResult();
+        }
+        return null;
+    }
+    fn cachedSource(self: *@This(), identity: ?[32]u8, id: []const u8) ?std.json.Value {
+        const work = self.req.value_search_work orelse &self.local_work;
+        return if (identity) |snapshot| work.sources.getIndexed(snapshot) else work.sources.get(self.load_ctx, id);
+    }
+    fn rememberSource(self: *@This(), identity: ?[32]u8, id: []const u8, bytes: []const u8) !?std.json.Value {
+        const work = self.req.value_search_work orelse &self.local_work;
+        return if (identity) |snapshot| work.sources.rememberIndexed(self.a, snapshot, bytes) else work.sources.remember(self.a, self.load_ctx, id, bytes);
+    }
     fn beginTuning(self: *@This(), projected: bool) void {
         if (self.tuning_started and !projected) return;
         self.publishTuning();
@@ -18871,6 +19047,7 @@ const ValueExecution = struct {
         };
         self.publishTuning();
         if (self.projected_reader) |reader| reader.close(reader.ctx);
+        if (self.indexed_reader) |reader| reader.close(reader.ctx);
         self.clearGroups();
         for (self.producers.items) |producer| {
             producer.matcher.deinit();
@@ -19380,6 +19557,7 @@ const ValueSourceWindow = struct {
     keys: [capacity][]const u8 = undefined,
     values: []LogicalSourceRow = &.{},
     count: usize = 0,
+    segment: usize = 0,
     enabled: bool = true,
     admitted: bool = false,
     rows: usize = 16,
@@ -19415,6 +19593,10 @@ const ValueSourceWindow = struct {
     }
     fn load(self: *@This(), owner: *ValueExecution) ![]LogicalSourceRow {
         const a = self.arena.allocator();
+        if (try owner.indexedForSegment(self.segment)) |reader| {
+            var fields: [64][]const u8 = undefined;
+            return try reader.load(reader.ctx, a, self.segment, self.ids[0..self.count], owner.paths(&fields));
+        }
         if (owner.shouldProject()) if (try owner.projectedSources(a, self.keys[0..self.count])) |rows| return rows;
         const raw = try owner.load_many.?(owner.load_ctx, a, self.keys[0..self.count]);
         const rows = try a.alloc(LogicalSourceRow, raw.len);
@@ -19423,7 +19605,7 @@ const ValueSourceWindow = struct {
     }
     fn fillOnce(self: *@This(), producer: *ValueProducer, segment: *const index_mod.SegmentEntry, initial_key: []const u8, started_ns: u64, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
         const owner = producer.owner;
-        if (owner.load_many == null) {
+        if (owner.load_many == null and (owner.source_domain == .primary or !segment.hasSourceReferences())) {
             self.enabled = false;
             return;
         }
@@ -19473,7 +19655,7 @@ const ValueSourceWindow = struct {
             const global = offset + id;
             if (!(if (deleted) |d| d.contains(id) else false) and !known.contains(id) and !producer.visited.contains(global) and !(if (coverage) |c| c.contains(global) else false)) {
                 const key = if (id == local) try self.arena.allocator().dupe(u8, initial_key) else (try segment.reader.storedIdScoped(self.arena.allocator(), id)) orelse return error.StoredDocMissing;
-                if (work.sources.get(owner.load_ctx, key) == null) {
+                if (owner.cachedSource(try owner.sourceIdentity(self.segment, id), key) == null) {
                     self.ids[self.count] = id;
                     self.keys[self.count] = key;
                     self.count += 1;
@@ -19585,7 +19767,8 @@ const ValueProducer = struct {
         const scope = owner.req.value_search_scope;
         const membership = value_query.membership;
         const now = if (scope != null) @import("../native_query_cut.zig").nowMs() else 0;
-        const cache_key = if (scope) |cut| membership.key(cut, owner.req.index_name, lease.entry.id, count, self.matcher.spec) else null;
+        const indexed_root = if (try owner.indexedForSegment(resolved.seg_idx)) |reader| try reader.publication_root(reader.ctx, resolved.seg_idx) else null;
+        const cache_key = if (scope) |cut| if (indexed_root) |root| membership.indexedKey(cut, owner.req.index_name, lease.entry.id, count, self.matcher.spec, root) else membership.key(cut, owner.req.index_name, lease.entry.id, count, self.matcher.spec) else null;
         var cached = if (cache_key) |key| membership.retained.borrow(key, now) else null;
         defer if (cached) |*pin| pin.deinit();
         if (cached != null and cached.?.facts().complete) {
@@ -19617,7 +19800,7 @@ const ValueProducer = struct {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         owner.beginTuning(false);
-        var source_window: ValueSourceWindow = .{ .rows = owner.source_tuner.desired(), .budget = .{ .backing = @import("../../../sql/memory_budget.zig").reclaimingAllocator(a), .limit = ValueSourceWindow.limit } };
+        var source_window: ValueSourceWindow = .{ .segment = resolved.seg_idx, .rows = owner.source_tuner.desired(), .budget = .{ .backing = @import("../../../sql/memory_budget.zig").reclaimingAllocator(a), .limit = ValueSourceWindow.limit } };
         source_window.arena = .init(source_window.budget.allocator());
         defer source_window.arena.deinit();
         if (indexed) |*bitmap| if (incoming) |other| bitmap.andWith(other);
@@ -19678,7 +19861,8 @@ const ValueProducer = struct {
             const id = if (buffered) |row| row.key else (try lease.entry.reader.storedIdScoped(scratch.allocator(), local)) orelse return error.StoredDocMissing;
             if (owner.req.profile and buffered == null) owner.key_lookup_ns +|= platform_time.monotonicNs() - scalar_start;
             var matched = false;
-            if (work.sources.get(owner.load_ctx, id)) |doc| {
+            const source_identity = try owner.sourceIdentity(resolved.seg_idx, local);
+            if (owner.cachedSource(source_identity, id)) |doc| {
                 matched = try owner.matchSource(self, global, doc);
             } else {
                 const already_buffered = buffered != null;
@@ -19697,6 +19881,14 @@ const ValueProducer = struct {
                         defer if (owner.req.profile) {
                             owner.provider_ns +|= platform_time.monotonicNs() - provider_start;
                         };
+                        if (try owner.indexedForSegment(resolved.seg_idx)) |reader| {
+                            var fields: [64][]const u8 = undefined;
+                            const rows = try reader.load(reader.ctx, scratch.allocator(), resolved.seg_idx, &.{local}, owner.paths(&fields));
+                            if (rows.len != 1) return error.InvalidArgument;
+                            projected_source = rows[0].projected;
+                            original_bytes = rows[0].original_bytes;
+                            break :loaded rows[0].bytes;
+                        }
                         if (owner.shouldProject()) if (try owner.projectedSources(scratch.allocator(), &.{id})) |rows| {
                             if (rows.len != 1) return error.InvalidArgument;
                             projected_source = rows[0].projected;
@@ -19723,12 +19915,12 @@ const ValueProducer = struct {
                 if (owner.req.profile and !already_buffered) _ = work.source_read_ns.fetchAdd(platform_time.monotonicNs() - scalar_start, .monotonic);
                 if (stored) |bytes| {
                     if (buffered == null) try value_query.Work.charge(&work.bytes, original_bytes, owner.req.value_search_execution.max_bytes);
-                    const shared = if (!stream_membership and !projected_source) remembered: {
+                    const shared = if (!stream_membership and (!projected_source or source_identity != null)) remembered: {
                         const start = if (owner.req.profile) platform_time.monotonicNs() else 0;
                         defer if (owner.req.profile) {
                             _ = work.source_parse_ns.fetchAdd(platform_time.monotonicNs() - start, .monotonic);
                         };
-                        break :remembered try work.sources.remember(owner.a, owner.load_ctx, id, bytes);
+                        break :remembered try owner.rememberSource(source_identity, id, bytes);
                     } else null;
                     if (shared) |doc| {
                         matched = try owner.matchSource(self, global, doc);
@@ -34225,7 +34417,7 @@ test "primary match_all stream retains ownership on consumer error (#1095)" {
     try std.testing.expectError(error.ConsumerFailure, testStreamPrimaryMatchAllCandidatesCallback(&source, std.testing.allocator, .{}, .{}, null, Consumer.fail));
 }
 
-test "external lake ranked delivery shares exact snapshot authority until its final owner closes" {
+test "logical value external lake ranked delivery shares exact snapshot authority until its final owner closes" {
     const a = std.testing.allocator;
     const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{.{ .key = "row", .value = "{\"body\":\"quasar\"}" }}, .{}, null)).?;
     defer a.free(bytes);
@@ -34247,8 +34439,8 @@ test "external lake ranked delivery shares exact snapshot authority until its fi
     var context: Context = .{};
     const snapshot = try writer.acquireSnapshotWithReadCapability(.{ .ptr = &context, .check = Context.check, .io = std.testing.io });
     var ranking: PinnedTextSource = .{ .snapshot = snapshot, .name = "body", .text_analysis = .{}, .runtime_schema = null, .owner = &context, .release_owner = Context.release };
-    ranking = try ranking.share(a);
-    var delivery = try ranking.clone();
+    try std.testing.expect(ranking.requiresDeliveryLease());
+    var delivery = (try ranking.retainForDelivery(a)).?;
     const inspect = snapshot.retain();
     defer inspect.release();
     ranking.deinit();

@@ -652,3 +652,6 @@ source-reference fixture and regenerating packaged tooling, its six failed
 cases all passed on the optimized recheck; two optional cases were skipped.
 This is split/correctness validation, not a new performance qualification or
 an independent Linux hardware result.
+
+The deferred [immutable-document-format proposal](immutable-document-format.md)
+preserves the implementation history and qualification results.

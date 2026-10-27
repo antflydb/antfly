@@ -22,6 +22,13 @@ pub fn resolveDocumentTransform(
     existing_json: ?[]const u8,
     transform: types.DocumentTransform,
 ) !?[]u8 {
+    if (existing_json) |source| if (source.len >= 16 * 1024) {
+        if (try resolveProjectedTransform(alloc, source, transform)) |value| return value;
+    };
+    return resolveDocumentTransformReference(alloc, existing_json, transform);
+}
+
+fn resolveDocumentTransformReference(alloc: Allocator, existing_json: ?[]const u8, transform: types.DocumentTransform) !?[]u8 {
     // The mutable tree and operands share one request-budgeted scratch region.
     // Parse the base directly into it instead of cloning a second full DOM.
     // Only the final encoded document escapes this scope.
@@ -42,6 +49,107 @@ pub fn resolveDocumentTransform(
     for (prepared.operations) |*op| try applyPreparedTransformOp(scratch_alloc, &root, op, is_insert);
 
     return try std.json.Stringify.valueAlloc(alloc, root, .{});
+}
+
+/// Bounded native change preparation. Unchanged root values stay as validated
+/// borrowed JSON spans; only changed roots are decoded into mutable values.
+/// The complete source is still structurally validated, including nested duplicate
+/// keys. Consumers requiring complete source receive one final serialized result.
+fn resolveProjectedTransform(alloc: Allocator, source: []const u8, transform: types.DocumentTransform) !?[]u8 {
+    return resolveProjectedTransformAllocating(alloc, source, transform) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn resolveProjectedTransformAllocating(alloc: Allocator, source: []const u8, transform: types.DocumentTransform) !?[]u8 {
+    const json = @import("antfly-json");
+    const limit = 32 * 1024;
+    if (transform.operations.len > 128) return null;
+    var operand_bytes: usize = 0;
+    for (transform.operations) |operation| if (operation.value_json) |value| {
+        operand_bytes = std.math.add(usize, operand_bytes, value.len) catch return null;
+        if (operand_bytes > limit) return null;
+    };
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prepared = try prepareDocumentTransform(a, transform);
+    defer prepared.deinit(a);
+    const Member = struct { name: []const u8, raw: []const u8, changed: bool };
+    const Collector = struct {
+        a: Allocator,
+        operations: []const PreparedTransformOp,
+        members: std.ArrayList(Member) = .empty,
+        changed_bytes: usize = 0,
+        eligible: bool = true,
+        fn changed(self: *@This(), name: []const u8) bool {
+            for (self.operations) |operation| if (std.mem.eql(u8, operation.path.parts[0], name)) return true;
+            return false;
+        }
+        fn member(ptr: *anyopaque, name: []const u8, raw: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.eligible) return;
+            if (self.members.items.len >= 512) {
+                self.eligible = false;
+                return;
+            }
+            const touched = self.changed(name);
+            if (touched) {
+                self.changed_bytes = std.math.add(usize, self.changed_bytes, raw.len) catch {
+                    self.eligible = false;
+                    return;
+                };
+                if (self.changed_bytes > limit) {
+                    self.eligible = false;
+                    return;
+                }
+            }
+            try self.members.append(self.a, .{ .name = try self.a.dupe(u8, name), .raw = raw, .changed = touched });
+        }
+    };
+    var collector: Collector = .{ .a = a, .operations = prepared.operations };
+    var scanner = std.json.Scanner.initCompleteInput(a, source);
+    defer scanner.deinit();
+    if (try scanner.peekNextTokenType() != .object_begin) return null;
+    try json.scanValue(a, &scanner, source.len, .{ .ctx = &collector, .member_fn = Collector.member });
+    if (try scanner.next() != .end_of_document) return error.UnexpectedToken;
+    if (!collector.eligible) return null;
+    var root: std.json.Value = .{ .object = .empty };
+    for (collector.members.items) |member| if (member.changed) {
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, member.raw, .{ .allocate = .alloc_always });
+        try root.object.put(a, try a.dupe(u8, member.name), parsed);
+    };
+    for (prepared.operations) |*operation| try applyPreparedTransformOp(a, &root, operation, false);
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+    try output.writer.writeByte('{');
+    var first = true;
+    for (collector.members.items) |member| if (!member.changed) {
+        if (!first) try output.writer.writeByte(',');
+        first = false;
+        try std.json.Stringify.value(member.name, .{}, &output.writer);
+        try output.writer.writeByte(':');
+        try output.writer.writeAll(member.raw);
+    };
+    var changed = root.object.iterator();
+    while (changed.next()) |member| {
+        if (!first) try output.writer.writeByte(',');
+        first = false;
+        try std.json.Stringify.value(member.key_ptr.*, .{}, &output.writer);
+        try output.writer.writeByte(':');
+        try std.json.Stringify.value(member.value_ptr.*, .{}, &output.writer);
+    }
+    try output.writer.writeByte('}');
+    return try output.toOwnedSlice();
+}
+
+/// Same normalized path language as execution, shared with prepared storage
+/// plans. Callers must not infer root dependencies using string prefixes.
+pub fn rootPath(path: []const u8) ![]const u8 {
+    const normalized = try normalizeJsonPath(path);
+    if (normalized.len == 0) return error.InvalidArgument;
+    return normalized.parts[0];
 }
 
 /// Validates the complete transform at admission and storage boundaries.
@@ -925,4 +1033,46 @@ test "invalid transform operands are rejected before missing-document no-op reso
             .operations = &overflowing_integer_increment,
         }),
     );
+}
+
+test "document payload projected transforms preserve reference semantics and reject nested duplicate keys" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 32 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const source = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\",\"metadata\":{{\"count\":1,\"tags\":[\"a\",\"b\"]}},\"removed\":true}}", .{payload});
+    defer a.free(source);
+    const operations = [_]types.TransformOp{
+        .{ .op = .inc, .path = "$.metadata.count", .value_json = "2" },
+        .{ .op = .pull, .path = "metadata.tags", .value_json = "\"a\"" },
+        .{ .op = .add_to_set, .path = "metadata.tags", .value_json = "\"c\"" },
+        .{ .op = .unset, .path = "removed" },
+        .{ .op = .set, .path = "added.name", .value_json = "\"Ada\"" },
+        .{ .op = .set_on_insert, .path = "ignored", .value_json = "1" },
+        .{ .op = .min, .path = "metadata.count", .value_json = "2" },
+        .{ .op = .max, .path = "metadata.count", .value_json = "4" },
+    };
+    const Fixture = struct {
+        fn run(alloc: Allocator, input: []const u8, ops: []const types.TransformOp) !void {
+            const transform: types.DocumentTransform = .{ .key = "doc", .operations = ops };
+            const actual = (try resolveProjectedTransform(alloc, input, transform)).?;
+            defer alloc.free(actual);
+            const expected = (try resolveDocumentTransformReference(alloc, input, transform)).?;
+            defer alloc.free(expected);
+            var left = try std.json.parseFromSlice(std.json.Value, alloc, actual, .{});
+            defer left.deinit();
+            var right = try std.json.parseFromSlice(std.json.Value, alloc, expected, .{});
+            defer right.deinit();
+            try std.testing.expect(jsonValuesEqual(left.value, right.value));
+        }
+    };
+    for (1..operations.len + 1) |count| try Fixture.run(a, source, operations[0..count]);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{ source, &operations });
+    const invalid = "{\"body\":[{\"same\":1,\"same\":2}]}";
+    try std.testing.expectError(error.DuplicateField, resolveProjectedTransform(a, invalid, .{ .key = "doc", .operations = &operations }));
+}
+
+test "document payload native change plans match complete transforms and read payload once" {
+    try @import("document_change.zig").testNativeChangePlans();
+    try @import("document_change.zig").testNativeRootValidation();
 }

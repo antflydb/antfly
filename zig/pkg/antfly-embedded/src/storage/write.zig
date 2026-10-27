@@ -1576,6 +1576,18 @@ pub fn validateTableBatchAgainstLocalSchema(
     // CPU and allocation cost without improving error timing: both paths are
     // synchronous and return InvalidBatchRequest before any durable mutation.
     if (db.usesRelationalStorage()) return;
+    // Public/runtime schema publication installs one immutable compiled
+    // validator. Reuse that generation instead of loading, parsing and
+    // compiling the same schema for every ingress batch. Legacy stores with
+    // only the public marker still take the compatibility path below.
+    var pinned = db.core.acquireSchemaView();
+    defer if (pinned) |*view| view.release();
+    if (pinned) |view| if (view.validator()) |compiled| {
+        const effective_writes = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
+        defer freeOwnedBatchWrites(alloc, effective_writes);
+        try compiled.validateWrites(alloc, effective_writes);
+        return;
+    };
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
     if (schema_json.len == 0) return;

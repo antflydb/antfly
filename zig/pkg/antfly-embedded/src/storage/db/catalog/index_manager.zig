@@ -754,8 +754,13 @@ pub const PreparedTextMapperPublication = struct {
     segment_alloc: Allocator,
     segments: [][]u8 = &.{},
     observed_field_analyzers: []mapper.ObservedFieldAnalyzer = &.{},
+    /// Borrows the collector's native read cut through apply; never persisted.
+    source_families: []persistent_mod.PersistentIndex.PreparedSourceFamily = &.{},
+    skipped_field_compilations: u64 = 0,
 
     pub fn deinit(self: *PreparedTextMapperPublication) void {
+        for (self.source_families) |*family| family.deinit();
+        self.alloc.free(self.source_families);
         for (self.segments) |segment| {
             if (segment.len > 0) self.segment_alloc.free(segment);
         }
@@ -771,7 +776,11 @@ pub const PreparedTextMapperPublication = struct {
     pub fn estimate(self: PreparedTextMapperPublication) TextPublicationEstimate {
         var byte_count: u64 = 0;
         for (self.segments) |segment| byte_count +|= @intCast(segment.len);
-        return .{ .segment_count = @intCast(self.segments.len), .byte_count = byte_count };
+        for (self.source_families) |family| {
+            if (family.physical) |physical| byte_count +|= @intCast(physical.data.len());
+            if (family.field_family) |field| byte_count +|= field.plan.resource.physical_bytes;
+        }
+        return .{ .segment_count = @intCast(self.segments.len + self.source_families.len), .byte_count = byte_count };
     }
 };
 
@@ -1291,6 +1300,8 @@ pub const DenseSplitHandoff = struct {
     }
 };
 
+const index_source_recovery = @import("../../index_source_recovery.zig");
+
 const source_payload_store_mod = @import("../../vector_payload_store.zig");
 const source_payload_mod = @import("../../artifact_payload.zig");
 
@@ -1352,6 +1363,10 @@ pub const IndexManager = struct {
     }
 
     pub const dense_native_backup_backend_id = "hbc-native-v1";
+    const CachedSourceOwnerCleanup = struct {
+        key: []u8,
+        handle: persistent_mod.PersistentIndex.SourceOwnerCleanup,
+    };
     const max_retired_lsm_owner_stats: usize = 1024;
     const retired_lsm_owner_overflow_name = "__retired_owner_overflow__";
     /// Stable-address lifetime admission shared by DB searches and background
@@ -1365,6 +1380,9 @@ pub const IndexManager = struct {
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
     relaxed_split_durability: bool,
+    source_reader_broker: persistent_mod.SourceReaderBroker,
+    /// Never cleared: false skips source planning; true is not a reader grant.
+    source_ownership_possible: std.atomic.Value(bool) = .init(false),
     text_main_backend: persistent_mod.MainBackend,
     text_lsm_storage: ?lsm_backend_mod.Storage,
     text_main_lsm_options: lsm_backend_mod.Options,
@@ -1390,6 +1408,11 @@ pub const IndexManager = struct {
     // deletion, rather than index retirement, determines their liveness.
     table_owns_embedding_artifacts: bool = false,
     source_payload_store: ?*source_payload_store_mod.Store = null,
+    source_owner_cleanups: std.ArrayListUnmanaged(CachedSourceOwnerCleanup) = .empty,
+    source_owner_cleanup_mutex: std.atomic.Mutex = .unlocked,
+    source_owner_cleanup_count: std.atomic.Value(usize) = .init(0),
+    source_ownership_cursor: usize = 0,
+    source_ownership_generation: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     native_read_scratch: *native_read_scratch_pool.Pool,
     analysis_contributions: ?*introducer_mod.AnalyzedContributionCache = null,
@@ -1773,6 +1796,7 @@ pub const IndexManager = struct {
         /// runtime schema or analyzer configuration refresh cannot invalidate
         /// producer admission estimates while the caller waits for a permit.
         projection_revision: u64 = 1,
+        field_compilations_avoided: std.atomic.Value(u64) = .init(0),
         apply_mutex: *std.atomic.Mutex,
         io: std.Io,
         merge_delta_mutex: std.Io.Mutex = .init,
@@ -1959,6 +1983,7 @@ pub const IndexManager = struct {
     pub const TextMergeTask = struct {
         index_name: []u8,
         persistent: *persistent_mod.PersistentIndex,
+        primary_store: ?*docstore_mod.DocStore = null,
         source: []TextMergeSourceSegment,
         merge_indices: []usize,
         snapshot: *index_mod.IndexSnapshot,
@@ -2013,6 +2038,8 @@ pub const IndexManager = struct {
         segments: [][]u8 = &.{},
         prepared_segments: []persistent_mod.PreparedMergeSegment = &.{},
         prepared_owner: ?*persistent_mod.PersistentIndex = null,
+        source_preparations: []index_source_recovery.Prepared = &.{},
+        field_preparations: []persistent_mod.PersistentIndex.PreparedFieldSourceFamily = &.{},
         output_ordinals: []OrdinalSlot = &.{},
         output_ids: []IdSlot = &.{},
         publication_lookup_built: bool = false,
@@ -2174,6 +2201,10 @@ pub const IndexManager = struct {
 
         pub fn deinit(self: *TextMergeResult, alloc: Allocator) void {
             const result_alloc = self.owned_alloc orelse alloc;
+            for (self.field_preparations) |*prepared| prepared.deinit();
+            result_alloc.free(self.field_preparations);
+            for (self.source_preparations) |*prepared| prepared.deinit(result_alloc);
+            result_alloc.free(self.source_preparations);
             result_alloc.free(self.prepared_delta_counts);
             result_alloc.free(self.pending_delta_counts);
             for (self.pending_deletes) |*delta| delta.deinit();
@@ -3246,6 +3277,7 @@ pub const IndexManager = struct {
             .relaxed_split_durability = false,
             .text_main_backend = opts.text_main_backend,
             .text_lsm_storage = opts.text_lsm_storage,
+            .source_reader_broker = opts.source_reader_broker,
             .text_main_lsm_options = text_main_lsm_options,
             .text_wal_lsm_options = text_wal_lsm_options,
             .dense_storage_backend = opts.dense_storage_backend,
@@ -3679,6 +3711,22 @@ pub const IndexManager = struct {
 
     /// Batch-read variant that reuses a request-pinned active epoch. Rows from
     /// older epochs still fall through to the historical registry lookup.
+    /// Consume caller-owned stored bytes on both success and error. JSON
+    /// documents already have their final representation; transfer that buffer
+    /// rather than allocate and copy another complete value. Typed rows retain
+    /// the existing pinned-schema decoding path.
+    pub fn materializeOwnedStoredValueWithPinnedSchemaAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []u8,
+        pinned: ?schema_registry_mod.SchemaView,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return stored_value;
+        defer alloc.free(stored_value);
+        return self.materializeStoredValueWithPinnedSchemaAlloc(alloc, store_key, stored_value, pinned);
+    }
+
     pub fn materializeStoredValueWithPinnedSchemaAlloc(
         self: *IndexManager,
         alloc: Allocator,
@@ -7102,6 +7150,7 @@ pub const IndexManager = struct {
     /// rollback. This fence must precede device.crash(); abandonAfterCrash()
     /// may then safely release the stale in-memory generation.
     pub fn prepareForCrashRollback(self: *IndexManager) void {
+        for (self.source_owner_cleanups.items) |*cleanup| cleanup.handle.index.prepareForCrashRollback();
         for (self.text_indexes.items) |*entry| {
             entry.persistent.prepareForCrashRollback();
         }
@@ -7115,6 +7164,11 @@ pub const IndexManager = struct {
         }
         self.clearVectorBlockGeneration();
         self.releaseFullTextPendingBytes();
+        for (self.source_owner_cleanups.items) |*cleanup| {
+            if (abandon_after_crash) cleanup.handle.index.abandonAfterCrash() else cleanup.handle.deinit();
+            self.alloc.free(cleanup.key);
+        }
+        self.source_owner_cleanups.deinit(self.alloc);
         self.text_merge_scheduler.deinit(self.alloc);
         for (self.text_indexes.items) |*entry| {
             if (abandon_after_crash) self.abandonTextIndexEntryAfterCrash(entry) else self.freeTextIndexEntry(entry);
@@ -9628,7 +9682,7 @@ pub const IndexManager = struct {
                     .owned_view => |view| {
                         if (view.file_backed) stats.text_mmap_segment_bytes +|= bytes else stats.text_heap_segment_bytes +|= bytes;
                     },
-                    .native => {
+                    .native, .authenticated => {
                         stats.text_native_segment_bytes +|= bytes;
                         const navigation = seg.reader.nativeNavigationBytes();
                         stats.text_native_navigation_bytes +|= navigation;
@@ -11925,6 +11979,7 @@ pub const IndexManager = struct {
         algebraic_active_registry = 12,
         graph_artifacts = 13,
         graph_global_contenders = 14,
+        source_ownership = 15,
     };
 
     const AlgebraicCleanupGeneration = enum { canonical, active };
@@ -11943,6 +11998,7 @@ pub const IndexManager = struct {
         alloc: ?Allocator = null,
         found: bool = false,
         completed: bool = false,
+        waiting: bool = false,
         key: []u8 = &.{},
         index_name: []u8 = &.{},
 
@@ -13416,6 +13472,89 @@ pub const IndexManager = struct {
         } else .{ .put = .{ .key = cleanup_key, .value = cleanup_value } };
     }
 
+    fn sourceOwnerCleanup(self: *IndexManager, store: anytype, key: []const u8, record: GeneratedArtifactCleanupRecord) !*persistent_mod.PersistentIndex.SourceOwnerCleanup {
+        const raw_owner = record.cursor orelse return error.InvalidGeneratedArtifactCleanup;
+        if (raw_owner.len != 32 or std.mem.allEqual(u8, raw_owner, 0) or record.chunk_name != null or record.embedding_name != null or record.embedding_name_count != 0) return error.InvalidGeneratedArtifactCleanup;
+        const owner = raw_owner[0..32].*;
+        for (self.source_owner_cleanups.items) |*cached| if (std.mem.eql(u8, cached.key, key)) {
+            if (!std.mem.eql(u8, &cached.handle.owner, &owner)) return error.IndexSourceOwnerMismatch;
+            return &cached.handle;
+        };
+        const name = try internal_keys.indexArtifactCleanupNameAlloc(self.alloc, key);
+        defer self.alloc.free(name);
+        // The durable tombstone blocks same-name admission and retains the
+        // validated active-root pointer until physical finalization succeeds.
+        self.catalog_mutex.lockShared();
+        const still_active = self.get(name) != null;
+        self.catalog_mutex.unlockShared();
+        if (still_active) return error.IndexGenerationStillActive;
+        const path = try self.activeIndexPath(name);
+        defer self.alloc.free(path);
+        const zpath = try self.alloc.dupeSentinel(u8, path, 0);
+        defer self.alloc.free(zpath);
+        try store.sync(true); // durable primary route before physical closure
+        var handle = try persistent_mod.PersistentIndex.SourceOwnerCleanup.open(self.alloc, .{
+            .path = zpath,
+            .io = self.io,
+            .source_reader_broker = self.source_reader_broker,
+            .main_backend = self.text_main_backend,
+            .main_lsm_storage = self.effectiveTextMainStorage(),
+            .main_lsm_options = self.text_main_lsm_options,
+            .lsm_cache = self.lsm_cache,
+            .lsm_root_generation = self.lsm_root_generation,
+        }, owner);
+        errdefer handle.deinit();
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        try self.source_owner_cleanups.append(self.alloc, .{ .key = owned_key, .handle = handle });
+        self.source_owner_cleanup_count.store(self.source_owner_cleanups.items.len, .release);
+        return &self.source_owner_cleanups.items[self.source_owner_cleanups.items.len - 1].handle;
+    }
+
+    fn drainSourceOwnerCleanup(self: *IndexManager, store: anytype, key: []const u8, record: GeneratedArtifactCleanupRecord) !GeneratedArtifactCleanupDrainResult {
+        self.lockAtomicWithBackoff(&self.source_owner_cleanup_mutex);
+        defer self.source_owner_cleanup_mutex.unlock();
+        return self.drainSourceOwnerCleanupLocked(store, key, record);
+    }
+
+    fn drainSourceOwnerCleanupLocked(self: *IndexManager, store: anytype, key: []const u8, record: GeneratedArtifactCleanupRecord) !GeneratedArtifactCleanupDrainResult {
+        const handle = try self.sourceOwnerCleanup(store, key, record);
+        const progress = try handle.step(store, 64);
+        if (!progress.finished) return .{ .found = true, .waiting = progress.waiting };
+        // Both stores' ownership cleanup is durable before the outbox may
+        // advance to namespace deletion. Retain the fence until finalization.
+        const next = try self.encodeGeneratedArtifactCleanupRecord(.generated_artifacts, null, null, &.{}, null);
+        defer self.alloc.free(next);
+        try store.put(key, next);
+        try store.sync(true);
+        for (self.source_owner_cleanups.items, 0..) |*cached, i| if (std.mem.eql(u8, cached.key, key)) {
+            cached.handle.deinit();
+            self.alloc.free(cached.key);
+            _ = self.source_owner_cleanups.swapRemove(i);
+            self.source_owner_cleanup_count.store(self.source_owner_cleanups.items.len, .release);
+            break;
+        };
+        return .{ .found = true };
+    }
+
+    /// Caller owns the DB deletion-outbox mutex and apply lifetime fence.
+    /// A waiting owner does no storage work until its native wake port fires.
+    pub fn runRetiredSourceOwnershipMaintenanceStep(self: *IndexManager, store: *docstore_mod.DocStore) !bool {
+        if (self.source_owner_cleanup_count.load(.acquire) == 0) return false;
+        if (!self.source_owner_cleanup_mutex.tryLock()) return true;
+        defer self.source_owner_cleanup_mutex.unlock();
+        for (self.source_owner_cleanups.items) |*cached| {
+            if (!cached.handle.pending()) continue;
+            const raw = try store.get(self.alloc, cached.key);
+            defer self.alloc.free(raw);
+            const record = try decodeGeneratedArtifactCleanupRecord(raw);
+            if (record.phase != .source_ownership) return error.InvalidGeneratedArtifactCleanup;
+            const result = try self.drainSourceOwnerCleanupLocked(store, cached.key, record);
+            return !result.waiting;
+        }
+        return false;
+    }
+
     fn drainGeneratedArtifactCleanupRecordPage(
         self: *IndexManager,
         store: anytype,
@@ -13440,6 +13579,7 @@ pub const IndexManager = struct {
             }
         }
         switch (record.phase) {
+            .source_ownership => return self.drainSourceOwnerCleanup(store, key, record),
             .dense_metadata => {
                 const index_name = try internal_keys.indexArtifactCleanupNameAlloc(self.alloc, key);
                 defer self.alloc.free(index_name);
@@ -13593,15 +13733,14 @@ pub const IndexManager = struct {
             return .{ .found = true, .completed = false };
         }
 
-        if (next_phase == .finalization) {
-            if (delete_keys.len != 0) try store.putBatch(&.{}, delete_keys);
-            return .{ .found = true, .completed = true };
-        }
+        // Persist completion with the final metadata deletes. Finalization
+        // revalidates this phase after taking its lease; an in-memory page
+        // result alone cannot authorize removing a physical namespace.
         const next_value = try self.encodeGeneratedArtifactCleanupRecordFromDecoded(next_phase, record, null);
         defer self.alloc.free(next_value);
         const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
         try store.putBatch(&writes, delete_keys);
-        return .{ .found = true, .completed = false };
+        return .{ .found = true, .completed = next_phase == .finalization };
     }
 
     fn algebraicCleanupStorageNamespaceAlloc(
@@ -13662,6 +13801,7 @@ pub const IndexManager = struct {
         var after_key: ?[]u8 = null;
         defer if (after_key) |key| self.alloc.free(key);
         var first_err: ?anyerror = null;
+        var waiting = false;
 
         // A malformed or temporarily unavailable tombstone must fail its own
         // namespace closed without starving cleanup for unrelated indexes.
@@ -13670,7 +13810,7 @@ pub const IndexManager = struct {
             defer docstore_mod.DocStore.freeResults(self.alloc, rows);
             if (rows.len == 0) {
                 if (first_err) |err| return err;
-                return .{};
+                return .{ .found = waiting, .waiting = waiting };
             }
             for (rows) |row| {
                 const index_name = internal_keys.indexArtifactCleanupNameAlloc(self.alloc, row.key) catch |err| {
@@ -13682,6 +13822,11 @@ pub const IndexManager = struct {
                     if (first_err == null) first_err = err;
                     continue;
                 };
+                if (result.waiting) {
+                    waiting = true;
+                    self.alloc.free(index_name);
+                    continue;
+                }
                 result.alloc = self.alloc;
                 result.index_name = index_name;
                 errdefer result.deinit();
@@ -13690,7 +13835,7 @@ pub const IndexManager = struct {
             }
             if (rows.len < page_limit) {
                 if (first_err) |err| return err;
-                return .{};
+                return .{ .found = waiting, .waiting = waiting };
             }
             const next = try self.alloc.dupe(u8, rows[rows.len - 1].key);
             if (after_key) |key| self.alloc.free(key);
@@ -13762,7 +13907,39 @@ pub const IndexManager = struct {
         }
     }
 
+    /// Called under deletion-page arbitration after acquiring the separate
+    /// finalization lease. A previous page read is not current authority:
+    /// another worker may already have finalized and forgotten that job.
+    pub fn retiredIndexCleanupReady(self: *IndexManager, store: anytype, key: []const u8) !bool {
+        const raw = store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return (try decodeGeneratedArtifactCleanupRecord(raw)).phase == .finalization;
+    }
+
     pub fn finalizeRetiredIndexStorage(self: *IndexManager, store: anytype, name: []const u8) !void {
+        try store.sync(true);
+        {
+            self.lockAtomicWithBackoff(&self.source_owner_cleanup_mutex);
+            defer self.source_owner_cleanup_mutex.unlock();
+            var i: usize = 0;
+            while (i < self.source_owner_cleanups.items.len) {
+                const cached = &self.source_owner_cleanups.items[i];
+                const cached_name = try internal_keys.indexArtifactCleanupNameAlloc(self.alloc, cached.key);
+                defer self.alloc.free(cached_name);
+                if (!std.mem.eql(u8, cached_name, name)) {
+                    i += 1;
+                    continue;
+                }
+                if (!cached.handle.finished) return error.IndexSourceReadersActive;
+                cached.handle.deinit();
+                self.alloc.free(cached.key);
+                _ = self.source_owner_cleanups.swapRemove(i);
+                self.source_owner_cleanup_count.store(self.source_owner_cleanups.items.len, .release);
+            }
+        }
         const canonical_path = try self.indexPath(name);
         defer self.alloc.free(canonical_path);
         // Catalog absence and the durable cleanup tombstone authorize removal
@@ -13824,16 +14001,34 @@ pub const IndexManager = struct {
         }
         for (self.text_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
+                const source_owner = try entry.persistent.sourceOwner();
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
                 var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, entry.config.kind, coverageGenerationForConfig(entry.config), null, null, &.{});
                 defer cleanup.deinit();
+                if (source_owner) |owner| {
+                    const value = try self.encodeGeneratedArtifactCleanupRecord(.source_ownership, null, null, &.{}, &owner);
+                    self.alloc.free(cleanup.value.?);
+                    cleanup.value = value;
+                }
                 try self.persistCatalogExcludingWithAtomicMutation(
                     store,
                     name,
                     try combineRemovalCatalogMutation(atomic_mutation, &cleanup),
                 );
+                var durability_error: ?anyerror = null;
+                if (source_owner) |owner| {
+                    // Cleanup can repeat the physical close after a crash or a
+                    // failed barrier. Logical catalog removal already won.
+                    store.sync(true) catch |err| {
+                        std.log.warn("source-owner removal requires durability recovery index={s} err={s}", .{ name, @errorName(err) });
+                        durability_error = err;
+                    };
+                    if (durability_error == null) entry.persistent.closeSourceOwner(owner) catch |err| {
+                        std.log.warn("source-owner close deferred to cleanup index={s} err={s}", .{ name, @errorName(err) });
+                    };
+                }
                 self.text_merge_scheduler.removeIndex(self.alloc, name);
                 entry.detachAllMergeDeletionStates();
                 self.retireTextIndexEntry(entry);
@@ -13842,6 +14037,7 @@ pub const IndexManager = struct {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 self.clearAppliedSequenceAfterCatalogRemoval(store, name);
                 self.invalidateIndexRootForName(name, index_path);
+                if (durability_error) |err| return err;
                 return true;
             }
         }
@@ -15233,19 +15429,7 @@ pub const IndexManager = struct {
                         }
                     } else {
                         if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
-                            try appendOwnedGeneratedRequest(alloc, &requests, .{
-                                .kind = .dense_embedding,
-                                .index_name = entry.config.name,
-                                .artifact_name = "",
-                                .embedding_name = embedding_name,
-                                .embedding_input = embedding_cfg.embedding_input,
-                                .doc_key = doc_key,
-                                .source_field = embedding_cfg.source_field,
-                                .source_template = if (embedding_cfg.source_template.len > 0) embedding_cfg.source_template else "",
-                                .expected_dims = entry.dims,
-                                .producer_json = if (embedding_cfg.producer_json.len > 0) embedding_cfg.producer_json else "",
-                                .execution_json = if (embedding_cfg.execution_json.len > 0) embedding_cfg.execution_json else "",
-                            });
+                            try appendOwnedGeneratedRequest(alloc, &requests, enrichment_types.directDocumentEmbeddingRequest(.dense_embedding, entry.config.name, doc_key, embedding_name, entry.dims, embedding_cfg));
                         }
                     }
                 }
@@ -15331,17 +15515,7 @@ pub const IndexManager = struct {
                             });
                         }
                     } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
-                        try appendOwnedGeneratedRequest(alloc, &requests, .{
-                            .kind = .sparse_embedding,
-                            .index_name = entry.config.name,
-                            .artifact_name = "",
-                            .embedding_name = embedding_name,
-                            .doc_key = doc_key,
-                            .source_field = embedding_cfg.source_field,
-                            .source_template = if (embedding_cfg.source_template.len > 0) embedding_cfg.source_template else "",
-                            .producer_json = if (embedding_cfg.producer_json.len > 0) embedding_cfg.producer_json else "",
-                            .execution_json = if (embedding_cfg.execution_json.len > 0) embedding_cfg.execution_json else "",
-                        });
+                        try appendOwnedGeneratedRequest(alloc, &requests, enrichment_types.directDocumentEmbeddingRequest(.sparse_embedding, entry.config.name, doc_key, embedding_name, 0, embedding_cfg));
                     }
                 }
             }
@@ -15879,6 +16053,7 @@ pub const IndexManager = struct {
         analyzer: ?[]const u8,
         fragment: algebraic_mod.ir.TensorFragment,
     ) !?algebraic_mod.ir.AccessPathPlan {
+        _ = alloc;
         const entry = self.textIndexEntry(name) orelse return null;
         entry.analysis_mutex.lockShared();
         defer entry.analysis_mutex.unlockShared();
@@ -15886,12 +16061,17 @@ pub const IndexManager = struct {
             if (!textFieldAnalyzerMatches(entry, field, explicit)) return null;
             break :blk explicit;
         } else textFieldAnalyzerName(entry, field) orelse return null;
-        return try self.planTypedAccessPathAlloc(alloc, .{
+        const dictionary = algebraic_mod.lexical.DictionaryIdentity.analyzedText(entry.config.name, field, resolved_analyzer);
+        const path = algebraic_mod.ir.lexicalAccessPath(entry.config.name, .full_text_postings, dictionary, true);
+        // The analyzer was checked under this lease. Reentering the generic
+        // catalog planner would acquire the same reader lock again, deadlocking
+        // when a waiting writer has closed reader admission.
+        return algebraic_mod.ir.selectUniqueAccessPath(&.{path}, .{
             .fragment = fragment,
             .layout = .full_text_postings,
             .output_dims = &.{.doc},
             .owner = entry.config.name,
-            .dictionary = algebraic_mod.lexical.DictionaryIdentity.analyzedText(entry.config.name, field, resolved_analyzer),
+            .dictionary = dictionary,
         });
     }
 
@@ -15918,6 +16098,156 @@ pub const IndexManager = struct {
         return !saw_field and std.mem.eql(u8, analyzer, "standard");
     }
 
+    /// One inventory for an unpublished split destination. Retry records live
+    /// in active family metadata, so retirement also reclaims the records.
+    /// ID overlap with a changed/compacted generation fails closed and requires
+    /// a fresh destination; it must never append a second live copy.
+    const TextTransferInventory = struct {
+        transfers: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+        keys: std.StringHashMapUnmanaged(void) = .empty,
+        fn deinit(self: *@This(), a: Allocator) void {
+            var it = self.keys.keyIterator();
+            while (it.next()) |key| a.free(key.*);
+            self.keys.deinit(a);
+            self.transfers.deinit(a);
+        }
+        fn capture(a: Allocator, index: *persistent_mod.PersistentIndex) !@This() {
+            var result: @This() = .{};
+            errdefer result.deinit(a);
+            const corpus = index.writer.acquireSnapshot();
+            defer corpus.release();
+            try corpus.checkScoringReadContext();
+            for (corpus.segments, 0..) |*segment, ordinal| {
+                if (segment.hasSourceReferences()) {
+                    const layout = index.sourceFamilyLayoutAt(corpus, ordinal) catch |err| switch (err) {
+                        error.IndexSourceConfigurationUnavailable => null,
+                        else => return err,
+                    };
+                    if (layout) |family| if (family.transfer) |identity| try result.transfers.put(a, identity, {});
+                }
+                var deleted = try segment.cloneDeleted(a);
+                defer if (deleted) |*mask| mask.deinit();
+                for (0..segment.reader.doc_count) |doc| {
+                    if (deleted != null and deleted.?.contains(@intCast(doc))) continue;
+                    const key = (try segment.reader.storedIdAlloc(a, @intCast(doc))) orelse return error.InvalidIndexSourceMap;
+                    var owned = true;
+                    defer if (owned) a.free(key);
+                    const slot = try result.keys.getOrPut(a, key);
+                    if (!slot.found_existing) owned = false;
+                }
+            }
+            return result;
+        }
+    };
+
+    fn handoffOwnedTextSegment(
+        self: *IndexManager,
+        dest_entry: *TextIndex,
+        src: *IndexManager,
+        src_entry: *TextIndex,
+        corpus: *const index_mod.IndexSnapshot,
+        ordinal: usize,
+        split_key: []const u8,
+        prune: bool,
+        collect_keys: bool,
+        handoff: *TextSplitHandoff,
+        inventory: *TextTransferInventory,
+    ) !void {
+        const from = src.primary_store orelse return error.UnsupportedSourcePublication;
+        const to = self.primary_store orelse return error.UnsupportedSourcePublication;
+        if (!std.mem.eql(u8, dest_entry.config.config_json, src_entry.config.config_json)) return error.IndexPublicationConflict;
+        if (dest_entry.runtime_schema) |target_schema| {
+            const source_schema = src_entry.runtime_schema orelse return error.IndexPublicationConflict;
+            if (!try schema_mod.schemasEqual(self.alloc, target_schema, source_schema)) return error.IndexPublicationConflict;
+        } else if (src_entry.runtime_schema != null) return error.IndexPublicationConflict;
+        const segment = &corpus.segments[ordinal];
+        const configuration = src_entry.persistent.sourceFamilyConfigurationAt(corpus, ordinal) catch |err| switch (err) {
+            error.IndexSourceConfigurationUnavailable => textSourceConfiguration(src_entry, src_entry.projection_revision),
+            else => return err,
+        };
+        const identity = try src_entry.persistent.sourceTransferIdentityAt(corpus, ordinal, split_key, configuration);
+        const repeated = inventory.transfers.contains(identity);
+        var keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (keys.items) |key| self.alloc.free(key);
+            keys.deinit(self.alloc);
+        }
+        var source_deleted = try segment.cloneDeleted(self.alloc);
+        defer if (source_deleted) |*mask| mask.deinit();
+        for (0..segment.reader.doc_count) |doc| {
+            if (source_deleted != null and source_deleted.?.contains(@intCast(doc))) continue;
+            const key = (try segment.reader.storedIdAlloc(self.alloc, @intCast(doc))) orelse return error.InvalidIndexSourceMap;
+            var owned = true;
+            defer if (owned) self.alloc.free(key);
+            if (prune and std.mem.order(u8, key, split_key) == .lt) continue;
+            if (!repeated and inventory.keys.contains(key)) return error.IndexPublicationConflict;
+            if (repeated and !inventory.keys.contains(key)) return error.IndexPublicationConflict;
+            try keys.append(self.alloc, key);
+            owned = false;
+        }
+        if (keys.items.len == 0) return;
+        if (collect_keys) {
+            const capacity = try std.math.add(usize, handoff.skip_doc_keys.count(), keys.items.len);
+            try handoff.skip_doc_keys.ensureTotalCapacity(self.alloc, std.math.cast(u32, capacity) orelse return error.OutOfMemory);
+        }
+        if (repeated) {
+            if (collect_keys) {
+                for (keys.items) |key| {
+                    const slot = handoff.skip_doc_keys.getOrPutAssumeCapacity(key);
+                    if (slot.found_existing) self.alloc.free(key);
+                }
+                keys.clearRetainingCapacity();
+            }
+            handoff.transferred_segments += 1;
+            return;
+        }
+        // Reserve before publication. A successful root publication cannot be
+        // followed by an allocation failure while recording this call's work.
+        try inventory.transfers.ensureUnusedCapacity(self.alloc, 1);
+        const inventory_capacity = try std.math.add(usize, inventory.keys.count(), keys.items.len);
+        try inventory.keys.ensureTotalCapacity(self.alloc, std.math.cast(u32, inventory_capacity) orelse return error.OutOfMemory);
+        var inventory_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (inventory_keys.items) |key| self.alloc.free(key);
+            inventory_keys.deinit(self.alloc);
+        }
+        try inventory_keys.ensureTotalCapacityPrecise(self.alloc, keys.items.len);
+        for (keys.items) |key| inventory_keys.appendAssumeCapacity(try self.alloc.dupe(u8, key));
+        var family = if (prune) selected: {
+            var excluded = (try segment.cloneDeleted(self.alloc)) orelse roaring.RoaringBitmap.init(self.alloc);
+            defer excluded.deinit();
+            for (0..segment.reader.doc_count) |doc| {
+                if (excluded.contains(@intCast(doc))) continue;
+                const id = (try segment.reader.storedIdAlloc(self.alloc, @intCast(doc))) orelse return error.InvalidIndexSourceMap;
+                defer self.alloc.free(id);
+                if (std.mem.order(u8, id, split_key) == .lt) try excluded.add(@intCast(doc));
+            }
+            if (excluded.cardinality() == segment.reader.doc_count) return;
+            var map = try segment_mod.MergeSourceMap.init(self.alloc, &.{segment.reader.doc_count});
+            defer map.deinit();
+            const artifacts = try dest_entry.persistent.prepareMergedSegmentToFileWithSourceMap(self.alloc, self.alloc, corpus, &.{ordinal}, &.{excluded}, &map);
+            var submitted = false;
+            defer if (submitted) self.alloc.free(artifacts) else dest_entry.persistent.discardPreparedMergeSegments(artifacts);
+            if (artifacts.len != 1) return error.InvalidIndexSourceMap;
+            submitted = true;
+            break :selected try dest_entry.persistent.prepareImportedPreparedSourceFamilyAt(self.alloc, to, &src_entry.persistent, from, corpus, ordinal, configuration, artifacts[0], &map, self.checkpointIo());
+        } else try dest_entry.persistent.prepareImportedSourceFamilyAt(self.alloc, to, &src_entry.persistent, from, corpus, ordinal, configuration, self.checkpointIo());
+        defer family.deinit();
+        family.layout.transfer = identity;
+        _ = try family.publish(&dest_entry.persistent, to);
+        inventory.transfers.putAssumeCapacity(identity, {});
+        for (inventory_keys.items) |key| inventory.keys.putAssumeCapacity(key, {});
+        inventory_keys.clearRetainingCapacity();
+        if (collect_keys) {
+            for (keys.items) |key| {
+                const inserted = handoff.skip_doc_keys.getOrPutAssumeCapacity(key);
+                if (inserted.found_existing) self.alloc.free(key);
+            }
+            keys.clearRetainingCapacity();
+        }
+        handoff.transferred_segments += 1;
+    }
+
     pub fn handoffRightOnlyTextSegmentsFrom(self: *IndexManager, src: *IndexManager, split_key: []const u8, collect_skip_doc_keys: bool) ![]TextSplitHandoff {
         var handoffs = try self.alloc.alloc(TextSplitHandoff, self.text_indexes.items.len);
         errdefer {
@@ -15937,7 +16267,7 @@ pub const IndexManager = struct {
         for (self.text_indexes.items, 0..) |*dest_entry, i| {
             handoffs[i].index_name = try self.alloc.dupe(u8, dest_entry.config.name);
             const src_entry = src.findTextIndexEntry(dest_entry.config.name) orelse continue;
-            const result = try src_entry.persistent.handoffRightOnlySegmentsToChildDetailed(&dest_entry.persistent, split_key, self.alloc, collect_skip_doc_keys);
+            const result = try src_entry.persistent.handoffRightOnlyLegacySegmentsToChildDetailed(&dest_entry.persistent, split_key, self.alloc, collect_skip_doc_keys);
             defer self.alloc.free(result.doc_keys);
 
             handoffs[i].transferred_segments += result.transferred_segments;
@@ -15951,7 +16281,19 @@ pub const IndexManager = struct {
                 self.alloc.free(plan);
             }
 
+            const corpus = src_entry.persistent.writer.acquireSnapshot();
+            defer corpus.release();
+            var transfer_inventory = try TextTransferInventory.capture(self.alloc, &dest_entry.persistent);
+            defer transfer_inventory.deinit(self.alloc);
             for (plan) |entry| {
+                if (entry.class == .left_only) continue;
+                const source_ordinal = for (corpus.segments, 0..) |*segment, n| {
+                    if (segment.id == entry.seg_id) break n;
+                } else return error.IndexPublicationConflict;
+                if (corpus.segments[source_ordinal].hasSourceReferences()) {
+                    try self.handoffOwnedTextSegment(dest_entry, src, src_entry, corpus, source_ordinal, split_key, entry.class == .mixed, collect_skip_doc_keys, &handoffs[i], &transfer_inventory);
+                    continue;
+                }
                 if (entry.class != .mixed) continue;
 
                 var stored_segment = try src_entry.persistent.readStoredSegment(self.alloc, entry.seg_id);
@@ -16588,6 +16930,8 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |*entry| {
             self.lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
+            const snapshot = entry.persistent.acquireSnapshot();
+            defer snapshot.release();
             const plan = try entry.persistent.classifyActiveSegmentsForSplit(self.alloc, split_key);
             defer {
                 for (plan) |*plan_entry| plan_entry.deinit(self.alloc);
@@ -16612,17 +16956,23 @@ pub const IndexManager = struct {
                     .left_only => {},
                     .right_only => try remove_ids.append(self.alloc, plan_entry.seg_id),
                     .mixed => {
-                        var stored_segment = try entry.persistent.readStoredSegment(self.alloc, plan_entry.seg_id);
-                        defer stored_segment.deinit(self.alloc);
-
-                        var rebuilt = try buildSplitSegment(
+                        const source = findSegmentById(snapshot, plan_entry.seg_id) orelse return error.InvalidSegment;
+                        var deletion_snapshot = try source.cloneDeleted(self.alloc);
+                        defer if (deletion_snapshot) |*bitmap| bitmap.deinit();
+                        var provenance: ?segment_mod.MergeSourceMap = if (source.hasSourceReferences())
+                            try segment_mod.MergeSourceMap.init(self.alloc, &.{source.reader.doc_count})
+                        else
+                            null;
+                        defer if (provenance) |*map| map.deinit();
+                        var rebuilt = try buildSplitReaderWithProvenance(
                             self.alloc,
-                            stored_segment.segment_bytes,
-                            stored_segment.deletion_bitmap_bytes,
+                            &source.reader,
+                            if (deletion_snapshot) |*bitmap| bitmap else null,
                             split_key,
                             .left,
                             entry.config.config_json,
                             false,
+                            if (provenance) |*map| map else null,
                         );
                         defer if (rebuilt.segment_bytes) |segment_bytes| self.alloc.free(segment_bytes);
                         defer {
@@ -16631,8 +16981,12 @@ pub const IndexManager = struct {
                         }
 
                         if (rebuilt.segment_bytes) |segment_bytes| {
-                            try entry.persistent.replaceSegmentsOwned(&.{plan_entry.seg_id}, segment_bytes);
-                            rebuilt.segment_bytes = null;
+                            rebuilt.segment_bytes = null; // transfer on every path
+                            if (provenance) |*map| {
+                                try self.replaceTextSplitWithSources(entry, snapshot, source, map, segment_bytes);
+                            } else {
+                                try entry.persistent.replaceSegmentsOwned(&.{plan_entry.seg_id}, segment_bytes);
+                            }
                         } else {
                             try remove_ids.append(self.alloc, plan_entry.seg_id);
                         }
@@ -16642,6 +16996,60 @@ pub const IndexManager = struct {
 
             try entry.persistent.removeSegments(remove_ids.items);
         }
+    }
+
+    /// Rebind surviving exact afterimages using the splitter's ordinal
+    /// provenance. This never hydrates current rows or reconstructs identity
+    /// from source text, and needs no per-document hash table.
+    fn replaceTextSplitWithSources(self: *IndexManager, entry: *TextIndex, snapshot: *const index_mod.IndexSnapshot, source: *const index_mod.SegmentEntry, map: *const segment_mod.MergeSourceMap, bytes: []u8) !void {
+        var owned = true;
+        defer if (owned) self.alloc.free(bytes);
+        const primary = self.primary_store orelse return error.MissingPrimaryStore;
+        var captured = (try entry.persistent.captureSourceCohorts(self.alloc, source)) orelse return error.InvalidIndexSourceMap;
+        defer captured.deinit();
+        const output_documents = blk: {
+            var output = try segment_mod.SegmentReader.init(self.alloc, bytes);
+            defer output.deinit();
+            break :blk output.doc_count;
+        };
+        const inputs = try self.alloc.alloc(index_source_recovery.Input, output_documents);
+        defer self.alloc.free(inputs);
+        for (inputs) |*input| input.* = .{ .root = @splat(0), .from = .{ .current = 0 } };
+        for (captured.items) |*cohort| try index_source_recovery.assignMappedInputs(&entry.persistent, cohort, map, 0, &.{inputs});
+        for (inputs) |input| if (input.from != .published) return error.InvalidIndexSourceMap;
+        if (entry.persistent.sourceFieldsEnabled()) {
+            var output = try segment_mod.SegmentReader.init(self.alloc, bytes);
+            defer output.deinit();
+            const OpaqueInputs = struct {
+                nonce: [32]u8,
+                pub fn inputForField(value: *@This(), name: []const u8) ![32]u8 {
+                    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                    hash.update("antfly/pruned-field-input/opaque-v1\x00");
+                    hash.update(&value.nonce);
+                    hash.update(name);
+                    return hash.finalResult();
+                }
+            };
+            var compiled: OpaqueInputs = .{ .nonce = undefined };
+            self.checkpointIo().random(&compiled.nonce);
+            var configuration = compiled.nonce;
+            if (source.data == .authenticated) {
+                var inventory = try source.data.authenticated.inventory();
+                defer inventory.deinit();
+                configuration = (try inventory.directory()).configuration;
+            }
+            var prepared = [_]persistent_mod.PersistentIndex.PreparedFieldSourceFamily{try entry.persistent.prepareFieldSourceFamilyFromReader(self.alloc, primary, inputs, &output, configuration, &compiled, self.checkpointIo())};
+            defer prepared[0].deinit();
+            const ordinal = for (snapshot.segments, 0..) |candidate, index| {
+                if (candidate.id == source.id) break index;
+            } else return error.InvalidSegment;
+            if (!try entry.persistent.replacePreparedFieldFamilies(self.alloc, primary, snapshot, &.{ordinal}, &prepared, &.{null})) return error.InvalidSegment;
+            return;
+        }
+        var preparation = try index_source_recovery.prepareFresh(self.alloc, primary, &entry.persistent, captured.items[0].decision.binding.owner, inputs, bytes, .{}, self.checkpointIo());
+        defer preparation.deinit(self.alloc);
+        owned = false;
+        _ = (try index_source_recovery.replaceOwned(self.alloc, primary, &entry.persistent, &preparation, &.{source.id}, bytes)) orelse return error.InvalidSegment;
     }
 
     pub fn pruneDenseSplitRange(self: *IndexManager, store: *docstore_mod.DocStore, split_key: []const u8) !void {
@@ -18722,8 +19130,7 @@ pub const IndexManager = struct {
                 TextMergeScheduler.noteComplete(entry);
                 continue;
             }
-            try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
-            TextMergeScheduler.noteComplete(entry);
+            if (try self.compactTextIndex(&entry.persistent, activeTextMergePolicy())) TextMergeScheduler.noteComplete(entry);
         }
     }
 
@@ -19162,6 +19569,37 @@ pub const IndexManager = struct {
             return error.TextProjectionChanged;
         }
 
+        return self.prepareTextMapperDocsPublicationForEntry(alloc, store, entry, context, docs);
+    }
+
+    /// Caller holds catalog/configuration and the entry's analysis read lease.
+    /// Shared by replay preparation and synchronous foreground consumers.
+    fn textSourceConfiguration(entry: *const TextIndex, _: u64) [32]u8 {
+        // Projection revisions fence in-process races; they reset on reopen
+        // and cannot identify durable compiler semantics. Hash actual pinned
+        // definitions instead, without materializing another schema buffer.
+        var writer = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&.{});
+        writer.hasher.update("antfly/text-source-configuration/v2\x00");
+        std.json.Stringify.value(entry.config.name, .{}, &writer.writer) catch unreachable;
+        std.json.Stringify.value(entry.config.config_json, .{}, &writer.writer) catch unreachable;
+        std.json.Stringify.value(entry.text_analysis, .{}, &writer.writer) catch unreachable;
+        if (entry.runtime_schema) |schema_value| {
+            var logical = schema_value;
+            logical.decoded_format_version = 0;
+            std.json.Stringify.value(logical, .{}, &writer.writer) catch unreachable;
+        } else writer.hasher.update(&.{0});
+        writer.writer.flush() catch unreachable;
+        return writer.hasher.finalResult();
+    }
+
+    fn prepareTextMapperDocsPublicationForEntry(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        entry: *TextIndex,
+        context: *TextPublicationContext,
+        docs: []const mapper.MapperDoc,
+    ) !PreparedTextMapperPublication {
         const segment_alloc = entry.persistent.alloc;
         var segments = std.ArrayListUnmanaged([]u8).empty;
         errdefer {
@@ -19182,6 +19620,35 @@ pub const IndexManager = struct {
         }
         if (filtered.items.len == 0) return .{ .alloc = alloc, .segment_alloc = segment_alloc };
 
+        // New source-family formats require explicit experimental admission.
+        // Already-admitted indexes keep their required publication semantics.
+        const exact_sources = (store.documentMigrationEnabled() or entry.persistent.sourceFamiliesEnabled()) and (for (filtered.items) |doc| {
+            if (doc.source_observation == null) break false;
+        } else true);
+        var families: std.ArrayListUnmanaged(persistent_mod.PersistentIndex.PreparedSourceFamily) = .empty;
+        errdefer {
+            for (families.items) |*family| family.deinit();
+            families.deinit(alloc);
+        }
+        const field_mode = exact_sources and eligible_fields: {
+            if (entry.persistent.sourceFieldsEnabled()) break :eligible_fields true;
+            if (comptime @import("../../schema.zig").maximum_reader_format_version < 29) break :eligible_fields false;
+            // An already-admitted table fence is durable format authority,
+            // independently of whether this particular index has written a
+            // packed family yet. No public index flag or live Boolean toggle.
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const encoded = read.getPhysical(@import("../../schema.zig").schema_key) catch |err| switch (err) {
+                error.NotFound => break :eligible_fields false,
+                else => return err,
+            };
+            if (try @import("../../schema.zig").serializedReaderFormat(encoded) < 29) break :eligible_fields false;
+            _ = try entry.persistent.ensureSourceOwner(self.checkpointIo());
+            try entry.persistent.admitSourceFields();
+            break :eligible_fields true;
+        };
+        const source_configuration = textSourceConfiguration(entry, context.projection_revision);
+        var avoided: u64 = 0;
         const source_target_bytes = textProjectionSourceBuildTargetBytes();
         var start: usize = 0;
         while (start < filtered.items.len) {
@@ -19202,7 +19669,7 @@ pub const IndexManager = struct {
                 const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(arena, store, source_batch.docs);
                 var chunk_observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
                 defer chunk_observed.deinit(arena);
-                const projection_batch = try buildTextProjectionBatchForEntry(
+                var projection_batch = try buildTextProjectionBatchForEntry(
                     arena,
                     entry,
                     source_docs_with_ordinals,
@@ -19213,12 +19680,36 @@ pub const IndexManager = struct {
 
                 const runtime_index_sort = if (entry.runtime_schema) |schema| schema.index_sort else &.{};
                 const index_sort = try textIndexSortFieldsForSegmentAlloc(arena, runtime_index_sort);
+                const field_inputs = @import("../../index_field_inputs.zig");
+                var planned_inputs: ?field_inputs.Inputs = null;
+                defer if (planned_inputs) |*inputs| inputs.deinit();
+                var compilation: ?persistent_mod.PersistentIndex.FieldCompilation = null;
+                defer if (compilation) |*proof| proof.deinit();
+                // Use exactly the builder's partition model. A reused field
+                // cannot be attached to a different ordinal inventory. Sorting
+                // is only worth duplicating for substantial projected text.
+                var projected_text_bytes: usize = 0;
+                if (field_mode and index_sort.len != 0) for (projection_batch.docs) |doc| {
+                    for (doc.text_fields) |field| projected_text_bytes +|= field.text.len;
+                };
+                if (field_mode and projection_batch.docs.len != 0 and (index_sort.len == 0 or projected_text_bytes >= 65536)) {
+                    const split = introducer_mod.splitTextDocumentsForBuildBudget(projection_batch.docs, 0, .{
+                        .target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes()),
+                        .target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes()),
+                    });
+                    if (split.end == projection_batch.docs.len) {
+                        if (index_sort.len != 0) projection_batch.docs = try introducer_mod.orderedTextDocumentsAlloc(arena, projection_batch.docs, entry.text_analysis, index_sort);
+                        planned_inputs = try field_inputs.prepare(alloc, projection_batch.docs, entry.text_analysis, source_configuration);
+                        compilation = try entry.persistent.prepareFieldCompilation(alloc, projection_batch.docs, &planned_inputs.?, source_configuration);
+                    }
+                }
                 const built = try mapper.buildTextSegmentsFromProjectionBatch(
                     segment_alloc,
                     projection_batch,
                     entry.text_analysis,
                     .{
                         .scratch_allocator = introducer_mod.textBuildScratchAllocator(),
+                        .skip_fields = if (compilation) |*proof| proof.names else &.{},
                         .contribution_cache = self.analysisContributionCache(projection_batch.docs),
                         .postings_run_io = if (textBuildSpoolDirectory(entry) != null) entry.io else null,
                         .postings_run_directory = textBuildSpoolDirectory(entry) orelse ".",
@@ -19230,7 +19721,39 @@ pub const IndexManager = struct {
                         .store_document_source = false,
                     },
                 );
-                if (built.len > 0) {
+                if (field_mode) {
+                    defer {
+                        for (built) |body| segment_alloc.free(body);
+                        segment_alloc.free(built);
+                    }
+                    var projected_by_id: std.StringHashMapUnmanaged(*const introducer_mod.TextDocument) = .empty;
+                    var observed_by_id: std.StringHashMapUnmanaged(*const @import("../../index_source_claim.zig").ObservedSource) = .empty;
+                    for (projection_batch.docs) |*doc| try projected_by_id.put(arena, doc.id, doc);
+                    for (filtered.items[start..end]) |doc| try observed_by_id.put(arena, doc.key, doc.source_observation.?);
+                    for (built) |body| {
+                        var reader = try segment_mod.SegmentReader.init(arena, body);
+                        defer reader.deinit();
+                        const ordered = try arena.alloc(introducer_mod.TextDocument, reader.doc_count);
+                        const source_inputs = try arena.alloc(index_source_recovery.Input, reader.doc_count);
+                        for (ordered, source_inputs, 0..) |*doc, *input, ordinal| {
+                            const id = (try reader.storedIdAlloc(arena, @intCast(ordinal))) orelse return error.InvalidIndexSourceMap;
+                            doc.* = (projected_by_id.get(id) orelse return error.InvalidIndexSourceMap).*;
+                            const observation = observed_by_id.get(id) orelse return error.InvalidIndexSourceMap;
+                            input.* = .{ .physical = observation.physical, .root = observation.root, .from = .{ .observed = observation } };
+                        }
+                        var compiled_fallback: ?field_inputs.Inputs = null;
+                        defer if (compiled_fallback) |*value| value.deinit();
+                        const compiled = if (planned_inputs) |*value| value else fallback: {
+                            compiled_fallback = try field_inputs.prepare(alloc, ordered, entry.text_analysis, source_configuration);
+                            break :fallback &compiled_fallback.?;
+                        };
+                        if (compilation != null and built.len != 1) return error.IndexPublicationFenceMismatch;
+                        var family = if (compilation) |*proof| try entry.persistent.prepareProjectedFieldSourceFamilyAsSource(alloc, store, source_inputs, body, source_configuration, compiled, proof, self.checkpointIo()) else try entry.persistent.prepareFieldSourceFamilyAsSource(alloc, store, source_inputs, body, source_configuration, compiled, self.checkpointIo());
+                        if (compilation) |*proof| avoided +|= proof.names.len;
+                        errdefer family.deinit();
+                        try families.append(alloc, family);
+                    }
+                } else if (built.len > 0) {
                     segments.ensureUnusedCapacity(alloc, built.len) catch |err| {
                         for (built) |segment| segment_alloc.free(segment);
                         segment_alloc.free(built);
@@ -19243,11 +19766,58 @@ pub const IndexManager = struct {
             start = end;
         }
 
+        if (exact_sources) {
+            const claim = @import("../../index_source_claim.zig");
+            var by_id: std.StringHashMapUnmanaged(*const claim.ObservedSource) = .empty;
+            defer by_id.deinit(alloc);
+            try by_id.ensureTotalCapacity(alloc, @intCast(filtered.items.len));
+            for (filtered.items) |doc| {
+                const inserted = try by_id.getOrPut(alloc, doc.key);
+                if (inserted.found_existing) return error.InvalidIndexSourceMap;
+                inserted.value_ptr.* = doc.source_observation.?;
+            }
+            try families.ensureTotalCapacityPrecise(alloc, segments.items.len);
+            const identity = textSourceConfiguration(entry, context.projection_revision);
+            for (segments.items) |*bytes| {
+                {
+                    var reader = try segment_mod.SegmentReader.init(alloc, bytes.*);
+                    defer reader.deinit();
+                    const inputs = try alloc.alloc(index_source_recovery.Input, reader.doc_count);
+                    defer alloc.free(inputs);
+                    for (inputs, 0..) |*input, ordinal| {
+                        const id = (try reader.storedIdAlloc(alloc, @intCast(ordinal))) orelse return error.InvalidIndexSourceMap;
+                        defer alloc.free(id);
+                        const observation = by_id.get(id) orelse return error.InvalidIndexSourceMap;
+                        input.* = .{ .physical = observation.physical, .root = observation.root, .from = .{ .observed = observation } };
+                    }
+                    const family = try entry.persistent.prepareSourceFamily(alloc, store, inputs, bytes.*, identity, self.checkpointIo());
+                    families.appendAssumeCapacity(family);
+                }
+                // Release each encoder buffer after its reader closes. Keeping
+                // every heap output until all mappings were staged doubled the
+                // retained artifact bytes for multi-segment publications.
+                segment_alloc.free(bytes.*);
+                bytes.* = &.{};
+            }
+            segments.clearRetainingCapacity();
+        }
+        const owned_segments = try segments.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_segments) |body| segment_alloc.free(body);
+            alloc.free(owned_segments);
+        }
+        const owned_families = try families.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_families) |*family| family.deinit();
+            alloc.free(owned_families);
+        }
         return .{
             .alloc = alloc,
             .segment_alloc = segment_alloc,
-            .segments = try segments.toOwnedSlice(alloc),
+            .segments = owned_segments,
             .observed_field_analyzers = try observed.toOwnedSlice(alloc),
+            .source_families = owned_families,
+            .skipped_field_compilations = avoided,
         };
     }
 
@@ -19542,6 +20112,39 @@ pub const IndexManager = struct {
             }
         }
         return stats;
+    }
+
+    /// Caller holds the catalog lifetime fence. This is a memory-only hint;
+    /// legacy indexes retain a null ownership state and perform no store I/O.
+    pub fn sourceOwnershipMaintenancePending(self: *const IndexManager) bool {
+        for (self.text_indexes.items) |*entry| if (entry.persistent.sourceOwnershipMaintenancePending()) return true;
+        if (self.source_owner_cleanup_count.load(.acquire) == 0) return false;
+        if (!@constCast(&self.source_owner_cleanup_mutex).tryLock()) return true;
+        defer @constCast(&self.source_owner_cleanup_mutex).unlock();
+        for (self.source_owner_cleanups.items) |*cached| if (cached.handle.pending()) return true;
+        return false;
+    }
+
+    /// One bounded turn under the existing maintenance/apply owner. Advance
+    /// through one sweep rather than repeatedly restarting earlier indexes
+    /// while a later index still has reclamation debt.
+    pub fn runSourceOwnershipMaintenanceStep(self: *IndexManager, store: *docstore_mod.DocStore) !bool {
+        const generation = self.write_plan_generation.load(.acquire);
+        if (generation != self.source_ownership_generation) {
+            self.source_ownership_generation = generation;
+            self.source_ownership_cursor = 0;
+        }
+        while (self.source_ownership_cursor < self.text_indexes.items.len) {
+            const entry = &self.text_indexes.items[self.source_ownership_cursor];
+            const result = (try entry.persistent.runSourceOwnershipMaintenanceStep(store, 128)) orelse {
+                self.source_ownership_cursor += 1;
+                continue;
+            };
+            if (result.scan_more) return true;
+            self.source_ownership_cursor += 1;
+        }
+        self.source_ownership_cursor = 0;
+        return false;
     }
 
     pub fn runTextMergeScheduler(self: *IndexManager, max_steps: usize) !usize {
@@ -20018,31 +20621,52 @@ pub const IndexManager = struct {
         prepared: *PreparedTextMapperPublication,
         opts: IndexBatchOptions,
     ) !void {
-        if (delete_keys.len == 0 and prepared.segments.len == 0 and prepared.observed_field_analyzers.len == 0) return;
+        if (delete_keys.len == 0 and prepared.segments.len == 0 and prepared.source_families.len == 0 and prepared.observed_field_analyzers.len == 0) return;
         for (self.text_indexes.items) |*entry| {
             if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
 
-            var stats = TextBatchMutationStats{};
-            if (delete_keys.len > 0) {
-                stats.noteDelete((try self.deleteTextBatchEntry(entry, delete_keys)).deleted_any);
-            }
-            if (prepared.observed_field_analyzers.len > 0) {
-                try mergeObservedTextFieldAnalyzers(self, store, entry, prepared.observed_field_analyzers);
-            }
-            for (prepared.segments) |*segment| {
-                if (segment.len == 0) continue;
-                const owned = segment.*;
-                // Transfer before entering persistent publication: success and
-                // every error path consume the buffer, while untouched suffix
-                // segments remain owned by PreparedTextMapperPublication.
-                segment.* = &.{};
-                try entry.persistent.indexSegmentOwned(owned);
-                stats.noteIndex(true);
-            }
+            const stats = try self.applyPreparedTextMapperPublicationForEntry(store, entry, delete_keys, prepared);
             try self.finalizeTextBatchMutations(entry, opts, stats);
             return;
         }
         return error.IndexNotFound;
+    }
+
+    /// Caller owns the same catalog/apply fence as ordinary text mutations.
+    fn applyPreparedTextMapperPublicationForEntry(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *TextIndex,
+        delete_keys: []const []const u8,
+        prepared: *PreparedTextMapperPublication,
+    ) !TextBatchMutationStats {
+        var stats = TextBatchMutationStats{};
+        if (delete_keys.len > 0) {
+            stats.noteDelete((try self.deleteTextBatchEntry(entry, delete_keys)).deleted_any);
+        }
+        if (prepared.observed_field_analyzers.len > 0) {
+            try mergeObservedTextFieldAnalyzers(self, store, entry, prepared.observed_field_analyzers);
+        }
+        for (prepared.source_families) |*family| {
+            if (family.physical == null and (family.field_family == null or family.field_family.?.published)) continue;
+            _ = try family.publish(&entry.persistent, store);
+            stats.noteIndex(true);
+        }
+        for (prepared.segments) |*segment| {
+            if (segment.len == 0) continue;
+            const owned = segment.*;
+            // Transfer before entering persistent publication: success and
+            // every error path consume the buffer, while untouched suffix
+            // segments remain owned by PreparedTextMapperPublication.
+            segment.* = &.{};
+            try entry.persistent.indexSegmentOwned(owned);
+            stats.noteIndex(true);
+        }
+        if (prepared.skipped_field_compilations != 0) {
+            _ = entry.field_compilations_avoided.fetchAdd(prepared.skipped_field_compilations, .monotonic);
+            prepared.skipped_field_compilations = 0;
+        }
+        return stats;
     }
 
     pub fn indexDenseBatchByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const types.BatchWrite) !void {
@@ -20514,7 +21138,7 @@ pub const IndexManager = struct {
             }
         }
 
-        if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
+        if (flushed_batches > 0) _ = try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }
@@ -20776,7 +21400,7 @@ pub const IndexManager = struct {
 
         // Cooperative builds leave merging to the normal bounded text merge
         // scheduler instead of adding a whole-index compaction to their tail.
-        if (flushed_batches > 0 and !resumable) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
+        if (flushed_batches > 0 and !resumable) _ = try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
         return null;
@@ -21113,15 +21737,33 @@ pub const IndexManager = struct {
     }
 
     fn deleteIndexDirUsingIoIfPresentFallible(self: *const IndexManager, path: []const u8) !void {
-        if (self.generation_storage) |storage| return storage.deleteTree(path);
-        if (is_hostless) return;
-        if (self.io) |io| {
-            try std.Io.Dir.cwd().deleteTree(io, path);
+        if (self.generation_storage) |storage| {
+            try storage.deleteTree(path);
+        } else {
+            if (is_hostless) return;
+            try std.Io.Dir.cwd().deleteTree(self.checkpointIo(), path);
+        }
+        // The primary cleanup tombstone must outlive durable namespace
+        // removal. On retry an ancestor may also have disappeared; flush the
+        // nearest existing parent before forgetting that recovery route.
+        var candidate = path;
+        while (true) {
+            const parent = std.fs.path.dirname(candidate) orelse ".";
+            if (self.generation_storage) |storage| {
+                storage.syncParentAbsolute(candidate) catch |err| {
+                    if (err != error.FileNotFound or std.mem.eql(u8, candidate, parent)) return err;
+                    candidate = parent;
+                    continue;
+                };
+            } else {
+                fs_paths.syncDirPortable(self.checkpointIo(), parent) catch |err| {
+                    if (err != error.FileNotFound or std.mem.eql(u8, candidate, parent)) return err;
+                    candidate = parent;
+                    continue;
+                };
+            }
             return;
         }
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        try std.Io.Dir.cwd().deleteTree(io_impl.io(), path);
     }
 
     fn activeIndexRootPointerPath(self: *const IndexManager, canonical_path: []const u8) ![]u8 {
@@ -22002,6 +22644,8 @@ pub const IndexManager = struct {
                 const persistent_opts = persistent_mod.PersistentIndexOptions{
                     .path = zpath,
                     .io = self.io,
+                    .source_reader_broker = self.source_reader_broker,
+                    .source_owner_hint = &self.source_ownership_possible,
                     .main_backend = self.text_main_backend,
                     .main_lsm_storage = self.effectiveTextMainStorage(),
                     .wal_storage = self.effectiveTextWalStorage(),
@@ -24067,10 +24711,25 @@ pub const IndexManager = struct {
         return false;
     }
 
-    fn compactTextIndex(self: *IndexManager, index: *persistent_mod.PersistentIndex, policy: merger_mod.MergePolicy) !void {
+    /// True means synchronous work drained; false leaves native merge debt
+    /// scheduled. Callers must not clear that scheduler notification.
+    fn compactTextIndex(self: *IndexManager, index: *persistent_mod.PersistentIndex, policy: merger_mod.MergePolicy) !bool {
         while (true) {
             const snap = index.snapshot();
-            const planned = (try text_index_maintenance.planPolicyMergeAlloc(self.alloc, snap, policy)) orelse return;
+            // Source-owned compaction must prepare provenance and receiver
+            // claims outside the foreground apply fence. The native task path
+            // also reconciles concurrent deletion deltas before its root CAS.
+            // Never send these generations through the legacy merge publisher,
+            // including a synchronous delete/backfill caller.
+            for (snap.segments) |segment| if (segment.hasSourceReferences()) {
+                for (self.text_indexes.items) |*entry| {
+                    if (&entry.persistent != index) continue;
+                    TextMergeScheduler.schedule(entry);
+                    return false;
+                }
+                return error.IndexNotFound;
+            };
+            const planned = (try text_index_maintenance.planPolicyMergeAlloc(self.alloc, snap, policy)) orelse return true;
             defer self.alloc.free(planned);
             var reservation = try self.reserveTextMergeBuffers(index, snap, planned, .strict);
             defer if (reservation) |*active| active.release();
@@ -24083,7 +24742,7 @@ pub const IndexManager = struct {
                 policy.max_segment_size,
                 "compact text index merge failed",
                 "compact text index apply merge failed",
-            )) return;
+            )) return false;
         }
     }
 
@@ -24148,13 +24807,14 @@ pub const IndexManager = struct {
         defer if (owns_source_map) source_map.deinit();
 
         if (comptime builtin.os.tag != .freestanding) {
-            if (task.persistent.prepareMergedSegmentToFileWithSourceMap(
+            if (task.persistent.prepareMergedSegmentToFileWithSourceMapAndIo(
                 task_alloc,
                 task.mergeAllocator(),
                 task.snapshot,
                 task.merge_indices,
                 deleted_docs,
                 &source_map,
+                task.deletion_state.preparation_io,
             )) |prepared| {
                 var output_bytes: u64 = 0;
                 for (prepared) |*segment| output_bytes +|= @intCast(segment.data.len());
@@ -24172,6 +24832,7 @@ pub const IndexManager = struct {
                 };
                 owns_source_map = false;
                 errdefer result.deinit(alloc);
+                prepareTextMergeSourceHandoff(task, &result) catch |err| return task.deletion_state.allocationError(err);
                 return result;
             } else |err| switch (err) {
                 error.EmptySegment => return .{
@@ -24214,7 +24875,215 @@ pub const IndexManager = struct {
         };
         owns_source_map = false;
         errdefer result.deinit(alloc);
+        prepareTextMergeSourceHandoff(task, &result) catch |err| return task.deletion_state.allocationError(err);
         return result;
+    }
+
+    /// Resolve source-map provenance in page-sized cohorts before the final
+    /// publication/apply lease. No current document is read or retokenized.
+    fn prepareTextMergeSourceHandoff(task: *const TextMergeTask, result: *TextMergeResult) !void {
+        var source_count: usize = 0;
+        for (task.merge_indices) |index| if (task.snapshot.segments[index].hasSourceReferences()) {
+            source_count += 1;
+        };
+        if (source_count == 0) return;
+        if (source_count != task.merge_indices.len) return error.SourcePublicationRequiresHandoff;
+        const primary = task.primary_store orelse return error.MissingPrimaryStore;
+        const a = task.mergeAllocator();
+        if (result.prepared_segments.len == 0 and result.segments.len != 0) {
+            result.prepared_segments = try task.persistent.prepareSourceSegmentCopies(a, result.segments);
+            result.prepared_owner = task.persistent;
+            merger_mod.freeMergedSegments(a, result.segments);
+            result.segments = &.{};
+        }
+        const outputs = result.prepared_segments;
+        if (outputs.len == 0) return;
+        const map = if (result.source_map) |*value| value else return error.MissingMergeDocumentIdentity;
+        const readers = try a.alloc(persistent_mod.PersistentIndex.CapturedSourceCohorts, task.merge_indices.len);
+        var readers_initialized: usize = 0;
+        defer {
+            for (readers[0..readers_initialized]) |*reader| reader.deinit();
+            a.free(readers);
+        }
+        for (task.merge_indices, readers) |index, *reader| {
+            reader.* = (try task.persistent.captureSourceCohorts(a, &task.snapshot.segments[index])) orelse return error.SourcePublicationRequiresHandoff;
+            readers_initialized += 1;
+        }
+        const inputs = try a.alloc([]index_source_recovery.Input, outputs.len);
+        var inputs_initialized: usize = 0;
+        defer {
+            for (inputs[0..inputs_initialized]) |rows| a.free(rows);
+            a.free(inputs);
+        }
+        for (outputs, inputs) |output, *rows| {
+            var reader = try output.data.initReader(a);
+            defer reader.deinit();
+            if (reader.doc_count > @import("../../index_source_map.zig").maximum_documents) return error.ResourceBudgetExceeded;
+            rows.* = try a.alloc(index_source_recovery.Input, reader.doc_count);
+            inputs_initialized += 1;
+            // An empty reference is an unfilled output slot, never authority.
+            for (rows.*) |*input| input.* = .{ .root = @splat(0), .from = .{ .current = 0 } };
+        }
+        for (readers, 0..) |*reader, input_index| {
+            for (reader.items) |*cohort| index_source_recovery.assignMappedInputs(task.persistent, cohort, map, input_index, inputs) catch |err| return if (err == error.InvalidIndexSourceMap) error.MissingMergeDocumentIdentity else err;
+        }
+        for (inputs) |rows| for (rows) |row| if (row.from != .published) return error.MissingMergeDocumentIdentity;
+        if (task.persistent.sourceFieldsEnabled()) {
+            try preparePackedTextMergeOutputs(task, result, inputs);
+        } else {
+            result.source_preparations = try index_source_recovery.prepareFreshSegments(a, primary, task.persistent, readers[0].items[0].decision.binding.owner, inputs, outputs, .{}, task.deletion_state.preparation_io);
+        }
+    }
+
+    fn preparePackedTextMergeOutputs(task: *const TextMergeTask, result: *TextMergeResult, inputs: []const []index_source_recovery.Input) !void {
+        const a = task.mergeAllocator();
+        const primary = task.primary_store orelse return error.MissingPrimaryStore;
+        const field_source = @import("../../index_field_source.zig");
+        var configuration: ?[32]u8 = null;
+        var compatible = true;
+        var provenance = std.crypto.hash.sha2.Sha256.init(.{});
+        provenance.update("antfly/merged-field-definitions/v1\x00");
+        for (task.merge_indices, 0..) |ordinal, source_index| {
+            const entry = &task.snapshot.segments[ordinal];
+            if (task.source[source_index].deleted) |deleted| if (deleted.cardinality() == entry.reader.doc_count) continue;
+            var lease = (try entry.sourceLease()) orelse return error.InvalidIndexSourceFamily;
+            defer lease.deinit();
+            const binding = try lease.binding();
+            provenance.update(&binding.owner);
+            provenance.update(&binding.publication);
+            if (entry.data != .authenticated) {
+                compatible = false;
+                continue;
+            }
+            var inventory = try entry.data.authenticated.inventory();
+            defer inventory.deinit();
+            const definition = (try inventory.directory()).configuration;
+            if (configuration) |prior| {
+                if (!std.mem.eql(u8, &prior, &definition)) compatible = false;
+            } else configuration = definition;
+        }
+        const definition = if (compatible and configuration != null) configuration.? else provenance.finalResult();
+        const Compiled = struct {
+            inventory: ?field_source.Inventory = null,
+            fallback_nonce: [32]u8,
+            task: *const TextMergeTask,
+            map: *segment_mod.MergeSourceMap,
+            output: usize,
+            documents: u32,
+            definition: [32]u8,
+            evidence: std.StringHashMapUnmanaged(?[]u8) = .empty,
+            fn deinit(self: *@This()) void {
+                const scratch_alloc = self.task.mergeAllocator();
+                var it = self.evidence.valueIterator();
+                while (it.next()) |value| if (value.*) |raw| scratch_alloc.free(raw);
+                self.evidence.deinit(scratch_alloc);
+                if (self.inventory) |*inventory| inventory.deinit();
+            }
+            fn ledger(self: *@This(), name: []const u8) !?[]const u8 {
+                const module = @import("../../index_field_ledger.zig");
+                if (self.evidence.get(name)) |entry| return entry;
+                const scratch_alloc = self.task.mergeAllocator();
+                const slot = try self.evidence.getOrPut(scratch_alloc, name);
+                slot.value_ptr.* = null;
+                if (self.documents > module.maximum_documents) return null;
+                const rows = try scratch_alloc.alloc(?[32]u8, self.documents);
+                defer scratch_alloc.free(rows);
+                @memset(rows, null);
+                var context: ?[32]u8 = null;
+                for (self.task.merge_indices, 0..) |ordinal, input_index| {
+                    const source = &self.task.snapshot.segments[ordinal];
+                    if (source.data != .authenticated) continue;
+                    var inventory = try source.data.authenticated.inventory();
+                    defer inventory.deinit();
+                    if (!std.mem.eql(u8, &(try inventory.directory()).configuration, &self.definition)) continue;
+                    const raw = (try self.task.persistent.copyFieldInputLedger(scratch_alloc, inventory, name)) orelse continue;
+                    defer scratch_alloc.free(raw);
+                    // copyFieldInputLedger already verified the actual held
+                    // descriptor. Re-open its bounded syntax without inventing
+                    // a digest from cooked postings.
+                    var hash: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(raw, &hash, .{});
+                    const input = try module.open(raw, hash);
+                    if (context) |prior| {
+                        if (!std.mem.eql(u8, &prior, &input.context())) return null;
+                    } else context = input.context();
+                    for (0..input.documents()) |row| {
+                        const location = (try self.map.lookupRead(input_index, @intCast(row))) orelse continue;
+                        if (location.segment != self.output) continue;
+                        if (location.doc >= rows.len) return error.InvalidIndexSourceMap;
+                        rows[location.doc] = try input.row(@intCast(row));
+                    }
+                }
+                if (context == null) return null;
+                // Fully deleted or other-output observations must not evict
+                // useful proofs with a vector that has no reusable row.
+                for (rows) |row| {
+                    if (row != null) break;
+                } else return null;
+                const raw = try module.encode(scratch_alloc, context.?, rows);
+                self.evidence.getPtr(name).?.* = raw;
+                return raw;
+            }
+            pub fn ledgerForField(self: *@This(), copy_alloc: Allocator, name: []const u8) !?[]u8 {
+                const raw = (try self.ledger(name)) orelse return null;
+                return try copy_alloc.dupe(u8, raw);
+            }
+            pub fn inputForField(self: *@This(), name: []const u8) ![32]u8 {
+                if (try self.ledger(name)) |raw| {
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+                    return digest;
+                }
+                if (self.inventory) |inventory| {
+                    var low: usize = 0;
+                    var high: usize = (try inventory.directory()).fields;
+                    while (low < high) {
+                        const middle = low + (high - low) / 2;
+                        const field = try inventory.field(middle);
+                        switch (std.mem.order(u8, field.name(), name)) {
+                            .lt => low = middle + 1,
+                            .gt => high = middle,
+                            .eq => return field.inputs(),
+                        }
+                    }
+                }
+                var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                hash.update("antfly/opaque-merged-field-input/v1\x00");
+                hash.update(&self.fallback_nonce);
+                hash.update(name);
+                return hash.finalResult();
+            }
+        };
+        const prepared = try a.alloc(persistent_mod.PersistentIndex.PreparedFieldSourceFamily, result.prepared_segments.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (prepared[0..initialized]) |*output| output.deinit();
+            a.free(prepared);
+        }
+        const map = if (result.source_map) |*value| value else return error.MissingMergeDocumentIdentity;
+        for (result.prepared_segments, inputs, prepared, 0..) |*output, rows, *target, output_index| {
+            var reader = try output.data.initReader(a);
+            defer reader.deinit();
+            var compiled: Compiled = .{ .fallback_nonce = undefined, .task = task, .map = map, .output = output_index, .documents = reader.doc_count, .definition = definition };
+            task.deletion_state.preparation_io.random(&compiled.fallback_nonce);
+            defer compiled.deinit();
+            // Keeping one complete document preserves its exact input ledger;
+            // no source JSON is read. Other shapes remain explicitly opaque.
+            if (reader.doc_count == 1) for (task.merge_indices, 0..) |ordinal, source_index| {
+                const source = &task.snapshot.segments[ordinal];
+                if (source.reader.doc_count != 1 or source.data != .authenticated) continue;
+                const location = (try map.lookupRead(source_index, 0)) orelse continue;
+                if (location.segment != output_index or location.doc != 0) continue;
+                var inventory = try source.data.authenticated.inventory();
+                if (std.mem.eql(u8, &(try inventory.directory()).configuration, &definition)) {
+                    compiled.inventory = inventory;
+                } else inventory.deinit();
+                break;
+            };
+            target.* = if (output.native_pack != null) try task.persistent.prepareFieldSourceFamilyFromPackedMerge(a, primary, output, &reader, rows, definition, &compiled, task.deletion_state.preparation_io) else try task.persistent.prepareFieldSourceFamilyFromReader(a, primary, rows, &reader, definition, &compiled, task.deletion_state.preparation_io);
+            initialized += 1;
+        }
+        result.field_preparations = prepared;
     }
 
     /// Compatibility fallback for results without task-owned provenance.
@@ -24417,6 +25286,13 @@ pub const IndexManager = struct {
         const output_stats = textMergeResultOutputStats(result);
         const applied = if (result.prepared_segments.len == 0 and result.segments.len == 0) blk: {
             break :blk try entry.persistent.removeSegmentsIfActive(old_ids);
+        } else if (result.field_preparations.len != 0) blk: {
+            break :blk try entry.persistent.replacePreparedFieldFamilies(task.mergeAllocator(), self.primary_store orelse return error.MissingPrimaryStore, task.snapshot, task.merge_indices, result.field_preparations, publication_deletes.bitmaps);
+        } else if (result.source_preparations.len != 0) blk: {
+            const prepared_segments = result.prepared_segments;
+            result.prepared_segments = &.{};
+            result.prepared_owner = null;
+            break :blk try index_source_recovery.replacePrepared(task.mergeAllocator(), self.primary_store orelse return error.MissingPrimaryStore, &entry.persistent, result.source_preparations, old_ids, prepared_segments, publication_deletes.bitmaps);
         } else if (result.prepared_segments.len > 0) blk: {
             const prepared_segments = result.prepared_segments;
             result.prepared_segments = &.{};
@@ -24551,6 +25427,21 @@ pub const IndexManager = struct {
             });
         }
         if (infos.items.len < 2) return null;
+        var exact_count: usize = 0;
+        for (infos.items) |info| if (snap.segments[info.index].hasSourceReferences()) {
+            exact_count += 1;
+        };
+        if (exact_count != 0 and exact_count != infos.items.len) {
+            const legacy_count = infos.items.len - exact_count;
+            const select_exact = exact_count >= legacy_count;
+            var kept: usize = 0;
+            for (infos.items) |info| if (snap.segments[info.index].hasSourceReferences() == select_exact) {
+                infos.items[kept] = info;
+                kept += 1;
+            };
+            infos.items.len = kept;
+            if (kept < 2) return null;
+        }
 
         const policy = activeTextMergePolicy();
         const planned = (try policy.plan(self.alloc, infos.items)) orelse blk: {
@@ -24650,6 +25541,7 @@ pub const IndexManager = struct {
         return .{
             .index_name = owned_index_name,
             .persistent = persistent,
+            .primary_store = self.primary_store,
             .source = source,
             .merge_indices = merge_indices,
             .snapshot = snap.retain(),
@@ -25039,7 +25931,79 @@ pub const IndexManager = struct {
     }
 
     fn textIndexNeedsMerge(self: *IndexManager, index: *persistent_mod.PersistentIndex, policy: merger_mod.MergePolicy) !bool {
+        const snapshot = index.snapshot();
+        if (snapshot.segments.len == 2 and snapshot.segments[0].hasSourceReferences() != snapshot.segments[1].hasSourceReferences()) return false;
         return try text_index_maintenance.needsMerge(self.alloc, index, policy);
+    }
+
+    /// Forced source-owned compaction uses the same bounded preparation,
+    /// provenance and publication protocol as scheduled work. Rebuilding via
+    /// the legacy force helper would discard exact source lineage.
+    fn forceCompactSourceTextIndex(self: *IndexManager, entry: *TextIndex, options: ForceTextCompactOptions) !bool {
+        while (true) {
+            if (!entry.apply_mutex.tryLock()) {
+                if (options.mode == .best_effort) return false;
+                return error.IndexApplyBusy;
+            }
+            var apply_locked = true;
+            defer if (apply_locked) entry.apply_mutex.unlock();
+            const snapshot = entry.persistent.acquireSnapshot();
+            defer snapshot.release();
+            if (snapshot.segments.len < 2) return true;
+            if (options.mode == .best_effort and self.shouldDeferTextMergeForResourcePressure()) return false;
+            var exact: usize = 0;
+            for (snapshot.segments) |segment| if (segment.hasSourceReferences()) {
+                exact += 1;
+            };
+            const legacy = snapshot.segments.len - exact;
+            if (exact < 2 and legacy < 2) return true;
+            const select_exact = exact >= legacy;
+            var infos = std.ArrayListUnmanaged(merger_mod.SegmentInfo).empty;
+            defer infos.deinit(self.alloc);
+            for (snapshot.segments, 0..) |segment, index| {
+                if (segment.hasSourceReferences() != select_exact) continue;
+                const deleted = segment.deletionSummary();
+                try infos.append(self.alloc, .{ .index = index, .size = segment.data.len(), .doc_count = segment.reader.doc_count, .deleted_count = deleted.count, .has_deletions = deleted.has_deletions });
+            }
+            const planned = try text_index_maintenance.planForceDrainFromInfos(self.alloc, infos.items, force_merge_max_segments_at_once);
+            defer self.alloc.free(planned);
+            var task = self.copyTextMergeTask(entry.config.name, &entry.persistent, snapshot, planned) catch |err| switch (err) {
+                error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
+                else => return err,
+            };
+            defer task.deinit(self.alloc);
+            try entry.attachMergeDeletionState(self.alloc, task.deletion_state);
+            var tracking: enum { attached, registered, retired } = .attached;
+            defer switch (tracking) {
+                .attached => entry.detachMergeDeletionState(task.deletion_state),
+                .registered => self.cancelTextMergeTask(&task),
+                .retired => {},
+            };
+            try self.text_merge_scheduler.registerSource(self.alloc, task.index_name, task.source, task.deletion_state);
+            tracking = .registered;
+            entry.apply_mutex.unlock();
+            apply_locked = false;
+            var result = executeTextMergeTask(self.alloc, &task) catch |err| switch (err) {
+                error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
+                else => return err,
+            };
+            defer result.deinit(self.alloc);
+            const applied = while (true) {
+                break self.finishTextMergeTask(&task, &result) catch |err| switch (err) {
+                    error.TextMergePublicationLookupRequired => {
+                        try prepareTextMergeTaskPublicationLookup(&task, &result);
+                        continue;
+                    },
+                    else => {
+                        tracking = .retired; // finish retired this task
+                        if (err == error.ResourceBudgetExceeded and options.mode == .best_effort) return false;
+                        return err;
+                    },
+                };
+            };
+            tracking = .retired;
+            if (!applied) return false;
+        }
     }
 
     fn forceCompactTextIndexWithOptions(
@@ -25049,6 +26013,7 @@ pub const IndexManager = struct {
     ) !bool {
         self.text_merge_scheduler.supersedeInFlightForIndex(self.alloc, entry.config.name);
         entry.detachAllMergeDeletionStates();
+        for (entry.persistent.snapshot().segments) |segment| if (segment.hasSourceReferences()) return self.forceCompactSourceTextIndex(entry, options);
         while (true) {
             const snap = entry.persistent.snapshot();
             if (snap.segments.len < 2) return true;
@@ -26232,6 +27197,49 @@ pub const IndexManager = struct {
                 .doc_ordinal = ordinals[i],
             };
         }
+        // Foreground and replay consume the same native publication contract.
+        // A probe or submitted JSON alone is not an indexed-source observation.
+        // Keep the actual stable read cut until all leaf claims have imported it.
+        if (store.documentLayoutEnabled() and !textEntryHasExplicitArtifactSources(entry) and
+            (entry.runtime_schema == null or entry.runtime_schema.?.storage_mode != .relational))
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const schema_bytes = read.getPhysical(@import("../../schema.zig").schema_key) catch |err| switch (err) {
+                error.NotFound => return try self.indexTextProjectionDocsMaybeChunked(store, entry, docs),
+                else => return err,
+            };
+            const format = try @import("../../schema.zig").serializedReaderFormat(schema_bytes);
+            if (format >= 28) {
+                for (docs) |doc| if (internal_keys.isInternalUserKey(doc.key))
+                    return try self.indexTextProjectionDocsMaybeChunked(store, entry, docs);
+                const claim = @import("../../index_source_claim.zig");
+                const observations = try self.alloc.alloc(claim.ObservedSource, docs.len);
+                defer self.alloc.free(observations);
+                var observed: usize = 0;
+                defer for (observations[0..observed]) |*source| source.deinit(self.alloc);
+                for (docs, observations) |*doc, *source| {
+                    const physical = try internal_keys.documentKeyAlloc(self.alloc, doc.key);
+                    defer self.alloc.free(physical);
+                    source.* = try claim.ObservedSource.capture(self.alloc, &read, physical, doc.value);
+                    observed += 1;
+                    doc.source_observation = source;
+                }
+                var context: TextPublicationContext = .{
+                    .alloc = self.alloc,
+                    .instance_id = entry.instance_id,
+                    .projection_revision = entry.projection_revision,
+                    .chunk_backed = false,
+                };
+                var prepared = blk: {
+                    entry.lockAnalysisShared();
+                    defer entry.unlockAnalysisShared();
+                    break :blk try self.prepareTextMapperDocsPublicationForEntry(self.alloc, store, entry, &context, docs);
+                };
+                defer prepared.deinit();
+                return try self.applyPreparedTextMapperPublicationForEntry(store, entry, &.{}, &prepared);
+            }
+        }
         return try self.indexTextProjectionDocsMaybeChunked(store, entry, docs);
     }
 
@@ -26918,8 +27926,7 @@ pub const IndexManager = struct {
             TextMergeScheduler.schedule(entry);
             return;
         }
-        try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
-        TextMergeScheduler.noteComplete(entry);
+        if (try self.compactTextIndex(&entry.persistent, activeTextMergePolicy())) TextMergeScheduler.noteComplete(entry);
     }
 
     fn indexDenseBatchEntry(
@@ -32141,7 +33148,19 @@ fn buildSplitSegment(
     config_json: ?[]const u8,
     collect_doc_keys: bool,
 ) !SplitRebuiltSegment {
-    _ = config_json;
+    return buildSplitSegmentWithProvenance(alloc, segment_bytes, deletion_bitmap_bytes, split_key, side, config_json, collect_doc_keys, null);
+}
+
+fn buildSplitSegmentWithProvenance(
+    alloc: Allocator,
+    segment_bytes: []const u8,
+    deletion_bitmap_bytes: ?[]const u8,
+    split_key: []const u8,
+    side: SplitSide,
+    config_json: ?[]const u8,
+    collect_doc_keys: bool,
+    source_map: ?*segment_mod.MergeSourceMap,
+) !SplitRebuiltSegment {
     var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
     defer reader.deinit();
 
@@ -32154,6 +33173,11 @@ fn buildSplitSegment(
         deleted = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
     }
 
+    return buildSplitReaderWithProvenance(alloc, &reader, if (deleted) |*bitmap| bitmap else null, split_key, side, config_json, collect_doc_keys, source_map);
+}
+
+fn buildSplitReaderWithProvenance(alloc: Allocator, reader: *const segment_mod.SegmentReader, deleted: ?*const roaring.RoaringBitmap, split_key: []const u8, side: SplitSide, config_json: ?[]const u8, collect_doc_keys: bool, source_map: ?*segment_mod.MergeSourceMap) !SplitRebuiltSegment {
+    _ = config_json;
     var doc_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (doc_keys.items) |key| alloc.free(key);
@@ -32172,10 +33196,11 @@ fn buildSplitSegment(
             }
         }
 
-        const stored = (try reader.storedDoc(doc_idx)) orelse return error.InvalidSegment;
+        const id = (try reader.storedIdAlloc(alloc, doc_idx)) orelse return error.InvalidSegment;
+        defer alloc.free(id);
         const keep = switch (side) {
-            .left => std.mem.order(u8, stored.id, split_key) == .lt,
-            .right => std.mem.order(u8, stored.id, split_key) != .lt,
+            .left => std.mem.order(u8, id, split_key) == .lt,
+            .right => std.mem.order(u8, id, split_key) != .lt,
         };
         if (!keep) {
             try excluded.add(doc_idx);
@@ -32183,7 +33208,7 @@ fn buildSplitSegment(
         }
         live_docs += 1;
         if (collect_doc_keys) {
-            try doc_keys.append(alloc, try alloc.dupe(u8, stored.id));
+            try doc_keys.append(alloc, try alloc.dupe(u8, id));
         }
     }
 
@@ -32197,10 +33222,12 @@ fn buildSplitSegment(
     // Preserve postings, positions, norms, typed doc values, and stored-field
     // mode directly. Reanalysis would require a duplicate source body in every
     // text segment and could silently change results after analyzer upgrades.
-    const rebuilt = try segment_mod.mergeSegmentInputs(alloc, &.{.{
-        .reader = &reader,
+    const rebuilt = try segment_mod.mergeSegmentInputsWithOptions(alloc, &.{.{
+        .reader = reader,
         .deleted = excluded,
-    }});
+    }}, .{ .source_map = source_map });
+    errdefer alloc.free(rebuilt);
+    if (source_map) |map| try map.finishOutput(live_docs);
     return .{
         .segment_bytes = rebuilt,
         .doc_keys = try doc_keys.toOwnedSlice(alloc),

@@ -96,6 +96,7 @@ pub const AtomicWriteSink = struct {
         write_at: *const fn (*anyopaque, usize, []const u8) anyerror!void,
         crc32_prefix: *const fn (*anyopaque, usize) anyerror!u32,
         crc32_range: *const fn (*anyopaque, usize, usize) anyerror!u32,
+        read_at: ?*const fn (*anyopaque, usize, []u8) anyerror!void = null,
         set_cache_intent: ?*const fn (*anyopaque, AtomicWriteCacheIntent) void = null,
         finish: *const fn (*anyopaque) anyerror!void,
         /// Consumes the writer on success AND failure, like finish. The
@@ -121,6 +122,11 @@ pub const AtomicWriteSink = struct {
 
     pub fn writeAt(self: *AtomicWriteSink, offset: usize, bytes: []const u8) !void {
         try BoundaryAbi.call("write_at", self.boundary_dispatch, self.vtable.write_at, .{ self.ptr, offset, bytes });
+    }
+
+    pub fn readAt(self: *AtomicWriteSink, offset: usize, bytes: []u8) !void {
+        const read = self.vtable.read_at orelse return error.Unsupported;
+        try BoundaryAbi.call("read_at", self.boundary_dispatch, read, .{ self.ptr, offset, bytes });
     }
 
     pub fn crc32Prefix(self: *AtomicWriteSink, len_prefix: usize) !u32 {
@@ -611,6 +617,10 @@ pub const Storage = struct {
         write_file_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         append_file_absolute: ?*const fn (*anyopaque, []const u8, []const u8, bool) anyerror!void = null,
         begin_atomic_write: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!AtomicWriteSink = null,
+        /// Exclusive final-name staging for a durably reserved immutable ID.
+        /// The catalog must not expose this path before finish. Recovery knows
+        /// the exact name even if the process dies halfway through a write.
+        begin_prepared_immutable_write: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!AtomicWriteSink = null,
         begin_cold_sequential_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
         begin_cold_random_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
         try_begin_cold_random_reads: ?*const fn (*anyopaque, Allocator, []const []const u8) anyerror!?[]ColdSequentialReader = null,
@@ -777,6 +787,11 @@ pub const Storage = struct {
         @memcpy(joined[existing.len..], contents);
         try self.writeFileAbsolute(path, joined);
         if (sync) try self.syncFileContentsAbsolute(path);
+    }
+
+    pub fn beginPreparedImmutableWrite(self: Storage, allocator: Allocator, path: []const u8) !AtomicWriteSink {
+        const begin = self.vtable.begin_prepared_immutable_write orelse return error.PreparedImmutableWriteUnsupported;
+        return BoundaryAbi.call("begin_prepared_immutable_write", self.boundary_dispatch, begin, .{ self.ptr, allocator, path });
     }
 
     pub fn beginAtomicWrite(self: Storage, allocator: Allocator, path: []const u8) !AtomicWriteSink {
@@ -1230,6 +1245,12 @@ const BufferedAtomicWriteSink = struct {
         byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
     }
 
+    fn readAt(ptr: *anyopaque, offset: usize, bytes: []u8) !void {
+        const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
+        @memcpy(bytes, self.out.items[offset..][0..bytes.len]);
+    }
+
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
@@ -1269,6 +1290,7 @@ const BufferedAtomicWriteSink = struct {
 };
 
 const buffered_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
+    .read_at = BufferedAtomicWriteSink.readAt,
     .len = BufferedAtomicWriteSink.len,
     .append_slice = BufferedAtomicWriteSink.appendSlice,
     .write_at = BufferedAtomicWriteSink.writeAt,
@@ -2639,6 +2661,8 @@ const ThreadedNativeStorage = struct {
 
     const threaded_only_vtable: Storage.VTable = .{
         .acquire_lease = acquireErasedLease,
+        .open_leased_immutable_source = if (supports_posix_fd_cache) openLeasedSource else null,
+        .begin_prepared_immutable_write = if (supports_posix_fd_cache) beginPreparedImmutableWrite else null,
         .create_dir_path = createDirPath,
         .read_file_alloc = readFileAlloc,
         .read_file_range_alloc = readFileRangeAlloc,
@@ -2713,6 +2737,15 @@ const ThreadedNativeStorage = struct {
     fn releaseErasedLease(ptr: *anyopaque) void {
         const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
         state.release();
+    }
+
+    fn beginPreparedImmutableWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
+        return NativeAtomicWriteSink.createPrepared(allocator, path, @ptrCast(@alignCast(ptr)));
+    }
+
+    fn openLeasedSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        return NativeImmutableReadSource.create(state, allocator, path);
     }
 
     pub fn beginAtomicWriteWithPermit(
@@ -2928,6 +2961,46 @@ const ThreadedNativeStorage = struct {
         defer retained.release();
         const now = std.Io.Timestamp.now(retained.threaded.io(), .awake);
         return @intCast(now.toNanoseconds());
+    }
+};
+
+// A cold mapping pins the actual immutable inode without retaining one file
+// descriptor per live generation. No body pages are touched during admission.
+// Replacement/unlink and storage shutdown cannot redirect subsequent reads.
+const NativeImmutableReadSource = if (supports_posix_fd_cache) struct {
+    allocator: Allocator,
+    bytes: []align(std.heap.page_size_min) u8,
+    fn create(state: *NativeStorageState, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
+        const self = try allocator.create(@This());
+        errdefer allocator.destroy(self);
+        var permit = try state.acquireFdPermit();
+        defer permit.release();
+        const file = try openNativePathFile(permit.io, path);
+        defer file.close(permit.io);
+        const stat = try file.stat(permit.io);
+        if (stat.kind != .file or stat.size == 0) return error.InvalidImmutableReadSource;
+        const length = std.math.cast(usize, stat.size) orelse return error.ResourceBudgetExceeded;
+        const bytes = try std.posix.mmap(null, length, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+        self.* = .{ .allocator = allocator, .bytes = bytes };
+        return .{ .ranges = .{ .ptr = self, .length = stat.size, .read_into = read, .close = close, .retained_bytes = retained } };
+    }
+    fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (offset > self.bytes.len or output.len > self.bytes.len - offset) return error.EndOfStream;
+        @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+    }
+    fn retained(_: *anyopaque) usize {
+        // Virtual address space is not retained heap or resident file memory.
+        return @sizeOf(@This());
+    }
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.posix.munmap(self.bytes);
+        self.allocator.destroy(self);
+    }
+} else struct {
+    fn create(_: *NativeStorageState, _: Allocator, _: []const u8) !@import("../../segment_source.zig").Source {
+        return error.ImmutableReadSourceUnsupported;
     }
 };
 
@@ -3451,6 +3524,12 @@ const NativeBufferedAtomicWriteSink = struct {
         byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
     }
 
+    fn readAt(ptr: *anyopaque, offset: usize, bytes: []u8) !void {
+        const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
+        @memcpy(bytes, self.out.items[offset..][0..bytes.len]);
+    }
+
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
@@ -3505,6 +3584,7 @@ const NativeBufferedAtomicWriteSink = struct {
 };
 
 const native_buffered_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
+    .read_at = NativeBufferedAtomicWriteSink.readAt,
     .len = NativeBufferedAtomicWriteSink.len,
     .append_slice = NativeBufferedAtomicWriteSink.appendSlice,
     .write_at = NativeBufferedAtomicWriteSink.writeAt,
@@ -3811,6 +3891,7 @@ const NativeAtomicWriteSink = struct {
     state: *NativeStorageState,
     fd_permit: NativeFdPermit,
     final_path: []u8,
+    prepared_immutable: bool = false,
     tmp_path: []u8,
     fd: std.posix.fd_t,
     bytes_written: usize = 0,
@@ -3830,26 +3911,35 @@ const NativeAtomicWriteSink = struct {
         return try createWithPermit(allocator, path, state, &fd_permit);
     }
 
+    fn createPrepared(allocator: Allocator, path: []const u8, state: *NativeStorageState) !AtomicWriteSink {
+        var permit = try state.acquireFdPermit();
+        defer permit.release();
+        return createWithPermitMode(allocator, path, state, &permit, true);
+    }
+
     fn createWithPermit(
         allocator: Allocator,
         path: []const u8,
         state: *NativeStorageState,
         permit: *NativeFdPermit,
     ) !AtomicWriteSink {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
-            return error.DurableAtomicRenameUnsupported;
-        }
+        return createWithPermitMode(allocator, path, state, permit, false);
+    }
+
+    fn createWithPermitMode(allocator: Allocator, path: []const u8, state: *NativeStorageState, permit: *NativeFdPermit, prepared: bool) !AtomicWriteSink {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.DurableAtomicRenameUnsupported;
         if (!permit.active or permit.count != 1 or permit.state != state) return error.InvalidNativeFdPermit;
 
         const final_path = try allocator.dupe(u8, path);
         errdefer allocator.free(final_path);
 
-        const tmp_path = try tempSiblingPath(allocator, path);
+        const tmp_path = if (prepared) try allocator.dupe(u8, path) else try tempSiblingPath(allocator, path);
         errdefer allocator.free(tmp_path);
 
         const retained = try state.retain();
         errdefer retained.release();
-        const fd = try createAtomicWriteFdPosix(tmp_path);
+        const fd = if (prepared) try std.posix.openat(std.posix.AT.FDCWD, tmp_path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, std.Io.File.Permissions.default_file.toMode()) else try createAtomicWriteFdPosix(tmp_path);
+        errdefer if (prepared) deleteFilePathPosix(tmp_path) catch {};
         errdefer closeFd(fd);
 
         const self = try allocator.create(NativeAtomicWriteSink);
@@ -3859,6 +3949,7 @@ const NativeAtomicWriteSink = struct {
             .state = retained,
             .fd_permit = permit.take(),
             .final_path = final_path,
+            .prepared_immutable = prepared,
             .tmp_path = tmp_path,
             .fd = fd,
         };
@@ -3924,6 +4015,12 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.bytes_written or bytes.len > self.bytes_written - offset) return error.InvalidAtomicWriteOffset;
         try writeAllAtOffset(self.fd, bytes, @intCast(offset));
+    }
+
+    fn readAt(ptr: *anyopaque, offset: usize, bytes: []u8) !void {
+        const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.bytes_written or bytes.len > self.bytes_written - offset) return error.InvalidAtomicWriteOffset;
+        try readAllAtOffset(self.fd, bytes, @intCast(offset));
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
@@ -3995,6 +4092,11 @@ const NativeAtomicWriteSink = struct {
         // the slot and make finish fail after the rename has already published
         // the destination.
 
+        if (self.prepared_immutable) {
+            self.state.invalidatePath(self.final_path);
+            try syncParentDirectoryPosix(self.final_path);
+            return;
+        }
         self.state.invalidateRename(self.tmp_path, self.final_path);
         defer self.state.invalidateRename(self.tmp_path, self.final_path);
         renameAbsoluteDirectPosix(self.tmp_path, self.final_path) catch |err| {
@@ -4018,6 +4120,7 @@ const NativeAtomicWriteSink = struct {
 };
 
 const native_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
+    .read_at = NativeAtomicWriteSink.readAt,
     .len = NativeAtomicWriteSink.len,
     .append_slice = NativeAtomicWriteSink.appendSlice,
     .write_at = NativeAtomicWriteSink.writeAt,

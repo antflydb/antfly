@@ -221,6 +221,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const batchInternalWithPreparationAllocator = commit.batchInternalWithPreparationAllocator;
         pub const captureGeneratedWriteReadSnapshot = preparation.captureGeneratedWriteReadSnapshot;
         pub const captureTransformReadSnapshot = preparation.captureTransformReadSnapshot;
+        pub const prepareDocumentPatches = preparation.prepareDocumentPatches;
         pub const childRangeManifestReader = materialization.childRangeManifestReader;
         pub const clearActiveIndexRepairsLocked = commit.clearActiveIndexRepairsLocked;
         pub const clearBulkIngestIdentityAllNewLocked = commit.clearBulkIngestIdentityAllNewLocked;
@@ -763,6 +764,7 @@ pub fn ImplementationFor(comptime D: type) type {
             wait_fn: *const fn (*anyopaque, types.SyncLevel, u64, ManagedSyncTargets, types.CancellationToken, bool) anyerror!void,
             resolved_wait_fn: *const fn (*anyopaque, types.SyncLevel, u64, types.CancellationToken) anyerror!void,
             local_execution: *@FieldType(Execution, "local_execution"),
+            document_validation_authority: *@FieldType(Execution, "document_validation_authority"),
             rewrite_program_cache: *@FieldType(Execution, "rewrite_program_cache"),
             rewrite_tail_cache: *@FieldType(Execution, "rewrite_tail_cache"),
             restore_decoder_cache: *@FieldType(Execution, "restore_decoder_cache"),
@@ -805,6 +807,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const batchInternalPrepared = Implementation.batchInternalPrepared;
             pub const batchInternalWithPreparationAllocator = Implementation.batchInternalWithPreparationAllocator;
             pub const captureTransformReadSnapshot = Implementation.captureTransformReadSnapshot;
+            pub const prepareDocumentPatches = Implementation.prepareDocumentPatches;
             pub const captureGeneratedWriteReadSnapshot = Implementation.captureGeneratedWriteReadSnapshot;
             pub const validateGeneratedWriteReadSnapshot = Implementation.validateGeneratedWriteReadSnapshot;
             pub const GeneratedWriteReadSnapshot = Implementation.GeneratedWriteReadSnapshot;
@@ -915,6 +918,7 @@ pub fn ImplementationFor(comptime D: type) type {
         }
         pub const Execution = struct {
             local_execution: *LocalExecutionState,
+            document_validation_authority: @import("document_validation_authority.zig").Authority = .{},
             rewrite_program_cache: @import("../rewrite_program_cache.zig").Cache = .{},
             rewrite_tail_cache: @import("../rewrite_tail_spool.zig").Cache = .{},
             restore_decoder_cache: @import("../restore_decoder_cache.zig").Cache = .{},
@@ -962,6 +966,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const batchInternalPrepared = Implementation.batchInternalPrepared;
             pub const batchInternalWithPreparationAllocator = Implementation.batchInternalWithPreparationAllocator;
             pub const captureTransformReadSnapshot = Implementation.captureTransformReadSnapshot;
+            pub const prepareDocumentPatches = Implementation.prepareDocumentPatches;
             pub const captureGeneratedWriteReadSnapshot = Implementation.captureGeneratedWriteReadSnapshot;
             pub const validateGeneratedWriteReadSnapshot = Implementation.validateGeneratedWriteReadSnapshot;
             pub const GeneratedWriteReadSnapshot = Implementation.GeneratedWriteReadSnapshot;

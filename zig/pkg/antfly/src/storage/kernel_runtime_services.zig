@@ -20,7 +20,8 @@ const abi = @import("kernel_owner_abi");
 pub const memory = @import("runtime_memory_abi");
 pub const executor = @import("antfly_runtime_abi").io_abi;
 
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
+pub const SourceReaderBrokerPort = @import("antfly_runtime_abi").source_owner_abi.Port;
 pub const Request = extern struct {
     version: u32 = abi_version,
     _reserved: u32 = 0,
@@ -34,12 +35,17 @@ pub const Request = extern struct {
     /// A borrowed executor supplies storage, clock, scheduling, and
     /// cancellation together. Its runtime must outlive context destruction.
     io: ?*const executor.Borrow = null,
+    /// Version 2 append-only extension. The provider copies this checked native
+    /// lookup; its origin image/context outlives every storage reader.
+    source_reader_broker: ?*const SourceReaderBrokerPort = null,
 };
 
 pub extern fn antfly_storage_context_create_with_runtime(
     request: *const Request,
     out_context: *?*anyopaque,
 ) abi.Status;
+
+pub extern fn antfly_storage_source_reader_broker(out: *SourceReaderBrokerPort) abi.Status;
 
 /// Borrowed publisher; callbacks and context outlive the storage context.
 /// JSON crosses the compilation boundary, and its producer releases it.

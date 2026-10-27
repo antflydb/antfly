@@ -4890,6 +4890,9 @@ const UnsupportedEnrichmentRuntime = struct {
     owns_store: bool,
     artifact_store: ?*docstore_mod.DocStore = null,
     artifact_publication_dispatcher: ?ordered_publication.Dispatcher = null,
+    // An optimization hint, never authority. Only a captured protocol17 token
+    // enables it; every hit revalidates the active catalog and source snapshot.
+    scoped_input_hint: std.atomic.Value(bool) = .init(false),
     artifact_unit_turn_commit: ?ArtifactUnitTurnCommit = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
@@ -5396,6 +5399,9 @@ const PlatformEnrichmentRuntime = struct {
     owns_store: bool,
     artifact_store: ?*docstore_mod.DocStore = null,
     artifact_publication_dispatcher: ?ordered_publication.Dispatcher = null,
+    // An optimization hint, never authority. Only a captured protocol17 token
+    // enables it; every hit revalidates the active catalog and source snapshot.
+    scoped_input_hint: std.atomic.Value(bool) = .init(false),
     artifact_unit_turn_commit: ?ArtifactUnitTurnCommit = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
@@ -24677,6 +24683,7 @@ fn collectPlainDenseBatchItem(
     window: *GeneratedReplayWindow,
 ) !?PlainDenseBatchItem {
     const embedding_artifact_name = requestEmbeddingName(request);
+    if (try scopedProducerInputAccepted(runtime, request)) return null;
     const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
     const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return null;
@@ -24830,6 +24837,19 @@ const GuardedEmbeddingWrite = struct {
     ordered_input: ?*const producer_input.Token = null,
 };
 
+// Observation consumers need equality, not ownership of another JSON copy.
+// Primary/group source values already have their logical representation. Typed
+// rows retain the exact pinned-schema decoder and owned temporary lifetime.
+fn verifyProducerInput(ctx: *anyopaque, alloc: Allocator, key: []const u8, raw: []const u8, observed: []const u8) !void {
+    if (!internal_keys.isRelationalRowKey(key)) {
+        if (!std.mem.eql(u8, raw, observed)) return error.EnrichmentSourceChanged;
+        return;
+    }
+    const logical = try materializeProducerInput(ctx, alloc, key, raw);
+    defer alloc.free(logical);
+    if (!std.mem.eql(u8, logical, observed)) return error.EnrichmentSourceChanged;
+}
+
 fn materializeProducerInput(ctx: *anyopaque, alloc: Allocator, key: []const u8, raw: []const u8) ![]u8 {
     const manager: *index_manager_mod.IndexManager = @ptrCast(@alignCast(ctx));
     return manager.materializeStoredValueAlloc(alloc, key, raw);
@@ -24838,12 +24858,17 @@ fn materializeProducerInput(ctx: *anyopaque, alloc: Allocator, key: []const u8, 
 fn captureAssetProducerContext(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: ?[]const u8) !?@import("../artifact_producer_context.zig").Token {
     if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
     defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
-    var read = try runtime.store.beginProbe();
+    {
+        var probe = try runtime.store.beginProbe();
+        defer probe.abort();
+        if (try ordered_publication.authority(&probe) == null) return null;
+    }
+    var read = try runtime.store.beginRead();
     defer read.abort();
     if (try ordered_publication.authority(&read) == null) return null;
     var plan = try runtime.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
-    return @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical_input, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput });
+    return @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical_input, .{ .ptr = runtime.index_manager, .verify = verifyProducerInput });
 }
 
 fn finishAcceptedAssetGraph(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
@@ -24881,19 +24906,63 @@ fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artif
 fn captureProducerInput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: []const u8) !?producer_input.Token {
     if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
     defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
-    var read = try runtime.store.beginProbe();
+    // Legacy/local execution without ordered producer authority keeps the
+    // inexpensive probe path. A positive hint is rechecked in the pinned cut.
+    {
+        var probe = try runtime.store.beginProbe();
+        defer probe.abort();
+        if (try ordered_publication.authority(&probe) == null) return null;
+    }
+    // Source bytes, lifecycle and authority form one immutable observation.
+    // Separate calls on a current-tip probe can observe different commits.
+    var read = try runtime.store.beginRead();
     defer read.abort();
     if (try ordered_publication.authority(&read) == null) return null;
     var plan = try runtime.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
-    return producer_input.capture(runtime.alloc, &read, runtime.config.root_incarnation, request, plan.plan(), source_key, logical_input, .{
+    const result = try producer_input.capture(runtime.alloc, &read, runtime.config.root_incarnation, request, plan.plan(), source_key, logical_input, .{
         .ptr = runtime.index_manager,
-        .materialize = materializeProducerInput,
+        .verify = verifyProducerInput,
     });
+    if (result) |token| if (token.scoped != null) runtime.scoped_input_hint.store(true, .release);
+    return result;
+}
+
+fn scopedProducerInputAccepted(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
+    if (!runtime.scoped_input_hint.load(.acquire) or @import("../producer_input_revision.zig").compile(request) == null) return false;
+    if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+    defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+    var read = try runtime.store.beginRead();
+    defer read.abort();
+    var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    const authorized = (try producer_input.authorizeDocument(runtime.alloc, &read, request, plan.plan())) orelse return false;
+    if (authorized.effect_protocol < 17 or authorized.input == null) return false;
+    if (request.sequence != 0) {
+        const identity = @import("../doc_identity.zig");
+        const ordinal = (try identity.lookupOrdinalTxn(runtime.alloc, &read, request.doc_key)) orelse return false;
+        const state = (try identity.lookupStateTxn(&read, ordinal)) orelse return false;
+        if (!state.isLive() or state.created_generation > request.sequence) return error.EnrichmentSourceChanged;
+    }
+    try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(runtime.alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
+    const selector: ordered_publication.Command = .{
+        .namespace = authorized.authority.namespace,
+        .authority_epoch = authorized.authority.epoch,
+        .catalog_digest = authorized.authority.catalog_digest,
+        .producer_name = request.index_name,
+        .producer_generation = authorized.generation,
+        .producer_artifact_name = requestEmbeddingName(request),
+        .sources = &.{},
+        .mutations = &.{},
+        .publication_digest = @splat(0),
+    };
+    var accepted = (try @import("../artifact_producer_provenance.zig").readCurrentScopedForDocument(runtime.alloc, &read, selector, request.doc_key)) orelse return false;
+    defer accepted.deinit();
+    return true;
 }
 
 fn producerInputAccepted(runtime: *EnrichmentRuntime, token: *const producer_input.Token) !bool {
-    var read = try runtime.store.beginProbe();
+    var read = try runtime.store.beginRead();
     defer read.abort();
     return token.accepted(&read);
 }
@@ -26091,7 +26160,7 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
         const stored = read.get(source_key) catch |err| if (err == error.NotFound) null else return err;
         const logical = if (stored) |raw| try materializeProducerInput(runtime.index_manager, runtime.alloc, source_key, raw) else null;
         defer if (logical) |raw| runtime.alloc.free(raw);
-        var token = (try @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput })) orelse return error.ArtifactCatalogDrift;
+        var token = (try @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical, .{ .ptr = runtime.index_manager, .verify = verifyProducerInput })) orelse return error.ArtifactCatalogDrift;
         errdefer token.deinit();
         const manifest_key = token.preconditions.items[0].key;
         const previous = try inventory.Manifest.decode(try read.get(manifest_key));
@@ -27551,6 +27620,7 @@ fn processDenseEmbedding(
         return;
     }
 
+    if (try scopedProducerInputAccepted(runtime, request)) return;
     const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
     const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return;
@@ -27707,6 +27777,7 @@ fn processSparseEmbedding(
         return;
     }
 
+    if (try scopedProducerInputAccepted(runtime, request)) return;
     const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
     const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return;
@@ -33715,6 +33786,100 @@ test "ordered artifact inventory authored document callbacks bypass providers an
             try std.testing.expect(try collectPlainDenseBatchItem(runtime, request, &.{"vector"}, &window) == null);
         } else try processSparseEmbedding(runtime, request, &cache, &window);
         try std.testing.expectEqual(@as(usize, 0), harness.calls);
+
+        // Real ordered producer capture must retain whole-source proof
+        // semantics for native documents, including unchanged-timestamp ABA.
+        db.core.store.document_payload_prototype = true;
+        const body = try owned.alloc(u8, 128 * 1024);
+        @memset(body, 'x');
+        const first = try std.fmt.allocPrint(owned, "{{\"body\":\"{s}\",\"metadata\":1}}", .{body});
+        const second = try std.fmt.allocPrint(owned, "{{\"body\":\"{s}\",\"metadata\":2}}", .{body});
+        try db.core.store.put(primary, first);
+        try db.core.store.put(primary, second);
+        {
+            var physical = try db.core.store.beginReadTxn();
+            defer physical.abort();
+            try std.testing.expect(@import("../../document_payload.zig").isManifest(try physical.getPhysical(primary)));
+        }
+        var no_bytes: [0]u8 = .{};
+        var no_allocations = std.heap.FixedBufferAllocator.init(&no_bytes);
+        try verifyProducerInput(runtime.index_manager, no_allocations.allocator(), primary, second, second);
+        try std.testing.expectError(error.EnrichmentSourceChanged, verifyProducerInput(runtime.index_manager, no_allocations.allocator(), primary, second, first));
+        var input = (try captureProducerInput(runtime, request, primary, second)) orelse return error.TestUnexpectedResult;
+        defer input.deinit();
+        var expected: publication.Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(second, &expected, .{});
+        try std.testing.expectEqualDeep(expected, input.source.content_digest);
+        {
+            var read = try runtime.store.beginRead();
+            defer read.abort();
+            try publication.validateSources(alloc, &read, input.namespace, (&input.source)[0..1]);
+        }
+        // The TTL is unchanged. A new source position must still invalidate
+        // the old provider result, including a return to identical bytes.
+        try db.core.store.put(primary, first);
+        try std.testing.expectError(error.EnrichmentSourceChanged, captureProducerInput(runtime, request, primary, second));
+        try db.core.store.put(primary, second);
+        {
+            var read = try runtime.store.beginRead();
+            defer read.abort();
+            try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateSources(alloc, &read, input.namespace, (&input.source)[0..1]));
+        }
+        // Upgrade the ordered protocol and exercise the actual dense/sparse
+        // replay fast path and completion closure with a retained model result.
+        var upgraded = try db.artifactInventoryCommand(alloc);
+        defer upgraded.catalogs.deinit(alloc);
+        upgraded.previous = catalog.binding;
+        upgraded.binding.epoch = catalog.binding.epoch + 1;
+        upgraded.binding.effect_protocol = 17;
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            const identity = @import("../doc_identity.zig");
+            _ = try identity.ensureOrdinalForNamespaceTxn(alloc, &txn, db.core.identity_namespace, 2, "doc");
+            try @import("../artifact_inventory.zig").stageOrdered(alloc, &txn, upgraded, 2);
+            try txn.commit();
+        }
+        var scoped_input = (try captureProducerInput(runtime, request, primary, second)) orelse return error.TestUnexpectedResult;
+        defer scoped_input.deinit();
+        try std.testing.expect(scoped_input.scoped != null);
+        try std.testing.expect(runtime.scoped_input_hint.load(.acquire));
+        const scoped_command = scoped_input.command(&.{.{ .family = .base_vector, .key = output, .value = value, .source_index = 0 }});
+        const provenance = @import("../artifact_producer_provenance.zig");
+        var proof = try provenance.fromCommand(alloc, scoped_command);
+        defer proof.deinit();
+        const proof_bytes = try provenance.encodeAlloc(alloc, proof.proof);
+        defer alloc.free(proof_bytes);
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            const position: publication.Position = .{ .raft = .{ .term = 1, .index = 3 } };
+            try publication.stageReceipts(&txn, scoped_command, 3);
+            try publication.stageArtifactRevisions(&txn, scoped_command, position);
+            try provenance.stage(&txn, scoped_command, proof_bytes, position);
+            try txn.commit();
+        }
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.patchMetadata(primary, &.{.{ .name = "metadata", .value_json = "3" }});
+            try txn.commit();
+        }
+        try std.testing.expect(try scopedProducerInputAccepted(runtime, request));
+        if (dense) {
+            try processDenseEmbedding(runtime, request, &cache, &sources, &window);
+            try std.testing.expect(try collectPlainDenseBatchItem(runtime, request, &.{"vector"}, &window) == null);
+        } else try processSparseEmbedding(runtime, request, &cache, &window);
+        try std.testing.expectEqual(@as(usize, 0), harness.calls);
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var closed = try @import("../artifact_stream_progress.zig").prepareDocumentClosure(alloc, &read, db.root_incarnation, request, pin.plan());
+            defer closed.deinit();
+            try closed.observation.requireCurrent(&read, "doc");
+        }
+        try db.core.store.put(primary, "{\"body\":\"changed\",\"metadata\":3}");
+        try std.testing.expect(!try scopedProducerInputAccepted(runtime, request));
     }
 }
 
@@ -34345,6 +34510,13 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
         .invocation_memory_for_requests = testInvocationMemoryForRequests,
     } } else null });
     const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    // This fixture advances causal publications explicitly; host contention
+    // must not expire its worker tenure between those deterministic steps.
+    const original_clock = runtime.clock;
+    defer runtime.clock = original_clock;
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(original_clock.nowRealtimeNs());
+    runtime.clock = clock.clock();
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     var plan = try db.core.index_manager.acquireWritePlanSnapshot();
     defer plan.release();

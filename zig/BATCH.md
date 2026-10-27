@@ -329,3 +329,68 @@ That bench should use overwrite-heavy document/full-text input and make it easy 
 - no bulk session
 - bulk session with coalescing
 - different sync levels
+
+## Prepared immutable document publications (internal qualification)
+
+Document transforms may carry a native prepared storage receipt alongside their
+complete logical JSON. Positive snapshot preparation reads only bounded inline
+roots and manifest metadata, and never reconstructs the old complete source.
+Same-document operations share one ordered change plan; immutable descriptors
+remain borrowed until one final compatibility rendering. Opaque extraction borrows
+that request-owned rendering through commit. Unsupported changes reconstruct
+complete source directly into request-owned buffers and use ordinary execution.
+Wide batches group transforms once in key/request order, and prepared receipts
+are sorted for binary lookup. Ordinary unactivated stores allocate no payload
+snapshot sidecars.
+
+Whole-document point reads transfer the already owned JSON buffer through the DB
+materializer. Typed rows retain pinned-schema decoding. The owned materializer
+consumes its input even on error; TTL and row-policy checks retain their original
+fences and free the result on rejection. No extra full JSON allocation is needed
+when the stored value already has the caller's logical representation. Native
+reconstruction uses a child scope from the same pinned view to deliver whole
+immutable values into final caller buffers in sorted batches of at most 64 keys.
+Partial values keep range I/O, and unsupported scopes retain the reference path.
+Temporary decoder memory is reclaimed independently of the returned JSON.
+
+The receipt binds the source logical root and exact physical manifest checksum.
+At apply, current source/schema/index fences remain authoritative, the receipt
+must still match the complete requested logical input. A changed source root or
+mutation revision rejects preparation for retry, including identical-timestamp
+and delete/reinsert ABA changes. Representation-only changes and unsupported
+receipts retain the ordinary full-write path. A disposable root cache is only a
+hint; missing/damaged entries fall back to actual manifest metadata. Extraction,
+observers, retained history and indexing still receive complete logical documents.
+Receipts travel through the existing private commit participant, independently
+of its observer/stamping callbacks. KV pairs keep their original two-slice layout
+and ordinary fast JSON codec; no receipt field exists in the wire record.
+Permissive JSON parsing cannot construct a native receipt. Replay, cloning and
+paths that cannot retain the participant use the complete logical fallback.
+
+This path remains behind an internal format qualification gate. Persisted
+catalog/peer activation is required before automatic migration can ship; users
+should not need a per-table opt-in. Eligible local writes now reuse root-local
+HMAC validation attestations bound to the row, exact physical manifest, logical
+root, validator rules and schema version. Publication is atomic with source and
+revision effects; preparation grants no storage ownership or authorization.
+Unknown/non-composable rules and historical ordered admission keep full validation.
+DDL preserves an already upgraded physical reader fence and keeps logical schema
+fingerprints independent of that local physical layout. Scoped index/producer
+effects are still required before untouched derived work can be skipped safely. See the [payload and publication design](../docs/design/antfly-grep.md)
+and [qualification evidence](pkg/antfly-grep/README.md). Public transform semantics
+and authorization are unchanged.
+
+
+Provider input capture uses a pinned authority/source snapshot after a cheap
+negative authority probe. Its private verifier borrows primary/group JSON for
+equality instead of allocating another source copy; relational rows retain
+schema-aware decoding and an owned temporary. Hash borrowed input before
+verification or later lookups can retire decoder buffers; shared source validation
+hashes each row encoding before probing its alternate encoding. Existing
+whole-source guards, logical fallback and wire semantics are unchanged.
+`document-provider-input-test` covers ordered dense/sparse and asset capture,
+source ABA, zero-allocation JSON verification and retiring-buffer adapters.
+A test-only native manifest comparison candidate remains reproducible, but is
+not active: its second SHA-256 pass measured about 1.9x the reference latency in
+the focused macOS fixture. Composable producer proofs require their own versioned
+contract before source hashing and unrelated-update invalidation can be removed.

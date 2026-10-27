@@ -33,13 +33,19 @@ pub const Binding = struct {
     effect_protocol: u16 = 14,
 
     pub fn valid(self: Binding) bool {
-        return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= 16);
+        return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= 17);
     }
 
     /// Protocol 16 extends protocol 15's receipt-backed stream witnesses.
     /// Keep this a capability check so compatible extensions retain them.
     pub fn supportsProducerWitnesses(self: Binding) bool {
         return self.valid() and self.effect_protocol >= 15;
+    }
+    pub fn supportsGroupedSources(self: Binding) bool {
+        return self.valid() and self.effect_protocol >= 16;
+    }
+    pub fn supportsScopedInputs(self: Binding) bool {
+        return self.valid() and self.effect_protocol >= 17;
     }
     pub fn compatible(a: Binding, b: Binding) bool {
         return a.valid() and b.valid() and a.effect_protocol == b.effect_protocol and std.mem.eql(u8, &a.semantic_digest, &b.semantic_digest);
@@ -113,6 +119,7 @@ pub const Command = struct {
 
     pub fn validate(self: Command) !void {
         const previous_epoch = if (self.previous) |p| p.epoch else 0;
+        if (self.previous) |previous| if (!previous.valid() or previous.effect_protocol > self.binding.effect_protocol) return error.InvalidArtifactCatalogCommand;
         if (!self.binding.valid() or previous_epoch == std.math.maxInt(u64) or self.binding.epoch != previous_epoch + 1 or
             !std.mem.eql(u8, &self.binding.digest, &self.catalogs.digest()) or
             self.catalogs.indexes.len > 1024 * 1024 or self.catalogs.enrichments.len > 1024 * 1024 or self.catalogs.resolvers.len > 1024 * 1024 or
@@ -142,7 +149,9 @@ test "grouped sources production ordered artifact inventory compatibility binds 
     try std.testing.expect(extended.supportsProducerWitnesses());
     try std.testing.expect(!direct.compatible(extended));
     extended.effect_protocol = 17;
-    try std.testing.expect(!extended.supportsProducerWitnesses());
+    try std.testing.expect(extended.supportsProducerWitnesses() and extended.supportsScopedInputs());
+    try std.testing.expect(!direct.supportsScopedInputs());
+    extended.effect_protocol = 18;
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }
 
@@ -190,12 +199,12 @@ pub fn catalogs(txn: anytype) !Catalogs {
     return .{ .indexes = try get(txn, index_key), .enrichments = try get(txn, enrichment_key), .resolvers = try get(txn, resolver_key) };
 }
 pub fn copyCatalogs(alloc: std.mem.Allocator, txn: anytype) !Catalogs {
-    const view = try catalogs(txn);
-    const indexes = try alloc.dupe(u8, view.indexes);
+    // Copy each borrowed result before the next lookup can retire it.
+    const indexes = try alloc.dupe(u8, try get(txn, index_key));
     errdefer alloc.free(indexes);
-    const enrichments = try alloc.dupe(u8, view.enrichments);
+    const enrichments = try alloc.dupe(u8, try get(txn, enrichment_key));
     errdefer alloc.free(enrichments);
-    return .{ .indexes = indexes, .enrichments = enrichments, .resolvers = try alloc.dupe(u8, view.resolvers) };
+    return .{ .indexes = indexes, .enrichments = enrichments, .resolvers = try alloc.dupe(u8, try get(txn, resolver_key)) };
 }
 pub fn local(txn: anytype) !LocalBinding {
     const bytes = try get(txn, local_key);
@@ -231,8 +240,16 @@ pub fn load(alloc: std.mem.Allocator, txn: anytype) !?std.json.Parsed(Ordered) {
     return parsed;
 }
 pub fn stageOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, applied_index: u64) !void {
+    errdefer if (command.binding.supportsScopedInputs()) {
+        const T = switch (@typeInfo(@TypeOf(txn))) {
+            .pointer => |ptr| ptr.child,
+            else => @TypeOf(txn),
+        };
+        if (comptime @hasDecl(T, "poison")) txn.poison();
+    };
     const raw = try prepareOrdered(alloc, txn, command, applied_index);
     defer if (raw) |value| alloc.free(value);
+    if (command.binding.supportsScopedInputs()) try @import("scoped_producer_inputs.zig").admitProtocol(alloc, txn);
     if (raw) |value| try txn.put(ordered_key, value);
     try @import("artifact_catalog_activation.zig").stage(alloc, txn, command);
 }

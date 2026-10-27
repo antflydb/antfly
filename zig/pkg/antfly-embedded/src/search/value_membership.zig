@@ -47,6 +47,12 @@ fn digest(value: anytype) [32]u8 {
 pub fn key(scope: Scope, index: ?[]const u8, segment: u64, count: u32, spec: anytype) [32]u8 {
     return digest(.{ scope.identity, index, segment, count, @tagName(spec.kind), spec.field, spec.text, spec.case_sensitive });
 }
+/// Retained facts must bind the authenticated source-map root as well as
+/// visibility/schema scope. Reusing a physical segment ID does not preserve
+/// unindexed values when a logical source generation changes.
+pub fn indexedKey(scope: Scope, index: ?[]const u8, segment: u64, count: u32, spec: anytype, root: [32]u8) [32]u8 {
+    return digest(.{ "indexed-source-values-v1", scope.identity, index, segment, count, root, @tagName(spec.kind), spec.field, spec.text, spec.case_sensitive });
+}
 pub const Facts = struct {
     complete: bool = false,
     known: Bitmap,

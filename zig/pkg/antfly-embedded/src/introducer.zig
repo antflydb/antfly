@@ -534,12 +534,17 @@ pub const TextField = struct {
     field_name: []const u8,
     /// Stored source path, including for generated companions and `_all`.
     source_field: ?[]const u8 = null,
+    source_identity: ?@import("storage/text_value_identity.zig").Text = null,
     text: []const u8,
     analyzer: ?*const analysis_mod.Analyzer = null,
 };
 
 pub const BuildTextOptions = struct {
     contribution_cache: ?*AnalyzedContributionCache = null,
+    /// Internal native field plan. Every skipped field must be restored through
+    /// an authenticated field publication; callers publishing standalone legacy
+    /// segments leave this empty.
+    skip_fields: []const []const u8 = &.{},
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
     unindexed_paths: []const []const u8 = &.{},
@@ -575,6 +580,11 @@ const ContributionSpan = struct {
 const ContributionUses = std.AutoHashMapUnmanaged(ContributionSpan, u8);
 fn repeatedContribution(uses: *const ContributionUses, field: TextField, analyzer: *const analysis_mod.Analyzer) bool {
     return (uses.get(ContributionSpan.init(field.text, analyzer)) orelse 0) >= 2;
+}
+
+fn skipCompiledField(options: BuildTextOptions, name: []const u8) bool {
+    for (options.skip_fields) |skipped| if (std.mem.eql(u8, skipped, name)) return true;
+    return false;
 }
 
 pub const BuildTextProfile = struct {
@@ -1050,7 +1060,7 @@ fn writeTextSegmentWithScratch(
             // Bounded prediction admits the first analysis only when another
             // actual, unskipped consumer will use these same bytes/pipeline.
             for (text_doc.text_fields) |field| {
-                if (field.text.len < contribution_cache_mod.minimum_input) continue;
+                if (field.text.len < contribution_cache_mod.minimum_input or skipCompiledField(options, field.field_name)) continue;
                 if (contribution_uses.count() >= 256) break;
                 const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, field, default_analyzer, text_analysis);
                 const use = contribution_uses.getOrPut(alloc, ContributionSpan.init(field.text, analyzer)) catch {
@@ -1087,7 +1097,7 @@ fn writeTextSegmentWithScratch(
 
         if (!try orderTextFields(alloc, &scratch.field_order, text_doc.text_fields)) {
             for (text_doc.text_fields) |tf| {
-
+                if (skipCompiledField(options, tf.field_name)) continue;
                 // Unique contributions do not share token ownership. Release
                 // copied term keys between physical representations, rather
                 // than retaining every representation until the row finishes.
@@ -1121,6 +1131,10 @@ fn writeTextSegmentWithScratch(
                 const field_name = text_doc.text_fields[scratch.field_order.items[start]].field_name;
                 var end = start + 1;
                 while (end < scratch.field_order.items.len and std.mem.eql(u8, field_name, text_doc.text_fields[scratch.field_order.items[end]].field_name)) : (end += 1) {}
+                if (skipCompiledField(options, field_name)) {
+                    start = end;
+                    continue;
+                }
                 _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
                 if (end == start + 1) {
                     try addSingleTextFieldToBuilders(alloc, doc_alloc, &field_builders, &field_indices, &seg_writer, &analyzer_cache, @intCast(doc_idx), text_doc.text_fields[scratch.field_order.items[start]], default_analyzer, text_analysis, profile, profile_timings, &scratch, options.contribution_cache, &contribution_uses);
@@ -1135,7 +1149,7 @@ fn writeTextSegmentWithScratch(
                         const tf = text_doc.text_fields[index];
                         if (profile) |p| p.text_field_count +|= 1;
                         const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, tf, default_analyzer, text_analysis);
-                        try accumulateAnalyzedField(doc_alloc, alloc, &field_maps, tf.field_name, analyzer, tf.text, profile, profile_timings, options.contribution_cache, repeatedContribution(&contribution_uses, tf, analyzer));
+                        try accumulateAnalyzedField(doc_alloc, alloc, &field_maps, tf.field_name, analyzer, tf.text, tf.source_identity, profile, profile_timings, options.contribution_cache, repeatedContribution(&contribution_uses, tf, analyzer));
                     }
                     const hit_materialize_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
                     scratch.hits.clearRetainingCapacity();
@@ -1174,6 +1188,7 @@ fn writeTextSegmentWithScratch(
         const typed_collect_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         if (text_doc.typed_fields) |projected_typed_fields| {
             for (projected_typed_fields) |field| {
+                if (skipCompiledField(doc_options, field.field_name)) continue;
                 if (field.conflicted) {
                     try markTypedFieldConflict(alloc, &typed_fields, field.field_name);
                     continue;
@@ -1503,6 +1518,14 @@ fn buildTextDocumentOrderAlloc(
     return order;
 }
 
+pub fn orderedTextDocumentsAlloc(a: Allocator, docs: []const TextDocument, analysis: TextAnalysisConfig, index_sort: []const segment_mod.SegmentIndexSortField) ![]TextDocument {
+    const order = try buildTextDocumentOrderAlloc(a, docs, analysis, index_sort);
+    defer freeTextDocumentOrder(a, order);
+    const sorted = try a.alloc(TextDocument, docs.len);
+    for (sorted, order) |*doc, entry| doc.* = docs[entry.doc_index];
+    return sorted;
+}
+
 fn freeTextDocumentOrder(alloc: Allocator, order: []TextIndexSortEntry) void {
     for (order) |*entry| entry.deinit(alloc);
     if (order.len > 0) alloc.free(order);
@@ -1705,7 +1728,7 @@ fn addSingleTextFieldToBuilders(
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
     var field_acc = FieldAcc.init(alloc);
     defer field_acc.deinit();
-    if (try accumulateCachedContribution(doc_alloc, &field_acc, analyzer, field.text, profile, contribution_cache, repeatedContribution(contribution_uses, field, analyzer))) {
+    if (try accumulateCachedContribution(doc_alloc, &field_acc, analyzer, field.text, field.source_identity, profile, contribution_cache, repeatedContribution(contribution_uses, field, analyzer))) {
         // The cached term contribution already has exact norms and positions.
     } else if (if (field.text.len >= 128) analyzer.tokenStream(field.text) else null) |producer| {
         const started = if (profile_timings) platform_time.monotonicNs() else 0;
@@ -1804,13 +1827,13 @@ fn accumulateTokenStream(a: Allocator, field: *FieldAcc, input: analysis_mod.Tok
     field.token_offset = try std.math.add(u32, base, count);
     return count;
 }
-fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool, contribution_cache: ?*AnalyzedContributionCache, known_reuse: bool) !void {
+fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, source_identity: ?@import("storage/text_value_identity.zig").Text, profile: ?*BuildTextProfile, timings: bool, contribution_cache: ?*AnalyzedContributionCache, known_reuse: bool) !void {
     if (contribution_cache != null and text.len >= contribution_cache_mod.minimum_input) {
         const existing = fields.getPtr(name);
         var fresh = FieldAcc.init(scratch);
         var transferred = false;
         defer if (existing == null and !transferred) fresh.deinit();
-        if (try accumulateCachedContribution(a, existing orelse &fresh, analyzer, text, profile, contribution_cache, known_reuse)) {
+        if (try accumulateCachedContribution(a, existing orelse &fresh, analyzer, text, source_identity, profile, contribution_cache, known_reuse)) {
             if (existing == null and fresh.token_offset != 0) {
                 try fields.put(a, name, fresh);
                 transferred = true;
@@ -1897,10 +1920,10 @@ fn mergeEncodedContribution(a: Allocator, target: *FieldAcc, lease: *const Analy
     target.token_offset = next;
 }
 
-fn accumulateCachedContribution(a: Allocator, target: *FieldAcc, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, optional_cache: ?*AnalyzedContributionCache, known_reuse: bool) !bool {
+fn accumulateCachedContribution(a: Allocator, target: *FieldAcc, analyzer: *const analysis_mod.Analyzer, text: []const u8, source_identity: ?@import("storage/text_value_identity.zig").Text, profile: ?*BuildTextProfile, optional_cache: ?*AnalyzedContributionCache, known_reuse: bool) !bool {
     const cache = optional_cache orelse return false;
     if (text.len < contribution_cache_mod.minimum_input) return false;
-    const digest = try AnalyzedContributionCache.key(analyzer, text);
+    const digest = try AnalyzedContributionCache.keyWithIdentity(analyzer, text, if (source_identity) |identity| identity.digest(text) else null);
     if (cache.borrow(digest)) |borrowed| {
         var lease = borrowed;
         defer lease.deinit();
@@ -2114,33 +2137,59 @@ const DetectedTypedValue = struct {
     value: typed_dv.TypedValue,
 };
 
-pub fn collectTypedFieldProjection(
-    alloc: Allocator,
-    value: std.json.Value,
-    text_analysis: TextAnalysisConfig,
-    options: BuildTextOptions,
-) ![]TypedFieldValue {
-    if (value != .object) return &.{};
-
-    var fields = std.ArrayListUnmanaged(TypedFieldValue).empty;
-    defer fields.deinit(alloc);
-
-    if (options.recursive_typed_fields) {
-        try collectTypedFieldProjectionRecursive(alloc, value, "", text_analysis, &fields);
-    } else if (options.infer_type_dynamic_paths.len > 0) {
-        try collectTypedFieldProjectionRecursiveScoped(alloc, value, "", text_analysis, options.infer_type_dynamic_paths, options.unindexed_paths, &fields);
+/// Visit the same inferred typed contributions used by the native text
+/// compiler, borrowing names/values for the callback. Consumers can hash closed
+/// inputs without cloning large byte values or maintaining a second type DSL.
+pub fn visitTypedFieldProjection(alloc: Allocator, value: std.json.Value, text_analysis: TextAnalysisConfig, options: BuildTextOptions, visitor: anytype) !void {
+    if (value != .object) return;
+    if (options.recursive_typed_fields or options.infer_type_dynamic_paths.len != 0) {
+        try visitTypedFieldProjectionAt(alloc, value, "", text_analysis, options, visitor, 0);
     } else {
-        var it = value.object.iterator();
-        while (it.next()) |entry| {
-            const field_name = entry.key_ptr.*;
-            if (field_name.len > 0 and field_name[0] == '_') continue;
-            if (pathFallsUnderAnyScopedPath(options.unindexed_paths, field_name)) continue;
-
-            const detected = detectTypedValue(field_name, entry.value_ptr.*, text_analysis) orelse continue;
-            try appendTypedFieldProjectionValue(alloc, &fields, field_name, detected);
+        var entries = value.object.iterator();
+        while (entries.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if ((name.len != 0 and name[0] == '_') or pathFallsUnderAnyScopedPath(options.unindexed_paths, name)) continue;
+            const detected = detectTypedValue(name, entry.value_ptr.*, text_analysis) orelse continue;
+            try visitor.field(TypedFieldValue{ .field_name = name, .value_type = detected.value_type, .value = detected.value });
         }
     }
+}
+fn visitTypedFieldProjectionAt(alloc: Allocator, value: std.json.Value, path: []const u8, text_analysis: TextAnalysisConfig, options: BuildTextOptions, visitor: anytype, depth: usize) !void {
+    if (depth > 256) return error.ResourceBudgetExceeded;
+    if (!options.recursive_typed_fields and path.len != 0 and pathFallsUnderAnyScopedPath(options.unindexed_paths, path)) return;
+    if (path.len != 0 and (options.recursive_typed_fields or pathFallsUnderAnyScopedPath(options.infer_type_dynamic_paths, path))) {
+        if (detectTypedValue(path, value, text_analysis)) |detected| {
+            try visitor.field(TypedFieldValue{ .field_name = path, .value_type = detected.value_type, .value = detected.value });
+            if (value == .object and detected.value_type == .geo_point) return;
+        }
+    }
+    switch (value) {
+        .object => |object| {
+            var entries = object.iterator();
+            while (entries.next()) |entry| {
+                if (entry.key_ptr.*.len != 0 and entry.key_ptr.*[0] == '_') continue;
+                const child = if (path.len == 0) try alloc.dupe(u8, entry.key_ptr.*) else try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
+                defer alloc.free(child);
+                try visitTypedFieldProjectionAt(alloc, entry.value_ptr.*, child, text_analysis, options, visitor, depth + 1);
+            }
+        },
+        .array => |array| for (array.items) |item| try visitTypedFieldProjectionAt(alloc, item, path, text_analysis, options, visitor, depth + 1),
+        else => {},
+    }
+}
 
+pub fn collectTypedFieldProjection(alloc: Allocator, value: std.json.Value, text_analysis: TextAnalysisConfig, options: BuildTextOptions) ![]TypedFieldValue {
+    var fields = std.ArrayListUnmanaged(TypedFieldValue).empty;
+    defer fields.deinit(alloc);
+    const Collector = struct {
+        allocator: Allocator,
+        fields: *std.ArrayListUnmanaged(TypedFieldValue),
+        pub fn field(self: *@This(), projected: TypedFieldValue) !void {
+            try appendTypedFieldProjectionValue(self.allocator, self.fields, projected.field_name, .{ .value_type = projected.value_type, .value = projected.value });
+        }
+    };
+    var collector: Collector = .{ .allocator = alloc, .fields = &fields };
+    try visitTypedFieldProjection(alloc, value, text_analysis, options, &collector);
     if (fields.items.len == 0) return &.{};
     return try alloc.dupe(TypedFieldValue, fields.items);
 }
@@ -2158,110 +2207,21 @@ fn collectTypedFieldValues(
     try collectTypedFieldValuesFromValue(alloc, parsed.value, doc_id, typed_fields, text_analysis, options, false);
 }
 
-fn collectTypedFieldValuesFromValue(
-    alloc: Allocator,
-    value: std.json.Value,
-    doc_id: u32,
-    typed_fields: *TypedFieldCollectors,
-    text_analysis: TextAnalysisConfig,
-    options: BuildTextOptions,
-    borrow_values: bool,
-) !void {
-    if (value != .object) return;
-
-    if (options.recursive_typed_fields) {
-        try collectTypedFieldValuesRecursive(alloc, value, "", doc_id, typed_fields, text_analysis, options.profile, borrow_values);
-        return;
-    }
-    if (options.infer_type_dynamic_paths.len > 0) {
-        try collectTypedFieldValuesRecursiveScoped(alloc, value, "", doc_id, typed_fields, text_analysis, options.infer_type_dynamic_paths, options.unindexed_paths, options.profile, borrow_values);
-        return;
-    }
-
-    var it = value.object.iterator();
-    while (it.next()) |entry| {
-        const field_name = entry.key_ptr.*;
-        if (field_name.len > 0 and field_name[0] == '_') continue;
-        if (pathFallsUnderAnyScopedPath(options.unindexed_paths, field_name)) continue;
-
-        const detected = detectTypedValue(field_name, entry.value_ptr.*, text_analysis) orelse continue;
-        try appendTypedFieldValue(alloc, typed_fields, field_name, doc_id, detected, options.profile, borrow_values);
-    }
-}
-
-fn collectTypedFieldProjectionRecursive(
-    alloc: Allocator,
-    value: std.json.Value,
-    path: []const u8,
-    text_analysis: TextAnalysisConfig,
-    fields: *std.ArrayListUnmanaged(TypedFieldValue),
-) !void {
-    if (path.len > 0) {
-        if (detectTypedValue(path, value, text_analysis)) |detected| {
-            try appendTypedFieldProjectionValue(alloc, fields, path, detected);
-            if (value == .object and detected.value_type == .geo_point) return;
+fn collectTypedFieldValuesFromValue(alloc: Allocator, value: std.json.Value, doc_id: u32, typed_fields: *TypedFieldCollectors, text_analysis: TextAnalysisConfig, options: BuildTextOptions, borrow_values: bool) !void {
+    const Collector = struct {
+        allocator: Allocator,
+        doc_id: u32,
+        fields: *TypedFieldCollectors,
+        profile: ?*BuildTextProfile,
+        borrow_values: bool,
+        options: BuildTextOptions,
+        pub fn field(self: *@This(), projected: TypedFieldValue) !void {
+            if (skipCompiledField(self.options, projected.field_name)) return;
+            try appendTypedFieldValue(self.allocator, self.fields, projected.field_name, self.doc_id, .{ .value_type = projected.value_type, .value = projected.value }, self.profile, self.borrow_values);
         }
-    }
-
-    switch (value) {
-        .object => |object| {
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
-                const child_path = if (path.len == 0)
-                    try alloc.dupe(u8, entry.key_ptr.*)
-                else
-                    try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
-                defer alloc.free(child_path);
-                try collectTypedFieldProjectionRecursive(alloc, entry.value_ptr.*, child_path, text_analysis, fields);
-            }
-        },
-        .array => |array| {
-            for (array.items) |item| {
-                try collectTypedFieldProjectionRecursive(alloc, item, path, text_analysis, fields);
-            }
-        },
-        else => {},
-    }
-}
-
-fn collectTypedFieldProjectionRecursiveScoped(
-    alloc: Allocator,
-    value: std.json.Value,
-    path: []const u8,
-    text_analysis: TextAnalysisConfig,
-    scoped_paths: []const []const u8,
-    unindexed_paths: []const []const u8,
-    fields: *std.ArrayListUnmanaged(TypedFieldValue),
-) !void {
-    if (path.len > 0 and pathFallsUnderAnyScopedPath(unindexed_paths, path)) return;
-    if (path.len > 0 and pathFallsUnderAnyScopedPath(scoped_paths, path)) {
-        if (detectTypedValue(path, value, text_analysis)) |detected| {
-            try appendTypedFieldProjectionValue(alloc, fields, path, detected);
-            if (value == .object and detected.value_type == .geo_point) return;
-        }
-    }
-
-    switch (value) {
-        .object => |object| {
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
-                const child_path = if (path.len == 0)
-                    try alloc.dupe(u8, entry.key_ptr.*)
-                else
-                    try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
-                defer alloc.free(child_path);
-                try collectTypedFieldProjectionRecursiveScoped(alloc, entry.value_ptr.*, child_path, text_analysis, scoped_paths, unindexed_paths, fields);
-            }
-        },
-        .array => |array| {
-            for (array.items) |item| {
-                try collectTypedFieldProjectionRecursiveScoped(alloc, item, path, text_analysis, scoped_paths, unindexed_paths, fields);
-            }
-        },
-        else => {},
-    }
+    };
+    var collector: Collector = .{ .allocator = alloc, .doc_id = doc_id, .fields = typed_fields, .profile = options.profile, .borrow_values = borrow_values, .options = options };
+    try visitTypedFieldProjection(alloc, value, text_analysis, options, &collector);
 }
 
 fn appendTypedFieldProjectionValue(
@@ -2302,87 +2262,6 @@ fn cloneTypedValue(alloc: Allocator, value: typed_dv.TypedValue) !typed_dv.Typed
         .numeric_val => |number| .{ .numeric_val = number },
         .datetime_ns => |ns| .{ .datetime_ns = ns },
     };
-}
-
-fn collectTypedFieldValuesRecursive(
-    alloc: Allocator,
-    value: std.json.Value,
-    path: []const u8,
-    doc_id: u32,
-    typed_fields: *TypedFieldCollectors,
-    text_analysis: TextAnalysisConfig,
-    profile: ?*BuildTextProfile,
-    borrow_values: bool,
-) !void {
-    if (path.len > 0) {
-        if (detectTypedValue(path, value, text_analysis)) |detected| {
-            try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected, profile, borrow_values);
-            if (value == .object and detected.value_type == .geo_point) return;
-        }
-    }
-
-    switch (value) {
-        .object => |object| {
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
-                const child_path = if (path.len == 0)
-                    try alloc.dupe(u8, entry.key_ptr.*)
-                else
-                    try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
-                defer alloc.free(child_path);
-                try collectTypedFieldValuesRecursive(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, profile, borrow_values);
-            }
-        },
-        .array => |array| {
-            for (array.items) |item| {
-                try collectTypedFieldValuesRecursive(alloc, item, path, doc_id, typed_fields, text_analysis, profile, borrow_values);
-            }
-        },
-        else => {},
-    }
-}
-
-fn collectTypedFieldValuesRecursiveScoped(
-    alloc: Allocator,
-    value: std.json.Value,
-    path: []const u8,
-    doc_id: u32,
-    typed_fields: *TypedFieldCollectors,
-    text_analysis: TextAnalysisConfig,
-    scoped_paths: []const []const u8,
-    unindexed_paths: []const []const u8,
-    profile: ?*BuildTextProfile,
-    borrow_values: bool,
-) !void {
-    if (path.len > 0 and pathFallsUnderAnyScopedPath(unindexed_paths, path)) return;
-    if (path.len > 0 and pathFallsUnderAnyScopedPath(scoped_paths, path)) {
-        if (detectTypedValue(path, value, text_analysis)) |detected| {
-            try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected, profile, borrow_values);
-            if (value == .object and detected.value_type == .geo_point) return;
-        }
-    }
-
-    switch (value) {
-        .object => |object| {
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
-                const child_path = if (path.len == 0)
-                    try alloc.dupe(u8, entry.key_ptr.*)
-                else
-                    try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
-                defer alloc.free(child_path);
-                try collectTypedFieldValuesRecursiveScoped(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, scoped_paths, unindexed_paths, profile, borrow_values);
-            }
-        },
-        .array => |array| {
-            for (array.items) |item| {
-                try collectTypedFieldValuesRecursiveScoped(alloc, item, path, doc_id, typed_fields, text_analysis, scoped_paths, unindexed_paths, profile, borrow_values);
-            }
-        },
-        else => {},
-    }
 }
 
 fn pathFallsUnderAnyScopedPath(scoped_paths: []const []const u8, path: []const u8) bool {
@@ -4831,13 +4710,13 @@ test "introducer.substring stream admits only nonempty field contributions" {
         while (entries.next()) |entry| entry.deinit();
     }
     for ([_]*const analysis_mod.Analyzer{ &analysis_mod.substring_analyzer, &analysis_mod.default_analyzer }) |analyzer| {
-        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "empty", analyzer, "", null, false, null, false);
-        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "punctuation", analyzer, "...", null, false, null, false);
+        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "empty", analyzer, "", null, null, false, null, false);
+        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "punctuation", analyzer, "...", null, null, false, null, false);
         try std.testing.expectEqual(@as(u32, 0), fields.count());
     }
-    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "NEEDLE", null, false, null, false);
+    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "NEEDLE", null, null, false, null, false);
     const before = fields.get("source").?.token_offset;
-    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "", null, false, null, false);
+    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "", null, null, false, null, false);
     try std.testing.expectEqual(before, fields.get("source").?.token_offset);
     try std.testing.expectEqual(@as(u32, 1), fields.count());
 }

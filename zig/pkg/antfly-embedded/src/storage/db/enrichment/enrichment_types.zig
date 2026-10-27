@@ -236,6 +236,25 @@ pub const GeneratedEnrichmentRequest = struct {
     reprocess_generation: u64 = 0,
 };
 
+/// One definition constructor for runtime planning and scoped-input validation.
+/// Names/dimensions and producer membership must come from the active catalog.
+pub fn directDocumentEmbeddingRequest(kind: GeneratedEnrichmentKind, index_name: []const u8, document: []const u8, embedding_name: []const u8, dimensions: u32, config: anytype) GeneratedEnrichmentRequest {
+    std.debug.assert(kind == .dense_embedding or kind == .sparse_embedding);
+    return .{
+        .kind = kind,
+        .index_name = index_name,
+        .artifact_name = "",
+        .embedding_name = embedding_name,
+        .embedding_input = if (kind == .dense_embedding) config.embedding_input else .text,
+        .doc_key = document,
+        .source_field = config.source_field,
+        .source_template = config.source_template,
+        .expected_dims = if (kind == .dense_embedding) dimensions else 0,
+        .producer_json = config.producer_json,
+        .execution_json = config.execution_json,
+    };
+}
+
 pub const GeneratedEnrichmentRef = struct {
     kind: GeneratedEnrichmentKind,
     index_name: []const u8,

@@ -100,6 +100,9 @@ pub const Cache = struct {
         return self;
     }
     pub fn key(analyzer: *const analysis.Analyzer, text: []const u8) ![32]u8 {
+        return keyWithIdentity(analyzer, text, null);
+    }
+    pub fn keyWithIdentity(analyzer: *const analysis.Analyzer, text: []const u8, identity: ?[32]u8) ![32]u8 {
         const H = std.crypto.hash.sha2.Sha256;
         var writer = std.Io.Writer.Hashing(H).init(&.{});
         try std.json.Stringify.value(analyzer.*, .{ .emit_null_optional_fields = true }, &writer.writer);
@@ -107,7 +110,8 @@ pub const Cache = struct {
         var hash = H.init(.{});
         hash.update("antfly/analyzed-contribution/v1\x00");
         hash.update(&writer.hasher.finalResult());
-        hash.update(text);
+        hash.update(&.{@intFromBool(identity != null)});
+        hash.update(if (identity) |*value| value else text);
         return hash.finalResult();
     }
     fn entry(self: *Cache, digest: [32]u8) *Entry {

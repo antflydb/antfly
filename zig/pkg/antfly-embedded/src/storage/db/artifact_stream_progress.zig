@@ -337,6 +337,31 @@ pub fn prepareDocumentClosure(alloc: std.mem.Allocator, txn: anytype, root: u128
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
+    if (authorized.effect_protocol >= 17 and authorized.input != null) {
+        const provenance = @import("artifact_producer_provenance.zig");
+        const selector: publication.Command = .{
+            .namespace = authorized.authority.namespace,
+            .authority_epoch = authorized.authority.epoch,
+            .catalog_digest = authorized.authority.catalog_digest,
+            .producer_name = request.index_name,
+            .producer_generation = authorized.generation,
+            .producer_artifact_name = @import("enrichment/enrichment_types.zig").requestEmbeddingName(request),
+            .sources = &.{},
+            .mutations = &.{},
+            .publication_digest = @splat(0),
+        };
+        var accepted = try provenance.readCurrentScopedForDocument(alloc, txn, selector, request.doc_key);
+        if (accepted) |*value| {
+            defer value.deinit();
+            var observation = try Observation.capture(txn, request.doc_key);
+            try observation.observeProof(request.doc_key, value.owned.proof);
+            try observation.requireCurrent(txn, request.doc_key);
+            const source: publication.Source = .{ .document_key = request.doc_key, .content_digest = @splat(0), .timestamp = 1, .input_position = null };
+            const document = try owned.dupe(u8, request.doc_key);
+            const reference = try owned.dupe(u8, &provenance.referenceKey(selector, source));
+            return .{ .arena = arena, .root = root, .requirement = authorized.requirement, .observation = observation, .document = document, .reference = reference, .record_digest = value.receipt.publication_digest, .record_bytes = 32 };
+        }
+    }
     const source = publication.capturePrimarySource(owned, txn, authorized.authority.namespace, request.doc_key) catch |err| switch (err) {
         error.EnrichmentSourceChanged => try publication.capturePrimaryTombstoneSource(owned, txn, authorized.authority.namespace, request.doc_key),
         else => return err,

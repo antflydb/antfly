@@ -80,7 +80,7 @@ const graph_apply_envelope_version: u32 = 21;
 
 fn encodeBatchPayloadAlloc(alloc: Allocator, input: BatchMutationPayload) ![]u8 {
     var payload = input;
-    if (db_types.requiresGraphRelationshipProtocol(payload.request)) {
+    if (payload.schema_version < 24 and db_types.requiresGraphRelationshipProtocol(payload.request)) {
         payload.apply_schema_version = payload.schema_version;
         payload.schema_version = graph_apply_envelope_version;
     }
@@ -661,7 +661,7 @@ test "storage.hot_standby ordered artifact inventory merge adoption requires a v
 }
 
 pub fn encodeRaftBatchMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.OrderedApplyReceipt) ![]u8 {
-    const payload: BatchMutationPayload = .{ .schema_version = if (request.resolver_review != null) 23 else if (request.graph_endpoint_cleanup) 19 else 15, .request = request, .ordinary_raft_entry = entry };
+    const payload: BatchMutationPayload = .{ .schema_version = if (entry.document_reader_format != 0) 24 else if (request.resolver_review != null) 23 else if (request.graph_endpoint_cleanup) 19 else 15, .request = request, .ordinary_raft_entry = entry };
     try validateOrdinaryRaftPayload(payload);
     return encodeBatchPayloadAlloc(alloc, payload);
 }
@@ -790,15 +790,18 @@ test "storage.hot_standby ordered artifact inventory standby transport marker ca
 
 fn validateOrdinaryRaftPayload(payload: BatchMutationPayload) !void {
     const entry = payload.ordinary_raft_entry orelse return error.InvalidBatchRequest;
-    if ((payload.schema_version != 15 and payload.schema_version != 19 and payload.schema_version != 23) or entry.term == 0 or entry.index == 0 or
+    if ((payload.schema_version != 15 and payload.schema_version != 19 and payload.schema_version != 23 and payload.schema_version != 24) or entry.term == 0 or entry.index == 0 or
         payload.native_topology_position != null or payload.artifact_publication_raft_entry != null or payload.artifact_publication_transport_raft_entry != null or payload.merge_proof_adoption_raft_entry != null or payload.artifact_catalog_raft_entry != null or
         payload.initial_child_raft_entry != null or payload.graph_retirement_raft_entry != null or payload.restore_generation_admission_raft_entry != null or
         payload.online_source_applied_index != null or payload.restore_staging_bootstrap != null or payload.request.online_source != null)
         return error.InvalidBatchRequest;
+    if (entry.document_reader_format != 0 and (entry.document_reader_format != 29 or payload.schema_version != 24)) return error.UnsupportedBatchMutationPayloadVersion;
+    if (payload.schema_version == 24 and entry.document_reader_format != 29) return error.InvalidBatchRequest;
     const base = batchMutationVersion(payload.request);
-    if (payload.schema_version == 23) {
+    const control_version = if (payload.schema_version == 24) (if (payload.request.resolver_review != null) @as(u32, 23) else if (payload.request.graph_endpoint_cleanup) @as(u32, 19) else @as(u32, 15)) else payload.schema_version;
+    if (control_version == 23) {
         if (base != 22) return error.InvalidBatchRequest;
-    } else if (payload.schema_version == 19) {
+    } else if (control_version == 19) {
         if (base != 18 or !payload.request.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
     } else if (base > 7 and base != 11) return error.InvalidBatchRequest;
     try db_types.validateGraphEndpointCleanupCommand(payload.request);
@@ -824,7 +827,7 @@ pub fn decodeBatchMutationRequest(
     });
     errdefer parsed.deinit();
     try unwrapGraphApplyEnvelope(&parsed.value);
-    if (parsed.value.schema_version == 15 or parsed.value.schema_version == 19 or parsed.value.schema_version == 23) {
+    if (parsed.value.schema_version == 15 or parsed.value.schema_version == 19 or parsed.value.schema_version == 23 or parsed.value.schema_version == 24) {
         try validateOrdinaryRaftPayload(parsed.value);
         return parsed;
     }
@@ -918,6 +921,11 @@ pub fn decodeRestoreFinishForReplay(
     // A duplicate ordinary batch needs only this small projection. Preserve
     // the no-row-copy replay path even for the graph capability envelope.
     try unwrapSchemaVersion(&parsed.value.schema_version, &parsed.value.apply_schema_version);
+    if (parsed.value.schema_version == 24) {
+        var control = try decodeBatchMutationRequest(alloc, record);
+        defer control.deinit();
+        return if (control.value.request.restore_staging) |staging| if (staging == .finish) staging.finish else null else null;
+    }
     if (parsed.value.schema_version == 19 or parsed.value.schema_version == 18 or parsed.value.schema_version == 22 or parsed.value.schema_version == 23) {
         var control = try decodeBatchMutationRequest(alloc, record);
         defer control.deinit();
@@ -1408,4 +1416,22 @@ test "db graph owner revival HA transports checkpoint guards and exact replay in
         try std.testing.expect(!try contract.guardMatches(restored.graph_endpoint_cleanup_guards[0], job_key, next));
         if (ordered) try std.testing.expectEqual(@as(u64, 8), parsed.value.ordinary_raft_entry.?.index);
     }
+}
+
+test "document payload automatic reader authority survives standby replay and rejects older envelopes" {
+    const a = std.testing.allocator;
+    const entry: db_types.OrderedApplyReceipt = .{ .term = 2, .index = 9, .document_reader_format = 29 };
+    const bytes = try encodeRaftBatchMutationRequestAlloc(a, .{}, entry);
+    defer a.free(bytes);
+    const record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = bytes };
+    var decoded = try decodeBatchMutationRequest(a, record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 24), decoded.value.schema_version);
+    try std.testing.expectEqualDeep(entry, decoded.value.ordinary_raft_entry.?);
+    decoded.value.schema_version = 15;
+    const old = try std.json.Stringify.valueAlloc(a, decoded.value, .{});
+    defer a.free(old);
+    var bad_record = record;
+    bad_record.payload = old;
+    try std.testing.expectError(error.UnsupportedBatchMutationPayloadVersion, decodeBatchMutationRequest(a, bad_record));
 }

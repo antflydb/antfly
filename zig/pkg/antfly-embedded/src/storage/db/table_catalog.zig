@@ -121,7 +121,7 @@ pub const Catalog = struct {
         // The preceding deployed schema format remains readable. Merely
         // opening an owner must not rewrite it or make all document tables
         // unavailable when precise SQL descriptors are introduced.
-        if ((catalog.schema_format_version < 15 or catalog.schema_format_version > schema_mod.storage_format_version) or
+        if ((catalog.schema_format_version < 15 or catalog.schema_format_version > schema_mod.maximum_reader_format_version) or
             catalog.row_format_version != row_codec.ordinal_version)
             return error.UnsupportedTableCapabilityVersion;
         return catalog;
@@ -296,7 +296,7 @@ test "table catalog has a stable canonical representation" {
     std.mem.writeInt(u64, corrupt[24..32], 2, .little);
     try std.testing.expectError(error.InvalidTableCatalog, Catalog.decode(&corrupt));
     corrupt = encoded;
-    std.mem.writeInt(u32, corrupt[16..20], schema_mod.storage_format_version + 1, .little);
+    std.mem.writeInt(u32, corrupt[16..20], schema_mod.maximum_reader_format_version + 1, .little);
     try std.testing.expectError(error.UnsupportedTableCapabilityVersion, Catalog.decode(&corrupt));
     corrupt = encoded;
     std.mem.writeInt(u32, corrupt[20..24], row_codec.ordinal_version + 1, .little);

@@ -40,7 +40,11 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 24;
+pub const batch_protocol_version: u16 = 25;
+/// Version 25 qualifies ASCH 29 document readers on every applying member.
+/// Permission is attached to each subsequent ordered mutation, not inferred
+/// from an apply store which may have advanced ahead of the document owner.
+pub const batch_document_fields_protocol_version: u16 = 25;
 /// Version 24 commits curator review CAS, overrides and replay atomically.
 pub const batch_resolver_review_protocol_version: u16 = 24;
 /// Version 23 applies grouped-source private state and unit sources atomically.

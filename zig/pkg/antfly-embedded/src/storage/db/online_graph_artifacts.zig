@@ -377,5 +377,7 @@ test "online graph transfer requires explicit source effect protocol for values 
     try pages.validateArtifactEffect(source, edge, null);
     try std.testing.expectError(error.InvalidMergePage, pages.validateArtifactEffect(source, catalogs.ordered_key, "foreign authority"));
     source.artifact_catalog.?.effect_protocol = 17;
+    try pages.validateArtifactEffect(source, edge, raw);
+    source.artifact_catalog.?.effect_protocol = 18;
     try std.testing.expectError(error.InvalidMergePage, pages.validateArtifactEffect(source, edge, raw));
 }
