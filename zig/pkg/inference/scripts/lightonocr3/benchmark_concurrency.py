@@ -789,6 +789,9 @@ def run(args, model, label, mode, concurrency, output):
                         if chunk_progress
                         else sample["packed_prefill_chunks"]
                     )
+                    sample["prepared_prefill_chunk_rows_observed"] = sorted(
+                        {rows for _, _, rows in chunk_progress}
+                    )
                     sample["prepared_prefill_chunk_rows"] = (
                         args.prepared_prefill_chunk_rows
                     )
