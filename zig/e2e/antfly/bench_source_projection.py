@@ -345,10 +345,8 @@ def main():
                     for update in range(args.metadata_updates):
                         updated = copy.deepcopy(documents)
                         for doc in updated.values():
-                            doc["metadata"] = {
-                                "revision": f"r{update + 2}",
-                                "allowed": update % 2 == 0,
-                            }
+                            doc["metadata"]["revision"] = f"r{update + 2}"
+                            doc["metadata"]["allowed"] = update % 2 == 0
                         _, usage = measure(
                             read,
                             lambda: session.post(
@@ -373,11 +371,13 @@ def main():
                         changed_hits = verified.json()["responses"][0]["hits"]["hits"]
                         assert {h["_id"] for h in changed_hits} == set(documents)
                         for hit in changed_hits:
-                            assert (
-                                hit["_source"]["metadata"]
-                                == updated[hit["_id"]]["metadata"]
-                            ), hit["_id"]
+                            assert hit["_source"]["metadata"] == {
+                                key: updated[hit["_id"]]["metadata"][key]
+                                for key in ("revision", "allowed")
+                            }, hit["_id"]
                             assert hit["_computed"]["changed"] is False, hit
+                            for j in range(args.metadata_outputs):
+                                assert hit["_computed"][f"extra_{j}"] == f"value-{j}"
                         digest = hashlib.sha256(
                             json.dumps(
                                 sorted(

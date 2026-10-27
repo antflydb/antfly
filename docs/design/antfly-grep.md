@@ -947,6 +947,84 @@ Raw output validation counts logical JSON values for the VM work budget, not
 scanner fragments or object keys. Escaped strings and surrogate-pair Unicode
 therefore have the same value-step budget as the typed VM. Fragment scanning
 polls cancellation independently of those steps. Validation has a bounded
-container stack in a separate leaf helper, so recursive CASE frames do not each
-reserve that stack. Native equivalence fixtures include large escaped strings,
+container stack isolated in a separate helper. Native equivalence fixtures include large escaped strings,
 Unicode, wide objects, cancellation and empty malformed input.
+
+
+### ReleaseFast qualification after the bounded-delivery follow-up
+
+The 2026-10-27 paired run compares native macOS ARM64 ReleaseFast servers
+built with pinned Zig 0.17.0. The baseline is original PR head `7badb5658d`
+merged with the same `origin/main` revision `ca4339f030` as the candidate
+(baseline tree commit `c26dd115c5465539c71d8a62b6fcc90e237e15f9`,
+candidate runtime source `952f4161577b0f5de5a3e4f1b1a177562ef43b45`).
+Both binaries report `antfly dev (zig runtime)`. Their SHA-256 hashes are:
+
+- Baseline: `7456751926649113da3802df93fa6354005d01b3bb16a12218d8db90d2100db0`.
+- Candidate: `e4b1d40f6e707e39cfe388f65be91af10da70435f766896c701dd08e0025afbe`.
+
+Each workload uses five fresh-server trials per variant, alternating variant
+order, with five queries per read phase: 25 samples per variant/read phase.
+Each server ingests eight documents, with 256 KiB target large values, and
+performs two metadata updates. The small workload adds 60 metadata outputs
+for 64 computed outputs. Updates preserve and verify these fields. Medians
+below include the whole server process; background work and a shared host
+contribute noise. Filesystem/storage caches are warm after ingestion. A full
+read means a client identity miss, not cold storage. There is no inference.
+
+| Workload | Known-identity CPU ms | Known-identity elapsed ms | Full computed CPU ms | Full computed elapsed ms |
+|---|---:|---:|---:|---:|
+| ASCII | 0.69 → 0.69 | 1.18 → 1.20 | 10.03 → 10.63 | 11.48 → 12.23 |
+| Mixed | 1.38 → 0.70 | 1.99 → 1.16 | 14.08 → 13.98 | 15.37 → 15.20 |
+| Opaque array | 5.54 → 0.69 | 6.20 → 1.24 | 11.96 → 10.52 | 13.40 → 11.82 |
+| Small / 64 outputs | 1.85 → 1.55 | 2.30 → 1.93 | 1.77 → 1.53 | 2.19 → 1.95 |
+
+Every value is baseline → candidate. Opaque known-identity reads use about
+8× less CPU and take about 5× less elapsed time; mixed known-identity CPU
+decreases about 49%. Small full-output CPU decreases about 13%. Full ASCII
+CPU increases about 6%, and full mixed delivery is nearly unchanged. These
+results replace neither the typed reference path nor its equivalence checks.
+
+| Workload | Ingest CPU ms | Metadata-update CPU ms | Ordinary source CPU ms | Known-identity RSS MiB |
+|---|---:|---:|---:|---:|
+| ASCII | 54.50 → 55.41 | 37.81 → 38.96 | 3.53 → 3.59 | 203.69 → 202.08 |
+| Mixed | 65.34 → 69.66 | 44.13 → 43.78 | 4.07 → 4.31 | 205.67 → 207.95 |
+| Opaque array | 51.07 → 57.02 | 38.90 → 39.14 | 3.57 → 3.67 | 199.89 → 202.80 |
+| Small / 64 outputs | 17.39 → 18.25 | 10.17 → 10.12 | 0.97 → 1.32 | 170.41 → 170.94 |
+
+Building reusable opaque certificates adds about 12% ingestion CPU in this
+fixture. Metadata updates still rewrite primary documents; they are not free.
+Ordinary small-row CPU rises by about 0.35 ms in this confirmation, while the
+initial three-trial run showed the opposite direction. Sub-millisecond controls
+need more isolated host qualification before attributing them to the patch.
+RSS is sampled every 5 ms and is not an allocation bound; memory is not
+consistently lower. This is a targeted read improvement, not a universal
+speedup or a zero-cost claim. Linux hardware, cold storage, sustained writes
+and concurrent production load need independent performance qualification.
+
+The driver checks source/computed output hashes across binaries and across
+optimized/reference phases, including results after each metadata update.
+For each opaque candidate trial, identity profiling records 96 genuine
+certificate hits and zero fallback rows; the baseline records 176 fallback
+rows. Full-value output still reads and encodes the payload. The older binary
+has no certificate-hit counter, so its zero counter is not evidence of zero
+hits for other workloads. Small rows correctly retain full operand fallback.
+
+Reproduce with `zig/e2e/antfly/bench_source_projection.py BINARY --baseline BASELINE
+--rounds 5 --queries-per-phase 5 --documents 8 --value-bytes 262144
+--metadata-updates 2 --workload WORKLOAD --output REPORT`, for `ascii`, `mixed`,
+`opaque` and `small`; add `--metadata-outputs 60` for `small`. Both executable
+basenames must be `antfly`. Reports retain binary hashes, host details, corpus
+and output hashes, individual samples, medians and certificate counters. Raw
+JSON/logs and the source/version manifest remain ignored under
+`output/projection-followup/` rather than committed.
+
+Final validation: ReleaseFast build and cached rebuild both passed 71/71
+steps; nine server smoke tests passed; the full indexed-server suite passed
+43 cases with seven opt-in profiling cases skipped. The suite includes
+scalar/opaque persisted upgrades and older-reader rollback with one/two
+shards. The 196 focused query/worker contracts, 18 identity/publication cases,
+native borrowed-program retrieval, raw/VM work-budget equivalence,
+allocation-failure cleanup, Go SDK tests, 356 Python query/resolver cases,
+OpenAPI regeneration, Apache boundary (2,553 files) and control catalog
+checks passed. Local tests do not replace maintainer-approved PR CI.
