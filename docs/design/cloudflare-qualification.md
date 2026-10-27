@@ -1721,5 +1721,14 @@ in approved control `8a61f42df8`: both mutation groups and runtime-actor queues
 execute separately admitted `a`, `b`, `c` under contexts `a`, `a`, `a`. A
 [two-file correction proposal](cloudflare-control-callers.md) preserves original
 capacities and native artifacts, passes all 90 original Node tests, and observes
-`a`, `b`, `c` in both probes. The live control remains unchanged pending the
-frozen-control replacement decision.
+`a`, `b`, `c` in both probes. The user explicitly approved replacement control
+`c44896ac8c`; its deployment and fresh comparisons are separate steps.
+
+The five-minute read-overlap pair-3 comparison completes with zero final request
+or resource errors and all 2,052 body/count checks plus eight receipt replays on
+each side. Candidate read/write p95 is 1,036/2,628 ms versus control 4,590/6,039 ms.
+Reads remain 36 ms above target, and the comparison lacks the full soak and cold
+coverage. It does not pass the gate. The prior pair-1 control subsequently
+exhausted the thirty-minute publication setup deadline despite both sides
+acknowledging all 32 seed batches; the candidate had converged. Its failed report
+is preserved before pausing the pair for the approved-control transition.

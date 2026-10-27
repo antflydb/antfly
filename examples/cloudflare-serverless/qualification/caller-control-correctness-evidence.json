@@ -148,5 +148,7 @@
     "log_sha256": "277b7597bf205f6902f615f907695d32519cd1f538bd548075e1aff0697eb440"
   },
   "live_control_changed": false,
-  "replacement_approved": false
+  "replacement_approved": true,
+  "approval": "User: Use corrected control c44896ac8c",
+  "combined_original_control_patch_sha256": "83f830a299e0a5cedc384120f3184d2de5b30c9cb8bdd2658cedc910c76fd382"
 }

@@ -1,7 +1,9 @@
 # Remaining corrected-control caller ownership
 
-Proposed control: `c44896ac8c`, based on approved control `8a61f42df8`.
-This proposal is prepared and tested, but has not replaced the live control.
+Approved replacement control: `c44896ac8c`, based on control `8a61f42df8`.
+The user explicitly selected "Use corrected control c44896ac8c" after reviewing
+this proposal. Approval is recorded in the evidence file; deployment and new
+paired trials must be recorded separately.
 
 The approved control still drains later mutation groups and runtime-actor jobs
 through the first caller's continuation. Actual-workerd probes submit callers
@@ -43,9 +45,8 @@ Review artifacts are
 [the two-file patch](../../examples/cloudflare-serverless/qualification/caller-control-correctness.patch)
 and [proof and hashes](../../examples/cloudflare-serverless/qualification/caller-control-correctness-evidence.json).
 
-The frozen-control protocol requires a replacement decision before deployment:
-the existing authorization names `8a61f42df8`; this is a new proposed baseline.
-On acceptance, retain all prior bundles and failed reports, record both the
+The frozen-control replacement decision is now complete. Retain all prior
+bundles and failed reports, record both the
 incremental patch and combined original-control patch hashes, deploy the new
 control to the same disposable stacks, and prepare fresh paired corpora.
 Native ANN evidence remains tied to the same original module hashes. All warm
