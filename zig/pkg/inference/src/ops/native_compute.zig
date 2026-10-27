@@ -13945,6 +13945,54 @@ inline fn aarch64Sdot16(acc_in: I32x4, raw_x: U8x16, raw_w: U8x16) I32x4 {
     return acc;
 }
 
+/// Row/column geometry and integer instruction policy specialize before LLVM.
+/// One-row SDOT consumes weight loads directly; wider rows share weight views.
+inline fn integerDotTile(comptime Result: type, comptime mr: usize, comptime nc: usize, comptime bytes: usize, comptime use_sdot: bool, inputs: [mr]*const [bytes]u8, weights: [nc]*const [bytes]u8) Result {
+    const lanes = if (use_sdot) 16 else VEC_LEN;
+    comptime std.debug.assert(bytes % lanes == 0);
+    const Accumulator = if (use_sdot) I32x4 else I32xN;
+    const Operand = if (use_sdot) U8x16 else I32xN;
+    const early_reduce = use_sdot and bytes == 16 and mr == 2 and nc == 8;
+    var output: Result = undefined;
+    var acc: [mr][nc]Accumulator = @splat(@splat(@splat(0)));
+    inline for (0..bytes / lanes) |chunk| {
+        const off = chunk * lanes;
+        var x: [mr]Operand = undefined;
+        inline for (0..mr) |row| {
+            x[row] = if (use_sdot) inputs[row][off..][0..16].* else integerDotLoad(inputs[row][off..][0..VEC_LEN]);
+        }
+        var w: [nc]Operand = undefined;
+        if (comptime !use_sdot or mr != 1) inline for (0..nc) |col| {
+            w[col] = if (use_sdot) weights[col][off..][0..16].* else integerDotLoad(weights[col][off..][0..VEC_LEN]);
+        };
+        inline for (0..mr) |row| inline for (0..nc) |col| {
+            const next = if (use_sdot)
+                aarch64Sdot16(acc[row][col], x[row], if (mr == 1) weights[col][off..][0..16].* else w[col])
+            else
+                acc[row][col] + x[row] * w[col];
+            if (comptime early_reduce) integerDotPublish(Result, &output, nc, row, col, @reduce(.Add, next)) else acc[row][col] = next;
+        };
+    }
+    if (comptime !early_reduce) inline for (0..mr) |row| inline for (0..nc) |col| {
+        integerDotPublish(Result, &output, nc, row, col, @reduce(.Add, acc[row][col]));
+    };
+    return output;
+}
+
+// Preserve the raw vector load before signed widening. Array-to-vector
+// bitcasts can lower to byte extraction/shuffles instead of a native load.
+inline fn integerDotLoad(input: *const [VEC_LEN]u8) I32xN {
+    const raw: U8xN = input.*;
+    return @as(@Vector(VEC_LEN, i8), @bitCast(raw));
+}
+
+inline fn integerDotPublish(comptime Result: type, output: *Result, comptime nc: usize, comptime row: usize, comptime col: usize, value: i32) void {
+    if (comptime @typeInfo(Result) == .@"struct" and !@typeInfo(Result).@"struct".is_tuple) {
+        const fields = [_][]const u8{ "r0", "r1", "r2", "r3" };
+        @field(output.*, fields[row])[col] = value;
+    } else output.*[row * nc + col] = value;
+}
+
 fn dotI8I8BlockAarch64Sdot(q_input: *const [32]u8, q_weight: *const [32]u8) i32 {
     var acc: I32x4 = @splat(0);
     comptime var i: usize = 0;
@@ -13981,32 +14029,7 @@ fn dotI8I8Block4_16(
     q_weight2: *const [16]u8,
     q_weight3: *const [16]u8,
 ) struct { i32, i32, i32, i32 } {
-    if (comptime native_aarch64_dotprod) {
-        const raw_x: U8x16 = q_input.*;
-        const acc0 = aarch64Sdot16(@splat(0), raw_x, q_weight0.*);
-        const acc1 = aarch64Sdot16(@splat(0), raw_x, q_weight1.*);
-        const acc2 = aarch64Sdot16(@splat(0), raw_x, q_weight2.*);
-        const acc3 = aarch64Sdot16(@splat(0), raw_x, q_weight3.*);
-        return .{ @reduce(.Add, acc0), @reduce(.Add, acc1), @reduce(.Add, acc2), @reduce(.Add, acc3) };
-    }
-    var acc0: I32xN = @splat(0);
-    var acc1: I32xN = @splat(0);
-    var acc2: I32xN = @splat(0);
-    var acc3: I32xN = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 16) : (i += VEC_LEN) {
-        const raw_x: U8xN = q_input[i..][0..VEC_LEN].*;
-        const x: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_x));
-        const w0: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(q_weight0[i..][0..VEC_LEN].*));
-        const w1: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(q_weight1[i..][0..VEC_LEN].*));
-        const w2: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(q_weight2[i..][0..VEC_LEN].*));
-        const w3: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(q_weight3[i..][0..VEC_LEN].*));
-        acc0 += x * w0;
-        acc1 += x * w1;
-        acc2 += x * w2;
-        acc3 += x * w3;
-    }
-    return .{ @reduce(.Add, acc0), @reduce(.Add, acc1), @reduce(.Add, acc2), @reduce(.Add, acc3) };
+    return integerDotTile(struct { i32, i32, i32, i32 }, 1, 4, 16, native_aarch64_dotprod, .{q_input}, .{ q_weight0, q_weight1, q_weight2, q_weight3 });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block4_16
 
@@ -14022,58 +14045,7 @@ inline fn dotI8I8Block8_16Vec(
     q_weight6: *const [16]u8,
     q_weight7: *const [16]u8,
 ) I32x8 {
-    if (comptime native_aarch64_dotprod) {
-        const raw_x: U8x16 = q_input.*;
-        const acc0 = aarch64Sdot16(@splat(0), raw_x, q_weight0.*);
-        const acc1 = aarch64Sdot16(@splat(0), raw_x, q_weight1.*);
-        const acc2 = aarch64Sdot16(@splat(0), raw_x, q_weight2.*);
-        const acc3 = aarch64Sdot16(@splat(0), raw_x, q_weight3.*);
-        const acc4 = aarch64Sdot16(@splat(0), raw_x, q_weight4.*);
-        const acc5 = aarch64Sdot16(@splat(0), raw_x, q_weight5.*);
-        const acc6 = aarch64Sdot16(@splat(0), raw_x, q_weight6.*);
-        const acc7 = aarch64Sdot16(@splat(0), raw_x, q_weight7.*);
-        return .{
-            @reduce(.Add, acc0),
-            @reduce(.Add, acc1),
-            @reduce(.Add, acc2),
-            @reduce(.Add, acc3),
-            @reduce(.Add, acc4),
-            @reduce(.Add, acc5),
-            @reduce(.Add, acc6),
-            @reduce(.Add, acc7),
-        };
-    }
-    var acc0: I32xN = @splat(0);
-    var acc1: I32xN = @splat(0);
-    var acc2: I32xN = @splat(0);
-    var acc3: I32xN = @splat(0);
-    var acc4: I32xN = @splat(0);
-    var acc5: I32xN = @splat(0);
-    var acc6: I32xN = @splat(0);
-    var acc7: I32xN = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 16) : (i += VEC_LEN) {
-        const raw_x: U8xN = q_input[i..][0..VEC_LEN].*;
-        const x: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_x));
-        acc0 += x * @as(I32xN, @as(@Vector(VEC_LEN, i8), @bitCast(q_weight0[i..][0..VEC_LEN].*)));
-        acc1 += x * @as(I32xN, @as(@Vector(VEC_LEN, i8), @bitCast(q_weight1[i..][0..VEC_LEN].*)));
-        acc2 += x * @as(I32xN, @as(@Vector(VEC_LEN, i8), @bitCast(q_weight2[i..][0..VEC_LEN].*)));
-        acc3 += x * @as(I32xN, @as(@Vector(VEC_LEN, i8), @bitCast(q_weight3[i..][0..VEC_LEN].*)));
-        acc4 += x * @as(I32xN, @as(@Vector(VEC_LEN, i8), @bitCast(q_weight4[i..][0..VEC_LEN].*)));
-        acc5 += x * @as(I32xN, @as(@Vector(VEC_LEN, i8), @bitCast(q_weight5[i..][0..VEC_LEN].*)));
-        acc6 += x * @as(I32xN, @as(@Vector(VEC_LEN, i8), @bitCast(q_weight6[i..][0..VEC_LEN].*)));
-        acc7 += x * @as(I32xN, @as(@Vector(VEC_LEN, i8), @bitCast(q_weight7[i..][0..VEC_LEN].*)));
-    }
-    return .{
-        @reduce(.Add, acc0),
-        @reduce(.Add, acc1),
-        @reduce(.Add, acc2),
-        @reduce(.Add, acc3),
-        @reduce(.Add, acc4),
-        @reduce(.Add, acc5),
-        @reduce(.Add, acc6),
-        @reduce(.Add, acc7),
-    };
+    return integerDotTile(I32x8, 1, 8, 16, native_aarch64_dotprod, .{q_input}, .{ q_weight0, q_weight1, q_weight2, q_weight3, q_weight4, q_weight5, q_weight6, q_weight7 });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block8_16Vec
 
@@ -14112,40 +14084,8 @@ inline fn dotI8I8Block8MR2RowsVec16(
     q_weight6: *const [16]u8,
     q_weight7: *const [16]u8,
 ) DotI8I8Block8MR2RowsVec16 {
-    if (comptime native_aarch64_dotprod) {
-        const raw_x0: U8x16 = q_input_r0.*;
-        const raw_x1: U8x16 = q_input_r1.*;
-        const raw_w0: U8x16 = q_weight0.*;
-        const raw_w1: U8x16 = q_weight1.*;
-        const raw_w2: U8x16 = q_weight2.*;
-        const raw_w3: U8x16 = q_weight3.*;
-        const raw_w4: U8x16 = q_weight4.*;
-        const raw_w5: U8x16 = q_weight5.*;
-        const raw_w6: U8x16 = q_weight6.*;
-        const raw_w7: U8x16 = q_weight7.*;
-        return .{
-            .r0 = .{
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x0, raw_w0)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x0, raw_w1)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x0, raw_w2)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x0, raw_w3)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x0, raw_w4)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x0, raw_w5)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x0, raw_w6)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x0, raw_w7)),
-            },
-            .r1 = .{
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x1, raw_w0)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x1, raw_w1)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x1, raw_w2)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x1, raw_w3)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x1, raw_w4)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x1, raw_w5)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x1, raw_w6)),
-                @reduce(.Add, aarch64Sdot16(@splat(0), raw_x1, raw_w7)),
-            },
-        };
-    }
+    if (comptime native_aarch64_dotprod) return integerDotTile(DotI8I8Block8MR2RowsVec16, 2, 8, 16, true, .{ q_input_r0, q_input_r1 }, .{ q_weight0, q_weight1, q_weight2, q_weight3, q_weight4, q_weight5, q_weight6, q_weight7 });
+    // Preserve the portable two-tile live-register bound.
     return .{
         .r0 = dotI8I8Block8_16Vec(q_input_r0, q_weight0, q_weight1, q_weight2, q_weight3, q_weight4, q_weight5, q_weight6, q_weight7),
         .r1 = dotI8I8Block8_16Vec(q_input_r1, q_weight0, q_weight1, q_weight2, q_weight3, q_weight4, q_weight5, q_weight6, q_weight7),
@@ -14231,51 +14171,7 @@ fn dotI8I8Block4MR2_16(
     q_weight2: *const [16]u8,
     q_weight3: *const [16]u8,
 ) struct { i32, i32, i32, i32, i32, i32, i32, i32 } {
-    if (comptime native_aarch64_dotprod) {
-        const raw_x0: U8x16 = q_input_r0.*;
-        const raw_x1: U8x16 = q_input_r1.*;
-        const raw_w0: U8x16 = q_weight0.*;
-        const raw_w1: U8x16 = q_weight1.*;
-        const raw_w2: U8x16 = q_weight2.*;
-        const raw_w3: U8x16 = q_weight3.*;
-        const acc00 = aarch64Sdot16(@splat(0), raw_x0, raw_w0);
-        const acc01 = aarch64Sdot16(@splat(0), raw_x0, raw_w1);
-        const acc02 = aarch64Sdot16(@splat(0), raw_x0, raw_w2);
-        const acc03 = aarch64Sdot16(@splat(0), raw_x0, raw_w3);
-        const acc10 = aarch64Sdot16(@splat(0), raw_x1, raw_w0);
-        const acc11 = aarch64Sdot16(@splat(0), raw_x1, raw_w1);
-        const acc12 = aarch64Sdot16(@splat(0), raw_x1, raw_w2);
-        const acc13 = aarch64Sdot16(@splat(0), raw_x1, raw_w3);
-        return .{ @reduce(.Add, acc00), @reduce(.Add, acc01), @reduce(.Add, acc02), @reduce(.Add, acc03), @reduce(.Add, acc10), @reduce(.Add, acc11), @reduce(.Add, acc12), @reduce(.Add, acc13) };
-    }
-    var acc00: I32xN = @splat(0);
-    var acc01: I32xN = @splat(0);
-    var acc02: I32xN = @splat(0);
-    var acc03: I32xN = @splat(0);
-    var acc10: I32xN = @splat(0);
-    var acc11: I32xN = @splat(0);
-    var acc12: I32xN = @splat(0);
-    var acc13: I32xN = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 16) : (i += VEC_LEN) {
-        const raw_x0: U8xN = q_input_r0[i..][0..VEC_LEN].*;
-        const raw_x1: U8xN = q_input_r1[i..][0..VEC_LEN].*;
-        const x0: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_x0));
-        const x1: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_x1));
-        const w0: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(q_weight0[i..][0..VEC_LEN].*));
-        const w1: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(q_weight1[i..][0..VEC_LEN].*));
-        const w2: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(q_weight2[i..][0..VEC_LEN].*));
-        const w3: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(q_weight3[i..][0..VEC_LEN].*));
-        acc00 += x0 * w0;
-        acc01 += x0 * w1;
-        acc02 += x0 * w2;
-        acc03 += x0 * w3;
-        acc10 += x1 * w0;
-        acc11 += x1 * w1;
-        acc12 += x1 * w2;
-        acc13 += x1 * w3;
-    }
-    return .{ @reduce(.Add, acc00), @reduce(.Add, acc01), @reduce(.Add, acc02), @reduce(.Add, acc03), @reduce(.Add, acc10), @reduce(.Add, acc11), @reduce(.Add, acc12), @reduce(.Add, acc13) };
+    return integerDotTile(struct { i32, i32, i32, i32, i32, i32, i32, i32 }, 2, 4, 16, native_aarch64_dotprod, .{ q_input_r0, q_input_r1 }, .{ q_weight0, q_weight1, q_weight2, q_weight3 });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block4MR2_16
 
@@ -14367,28 +14263,7 @@ fn dotI8I8Block4Portable(
     q_weight2: *const [32]u8,
     q_weight3: *const [32]u8,
 ) struct { i32, i32, i32, i32 } {
-    var acc0: I32xN = @splat(0);
-    var acc1: I32xN = @splat(0);
-    var acc2: I32xN = @splat(0);
-    var acc3: I32xN = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 32) : (i += VEC_LEN) {
-        const raw_x: U8xN = q_input[i..][0..VEC_LEN].*;
-        const x: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_x));
-        const raw_w0: U8xN = q_weight0[i..][0..VEC_LEN].*;
-        const raw_w1: U8xN = q_weight1[i..][0..VEC_LEN].*;
-        const raw_w2: U8xN = q_weight2[i..][0..VEC_LEN].*;
-        const raw_w3: U8xN = q_weight3[i..][0..VEC_LEN].*;
-        const w0: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_w0));
-        const w1: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_w1));
-        const w2: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_w2));
-        const w3: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_w3));
-        acc0 += x * w0;
-        acc1 += x * w1;
-        acc2 += x * w2;
-        acc3 += x * w3;
-    }
-    return .{ @reduce(.Add, acc0), @reduce(.Add, acc1), @reduce(.Add, acc2), @reduce(.Add, acc3) };
+    return integerDotTile(struct { i32, i32, i32, i32 }, 1, 4, 32, false, .{q_input}, .{ q_weight0, q_weight1, q_weight2, q_weight3 });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block4Portable
 
@@ -14400,19 +14275,7 @@ fn dotI8I8Block4Aarch64Sdot(
     q_weight2: *const [32]u8,
     q_weight3: *const [32]u8,
 ) struct { i32, i32, i32, i32 } {
-    var acc0: I32x4 = @splat(0);
-    var acc1: I32x4 = @splat(0);
-    var acc2: I32x4 = @splat(0);
-    var acc3: I32x4 = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 32) : (i += 16) {
-        const raw_x: U8x16 = q_input[i..][0..16].*;
-        acc0 = aarch64Sdot16(acc0, raw_x, q_weight0[i..][0..16].*);
-        acc1 = aarch64Sdot16(acc1, raw_x, q_weight1[i..][0..16].*);
-        acc2 = aarch64Sdot16(acc2, raw_x, q_weight2[i..][0..16].*);
-        acc3 = aarch64Sdot16(acc3, raw_x, q_weight3[i..][0..16].*);
-    }
-    return .{ @reduce(.Add, acc0), @reduce(.Add, acc1), @reduce(.Add, acc2), @reduce(.Add, acc3) };
+    return integerDotTile(struct { i32, i32, i32, i32 }, 1, 4, 32, true, .{q_input}, .{ q_weight0, q_weight1, q_weight2, q_weight3 });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block4Aarch64Sdot
 
@@ -14621,47 +14484,7 @@ fn dotI8I8Block4MR2Portable(
     q_weight2: *const [32]u8,
     q_weight3: *const [32]u8,
 ) struct { i32, i32, i32, i32, i32, i32, i32, i32 } {
-    var acc00: I32xN = @splat(0);
-    var acc01: I32xN = @splat(0);
-    var acc02: I32xN = @splat(0);
-    var acc03: I32xN = @splat(0);
-    var acc10: I32xN = @splat(0);
-    var acc11: I32xN = @splat(0);
-    var acc12: I32xN = @splat(0);
-    var acc13: I32xN = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 32) : (i += VEC_LEN) {
-        const raw_x0: U8xN = q_input_r0[i..][0..VEC_LEN].*;
-        const raw_x1: U8xN = q_input_r1[i..][0..VEC_LEN].*;
-        const x0: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_x0));
-        const x1: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_x1));
-        const raw_w0: U8xN = q_weight0[i..][0..VEC_LEN].*;
-        const raw_w1: U8xN = q_weight1[i..][0..VEC_LEN].*;
-        const raw_w2: U8xN = q_weight2[i..][0..VEC_LEN].*;
-        const raw_w3: U8xN = q_weight3[i..][0..VEC_LEN].*;
-        const w0: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_w0));
-        const w1: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_w1));
-        const w2: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_w2));
-        const w3: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_w3));
-        acc00 += x0 * w0;
-        acc01 += x0 * w1;
-        acc02 += x0 * w2;
-        acc03 += x0 * w3;
-        acc10 += x1 * w0;
-        acc11 += x1 * w1;
-        acc12 += x1 * w2;
-        acc13 += x1 * w3;
-    }
-    return .{
-        @reduce(.Add, acc00),
-        @reduce(.Add, acc01),
-        @reduce(.Add, acc02),
-        @reduce(.Add, acc03),
-        @reduce(.Add, acc10),
-        @reduce(.Add, acc11),
-        @reduce(.Add, acc12),
-        @reduce(.Add, acc13),
-    };
+    return integerDotTile(struct { i32, i32, i32, i32, i32, i32, i32, i32 }, 2, 4, 32, false, .{ q_input_r0, q_input_r1 }, .{ q_weight0, q_weight1, q_weight2, q_weight3 });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block4MR2Portable
 
@@ -14678,69 +14501,7 @@ fn dotI8I8Block8MR2Aarch64Sdot(
     q_weight6: *const [32]u8,
     q_weight7: *const [32]u8,
 ) [16]i32 {
-    var acc00: I32x4 = @splat(0);
-    var acc01: I32x4 = @splat(0);
-    var acc02: I32x4 = @splat(0);
-    var acc03: I32x4 = @splat(0);
-    var acc04: I32x4 = @splat(0);
-    var acc05: I32x4 = @splat(0);
-    var acc06: I32x4 = @splat(0);
-    var acc07: I32x4 = @splat(0);
-    var acc10: I32x4 = @splat(0);
-    var acc11: I32x4 = @splat(0);
-    var acc12: I32x4 = @splat(0);
-    var acc13: I32x4 = @splat(0);
-    var acc14: I32x4 = @splat(0);
-    var acc15: I32x4 = @splat(0);
-    var acc16: I32x4 = @splat(0);
-    var acc17: I32x4 = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 32) : (i += 16) {
-        const raw_x0: U8x16 = q_input_r0[i..][0..16].*;
-        const raw_x1: U8x16 = q_input_r1[i..][0..16].*;
-        const raw_w0: U8x16 = q_weight0[i..][0..16].*;
-        const raw_w1: U8x16 = q_weight1[i..][0..16].*;
-        const raw_w2: U8x16 = q_weight2[i..][0..16].*;
-        const raw_w3: U8x16 = q_weight3[i..][0..16].*;
-        const raw_w4: U8x16 = q_weight4[i..][0..16].*;
-        const raw_w5: U8x16 = q_weight5[i..][0..16].*;
-        const raw_w6: U8x16 = q_weight6[i..][0..16].*;
-        const raw_w7: U8x16 = q_weight7[i..][0..16].*;
-        acc00 = aarch64Sdot16(acc00, raw_x0, raw_w0);
-        acc01 = aarch64Sdot16(acc01, raw_x0, raw_w1);
-        acc02 = aarch64Sdot16(acc02, raw_x0, raw_w2);
-        acc03 = aarch64Sdot16(acc03, raw_x0, raw_w3);
-        acc04 = aarch64Sdot16(acc04, raw_x0, raw_w4);
-        acc05 = aarch64Sdot16(acc05, raw_x0, raw_w5);
-        acc06 = aarch64Sdot16(acc06, raw_x0, raw_w6);
-        acc07 = aarch64Sdot16(acc07, raw_x0, raw_w7);
-        acc10 = aarch64Sdot16(acc10, raw_x1, raw_w0);
-        acc11 = aarch64Sdot16(acc11, raw_x1, raw_w1);
-        acc12 = aarch64Sdot16(acc12, raw_x1, raw_w2);
-        acc13 = aarch64Sdot16(acc13, raw_x1, raw_w3);
-        acc14 = aarch64Sdot16(acc14, raw_x1, raw_w4);
-        acc15 = aarch64Sdot16(acc15, raw_x1, raw_w5);
-        acc16 = aarch64Sdot16(acc16, raw_x1, raw_w6);
-        acc17 = aarch64Sdot16(acc17, raw_x1, raw_w7);
-    }
-    return .{
-        @reduce(.Add, acc00),
-        @reduce(.Add, acc01),
-        @reduce(.Add, acc02),
-        @reduce(.Add, acc03),
-        @reduce(.Add, acc04),
-        @reduce(.Add, acc05),
-        @reduce(.Add, acc06),
-        @reduce(.Add, acc07),
-        @reduce(.Add, acc10),
-        @reduce(.Add, acc11),
-        @reduce(.Add, acc12),
-        @reduce(.Add, acc13),
-        @reduce(.Add, acc14),
-        @reduce(.Add, acc15),
-        @reduce(.Add, acc16),
-        @reduce(.Add, acc17),
-    };
+    return integerDotTile([16]i32, 2, 8, 32, true, .{ q_input_r0, q_input_r1 }, .{ q_weight0, q_weight1, q_weight2, q_weight3, q_weight4, q_weight5, q_weight6, q_weight7 });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block8MR2Aarch64Sdot
 
@@ -14757,73 +14518,7 @@ fn dotI8I8Block8MR2RowsVecAarch64Sdot(
     q_weight6: *const [32]u8,
     q_weight7: *const [32]u8,
 ) DotI8I8Block8MR2RowsVec {
-    var acc00: I32x4 = @splat(0);
-    var acc01: I32x4 = @splat(0);
-    var acc02: I32x4 = @splat(0);
-    var acc03: I32x4 = @splat(0);
-    var acc04: I32x4 = @splat(0);
-    var acc05: I32x4 = @splat(0);
-    var acc06: I32x4 = @splat(0);
-    var acc07: I32x4 = @splat(0);
-    var acc10: I32x4 = @splat(0);
-    var acc11: I32x4 = @splat(0);
-    var acc12: I32x4 = @splat(0);
-    var acc13: I32x4 = @splat(0);
-    var acc14: I32x4 = @splat(0);
-    var acc15: I32x4 = @splat(0);
-    var acc16: I32x4 = @splat(0);
-    var acc17: I32x4 = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 32) : (i += 16) {
-        const raw_x0: U8x16 = q_input_r0[i..][0..16].*;
-        const raw_x1: U8x16 = q_input_r1[i..][0..16].*;
-        const raw_w0: U8x16 = q_weight0[i..][0..16].*;
-        const raw_w1: U8x16 = q_weight1[i..][0..16].*;
-        const raw_w2: U8x16 = q_weight2[i..][0..16].*;
-        const raw_w3: U8x16 = q_weight3[i..][0..16].*;
-        const raw_w4: U8x16 = q_weight4[i..][0..16].*;
-        const raw_w5: U8x16 = q_weight5[i..][0..16].*;
-        const raw_w6: U8x16 = q_weight6[i..][0..16].*;
-        const raw_w7: U8x16 = q_weight7[i..][0..16].*;
-        acc00 = aarch64Sdot16(acc00, raw_x0, raw_w0);
-        acc01 = aarch64Sdot16(acc01, raw_x0, raw_w1);
-        acc02 = aarch64Sdot16(acc02, raw_x0, raw_w2);
-        acc03 = aarch64Sdot16(acc03, raw_x0, raw_w3);
-        acc04 = aarch64Sdot16(acc04, raw_x0, raw_w4);
-        acc05 = aarch64Sdot16(acc05, raw_x0, raw_w5);
-        acc06 = aarch64Sdot16(acc06, raw_x0, raw_w6);
-        acc07 = aarch64Sdot16(acc07, raw_x0, raw_w7);
-        acc10 = aarch64Sdot16(acc10, raw_x1, raw_w0);
-        acc11 = aarch64Sdot16(acc11, raw_x1, raw_w1);
-        acc12 = aarch64Sdot16(acc12, raw_x1, raw_w2);
-        acc13 = aarch64Sdot16(acc13, raw_x1, raw_w3);
-        acc14 = aarch64Sdot16(acc14, raw_x1, raw_w4);
-        acc15 = aarch64Sdot16(acc15, raw_x1, raw_w5);
-        acc16 = aarch64Sdot16(acc16, raw_x1, raw_w6);
-        acc17 = aarch64Sdot16(acc17, raw_x1, raw_w7);
-    }
-    return .{
-        .r0 = .{
-            @reduce(.Add, acc00),
-            @reduce(.Add, acc01),
-            @reduce(.Add, acc02),
-            @reduce(.Add, acc03),
-            @reduce(.Add, acc04),
-            @reduce(.Add, acc05),
-            @reduce(.Add, acc06),
-            @reduce(.Add, acc07),
-        },
-        .r1 = .{
-            @reduce(.Add, acc10),
-            @reduce(.Add, acc11),
-            @reduce(.Add, acc12),
-            @reduce(.Add, acc13),
-            @reduce(.Add, acc14),
-            @reduce(.Add, acc15),
-            @reduce(.Add, acc16),
-            @reduce(.Add, acc17),
-        },
-    };
+    return integerDotTile(DotI8I8Block8MR2RowsVec, 2, 8, 32, true, .{ q_input_r0, q_input_r1 }, .{ q_weight0, q_weight1, q_weight2, q_weight3, q_weight4, q_weight5, q_weight6, q_weight7 });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block8MR2RowsVecAarch64Sdot
 
@@ -14834,73 +14529,7 @@ fn dotI8I8Block8MR2RowsContiguousVecAarch64Sdot(
     values: []const u8,
 ) DotI8I8Block8MR2RowsVec {
     std.debug.assert(values.len >= 8 * 32);
-    var acc00: I32x4 = @splat(0);
-    var acc01: I32x4 = @splat(0);
-    var acc02: I32x4 = @splat(0);
-    var acc03: I32x4 = @splat(0);
-    var acc04: I32x4 = @splat(0);
-    var acc05: I32x4 = @splat(0);
-    var acc06: I32x4 = @splat(0);
-    var acc07: I32x4 = @splat(0);
-    var acc10: I32x4 = @splat(0);
-    var acc11: I32x4 = @splat(0);
-    var acc12: I32x4 = @splat(0);
-    var acc13: I32x4 = @splat(0);
-    var acc14: I32x4 = @splat(0);
-    var acc15: I32x4 = @splat(0);
-    var acc16: I32x4 = @splat(0);
-    var acc17: I32x4 = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 32) : (i += 16) {
-        const raw_x0: U8x16 = q_input_r0[i..][0..16].*;
-        const raw_x1: U8x16 = q_input_r1[i..][0..16].*;
-        const raw_w0: U8x16 = values[i..][0..16].*;
-        const raw_w1: U8x16 = values[32 + i ..][0..16].*;
-        const raw_w2: U8x16 = values[2 * 32 + i ..][0..16].*;
-        const raw_w3: U8x16 = values[3 * 32 + i ..][0..16].*;
-        const raw_w4: U8x16 = values[4 * 32 + i ..][0..16].*;
-        const raw_w5: U8x16 = values[5 * 32 + i ..][0..16].*;
-        const raw_w6: U8x16 = values[6 * 32 + i ..][0..16].*;
-        const raw_w7: U8x16 = values[7 * 32 + i ..][0..16].*;
-        acc00 = aarch64Sdot16(acc00, raw_x0, raw_w0);
-        acc01 = aarch64Sdot16(acc01, raw_x0, raw_w1);
-        acc02 = aarch64Sdot16(acc02, raw_x0, raw_w2);
-        acc03 = aarch64Sdot16(acc03, raw_x0, raw_w3);
-        acc04 = aarch64Sdot16(acc04, raw_x0, raw_w4);
-        acc05 = aarch64Sdot16(acc05, raw_x0, raw_w5);
-        acc06 = aarch64Sdot16(acc06, raw_x0, raw_w6);
-        acc07 = aarch64Sdot16(acc07, raw_x0, raw_w7);
-        acc10 = aarch64Sdot16(acc10, raw_x1, raw_w0);
-        acc11 = aarch64Sdot16(acc11, raw_x1, raw_w1);
-        acc12 = aarch64Sdot16(acc12, raw_x1, raw_w2);
-        acc13 = aarch64Sdot16(acc13, raw_x1, raw_w3);
-        acc14 = aarch64Sdot16(acc14, raw_x1, raw_w4);
-        acc15 = aarch64Sdot16(acc15, raw_x1, raw_w5);
-        acc16 = aarch64Sdot16(acc16, raw_x1, raw_w6);
-        acc17 = aarch64Sdot16(acc17, raw_x1, raw_w7);
-    }
-    return .{
-        .r0 = .{
-            @reduce(.Add, acc00),
-            @reduce(.Add, acc01),
-            @reduce(.Add, acc02),
-            @reduce(.Add, acc03),
-            @reduce(.Add, acc04),
-            @reduce(.Add, acc05),
-            @reduce(.Add, acc06),
-            @reduce(.Add, acc07),
-        },
-        .r1 = .{
-            @reduce(.Add, acc10),
-            @reduce(.Add, acc11),
-            @reduce(.Add, acc12),
-            @reduce(.Add, acc13),
-            @reduce(.Add, acc14),
-            @reduce(.Add, acc15),
-            @reduce(.Add, acc16),
-            @reduce(.Add, acc17),
-        },
-    };
+    return integerDotTile(DotI8I8Block8MR2RowsVec, 2, 8, 32, true, .{ q_input_r0, q_input_r1 }, .{ values[0..][0..32], values[32..][0..32], values[64..][0..32], values[96..][0..32], values[128..][0..32], values[160..][0..32], values[192..][0..32], values[224..][0..32] });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block8MR2RowsContiguousVecAarch64Sdot
 
@@ -14915,67 +14544,7 @@ fn dotI8I8Block4MR4Aarch64Sdot(
     q_weight2: *const [32]u8,
     q_weight3: *const [32]u8,
 ) [16]i32 {
-    var acc00: I32x4 = @splat(0);
-    var acc01: I32x4 = @splat(0);
-    var acc02: I32x4 = @splat(0);
-    var acc03: I32x4 = @splat(0);
-    var acc10: I32x4 = @splat(0);
-    var acc11: I32x4 = @splat(0);
-    var acc12: I32x4 = @splat(0);
-    var acc13: I32x4 = @splat(0);
-    var acc20: I32x4 = @splat(0);
-    var acc21: I32x4 = @splat(0);
-    var acc22: I32x4 = @splat(0);
-    var acc23: I32x4 = @splat(0);
-    var acc30: I32x4 = @splat(0);
-    var acc31: I32x4 = @splat(0);
-    var acc32: I32x4 = @splat(0);
-    var acc33: I32x4 = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 32) : (i += 16) {
-        const raw_x0: U8x16 = q_input_r0[i..][0..16].*;
-        const raw_x1: U8x16 = q_input_r1[i..][0..16].*;
-        const raw_x2: U8x16 = q_input_r2[i..][0..16].*;
-        const raw_x3: U8x16 = q_input_r3[i..][0..16].*;
-        const raw_w0: U8x16 = q_weight0[i..][0..16].*;
-        const raw_w1: U8x16 = q_weight1[i..][0..16].*;
-        const raw_w2: U8x16 = q_weight2[i..][0..16].*;
-        const raw_w3: U8x16 = q_weight3[i..][0..16].*;
-        acc00 = aarch64Sdot16(acc00, raw_x0, raw_w0);
-        acc01 = aarch64Sdot16(acc01, raw_x0, raw_w1);
-        acc02 = aarch64Sdot16(acc02, raw_x0, raw_w2);
-        acc03 = aarch64Sdot16(acc03, raw_x0, raw_w3);
-        acc10 = aarch64Sdot16(acc10, raw_x1, raw_w0);
-        acc11 = aarch64Sdot16(acc11, raw_x1, raw_w1);
-        acc12 = aarch64Sdot16(acc12, raw_x1, raw_w2);
-        acc13 = aarch64Sdot16(acc13, raw_x1, raw_w3);
-        acc20 = aarch64Sdot16(acc20, raw_x2, raw_w0);
-        acc21 = aarch64Sdot16(acc21, raw_x2, raw_w1);
-        acc22 = aarch64Sdot16(acc22, raw_x2, raw_w2);
-        acc23 = aarch64Sdot16(acc23, raw_x2, raw_w3);
-        acc30 = aarch64Sdot16(acc30, raw_x3, raw_w0);
-        acc31 = aarch64Sdot16(acc31, raw_x3, raw_w1);
-        acc32 = aarch64Sdot16(acc32, raw_x3, raw_w2);
-        acc33 = aarch64Sdot16(acc33, raw_x3, raw_w3);
-    }
-    return .{
-        @reduce(.Add, acc00),
-        @reduce(.Add, acc01),
-        @reduce(.Add, acc02),
-        @reduce(.Add, acc03),
-        @reduce(.Add, acc10),
-        @reduce(.Add, acc11),
-        @reduce(.Add, acc12),
-        @reduce(.Add, acc13),
-        @reduce(.Add, acc20),
-        @reduce(.Add, acc21),
-        @reduce(.Add, acc22),
-        @reduce(.Add, acc23),
-        @reduce(.Add, acc30),
-        @reduce(.Add, acc31),
-        @reduce(.Add, acc32),
-        @reduce(.Add, acc33),
-    };
+    return integerDotTile([16]i32, 4, 4, 32, true, .{ q_input_r0, q_input_r1, q_input_r2, q_input_r3 }, .{ q_weight0, q_weight1, q_weight2, q_weight3 });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block4MR4Aarch64Sdot
 
@@ -15029,41 +14598,7 @@ fn dotI8I8Block4MR2Aarch64Sdot(
     q_weight2: *const [32]u8,
     q_weight3: *const [32]u8,
 ) struct { i32, i32, i32, i32, i32, i32, i32, i32 } {
-    var acc00: I32x4 = @splat(0);
-    var acc01: I32x4 = @splat(0);
-    var acc02: I32x4 = @splat(0);
-    var acc03: I32x4 = @splat(0);
-    var acc10: I32x4 = @splat(0);
-    var acc11: I32x4 = @splat(0);
-    var acc12: I32x4 = @splat(0);
-    var acc13: I32x4 = @splat(0);
-    comptime var i: usize = 0;
-    inline while (i < 32) : (i += 16) {
-        const raw_x0: U8x16 = q_input_r0[i..][0..16].*;
-        const raw_x1: U8x16 = q_input_r1[i..][0..16].*;
-        const raw_w0: U8x16 = q_weight0[i..][0..16].*;
-        const raw_w1: U8x16 = q_weight1[i..][0..16].*;
-        const raw_w2: U8x16 = q_weight2[i..][0..16].*;
-        const raw_w3: U8x16 = q_weight3[i..][0..16].*;
-        acc00 = aarch64Sdot16(acc00, raw_x0, raw_w0);
-        acc01 = aarch64Sdot16(acc01, raw_x0, raw_w1);
-        acc02 = aarch64Sdot16(acc02, raw_x0, raw_w2);
-        acc03 = aarch64Sdot16(acc03, raw_x0, raw_w3);
-        acc10 = aarch64Sdot16(acc10, raw_x1, raw_w0);
-        acc11 = aarch64Sdot16(acc11, raw_x1, raw_w1);
-        acc12 = aarch64Sdot16(acc12, raw_x1, raw_w2);
-        acc13 = aarch64Sdot16(acc13, raw_x1, raw_w3);
-    }
-    return .{
-        @reduce(.Add, acc00),
-        @reduce(.Add, acc01),
-        @reduce(.Add, acc02),
-        @reduce(.Add, acc03),
-        @reduce(.Add, acc10),
-        @reduce(.Add, acc11),
-        @reduce(.Add, acc12),
-        @reduce(.Add, acc13),
-    };
+    return integerDotTile(struct { i32, i32, i32, i32, i32, i32, i32, i32 }, 2, 4, 32, true, .{ q_input_r0, q_input_r1 }, .{ q_weight0, q_weight1, q_weight2, q_weight3 });
 }
 // quant-kernel-codegen:end CPU integer dot dotI8I8Block4MR2Aarch64Sdot
 
@@ -51859,5 +51394,145 @@ test "Q6 panel8 row families independent oracle and benchmark" {
             std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
             std.debug.print("q6_panel mr={d} kind={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=20001\n", .{ mr, kind, @as(f64, @floatFromInt(samples[10])) / 20001.0, @as(f64, @floatFromInt(samples[19])) / 20001.0, samples[10], samples[19] });
         };
+    }
+}
+
+test "integer tile owners independent oracle and benchmark" {
+    @setEvalBranchQuota(500_000);
+    const profiles = .{
+        .{ .mr = 1, .nc = 4, .bytes = 16, .arm = false },
+        .{ .mr = 2, .nc = 4, .bytes = 16, .arm = false },
+        .{ .mr = 1, .nc = 8, .bytes = 16, .arm = false },
+        .{ .mr = 1, .nc = 4, .bytes = 32, .arm = false },
+        .{ .mr = 1, .nc = 4, .bytes = 32, .arm = true },
+        .{ .mr = 2, .nc = 4, .bytes = 32, .arm = false },
+        .{ .mr = 2, .nc = 4, .bytes = 32, .arm = true },
+        .{ .mr = 2, .nc = 8, .bytes = 32, .arm = true },
+        .{ .mr = 4, .nc = 4, .bytes = 32, .arm = true },
+        .{ .mr = 2, .nc = 8, .bytes = 32, .arm = true },
+        .{ .mr = 2, .nc = 8, .bytes = 32, .arm = true },
+        .{ .mr = 2, .nc = 8, .bytes = 16, .arm = false },
+    };
+    const State = struct {
+        inputs: [4][32]u8 align(64) = @splat(@splat(0)),
+        weights: [8][32]u8 align(64) = @splat(@splat(0)),
+        fn initialize(self: *@This(), seed: usize) void {
+            for (&self.inputs, 0..) |*input, row| for (0..32) |i| {
+                const value: i8 = if (seed == 0) 0 else if (seed == 1) (if ((i + row) % 2 == 0) -128 else 127) else @intCast(@as(i32, @intCast((i * 17 + row * 37 + seed * 11) % 256)) - 128);
+                input[i] = @bitCast(value);
+            };
+            for (&self.weights, 0..) |*weight, col| for (0..32) |i| {
+                const value: i8 = if (seed == 0) 0 else if (seed == 1) (if ((i + col) % 2 == 0) -128 else 127) else @intCast(@as(i32, @intCast((i * 29 + col * 19 + seed * 13) % 256)) - 128);
+                weight[i] = @bitCast(value);
+            };
+        }
+        noinline fn run(self: *@This(), comptime profile: usize) [profiles[profile].mr * profiles[profile].nc]i32 {
+            if (comptime profile == 0) {
+                const values = dotI8I8Block4_16(self.inputs[0][0..16], self.weights[0][0..16], self.weights[1][0..16], self.weights[2][0..16], self.weights[3][0..16]);
+                var output: [4]i32 = undefined;
+                inline for (0..4) |i| output[i] = values[i];
+                return output;
+            }
+            if (comptime profile == 1) {
+                const values = dotI8I8Block4MR2_16(self.inputs[0][0..16], self.inputs[1][0..16], self.weights[0][0..16], self.weights[1][0..16], self.weights[2][0..16], self.weights[3][0..16]);
+                var output: [8]i32 = undefined;
+                inline for (0..8) |i| output[i] = values[i];
+                return output;
+            }
+            if (comptime profile == 2) {
+                const values = dotI8I8Block8_16Vec(self.inputs[0][0..16], self.weights[0][0..16], self.weights[1][0..16], self.weights[2][0..16], self.weights[3][0..16], self.weights[4][0..16], self.weights[5][0..16], self.weights[6][0..16], self.weights[7][0..16]);
+                var output: [8]i32 = undefined;
+                inline for (0..8) |i| output[i] = values[i];
+                return output;
+            }
+            if (comptime profile == 3) {
+                const values = dotI8I8Block4Portable(self.inputs[0][0..32], self.weights[0][0..32], self.weights[1][0..32], self.weights[2][0..32], self.weights[3][0..32]);
+                var output: [4]i32 = undefined;
+                inline for (0..4) |i| output[i] = values[i];
+                return output;
+            }
+            if (comptime profile == 4) {
+                const values = dotI8I8Block4Aarch64Sdot(self.inputs[0][0..32], self.weights[0][0..32], self.weights[1][0..32], self.weights[2][0..32], self.weights[3][0..32]);
+                var output: [4]i32 = undefined;
+                inline for (0..4) |i| output[i] = values[i];
+                return output;
+            }
+            if (comptime profile == 5) {
+                const values = dotI8I8Block4MR2Portable(self.inputs[0][0..32], self.inputs[1][0..32], self.weights[0][0..32], self.weights[1][0..32], self.weights[2][0..32], self.weights[3][0..32]);
+                var output: [8]i32 = undefined;
+                inline for (0..8) |i| output[i] = values[i];
+                return output;
+            }
+            if (comptime profile == 6) {
+                const values = dotI8I8Block4MR2Aarch64Sdot(self.inputs[0][0..32], self.inputs[1][0..32], self.weights[0][0..32], self.weights[1][0..32], self.weights[2][0..32], self.weights[3][0..32]);
+                var output: [8]i32 = undefined;
+                inline for (0..8) |i| output[i] = values[i];
+                return output;
+            }
+            if (comptime profile == 7) {
+                const values = dotI8I8Block8MR2Aarch64Sdot(self.inputs[0][0..32], self.inputs[1][0..32], self.weights[0][0..32], self.weights[1][0..32], self.weights[2][0..32], self.weights[3][0..32], self.weights[4][0..32], self.weights[5][0..32], self.weights[6][0..32], self.weights[7][0..32]);
+                return values;
+            }
+            if (comptime profile == 8) {
+                const values = dotI8I8Block4MR4Aarch64Sdot(self.inputs[0][0..32], self.inputs[1][0..32], self.inputs[2][0..32], self.inputs[3][0..32], self.weights[0][0..32], self.weights[1][0..32], self.weights[2][0..32], self.weights[3][0..32]);
+                return values;
+            }
+            if (comptime profile == 9) {
+                const values = dotI8I8Block8MR2RowsVecAarch64Sdot(self.inputs[0][0..32], self.inputs[1][0..32], self.weights[0][0..32], self.weights[1][0..32], self.weights[2][0..32], self.weights[3][0..32], self.weights[4][0..32], self.weights[5][0..32], self.weights[6][0..32], self.weights[7][0..32]);
+                var output: [16]i32 = undefined;
+                inline for (0..8) |col| output[0 + col] = values.r0[col];
+                inline for (0..8) |col| output[8 + col] = values.r1[col];
+                return output;
+            }
+            if (comptime profile == 10) {
+                const values = dotI8I8Block8MR2RowsContiguousVecAarch64Sdot(self.inputs[0][0..32], self.inputs[1][0..32], std.mem.asBytes(&self.weights));
+                var output: [16]i32 = undefined;
+                inline for (0..8) |col| output[0 + col] = values.r0[col];
+                inline for (0..8) |col| output[8 + col] = values.r1[col];
+                return output;
+            }
+            if (comptime profile == 11) {
+                const values = dotI8I8Block8MR2RowsVec16(self.inputs[0][0..16], self.inputs[1][0..16], self.weights[0][0..16], self.weights[1][0..16], self.weights[2][0..16], self.weights[3][0..16], self.weights[4][0..16], self.weights[5][0..16], self.weights[6][0..16], self.weights[7][0..16]);
+                var output: [16]i32 = undefined;
+                inline for (0..8) |col| output[0 + col] = values.r0[col];
+                inline for (0..8) |col| output[8 + col] = values.r1[col];
+                return output;
+            }
+            unreachable;
+        }
+        noinline fn measure(self: *@This(), comptime profile: usize) u64 {
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (0..20001) |_| {
+                self.inputs[0][0] +%= 1;
+                std.mem.doNotOptimizeAway(self.run(profile));
+            }
+            return @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds - start);
+        }
+    };
+    var state: State = .{};
+    for (0..4) |seed| {
+        state.initialize(seed);
+        inline for (0..profiles.len) |profile| {
+            const p = profiles[profile];
+            if (comptime p.arm and !native_aarch64_dotprod) continue;
+            const output = state.run(profile);
+            for (0..p.mr) |row| for (0..p.nc) |col| {
+                var expected: i64 = 0;
+                for (0..p.bytes) |i| expected += @as(i64, @as(i8, @bitCast(state.inputs[row][i]))) * @as(i64, @as(i8, @bitCast(state.weights[col][i])));
+                try std.testing.expectEqual(@as(i32, @intCast(expected)), output[row * p.nc + col]);
+            };
+        }
+    }
+    if (platform.env.getenvBool("ANTFLY_INTEGER_TILE_BENCH")) {
+        state.initialize(3);
+        inline for (0..profiles.len) |profile| {
+            const p = profiles[profile];
+            if (comptime p.arm and !native_aarch64_dotprod) continue;
+            for (0..10) |_| _ = state.measure(profile);
+            var samples: [21]u64 = undefined;
+            for (&samples) |*sample| sample.* = state.measure(profile);
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            std.debug.print("integer_tile profile={d} mr={d} nc={d} bytes={d} p50_ns={d:.6} p95_ns={d:.6} p50_batch_ns={d} p95_batch_ns={d} measure_iters=20001\n", .{ profile, p.mr, p.nc, p.bytes, @as(f64, @floatFromInt(samples[10])) / 20001.0, @as(f64, @floatFromInt(samples[19])) / 20001.0, samples[10], samples[19] });
+        }
     }
 }

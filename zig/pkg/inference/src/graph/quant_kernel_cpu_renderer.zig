@@ -1,9 +1,8 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Static integer-dot tile lowering. Expand row/column ownership into the
-//! qualified scalar register idioms before Zig optimization. This shares the
-//! algorithm without requiring LLVM to recover those idioms from local arrays.
+//! Integer-dot ABI adapters call one native compile-time arithmetic owner.
+//! Entry signatures and inlining policy remain specialized for each consumer.
 const std = @import("std");
 const native_source = @import("quant_kernel_cpu_source.zig");
 
@@ -56,68 +55,43 @@ fn accumulator(buffer: *[32]u8, tile: Tile, row: usize, col: usize) []const u8 {
 fn renderTile(allocator: std.mem.Allocator, tile: Tile) ![]u8 {
     var out = Emitter{ .allocator = allocator };
     defer out.bytes.deinit(allocator);
-    const step = if (tile.sdot) "16" else "VEC_LEN";
-    const vector = if (tile.sdot) "I32x4" else "I32xN";
-    const raw_vector = if (tile.sdot) "U8x16" else "U8xN";
     if (tile.native_inline) try out.raw("inline ");
     try out.add("fn {s}(\n", .{tile.name});
     for (0..tile.rows) |r| {
         if (tile.rows == 1) try out.add("q_input: *const [{d}]u8,\n", .{tile.bytes}) else try out.add("q_input_r{d}: *const [{d}]u8,\n", .{ r, tile.bytes });
     }
     if (tile.contiguous) try out.raw("values: []const u8,\n") else for (0..tile.columns) |c| try out.add("q_weight{d}: *const [{d}]u8,\n", .{ c, tile.bytes });
+    try out.raw(") ");
+    try tileResultType(&out, tile);
+    try out.raw(" {\n");
+    if (tile.contiguous) try out.raw("std.debug.assert(values.len >= 8 * 32);\n");
+    try out.raw("return integerDotTile(");
+    try tileResultType(&out, tile);
+    try out.add(", {d}, {d}, {d}, {s}, .{{ ", .{ tile.rows, tile.columns, tile.bytes, if (tile.sdot) "true" else if (tile.bytes == 16) "native_aarch64_dotprod" else "false" });
+    for (0..tile.rows) |row| {
+        if (row != 0) try out.raw(", ");
+        if (tile.rows == 1) try out.raw("q_input") else try out.add("q_input_r{d}", .{row});
+    }
+    try out.raw(" }, .{ ");
+    for (0..tile.columns) |col| {
+        if (col != 0) try out.raw(", ");
+        if (tile.contiguous) try out.add("values[{d}..][0..{d}]", .{ col * tile.bytes, tile.bytes }) else try out.add("q_weight{d}", .{col});
+    }
+    try out.raw(" });\n}\n");
+    return formatSource(allocator, out.bytes.items);
+}
+
+fn tileResultType(out: *Emitter, tile: Tile) !void {
     switch (tile.result) {
         .tuple => {
-            try out.add(") struct {{", .{});
+            try out.raw("struct { ");
             for (0..tile.rows * tile.columns) |i| try out.add("{s}i32", .{if (i == 0) "" else ", "});
-            try out.add("}} {{\n", .{});
+            try out.raw(" }");
         },
-        .array => try out.add(") [{d}]i32 {{\n", .{tile.rows * tile.columns}),
-        .row_vectors => try out.add(") DotI8I8Block8MR2RowsVec {{\n", .{}),
-        .vector => try out.raw(") I32x8 {\n"),
+        .array => try out.add("[{d}]i32", .{tile.rows * tile.columns}),
+        .row_vectors => try out.raw("DotI8I8Block8MR2RowsVec"),
+        .vector => try out.raw("I32x8"),
     }
-    if (tile.contiguous) try out.raw("std.debug.assert(values.len >= 8 * 32);\n");
-    var buf: [32]u8 = undefined;
-    if (tile.bytes == 16) try directSdot16(&out, tile);
-    for (0..tile.rows) |r| for (0..tile.columns) |c| {
-        try out.add("var {s}: {s} = @splat(0);\n", .{ accumulator(&buf, tile, r, c), vector });
-    };
-    try out.add("comptime var i: usize = 0;\ninline while (i < {d}) : (i += {s}) {{\n", .{ tile.bytes, step });
-    for (0..tile.rows) |r| {
-        if (tile.rows == 1) try out.add("const raw_x: {s} = q_input[i..][0..{s}].*;\n", .{ raw_vector, step }) else try out.add("const raw_x{d}: {s} = q_input_r{d}[i..][0..{s}].*;\n", .{ r, raw_vector, r, step });
-    }
-    if (!tile.sdot) {
-        for (0..tile.rows) |r| {
-            if (tile.rows == 1) try out.add("const x: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_x));\n", .{}) else try out.add("const x{d}: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_x{d}));\n", .{ r, r });
-        }
-    }
-    // The one-row SDOT schedule consumes weight loads directly. Multi-row
-    // schedules acquire all weights before the row-major accumulator updates.
-    if (tile.bytes == 32 and (!tile.sdot or tile.rows != 1)) {
-        for (0..tile.columns) |c| {
-            if (tile.contiguous) {
-                try out.add("const raw_w{d}: U8x16 = values[", .{c});
-                if (c == 1) try out.raw("32 + ") else if (c != 0) try out.add("{d} * 32 + ", .{c});
-                try out.raw(if (c == 0) "i..][0..16].*;\n" else "i ..][0..16].*;\n");
-            } else try out.add("const raw_w{d}: {s} = q_weight{d}[i..][0..{s}].*;\n", .{ c, raw_vector, c, step });
-        }
-    }
-    if (!tile.sdot) {
-        for (0..tile.columns) |c| {
-            if (tile.bytes == 32) try out.add("const w{d}: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw_w{d}));\n", .{ c, c }) else if (tile.columns == 4) try out.add("const w{d}: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(q_weight{d}[i..][0..VEC_LEN].*));\n", .{ c, c });
-        }
-    }
-    for (0..tile.rows) |r| for (0..tile.columns) |c| {
-        const acc = accumulator(&buf, tile, r, c);
-        if (tile.sdot) {
-            if (tile.rows == 1) try out.add("{s} = aarch64Sdot16({s}, raw_x, q_weight{d}[i..][0..16].*);\n", .{ acc, acc, c }) else try out.add("{s} = aarch64Sdot16({s}, raw_x{d}, raw_w{d});\n", .{ acc, acc, r, c });
-        } else {
-            if (tile.bytes == 16 and tile.columns == 8) try out.add("{s} += x * @as(I32xN, @as(@Vector(VEC_LEN, i8), @bitCast(q_weight{d}[i..][0..VEC_LEN].*)));\n", .{ acc, c }) else if (tile.rows == 1) try out.add("{s} += x * w{d};\n", .{ acc, c }) else try out.add("{s} += x{d} * w{d};\n", .{ acc, r, c });
-        }
-    };
-    try out.raw("}\n");
-    try tileReturn(&out, tile);
-    try out.raw("}\n");
-    return formatSource(allocator, out.bytes.items);
 }
 
 test "CPU tile renderer parses all native result shapes without leaking" {
@@ -526,35 +500,4 @@ fn q8KWeightOffsets(out: *Emitter) !void {
     for (0..4) |c| {
         if (c == 0) try out.add("const w0_off = o * row_stride;\n", .{}) else try out.add("const w{d}_off = (o + {d}) * row_stride;\n", .{ c, c });
     }
-}
-
-// Sixteen-byte leaves keep the original direct SDOT idiom before the portable
-// vector traversal. Both widths share row/column and result ownership.
-fn directSdot16(out: *Emitter, tile: Tile) !void {
-    try out.raw("if (comptime native_aarch64_dotprod) {\n");
-    for (0..tile.rows) |r| {
-        if (tile.rows == 1) try out.raw("const raw_x: U8x16 = q_input.*;\n") else try out.add("const raw_x{d}: U8x16 = q_input_r{d}.*;\n", .{ r, r });
-    }
-    if (tile.rows != 1) for (0..tile.columns) |c| try out.add("const raw_w{d}: U8x16 = q_weight{d}.*;\n", .{ c, c });
-    var buf: [32]u8 = undefined;
-    for (0..tile.rows) |r| for (0..tile.columns) |c| {
-        try out.add("const {s} = aarch64Sdot16(@splat(0), ", .{accumulator(&buf, tile, r, c)});
-        if (tile.rows == 1) try out.add("raw_x, q_weight{d}.*);\n", .{c}) else try out.add("raw_x{d}, raw_w{d});\n", .{ r, c });
-    };
-    try tileReturn(out, tile);
-    try out.raw("}\n");
-}
-fn tileReturn(out: *Emitter, tile: Tile) !void {
-    const flat_tuple = tile.result == .tuple and (tile.bytes == 16 or tile.rows == 1);
-    try out.raw(if (flat_tuple) "return .{ " else "return .{\n");
-    var buf: [32]u8 = undefined;
-    for (0..tile.rows) |r| {
-        if (tile.result == .row_vectors) try out.add(".r{d} = .{{\n", .{r});
-        for (0..tile.columns) |c| {
-            try out.add("@reduce(.Add, {s})", .{accumulator(&buf, tile, r, c)});
-            if (flat_tuple) try out.raw(if (r + 1 == tile.rows and c + 1 == tile.columns) " " else ", ") else try out.raw(",\n");
-        }
-        if (tile.result == .row_vectors) try out.raw("},\n");
-    }
-    try out.raw("};\n");
 }

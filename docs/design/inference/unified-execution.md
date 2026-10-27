@@ -3275,3 +3275,10 @@ failed prototypes and explicit full-kernel instruction audits.
 [The AC outcome register](unified-execution-ac-outcomes.md) records one native
 Q6 panel8 owner for ordinary and fused row variants, preserved accumulation
 schedules, signed-extrema oracle coverage and fixed performance comparisons.
+
+### AD native CPU integer-dot tiles
+
+[The AD outcome register](unified-execution-ad-outcomes.md) records one native
+integer-dot owner with preserved result and instruction policies, signed-byte
+oracles, native and non-SDOT performance matrices, and retained compiler and
+performance findings from rejected prototypes.
