@@ -31,7 +31,14 @@ fn Owner(comptime layout: Layout, comptime mr: usize) type {
         pub fn render(allocator: std.mem.Allocator) ![]u8 {
             var out = Emitter{ .allocator = allocator };
             defer out.bytes.deinit(allocator);
-            if (layout == .panel8 or layout == .panel16 or layout == .blocks8) try wideBody(&out, layout, mr) else try fourBody(&out, layout, mr);
+            if (layout == .panel4) {
+                try out.add("return q8KPanel4Rows({d}, .{{ ", .{mr});
+                for (0..mr) |r| {
+                    if (r != 0) try out.raw(", ");
+                    try symbol(&out, "q8_input", mr, r);
+                }
+                try out.raw(" }, panel_block);\n");
+            } else if (layout == .panel8 or layout == .panel16 or layout == .blocks8) try wideBody(&out, layout, mr) else try fourBody(&out, layout, mr);
             return cpu.formatStatements(allocator, out.bytes.items, 4);
         }
     };
@@ -99,13 +106,12 @@ fn fallback(out: *Emitter, mr: usize, fused: bool) !void {
 }
 fn fourBody(out: *Emitter, layout: Layout, mr: usize) !void {
     const fused = layout == .fused4;
-    const panel = layout == .panel4;
-    const array = panel or (mr == 4 and !fused);
+    const array = mr == 4 and !fused;
     if (fused or (layout == .blocks4 and mr == 4)) try fallback(out, mr, fused);
-    if (panel or fused or mr != 2) try asserts(out, mr, layout);
-    if (!fused and (panel or mr != 4)) try inputScales(out, mr, false);
+    if (fused or mr != 2) try asserts(out, mr, layout);
+    if (!fused and mr != 4) try inputScales(out, mr, false);
     try queryViews(out, mr);
-    if (!panel) for (0..4) |c| try out.add("const qw{d} = q8_weight{d}[4..260];\n", .{ c, c });
+    for (0..4) |c| try out.add("const qw{d} = q8_weight{d}[4..260];\n", .{ c, c });
     if (array) {
         try out.add("var dot: [{d}]i32 = @as([{d}]i32, @splat(0));\n", .{ mr * 4, mr * 4 });
     } else for (0..mr) |r| for (0..4) |c| {
@@ -117,9 +123,8 @@ fn fourBody(out: *Emitter, layout: Layout, mr: usize) !void {
         try fusedLoop(out, mr);
     } else {
         try out.raw("inline for (0..8) |chunk| {\nconst off = chunk * 32;\n");
-        if (panel) try out.raw("const values_base = prepared_q8_k_panel4_values_offset + chunk * prepared_q8_k_panel4_nr * 32;\n");
-        const vertical = panel or mr != 1;
-        try out.add("const {s} = dotI8I8Block4{s}{s}", .{ if (!panel and mr == 4) "sums" else "dots", switch (mr) {
+        const vertical = mr != 1;
+        try out.add("const {s} = dotI8I8Block4{s}{s}", .{ if (mr == 4) "sums" else "dots", switch (mr) {
             1 => "",
             2 => "MR2",
             4 => "MR4",
@@ -131,15 +136,11 @@ fn fourBody(out: *Emitter, layout: Layout, mr: usize) !void {
             try out.raw(if (vertical) "\n" else " ");
         }
         for (0..4) |c| {
-            if (panel) {
-                try out.raw("panel_block[values_base");
-                if (c == 1) try out.raw(" + 32 ") else if (c != 0) try out.add(" + {d} * 32 ", .{c});
-                try out.raw("..][0..32]");
-            } else try out.add("qw{d}[off..][0..32]", .{c});
+            try out.add("qw{d}[off..][0..32]", .{c});
             if (vertical) try out.raw(",\n") else if (c != 3) try out.raw(", ");
         }
         try out.raw(");\n");
-        if (array and mr != 1) try out.add("inline for (0..{d}) |idx| dot[idx] += {s}[idx];\n", .{ mr * 4, if (panel) "dots" else "sums" }) else for (0..mr) |r| for (0..4) |c| {
+        if (array and mr != 1) try out.add("inline for (0..{d}) |idx| dot[idx] += {s}[idx];\n", .{ mr * 4, "sums" }) else for (0..mr) |r| for (0..4) |c| {
             if (array) try out.add("dot[{d}]", .{c}) else try matrix(out, "dot", mr, r, c);
             try out.add(" += dots[{d}];\n", .{r * 4 + c});
         };
@@ -147,13 +148,13 @@ fn fourBody(out: *Emitter, layout: Layout, mr: usize) !void {
     }
     if (fused or (layout == .blocks4 and mr == 4)) try inputScales(out, mr, false);
     if (mr != 1) for (0..4) |c| {
-        if (panel) try out.add("const weight_scale{d} = q8KPanel4WeightScale(panel_block, {d});\n", .{ c, c }) else try out.add("const weight_scale{d} = readF32Le(q8_weight{d}[0..4]);\n", .{ c, c });
+        try out.add("const weight_scale{d} = readF32Le(q8_weight{d}[0..4]);\n", .{ c, c });
     };
     try out.raw("return .{\n");
     for (0..mr) |r| for (0..4) |c| {
         try symbol(out, "input_scale", mr, r);
         try out.raw(" * ");
-        if (mr != 1) try out.add("weight_scale{d}", .{c}) else if (panel) try out.add("q8KPanel4WeightScale(panel_block, {d})", .{c}) else try out.add("readF32Le(q8_weight{d}[0..4])", .{c});
+        if (mr != 1) try out.add("weight_scale{d}", .{c}) else try out.add("readF32Le(q8_weight{d}[0..4])", .{c});
         try out.raw(" * @as(f32, @floatFromInt(");
         if (fused) try out.raw("@reduce(.Add, ");
         if (array) try out.add("dot[{d}]", .{r * 4 + c}) else try matrix(out, if (fused) "acc" else "dot", mr, r, c);
@@ -201,6 +202,6 @@ test "Q8K dot policies preserve native widths and integer scale boundaries" {
     inline for (owners) |O| {
         const source = try O.render(std.testing.allocator);
         defer std.testing.allocator.free(source);
-        try std.testing.expect(std.mem.indexOf(u8, source, "[4..260]") != null or std.mem.indexOf(u8, source, "q8KDotWide(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "[4..260]") != null or std.mem.indexOf(u8, source, "q8KDotWide(") != null or std.mem.indexOf(u8, source, "q8KPanel4Rows(") != null);
     }
 }

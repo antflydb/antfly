@@ -2249,21 +2249,7 @@ const splitk_online_decode_sm89_template =
 /// The relative paths are from src/ops/cuda/generated; runtime source is not
 /// passed through this function and retains its complete include-free body.
 pub fn compactAttentionSourceFile(allocator: std.mem.Allocator, source: []const u8) !?[]u8 {
-    const templates = .{
-        .{ flash_prefill_f16_sm89_template, "cuda_gqa_flash_prefill_f16_sm89.cuh" },
-        .{ splitk_online_decode_sm89_template, "cuda_gqa_decode_splitk_online_sm89.cuh" },
-        .{ attention_split_source, "cuda_gqa_split_decode_f32.cuh" },
-    };
-    inline for (templates) |entry| {
-        if (std.mem.indexOf(u8, source, entry[0])) |start| {
-            return try std.mem.concat(allocator, u8, &.{
-                source[0..start],
-                "#include \"../../../graph/templates/" ++ entry[1] ++ "\"\n",
-                source[start + entry[0].len ..],
-            });
-        }
-    }
-    return null;
+    return @import("kernel_source_owner.zig").compact(allocator, source, &native_source_owners);
 }
 
 test "standalone CUDA attention includes reconstruct complete runtime templates" {
@@ -2686,10 +2672,38 @@ pub const helper_q4_0_ggml_q8_1_dot16 = SourceFragment{
     ,
 };
 
-pub const ggml_q8_1_runtime_owned_helpers = [_]SourceFragment{
-    helper_q4_0_ggml_q8_1_dot16,
+const q8_legacy_policy = SourceFragment{
+    .name = "antfly_q8_legacy",
+    .source =
+    \\struct antfly_q8_legacy {
+    \\    static __device__ __forceinline__ float input_sum(const unsigned char* bp) { return 0.0f; }
+    \\    static __device__ __forceinline__ float output_sum(float x) { return 0.0f; }
+    \\    static __device__ __forceinline__ float dot(const unsigned char* bp, float d, float sum, unsigned iqs, int lo0, int hi0, int lo1, int hi1) { return antfly_q4_0_q8_dot16(bp, d, iqs, lo0, hi0, lo1, hi1); }
+    \\    static __device__ __forceinline__ void store_sum(unsigned char* bp, float sum) { bp[2] = 0u; bp[3] = 0u; }
+    \\};
+    ,
 };
-
+const q8_ggml_policy = SourceFragment{
+    .name = "antfly_q8_ggml",
+    .source =
+    \\struct antfly_q8_ggml {
+    \\    static __device__ __forceinline__ float input_sum(const unsigned char* bp) { return antfly_half_bits_to_float(((const unsigned short*)bp)[1]); }
+    \\    static __device__ __forceinline__ float output_sum(float x) { return antfly_warp_reduce_sum_f32(x); }
+    \\    static __device__ __forceinline__ float dot(const unsigned char* bp, float d, float sum, unsigned iqs, int lo0, int hi0, int lo1, int hi1) { return antfly_q4_0_ggml_q8_1_dot16(bp, d, sum, iqs, lo0, hi0, lo1, hi1); }
+    \\    static __device__ __forceinline__ void store_sum(unsigned char* bp, float sum) { const unsigned short bits = __half_as_ushort(__float2half(sum)); bp[2] = (unsigned char)(bits & 0xffu); bp[3] = (unsigned char)(bits >> 8); }
+    \\};
+    ,
+};
+const q4_q8_projection_native = SourceFragment{
+    .name = "antfly_q4_q8_projection_native",
+    .source = @embedFile("templates/cuda_q4_q8_projection.cuh"),
+};
+pub const q8_projection_runtime_owned_helpers = [_]SourceFragment{
+    helper_q4_0_ggml_q8_1_dot16,
+    q8_legacy_policy,
+    q8_ggml_policy,
+    q4_q8_projection_native,
+};
 const q4_0_q8_helpers = [_]SourceFragment{
     helper_half_bits_to_float,
     helper_warp_reduce_sum_f32,
@@ -2697,15 +2711,9 @@ const q4_0_q8_helpers = [_]SourceFragment{
     helper_decoder_activation_f32,
     helper_q4_0_word_u16,
     helper_q4_0_q8_dot16,
+    q8_legacy_policy,
+    q4_q8_projection_native,
 };
-
-const q4_0_down_q8_helpers = [_]SourceFragment{
-    helper_half_bits_to_float,
-    helper_warp_reduce_sum_f32,
-    helper_q4_0_word_u16_no_comment,
-    helper_q4_0_q8_dot16,
-};
-
 const q4_0_ggml_q8_1_helpers = [_]SourceFragment{
     helper_half_bits_to_float,
     helper_warp_reduce_sum_f32,
@@ -2713,14 +2721,11 @@ const q4_0_ggml_q8_1_helpers = [_]SourceFragment{
     helper_decoder_activation_f32,
     helper_q4_0_word_u16,
     helper_q4_0_ggml_q8_1_dot16,
+    q8_ggml_policy,
+    q4_q8_projection_native,
 };
-
-const q4_0_down_ggml_q8_1_helpers = [_]SourceFragment{
-    helper_half_bits_to_float,
-    helper_warp_reduce_sum_f32,
-    helper_q4_0_word_u16_no_comment,
-    helper_q4_0_ggml_q8_1_dot16,
-};
+const q4_0_down_q8_helpers = q4_0_q8_helpers;
+const q4_0_down_ggml_q8_1_helpers = q4_0_ggml_q8_1_helpers;
 
 const q6_recipe = quant_recipe.forFormat(.q6_k);
 const helper_q6_k_sub_scale_f32 = SourceFragment{
@@ -3316,190 +3321,6 @@ const body_q4_k_mmv = SourceFragment{
     ,
 };
 
-const body_q4_0_pair_activation_q8_1 = SourceFragment{
-    .name = "antfly_q4_0_pair_activation_q8_1_mmv_v1",
-    .source =
-    \\extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_mmv_v1(
-    \\    unsigned char *dst_q8,
-    \\    const unsigned char *q8_input,
-    \\    const unsigned char *weight_gate,
-    \\    const unsigned char *weight_up,
-    \\    unsigned int activation,
-    \\    unsigned int rows,
-    \\    unsigned int in_dim,
-    \\    unsigned int out_dim
-    \\) {
-    \\    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
-    \\    const unsigned int row_blocks = in_dim >> 5;
-    \\    const unsigned int out_row_blocks = out_dim >> 5;
-    \\    const unsigned int group_cols = 4u;
-    \\    const unsigned int groups_per_wave = 4u;
-    \\    const unsigned int waves = 2u;
-    \\
-    \\    const unsigned int out_block = blockIdx.x % out_row_blocks;
-    \\    const unsigned int row = blockIdx.x / out_row_blocks;
-    \\    const unsigned int col_block = out_block * 32u;
-    \\    const unsigned int tid = threadIdx.x;
-    \\    const unsigned int lane = tid & 31u;
-    \\    const unsigned int warp = tid >> 5u;
-    \\    const unsigned int group = warp / 5u;
-    \\    const unsigned int group_warp = warp - group * 5u;
-    \\    if (blockDim.x != 640u || row >= rows) return;
-    \\
-    \\    __shared__ float gate_partial[4][4][5];
-    \\    __shared__ float up_partial[4][4][5];
-    \\    __shared__ float activated[32];
-    \\
-    \\    #pragma unroll
-    \\    for (unsigned int wave = 0u; wave < waves; ++wave) {
-    \\        if (group < groups_per_wave) {
-    \\            const unsigned int local_tid = group_warp * 32u + lane;
-    \\            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
-    \\            float gate_acc[4];
-    \\            float up_acc[4];
-    \\            #pragma unroll
-    \\            for (unsigned int c = 0u; c < group_cols; ++c) {
-    \\                gate_acc[c] = 0.0f;
-    \\                up_acc[c] = 0.0f;
-    \\            }
-    \\
-    \\            const unsigned int iqs = (local_tid & 1u) * 2u;
-    \\            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += 80u) {
-    \\                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
-    \\                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-    \\                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-    \\                const unsigned int q8_base0 = iqs * 4u;
-    \\                const unsigned int q8_base1 = q8_base0 + 4u;
-    \\                const int q8_low0 = *(const int *)(q8_values + q8_base0);
-    \\                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-    \\                const int q8_low1 = *(const int *)(q8_values + q8_base1);
-    \\                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-    \\
-    \\                #pragma unroll
-    \\                for (unsigned int c = 0u; c < group_cols; ++c) {
-    \\                    const unsigned int col = col_tile + c;
-    \\                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
-    \\                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
-    \\                    gate_acc[c] += antfly_q4_0_q8_dot16(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-    \\                    up_acc[c] += antfly_q4_0_q8_dot16(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-    \\                }
-    \\            }
-    \\
-    \\            #pragma unroll
-    \\            for (unsigned int c = 0u; c < group_cols; ++c) {
-    \\                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
-    \\                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
-    \\                if (lane == 0u) {
-    \\                    gate_partial[group][c][group_warp] = gate_sum;
-    \\                    up_partial[group][c][group_warp] = up_sum;
-    \\                }
-    \\            }
-    \\        }
-    \\        __syncthreads();
-    \\        if (tid < 16u) {
-    \\            const unsigned int out_group = tid >> 2u;
-    \\            const unsigned int c = tid & 3u;
-    \\            float gate_y = 0.0f;
-    \\            float up_y = 0.0f;
-    \\            #pragma unroll
-    \\            for (unsigned int w = 0u; w < 5u; ++w) {
-    \\                gate_y += gate_partial[out_group][c][w];
-    \\                up_y += up_partial[out_group][c][w];
-    \\            }
-    \\            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
-    \\        }
-    \\        __syncthreads();
-    \\    }
-    \\
-    \\    if (warp == 0u) {
-    \\        const float x = activated[lane];
-    \\        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
-    \\        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
-    \\        int q = 0;
-    \\        if (d > 0.0f) {
-    \\            q = __float2int_rn(x / d);
-    \\            q = max(-127, min(127, q));
-    \\        }
-    \\        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
-    \\        bp[4u + lane] = (unsigned char)(signed char)q;
-    \\        if (lane == 0u) {
-    \\            const unsigned short d_bits = __half_as_ushort(__float2half(d));
-    \\            bp[0] = (unsigned char)(d_bits & 0xffu);
-    \\            bp[1] = (unsigned char)(d_bits >> 8);
-    \\            bp[2] = 0u;
-    \\            bp[3] = 0u;
-    \\        }
-    \\    }
-    \\}
-    ,
-};
-
-const body_q4_0_down_q8_1 = SourceFragment{
-    .name = "antfly_q4_0_down_q8_1_mmv_v1",
-    .source =
-    \\extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
-    \\    float *dst,
-    \\    const unsigned char *q8_input,
-    \\    const unsigned char *weight,
-    \\    unsigned int rows,
-    \\    unsigned int in_dim,
-    \\    unsigned int out_dim
-    \\) {
-    \\    const unsigned int cols = 4u;
-    \\    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
-    \\    const unsigned int row_blocks = in_dim >> 5;
-    \\    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
-    \\    const unsigned int row = blockIdx.x / col_tiles;
-    \\    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
-    \\    const unsigned int tid = threadIdx.x;
-    \\    const unsigned int lane = tid & 31u;
-    \\    const unsigned int warp = tid >> 5u;
-    \\    if (blockDim.x != 256u || row >= rows) return;
-    \\
-    \\    __shared__ float warp_partial[4][8];
-    \\    float acc[4];
-    \\    #pragma unroll
-    \\    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
-    \\
-    \\    const unsigned int iqs = (tid & 1u) * 2u;
-    \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += 128u) {
-    \\        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
-    \\        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-    \\        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-    \\        const unsigned int q8_base0 = iqs * 4u;
-    \\        const unsigned int q8_base1 = q8_base0 + 4u;
-    \\        const int q8_low0 = *(const int *)(q8_values + q8_base0);
-    \\        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-    \\        const int q8_low1 = *(const int *)(q8_values + q8_base1);
-    \\        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-    \\
-    \\        #pragma unroll
-    \\        for (unsigned int c = 0u; c < cols; ++c) {
-    \\            const unsigned int col = col_tile + c;
-    \\            if (col < out_dim) {
-    \\                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
-    \\                acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    #pragma unroll
-    \\    for (unsigned int c = 0u; c < cols; ++c) {
-    \\        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
-    \\        if (lane == 0u) warp_partial[c][warp] = sum;
-    \\    }
-    \\    __syncthreads();
-    \\    if (tid < 4u) {
-    \\        float y = 0.0f;
-    \\        #pragma unroll
-    \\        for (unsigned int w = 0u; w < 8u; ++w) y += warp_partial[tid][w];
-    \\        const unsigned int col = col_tile + tid;
-    \\        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
-    \\    }
-    \\}
-    ,
-};
-
 fn appendFmt(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -3836,283 +3657,30 @@ fn renderQ4ProjectionBody(
     try out.appendSlice(allocator, "    }\n}\n");
 }
 
-fn renderPairActivationQ8Body(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    plan: RenderPlan,
-) !void {
+fn renderPairActivationQ8Body(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), plan: RenderPlan) !void {
     const lowering = switch (plan.lowering) {
         .q4_0_pair_activation_q8_1 => |value| value,
         else => return error.InvalidPairActivationQ8Lowering,
     };
-    const warps = lowering.warps_per_projection_group;
-    const ggml_q8_1 = lowering.decode == .q4_0_q8_1_dp4a;
-    const dot_function = if (ggml_q8_1) "antfly_q4_0_ggml_q8_1_dot16" else "antfly_q4_0_q8_dot16";
-    const dot_sum_argument = if (ggml_q8_1) ", q8_sum" else "";
-    try appendFmt(allocator, out, "extern \"C\" __global__ void {s}(\n", .{plan.kernel_id});
-    try out.appendSlice(allocator,
-        \\    unsigned char *dst_q8,
-        \\    const unsigned char *q8_input,
-        \\    const unsigned char *weight_gate,
-        \\    const unsigned char *weight_up,
-        \\    unsigned int activation,
-        \\    unsigned int rows,
-        \\    unsigned int in_dim,
-        \\    unsigned int out_dim
-        \\) {
-        \\    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
-        \\    const unsigned int row_blocks = in_dim >> 5;
-        \\    const unsigned int out_row_blocks = out_dim >> 5;
-        \\    const unsigned int group_cols = 4u;
-        \\    const unsigned int groups_per_wave = 4u;
-        \\    const unsigned int waves = 2u;
+    try appendFmt(allocator, out,
+        \\extern "C" __global__ void {s}(ANTFLY_Q4_Q8_PAIR_PARAMS) {{
+        \\    antfly_q4_q8_pair<{d}u, {s}>(ANTFLY_Q4_Q8_PAIR_ARGS);
+        \\}}
         \\
-        \\    const unsigned int out_block = blockIdx.x % out_row_blocks;
-        \\    const unsigned int row = blockIdx.x / out_row_blocks;
-        \\    const unsigned int col_block = out_block * 32u;
-        \\    const unsigned int tid = threadIdx.x;
-        \\    const unsigned int lane = tid & 31u;
-        \\    const unsigned int warp = tid >> 5u;
-        \\    const unsigned int group = warp /
-    );
-    try appendFmt(allocator, out, " {d}u;\n    const unsigned int group_warp = warp - group * {d}u;\n", .{ warps, warps });
-    try appendFmt(allocator, out, "    if (blockDim.x != {d}u || row >= rows) return;\n\n", .{plan.launch.threads_per_block});
-    try appendFmt(allocator, out, "    __shared__ float gate_partial[4][4][{d}];\n", .{warps});
-    try appendFmt(allocator, out, "    __shared__ float up_partial[4][4][{d}];\n", .{warps});
-    try out.appendSlice(allocator,
-        \\    __shared__ float activated[32];
-        \\
-        \\    #pragma unroll
-        \\    for (unsigned int wave = 0u; wave < waves; ++wave) {
-        \\        if (group < groups_per_wave) {
-        \\            const unsigned int local_tid = group_warp * 32u + lane;
-        \\            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
-        \\            float gate_acc[4];
-        \\            float up_acc[4];
-        \\            #pragma unroll
-        \\            for (unsigned int c = 0u; c < group_cols; ++c) {
-        \\                gate_acc[c] = 0.0f;
-        \\                up_acc[c] = 0.0f;
-        \\            }
-        \\
-        \\            const unsigned int iqs = (local_tid & 1u) * 2u;
-        \\            for (unsigned int block = local_tid >> 1u; block < row_blocks; block +=
-    );
-    try appendFmt(allocator, out, " {d}u) {{\n", .{lowering.input_blocks});
-    try out.appendSlice(allocator,
-        \\                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
-        \\                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-    );
-    try out.appendSlice(allocator, "\n");
-    if (ggml_q8_1) try out.appendSlice(
-        allocator,
-        "                const float q8_sum = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[1]);\n",
-    );
-    try out.appendSlice(allocator,
-        \\                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-        \\                const unsigned int q8_base0 = iqs * 4u;
-        \\                const unsigned int q8_base1 = q8_base0 + 4u;
-        \\                const int q8_low0 = *(const int *)(q8_values + q8_base0);
-        \\                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-        \\                const int q8_low1 = *(const int *)(q8_values + q8_base1);
-        \\                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-        \\
-        \\                #pragma unroll
-        \\                for (unsigned int c = 0u; c < group_cols; ++c) {
-        \\                    const unsigned int col = col_tile + c;
-        \\                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
-        \\                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
-    );
-    try out.appendSlice(allocator, "\n");
-    try appendFmt(
-        allocator,
-        out,
-        "                    gate_acc[c] += {s}(gate_bp, q8_d{s}, iqs, q8_low0, q8_high0, q8_low1, q8_high1);\n" ++
-            "                    up_acc[c] += {s}(up_bp, q8_d{s}, iqs, q8_low0, q8_high0, q8_low1, q8_high1);\n",
-        .{ dot_function, dot_sum_argument, dot_function, dot_sum_argument },
-    );
-    try out.appendSlice(allocator,
-        \\                }
-        \\            }
-        \\
-        \\            #pragma unroll
-        \\            for (unsigned int c = 0u; c < group_cols; ++c) {
-        \\                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
-        \\                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
-        \\                if (lane == 0u) {
-        \\                    gate_partial[group][c][group_warp] = gate_sum;
-        \\                    up_partial[group][c][group_warp] = up_sum;
-        \\                }
-        \\            }
-        \\        }
-        \\        __syncthreads();
-        \\        if (tid < 16u) {
-        \\            const unsigned int out_group = tid >> 2u;
-        \\            const unsigned int c = tid & 3u;
-        \\            float gate_y = 0.0f;
-        \\            float up_y = 0.0f;
-        \\            #pragma unroll
-        \\            for (unsigned int w = 0u; w <
-    );
-    try appendFmt(allocator, out, " {d}u; ++w) {{\n", .{warps});
-    try out.appendSlice(allocator,
-        \\                gate_y += gate_partial[out_group][c][w];
-        \\                up_y += up_partial[out_group][c][w];
-        \\            }
-        \\            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
-        \\        }
-        \\        __syncthreads();
-        \\    }
-        \\
-        \\    if (warp == 0u) {
-        \\        const float x = activated[lane];
-    );
-    try out.appendSlice(allocator, "\n");
-    if (ggml_q8_1) try out.appendSlice(
-        allocator,
-        "        const float sum = antfly_warp_reduce_sum_f32(x);\n",
-    );
-    try out.appendSlice(allocator,
-        \\        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
-        \\        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
-        \\        int q = 0;
-        \\        if (d > 0.0f) {
-        \\            q = __float2int_rn(x / d);
-        \\            q = max(-127, min(127, q));
-        \\        }
-        \\        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
-        \\        bp[4u + lane] = (unsigned char)(signed char)q;
-        \\        if (lane == 0u) {
-        \\            const unsigned short d_bits = __half_as_ushort(__float2half(d));
-        \\            bp[0] = (unsigned char)(d_bits & 0xffu);
-        \\            bp[1] = (unsigned char)(d_bits >> 8);
-    );
-    try out.appendSlice(allocator, "\n");
-    if (ggml_q8_1) {
-        try out.appendSlice(allocator,
-            \\            const unsigned short sum_bits = __half_as_ushort(__float2half(sum));
-            \\            bp[2] = (unsigned char)(sum_bits & 0xffu);
-            \\            bp[3] = (unsigned char)(sum_bits >> 8);
-        );
-    } else {
-        try out.appendSlice(allocator,
-            \\            bp[2] = 0u;
-            \\            bp[3] = 0u;
-        );
-    }
-    try out.appendSlice(allocator, "\n");
-    try out.appendSlice(allocator,
-        \\        }
-        \\    }
-        \\}
-    );
+    , .{ plan.kernel_id, lowering.warps_per_projection_group, if (lowering.decode == .q4_0_q8_1_dp4a) "antfly_q8_ggml" else "antfly_q8_legacy" });
 }
 
-fn renderDownQ8Body(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    plan: RenderPlan,
-) !void {
+fn renderDownQ8Body(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), plan: RenderPlan) !void {
     const lowering = switch (plan.lowering) {
         .q4_0_down_q8_1 => |value| value,
         else => return error.InvalidDownQ8Lowering,
     };
-    const warps = plan.launch.threads_per_block / 32;
-    const block_stride = plan.launch.threads_per_block / 2;
-    const cols = lowering.columns_per_block;
-    const ggml_q8_1 = lowering.decode == .q4_0_q8_1_dp4a;
-    const dot_function = if (ggml_q8_1) "antfly_q4_0_ggml_q8_1_dot16" else "antfly_q4_0_q8_dot16";
-    const dot_sum_argument = if (ggml_q8_1) ", q8_sum" else "";
-    try appendFmt(allocator, out, "extern \"C\" __global__ void {s}(\n", .{plan.kernel_id});
-    try out.appendSlice(allocator,
-        \\    float *dst,
-        \\    const unsigned char *q8_input,
-        \\    const unsigned char *weight,
-        \\    unsigned int rows,
-        \\    unsigned int in_dim,
-        \\    unsigned int out_dim
-        \\) {
-    );
-    try out.appendSlice(allocator, "\n");
-    try appendFmt(allocator, out, "    const unsigned int cols = {d}u;\n", .{cols});
-    try out.appendSlice(allocator,
-        \\    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
-        \\    const unsigned int row_blocks = in_dim >> 5;
-        \\    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
-        \\    const unsigned int row = blockIdx.x / col_tiles;
-        \\    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
-        \\    const unsigned int tid = threadIdx.x;
-        \\    const unsigned int lane = tid & 31u;
-        \\    const unsigned int warp = tid >> 5u;
-    );
-    try appendFmt(allocator, out, "\n    if (blockDim.x != {d}u || row >= rows) return;\n\n", .{plan.launch.threads_per_block});
-    try appendFmt(allocator, out, "    __shared__ float warp_partial[{d}][{d}];\n", .{ cols, warps });
-    try appendFmt(allocator, out, "    float acc[{d}];\n", .{cols});
-    try out.appendSlice(allocator,
-        \\    #pragma unroll
-        \\    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
+    try appendFmt(allocator, out,
+        \\extern "C" __global__ void {s}(ANTFLY_Q4_Q8_DOWN_PARAMS) {{
+        \\    antfly_q4_q8_down<{d}u, {d}u, {s}>(ANTFLY_Q4_Q8_DOWN_ARGS);
+        \\}}
         \\
-        \\    const unsigned int iqs = (tid & 1u) * 2u;
-        \\    for (unsigned int block = tid >> 1u; block < row_blocks; block +=
-    );
-    try appendFmt(allocator, out, " {d}u) {{\n", .{block_stride});
-    try out.appendSlice(allocator,
-        \\        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
-        \\        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-    );
-    try out.appendSlice(allocator, "\n");
-    if (ggml_q8_1) try out.appendSlice(
-        allocator,
-        "        const float q8_sum = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[1]);\n",
-    );
-    try out.appendSlice(allocator,
-        \\        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-        \\        const unsigned int q8_base0 = iqs * 4u;
-        \\        const unsigned int q8_base1 = q8_base0 + 4u;
-        \\        const int q8_low0 = *(const int *)(q8_values + q8_base0);
-        \\        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-        \\        const int q8_low1 = *(const int *)(q8_values + q8_base1);
-        \\        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-        \\
-        \\        #pragma unroll
-        \\        for (unsigned int c = 0u; c < cols; ++c) {
-        \\            const unsigned int col = col_tile + c;
-        \\            if (col < out_dim) {
-        \\                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
-    );
-    try out.appendSlice(allocator, "\n");
-    try appendFmt(
-        allocator,
-        out,
-        "                acc[c] += {s}(bp, q8_d{s}, iqs, q8_low0, q8_high0, q8_low1, q8_high1);\n",
-        .{ dot_function, dot_sum_argument },
-    );
-    try out.appendSlice(allocator,
-        \\            }
-        \\        }
-        \\    }
-        \\
-        \\    #pragma unroll
-        \\    for (unsigned int c = 0u; c < cols; ++c) {
-        \\        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
-        \\        if (lane == 0u) warp_partial[c][warp] = sum;
-        \\    }
-        \\    __syncthreads();
-    );
-    try out.appendSlice(allocator, "\n");
-    try appendFmt(allocator, out, "    if (tid < {d}u) {{\n", .{cols});
-    try out.appendSlice(allocator,
-        \\        float y = 0.0f;
-        \\        #pragma unroll
-        \\        for (unsigned int w = 0u; w <
-    );
-    try appendFmt(allocator, out, " {d}u; ++w) y += warp_partial[tid][w];\n", .{warps});
-    try out.appendSlice(allocator,
-        \\        const unsigned int col = col_tile + tid;
-        \\        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
-        \\    }
-        \\}
-    );
+    , .{ plan.kernel_id, plan.launch.threads_per_block, lowering.columns_per_block, if (lowering.decode == .q4_0_q8_1_dp4a) "antfly_q8_ggml" else "antfly_q8_legacy" });
 }
 
 // Exact input traversal; paired and ordinary accumulators remain native.
@@ -4588,9 +4156,9 @@ test "cuda renderer keeps legacy zero-point Q8 and llama CUDA Q8_1 contracts sep
 
     const pair_body = try renderBodyAlloc(allocator, ggml_pair);
     defer allocator.free(pair_body);
-    try std.testing.expect(std.mem.containsAtLeast(u8, pair_body, 1, "antfly_q4_0_ggml_q8_1_dot16"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, pair_body, 1, "const float q8_sum"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, pair_body, 1, "bp[2] = (unsigned char)(sum_bits & 0xffu)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, pair_body, 1, "antfly_q4_q8_pair<3u, antfly_q8_ggml>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, q4_q8_projection_native.source, 1, "const float q8_sum"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, q8_ggml_policy.source, 1, "bp[2] = (unsigned char)(bits & 0xffu)"));
 
     const full_source = try renderKernel(allocator, ggml_down);
     defer allocator.free(full_source);
@@ -4680,34 +4248,39 @@ test "cuda renderer owns exact E2B Q8 FFN shape contracts" {
     try std.testing.expectError(error.DownQ8ShapeDoesNotMatchLowering, bad_down.validate());
 }
 
-test "cuda renderer parameterizes Q8 FFN bodies without changing E4B goldens" {
+test "cuda renderer specializes one native Q8 FFN owner for every profile" {
     const allocator = std.testing.allocator;
-    const e4b_pair = try renderBodyAlloc(allocator, planFor(.q4_0_pair_activation_q8_1));
-    defer allocator.free(e4b_pair);
-    const e4b_down = try renderBodyAlloc(allocator, planFor(.q4_0_down_q8_1));
-    defer allocator.free(e4b_down);
-    try std.testing.expectEqualStrings(body_q4_0_pair_activation_q8_1.source, e4b_pair);
-    try std.testing.expectEqualStrings(body_q4_0_down_q8_1.source, e4b_down);
-
-    const pair = try renderBodyAlloc(allocator, planFor(.q4_0_pair_activation_q8_1_e2b_6144));
-    defer allocator.free(pair);
-    try std.testing.expect(std.mem.containsAtLeast(u8, pair, 1, "void antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1("));
-    try std.testing.expect(std.mem.containsAtLeast(u8, pair, 1, "blockDim.x != 384u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, pair, 1, "gate_partial[4][4][3]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, pair, 1, "block += 48u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, pair, 1, "w < 3u"));
-
-    const down_small = try renderBodyAlloc(allocator, planFor(.q4_0_down_q8_1_e2b_6144));
-    defer allocator.free(down_small);
-    try std.testing.expect(std.mem.containsAtLeast(u8, down_small, 1, "blockDim.x != 128u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, down_small, 1, "warp_partial[4][4]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, down_small, 1, "block += 64u"));
-
-    const down_large = try renderBodyAlloc(allocator, planFor(.q4_0_down_q8_1_e2b_12288));
-    defer allocator.free(down_large);
-    try std.testing.expect(std.mem.containsAtLeast(u8, down_large, 1, "blockDim.x != 256u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, down_large, 1, "warp_partial[4][8]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, down_large, 1, "block += 128u"));
+    inline for (.{
+        KernelKind.q4_0_pair_activation_q8_1,
+        KernelKind.q4_0_pair_activation_q8_1_e2b_6144,
+        KernelKind.q4_0_pair_activation_q8_1_e2b_12288,
+        KernelKind.q4_0_pair_activation_ggml_q8_1_e2b_6144,
+        KernelKind.q4_0_pair_activation_ggml_q8_1_e2b_12288,
+        KernelKind.q4_0_down_q8_1,
+        KernelKind.q4_0_down_q8_1_e2b_6144,
+        KernelKind.q4_0_down_q8_1_e2b_12288,
+        KernelKind.q4_0_down_ggml_q8_1_e2b_6144,
+        KernelKind.q4_0_down_ggml_q8_1_e2b_12288,
+    }) |kind| {
+        const plan = planFor(kind);
+        const body = try renderBodyAlloc(allocator, plan);
+        defer allocator.free(body);
+        const call = switch (plan.lowering) {
+            .q4_0_pair_activation_q8_1 => |lowering| try std.fmt.allocPrint(allocator, "antfly_q4_q8_pair<{d}u, {s}>(ANTFLY_Q4_Q8_PAIR_ARGS)", .{ lowering.warps_per_projection_group, if (lowering.decode == .q4_0_q8_1_dp4a) "antfly_q8_ggml" else "antfly_q8_legacy" }),
+            .q4_0_down_q8_1 => |lowering| try std.fmt.allocPrint(allocator, "antfly_q4_q8_down<{d}u, {d}u, {s}>(ANTFLY_Q4_Q8_DOWN_ARGS)", .{ plan.launch.threads_per_block, lowering.columns_per_block, if (lowering.decode == .q4_0_q8_1_dp4a) "antfly_q8_ggml" else "antfly_q8_legacy" }),
+            else => unreachable,
+        };
+        defer allocator.free(call);
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, plan.kernel_id));
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, call));
+        try std.testing.expect(body.len < 300);
+        const support = supportFor(plan.lowering);
+        var owners: usize = 0;
+        for (support.helpers) |helper| if (std.mem.eql(u8, helper.name, q4_q8_projection_native.name)) {
+            owners += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), owners);
+    }
 }
 
 test "cuda renderer owns the E2B Q4_0 Q8_1 argmax contract" {
@@ -5261,4 +4834,15 @@ test "E4B Flash bounds and plan identity keep E2B qualification separate" {
         defer std.testing.allocator.free(id);
         try std.testing.expect(std.mem.containsAtLeast(u8, id, 1, "e4b"));
     }
+}
+
+const native_source_owners = [_]@import("kernel_source_owner.zig").NativeOwner{
+    .{ .source = flash_prefill_f16_sm89_template, .include_path = "../../../graph/templates/cuda_gqa_flash_prefill_f16_sm89.cuh" },
+    .{ .source = splitk_online_decode_sm89_template, .include_path = "../../../graph/templates/cuda_gqa_decode_splitk_online_sm89.cuh" },
+    .{ .source = attention_split_source, .include_path = "../../../graph/templates/cuda_gqa_split_decode_f32.cuh" },
+    .{ .source = q4_q8_projection_native.source, .include_path = "../../../graph/templates/cuda_q4_q8_projection.cuh" },
+};
+
+pub fn expandNativeSourceFile(allocator: std.mem.Allocator, source: []const u8) !?[]u8 {
+    return @import("kernel_source_owner.zig").expand(allocator, source, &native_source_owners);
 }

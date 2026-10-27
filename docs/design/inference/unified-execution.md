@@ -3255,3 +3255,10 @@ the individual CUDA/Metal targets and CUDA device qualification remain pending.
 compile-time CPU/Metal/CUDA numerical sharing and removal of stored CUDA
 attention expansions. It separates maintained-source savings from physical
 text savings and records performance and device-qualification limits.
+
+### AA native projection policies and decode correctness
+
+[The AA outcome register](unified-execution-aa-outcomes.md) records native
+quantized projection policies, narrow CPU panel sharing, shared paged decode
+and its masked-window fixes. It distinguishes maintained code, stored
+expansions, measured performance and transferred byte-identical CUDA evidence.

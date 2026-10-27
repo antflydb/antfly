@@ -14172,6 +14172,213 @@ extern "C" __global__ void termite_split_last_dim3_f32(
 }
 
 // quant-kernel-codegen:begin generated CUDA promoted matmul kernels (do not edit; run: zig build quant-kernel-codegen -- --write)
+// One of two 16-value contributions for a Q4_0/Q8_1 block. Keeping Q4
+// nibbles unsigned removes four packed-byte centering instructions; each
+// contribution applies half of the block-wide -8*sum correction.
+static __device__ __forceinline__ float antfly_q4_0_ggml_q8_1_dot16(
+    const unsigned char *q4_bp,
+    float q8_d,
+    float q8_sum,
+    unsigned int iqs,
+    int q8_low0,
+    int q8_high0,
+    int q8_low1,
+    int q8_high1
+) {
+    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
+    const unsigned int base0 = iqs * 4u;
+    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
+    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
+    const unsigned int low0 = word0 & 0x0f0f0f0fu;
+    const unsigned int high0 = (word0 >> 4) & 0x0f0f0f0fu;
+    const unsigned int low1 = word1 & 0x0f0f0f0fu;
+    const unsigned int high1 = (word1 >> 4) & 0x0f0f0f0fu;
+    int sumi = __dp4a((int)low0, q8_low0, 0);
+    sumi = __dp4a((int)high0, q8_high0, sumi);
+    sumi = __dp4a((int)low1, q8_low1, sumi);
+    sumi = __dp4a((int)high1, q8_high1, sumi);
+    return q4_d * (q8_d * (float)sumi - 4.0f * q8_sum);
+}
+struct antfly_q8_legacy {
+    static __device__ __forceinline__ float input_sum(const unsigned char* bp) { return 0.0f; }
+    static __device__ __forceinline__ float output_sum(float x) { return 0.0f; }
+    static __device__ __forceinline__ float dot(const unsigned char* bp, float d, float sum, unsigned iqs, int lo0, int hi0, int lo1, int hi1) { return antfly_q4_0_q8_dot16(bp, d, iqs, lo0, hi0, lo1, hi1); }
+    static __device__ __forceinline__ void store_sum(unsigned char* bp, float sum) { bp[2] = 0u; bp[3] = 0u; }
+};
+struct antfly_q8_ggml {
+    static __device__ __forceinline__ float input_sum(const unsigned char* bp) { return antfly_half_bits_to_float(((const unsigned short*)bp)[1]); }
+    static __device__ __forceinline__ float output_sum(float x) { return antfly_warp_reduce_sum_f32(x); }
+    static __device__ __forceinline__ float dot(const unsigned char* bp, float d, float sum, unsigned iqs, int lo0, int hi0, int lo1, int hi1) { return antfly_q4_0_ggml_q8_1_dot16(bp, d, sum, iqs, lo0, hi0, lo1, hi1); }
+    static __device__ __forceinline__ void store_sum(unsigned char* bp, float sum) { const unsigned short bits = __half_as_ushort(__float2half(sum)); bp[2] = (unsigned char)(bits & 0xffu); bp[3] = (unsigned char)(bits >> 8); }
+};
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+// Native compile-time Q4_0/Q8_1 FFN schedules. Keep packed-sum precision,
+// reduction order and output rounding distinct through the Ggml policy.
+#define ANTFLY_Q4_Q8_PAIR_PARAMS unsigned char* dst_q8, const unsigned char* q8_input, const unsigned char* weight_gate, const unsigned char* weight_up, unsigned int activation, unsigned int rows, unsigned int in_dim, unsigned int out_dim
+#define ANTFLY_Q4_Q8_PAIR_ARGS dst_q8, q8_input, weight_gate, weight_up, activation, rows, in_dim, out_dim
+#define ANTFLY_Q4_Q8_DOWN_PARAMS float* dst, const unsigned char* q8_input, const unsigned char* weight, unsigned int rows, unsigned int in_dim, unsigned int out_dim
+#define ANTFLY_Q4_Q8_DOWN_ARGS dst, q8_input, weight, rows, in_dim, out_dim
+template<unsigned Warps, typename Decode>
+__device__ __forceinline__ void antfly_q4_q8_pair(ANTFLY_Q4_Q8_PAIR_PARAMS) {
+    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
+    const unsigned int row_blocks = in_dim >> 5;
+    const unsigned int out_row_blocks = out_dim >> 5;
+    const unsigned int group_cols = 4u;
+    const unsigned int groups_per_wave = 4u;
+    const unsigned int waves = 2u;
+
+    const unsigned int out_block = blockIdx.x % out_row_blocks;
+    const unsigned int row = blockIdx.x / out_row_blocks;
+    const unsigned int col_block = out_block * 32u;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int group = warp / Warps;
+    const unsigned int group_warp = warp - group * Warps;
+    if (blockDim.x != Warps * 128u || row >= rows) return;
+
+    __shared__ float gate_partial[4][4][Warps];
+    __shared__ float up_partial[4][4][Warps];
+    __shared__ float activated[32];
+
+    #pragma unroll
+    for (unsigned int wave = 0u; wave < waves; ++wave) {
+        if (group < groups_per_wave) {
+            const unsigned int local_tid = group_warp * 32u + lane;
+            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
+            float gate_acc[4];
+            float up_acc[4];
+            #pragma unroll
+            for (unsigned int c = 0u; c < group_cols; ++c) {
+                gate_acc[c] = 0.0f;
+                up_acc[c] = 0.0f;
+            }
+
+            const unsigned int iqs = (local_tid & 1u) * 2u;
+            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += Warps * 16u) {
+                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
+                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
+                const float q8_sum = Decode::input_sum(q8_bp);
+                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
+                const unsigned int q8_base0 = iqs * 4u;
+                const unsigned int q8_base1 = q8_base0 + 4u;
+                const int q8_low0 = *(const int *)(q8_values + q8_base0);
+                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
+                const int q8_low1 = *(const int *)(q8_values + q8_base1);
+                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+
+                #pragma unroll
+                for (unsigned int c = 0u; c < group_cols; ++c) {
+                    const unsigned int col = col_tile + c;
+                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
+                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
+                    gate_acc[c] += Decode::dot(gate_bp, q8_d, q8_sum, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+                    up_acc[c] += Decode::dot(up_bp, q8_d, q8_sum, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+                }
+            }
+
+            #pragma unroll
+            for (unsigned int c = 0u; c < group_cols; ++c) {
+                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
+                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
+                if (lane == 0u) {
+                    gate_partial[group][c][group_warp] = gate_sum;
+                    up_partial[group][c][group_warp] = up_sum;
+                }
+            }
+        }
+        __syncthreads();
+        if (tid < 16u) {
+            const unsigned int out_group = tid >> 2u;
+            const unsigned int c = tid & 3u;
+            float gate_y = 0.0f;
+            float up_y = 0.0f;
+            #pragma unroll
+            for (unsigned int w = 0u; w < Warps; ++w) {
+                gate_y += gate_partial[out_group][c][w];
+                up_y += up_partial[out_group][c][w];
+            }
+            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
+        }
+        __syncthreads();
+    }
+
+    if (warp == 0u) {
+        const float x = activated[lane];
+        const float sum = Decode::output_sum(x);
+        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
+        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+        int q = 0;
+        if (d > 0.0f) {
+            q = __float2int_rn(x / d);
+            q = max(-127, min(127, q));
+        }
+        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
+        bp[4u + lane] = (unsigned char)(signed char)q;
+        if (lane == 0u) {
+            const unsigned short d_bits = __half_as_ushort(__float2half(d));
+            bp[0] = (unsigned char)(d_bits & 0xffu);
+            bp[1] = (unsigned char)(d_bits >> 8);
+            Decode::store_sum(bp, sum);
+        }
+    }
+}
+template<unsigned Threads, unsigned Cols, typename Decode>
+__device__ __forceinline__ void antfly_q4_q8_down(ANTFLY_Q4_Q8_DOWN_PARAMS) {
+    const unsigned int cols = Cols;
+    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
+    const unsigned int row_blocks = in_dim >> 5;
+    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
+    const unsigned int row = blockIdx.x / col_tiles;
+    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    if (blockDim.x != Threads || row >= rows) return;
+
+    __shared__ float warp_partial[Cols][Threads / 32u];
+    float acc[Cols];
+    #pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
+
+    const unsigned int iqs = (tid & 1u) * 2u;
+    for (unsigned int block = tid >> 1u; block < row_blocks; block += Threads / 2u) {
+        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
+        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
+                const float q8_sum = Decode::input_sum(q8_bp);
+        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
+        const unsigned int q8_base0 = iqs * 4u;
+        const unsigned int q8_base1 = q8_base0 + 4u;
+        const int q8_low0 = *(const int *)(q8_values + q8_base0);
+        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
+        const int q8_low1 = *(const int *)(q8_values + q8_base1);
+        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+
+        #pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
+                acc[c] += Decode::dot(bp, q8_d, q8_sum, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
+        if (lane == 0u) warp_partial[c][warp] = sum;
+    }
+    __syncthreads();
+    if (tid < Cols) {
+        float y = 0.0f;
+        #pragma unroll
+        for (unsigned int w = 0u; w < Threads / 32u; ++w) y += warp_partial[tid][w];
+        const unsigned int col = col_tile + tid;
+        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
+    }
+}
 // Production generated CUDA matmul route from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_mmv_f32_v1 plan_id=cuda/q4_0/rows_1/none/mmv
 extern "C" __global__ void antfly_q4_0_mmv_f32_v1(
@@ -14371,211 +14578,20 @@ extern "C" __global__ void antfly_q4_0_pair_mmv_f32_v1(
 
 // Production generated CUDA matmul route from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_pair_activation_q8_1_mmv_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
-extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_mmv_v1(
-    unsigned char *dst_q8,
-    const unsigned char *q8_input,
-    const unsigned char *weight_gate,
-    const unsigned char *weight_up,
-    unsigned int activation,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
-    const unsigned int row_blocks = in_dim >> 5;
-    const unsigned int out_row_blocks = out_dim >> 5;
-    const unsigned int group_cols = 4u;
-    const unsigned int groups_per_wave = 4u;
-    const unsigned int waves = 2u;
-
-    const unsigned int out_block = blockIdx.x % out_row_blocks;
-    const unsigned int row = blockIdx.x / out_row_blocks;
-    const unsigned int col_block = out_block * 32u;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    const unsigned int group = warp / 5u;
-    const unsigned int group_warp = warp - group * 5u;
-    if (blockDim.x != 640u || row >= rows) return;
-
-    __shared__ float gate_partial[4][4][5];
-    __shared__ float up_partial[4][4][5];
-    __shared__ float activated[32];
-
-    #pragma unroll
-    for (unsigned int wave = 0u; wave < waves; ++wave) {
-        if (group < groups_per_wave) {
-            const unsigned int local_tid = group_warp * 32u + lane;
-            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
-            float gate_acc[4];
-            float up_acc[4];
-            #pragma unroll
-            for (unsigned int c = 0u; c < group_cols; ++c) {
-                gate_acc[c] = 0.0f;
-                up_acc[c] = 0.0f;
-            }
-
-            const unsigned int iqs = (local_tid & 1u) * 2u;
-            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += 80u) {
-                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
-                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-                const unsigned int q8_base0 = iqs * 4u;
-                const unsigned int q8_base1 = q8_base0 + 4u;
-                const int q8_low0 = *(const int *)(q8_values + q8_base0);
-                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-                const int q8_low1 = *(const int *)(q8_values + q8_base1);
-                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-
-                #pragma unroll
-                for (unsigned int c = 0u; c < group_cols; ++c) {
-                    const unsigned int col = col_tile + c;
-                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
-                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
-                    gate_acc[c] += antfly_q4_0_q8_dot16(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                    up_acc[c] += antfly_q4_0_q8_dot16(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                }
-            }
-
-            #pragma unroll
-            for (unsigned int c = 0u; c < group_cols; ++c) {
-                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
-                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
-                if (lane == 0u) {
-                    gate_partial[group][c][group_warp] = gate_sum;
-                    up_partial[group][c][group_warp] = up_sum;
-                }
-            }
-        }
-        __syncthreads();
-        if (tid < 16u) {
-            const unsigned int out_group = tid >> 2u;
-            const unsigned int c = tid & 3u;
-            float gate_y = 0.0f;
-            float up_y = 0.0f;
-            #pragma unroll
-            for (unsigned int w = 0u; w < 5u; ++w) {
-                gate_y += gate_partial[out_group][c][w];
-                up_y += up_partial[out_group][c][w];
-            }
-            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
-        }
-        __syncthreads();
-    }
-
-    if (warp == 0u) {
-        const float x = activated[lane];
-        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
-        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
-        int q = 0;
-        if (d > 0.0f) {
-            q = __float2int_rn(x / d);
-            q = max(-127, min(127, q));
-        }
-        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
-        bp[4u + lane] = (unsigned char)(signed char)q;
-        if (lane == 0u) {
-            const unsigned short d_bits = __half_as_ushort(__float2half(d));
-            bp[0] = (unsigned char)(d_bits & 0xffu);
-            bp[1] = (unsigned char)(d_bits >> 8);
-            bp[2] = 0u;
-            bp[3] = 0u;
-        }
-    }
+extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_mmv_v1(ANTFLY_Q4_Q8_PAIR_PARAMS) {
+    antfly_q4_q8_pair<5u, antfly_q8_legacy>(ANTFLY_Q4_Q8_PAIR_ARGS);
 }
+
 // Production generated CUDA matmul route from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_down_q8_1_mmv_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
-extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
-    float *dst,
-    const unsigned char *q8_input,
-    const unsigned char *weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    const unsigned int cols = 4u;
-    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
-    const unsigned int row_blocks = in_dim >> 5;
-    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
-    const unsigned int row = blockIdx.x / col_tiles;
-    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    if (blockDim.x != 256u || row >= rows) return;
-
-    __shared__ float warp_partial[4][8];
-    float acc[4];
-    #pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
-
-    const unsigned int iqs = (tid & 1u) * 2u;
-    for (unsigned int block = tid >> 1u; block < row_blocks; block += 128u) {
-        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
-        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-        const unsigned int q8_base0 = iqs * 4u;
-        const unsigned int q8_base1 = q8_base0 + 4u;
-        const int q8_low0 = *(const int *)(q8_values + q8_base0);
-        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-        const int q8_low1 = *(const int *)(q8_values + q8_base1);
-        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-
-        #pragma unroll
-        for (unsigned int c = 0u; c < cols; ++c) {
-            const unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
-                acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-            }
-        }
-    }
-
-    #pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) {
-        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
-        if (lane == 0u) warp_partial[c][warp] = sum;
-    }
-    __syncthreads();
-    if (tid < 4u) {
-        float y = 0.0f;
-        #pragma unroll
-        for (unsigned int w = 0u; w < 8u; ++w) y += warp_partial[tid][w];
-        const unsigned int col = col_tile + tid;
-        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
-    }
+extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(ANTFLY_Q4_Q8_DOWN_PARAMS) {
+    antfly_q4_q8_down<256u, 4u, antfly_q8_legacy>(ANTFLY_Q4_Q8_DOWN_ARGS);
 }
+
 // quant-kernel-codegen:end generated CUDA promoted matmul kernels
 
 // quant-kernel-codegen:begin generated CUDA runtime-wired dev matmul candidates (do not edit; run: zig build quant-kernel-codegen -- --write)
 // Runtime-owned llama.cpp CUDA block_q8_1 support; generated, never hand-edited.
-// One of two 16-value contributions for a Q4_0/Q8_1 block. Keeping Q4
-// nibbles unsigned removes four packed-byte centering instructions; each
-// contribution applies half of the block-wide -8*sum correction.
-static __device__ __forceinline__ float antfly_q4_0_ggml_q8_1_dot16(
-    const unsigned char *q4_bp,
-    float q8_d,
-    float q8_sum,
-    unsigned int iqs,
-    int q8_low0,
-    int q8_high0,
-    int q8_low1,
-    int q8_high1
-) {
-    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
-    const unsigned int base0 = iqs * 4u;
-    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
-    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
-    const unsigned int low0 = word0 & 0x0f0f0f0fu;
-    const unsigned int high0 = (word0 >> 4) & 0x0f0f0f0fu;
-    const unsigned int low1 = word1 & 0x0f0f0f0fu;
-    const unsigned int high1 = (word1 >> 4) & 0x0f0f0f0fu;
-    int sumi = __dp4a((int)low0, q8_low0, 0);
-    sumi = __dp4a((int)high0, q8_high0, sumi);
-    sumi = __dp4a((int)low1, q8_low1, sumi);
-    sumi = __dp4a((int)high1, q8_high1, sumi);
-    return q4_d * (q8_d * (float)sumi - 4.0f * q8_sum);
-}
 
 extern "C" __global__ void antfly_quantize_f32_ggml_q8_1_rows_v1(
     unsigned char *dst_q8,
@@ -14609,722 +14625,50 @@ extern "C" __global__ void antfly_quantize_f32_ggml_q8_1_rows_v1(
 }
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
-extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1(
-    unsigned char *dst_q8,
-    const unsigned char *q8_input,
-    const unsigned char *weight_gate,
-    const unsigned char *weight_up,
-    unsigned int activation,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
-    const unsigned int row_blocks = in_dim >> 5;
-    const unsigned int out_row_blocks = out_dim >> 5;
-    const unsigned int group_cols = 4u;
-    const unsigned int groups_per_wave = 4u;
-    const unsigned int waves = 2u;
-
-    const unsigned int out_block = blockIdx.x % out_row_blocks;
-    const unsigned int row = blockIdx.x / out_row_blocks;
-    const unsigned int col_block = out_block * 32u;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    const unsigned int group = warp / 3u;
-    const unsigned int group_warp = warp - group * 3u;
-    if (blockDim.x != 384u || row >= rows) return;
-
-    __shared__ float gate_partial[4][4][3];
-    __shared__ float up_partial[4][4][3];
-    __shared__ float activated[32];
-
-    #pragma unroll
-    for (unsigned int wave = 0u; wave < waves; ++wave) {
-        if (group < groups_per_wave) {
-            const unsigned int local_tid = group_warp * 32u + lane;
-            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
-            float gate_acc[4];
-            float up_acc[4];
-            #pragma unroll
-            for (unsigned int c = 0u; c < group_cols; ++c) {
-                gate_acc[c] = 0.0f;
-                up_acc[c] = 0.0f;
-            }
-
-            const unsigned int iqs = (local_tid & 1u) * 2u;
-            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += 48u) {
-                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
-                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-                const unsigned int q8_base0 = iqs * 4u;
-                const unsigned int q8_base1 = q8_base0 + 4u;
-                const int q8_low0 = *(const int *)(q8_values + q8_base0);
-                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-                const int q8_low1 = *(const int *)(q8_values + q8_base1);
-                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-
-                #pragma unroll
-                for (unsigned int c = 0u; c < group_cols; ++c) {
-                    const unsigned int col = col_tile + c;
-                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
-                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
-                    gate_acc[c] += antfly_q4_0_q8_dot16(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                    up_acc[c] += antfly_q4_0_q8_dot16(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                }
-            }
-
-            #pragma unroll
-            for (unsigned int c = 0u; c < group_cols; ++c) {
-                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
-                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
-                if (lane == 0u) {
-                    gate_partial[group][c][group_warp] = gate_sum;
-                    up_partial[group][c][group_warp] = up_sum;
-                }
-            }
-        }
-        __syncthreads();
-        if (tid < 16u) {
-            const unsigned int out_group = tid >> 2u;
-            const unsigned int c = tid & 3u;
-            float gate_y = 0.0f;
-            float up_y = 0.0f;
-            #pragma unroll
-            for (unsigned int w = 0u; w < 3u; ++w) {
-                gate_y += gate_partial[out_group][c][w];
-                up_y += up_partial[out_group][c][w];
-            }
-            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
-        }
-        __syncthreads();
-    }
-
-    if (warp == 0u) {
-        const float x = activated[lane];
-        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
-        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
-        int q = 0;
-        if (d > 0.0f) {
-            q = __float2int_rn(x / d);
-            q = max(-127, min(127, q));
-        }
-        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
-        bp[4u + lane] = (unsigned char)(signed char)q;
-        if (lane == 0u) {
-            const unsigned short d_bits = __half_as_ushort(__float2half(d));
-            bp[0] = (unsigned char)(d_bits & 0xffu);
-            bp[1] = (unsigned char)(d_bits >> 8);
-            bp[2] = 0u;
-            bp[3] = 0u;
-        }
-    }
+extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1(ANTFLY_Q4_Q8_PAIR_PARAMS) {
+    antfly_q4_q8_pair<3u, antfly_q8_legacy>(ANTFLY_Q4_Q8_PAIR_ARGS);
 }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
-extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1(
-    unsigned char *dst_q8,
-    const unsigned char *q8_input,
-    const unsigned char *weight_gate,
-    const unsigned char *weight_up,
-    unsigned int activation,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
-    const unsigned int row_blocks = in_dim >> 5;
-    const unsigned int out_row_blocks = out_dim >> 5;
-    const unsigned int group_cols = 4u;
-    const unsigned int groups_per_wave = 4u;
-    const unsigned int waves = 2u;
-
-    const unsigned int out_block = blockIdx.x % out_row_blocks;
-    const unsigned int row = blockIdx.x / out_row_blocks;
-    const unsigned int col_block = out_block * 32u;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    const unsigned int group = warp / 3u;
-    const unsigned int group_warp = warp - group * 3u;
-    if (blockDim.x != 384u || row >= rows) return;
-
-    __shared__ float gate_partial[4][4][3];
-    __shared__ float up_partial[4][4][3];
-    __shared__ float activated[32];
-
-    #pragma unroll
-    for (unsigned int wave = 0u; wave < waves; ++wave) {
-        if (group < groups_per_wave) {
-            const unsigned int local_tid = group_warp * 32u + lane;
-            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
-            float gate_acc[4];
-            float up_acc[4];
-            #pragma unroll
-            for (unsigned int c = 0u; c < group_cols; ++c) {
-                gate_acc[c] = 0.0f;
-                up_acc[c] = 0.0f;
-            }
-
-            const unsigned int iqs = (local_tid & 1u) * 2u;
-            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += 48u) {
-                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
-                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-                const unsigned int q8_base0 = iqs * 4u;
-                const unsigned int q8_base1 = q8_base0 + 4u;
-                const int q8_low0 = *(const int *)(q8_values + q8_base0);
-                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-                const int q8_low1 = *(const int *)(q8_values + q8_base1);
-                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-
-                #pragma unroll
-                for (unsigned int c = 0u; c < group_cols; ++c) {
-                    const unsigned int col = col_tile + c;
-                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
-                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
-                    gate_acc[c] += antfly_q4_0_q8_dot16(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                    up_acc[c] += antfly_q4_0_q8_dot16(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                }
-            }
-
-            #pragma unroll
-            for (unsigned int c = 0u; c < group_cols; ++c) {
-                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
-                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
-                if (lane == 0u) {
-                    gate_partial[group][c][group_warp] = gate_sum;
-                    up_partial[group][c][group_warp] = up_sum;
-                }
-            }
-        }
-        __syncthreads();
-        if (tid < 16u) {
-            const unsigned int out_group = tid >> 2u;
-            const unsigned int c = tid & 3u;
-            float gate_y = 0.0f;
-            float up_y = 0.0f;
-            #pragma unroll
-            for (unsigned int w = 0u; w < 3u; ++w) {
-                gate_y += gate_partial[out_group][c][w];
-                up_y += up_partial[out_group][c][w];
-            }
-            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
-        }
-        __syncthreads();
-    }
-
-    if (warp == 0u) {
-        const float x = activated[lane];
-        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
-        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
-        int q = 0;
-        if (d > 0.0f) {
-            q = __float2int_rn(x / d);
-            q = max(-127, min(127, q));
-        }
-        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
-        bp[4u + lane] = (unsigned char)(signed char)q;
-        if (lane == 0u) {
-            const unsigned short d_bits = __half_as_ushort(__float2half(d));
-            bp[0] = (unsigned char)(d_bits & 0xffu);
-            bp[1] = (unsigned char)(d_bits >> 8);
-            bp[2] = 0u;
-            bp[3] = 0u;
-        }
-    }
+extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1(ANTFLY_Q4_Q8_PAIR_PARAMS) {
+    antfly_q4_q8_pair<3u, antfly_q8_legacy>(ANTFLY_Q4_Q8_PAIR_ARGS);
 }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_down_q8_1_e2b_6144_mmv_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
-extern "C" __global__ void antfly_q4_0_down_q8_1_e2b_6144_mmv_v1(
-    float *dst,
-    const unsigned char *q8_input,
-    const unsigned char *weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    const unsigned int cols = 4u;
-    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
-    const unsigned int row_blocks = in_dim >> 5;
-    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
-    const unsigned int row = blockIdx.x / col_tiles;
-    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    if (blockDim.x != 128u || row >= rows) return;
-
-    __shared__ float warp_partial[4][4];
-    float acc[4];
-    #pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
-
-    const unsigned int iqs = (tid & 1u) * 2u;
-    for (unsigned int block = tid >> 1u; block < row_blocks; block += 64u) {
-        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
-        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-        const unsigned int q8_base0 = iqs * 4u;
-        const unsigned int q8_base1 = q8_base0 + 4u;
-        const int q8_low0 = *(const int *)(q8_values + q8_base0);
-        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-        const int q8_low1 = *(const int *)(q8_values + q8_base1);
-        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-
-        #pragma unroll
-        for (unsigned int c = 0u; c < cols; ++c) {
-            const unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
-                acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-            }
-        }
-    }
-
-    #pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) {
-        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
-        if (lane == 0u) warp_partial[c][warp] = sum;
-    }
-    __syncthreads();
-    if (tid < 4u) {
-        float y = 0.0f;
-        #pragma unroll
-        for (unsigned int w = 0u; w < 4u; ++w) y += warp_partial[tid][w];
-        const unsigned int col = col_tile + tid;
-        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
-    }
+extern "C" __global__ void antfly_q4_0_down_q8_1_e2b_6144_mmv_v1(ANTFLY_Q4_Q8_DOWN_PARAMS) {
+    antfly_q4_q8_down<128u, 4u, antfly_q8_legacy>(ANTFLY_Q4_Q8_DOWN_ARGS);
 }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_down_q8_1_e2b_12288_mmv_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
-extern "C" __global__ void antfly_q4_0_down_q8_1_e2b_12288_mmv_v1(
-    float *dst,
-    const unsigned char *q8_input,
-    const unsigned char *weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    const unsigned int cols = 4u;
-    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
-    const unsigned int row_blocks = in_dim >> 5;
-    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
-    const unsigned int row = blockIdx.x / col_tiles;
-    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    if (blockDim.x != 256u || row >= rows) return;
-
-    __shared__ float warp_partial[4][8];
-    float acc[4];
-    #pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
-
-    const unsigned int iqs = (tid & 1u) * 2u;
-    for (unsigned int block = tid >> 1u; block < row_blocks; block += 128u) {
-        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
-        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-        const unsigned int q8_base0 = iqs * 4u;
-        const unsigned int q8_base1 = q8_base0 + 4u;
-        const int q8_low0 = *(const int *)(q8_values + q8_base0);
-        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-        const int q8_low1 = *(const int *)(q8_values + q8_base1);
-        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-
-        #pragma unroll
-        for (unsigned int c = 0u; c < cols; ++c) {
-            const unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
-                acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-            }
-        }
-    }
-
-    #pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) {
-        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
-        if (lane == 0u) warp_partial[c][warp] = sum;
-    }
-    __syncthreads();
-    if (tid < 4u) {
-        float y = 0.0f;
-        #pragma unroll
-        for (unsigned int w = 0u; w < 8u; ++w) y += warp_partial[tid][w];
-        const unsigned int col = col_tile + tid;
-        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
-    }
+extern "C" __global__ void antfly_q4_0_down_q8_1_e2b_12288_mmv_v1(ANTFLY_Q4_Q8_DOWN_PARAMS) {
+    antfly_q4_q8_down<256u, 4u, antfly_q8_legacy>(ANTFLY_Q4_Q8_DOWN_ARGS);
 }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
-extern "C" __global__ void antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1(
-    unsigned char *dst_q8,
-    const unsigned char *q8_input,
-    const unsigned char *weight_gate,
-    const unsigned char *weight_up,
-    unsigned int activation,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
-    const unsigned int row_blocks = in_dim >> 5;
-    const unsigned int out_row_blocks = out_dim >> 5;
-    const unsigned int group_cols = 4u;
-    const unsigned int groups_per_wave = 4u;
-    const unsigned int waves = 2u;
-
-    const unsigned int out_block = blockIdx.x % out_row_blocks;
-    const unsigned int row = blockIdx.x / out_row_blocks;
-    const unsigned int col_block = out_block * 32u;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    const unsigned int group = warp / 3u;
-    const unsigned int group_warp = warp - group * 3u;
-    if (blockDim.x != 384u || row >= rows) return;
-
-    __shared__ float gate_partial[4][4][3];
-    __shared__ float up_partial[4][4][3];
-    __shared__ float activated[32];
-
-    #pragma unroll
-    for (unsigned int wave = 0u; wave < waves; ++wave) {
-        if (group < groups_per_wave) {
-            const unsigned int local_tid = group_warp * 32u + lane;
-            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
-            float gate_acc[4];
-            float up_acc[4];
-            #pragma unroll
-            for (unsigned int c = 0u; c < group_cols; ++c) {
-                gate_acc[c] = 0.0f;
-                up_acc[c] = 0.0f;
-            }
-
-            const unsigned int iqs = (local_tid & 1u) * 2u;
-            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += 48u) {
-                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
-                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-                const float q8_sum = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[1]);
-                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-                const unsigned int q8_base0 = iqs * 4u;
-                const unsigned int q8_base1 = q8_base0 + 4u;
-                const int q8_low0 = *(const int *)(q8_values + q8_base0);
-                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-                const int q8_low1 = *(const int *)(q8_values + q8_base1);
-                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-
-                #pragma unroll
-                for (unsigned int c = 0u; c < group_cols; ++c) {
-                    const unsigned int col = col_tile + c;
-                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
-                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
-                    gate_acc[c] += antfly_q4_0_ggml_q8_1_dot16(gate_bp, q8_d, q8_sum, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                    up_acc[c] += antfly_q4_0_ggml_q8_1_dot16(up_bp, q8_d, q8_sum, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                }
-            }
-
-            #pragma unroll
-            for (unsigned int c = 0u; c < group_cols; ++c) {
-                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
-                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
-                if (lane == 0u) {
-                    gate_partial[group][c][group_warp] = gate_sum;
-                    up_partial[group][c][group_warp] = up_sum;
-                }
-            }
-        }
-        __syncthreads();
-        if (tid < 16u) {
-            const unsigned int out_group = tid >> 2u;
-            const unsigned int c = tid & 3u;
-            float gate_y = 0.0f;
-            float up_y = 0.0f;
-            #pragma unroll
-            for (unsigned int w = 0u; w < 3u; ++w) {
-                gate_y += gate_partial[out_group][c][w];
-                up_y += up_partial[out_group][c][w];
-            }
-            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
-        }
-        __syncthreads();
-    }
-
-    if (warp == 0u) {
-        const float x = activated[lane];
-        const float sum = antfly_warp_reduce_sum_f32(x);
-        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
-        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
-        int q = 0;
-        if (d > 0.0f) {
-            q = __float2int_rn(x / d);
-            q = max(-127, min(127, q));
-        }
-        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
-        bp[4u + lane] = (unsigned char)(signed char)q;
-        if (lane == 0u) {
-            const unsigned short d_bits = __half_as_ushort(__float2half(d));
-            bp[0] = (unsigned char)(d_bits & 0xffu);
-            bp[1] = (unsigned char)(d_bits >> 8);
-            const unsigned short sum_bits = __half_as_ushort(__float2half(sum));
-            bp[2] = (unsigned char)(sum_bits & 0xffu);
-            bp[3] = (unsigned char)(sum_bits >> 8);
-        }
-    }
+extern "C" __global__ void antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1(ANTFLY_Q4_Q8_PAIR_PARAMS) {
+    antfly_q4_q8_pair<3u, antfly_q8_ggml>(ANTFLY_Q4_Q8_PAIR_ARGS);
 }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
-extern "C" __global__ void antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1(
-    unsigned char *dst_q8,
-    const unsigned char *q8_input,
-    const unsigned char *weight_gate,
-    const unsigned char *weight_up,
-    unsigned int activation,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
-    const unsigned int row_blocks = in_dim >> 5;
-    const unsigned int out_row_blocks = out_dim >> 5;
-    const unsigned int group_cols = 4u;
-    const unsigned int groups_per_wave = 4u;
-    const unsigned int waves = 2u;
-
-    const unsigned int out_block = blockIdx.x % out_row_blocks;
-    const unsigned int row = blockIdx.x / out_row_blocks;
-    const unsigned int col_block = out_block * 32u;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    const unsigned int group = warp / 3u;
-    const unsigned int group_warp = warp - group * 3u;
-    if (blockDim.x != 384u || row >= rows) return;
-
-    __shared__ float gate_partial[4][4][3];
-    __shared__ float up_partial[4][4][3];
-    __shared__ float activated[32];
-
-    #pragma unroll
-    for (unsigned int wave = 0u; wave < waves; ++wave) {
-        if (group < groups_per_wave) {
-            const unsigned int local_tid = group_warp * 32u + lane;
-            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
-            float gate_acc[4];
-            float up_acc[4];
-            #pragma unroll
-            for (unsigned int c = 0u; c < group_cols; ++c) {
-                gate_acc[c] = 0.0f;
-                up_acc[c] = 0.0f;
-            }
-
-            const unsigned int iqs = (local_tid & 1u) * 2u;
-            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += 48u) {
-                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
-                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-                const float q8_sum = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[1]);
-                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-                const unsigned int q8_base0 = iqs * 4u;
-                const unsigned int q8_base1 = q8_base0 + 4u;
-                const int q8_low0 = *(const int *)(q8_values + q8_base0);
-                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-                const int q8_low1 = *(const int *)(q8_values + q8_base1);
-                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-
-                #pragma unroll
-                for (unsigned int c = 0u; c < group_cols; ++c) {
-                    const unsigned int col = col_tile + c;
-                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
-                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
-                    gate_acc[c] += antfly_q4_0_ggml_q8_1_dot16(gate_bp, q8_d, q8_sum, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                    up_acc[c] += antfly_q4_0_ggml_q8_1_dot16(up_bp, q8_d, q8_sum, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                }
-            }
-
-            #pragma unroll
-            for (unsigned int c = 0u; c < group_cols; ++c) {
-                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
-                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
-                if (lane == 0u) {
-                    gate_partial[group][c][group_warp] = gate_sum;
-                    up_partial[group][c][group_warp] = up_sum;
-                }
-            }
-        }
-        __syncthreads();
-        if (tid < 16u) {
-            const unsigned int out_group = tid >> 2u;
-            const unsigned int c = tid & 3u;
-            float gate_y = 0.0f;
-            float up_y = 0.0f;
-            #pragma unroll
-            for (unsigned int w = 0u; w < 3u; ++w) {
-                gate_y += gate_partial[out_group][c][w];
-                up_y += up_partial[out_group][c][w];
-            }
-            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
-        }
-        __syncthreads();
-    }
-
-    if (warp == 0u) {
-        const float x = activated[lane];
-        const float sum = antfly_warp_reduce_sum_f32(x);
-        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
-        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
-        int q = 0;
-        if (d > 0.0f) {
-            q = __float2int_rn(x / d);
-            q = max(-127, min(127, q));
-        }
-        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
-        bp[4u + lane] = (unsigned char)(signed char)q;
-        if (lane == 0u) {
-            const unsigned short d_bits = __half_as_ushort(__float2half(d));
-            bp[0] = (unsigned char)(d_bits & 0xffu);
-            bp[1] = (unsigned char)(d_bits >> 8);
-            const unsigned short sum_bits = __half_as_ushort(__float2half(sum));
-            bp[2] = (unsigned char)(sum_bits & 0xffu);
-            bp[3] = (unsigned char)(sum_bits >> 8);
-        }
-    }
+extern "C" __global__ void antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1(ANTFLY_Q4_Q8_PAIR_PARAMS) {
+    antfly_q4_q8_pair<3u, antfly_q8_ggml>(ANTFLY_Q4_Q8_PAIR_ARGS);
 }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
-extern "C" __global__ void antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1(
-    float *dst,
-    const unsigned char *q8_input,
-    const unsigned char *weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    const unsigned int cols = 1u;
-    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
-    const unsigned int row_blocks = in_dim >> 5;
-    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
-    const unsigned int row = blockIdx.x / col_tiles;
-    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    if (blockDim.x != 128u || row >= rows) return;
-
-    __shared__ float warp_partial[1][4];
-    float acc[1];
-    #pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
-
-    const unsigned int iqs = (tid & 1u) * 2u;
-    for (unsigned int block = tid >> 1u; block < row_blocks; block += 64u) {
-        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
-        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-        const float q8_sum = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[1]);
-        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-        const unsigned int q8_base0 = iqs * 4u;
-        const unsigned int q8_base1 = q8_base0 + 4u;
-        const int q8_low0 = *(const int *)(q8_values + q8_base0);
-        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-        const int q8_low1 = *(const int *)(q8_values + q8_base1);
-        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-
-        #pragma unroll
-        for (unsigned int c = 0u; c < cols; ++c) {
-            const unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
-                acc[c] += antfly_q4_0_ggml_q8_1_dot16(bp, q8_d, q8_sum, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-            }
-        }
-    }
-
-    #pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) {
-        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
-        if (lane == 0u) warp_partial[c][warp] = sum;
-    }
-    __syncthreads();
-    if (tid < 1u) {
-        float y = 0.0f;
-        #pragma unroll
-        for (unsigned int w = 0u; w < 4u; ++w) y += warp_partial[tid][w];
-        const unsigned int col = col_tile + tid;
-        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
-    }
+extern "C" __global__ void antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1(ANTFLY_Q4_Q8_DOWN_PARAMS) {
+    antfly_q4_q8_down<128u, 1u, antfly_q8_ggml>(ANTFLY_Q4_Q8_DOWN_ARGS);
 }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
-extern "C" __global__ void antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1(
-    float *dst,
-    const unsigned char *q8_input,
-    const unsigned char *weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    const unsigned int cols = 1u;
-    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
-    const unsigned int row_blocks = in_dim >> 5;
-    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
-    const unsigned int row = blockIdx.x / col_tiles;
-    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    if (blockDim.x != 128u || row >= rows) return;
-
-    __shared__ float warp_partial[1][4];
-    float acc[1];
-    #pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
-
-    const unsigned int iqs = (tid & 1u) * 2u;
-    for (unsigned int block = tid >> 1u; block < row_blocks; block += 64u) {
-        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
-        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-        const float q8_sum = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[1]);
-        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-        const unsigned int q8_base0 = iqs * 4u;
-        const unsigned int q8_base1 = q8_base0 + 4u;
-        const int q8_low0 = *(const int *)(q8_values + q8_base0);
-        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-        const int q8_low1 = *(const int *)(q8_values + q8_base1);
-        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-
-        #pragma unroll
-        for (unsigned int c = 0u; c < cols; ++c) {
-            const unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
-                acc[c] += antfly_q4_0_ggml_q8_1_dot16(bp, q8_d, q8_sum, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-            }
-        }
-    }
-
-    #pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) {
-        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
-        if (lane == 0u) warp_partial[c][warp] = sum;
-    }
-    __syncthreads();
-    if (tid < 1u) {
-        float y = 0.0f;
-        #pragma unroll
-        for (unsigned int w = 0u; w < 4u; ++w) y += warp_partial[tid][w];
-        const unsigned int col = col_tile + tid;
-        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
-    }
+extern "C" __global__ void antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1(ANTFLY_Q4_Q8_DOWN_PARAMS) {
+    antfly_q4_q8_down<128u, 1u, antfly_q8_ggml>(ANTFLY_Q4_Q8_DOWN_ARGS);
 }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.

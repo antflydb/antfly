@@ -107,7 +107,12 @@ pub const helper_paged_attention_1x_params = HelperFragment{
 
 pub const helper_paged_attention_1x_page_token = HelperFragment{
     .name = "antfly_paged_attention_1x_page_token",
-    .msl = "inline uint antfly_paged_attention_1x_page_token(device const uint *block_table, constant antfly_paged_attention_1x_params &p, uint logical_token) { if (p.contiguous_blocks != 0u) return p.contiguous_base_token + logical_token; uint logical_block = logical_token / p.page_size; uint token_in_block = logical_token - logical_block * p.page_size; if (logical_block >= p.block_count) return 0xffffffffu; return block_table[logical_block] + token_in_block; }",
+    .msl = "template<typename Params> inline uint antfly_paged_attention_1x_page_token(device const uint *block_table, constant Params &p, uint logical_token) { if (p.contiguous_blocks != 0u) return p.contiguous_base_token + logical_token; uint logical_block = logical_token / p.page_size; uint token_in_block = logical_token - logical_block * p.page_size; if (logical_block >= p.block_count) return 0xffffffffu; return block_table[logical_block] + token_in_block; }",
+};
+
+const helper_paged_decode_native = HelperFragment{
+    .name = "antfly_paged_decode_body",
+    .msl = @embedFile("templates/metal_paged_decode_native.metal"),
 };
 
 fn formatDecoder(comptime format: quant_matmul.Format) FormatDecoder {
@@ -182,9 +187,12 @@ pub fn renderKernel(
 
     // Helper vocabulary (deduped by name across decoder + gelu).
     var emitted_names = EmittedNames{};
+    try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
     for (decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
-    if (epilogue == .bias_gelu) try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
+    try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
     try emitDecoder(allocator, &out, &emitted_names, decoder);
+    try emitProjectionPolicy(allocator, &out, decoder);
+    try out.appendSlice(allocator, projection_native_source);
 
     try renderBody(allocator, &out, kernel_id, decoder, schedule, epilogue, block_values, block_bytes);
     return out.toOwnedSlice(allocator);
@@ -209,8 +217,11 @@ pub fn renderQkvKernel(
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     var emitted_names = EmittedNames{};
+    try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
     for (decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
     try emitDecoder(allocator, &out, &emitted_names, decoder);
+    try emitProjectionPolicy(allocator, &out, decoder);
+    try out.appendSlice(allocator, projection_native_source);
     try renderQkvBody(allocator, &out, kernel_id, decoder, schedule, block_values, block_bytes);
     return out.toOwnedSlice(allocator);
 }
@@ -357,7 +368,8 @@ pub const helper_attention_online_row32 = HelperFragment{
 
 fn attentionHelpers(kind: AttentionKind) []const HelperFragment {
     return switch (kind) {
-        .decode_1x, .prefill_flash => &.{ helper_paged_attention_1x_params, helper_paged_attention_1x_page_token, helper_attention_online_row32 },
+        .decode_1x => &.{ helper_paged_attention_1x_params, helper_paged_attention_1x_page_token, helper_attention_online_row32, helper_paged_decode_native },
+        .prefill_flash => &.{ helper_paged_attention_1x_params, helper_paged_attention_1x_page_token, helper_attention_online_row32 },
     };
 }
 
@@ -412,7 +424,7 @@ fn renderAttentionBody(
 ) !void {
     try validateAttentionSchedule(kind, schedule);
     switch (kind) {
-        .decode_1x => try renderPagedAttention1xBody(allocator, out, kernel_id, schedule, .standalone, false),
+        .decode_1x => try renderPagedAttention1xBody(allocator, out, kernel_id, schedule, .standalone),
         .prefill_flash => if (schedule.threads_per_threadgroup == 256)
             try renderPrefillFlashHd512Body(allocator, out, kernel_id)
         else
@@ -429,31 +441,18 @@ fn renderAttentionBody(
 /// masking; no sinks, no softcap (the dispatch gates those to the scalar path).
 ///
 /// One owner for standalone and compatibility-runtime decode. The legacy
-/// runtime retains its extra max-read barrier and masked-mass policy; generated
-/// schedules keep their explicitly guarded zero-mass policy.
+/// runtime and generated schedules share guarded zero-mass semantics and
+/// synchronize the max read before reusing the shared partial array.
 fn renderPagedAttention1xBody(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     kernel_id: []const u8,
     schedule: KernelSchedule,
     abi: AttentionSourceAbi,
-    legacy_masked_mass: bool,
 ) !void {
     const params_name = if (abi == .runtime) "termite_metal_paged_attention_params" else "antfly_paged_attention_1x_params";
-    const page_token = if (abi == .runtime) "termite_attention_page_token" else "antfly_paged_attention_1x_page_token";
-    const nt = schedule.threads_per_threadgroup;
-    const nsg = nt / 32;
     try appendFmt(allocator, out, "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant {s} &p [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n", .{ kernel_id, params_name });
-    try appendFmt(allocator, out, "    uint qi = tg.x; uint h = tg.y; if (qi >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u) return;\n", .{});
-    try appendFmt(allocator, out, "    const uint NT = {d}u; const uint NW = 32u; const uint NSG = {d}u; const float scale = rsqrt(float(p.head_dim)); uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint q_stride = p.num_heads * p.head_dim; uint q_base = qi * q_stride + h * p.head_dim; uint out_base = qi * q_stride + h * p.head_dim; uint kv_head_base = kv_h * p.head_dim; uint query_pos = p.query_position_offset + qi; uint kv_end_pos = p.kv_position_offset + p.kv_tokens; bool all_tokens_allowed = query_pos + 1u >= kv_end_pos && (p.sliding_window == 0u || p.sliding_window >= p.kv_tokens); threadgroup float *scores = shmem; threadgroup float *partials = shmem + p.kv_tokens; threadgroup float *phys_tokens = shmem + p.kv_tokens + {d}u; const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n", .{ nt, nsg, nt });
-    try appendFmt(allocator, out, "    for (uint base = 0u; base < p.kv_tokens; base += NSG) {{ uint ki = base + uint(sgitg); bool allowed = ki < p.kv_tokens && all_tokens_allowed; if (ki < p.kv_tokens && !allowed) {{ uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }} uint physical_token = allowed ? {s}(block_table, p, ki) : 0xffffffffu; if (physical_token == 0xffffffffu) allowed = false; float acc = 0.0f; if (allowed) {{ const device half *k_half = reinterpret_cast<const device half *>(encoded_key + physical_token * p.key_row_bytes); for (uint d = uint(lane); d < p.head_dim; d += NW) acc += q[q_base + d] * float(k_half[kv_head_base + d]); }} float score = allowed ? simd_sum(acc) * scale : -3.402823466e+38f; if (!isfinite(score)) score = -3.402823466e+38f; if (lane == 0u && ki < p.kv_tokens) {{ scores[ki] = score; phys_tokens[ki] = as_type<float>(allowed ? physical_token : 0u); }} }}\n", .{page_token});
-    try appendFmt(allocator, out, "    threadgroup_barrier(mem_flags::mem_threadgroup); float local_best = -3.402823466e+38f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float score = scores[ki]; local_best = score > local_best ? score : local_best; }} partials[tid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) {{ float rhs = partials[tid + stride]; partials[tid] = rhs > partials[tid] ? rhs : partials[tid]; }} threadgroup_barrier(mem_flags::mem_threadgroup); }} float best = partials[0];\n", .{});
-    if (legacy_masked_mass) try out.appendSlice(allocator, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
-    const exponent = if (legacy_masked_mass) "exp(scores[ki] - best)" else "(best > -3.0e+38f && score > -3.0e+38f) ? exp(score - best) : 0.0f";
-    const score_load = if (legacy_masked_mass) "" else "float score = scores[ki]; ";
-    try appendFmt(allocator, out, "    float local_sum = 0.0f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ {s}float e = {s}; e = isfinite(e) ? e : 0.0f; scores[ki] = e; local_sum += e; }} partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }} const float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f;\n", .{ score_load, exponent });
-    try appendFmt(allocator, out, "    for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n", .{});
-    try appendFmt(allocator, out, "    for (uint d = uint(tid); d < p.head_dim; d += NT) {{ const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) {{ float weight = scores[ki]; value += weight * select(float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]), 0.0f, weight == 0.0f); }} output[out_base + d] = value; }}\n", .{});
+    try appendFmt(allocator, out, "    antfly_paged_decode_body<{s}, {d}u>(q, encoded_key, v_bytes, block_table, sinks, output, p, shmem, tid, lane, sgitg, tg);\n", .{ params_name, schedule.threads_per_threadgroup });
     try out.appendSlice(allocator, "}\n");
 }
 
@@ -480,7 +479,7 @@ pub fn renderCompatibilityAttention(allocator: std.mem.Allocator, kernel_id: []c
     var names = EmittedNames{};
     for (attentionHelpers(kind)) |helper| try emitHelper(allocator, &out, &names, helper);
     switch (kind) {
-        .decode_1x => try renderPagedAttention1xBody(allocator, &out, kernel_id, .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree }, .standalone, true),
+        .decode_1x => try renderPagedAttention1xBody(allocator, &out, kernel_id, .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree }, .standalone),
         .prefill_flash => try renderCompatibilityPrefillBody(allocator, &out, kernel_id, .standalone),
     }
     return out.toOwnedSlice(allocator);
@@ -489,7 +488,7 @@ pub fn renderCompatibilityAttention(allocator: std.mem.Allocator, kernel_id: []c
 pub fn renderCompatibilityRuntimeAttention(allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
-    try renderPagedAttention1xBody(allocator, &out, "termite_paged_attention_kv_1x", .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree }, .runtime, true);
+    try renderPagedAttention1xBody(allocator, &out, "termite_paged_attention_kv_1x", .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree }, .runtime);
     try renderCompatibilityPrefillBody(allocator, &out, "termite_paged_attention_kv_prefill_sg", .runtime);
     return out.toOwnedSlice(allocator);
 }
@@ -740,12 +739,12 @@ pub fn renderFlorenceNr4Compatibility(allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "kernel void termite_florence_q4_k_mm_nr4(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {\n");
-    try renderKFamilyTiledBody(allocator, &out, decoderFor(.q4_k).?, .{
+    try renderMatmulComputation(allocator, &out, decoderFor(.q4_k).?, .{
         .threads_per_threadgroup = 128,
         .cols_per_threadgroup = 16,
         .rows_per_threadgroup = 4,
         .reduction = .simdgroup_tiled,
-    }, .none);
+    }, .none, 256, 144);
     try out.appendSlice(allocator, "}\n");
     return out.toOwnedSlice(allocator);
 }
@@ -774,8 +773,13 @@ pub fn renderRuntimeRegion(
                 try validateEpilogueSchedule(k.schedule, k.epilogue);
                 try validateTiledSchedule(k.decoder.format, k.schedule, k.epilogue);
                 for (k.decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
-                if (k.epilogue == .bias_gelu) try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
+                try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
                 try emitDecoder(allocator, &out, &emitted_names, k.decoder);
+                if (!emitted_names.contains(k.decoder.weight_param)) {
+                    try emitProjectionPolicy(allocator, &out, k.decoder);
+                    // Names must have stable storage for the rest of this render.
+                    emitted_names.add(k.decoder.weight_param);
+                }
             },
             .microkernel => try validateMicrokernelSchedule(k.microkernel, k.schedule),
             // Attention kernels are self-contained: their params struct + paging
@@ -785,6 +789,13 @@ pub fn renderRuntimeRegion(
                 try validateAttentionSchedule(k.attention, k.schedule);
                 for (attentionHelpers(k.attention)) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
             },
+        }
+    }
+
+    for (kernels) |k| {
+        if (k.op_kind == .small_batch_matmul) {
+            try out.appendSlice(allocator, projection_native_source);
+            break;
         }
     }
 
@@ -924,206 +935,76 @@ fn renderMatmulComputation(
     block_values: usize,
     block_bytes: usize,
 ) !void {
-    const threads = schedule.threads_per_threadgroup;
-    const mask = block_values - 1;
-    const shift = log2Usize(block_values);
-    const two_col = schedule.cols_per_threadgroup == 2;
-
-    if (schedule.reduction == .simdgroup_matrix) {
-        try renderSimdgroupMatrixBody(allocator, out, decoder, schedule);
-    } else if (schedule.reduction == .simdgroup_tiled) {
-        switch (decoder.format) {
-            .q4_0 => try renderPackedQ4_0TiledBody(allocator, out, decoder, schedule),
-            .q4_k, .q6_k => try renderKFamilyTiledBody(allocator, out, decoder, schedule, epilogue),
-            else => return error.TiledRequiresSupportedFormat,
-        }
-    } else if (two_col) {
-        try renderTwoColBody(allocator, out, decoder, schedule, epilogue, mask, shift, block_values, block_bytes);
-    } else {
-        try renderSingleColBody(allocator, out, decoder, schedule, epilogue, threads, mask, shift, block_values, block_bytes);
-    }
-}
-
-fn renderSimdgroupMatrixBody(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    decoder: FormatDecoder,
-    schedule: KernelSchedule,
-) !void {
-    const tile_rows: usize = schedule.rows_per_threadgroup;
-    const threads: usize = schedule.threads_per_threadgroup;
-    const input_elements = tile_rows * 32;
-    const result_elements = tile_rows * 64;
-    // Q6_K's wider blocks make high-row projections precision-sensitive at
-    // production K dimensions. Apple family 9 supports float simdgroup
-    // operands at effectively the same throughput for this schedule, so keep
-    // Q6_K fully f32 while retaining the established f16 Q4_K matrix path.
-    const f32_operands = decoder.format == .q6_k;
-    const operand_bytes: usize = if (f32_operands) @sizeOf(f32) else @sizeOf(f16);
-    const operand_scalar = if (f32_operands) "float" else "half";
-    const operand_matrix = if (f32_operands) "simdgroup_float8x8" else "simdgroup_half8x8";
-    const operand_zero = if (f32_operands) "0.0f" else "half(0.0f)";
-    const cast_prefix = if (f32_operands) "" else "half(";
-    const cast_suffix = if (f32_operands) "" else ")";
-    const shared_bytes = @max((2048 + input_elements) * operand_bytes, result_elements * @sizeOf(f32));
-    try appendFmt(
-        allocator,
-        out,
-        "    const uint tid = thread_pos.x; const uint first_o = group_pos.x * 64u; const uint first_r = group_pos.y * {d}u;\n" ++
-            "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return;\n" ++
-            "    threadgroup uchar shared[{d}]; threadgroup {s} *weight_tile = (threadgroup {s} *)shared; threadgroup {s} *input_tile = weight_tile + 2048;\n" ++
-            "    {s} mw[8]; {s} mx; simdgroup_float8x8 acc[8];\n" ++
-            "    for (uint i = 0u; i < 8u; ++i) acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n" ++
-            "    const uint block_count = uint(in_dim) >> 8; const uint sg_row = uint(simdgroup_id) * 8u;\n" ++
-            "    for (uint k0 = 0u; k0 < uint(in_dim); k0 += 32u) {{\n" ++
-            "        for (uint index = tid; index < 2048u; index += {d}u) {{ uint k = index >> 6; uint col = index & 63u; uint global_col = first_o + col; uint global_k = k0 + k; {s} value = {s}; if (global_col < uint(out_dim)) {{ device const uchar *block = ",
-        .{ tile_rows, shared_bytes, operand_scalar, operand_scalar, operand_scalar, operand_matrix, operand_matrix, threads, operand_scalar, operand_zero },
-    );
-    try out.appendSlice(allocator, decoder.weight_param);
-    try out.appendSlice(allocator, " + (global_col * block_count + (global_k >> 8)) * ");
-    try appendFmt(allocator, out, "{d}u", .{decoder.format.bytesPerBlock().?});
-    try out.appendSlice(allocator, "; value = ");
-    try out.appendSlice(allocator, cast_prefix);
-    try out.appendSlice(allocator, decoder.lane_decode_fn);
-    try appendFmt(
-        allocator,
-        out,
-        "(block, int(global_k & 255u)){s}; }} weight_tile[k * 64u + col] = value; }}\n" ++
-            "        for (uint index = tid; index < {d}u; index += {d}u) {{ uint row = index >> 5; uint k = index & 31u; uint global_row = first_r + row; input_tile[row * 32u + k] = global_row < uint(rows) ? {s}input[global_row * uint(in_dim) + k0 + k]{s} : {s}; }}\n" ++
-            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
-            "        for (uint k = 0u; k < 32u; k += 8u) {{ for (uint i = 0u; i < 8u; ++i) simdgroup_load(mw[i], weight_tile + k * 64u + i * 8u, 64u); simdgroup_load(mx, input_tile + sg_row * 32u + k, 32u); for (uint i = 0u; i < 8u; ++i) simdgroup_multiply_accumulate(acc[i], mx, mw[i], acc[i]); }}\n" ++
-            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
-            "    }}\n" ++
-            "    threadgroup float *result_tile = (threadgroup float *)shared; for (uint i = 0u; i < 8u; ++i) simdgroup_store(acc[i], result_tile + sg_row * 64u + i * 8u, 64u);\n" ++
-            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
-            "    for (uint index = tid; index < {d}u; index += {d}u) {{ uint row = index >> 6; uint col = index & 63u; uint global_row = first_r + row; if (global_row < uint(rows) && first_o + col < uint(out_dim)) output[global_row * uint(out_dim) + first_o + col] = result_tile[index]; }}\n",
-        .{ cast_suffix, input_elements, threads, cast_prefix, cast_suffix, operand_zero, result_elements, threads },
-    );
-}
-
-fn writeExpr(allocator: std.mem.Allocator, acc: []const u8, col: []const u8, epilogue: Epilogue) ![]u8 {
-    return switch (epilogue) {
-        .none => allocator.dupe(u8, acc),
-        .relu => std.fmt.allocPrint(allocator, "max({s}, 0.0f)", .{acc}),
-        .bias => std.fmt.allocPrint(allocator, "{s} + bias[{s}]", .{ acc, col }),
-        .bias_gelu => std.fmt.allocPrint(allocator, "antfly_qk_gelu({s} + bias[{s}])", .{ acc, col }),
-        else => error.UnsupportedEpilogue,
+    _ = block_values;
+    _ = block_bytes;
+    const policy = try std.fmt.allocPrint(allocator, "antfly_projection_decode_{s}", .{@tagName(decoder.format)});
+    defer allocator.free(policy);
+    const ep = switch (epilogue) {
+        .none => "antfly_projection_plain",
+        .bias => "antfly_projection_bias",
+        .bias_gelu => "antfly_projection_bias_gelu",
+        .relu => "antfly_projection_relu",
+        else => return error.UnsupportedEpilogue,
     };
-}
-
-fn renderSingleColBody(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    decoder: FormatDecoder,
-    schedule: KernelSchedule,
-    epilogue: Epilogue,
-    threads: u16,
-    mask: usize,
-    shift: u6,
-    block_values: usize,
-    block_bytes: usize,
-) !void {
-    try appendFmt(allocator, out, "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return; float acc = 0.0f; int block_count = in_dim >> {d};\n", .{ mask, shift });
-    // Accumulation: strided lane loop covers block_values with `threads` threads.
-    try appendFmt(allocator, out, "    for (int block_idx = 0; block_idx < block_count; ++block_idx) {{ device const uchar *block = {s} + ((col * block_count + block_idx) * {d}); int base = block_idx << {d}; for (int lane = int(tid); lane < {d}; lane += {d}) acc += input[row * in_dim + base + lane] * {s}(block, lane); }}\n", .{ decoder.weight_param, block_bytes, shift, block_values, threads, decoder.lane_decode_fn });
-    try renderReductionAndWrite(allocator, out, schedule, epilogue, threads);
-}
-
-fn renderReductionAndWrite(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    schedule: KernelSchedule,
-    epilogue: Epilogue,
-    threads: u16,
-) !void {
-    const write = try writeExpr(allocator, reductionResultName(schedule.reduction), "col", epilogue);
-    defer allocator.free(write);
+    const bias = if (epilogue == .bias or epilogue == .bias_gelu) "bias" else "nullptr";
+    const groups = schedule.threads_per_threadgroup / 32;
+    const columns = schedule.cols_per_threadgroup / @as(u8, @intCast(groups));
     switch (schedule.reduction) {
-        .simd_sum => try appendFmt(allocator, out, "    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = {s};\n", .{write}),
-        .threadgroup_tree => try appendFmt(allocator, out, "    threadgroup float partial[{d}]; partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = {d}u; stride > 0u; stride >>= 1) {{ if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }} if (tid == 0) output[row * out_dim + col] = {s};\n", .{ threads, threads / 2, write }),
-        .hybrid_simd => try appendFmt(allocator, out, "    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= {d}u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = {s};\n", .{ threads / 32, write }),
-        .simdgroup_tiled => return error.TiledReductionRequiresPackedBody,
-        .simdgroup_matrix => return error.MatrixReductionRequiresPackedBody,
+        .simdgroup_matrix => {
+            const scalar_bytes: usize = if (decoder.format == .q6_k) 4 else 2;
+            const shared_bytes = @max((2048 + @as(usize, schedule.rows_per_threadgroup) * 32) * scalar_bytes, @as(usize, schedule.rows_per_threadgroup) * 64 * 4);
+            try appendFmt(allocator, out, "    threadgroup uchar shared[{d}];\n    antfly_projection_matrix<{s}, {d}u, {d}u>(input, {s}, output, rows, in_dim, out_dim, thread_pos, group_pos, simdgroup_id, shared);\n", .{ shared_bytes, policy, schedule.rows_per_threadgroup, schedule.threads_per_threadgroup, decoder.weight_param });
+        },
+        .simdgroup_tiled => if (decoder.format == .q4_0) {
+            try appendFmt(allocator, out, "    antfly_projection_q4_packed_tile<{d}u, {d}u>(input, {s}, output, rows, in_dim, out_dim, lane_id, simdgroup_id, group_pos);\n", .{ groups, columns, decoder.weight_param });
+        } else {
+            try appendFmt(allocator, out, "    antfly_projection_k_tile<{s}, {s}, {d}u, {d}u, {d}u>(input, {s}, {s}, output, rows, in_dim, out_dim, lane_id, simdgroup_id, group_pos);\n", .{ policy, ep, groups, columns, schedule.rows_per_threadgroup, decoder.weight_param, bias });
+        },
+        else => if (schedule.cols_per_threadgroup == 2) {
+            try appendFmt(allocator, out, "    antfly_projection_two_columns<{s}, {s}>(input, {s}, {s}, output, rows, in_dim, out_dim, thread_pos, group_pos);\n", .{ policy, ep, decoder.weight_param, bias });
+        } else {
+            const reduction: u8 = switch (schedule.reduction) {
+                .simd_sum => 0,
+                .threadgroup_tree => 1,
+                .hybrid_simd => 2,
+                else => unreachable,
+            };
+            if (reduction != 0) try appendFmt(allocator, out, "    threadgroup float partial[{d}];\n", .{if (reduction == 1) schedule.threads_per_threadgroup else @as(u16, 32)});
+            try appendFmt(allocator, out, "    antfly_projection_column<{s}, {s}, {d}u, {d}u>(input, {s}, {s}, output, rows, in_dim, out_dim, thread_pos, group_pos, {s}, {s}, {s});\n", .{ policy, ep, schedule.threads_per_threadgroup, reduction, decoder.weight_param, bias, if (reduction == 2) "lane_id" else "0", if (reduction == 2) "simdgroup_id" else "0", if (reduction != 0) "partial" else "nullptr" });
+        },
     }
-}
-
-fn reductionResultName(reduction: ReductionKind) []const u8 {
-    return switch (reduction) {
-        .simd_sum => "acc",
-        .threadgroup_tree => "partial[0]",
-        .hybrid_simd => "total",
-        .simdgroup_tiled => "acc",
-        .simdgroup_matrix => "acc",
-    };
 }
 
 /// Packed Q4_0 register tile for an exact two-row projection. Each simdgroup
 /// owns 2, 4, or 8 output columns and reuses their packed ushort weights across
 /// both input rows.
-fn renderPackedQ4_0TiledBody(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    decoder: FormatDecoder,
-    schedule: KernelSchedule,
-) !void {
-    const simdgroups = schedule.threads_per_threadgroup / 32;
-    const cols_per_simdgroup = schedule.cols_per_threadgroup / @as(u8, @intCast(simdgroups));
-
-    try appendFmt(allocator, out, "    const uint NSG = {d}u; const uint NR0 = {d}u; const uint NQ16 = 16u; const uint first_o = (group_pos.x * NSG + uint(simdgroup_id)) * NR0; const uint first_r = group_pos.y * 2u;\n", .{ simdgroups, cols_per_simdgroup });
-    try appendFmt(allocator, out, "    if (rows != 2 || in_dim <= 0 || (uint(in_dim) & 31u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 5; const uint ix = uint(lane_id) >> 1; const uint il = (uint(lane_id) & 1u) * 8u; float acc[{d}][2]; for (uint c = 0u; c < NR0; ++c) for (uint rr = 0u; rr < 2u; ++rr) acc[c][rr] = 0.0f;\n", .{cols_per_simdgroup});
-    try appendFmt(allocator, out, "    for (uint b = ix; b < block_count; b += NQ16) {{ ushort qs_cache[{d}][4]; float dscale[{d}]; for (uint c = 0u; c < NR0; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) {{ dscale[c] = 0.0f; for (uint q = 0u; q < 4u; ++q) qs_cache[c][q] = 0u; continue; }} uint off = (col * block_count + b) * 18u; ushort bits = (ushort({s}[off + 1u]) << 8) | ushort({s}[off]); dscale[c] = float(as_type<half>(bits)); const device ushort *qs = reinterpret_cast<const device ushort *>({s} + off + 2u) + (il >> 1); for (uint q = 0u; q < 4u; ++q) qs_cache[c][q] = qs[q]; }}\n", .{ cols_per_simdgroup, cols_per_simdgroup, decoder.weight_param, decoder.weight_param, decoder.weight_param });
-    try out.appendSlice(allocator, "        for (uint rr = 0u; rr < 2u; ++rr) { uint in_off = (first_r + rr) * uint(in_dim) + b * 32u + il; float yl[16]; float sumy = 0.0f; for (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; }\n");
-    try out.appendSlice(allocator, "            for (uint c = 0u; c < NR0; ++c) { float qacc = 0.0f; for (uint i = 0u; i < 8u; i += 2u) { uint packed = uint(qs_cache[c][i >> 1]); qacc += yl[i] * float(packed & 0x000Fu); qacc += yl[i + 1u] * float(packed & 0x0F00u); qacc += yl[i + 8u] * float(packed & 0x00F0u); qacc += yl[i + 9u] * float(packed & 0xF000u); } acc[c][rr] += dscale[c] * (qacc - 8.0f * sumy); } } }\n");
-    try out.appendSlice(allocator, "    for (uint c = 0u; c < NR0; ++c) for (uint rr = 0u; rr < 2u; ++rr) { float total = simd_sum(acc[c][rr]); uint col = first_o + c; uint row = first_r + rr; if (lane_id == 0u && col < uint(out_dim) && row < uint(rows)) output[row * uint(out_dim) + col] = total; }\n");
-}
-
 /// One register-tile schedule for K-family projections. Format-specific
 /// decoding keeps Q4_K's scale/min hoisting and Q6_K's eight-value scale reuse;
 /// grid mapping, row tails, activation loads, accumulation and writes are shared.
-fn renderKFamilyTiledBody(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    decoder: FormatDecoder,
-    schedule: KernelSchedule,
-    epilogue: Epilogue,
-) !void {
-    const simdgroups = schedule.threads_per_threadgroup / 32;
-    const cols_per_simdgroup = schedule.cols_per_threadgroup / @as(u8, @intCast(simdgroups));
+const projection_native_source = @embedFile("templates/metal_projection_native.metal");
 
-    try appendFmt(allocator, out, "    const uint NSG = {d}u; const uint NC = {d}u; const uint NR = {d}u; const uint first_o = (group_pos.x * NSG + uint(simdgroup_id)) * NC; const uint first_r = group_pos.y * NR;\n", .{ simdgroups, cols_per_simdgroup, schedule.rows_per_threadgroup });
-    const q4 = decoder.format == .q4_k;
-    try appendFmt(allocator, out, "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> {d}; const uint j0 = (uint(lane_id) & {d}u) << 3;{s} float acc[{d}][{d}]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;\n", .{ @as(u8, if (q4) 2 else 1), @as(u8, if (q4) 3 else 1), if (q4) " const uint chunk = sub >> 1; const bool high = (sub & 1u) != 0u;" else "", cols_per_simdgroup, schedule.rows_per_threadgroup });
-    try appendFmt(allocator, out, "    for (uint b = 0u; b < block_count; ++b) {{ uint input_off = first_r * uint(in_dim) + b * 256u + sub * {d}u + j0; float x[{d}][8]; for (uint rr = 0u; rr < NR; ++rr) for (uint i = 0u; i < 8u; ++i) x[rr][i] = first_r + rr < uint(rows) ? input[input_off + rr * uint(in_dim) + i] : 0.0f;\n", .{ @as(u8, if (q4) 32 else 16), schedule.rows_per_threadgroup });
-    if (q4) {
-        try appendFmt(allocator, out, "        for (uint c = 0u; c < NC; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = {s} + (col * block_count + b) * 144u; float raw_scale = 0.0f; float raw_min = 0.0f; antfly_qk_unpack_scale_min_6bit(block + 4u, int(sub), raw_scale, raw_min); float dsc = antfly_qk_half_le_to_float(block) * raw_scale; float dmn = antfly_qk_half_le_to_float(block + 2u) * raw_min; device const uchar *qs = block + 16u + chunk * 32u + j0; for (uint i = 0u; i < 8u; ++i) {{ uchar packed = qs[i]; float w = dsc * float(high ? packed >> 4 : packed & 0x0fu) - dmn; for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; }} }} }}\n", .{decoder.weight_param});
-    } else {
-        try appendFmt(allocator, out, "        for (uint c = 0u; c < NC; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = {s} + (col * block_count + b) * 210u; float dscale = antfly_qk_q6_k_scale(block, int(sub * 16u)); for (uint i = 0u; i < 8u; ++i) {{ float w = dscale * antfly_qk_q6_k_value(block, int(sub * 16u + j0 + i)); for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; }} }} }}\n", .{decoder.weight_param});
+// Keep the decoder policy transparent to Metal's inliner: omitting the
+// attribute regresses Q4_K 64-thread tree/hybrid reductions by about 9%.
+fn emitProjectionPolicy(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), decoder: FormatDecoder) !void {
+    try appendFmt(allocator, out, "struct antfly_projection_decode_{s} {{\n    enum : int {{ values = {d}, bytes = {d}, shift = {d} }};\n    __attribute__((always_inline)) static float decode(device const uchar* block, int lane) {{ return {s}(block, lane); }}\n", .{ @tagName(decoder.format), decoder.format.valuesPerBlock().?, decoder.format.bytesPerBlock().?, log2Usize(decoder.format.valuesPerBlock().?), decoder.lane_decode_fn });
+    switch (decoder.format) {
+        .q4_k => try out.appendSlice(allocator,
+            \\    using Scalar = half; using Matrix = simdgroup_half8x8; using Scale = float2;
+            \\    enum : uint { sub_shift = 2u, sub_mask = 3u, sub_values = 32u };
+            \\    static Scale scale(device const uchar* block, uint sub) { float raw_scale = 0.0f; float raw_min = 0.0f; antfly_qk_unpack_scale_min_6bit(block + 4u, int(sub), raw_scale, raw_min); return float2(antfly_qk_half_le_to_float(block) * raw_scale, antfly_qk_half_le_to_float(block + 2u) * raw_min); }
+            \\    static float value(device const uchar* block, Scale scale, uint sub, uint j0, uint i) { const uint chunk = sub >> 1; const bool high = (sub & 1u) != 0u; device const uchar* qs = block + 16u + chunk * 32u + j0; uchar packed = qs[i]; return scale.x * float(high ? packed >> 4 : packed & 0x0fu) - scale.y; }
+            \\
+        ),
+        .q6_k => try out.appendSlice(allocator,
+            \\    using Scalar = float; using Matrix = simdgroup_float8x8; using Scale = float;
+            \\    enum : uint { sub_shift = 1u, sub_mask = 1u, sub_values = 16u };
+            \\    static Scale scale(device const uchar* block, uint sub) { return antfly_qk_q6_k_scale(block, int(sub * 16u)); }
+            \\    static float value(device const uchar* block, Scale scale, uint sub, uint j0, uint i) { return scale * antfly_qk_q6_k_value(block, int(sub * 16u + j0 + i)); }
+            \\
+        ),
+        else => {},
     }
-    const write = try writeExpr(allocator, "total", "col", epilogue);
-    defer allocator.free(write);
-    try appendFmt(allocator, out, "    for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) {{ float total = simd_sum(acc[c][rr]); uint col = first_o + c; uint row = first_r + rr; if (lane_id == 0u && col < uint(out_dim) && row < uint(rows)) output[row * uint(out_dim) + col] = {s}; }}\n", .{write});
-}
-
-fn renderTwoColBody(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    decoder: FormatDecoder,
-    schedule: KernelSchedule,
-    epilogue: Epilogue,
-    mask: usize,
-    shift: u6,
-    block_values: usize,
-    block_bytes: usize,
-) !void {
-    _ = schedule; // two-col is always simd_sum (validated)
-    try appendFmt(allocator, out, "    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & {d}) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> {d};\n", .{ mask, shift });
-    try appendFmt(allocator, out, "    device const float *row_input = input + row * in_dim; device const uchar *col0_weight = {s} + col0 * block_count * {d}; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? {s} + col1 * block_count * {d} : col0_weight;\n", .{ decoder.weight_param, block_bytes, decoder.weight_param, block_bytes });
-    try appendFmt(allocator, out, "    for (int block_idx = 0; block_idx < block_count; ++block_idx) {{ device const uchar *block0 = col0_weight + block_idx * {d}; device const uchar *block1 = col1_weight + block_idx * {d}; int base = block_idx << {d}; for (int lane = int(tid); lane < {d}; lane += {d}) {{ float x = row_input[base + lane]; acc0 += x * {s}(block0, lane); if (has_col1) acc1 += x * {s}(block1, lane); }} }}\n", .{ block_bytes, block_bytes, shift, block_values, @as(u16, 32), decoder.lane_decode_fn, decoder.lane_decode_fn });
-    const w0 = try writeExpr(allocator, "acc0", "col0", epilogue);
-    defer allocator.free(w0);
-    const w1 = try writeExpr(allocator, "acc1", "col1", epilogue);
-    defer allocator.free(w1);
-    try appendFmt(allocator, out, "    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) {{ output[row * out_dim + col0] = {s}; if (has_col1) output[row * out_dim + col1] = {s}; }}\n", .{ w0, w1 });
+    try out.appendSlice(allocator, "};\n");
 }
 
 // ---- Tests ---------------------------------------------------------------
@@ -1149,6 +1030,7 @@ test "metal renderer renders every production route and passes structure checks"
         }
         try std.testing.expectEqual(@as(i32, 0), depth);
         // Dequant fragment and its call present.
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "__attribute__((always_inline)) static float decode("));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, decoder.lane_decode_fn));
         // Reduction primitive present.
         switch (entry.schedule.reduction) {
@@ -1159,7 +1041,7 @@ test "metal renderer renders every production route and passes structure checks"
                 try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_id"));
             },
             .simdgroup_tiled => {
-                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NSG"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_projection_"));
                 try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simd_sum"));
             },
             .simdgroup_matrix => {
@@ -1170,7 +1052,7 @@ test "metal renderer renders every production route and passes structure checks"
         const has_simd_params = std.mem.containsAtLeast(u8, source, 1, "lane_id [[thread_index_in_simdgroup]]");
         try std.testing.expectEqual(entry.schedule.reduction == .hybrid_simd or entry.schedule.reduction == .simdgroup_tiled or entry.schedule.reduction == .simdgroup_matrix, has_simd_params);
         // Two-column marker matches schedule.
-        const has_two_col = std.mem.containsAtLeast(u8, source, 1, "group_pos.x << 1");
+        const has_two_col = std.mem.containsAtLeast(u8, source, 1, "    antfly_projection_two_columns<");
         try std.testing.expectEqual(entry.schedule.cols_per_threadgroup == 2, has_two_col);
         // Epilogue write.
         switch (entry.epilogue) {
@@ -1207,16 +1089,16 @@ test "metal renderer emits the shape-general two-row packed Q4_0 register-tile g
             defer allocator.free(source);
             const simdgroups = schedule.threads_per_threadgroup / 32;
             const cols_per_simdgroup = schedule.cols_per_threadgroup / @as(u8, @intCast(simdgroups));
-            const grid_marker = try std.fmt.allocPrint(allocator, "const uint NSG = {d}u; const uint NR0 = {d}u", .{ simdgroups, cols_per_simdgroup });
+            const grid_marker = try std.fmt.allocPrint(allocator, "antfly_projection_q4_packed_tile<{d}u, {d}u>", .{ simdgroups, cols_per_simdgroup });
             defer allocator.free(grid_marker);
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, grid_marker));
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NQ16 = 16u"));
-            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "reinterpret_cast<const device ushort *>"));
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "reinterpret_cast<const device ushort*>"));
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float(packed & 0xF000u)"));
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "rows != 2 || in_dim <= 0 || (uint(in_dim) & 31u) != 0u || out_dim <= 0"));
             try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "10240"));
             try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "2560"));
-            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "antfly_q4_0_dequant_lane_v2("));
+            try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "antfly_q4_0_dequant_lane_v2("));
             var brace_depth: i32 = 0;
             for (source) |c| {
                 if (c == '{') brace_depth += 1 else if (c == '}') brace_depth -= 1;
@@ -1233,9 +1115,9 @@ test "metal renderer emits a shape-general two-row Q4_K register tile" {
     const source = try renderKernel(allocator, "antfly_q4_k_tiled", decoder_q4_k, schedule, .none);
     defer allocator.free(source);
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_projection_k_tile<antfly_projection_decode_q4_k, antfly_projection_plain, 4u, 4u, 2u>"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "rows < 2 || in_dim <= 0"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float x[2][8]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float x[NR][8]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_qk_unpack_scale_min_6bit"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "acc[c][rr] += x[rr][i] * w"));
 
@@ -1246,14 +1128,14 @@ test "metal renderer emits a shape-general two-row Q4_K register tile" {
         .reduction = .simdgroup_tiled,
     }, .none);
     defer allocator.free(nr4);
-    try std.testing.expect(std.mem.containsAtLeast(u8, nr4, 1, "const uint NR = 4u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, nr4, 1, "float acc[4][4]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, nr4, 1, "float x[4][8]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, nr4, 1, "antfly_projection_k_tile<antfly_projection_decode_q4_k, antfly_projection_plain, 2u, 4u, 4u>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, nr4, 1, "float acc[NC][NR]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, nr4, 1, "float x[NR][8]"));
 
     const fused = try renderKernel(allocator, "antfly_q4_k_tiled_bias_gelu", decoder_q4_k, schedule, .bias_gelu);
     defer allocator.free(fused);
     try std.testing.expect(std.mem.containsAtLeast(u8, fused, 1, "device const float *bias [[buffer(2)]]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, fused, 1, "antfly_qk_gelu(total + bias[col])"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, fused, 1, "antfly_projection_bias_gelu"));
 }
 
 test "metal renderer emits a shape-general two-row Q6_K register tile" {
@@ -1262,11 +1144,11 @@ test "metal renderer emits a shape-general two-row Q6_K register tile" {
     const source = try renderKernel(allocator, "antfly_q6_k_tiled", decoder_q6_k, schedule, .none);
     defer allocator.free(source);
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_projection_k_tile<antfly_projection_decode_q6_k, antfly_projection_plain, 4u, 4u, 2u>"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "rows < 2 || in_dim <= 0"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint sub = uint(lane_id) >> 1"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float dscale = antfly_qk_q6_k_scale(block"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float w = dscale * antfly_qk_q6_k_value(block"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sub_shift = 1u, sub_mask = 1u, sub_values = 16u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return antfly_qk_q6_k_scale(block"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return scale * antfly_qk_q6_k_value(block"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "acc[c][rr] += x[rr][i] * w"));
 
     const nr8 = try renderKernel(allocator, "antfly_q6_k_tiled_nr8", decoder_q6_k, .{
@@ -1276,22 +1158,22 @@ test "metal renderer emits a shape-general two-row Q6_K register tile" {
         .reduction = .simdgroup_tiled,
     }, .none);
     defer allocator.free(nr8);
-    try std.testing.expect(std.mem.containsAtLeast(u8, nr8, 1, "const uint NR = 8u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, nr8, 1, "float acc[4][8]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, nr8, 1, "float x[8][8]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, nr8, 1, "antfly_projection_k_tile<antfly_projection_decode_q6_k, antfly_projection_plain, 4u, 4u, 8u>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, nr8, 1, "float acc[NC][NR]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, nr8, 1, "float x[NR][8]"));
 
     const fused = try renderKernel(allocator, "antfly_q6_k_tiled_bias", decoder_q6_k, schedule, .bias);
     defer allocator.free(fused);
     try std.testing.expect(std.mem.containsAtLeast(u8, fused, 1, "device const float *bias [[buffer(2)]]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, fused, 1, "total + bias[col]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, fused, 1, "antfly_projection_bias"));
 }
 
 test "metal renderer emits a Q4_K and Q6_K simdgroup matrix tile" {
     const allocator = std.testing.allocator;
     inline for (.{ decoder_q4_k, decoder_q6_k }) |decoder| {
         inline for (.{
-            .{ KernelSchedule{ .threads_per_threadgroup = 160, .cols_per_threadgroup = 64, .rows_per_threadgroup = 40, .reduction = .simdgroup_matrix }, "threadgroup uchar shared[10240]", "group_pos.y * 40u" },
-            .{ KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 64, .rows_per_threadgroup = 64, .reduction = .simdgroup_matrix }, "threadgroup uchar shared[16384]", "group_pos.y * 64u" },
+            .{ KernelSchedule{ .threads_per_threadgroup = 160, .cols_per_threadgroup = 64, .rows_per_threadgroup = 40, .reduction = .simdgroup_matrix }, "threadgroup uchar shared[10240]", "40u, 160u>" },
+            .{ KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 64, .rows_per_threadgroup = 64, .reduction = .simdgroup_matrix }, "threadgroup uchar shared[16384]", "64u, 256u>" },
         }) |case| {
             const source = try renderKernel(allocator, "antfly_quant_matrix", decoder, case[0], .none);
             defer allocator.free(source);
@@ -1306,9 +1188,9 @@ test "metal renderer emits a Q4_K and Q6_K simdgroup matrix tile" {
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "global_row < uint(rows)"));
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, decoder.lane_decode_fn));
             const operand_marker = if (decoder.format == .q6_k)
-                "simdgroup_float8x8 mw[8]; simdgroup_float8x8 mx"
+                "using Scalar = float; using Matrix = simdgroup_float8x8"
             else
-                "simdgroup_half8x8 mw[8]; simdgroup_half8x8 mx";
+                "using Scalar = half; using Matrix = simdgroup_half8x8";
             try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, operand_marker));
         }
     }
@@ -1416,8 +1298,8 @@ test "metal renderer renders the decode-1x paged attention kernel self-contained
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float e = (best > -3.0e+38f && score > -3.0e+38f) ? exp(score - best) : 0.0f"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "value += weight * select(float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]), 0.0f, weight == 0.0f)"));
     // NT/NSG parametrized to the schedule (256 threads -> 8 simdgroups).
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NT = 256u; const uint NW = 32u; const uint NSG = 8u;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "phys_tokens = shmem + p.kv_tokens + 256u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_paged_decode_body<antfly_paged_attention_1x_params, 256u>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "phys_tokens = shmem + p.kv_tokens + NT"));
     // No matmul artefacts leak into the attention kernel.
     try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "weight_q4_0"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "out_dim"));
@@ -1435,8 +1317,8 @@ test "metal renderer parametrizes the decode-1x attention NSG from the thread co
     const source = try renderPagedAttention1xKernel(allocator, "antfly_attn_test", schedule);
     defer allocator.free(source);
     // 128 threads -> 4 simdgroups, partials array sized to NT.
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NT = 128u; const uint NW = 32u; const uint NSG = 4u;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "phys_tokens = shmem + p.kv_tokens + 128u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_paged_decode_body<antfly_paged_attention_1x_params, 128u>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "phys_tokens = shmem + p.kv_tokens + NT"));
 }
 
 test "metal renderer rejects invalid attention schedules" {
@@ -1619,9 +1501,9 @@ test "metal renderer compatibility attention retains standalone ABI and legacy p
         try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "termite_metal_paged_attention_params"));
         switch (kind) {
             .decode_1x => {
-                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NT = 256u"));
-                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float e = exp(scores[ki] - best)"));
-                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float best = partials[0];\n    threadgroup_barrier"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_paged_decode_body<antfly_paged_attention_1x_params, 256u>"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float e = (best > -3.0e+38f && score > -3.0e+38f) ? exp(score - best) : 0.0f"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const float best = simd_max(uint(lane) < NSG ? partials[lane] : -3.402823466e+38f);\n    // Every SIMD group must load the maximum before partials[0] is reused.\n    threadgroup_barrier"));
             },
             .prefill_flash => {
                 try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "#define ANTFLY_COMPAT_PREFILL_KERNEL compatibility_attention"));
@@ -1631,4 +1513,18 @@ test "metal renderer compatibility attention retains standalone ABI and legacy p
             },
         }
     }
+}
+
+/// Compact stored AOT text; JIT and fingerprints keep the complete native body.
+pub fn compactNativeSourceFile(allocator: std.mem.Allocator, source: []const u8) !?[]u8 {
+    return @import("kernel_source_owner.zig").compact(allocator, source, &native_source_owners);
+}
+
+const native_source_owners = [_]@import("kernel_source_owner.zig").NativeOwner{
+    .{ .source = projection_native_source, .include_path = "../../../graph/templates/metal_projection_native.metal" },
+    .{ .source = helper_paged_decode_native.msl, .include_path = "../../../graph/templates/metal_paged_decode_native.metal" },
+};
+
+pub fn expandNativeSourceFile(allocator: std.mem.Allocator, source: []const u8) !?[]u8 {
+    return @import("kernel_source_owner.zig").expand(allocator, source, &native_source_owners);
 }

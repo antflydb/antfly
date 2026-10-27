@@ -32,6 +32,44 @@ class SourceAccountingTest(unittest.TestCase):
         self.assertEqual(receipt["groups"]["tests_and_benchmark_tooling"]["bytes_removed"], expected_bytes)
         self.assertEqual(sum(row["bytes_removed"] for row in receipt["groups"].values()), 2 * expected_bytes)
 
+    def test_native_metal_owners_and_runtime_qualification_have_distinct_budgets(self):
+        owner = "zig/pkg/inference/src/graph/templates/native.metal"
+        tool = "zig/pkg/inference/src/quant_kernel_metal_runtime_check.zig"
+        payload = "one native owner\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in (owner, tool):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(payload)
+            with mock.patch.object(accounting.subprocess, "check_output", side_effect=["0" * 40, owner + "\n" + tool + "\n", "", "1" * 40]), mock.patch.object(accounting.subprocess, "run", return_value=SimpleNamespace(stdout=b"")):
+                receipt = accounting.account(root, "baseline")
+        self.assertEqual(receipt["authored_production"]["bytes_removed"], -len(payload))
+        self.assertEqual(receipt["groups"]["authored_metal_shader"]["bytes_removed"], -len(payload))
+        self.assertEqual(receipt["groups"]["tests_and_benchmark_tooling"]["bytes_removed"], -len(payload))
+
+    def test_private_shader_goldens_are_not_production_savings(self):
+        source = r'''const golden = SourceFragment{
+    .name = "test-only",
+    .source =
+    \\void golden() { /* embedded braces */ }
+    ,
+};
+const shared = SourceFragment{ .name = "production", .source = "{}" };
+fn runtime() void { _ = shared.source; }
+test "goldens" {
+    _ = golden.source;
+    _ = shared.source;
+}
+'''
+        production, tests, _ = accounting.split_zig_tests(source)
+        authored, fixtures, names = accounting.split_test_source_fragments(production, tests)
+        self.assertEqual(names, ["golden"])
+        self.assertNotIn("const golden", authored)
+        self.assertIn("const shared", authored)
+        self.assertIn("const golden", fixtures)
+        self.assertEqual(len(authored) + len(fixtures), len(production))
+
     def test_zig_test_ownership_ignores_literals_comments_and_nested_braces(self):
         production = '''/*
 /* nested comment */

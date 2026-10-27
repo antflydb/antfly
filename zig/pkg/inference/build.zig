@@ -1819,6 +1819,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"wasm_compute:"},
     });
+    wasm_compute_tests.root_module.addImport("antfly_document_runs", runtime_graph.document_runs_mod);
     wasm_compute_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     wasm_compute_tests.root_module.addImport("httpx", httpx_mod);
     wasm_compute_tests.root_module.addImport("inference_api", inference_api_mod);

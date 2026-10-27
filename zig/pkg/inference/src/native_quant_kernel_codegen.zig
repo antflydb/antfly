@@ -418,6 +418,11 @@ fn compiledSourceForArtifact(
         .microkernel, .attention => {
             const source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse
                 return error.MissingGeneratedQuantKernelSource;
+            if (artifact.backend == .metal) {
+                if (try quant_kernel_compiler_renderer.compactNativeSourceFile(allocator, source)) |compact| {
+                    return .{ .data = compact, .owned = true };
+                }
+            }
             if (artifact.backend == .cuda and artifact.opKind() == .attention) {
                 if (try cuda_renderer.compactAttentionSourceFile(allocator, source)) |compact| {
                     return .{ .data = compact, .owned = true };
@@ -438,6 +443,14 @@ fn compiledSourceForArtifact(
     errdefer emitted.deinit(allocator);
     if (!try quant_kernel_compiler.compiledSourceHeaderMatchesSource(allocator, compiled, emitted.data)) {
         return error.GeneratedQuantKernelSourceHeaderMismatch;
+    }
+    const compact = switch (artifact.backend) {
+        .metal => try quant_kernel_compiler_renderer.compactNativeSourceFile(allocator, emitted.data),
+        .cuda => try cuda_renderer.compactAttentionSourceFile(allocator, emitted.data),
+    };
+    if (compact) |data| {
+        emitted.deinit(allocator);
+        return .{ .data = data, .owned = true };
     }
     return .{ .data = emitted.data, .owned = emitted.owned };
 }
@@ -794,7 +807,7 @@ test "quant kernel codegen sources map to compiler artifacts" {
     for (quant_kernel_compiler.first_generated_artifacts, sources[0..quant_kernel_compiler.first_generated_artifacts.len]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);
-        if (artifact.backend == .cuda and (artifact.opKind() == .small_batch_matmul or std.mem.indexOf(u8, source.data, "#include \"../../../graph/templates/") != null)) {
+        if ((artifact.backend == .cuda and artifact.opKind() == .small_batch_matmul) or std.mem.indexOf(u8, source.data, "#include \"../../../graph/templates/") != null) {
             try std.testing.expect(source.owned);
         } else {
             try std.testing.expect(!source.owned);

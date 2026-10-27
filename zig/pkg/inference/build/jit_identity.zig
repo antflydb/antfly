@@ -59,6 +59,8 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
             "src/graph/quant_kernel_metal_attention_phases.zig",
             "src/graph/quant_kernel_metal_param_abi.zig",
             "src/graph/templates/metal_paged_prefill_compat.metal",
+            "src/graph/templates/metal_projection_native.metal",
+            "src/graph/templates/metal_paged_decode_native.metal",
             "src/backends/metal_compile_options.h",
             "src/graph/kernel_jit.zig",
             "src/graph/quant_kernel_compiler.zig",
@@ -78,6 +80,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     };
     const contracts = [_][]const u8{
         "src/ops/kernel_descriptor.zig",
+        "src/graph/kernel_source_owner.zig",
         "src/ops/kernel_geometry.zig",
         "src/ops/kernel_math.zig",
         "src/ops/kernel_reduction.zig",
@@ -114,6 +117,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/cuda/launch_abi.zig",
         "src/ops/cuda/driver.zig",
         "src/graph/templates/cuda_q4_0_bf16_staged.cuh",
+        "src/graph/templates/cuda_q4_q8_projection.cuh",
         "src/graph/templates/cuda_gqa_repeat_prefill_f16.cuh",
         "src/graph/templates/cuda_gqa_repeat_split_f16.cuh",
         "src/ops/cuda/kernels/kernel_abi.cuh",
@@ -155,8 +159,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     for (contracts) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     for (if (backend == .cuda) &cuda_dependencies else &metal_dependencies) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     if (backend == .cuda) {
-        run.addArgs(&.{ "dispatch", "8" });
-        for ([_][]const u8{
+        const dispatch_dependencies = [_][]const u8{
             "src/ops/cuda/cuda_compute.zig",
             "src/ops/cuda/launch_abi.zig",
             "src/ops/cuda/kernels/kernel_abi.cuh",
@@ -165,7 +168,9 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_matmul.zig",
             "src/gguf/tensor_types.zig",
-        }) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
+        };
+        run.addArgs(&.{ "dispatch", b.fmt("{d}", .{dispatch_dependencies.len}) });
+        for (dispatch_dependencies) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     }
     run.addArg("--output");
     return b.createModule(.{ .root_source_file = run.addOutputFileArg2(b.fmt("{s}_identity.zig", .{@tagName(backend)}), .{ .make_absolute = true }) });

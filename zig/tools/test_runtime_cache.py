@@ -61,7 +61,9 @@ def link_children(source, destination):
 
 class RuntimeCacheTest(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        scratch = ZIG_ROOT.parent / ".zig-cache" / "runtime-cache-tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / "repo"
         self.build_directory = self.root / "zig"
@@ -1708,14 +1710,23 @@ class RuntimeCacheTest(unittest.TestCase):
                     if backend == "metal"
                     else None
                 )
-                native_templates = [
-                    self.own("zig/pkg/inference/src/graph/templates/" + name)
-                    for name in (
+                template_names = (
+                    ("metal_projection_native.metal", "metal_paged_decode_native.metal")
+                    if backend == "metal"
+                    else (
                         "cuda_gqa_flash_prefill_f16_sm89.cuh",
                         "cuda_gqa_decode_splitk_online_sm89.cuh",
                         "cuda_gqa_split_decode_f32.cuh",
+                        "cuda_q4_q8_projection.cuh",
                     )
-                ] if backend == "cuda" else []
+                )
+                native_templates = [
+                    self.own("zig/pkg/inference/src/graph/templates/" + name)
+                    for name in template_names
+                ]
+                native_templates.append(
+                    self.own("zig/pkg/inference/src/graph/kernel_source_owner.zig")
+                )
                 first = self.build(
                     "cache-identity", "runtime-unit-cli", backend=backend
                 )
@@ -1748,6 +1759,8 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/graph/quant_kernel_metal_attention_phases.zig",
                     "src/graph/quant_kernel_metal_param_abi.zig",
                     "src/graph/templates/metal_paged_prefill_compat.metal",
+                    "src/graph/templates/metal_projection_native.metal",
+                    "src/graph/templates/metal_paged_decode_native.metal",
                     "src/backends/metal_compile_options.h",
                     "src/graph/kernel_jit.zig",
                     "src/graph/quant_kernel_compiler.zig",
@@ -1755,6 +1768,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/gguf/quant_codec.zig",
                     "src/gguf/tensor_types.zig",
                     "src/ops/kernel_descriptor.zig",
+                    "src/graph/kernel_source_owner.zig",
                     "src/ops/kernel_geometry.zig",
                     "src/ops/kernel_math.zig",
                     "src/ops/kernel_reduction.zig",
@@ -1771,6 +1785,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/gguf/quant_codec.zig",
                     "src/gguf/tensor_types.zig",
                     "src/ops/kernel_descriptor.zig",
+                    "src/graph/kernel_source_owner.zig",
                     "src/ops/kernel_geometry.zig",
                     "src/ops/kernel_math.zig",
                     "src/ops/kernel_reduction.zig",
@@ -1796,6 +1811,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/cuda/launch_abi.zig",
                     "src/ops/cuda/driver.zig",
                     "src/graph/templates/cuda_q4_0_bf16_staged.cuh",
+                    "src/graph/templates/cuda_q4_q8_projection.cuh",
                     "src/graph/templates/cuda_gqa_repeat_prefill_f16.cuh",
                     "src/graph/templates/cuda_gqa_repeat_split_f16.cuh",
                     "src/ops/cuda/kernels/kernel_abi.cuh",

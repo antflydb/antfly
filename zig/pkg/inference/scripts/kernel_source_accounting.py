@@ -30,7 +30,7 @@ skip=re.compile(r'(?m:^[ \t]*\\\\[^\n]*)|//[^\n]*|/\*|"(?:[^"\\]|\\.)*"|\'(?:[^\
 header=re.compile(r'(?m)^[ \t]*test\s*(?:"(?:[^"\\]|\\.)*"\s*)?\{')
 
 
-def split_zig_tests(text):
+def mask_zig_literals(text):
     masked = list(text)
     cursor = 0
     while match := skip.search(text, cursor):
@@ -52,7 +52,11 @@ def split_zig_tests(text):
             if masked[index] != '\n':
                 masked[index] = ' '
         cursor = end
-    masked = ''.join(masked)
+    return ''.join(masked)
+
+
+def split_zig_tests(text):
+    masked = mask_zig_literals(text)
     spans = []
     for m in header.finditer(text):
         start = m.end() - 1
@@ -75,6 +79,47 @@ def split_zig_tests(text):
         start = b
     pure.append(text[start:])
     return (''.join(pure), ''.join(only), len(spans))
+
+
+def split_test_source_fragments(production, tests):
+    """Charge private source goldens used only by tests to their own budget.
+
+    A fragment referenced by production stays production, even when a test
+    also uses it. Mask embedded shader strings before balancing Zig braces.
+    """
+    masked = mask_zig_literals(production)
+    test_code = mask_zig_literals(tests)
+    spans = []
+    for match in re.finditer(r'(?m)^const (\w+)\s*=\s*SourceFragment\s*\{', masked):
+        name = match[1]
+        symbol = re.compile(r'\b' + re.escape(name) + r'\b')
+        if not symbol.search(test_code):
+            continue
+        start = match.end() - 1
+        depth = 0
+        for end in range(start, len(masked)):
+            depth += (masked[end] == '{') - (masked[end] == '}')
+            if depth == 0:
+                break
+        else:
+            raise ValueError('unclosed source fragment')
+        end += 1
+        if masked[end:end + 1] == ';':
+            end += 1
+        if production[end:end + 1] == '\n':
+            end += 1
+        if symbol.search(production[:match.start()] + production[end:]):
+            continue
+        spans.append((match.start(), end, name))
+    authored, fixtures, names = [], [], []
+    cursor = 0
+    for start, end, name in spans:
+        authored.append(production[cursor:start])
+        fixtures.append(production[start:end])
+        names.append(name)
+        cursor = end
+    authored.append(production[cursor:])
+    return ''.join(authored), ''.join(fixtures), names
 
 
 def shader(text):
@@ -146,7 +191,7 @@ def account(root, baseline):
         b = after.decode()
         if name.startswith('docs/'):
             row['groups'].append(add('documentation', a, b))
-        elif '/scripts/' in name or '/bench/' in name or '/tools/' in name or '/testing/' in name or (name == 'zig/pkg/inference/build.zig'):
+        elif '/scripts/' in name or '/bench/' in name or '/tools/' in name or '/testing/' in name or (name == 'zig/pkg/inference/build.zig') or name.endswith('/quant_kernel_metal_runtime_check.zig'):
             row['groups'].append(add('tests_and_benchmark_tooling', a, b))
         elif '/generated/' in name:
             row['groups'].append(add('generated', a, b))
@@ -158,6 +203,11 @@ def account(root, baseline):
                 (a, at, ac) = split_zig_tests(a)
                 (b, bt, bc) = split_zig_tests(b)
                 row['test_blocks'] = {'baseline': ac, 'candidate': bc}
+                (a, af, an) = split_test_source_fragments(a, at)
+                (b, bf, bn) = split_test_source_fragments(b, bt)
+                if an or bn:
+                    row['test_only_source_fragments'] = {'baseline': an, 'candidate': bn}
+                    row['groups'].append(add('test_only_source_fixtures', af, bf))
                 row['groups'].append(add('inline_tests', at, bt))
             if name.startswith('zig/lib/linalg/'):
                 group = 'authored_cpu_linalg_alignment'
@@ -166,6 +216,8 @@ def account(root, baseline):
                 (sb, b) = shader(b)
                 row['groups'].append(add('authored_metal_shader', sa, sb))
                 group = 'authored_metal_host_bindings'
+            elif '/graph/templates/' in name and path.suffix == '.metal':
+                group = 'authored_metal_shader'
             elif path.suffix in {'.cu', '.cuh'}:
                 group = 'authored_cuda_device'
             elif name.endswith(('/cuda/kernels.zig', '/cuda/launch_abi.zig')):

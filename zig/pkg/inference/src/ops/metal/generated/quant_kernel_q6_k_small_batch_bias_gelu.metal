@@ -24,8 +24,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 inline float antfly_qk_gelu(float x) { if (!isfinite(x)) return 0.0f; float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); if (inner > 10.0f) return x; if (inner < -10.0f) return 0.0f; float y = 0.5f * x * (1.0f + tanh(inner)); return isfinite(y) ? y : 0.0f; }
+inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 inline float antfly_qk_q6_k_scale(device const uchar *block, int lane) {
     int v0 = lane;
     int v1 = 4;
@@ -131,10 +131,15 @@ inline float antfly_q6_k_dequant_lane_v2(device const uchar *block, int lane) {
     float v46 = v44 * v45;
     return v46;
 }
+struct antfly_projection_decode_q6_k {
+    enum : int { values = 256, bytes = 210, shift = 8 };
+    __attribute__((always_inline)) static float decode(device const uchar* block, int lane) { return antfly_q6_k_dequant_lane_v2(block, lane); }
+    using Scalar = float; using Matrix = simdgroup_float8x8; using Scale = float;
+    enum : uint { sub_shift = 1u, sub_mask = 1u, sub_values = 16u };
+    static Scale scale(device const uchar* block, uint sub) { return antfly_qk_q6_k_scale(block, int(sub * 16u)); }
+    static float value(device const uchar* block, Scale scale, uint sub, uint j0, uint i) { return scale * antfly_qk_q6_k_value(block, int(sub * 16u + j0 + i)); }
+};
+#include "../../../graph/templates/metal_projection_native.metal"
 kernel void antfly_q6_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q6_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u; const uint first_o = (group_pos.x * NSG + uint(simdgroup_id)) * NC; const uint first_r = group_pos.y * NR;
-    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> 1; const uint j0 = (uint(lane_id) & 1u) << 3; float acc[4][2]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;
-    for (uint b = 0u; b < block_count; ++b) { uint input_off = first_r * uint(in_dim) + b * 256u + sub * 16u + j0; float x[2][8]; for (uint rr = 0u; rr < NR; ++rr) for (uint i = 0u; i < 8u; ++i) x[rr][i] = first_r + rr < uint(rows) ? input[input_off + rr * uint(in_dim) + i] : 0.0f;
-        for (uint c = 0u; c < NC; ++c) { uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = weight_q6_k + (col * block_count + b) * 210u; float dscale = antfly_qk_q6_k_scale(block, int(sub * 16u)); for (uint i = 0u; i < 8u; ++i) { float w = dscale * antfly_qk_q6_k_value(block, int(sub * 16u + j0 + i)); for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; } } }
-    for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) { float total = simd_sum(acc[c][rr]); uint col = first_o + c; uint row = first_r + rr; if (lane_id == 0u && col < uint(out_dim) && row < uint(rows)) output[row * uint(out_dim) + col] = antfly_qk_gelu(total + bias[col]); }
+    antfly_projection_k_tile<antfly_projection_decode_q6_k, antfly_projection_bias_gelu, 4u, 4u, 2u>(input, weight_q6_k, bias, output, rows, in_dim, out_dim, lane_id, simdgroup_id, group_pos);
 }

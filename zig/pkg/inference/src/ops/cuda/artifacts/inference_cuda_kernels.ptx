@@ -225,26 +225,6 @@
 // _ZZ22antfly_q4_0_mmv_f32_v1E7partial has been demoted
 // _ZZ21antfly_q4_0_mm_f32_v1E7partial has been demoted
 // _ZZ27antfly_q4_0_pair_mmv_f32_v1E7partial has been demoted
-// _ZZ39antfly_q4_0_pair_activation_q8_1_mmv_v1E12gate_partial has been demoted
-// _ZZ39antfly_q4_0_pair_activation_q8_1_mmv_v1E10up_partial has been demoted
-// _ZZ39antfly_q4_0_pair_activation_q8_1_mmv_v1E9activated has been demoted
-// _ZZ28antfly_q4_0_down_q8_1_mmv_v1E12warp_partial has been demoted
-// _ZZ48antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1E12gate_partial has been demoted
-// _ZZ48antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1E10up_partial has been demoted
-// _ZZ48antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1E9activated has been demoted
-// _ZZ49antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1E12gate_partial has been demoted
-// _ZZ49antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1E10up_partial has been demoted
-// _ZZ49antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1E9activated has been demoted
-// _ZZ37antfly_q4_0_down_q8_1_e2b_6144_mmv_v1E12warp_partial has been demoted
-// _ZZ38antfly_q4_0_down_q8_1_e2b_12288_mmv_v1E12warp_partial has been demoted
-// _ZZ53antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1E12gate_partial has been demoted
-// _ZZ53antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1E10up_partial has been demoted
-// _ZZ53antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1E9activated has been demoted
-// _ZZ54antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1E12gate_partial has been demoted
-// _ZZ54antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1E10up_partial has been demoted
-// _ZZ54antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1E9activated has been demoted
-// _ZZ42antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1E12warp_partial has been demoted
-// _ZZ43antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1E12warp_partial has been demoted
 // _ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial has been demoted
 // _ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial has been demoted
 // _ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial has been demoted
@@ -575,6 +555,18 @@
 // _ZZ32termite_argmax_reduce_pairs_implILj16EEvPjPKfPKjjjE17warp_best_indices has been demoted
 // _ZZ34termite_packed_qkv_projection_implILj4EEvPfS0_S0_PKhS2_S2_S2_jjjjE12warp_partial has been demoted
 // _ZZ34termite_packed_qkv_projection_implILj8EEvPfS0_S0_PKhS2_S2_S2_jjjjE12warp_partial has been demoted
+// _ZZ17antfly_q4_q8_pairILj5E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE12gate_partial has been demoted
+// _ZZ17antfly_q4_q8_pairILj5E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE10up_partial has been demoted
+// _ZZ17antfly_q4_q8_pairILj5E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE9activated has been demoted
+.shared .align 4 .b8 _ZZ17antfly_q4_q8_downILj256ELj4E16antfly_q8_legacyEvPfPKhS3_jjjE12warp_partial[128];
+.shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj3E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE12gate_partial[192];
+.shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj3E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE10up_partial[192];
+.shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj3E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE9activated[128];
+// _ZZ17antfly_q4_q8_downILj128ELj4E16antfly_q8_legacyEvPfPKhS3_jjjE12warp_partial has been demoted
+.shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE12gate_partial[192];
+.shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE10up_partial[192];
+.shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE9activated[128];
+.shared .align 4 .b8 _ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial[16];
 // _ZZ33termite_small_warp_attention_implILj512ELb0EEvPfPKfS2_S2_PKxjjjjjS0_E7partial has been demoted
 // _ZZ33termite_small_warp_attention_implILj512ELb0EEvPfPKfS2_S2_PKxjjjjjS0_E7maximum has been demoted
 // _ZZ33termite_small_warp_attention_implILj512ELb0EEvPfPKfS2_S2_PKxjjjjjS0_E11denominator has been demoted
@@ -291667,11 +291659,11 @@ $L__BB393_35:
 	.reg .b32 	%r<761>;
 	.reg .b64 	%rd<72>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ39antfly_q4_0_pair_activation_q8_1_mmv_v1E12gate_partial[320];
+	.shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj5E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE12gate_partial[320];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ39antfly_q4_0_pair_activation_q8_1_mmv_v1E10up_partial[320];
+	.shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj5E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE10up_partial[320];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ39antfly_q4_0_pair_activation_q8_1_mmv_v1E9activated[128];
+	.shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj5E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE9activated[128];
 
 	ld.param.u64 	%rd13, [antfly_q4_0_pair_activation_q8_1_mmv_v1_param_0];
 	ld.param.u64 	%rd14, [antfly_q4_0_pair_activation_q8_1_mmv_v1_param_1];
@@ -291713,11 +291705,11 @@ $L__BB393_35:
 
 	setp.gt.u32 	%p7, %r6, 639;
 	mul.lo.s32 	%r36, %r9, 80;
-	mov.u32 	%r37, _ZZ39antfly_q4_0_pair_activation_q8_1_mmv_v1E12gate_partial;
+	mov.u32 	%r37, _ZZ17antfly_q4_q8_pairILj5E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE12gate_partial;
 	add.s32 	%r38, %r37, %r36;
 	shl.b32 	%r39, %r10, 2;
 	add.s32 	%r11, %r38, %r39;
-	mov.u32 	%r40, _ZZ39antfly_q4_0_pair_activation_q8_1_mmv_v1E10up_partial;
+	mov.u32 	%r40, _ZZ17antfly_q4_q8_pairILj5E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE10up_partial;
 	add.s32 	%r41, %r40, %r36;
 	add.s32 	%r12, %r41, %r39;
 	@%p7 bra 	$L__BB394_14;
@@ -292318,7 +292310,7 @@ $L__BB394_14:
 	add.s32 	%r389, %r40, %r384;
 	add.s32 	%r19, %r389, %r387;
 	shl.b32 	%r390, %r6, 2;
-	mov.u32 	%r391, _ZZ39antfly_q4_0_pair_activation_q8_1_mmv_v1E9activated;
+	mov.u32 	%r391, _ZZ17antfly_q4_q8_pairILj5E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE9activated;
 	add.s32 	%r20, %r391, %r390;
 	setp.gt.u32 	%p54, %r6, 15;
 	@%p54 bra 	$L__BB394_25;
@@ -293210,8 +293202,7 @@ $L__BB394_55:
 	.reg .f32 	%f<107>;
 	.reg .b32 	%r<219>;
 	.reg .b64 	%rd<41>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ28antfly_q4_0_down_q8_1_mmv_v1E12warp_partial[128];
+
 
 	ld.param.u64 	%rd11, [antfly_q4_0_down_q8_1_mmv_v1_param_0];
 	ld.param.u64 	%rd12, [antfly_q4_0_down_q8_1_mmv_v1_param_1];
@@ -293519,7 +293510,7 @@ $L__BB395_13:
 	add.f32 	%f18, %f50, %f51;
 	shr.u32 	%r161, %r4, 3;
 	and.b32  	%r162, %r161, 536870908;
-	mov.u32 	%r163, _ZZ28antfly_q4_0_down_q8_1_mmv_v1E12warp_partial;
+	mov.u32 	%r163, _ZZ17antfly_q4_q8_downILj256ELj4E16antfly_q8_legacyEvPfPKhS3_jjjE12warp_partial;
 	add.s32 	%r16, %r163, %r162;
 	setp.ne.s32 	%p20, %r5, 0;
 	@%p20 bra 	$L__BB395_15;
@@ -293810,12 +293801,7 @@ $L__BB396_8:
 	.reg .f32 	%f<458>;
 	.reg .b32 	%r<761>;
 	.reg .b64 	%rd<72>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ48antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1E12gate_partial[192];
-	// demoted variable
-	.shared .align 4 .b8 _ZZ48antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1E10up_partial[192];
-	// demoted variable
-	.shared .align 4 .b8 _ZZ48antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1E9activated[128];
+
 
 	ld.param.u64 	%rd13, [antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1_param_0];
 	ld.param.u64 	%rd14, [antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1_param_1];
@@ -293857,11 +293843,11 @@ $L__BB396_8:
 
 	setp.gt.u32 	%p7, %r6, 383;
 	mul.lo.s32 	%r36, %r9, 48;
-	mov.u32 	%r37, _ZZ48antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1E12gate_partial;
+	mov.u32 	%r37, _ZZ17antfly_q4_q8_pairILj3E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE12gate_partial;
 	add.s32 	%r38, %r37, %r36;
 	shl.b32 	%r39, %r10, 2;
 	add.s32 	%r11, %r38, %r39;
-	mov.u32 	%r40, _ZZ48antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1E10up_partial;
+	mov.u32 	%r40, _ZZ17antfly_q4_q8_pairILj3E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE10up_partial;
 	add.s32 	%r41, %r40, %r36;
 	add.s32 	%r12, %r41, %r39;
 	@%p7 bra 	$L__BB397_14;
@@ -294462,7 +294448,7 @@ $L__BB397_14:
 	add.s32 	%r389, %r40, %r384;
 	add.s32 	%r19, %r389, %r387;
 	shl.b32 	%r390, %r6, 2;
-	mov.u32 	%r391, _ZZ48antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1E9activated;
+	mov.u32 	%r391, _ZZ17antfly_q4_q8_pairILj3E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE9activated;
 	add.s32 	%r20, %r391, %r390;
 	setp.gt.u32 	%p54, %r6, 15;
 	@%p54 bra 	$L__BB397_25;
@@ -295340,12 +295326,7 @@ $L__BB397_55:
 	.reg .f32 	%f<458>;
 	.reg .b32 	%r<761>;
 	.reg .b64 	%rd<72>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ49antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1E12gate_partial[192];
-	// demoted variable
-	.shared .align 4 .b8 _ZZ49antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1E10up_partial[192];
-	// demoted variable
-	.shared .align 4 .b8 _ZZ49antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1E9activated[128];
+
 
 	ld.param.u64 	%rd13, [antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1_param_0];
 	ld.param.u64 	%rd14, [antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1_param_1];
@@ -295387,11 +295368,11 @@ $L__BB397_55:
 
 	setp.gt.u32 	%p7, %r6, 383;
 	mul.lo.s32 	%r36, %r9, 48;
-	mov.u32 	%r37, _ZZ49antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1E12gate_partial;
+	mov.u32 	%r37, _ZZ17antfly_q4_q8_pairILj3E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE12gate_partial;
 	add.s32 	%r38, %r37, %r36;
 	shl.b32 	%r39, %r10, 2;
 	add.s32 	%r11, %r38, %r39;
-	mov.u32 	%r40, _ZZ49antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1E10up_partial;
+	mov.u32 	%r40, _ZZ17antfly_q4_q8_pairILj3E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE10up_partial;
 	add.s32 	%r41, %r40, %r36;
 	add.s32 	%r12, %r41, %r39;
 	@%p7 bra 	$L__BB398_14;
@@ -295992,7 +295973,7 @@ $L__BB398_14:
 	add.s32 	%r389, %r40, %r384;
 	add.s32 	%r19, %r389, %r387;
 	shl.b32 	%r390, %r6, 2;
-	mov.u32 	%r391, _ZZ49antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1E9activated;
+	mov.u32 	%r391, _ZZ17antfly_q4_q8_pairILj3E16antfly_q8_legacyEvPhPKhS3_S3_jjjjE9activated;
 	add.s32 	%r20, %r391, %r390;
 	setp.gt.u32 	%p54, %r6, 15;
 	@%p54 bra 	$L__BB398_25;
@@ -296869,7 +296850,7 @@ $L__BB398_55:
 	.reg .b32 	%r<219>;
 	.reg .b64 	%rd<41>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ37antfly_q4_0_down_q8_1_e2b_6144_mmv_v1E12warp_partial[64];
+	.shared .align 4 .b8 _ZZ17antfly_q4_q8_downILj128ELj4E16antfly_q8_legacyEvPfPKhS3_jjjE12warp_partial[64];
 
 	ld.param.u64 	%rd11, [antfly_q4_0_down_q8_1_e2b_6144_mmv_v1_param_0];
 	ld.param.u64 	%rd12, [antfly_q4_0_down_q8_1_e2b_6144_mmv_v1_param_1];
@@ -297177,7 +297158,7 @@ $L__BB399_13:
 	add.f32 	%f18, %f50, %f51;
 	shr.u32 	%r161, %r4, 3;
 	and.b32  	%r162, %r161, 536870908;
-	mov.u32 	%r163, _ZZ37antfly_q4_0_down_q8_1_e2b_6144_mmv_v1E12warp_partial;
+	mov.u32 	%r163, _ZZ17antfly_q4_q8_downILj128ELj4E16antfly_q8_legacyEvPfPKhS3_jjjE12warp_partial;
 	add.s32 	%r16, %r163, %r162;
 	setp.ne.s32 	%p20, %r5, 0;
 	@%p20 bra 	$L__BB399_15;
@@ -297312,8 +297293,7 @@ $L__BB399_24:
 	.reg .f32 	%f<107>;
 	.reg .b32 	%r<219>;
 	.reg .b64 	%rd<41>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ38antfly_q4_0_down_q8_1_e2b_12288_mmv_v1E12warp_partial[128];
+
 
 	ld.param.u64 	%rd11, [antfly_q4_0_down_q8_1_e2b_12288_mmv_v1_param_0];
 	ld.param.u64 	%rd12, [antfly_q4_0_down_q8_1_e2b_12288_mmv_v1_param_1];
@@ -297621,7 +297601,7 @@ $L__BB400_13:
 	add.f32 	%f18, %f50, %f51;
 	shr.u32 	%r161, %r4, 3;
 	and.b32  	%r162, %r161, 536870908;
-	mov.u32 	%r163, _ZZ38antfly_q4_0_down_q8_1_e2b_12288_mmv_v1E12warp_partial;
+	mov.u32 	%r163, _ZZ17antfly_q4_q8_downILj256ELj4E16antfly_q8_legacyEvPfPKhS3_jjjE12warp_partial;
 	add.s32 	%r16, %r163, %r162;
 	setp.ne.s32 	%p20, %r5, 0;
 	@%p20 bra 	$L__BB400_15;
@@ -297766,12 +297746,7 @@ $L__BB400_24:
 	.reg .f32 	%f<489>;
 	.reg .b32 	%r<643>;
 	.reg .b64 	%rd<72>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ53antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1E12gate_partial[192];
-	// demoted variable
-	.shared .align 4 .b8 _ZZ53antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1E10up_partial[192];
-	// demoted variable
-	.shared .align 4 .b8 _ZZ53antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1E9activated[128];
+
 
 	ld.param.u64 	%rd13, [antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1_param_0];
 	ld.param.u64 	%rd14, [antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1_param_1];
@@ -297813,11 +297788,11 @@ $L__BB400_24:
 
 	setp.gt.u32 	%p7, %r6, 383;
 	mul.lo.s32 	%r36, %r9, 48;
-	mov.u32 	%r37, _ZZ53antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1E12gate_partial;
+	mov.u32 	%r37, _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE12gate_partial;
 	add.s32 	%r38, %r37, %r36;
 	shl.b32 	%r39, %r10, 2;
 	add.s32 	%r11, %r38, %r39;
-	mov.u32 	%r40, _ZZ53antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1E10up_partial;
+	mov.u32 	%r40, _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE10up_partial;
 	add.s32 	%r41, %r40, %r36;
 	add.s32 	%r12, %r41, %r39;
 	@%p7 bra 	$L__BB401_14;
@@ -298368,7 +298343,7 @@ $L__BB401_14:
 	add.s32 	%r325, %r40, %r320;
 	add.s32 	%r19, %r325, %r323;
 	shl.b32 	%r326, %r6, 2;
-	mov.u32 	%r327, _ZZ53antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1E9activated;
+	mov.u32 	%r327, _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE9activated;
 	add.s32 	%r20, %r327, %r326;
 	setp.gt.u32 	%p54, %r6, 15;
 	@%p54 bra 	$L__BB401_25;
@@ -299220,12 +299195,7 @@ $L__BB401_55:
 	.reg .f32 	%f<489>;
 	.reg .b32 	%r<643>;
 	.reg .b64 	%rd<72>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ54antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1E12gate_partial[192];
-	// demoted variable
-	.shared .align 4 .b8 _ZZ54antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1E10up_partial[192];
-	// demoted variable
-	.shared .align 4 .b8 _ZZ54antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1E9activated[128];
+
 
 	ld.param.u64 	%rd13, [antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1_param_0];
 	ld.param.u64 	%rd14, [antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1_param_1];
@@ -299267,11 +299237,11 @@ $L__BB401_55:
 
 	setp.gt.u32 	%p7, %r6, 383;
 	mul.lo.s32 	%r36, %r9, 48;
-	mov.u32 	%r37, _ZZ54antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1E12gate_partial;
+	mov.u32 	%r37, _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE12gate_partial;
 	add.s32 	%r38, %r37, %r36;
 	shl.b32 	%r39, %r10, 2;
 	add.s32 	%r11, %r38, %r39;
-	mov.u32 	%r40, _ZZ54antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1E10up_partial;
+	mov.u32 	%r40, _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE10up_partial;
 	add.s32 	%r41, %r40, %r36;
 	add.s32 	%r12, %r41, %r39;
 	@%p7 bra 	$L__BB402_14;
@@ -299822,7 +299792,7 @@ $L__BB402_14:
 	add.s32 	%r325, %r40, %r320;
 	add.s32 	%r19, %r325, %r323;
 	shl.b32 	%r326, %r6, 2;
-	mov.u32 	%r327, _ZZ54antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1E9activated;
+	mov.u32 	%r327, _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE9activated;
 	add.s32 	%r20, %r327, %r326;
 	setp.gt.u32 	%p54, %r6, 15;
 	@%p54 bra 	$L__BB402_25;
@@ -300672,8 +300642,7 @@ $L__BB402_55:
 	.reg .f32 	%f<53>;
 	.reg .b32 	%r<108>;
 	.reg .b64 	%rd<36>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ42antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1E12warp_partial[16];
+
 
 	ld.param.u64 	%rd7, [antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1_param_0];
 	ld.param.u64 	%rd8, [antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1_param_1];
@@ -300933,7 +300902,7 @@ $L__BB403_7:
 
 	shr.u32 	%r102, %r4, 3;
 	and.b32  	%r103, %r102, 536870908;
-	mov.u32 	%r104, _ZZ42antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1E12warp_partial;
+	mov.u32 	%r104, _ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial;
 	add.s32 	%r105, %r104, %r103;
 	st.shared.f32 	[%r105], %f7;
 
@@ -300942,13 +300911,13 @@ $L__BB403_9:
 	setp.ne.s32 	%p19, %r4, 0;
 	@%p19 bra 	$L__BB403_11;
 
-	ld.shared.f32 	%f41, [_ZZ42antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1E12warp_partial];
+	ld.shared.f32 	%f41, [_ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial];
 	add.f32 	%f42, %f41, 0f00000000;
-	ld.shared.f32 	%f43, [_ZZ42antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1E12warp_partial+4];
+	ld.shared.f32 	%f43, [_ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial+4];
 	add.f32 	%f44, %f42, %f43;
-	ld.shared.f32 	%f45, [_ZZ42antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1E12warp_partial+8];
+	ld.shared.f32 	%f45, [_ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial+8];
 	add.f32 	%f46, %f44, %f45;
-	ld.shared.f32 	%f47, [_ZZ42antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1E12warp_partial+12];
+	ld.shared.f32 	%f47, [_ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial+12];
 	add.f32 	%f48, %f46, %f47;
 	mul.wide.u32 	%rd30, %r2, %r13;
 	cvt.u64.u32 	%rd31, %r3;
@@ -300977,8 +300946,7 @@ $L__BB403_11:
 	.reg .f32 	%f<53>;
 	.reg .b32 	%r<108>;
 	.reg .b64 	%rd<36>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ43antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1E12warp_partial[16];
+
 
 	ld.param.u64 	%rd7, [antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1_param_0];
 	ld.param.u64 	%rd8, [antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1_param_1];
@@ -301238,7 +301206,7 @@ $L__BB404_7:
 
 	shr.u32 	%r102, %r4, 3;
 	and.b32  	%r103, %r102, 536870908;
-	mov.u32 	%r104, _ZZ43antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1E12warp_partial;
+	mov.u32 	%r104, _ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial;
 	add.s32 	%r105, %r104, %r103;
 	st.shared.f32 	[%r105], %f7;
 
@@ -301247,13 +301215,13 @@ $L__BB404_9:
 	setp.ne.s32 	%p19, %r4, 0;
 	@%p19 bra 	$L__BB404_11;
 
-	ld.shared.f32 	%f41, [_ZZ43antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1E12warp_partial];
+	ld.shared.f32 	%f41, [_ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial];
 	add.f32 	%f42, %f41, 0f00000000;
-	ld.shared.f32 	%f43, [_ZZ43antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1E12warp_partial+4];
+	ld.shared.f32 	%f43, [_ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial+4];
 	add.f32 	%f44, %f42, %f43;
-	ld.shared.f32 	%f45, [_ZZ43antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1E12warp_partial+8];
+	ld.shared.f32 	%f45, [_ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial+8];
 	add.f32 	%f46, %f44, %f45;
-	ld.shared.f32 	%f47, [_ZZ43antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1E12warp_partial+12];
+	ld.shared.f32 	%f47, [_ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial+12];
 	add.f32 	%f48, %f46, %f47;
 	mul.wide.u32 	%rd30, %r2, %r13;
 	cvt.u64.u32 	%rd31, %r3;

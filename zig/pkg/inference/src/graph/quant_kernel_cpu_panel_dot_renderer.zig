@@ -36,16 +36,30 @@ fn query(out: *Emitter, mr: usize, r: usize) !void {
     if (mr != 1) try out.add("_r{d}", .{r});
 }
 fn body(out: *Emitter, kind: Kind, mr: usize) !void {
-    const k16 = kind == .k16_panel8;
+    if (kind == .k16_panel8) {
+        try out.add("const rows = k16Panel8Rows({d}, has_min, .{{ ", .{mr});
+        for (0..mr) |r| {
+            if (r != 0) try out.raw(", ");
+            try query(out, mr, r);
+        }
+        try out.raw(" }, panel_block);\nreturn ");
+        if (mr == 1) {
+            try out.raw("rows[0];\n");
+        } else {
+            try out.raw(".{ ");
+            for (0..mr) |r| try out.add(".r{d} = rows[{d}], ", .{ r, r });
+            try out.raw("};\n");
+        }
+        return;
+    }
     const wide = kind == .q6_panel16 or kind == .q4q5_panel16;
     const prepared_sums = kind == .q4q5_panel16;
-    if (k16) try out.raw("@setEvalBranchQuota(20_000);\n");
     for (0..mr) |r| {
         try out.raw("std.debug.assert(");
         try query(out, mr, r);
         try out.raw(".len == 292);\n");
     }
-    try out.add("std.debug.assert(panel_block.len == {s});\n", .{if (wide) "prepared_k_panel16_block_bytes" else if (k16) "prepared_k16_panel8_block_bytes" else "prepared_q6_k_panel8_block_bytes"});
+    try out.add("std.debug.assert(panel_block.len == {s});\n", .{if (wide) "prepared_k_panel16_block_bytes" else "prepared_q6_k_panel8_block_bytes"});
     if (kind == .q6_panel8) {
         try out.add("if (q6KPanel8FusedSdotEnabled()) return {s}FusedSdot(", .{switch (mr) {
             1 => Owner(.q6_panel8, 1).name,
@@ -81,9 +95,8 @@ fn body(out: *Emitter, kind: Kind, mr: usize) !void {
         if (wide) try out.raw(if (half == 0) "_lo" else "_hi");
         try out.raw(if (kind == .q6_panel8) ": I32x8 = @splat(0);\n" else ": F32x8 = @splat(0.0);\n");
     };
-    if (k16) try out.raw("inline ");
     try out.raw(if (prepared_sums) "for (0..8) |sub| {\nconst q_off = sub * 32;\n" else "for (0..16) |sub| {\nconst q_off = sub * 16;\n");
-    if (!k16) try out.raw(if (prepared_sums) "const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;\n" else if (wide) "const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 16;\n" else "const values_base = q6KPanel8ValuesBase(sub);\n");
+    try out.raw(if (prepared_sums) "const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 32;\n" else if (wide) "const values_base = prepared_k_panel16_values_offset + sub * prepared_k_panel16_nr * 16;\n" else "const values_base = q6KPanel8ValuesBase(sub);\n");
     if ((kind == .q6_panel8 and mr != 1) or prepared_sums) for (0..(if (prepared_sums) @as(usize, 16) else 8)) |c| {
         try out.add("const w{d} = ", .{c});
         try weightArgument(out, c, if (prepared_sums) 32 else 16);
@@ -104,37 +117,13 @@ fn body(out: *Emitter, kind: Kind, mr: usize) !void {
                 try out.raw("));\n");
             }
         };
-    } else if (!k16) {
+    } else {
         if (mr != 1) try out.raw("const scales = q6KPanel8ScaleI32(panel_block, sub);\n");
         for (0..mr) |r| {
             try symbol(out, "weighted", mr, r);
             try out.raw(" += dots");
             if (mr != 1) try out.add(".r{d}", .{r});
             try out.raw(if (mr == 1) " * q6KPanel8ScaleI32(panel_block, sub);\n" else " * scales;\n");
-        }
-    } else {
-        try out.raw("const dsc = k16Panel8Dsc(panel_block, sub);\n");
-        if (mr != 1) for (0..mr) |r| try out.add("const dots{d}: F32x8 = @floatFromInt(dots.r{d});\n", .{ r, r });
-        try out.raw("if (comptime has_min) {\nconst dmn = k16Panel8Dmn(panel_block, sub);\n");
-        for (0..mr) |r| {
-            try out.raw("const ");
-            try symbol(out, "activation_sum", mr, r);
-            try out.raw(": F32x8 = @splat(@as(f32, @floatFromInt(q8KBlockSum16(");
-            try query(out, mr, r);
-            try out.raw(", sub))));\n");
-        }
-        for ([_]bool{ true, false }) |with_min| {
-            for (0..mr) |r| {
-                try symbol(out, "acc", mr, r);
-                try out.raw(" += dsc * ");
-                try symbol(out, "dots", mr, r);
-                if (with_min) {
-                    try out.raw(" - dmn * ");
-                    try symbol(out, "activation_sum", mr, r);
-                }
-                try out.raw(";\n");
-            }
-            try out.raw(if (with_min) "} else {\n" else "}\n");
         }
     }
     try out.raw("}\n");
@@ -154,12 +143,12 @@ fn body(out: *Emitter, kind: Kind, mr: usize) !void {
         if (mr != 1) try out.raw(".{\n");
         for (0..mr) |r| {
             if (mr != 1) try out.add(".r{d} = ", .{r});
-            try symbol(out, if (k16) "x_scale" else "final_scale", mr, r);
+            try symbol(out, "final_scale", mr, r);
             try out.raw(" * ");
-            if (!k16) try out.raw("@as(F32x8, @floatFromInt(");
-            try symbol(out, if (k16) "acc" else "weighted", mr, r);
-            if (!k16) try out.raw("))");
-            if (mr != 1 and !(k16 and mr == 2 and r == 1)) try out.raw(",\n");
+            try out.raw("@as(F32x8, @floatFromInt(");
+            try symbol(out, "weighted", mr, r);
+            try out.raw("))");
+            if (mr != 1) try out.raw(",\n");
         }
         if (mr != 1) try out.raw("}");
         try out.raw(";\n");
@@ -171,18 +160,15 @@ fn weightArgument(out: *Emitter, c: usize, bytes: usize) !void {
     try out.add("..][0..{d}]", .{bytes});
 }
 fn dotCall(out: *Emitter, kind: Kind, mr: usize, half: usize) !void {
-    const k16 = kind == .k16_panel8;
     const wide = kind == .q6_panel16 or kind == .q4q5_panel16;
     const prepared_sums = kind == .q4q5_panel16;
-    const vertical = (wide and !prepared_sums) or (mr == 4 and k16) or (mr == 1 and !k16);
+    const vertical = (wide and !prepared_sums) or mr == 1;
     try out.raw("const dots");
     if (wide) try out.raw(if (half == 0) "_lo" else "_hi");
     try out.raw(" = ");
-    if (k16 and mr == 1) try out.raw("@as(F32x8, @floatFromInt(");
     try out.raw("dotI8I8Block8");
-    if (mr == 1) try out.raw(if (k16) "ContiguousVec16" else "_16Vec") else {
+    if (mr == 1) try out.raw("_16Vec") else {
         try out.add("MR{d}Rows", .{mr});
-        if (k16) try out.raw("Contiguous");
         try out.raw(if (prepared_sums) "Vec" else "Vec16");
     }
     try out.raw(if (vertical) "(\n" else "(");
@@ -191,12 +177,11 @@ fn dotCall(out: *Emitter, kind: Kind, mr: usize, half: usize) !void {
         try out.raw(if (prepared_sums) "[q_off..][0..32]," else "[q_off..][0..16],");
         try out.raw(if (vertical) "\n" else " ");
     }
-    if (k16) try out.raw("k16Panel8Values(panel_block, sub)") else for (0..8) |c| {
+    for (0..8) |c| {
         if ((wide and !prepared_sums) or mr == 1) try weightArgument(out, c + half * 8, 16) else try out.add("w{d}", .{c + half * 8});
         if (vertical) try out.raw(",\n") else if (c != 7) try out.raw(", ");
     }
-    if (k16 and vertical) try out.raw(",\n");
-    try out.raw(if (k16 and mr == 1) ")));\n" else ");\n");
+    try out.raw(");\n");
 }
 
 test "panel-dot geometries render valid native statements without leaking" {
