@@ -1466,6 +1466,12 @@ pub fn runPopulation(comptime Driver: type, scenario: PopulationScenario) !void 
 /// Unchanged original SQL enters the mounted HTTP handler. Source scans use
 /// real immutable native read views; destination jobs use real metadata Raft.
 pub fn runPopulationPublic(comptime Driver: type, case_id: []const u8, document: bool) !void {
+    return runPopulationPublicMode(Driver, case_id, document, true);
+}
+pub fn runPopulationPublicEmpty(comptime Driver: type, document: bool) !void {
+    return runPopulationPublicMode(Driver, "sql-0351", document, false);
+}
+fn runPopulationPublicMode(comptime Driver: type, case_id: []const u8, document: bool, with_data: bool) !void {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1506,7 +1512,7 @@ pub fn runPopulationPublic(comptime Driver: type, case_id: []const u8, document:
     server.restore_leadership_term.store(1, .release);
 
     const local = @import("antfly_local_sources");
-    const SourceTables = @import("sql_parity_sources.zig").Tables(1);
+    const SourceTables = @import("sql_parity_sources.zig").Tables(2);
     var inputs: SourceTables = .{ .records = undefined, .reads = undefined };
     const profile = try std.json.parseFromSliceLeaky(struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } }, a, local.sql_parity_fixtures.read_campaign_profile, .{ .ignore_unknown_fields = true });
     var original = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source", .{root}), .{ .backend_runtime = &runtime, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
@@ -1527,9 +1533,11 @@ pub fn runPopulationPublic(comptime Driver: type, case_id: []const u8, document:
     try original.batch(.{ .timestamp_ns = 42, .writes = source_writes });
     inputs.records[0] = .{ .table_id = 7, .name = "usage_records", .schema_json = schema, .indexes_json = "{}" };
     inputs.reads[0] = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init("usage_records", 7, &original, read_gate.alreadyReadSafeBarrier());
+    inputs.records[1] = .{ .table_id = 0, .name = "" };
+    inputs.reads[1] = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init("", 0, &original, read_gate.alreadyReadSafeBarrier());
     server.table_reads = inputs.source();
     try svc.upsertTable(inputs.records[0]);
-    try svc.upsertStore(.{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .schema_reader = tables.SchemaReaderCapabilities.current, .relational_topology_protocol_version = tables.query_population_protocol_version });
+    try svc.upsertStore(.{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .schema_reader = tables.SchemaReaderCapabilities.current, .relational_topology_protocol_version = tables.relational_topology_protocol_version });
     try svc.runRound();
     fixture.dbs[0] = try alloc.create(db.DB);
     allocated = 1;
@@ -1539,6 +1547,7 @@ pub fn runPopulationPublic(comptime Driver: type, case_id: []const u8, document:
     const oracle = try std.json.parseFromSliceLeaky(struct {
         inventory_sha256: []const u8,
         profile_sha256: []const u8,
+        materialized_diagnostics: []const struct { populated: bool, probes: []const struct { sql: []const u8, code: ?[]const u8 } },
         entries: []const struct { id: []const u8, source_entry_sha256: []const u8, sql: []const u8, command_tag: []const u8, columns: []const []const std.json.Value, rows: []const []const std.json.Value, repeat_command_tag: ?[]const u8 = null, repeat_rows: ?[]const []const std.json.Value = null },
     }, a, local.sql_parity_fixtures.population_reference, .{ .ignore_unknown_fields = true });
     var digest: [32]u8 = undefined;
@@ -1557,7 +1566,7 @@ pub fn runPopulationPublic(comptime Driver: type, case_id: []const u8, document:
     const Request = @import("httpx").Request;
     var request = try Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
     defer request.deinit();
-    request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = statement }, .{});
+    request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = if (with_data) statement else try std.fmt.allocPrint(a, "{s} WITH NO DATA", .{statement}) }, .{});
     var request_context: @import("httpx").Context = .init(alloc, std.testing.io, &request);
     defer request_context.deinit();
     var response = try handler.executeSQL(&request_context);
@@ -1580,8 +1589,8 @@ pub fn runPopulationPublic(comptime Driver: type, case_id: []const u8, document:
         }
         try std.testing.io.sleep(.fromMilliseconds(10), .awake);
     } else return error.PopulationWorkerDidNotComplete;
-    const empty = std.mem.eql(u8, case_id, "sql-0365");
-    const expected_count = reference.rows.len;
+    const empty = !with_data or std.mem.eql(u8, case_id, "sql-0365");
+    const expected_count = if (empty) 0 else reference.rows.len;
     const target_schema = (try fixture.dbs[0].getSchemaJson(a)).?;
     var parsed_schema = try @import("tables.zig").parseValidatedTableSchema(a, target_schema);
     defer parsed_schema.deinit(a);
@@ -1594,7 +1603,9 @@ pub fn runPopulationPublic(comptime Driver: type, case_id: []const u8, document:
         try std.testing.expectEqual(local.storage_schema.RelationalColumnType.string, column.column_type);
         try std.testing.expect(column.allows_null and !expected[2].bool);
     }
-    var reader = try fixture.dbs[0].beginRelationalRows(alloc, .{ .fields = &.{ "id", "status" } });
+    const field_names = try a.alloc([]const u8, reference.columns.len);
+    for (reference.columns, field_names) |column, *name| name.* = column[0].string;
+    var reader = try fixture.dbs[0].beginRelationalRows(alloc, .{ .fields = field_names });
     defer reader.deinit();
     var actual_count: usize = 0;
     var seen = try a.alloc(bool, reference.rows.len);
@@ -1603,13 +1614,16 @@ pub fn runPopulationPublic(comptime Driver: type, case_id: []const u8, document:
         var page = try reader.nextTypedPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
         defer page.deinit();
         for (page.rows) |row| {
-            try std.testing.expectEqualSlices(bool, &.{ false, false }, row.sql_nulls.?);
             const object = row.typed.?.object;
-            try std.testing.expectEqualStrings("closed", object.get("status").?.string);
-            const identifier = object.get("id").?;
+            const identifier = object.get(field_names[0]).?;
             var matched = false;
             for (reference.rows, 0..) |expected_row, index| {
-                if (identifier != .string or !std.mem.eql(u8, identifier.string, expected_row[0].string) or !std.mem.eql(u8, object.get("status").?.string, expected_row[1].string)) continue;
+                if (identifier != .string or !std.mem.eql(u8, identifier.string, expected_row[0].string)) continue;
+                for (field_names, expected_row, row.sql_nulls.?) |field, expected, is_null| {
+                    const actual = object.get(field) orelse .null;
+                    try std.testing.expectEqual(expected == .null, is_null);
+                    if (expected == .null) try std.testing.expect(actual == .null) else try std.testing.expectEqualStrings(expected.string, actual.string);
+                }
                 try std.testing.expect(!seen[index]);
                 seen[index] = true;
                 matched = true;
@@ -1641,5 +1655,86 @@ pub fn runPopulationPublic(comptime Driver: type, case_id: []const u8, document:
         try std.testing.expectEqual(before_captures, inputs.captures);
         try std.testing.expectEqual(before_imports, fixture.imports);
         try std.testing.expectEqual(reference.rows.len, reference.repeat_rows.?.len);
+    }
+    if (std.mem.startsWith(u8, case_id, "sql-035")) {
+        // A published generation stays immutable after the fixture reopens it.
+        try std.testing.expectError(error.MaterializedViewReadOnly, fixture.dbs[0].batch(.{ .writes = &.{.{ .key = "forged", .value = "{}" }} }));
+        try std.testing.expectError(error.MaterializedViewReadOnly, fixture.dbs[0].batch(.{ .deletes = &.{"forged"} }));
+        const encoded = (try server.restore_job_store.load(a, job_id)).?;
+        const job = try std.json.parseFromSliceLeaky(restore_jobs.JobState, a, encoded, .{});
+        const staged = (try source.getRestoreStaging(a, try stages.idForAttempt(job_id, job.staging_attempt_id), .{})).?;
+        const stage = try std.json.parseFromSliceLeaky(stages.Job, a, staged, .{});
+        inputs.records[1] = stage.plan.targets[0].table;
+        inputs.reads[1] = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init(inputs.records[1].name, inputs.records[1].table_id, fixture.dbs[0], read_gate.alreadyReadSafeBarrier());
+        var read_request = try Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer read_request.deinit();
+        read_request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = "SELECT * FROM usage_records_mv ORDER BY 1" }, .{});
+        var read_context: @import("httpx").Context = .init(alloc, std.testing.io, &read_request);
+        defer read_context.deinit();
+        var selected = try handler.executeSQL(&read_context);
+        defer selected.deinit();
+        if (selected.status.code != (if (with_data) @as(u16, 200) else 400)) std.debug.print("materialized read {s} status={d}: {s}\n", .{ case_id, selected.status.code, selected.body orelse "" });
+        try std.testing.expectEqual(@as(u16, if (with_data) 200 else 400), selected.status.code);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, selected.body.?, .{});
+        if (with_data) {
+            const actual_rows = value.object.get("rows").?.array.items;
+            try std.testing.expectEqual(reference.rows.len, actual_rows.len);
+            for (actual_rows, reference.rows) |actual, expected| {
+                try std.testing.expectEqual(expected.len, actual.array.items.len);
+                for (actual.array.items, expected) |cell, wanted| {
+                    if (wanted == .null) try std.testing.expect(cell == .null) else try std.testing.expectEqualStrings(wanted.string, cell.string);
+                }
+            }
+        } else try std.testing.expectEqualStrings("55000", value.object.get("code").?.string);
+
+        const diagnostics = for (oracle.materialized_diagnostics) |entry| {
+            if (entry.populated == with_data) break entry;
+        } else return error.MissingPopulationReference;
+        for (diagnostics.probes) |probe| {
+            if (probe.code == null) continue;
+            const rejected_sql = probe.sql;
+            var rejected_request = try Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+            defer rejected_request.deinit();
+            rejected_request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = rejected_sql }, .{});
+            var rejected_context: @import("httpx").Context = .init(alloc, std.testing.io, &rejected_request);
+            defer rejected_context.deinit();
+            var rejected = try handler.executeSQL(&rejected_context);
+            defer rejected.deinit();
+            const diagnostic = try std.json.parseFromSliceLeaky(std.json.Value, a, rejected.body.?, .{});
+            try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+            try std.testing.expectEqualStrings(probe.code.?, diagnostic.object.get("code").?.string);
+        }
+        const txn = try fixture.dbs[0].beginTransaction(999);
+        try std.testing.expectError(error.MaterializedViewReadOnly, fixture.dbs[0].writeTransaction(txn, .{ .writes = &.{.{ .key = "forged", .value = "{}" }} }));
+        try fixture.dbs[0].abortTransaction(txn, 1000);
+
+        // Execute the unchanged DROP originals (0358/0359), retaining the
+        // native reader above across metadata retirement to exercise its lease.
+        const drop_id = if (std.mem.eql(u8, case_id, "sql-0352")) "sql-0359" else "sql-0358";
+        const drop_sql = for (inventory.entries) |entry| {
+            if (std.mem.eql(u8, entry.id, drop_id)) break entry.sql;
+        } else return error.MissingOriginalCase;
+        const drop_reference = for (oracle.entries) |entry| {
+            if (std.mem.eql(u8, entry.id, drop_id)) break entry;
+        } else return error.MissingPopulationReference;
+        try std.testing.expectEqualStrings(drop_reference.sql, drop_sql);
+        var drop_request = try Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer drop_request.deinit();
+        drop_request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = drop_sql }, .{});
+        var drop_context: @import("httpx").Context = .init(alloc, std.testing.io, &drop_request);
+        defer drop_context.deinit();
+        var dropped = try handler.executeSQL(&drop_context);
+        defer dropped.deinit();
+        if (dropped.status.code != 200) std.debug.print("materialized drop {s}: {s}\n", .{ drop_id, dropped.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 200), dropped.status.code);
+        const drop_value = try std.json.parseFromSliceLeaky(std.json.Value, a, dropped.body.?, .{});
+        try std.testing.expectEqualStrings(drop_reference.command_tag, drop_value.object.get("command_tag").?.string);
+        var snapshot = (try source.adminSnapshot()).?;
+        defer source.freeAdminSnapshot(&snapshot);
+        for (snapshot.tables) |table| try std.testing.expect(table.table_id != inputs.records[1].table_id);
+        for (snapshot.ranges) |range| try std.testing.expect(range.table_id != inputs.records[1].table_id);
+        const missing_bytes = try source.systemCatalog(a, .{}, .{ .resolve_many = .{ .sql_sources = &.{.{ .name = .{ .database = "default", .namespace = "public", .table = "usage_records_mv" } }} } });
+        const missing = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").system_catalog_domain.ResolvedMany, a, missing_bytes, .{});
+        try std.testing.expect(missing.sql_sources[0] == null);
     }
 }

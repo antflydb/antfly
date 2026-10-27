@@ -22,7 +22,19 @@ import json
 from pathlib import Path
 from generate_sql_postgres_reference import postgres, FIXTURES, create_table, properties
 
-IDS = frozenset(("sql-0364", "sql-0365", "sql-0366", "sql-0567"))
+IDS = frozenset(
+    (
+        "sql-0351",
+        "sql-0352",
+        "sql-0353",
+        "sql-0358",
+        "sql-0359",
+        "sql-0364",
+        "sql-0365",
+        "sql-0366",
+        "sql-0567",
+    )
+)
 
 
 def generate():
@@ -45,15 +57,36 @@ def generate():
                 create_table(
                     pg, "usage_records", properties(profile["schema"]), profile["rows"]
                 )
+                if case["id"] in ("sql-0358", "sql-0359"):
+                    pg.execute(
+                        "CREATE MATERIALIZED VIEW usage_records_mv AS SELECT id,status FROM usage_records"
+                    )
+                    entry = {
+                        key: case[key] for key in ("id", "source_entry_sha256", "sql")
+                    }
+                    entry.update(
+                        command_tag=pg.execute(case["sql"]).statusmessage,
+                        columns=[],
+                        rows=[],
+                    )
+                    entry["absent"] = pg.execute(
+                        "SELECT to_regclass('usage_records_mv') IS NULL"
+                    ).fetchone()[0]
+                    if case["id"] == "sql-0359":
+                        entry["repeat_command_tag"] = pg.execute(
+                            case["sql"]
+                        ).statusmessage
+                    result["entries"].append(entry)
+                    continue
                 command = pg.execute(case["sql"]).statusmessage
                 target = (
-                    "usage_archive_empty"
+                    "usage_records_mv"
+                    if case["id"] in ("sql-0351", "sql-0352", "sql-0353")
+                    else "usage_archive_empty"
                     if case["id"] == "sql-0365"
                     else "usage_archive"
                 )
-                rows = pg.execute(
-                    "SELECT id,status FROM " + target + " ORDER BY id"
-                ).fetchall()
+                rows = pg.execute("SELECT * FROM " + target + " ORDER BY 1").fetchall()
                 columns = pg.execute(
                     "SELECT a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull FROM pg_attribute a WHERE a.attrelid=%s::regclass AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum",
                     (target,),
@@ -66,6 +99,31 @@ def generate():
                         "SELECT id,status FROM " + target + " ORDER BY id"
                     ).fetchall()
                 result["entries"].append(entry)
+        result["materialized_diagnostics"] = []
+        for populated in (False, True):
+            with pg.transaction(force_rollback=True):
+                pg.execute(
+                    "CREATE MATERIALIZED VIEW usage_records_mv AS SELECT 'one'::text AS id,'open'::text AS status"
+                    + ("" if populated else " WITH NO DATA")
+                )
+                probes = []
+                for query in (
+                    "DROP VIEW usage_records_mv",
+                    "DELETE FROM usage_records_mv",
+                    "SELECT * FROM usage_records_mv ORDER BY 1",
+                ):
+                    code = None
+                    try:
+                        with pg.transaction(force_rollback=True):
+                            pg.execute(query)
+                    except Exception as error:
+                        code = getattr(error, "sqlstate", None)
+                        if code is None:
+                            raise
+                    probes.append({"sql": query, "code": code})
+                result["materialized_diagnostics"].append(
+                    {"populated": populated, "probes": probes}
+                )
     if {entry["id"] for entry in result["entries"]} != IDS:
         raise ValueError("original population inventory changed")
     return json.loads(json.dumps(result))
@@ -85,7 +143,9 @@ def main():
         actual.pop("postgres_version", None)
         if existing != actual:
             raise SystemExit("PostgreSQL population reference changed")
-        print("PostgreSQL population reference: all four unchanged originals match")
+        print(
+            "PostgreSQL population reference: all nine unchanged originals and materialized diagnostics match"
+        )
     else:
         args.output.write_text(json.dumps(result, indent=2) + "\n")
 

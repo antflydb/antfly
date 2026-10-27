@@ -338,7 +338,9 @@ pub fn mutateSqlView(svc: anytype, alloc: std.mem.Allocator, context: operation.
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
     try request.mutation.validate();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_view_domains_version);
+    const materialized = request.mutation.operation == .drop and request.mutation.operation.drop.materialized;
+    if (materialized) try @import("../metadata/service.zig").ensureMaterializedViewCapabilityWithContext(svc, context);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (materialized) protocol.sql_materialized_view_version else protocol.sql_view_domains_version);
     svc.lockCatalogMutation();
     var locked = true;
     defer if (locked) svc.unlockCatalogMutation();
@@ -2015,8 +2017,12 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .relational_index_source_accept_status => |request| relationalIndexSourceAcceptanceStatusJson(svc, alloc, context, request),
         .query_population_prepare => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
-            try @import("../metadata/service.zig").ensureQueryPopulationCapabilityWithContext(svc, context);
-            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_population_version);
+            const version = if (request.materialized_view) protocol.sql_materialized_view_version else protocol.sql_population_version;
+            if (request.materialized_view)
+                try @import("../metadata/service.zig").ensureMaterializedViewCapabilityWithContext(svc, context)
+            else
+                try @import("../metadata/service.zig").ensureQueryPopulationCapabilityWithContext(svc, context);
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, version);
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.prepareRelationCreateJsonWithContext(alloc, svc.metadata_group_id, request, .query_population, context);

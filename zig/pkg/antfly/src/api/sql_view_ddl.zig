@@ -115,6 +115,20 @@ const Loader = struct {
     }
 };
 
+pub fn preparePopulation(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, a: A, intent: ast.RelationPopulation, revision: u64, path: ?*const Path) !definitions.Owned {
+    var loader: Loader = .{ .server = server, .identity = identity, .context = context, .database = database, .namespace = namespace, .revision = revision, .path = path };
+    var admitted = identity;
+    var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &admitted, .context = context, .database = database, .namespace = namespace };
+    var settings: ?sources.sql_setting_catalog.View = null;
+    defer if (settings) |*value| value.deinit();
+    if (identity != null) {
+        const capture = adapter.settingCapture().?;
+        settings = try sources.sql_setting_catalog.View.capture(a, capture.owner, capture.scope, capture.overlay);
+        try settings.?.pinSqlUser(capture.sql_user);
+    }
+    return definitions.preparePopulation(a, .{ .ptr = &loader, .resolve = Loader.resolve, .checkpoint = Loader.checkpoint }, intent, .{ .owner = try owner(identity, server.cfg.auth_enabled), .settings = if (settings) |*value| value else null });
+}
+
 pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: ast.CatalogDdl, path: ?*const Path) !catalog.DdlOutcome {
     try context.ensureActive();
     if (!server.source.vtable.supports_sql_views or !server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
@@ -145,6 +159,8 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         if (source.value != .view) return if (ddl.action == .create and !(if (ddl.view_definition) |intent| intent.replace else false)) error.CatalogAlreadyExists else error.SqlWrongObjectType;
         const parsed = try views.Record.decode(a, source.value.view.source_json);
         if (parsed.value.id != source.value.view.id) return error.InvalidSqlViewRecord;
+        if (ddl.action != .create and ddl.materialized != (parsed.value.materialization != null)) return error.SqlWrongObjectType;
+        if (parsed.value.materialization != null) try server.requireGenerationAuthority(http.storedDestinationPrincipal(identity), &.{logical}, true);
         expected = .{ .id = parsed.value.id, .generation = parsed.value.generation };
     }
     const change: views.Mutation = switch (ddl.action) {
@@ -175,7 +191,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
                 if (ddl.conditional) return .{};
                 return error.CatalogNotFound;
             }
-            break :drop .{ .target = target, .operation = .{ .drop = .{ .expected = expected, .if_exists = ddl.conditional, .cascade = ddl.cascade } } };
+            break :drop .{ .target = target, .operation = .{ .drop = .{ .expected = expected, .if_exists = ddl.conditional, .cascade = ddl.cascade, .materialized = ddl.materialized } } };
         },
         .rename => rename: {
             if (expected == null) {

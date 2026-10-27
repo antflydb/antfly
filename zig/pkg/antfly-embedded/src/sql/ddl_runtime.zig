@@ -44,7 +44,7 @@ fn generatedConstraintNamesAlloc(a: std.mem.Allocator, create: ast.CreateTable) 
 
 pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, statement: ast.Statement) !Output {
     const alloc = allocators.scratch;
-    if (statement == .catalog_ddl and (statement.catalog_ddl.action == .populate or statement.catalog_ddl.materialized)) return error.UnsupportedSqlExecution;
+    if (statement == .catalog_ddl and (statement.catalog_ddl.action == .populate or (statement.catalog_ddl.materialized and statement.catalog_ddl.action != .drop))) return error.UnsupportedSqlExecution;
     const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
     try backend.vtable.checkpoint(backend.ptr);
     const preparation: @import("immutable_plan.zig").Limits = if (backend.scalar_control) |control| .{ .checkpoint = control.checkpoint, .checkpoint_context = control.ptr } else .{};
@@ -105,7 +105,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
                 .namespace => "DROP SCHEMA",
                 .tablespace => "DROP TABLESPACE",
                 .index => "DROP INDEX",
-                .view => "DROP VIEW",
+                .view => if (ddl.materialized) "DROP MATERIALIZED VIEW" else "DROP VIEW",
                 .role => "DROP ROLE",
                 .sequence => "DROP SEQUENCE",
                 .table => unreachable,

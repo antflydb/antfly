@@ -20825,7 +20825,7 @@ pub const RaftApplyStore = struct {
     pub fn prepareRelationCreateJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../relation_create.zig").Request, purpose: @import("../relation_create.zig").Purpose, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         if (request.namespace_id == 0 or request.logical_name.len == 0 or request.logical_name.len > 256 or
-            request.candidate.table_id != 0 or request.candidate.name.len != 0) return error.InvalidGenerationPublication;
+            request.candidate.table_id != 0 or request.candidate.name.len != 0 or request.candidate.sql_materialized_view_id != null) return error.InvalidGenerationPublication;
         if (purpose == .foreign_key) {
             if (request.physical_name != null or !try fk_generation_publication.schemaHasForeignKeys(self.alloc, request.candidate.schema_json)) return error.InvalidGenerationPublication;
         } else {
@@ -20874,6 +20874,12 @@ pub const RaftApplyStore = struct {
         child.name = physical_name;
         const derived_id = std.hash.Wyhash.hash(0x54424c45, physical_name);
         child.table_id = if (derived_id == 0) 1 else derived_id;
+        if (request.materialized_view) {
+            if (purpose != .query_population) return error.InvalidGenerationPublication;
+            const view_id = std.hash.Wyhash.hash(0x56494557, physical_name);
+            if (view_id == 0 or view_id == child.table_id or try system_catalog_storage.getById(a, &txn, group_id, .view, view_id) != null) return error.CatalogAlreadyExists;
+            child.sql_materialized_view_id = view_id;
+        }
         const catalog_view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = meta };
         const explicit_tablespace_id = if (request.tablespace_name) |name| blk: {
             const space = (try catalog_view.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound;
@@ -24509,12 +24515,22 @@ pub const RaftApplyStore = struct {
                         if (table == null or table.?.table_id != id) return error.InvalidCatalogRecord;
                         resource = null;
                     }
-                } else if (kind == .view) return null else {
+                } else if (kind == .view) return null else physical: {
                     var buffer: [160]u8 = undefined;
                     const bytes = (try stagingGet(txn, try tableKeyForGroup(&buffer, group, id))) orelse return null;
                     table = try decodeTableIdentity(a, bytes);
                     if (table.?.table_id != id) return error.InvalidCatalogRecord;
                     target = .{ .table = table.?.name };
+                    if (try view.bindingForStorage(table.?.name)) |backing_binding| if (backing_binding.kind == .view) {
+                        var record = try sql_views.Record.decode(a, backing_binding.source_json);
+                        defer record.deinit();
+                        const backing = record.value.materialization orelse return error.InvalidSqlViewRecord;
+                        if (backing.table_id != id or !std.mem.eql(u8, backing.storage_name, table.?.name)) return error.InvalidSqlViewRecord;
+                        const namespace = (try view.byId(.namespace, backing_binding.parent_id)) orelse return error.InvalidCatalogRecord;
+                        const database = (try view.byId(.database, namespace.parent_id)) orelse return error.InvalidCatalogRecord;
+                        target = .{ .database = database.name, .namespace = namespace.name, .table = backing_binding.name };
+                        break :physical;
+                    };
                     // A raw physical record is not proof of public existence:
                     // hidden/retired restore generations can retain one. Use
                     // the ordinary name index and visibility rules as well.
@@ -24536,6 +24552,7 @@ pub const RaftApplyStore = struct {
             var record = try sql_views.Record.decode(a, binding.source_json);
             defer record.deinit();
             if (record.value.id != binding.id) return error.InvalidSqlViewRecord;
+            if (record.value.materialization != null) _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_materialized_view_version);
             if (record.value.definition.requiredFormat() >= 2) _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_view_domains_version);
             result.value = .{ .view = try system_catalog.cloneResource(alloc, binding) };
         } else {
@@ -24828,6 +24845,14 @@ pub const RaftApplyStore = struct {
             if (Result == metadata.TableRecord) metadata_table_manager.freeTable(alloc, table) else table.deinit(alloc);
             return null;
         }
+        if (try system_catalog_storage.getBindingForStorage(alloc, txn, group_id, table.name)) |value| {
+            var owned = value;
+            defer owned.deinit();
+            if (owned.value.kind == .view) {
+                if (Result == metadata.TableRecord) metadata_table_manager.freeTable(alloc, table) else table.deinit(alloc);
+                return null;
+            }
+        }
         return table;
     }
 
@@ -24853,7 +24878,7 @@ pub const RaftApplyStore = struct {
         }
         if (command.sql_view != null) {
             _ = self.applySqlViewLifecycleTxn(txn, group_id, command, true) catch |err| switch (err) {
-                error.CatalogGenerationChanged, error.CatalogAlreadyExists, error.CatalogNotFound, error.SqlDependentObjectsExist, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.SqlViewCycle, error.SqlProgramLimitExceeded, error.TableTransitionActive => return,
+                error.SqlWrongObjectType, error.CatalogGenerationChanged, error.CatalogAlreadyExists, error.CatalogNotFound, error.SqlDependentObjectsExist, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.SqlViewCycle, error.SqlProgramLimitExceeded, error.TableTransitionActive => return,
                 else => return err,
             };
             return;
@@ -26287,6 +26312,16 @@ pub const RaftApplyStore = struct {
             var owned = binding;
             defer owned.deinit();
             return self.deleteLegacyListingTxn(txn, group_id, name);
+        }
+        if (try system_catalog_storage.getBindingForStorage(self.alloc, txn, group_id, name)) |value| {
+            var binding = value;
+            defer binding.deinit();
+            if (binding.value.kind == .view) {
+                var record = try sql_views.Record.decode(self.alloc, binding.value.source_json);
+                defer record.deinit();
+                if (record.value.materialization == null or record.value.materialization.?.table_id != id) return error.InvalidCatalogRecord;
+                return self.deleteLegacyListingTxn(txn, group_id, name);
+            }
         }
         const prefix = try legacyListingPrefix(self.alloc, group_id);
         defer self.alloc.free(prefix);
@@ -30100,6 +30135,13 @@ pub const RaftApplyStore = struct {
         };
         const table = try decodeTableProjection(a, bytes, .schema);
         defer table.deinit(a);
+        if (binding == null) if ((try borrowTableProjection(bytes, .identity)).sql_materialized_view_id) |owner| {
+            binding = (try system_catalog_storage.getById(a, reader, group_id, .view, owner)) orelse return error.InvalidCatalogRecord;
+            var view_record = try sql_views.Record.decode(a, binding.?.value.source_json);
+            defer view_record.deinit();
+            const backing = view_record.value.materialization orelse return error.InvalidCatalogRecord;
+            if (backing.table_id != table_id or !std.mem.eql(u8, backing.storage_name, table.name)) return error.InvalidCatalogRecord;
+        };
         if (table.table_id != table_id) return error.InvalidCatalogRecord;
         if (binding) |value| {
             if (!std.mem.eql(u8, value.value.storage_name, table.name)) return error.InvalidCatalogRecord;
@@ -30188,7 +30230,7 @@ pub const RaftApplyStore = struct {
             child_before: Table,
             child_after: Table,
         },
-        const Table = struct { table_id: u64, name: []const u8, schema_json: []const u8 = "" };
+        const Table = struct { table_id: u64, name: []const u8, schema_json: []const u8 = "", sql_materialized_view_id: ?u64 = null };
     };
     fn relationFkReserved(phase: fk_generation_publication.Phase) bool {
         return switch (phase) {
@@ -30243,7 +30285,7 @@ pub const RaftApplyStore = struct {
         plan: struct { id: [16]u8, targets: []const Target },
         const Target = struct {
             table: RelationFkProjection.Table,
-            catalog_binding: ?struct { kind: system_catalog.Kind, parent_id: u64, name: []const u8 } = null,
+            catalog_binding: ?struct { kind: system_catalog.Kind, id: u64 = 0, parent_id: u64, name: []const u8 } = null,
             replace: ?struct { table: RelationFkProjection.Table } = null,
         };
     };
@@ -30439,7 +30481,7 @@ pub const RaftApplyStore = struct {
             hash.update(&relationTableSourceDigest(target.table.table_id, target.table.name, target.table.schema_json));
             hash.update(&.{@intFromBool(target.catalog_binding != null)});
             if (target.catalog_binding) |binding| {
-                if (binding.kind != .table) return error.InvalidCatalogRecord;
+                if (binding.kind != .table and !(binding.kind == .view and target.table.sql_materialized_view_id == binding.id)) return error.InvalidCatalogRecord;
                 try (relation_names.Key{ .namespace_id = binding.parent_id, .name = binding.name }).validate();
                 var header: [16]u8 = undefined;
                 std.mem.writeInt(u64, header[0..8], binding.parent_id, .big);
@@ -30794,7 +30836,9 @@ pub const RaftApplyStore = struct {
         return result;
     }
     fn relationSourceReplayBeforeKey(group_id: u64, key: []const u8) !bool {
-        return try reconciliationReplayBeforeKey(group_id, key) or try relationSourceKey(group_id, key);
+        var buffer: [160]u8 = undefined;
+        const prefix = try sql_views.recordPrefix(&buffer, group_id);
+        return std.mem.startsWith(u8, key, prefix) or try reconciliationReplayBeforeKey(group_id, key) or try relationSourceKey(group_id, key);
     }
     fn verifyReconciliationEpochTxn(txn: *docstore.DocStore.Txn, group_id: u64, journal: *command_journal.Journal) !void {
         var buf: [128]u8 = undefined;
@@ -31036,10 +31080,20 @@ pub const RaftApplyStore = struct {
         errdefer plan.deinit();
         for (plan.after) |claim| {
             if (claim.key.membership_table_id != 0) continue; // constraint names are table-local
-            inline for (.{ system_catalog.Kind.view, system_catalog.Kind.sequence }) |kind|
+            for ([_]system_catalog.Kind{ .view, .sequence }) |kind|
                 if (try system_catalog_storage.find(self.alloc, txn, group_id, kind, claim.key.namespace_id, claim.key.name)) |value_| {
                     var value = value_;
-                    value.deinit();
+                    defer value.deinit();
+                    if (kind == .view and claim.owner.kind == .table and claim.owner.phase == .active) {
+                        var record = try sql_views.Record.decode(self.alloc, value.value.source_json);
+                        defer record.deinit();
+                        if (record.value.materialization) |backing| if (backing.table_id == claim.owner.table_id and std.mem.eql(u8, backing.storage_name, value.value.storage_name)) {
+                            var key: [160]u8 = undefined;
+                            const raw = try txn.get(try tableKeyForGroup(&key, group_id, backing.table_id));
+                            const table = try borrowTableProjection(raw, .identity);
+                            if (table.sql_materialized_view_id == record.value.id and std.mem.eql(u8, table.name, backing.storage_name)) continue;
+                        };
+                    }
                     return error.CatalogAlreadyExists;
                 };
         }
@@ -32699,7 +32753,10 @@ pub const RaftApplyStore = struct {
                 try view.lookup(.view, binding.parent_id, binding.name) != null or
                 try view.lookup(.sequence, binding.parent_id, binding.name) != null) return "CatalogAlreadyExists";
         }
-        if (!try self.relationalTopologyStoresAtLeastTxn(txn, group, metadata_table_manager.query_population_protocol_version)) return "RelationalTopologyProtocolUpgradeRequired";
+        const data_version = for (plan.targets) |target| {
+            if (target.materialized_view != null) break metadata_table_manager.materialized_view_protocol_version;
+        } else metadata_table_manager.query_population_protocol_version;
+        if (!try self.relationalTopologyStoresAtLeastTxn(txn, group, data_version)) return "RelationalTopologyProtocolUpgradeRequired";
         return "CatalogGenerationChanged";
     }
 
@@ -32756,6 +32813,26 @@ pub const RaftApplyStore = struct {
         return .{ .database = try create.fingerprint(a, database), .namespace = try create.fingerprint(a, namespace), .tablespace_id = if (space) |value| value.id else 0, .tablespace = if (space) |value| try create.fingerprint(a, value) else null };
     }
 
+    fn prepareMaterializedViewTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, id: restore_staging.Id, target: restore_staging.Target) !PreparedSqlViewAux {
+        const materialized = target.materialized_view orelse return error.InvalidRestoreStaging;
+        const binding = target.catalog_binding orelse return error.InvalidRestoreStaging;
+        const meta = try system_catalog_storage.readMeta(a, txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
+        const namespace = (try view.byId(.namespace, binding.parent_id)) orelse return error.NamespaceNotFound;
+        const database = (try view.byId(.database, namespace.parent_id)) orelse return error.DatabaseNotFound;
+        var result: ?PreparedSqlViewAux = null;
+        _ = try self.publishSqlViewTxn(txn, group, .{
+            .expected_revision = meta.revision,
+            .target = .{ .database = database.name, .namespace = namespace.name, .table = binding.name },
+            .definition = materialized.definition,
+            .staged = .{ .id = materialized.id, .publication_id = id, .tablespace_id = binding.tablespace_id, .backing = .{ .table_id = target.table.table_id, .storage_name = target.table.name, .schema_digest = target.population.?.target_schema, .populated = materialized.populated } },
+            .dry_run = true,
+            .output_allocator = a,
+            .output = &result,
+        });
+        return result orelse return error.InvalidRestoreStaging;
+    }
+
     /// Validate every logical destination before any topology is changed.
     /// Schema rewrites inherit an existing binding; restore admission supplies
     /// explicit bindings for previously absent or differently named owners.
@@ -32792,7 +32869,7 @@ pub const RaftApplyStore = struct {
             }
             if (try view.byId(.namespace, binding.parent_id) == null or try view.byId(.table, target.table.table_id) != null) return error.InvalidRestoreStaging;
             if (binding.tablespace_id != 0 and try view.byId(.tablespace, binding.tablespace_id) == null) return error.InvalidRestoreStaging;
-            const current = try view.lookup(.table, binding.parent_id, binding.name);
+            const current = try view.lookup(binding.kind, binding.parent_id, binding.name);
             if (old) |prior| {
                 if (current == null or current.?.id != prior.id or prior.parent_id != binding.parent_id or
                     !std.mem.eql(u8, prior.name, binding.name) or !std.mem.eql(u8, prior.storage_name, target.replace.?.table.name)) return error.InvalidRestoreStaging;
@@ -32801,7 +32878,7 @@ pub const RaftApplyStore = struct {
             if (try view.bindingForStorage(target.table.name)) |physical| {
                 if (old == null or physical.id != old.?.id) return error.InvalidRestoreStaging;
             }
-            binding.id = target.table.table_id;
+            if (target.materialized_view == null) binding.id = target.table.table_id;
             binding.storage_name = target.table.name;
             try upserts.append(alloc, binding);
             for (target.sequence_handoffs) |move| try upserts.append(alloc, try move.resource(alloc));
@@ -32822,7 +32899,7 @@ pub const RaftApplyStore = struct {
             if (target.population != null) {
                 // New captures are inadmissible until the exact metadata
                 // voter cohort has durably activated this decoder.
-                _ = self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_population_version) catch |err| switch (err) {
+                _ = self.standbyRelationActivationTxn(txn, group_id, (if (@import("../schema_reader_wire.zig").requiresMaterializedView(bytes)) topology_protocol.sql_materialized_view_version else topology_protocol.sql_population_version)) catch |err| switch (err) {
                     error.TableTopologyProtocolUpgradeRequired => return,
                     else => return err,
                 };
@@ -32912,11 +32989,20 @@ pub const RaftApplyStore = struct {
                     !try self.restoreExternalParentMatchesTxn(txn, group_id, parent)) return;
                 for (parent.ranges) |range| if (try stagingGet(txn, try restore_staging.identityKey(&key_buf, group_id, .parent_group, range.group_id)) != null) return;
             }
+            for (plan.targets) |target| if (target.materialized_view != null) {
+                _ = self.prepareMaterializedViewTxn(catalog_arena.allocator(), txn, group_id, plan.id, target) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    return;
+                };
+            };
             if (!try self.restoreIncomingDependenciesClosedTxn(txn, group_id, plan)) return;
             const query_population = for (plan.targets) |target| {
                 if (target.population != null) break true;
             } else false;
-            if (query_population and !try self.activateDataTopologyFloorTxn(txn, group_id, metadata_table_manager.query_population_protocol_version)) return;
+            const data_version = for (plan.targets) |target| {
+                if (target.materialized_view != null) break metadata_table_manager.materialized_view_protocol_version;
+            } else metadata_table_manager.query_population_protocol_version;
+            if (query_population and !try self.activateDataTopologyFloorTxn(txn, group_id, data_version)) return;
             const initial_state: restore_staging.State = if (plan.preparing_sources) .preparing_sources else .importing;
             const job: restore_staging.Job = .{ .plan = plan, .plan_digest = try plan.digest(self.alloc), .state = initial_state };
             const value = try std.json.Stringify.valueAlloc(self.alloc, job, .{});
@@ -33284,7 +33370,9 @@ pub const RaftApplyStore = struct {
                         table.restore_backup_id = "";
                         table.restore_location = "";
                         var table_key_buf: [256]u8 = undefined;
-                        var prepared = (try self.prepareTableRecordTxnMode(txn, group_id, try tableKeyForGroup(&table_key_buf, group_id, table.table_id), table, false)) orelse return;
+                        var prepared = (try self.prepareTableRecordTxnMode(txn, group_id, try tableKeyForGroup(&table_key_buf, group_id, table.table_id), table, false)) orelse {
+                            return;
+                        };
                         errdefer prepared.deinit(self.alloc);
                         try prepared_targets.append(self.alloc, prepared);
                     };
@@ -33293,6 +33381,18 @@ pub const RaftApplyStore = struct {
                             if (err == error.InvalidRestoreStaging) return;
                             return err;
                         };
+                        var view_publications: std.ArrayList(PreparedSqlViewAux) = .empty;
+                        for (job.value.plan.targets) |target| if (target.materialized_view != null) {
+                            const prepared = self.prepareMaterializedViewTxn(catalog_arena.allocator(), txn, group_id, job.value.plan.id, target) catch |err| {
+                                if (err == error.OutOfMemory) return err;
+                                return;
+                            };
+                            try view_publications.append(catalog_arena.allocator(), prepared);
+                            for (@constCast(delta.upserts)) |*resource| if (resource.kind == .view and resource.id == prepared.resource.id) {
+                                resource.* = prepared.resource;
+                            };
+                        };
+                        for (view_publications.items) |prepared| try self.writeSqlViewAuxTxn(txn, group_id, prepared);
                         try self.applyColumnSequenceHandoffsTxn(catalog_arena.allocator(), txn, group_id, job.value.plan);
                         if (delta.upserts.len != 0) {
                             const meta = try system_catalog_storage.readMeta(catalog_arena.allocator(), txn, group_id);
@@ -33882,6 +33982,7 @@ pub const RaftApplyStore = struct {
         expected: metadata.TableRecord,
         replacement: metadata.TableRecord,
     ) !void {
+        if (expected.sql_materialized_view_id != null or replacement.sql_materialized_view_id != null) return error.SqlWrongObjectType;
         if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
         var scope = try self.guardedRelationOwnerTxn(txn, group_id, guard);
         defer scope.deinit();
@@ -35351,6 +35452,7 @@ pub const RaftApplyStore = struct {
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
             defer metadata_table_manager.freeTable(self.alloc, existing);
+            if (existing.sql_materialized_view_id != record.sql_materialized_view_id) return error.SqlWrongObjectType;
             if (source_tracked) previous_digest = relationTableSourceDigest(existing.table_id, existing.name, existing.schema_json);
             if (!std.mem.eql(u8, existing.schema_json, record.schema_json))
                 try @import("../schema_validation_dependencies.zig").requireDefinitionsRetained(self.alloc, txn, group_id, record.table_id, record.schema_json);
@@ -35925,7 +36027,28 @@ pub const RaftApplyStore = struct {
         return result;
     }
 
+    const SqlViewBootstrap = struct { key: []const u8, value: []const u8 };
+    const PreparedSqlViewAux = struct {
+        resource: system_catalog.Resource,
+        bootstrap: []const SqlViewBootstrap,
+        dependencies: []const sql_views.Dependency,
+        previous_dependencies: []const sql_views.Dependency,
+        next_id: u64,
+    };
+    fn writeSqlViewAuxTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, prepared: PreparedSqlViewAux) !void {
+        var key: [160]u8 = undefined;
+        for (prepared.previous_dependencies) |dependency| try txn.delete(try sql_views.dependencyKey(&key, group, dependency, prepared.resource.id));
+        for (prepared.bootstrap) |item| {
+            try txn.put(item.key, item.value);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group, .key = item.key });
+        }
+        for (prepared.dependencies) |dependency| try txn.put(try sql_views.dependencyKey(&key, group, dependency, prepared.resource.id), &.{1});
+    }
+
     const SqlViewPublication = struct {
+        staged: ?struct { id: u64, publication_id: [16]u8, backing: sql_views.Materialization, tablespace_id: u64 } = null,
+        output: ?*?PreparedSqlViewAux = null,
+        output_allocator: ?std.mem.Allocator = null,
         expected_revision: u64,
         target: system_catalog.Target,
         definition: @import("antfly_local_sources").sql_view_definition.Definition,
@@ -35944,7 +36067,7 @@ pub const RaftApplyStore = struct {
         _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_view_domains_version);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const a = arena.allocator();
+        const a = request.output_allocator orelse arena.allocator();
         const meta = try system_catalog_storage.readMeta(a, txn, group);
         if (meta.revision != request.expected_revision) return error.CatalogGenerationChanged;
         if (meta.revision == std.math.maxInt(u64)) return error.CatalogRevisionExhausted;
@@ -35955,8 +36078,14 @@ pub const RaftApplyStore = struct {
         if (!try relationWriterEnabledTxn(txn, group)) return error.InvalidCatalogRecord;
         if (live.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
         if (!live.root.epoch.eql(try relationSourceEpochTxn(txn, group))) return error.CatalogGenerationChanged;
-        if (try registry.getEntry(.{ .namespace_id = namespace.id, .name = request.target.table }) != null or
-            try view.lookup(.table, namespace.id, request.target.table) != null or
+        if (try registry.getEntry(.{ .namespace_id = namespace.id, .name = request.target.table })) |entry| {
+            const staged = request.staged orelse return error.CatalogAlreadyExists;
+            if (entry.pending) |pending| {
+                if (!std.mem.eql(u8, &pending.publication_id, &staged.publication_id) or pending.table_id != staged.backing.table_id) return error.TableTransitionActive;
+            } else if (!request.replace) return error.CatalogAlreadyExists;
+            if (entry.active != null and !request.replace) return error.CatalogAlreadyExists;
+        }
+        if (try view.lookup(.table, namespace.id, request.target.table) != null or
             try view.lookup(.sequence, namespace.id, request.target.table) != null) return error.CatalogAlreadyExists;
         var previous_resource = try system_catalog_storage.find(a, txn, group, .view, namespace.id, request.target.table);
         defer if (previous_resource) |*value| value.deinit();
@@ -35969,11 +36098,11 @@ pub const RaftApplyStore = struct {
             const expected = request.expected orelse return error.CatalogGenerationChanged;
             if (expected.id != resource.value.id or expected.generation != previous_record.?.value.generation) return error.CatalogGenerationChanged;
         } else if (request.expected != null) return error.CatalogGenerationChanged;
-        const id = if (previous_resource) |resource| resource.value.id else meta.next_id;
-        const next_id = if (previous_resource != null) meta.next_id else std.math.add(u64, meta.next_id, 1) catch return error.CatalogIdExhausted;
+        const id = if (previous_resource) |resource| resource.value.id else if (request.staged) |staged| staged.id else meta.next_id;
+        const next_id = if (previous_resource != null or request.staged != null) meta.next_id else std.math.add(u64, meta.next_id, 1) catch return error.CatalogIdExhausted;
         const definition = request.definition;
         const columns = try a.alloc([]const u64, definition.sources.len);
-        var bootstrap: std.ArrayList(struct { key: []const u8, value: []const u8 }) = .empty;
+        var bootstrap: std.ArrayList(SqlViewBootstrap) = .empty;
         for (definition.sources, columns) |source, *bound| switch (source.kind) {
             .table => {
                 var table_buf: [160]u8 = undefined;
@@ -36014,6 +36143,12 @@ pub const RaftApplyStore = struct {
         };
         var prepared = try sql_views.prepare(a, id, definition, if (previous_record) |record| record.value else null, columns);
         defer prepared.deinit();
+        if (request.staged) |staged| {
+            if (id != staged.id) return error.CatalogGenerationChanged;
+            prepared.value.materialization = staged.backing;
+            prepared.value.format = 2;
+            try prepared.value.validate(a);
+        } else if (previous_record) |record| if (record.value.materialization != null) return error.SqlWrongObjectType;
         const bytes = try prepared.value.encode(a);
         const dependencies = try prepared.value.dependencies(a);
         const previous_dependencies = if (previous_record) |record| try record.value.dependencies(a) else &.{};
@@ -36023,18 +36158,20 @@ pub const RaftApplyStore = struct {
             const key = try sql_views.dependencyKey(&key_buf, group, dependency, id);
             if (!std.mem.eql(u8, (try stagingGet(txn, key)) orelse return error.InvalidSqlViewRecord, &.{1})) return error.InvalidSqlViewRecord;
         }
+        var resource: system_catalog.Resource = if (previous_resource) |value| value.value else .{ .kind = .view, .id = id, .parent_id = namespace.id, .name = request.target.table };
+        resource.source_json = bytes;
+        if (request.staged) |staged| {
+            resource.storage_name = staged.backing.storage_name;
+            resource.tablespace_id = staged.tablespace_id;
+        }
+        const aux: PreparedSqlViewAux = .{ .resource = resource, .bootstrap = bootstrap.items, .dependencies = dependencies, .previous_dependencies = previous_dependencies, .next_id = next_id };
+        if (request.output) |output| output.* = aux;
         if (request.dry_run) return .{ .id = id, .generation = prepared.value.generation };
-        const resource: system_catalog.Resource = .{ .kind = .view, .id = id, .parent_id = namespace.id, .name = request.target.table, .source_json = bytes };
         var upserts = [_]system_catalog.Resource{resource};
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
         if (request.command_hash) |value| hash = value;
-        for (previous_dependencies) |dependency| try txn.delete(try sql_views.dependencyKey(&key_buf, group, dependency, id));
-        for (bootstrap.items) |item| {
-            try txn.put(item.key, item.value);
-            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group, .key = item.key });
-        }
-        for (dependencies) |dependency| try txn.put(try sql_views.dependencyKey(&key_buf, group, dependency, id), &.{1});
+        try self.writeSqlViewAuxTxn(txn, group, aux);
         try self.applySystemCatalogDeltaTxn(a, txn, group, .{ .upserts = &upserts, .removes = &.{}, .next_id = next_id }, meta, hash);
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group });
         // The durable bytes own the result; never return the local arena.
@@ -36095,6 +36232,8 @@ pub const RaftApplyStore = struct {
         var record = try sql_views.Record.decode(a, resource.value.source_json);
         defer record.deinit();
         if (record.value.id != resource.value.id) return error.InvalidSqlViewRecord;
+        if (request.operation == .drop and request.operation.drop.materialized != (record.value.materialization != null)) return error.SqlWrongObjectType;
+        if (record.value.materialization != null and request.operation == .rename) return error.SqlWrongObjectType;
         const identity: sql_views.Identity = .{ .id = record.value.id, .generation = record.value.generation };
         const expected: ?sql_views.Identity = switch (request.operation) {
             .rename => |input| input.expected,
@@ -36127,6 +36266,7 @@ pub const RaftApplyStore = struct {
             }
             return .{ .revision = meta.revision + 1, .identity = identity };
         }
+        var backing_drops: std.ArrayList(@FieldType(TableTopologyMutation, "drop")) = .empty;
         var removes: std.ArrayList(system_catalog.Resource) = .empty;
         try removes.append(a, resource.value);
         var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
@@ -36142,6 +36282,17 @@ pub const RaftApplyStore = struct {
             var current_record = try sql_views.Record.decode(a, current.source_json);
             defer current_record.deinit();
             if (current_record.value.id != current.id) return error.InvalidSqlViewRecord;
+            if (current_record.value.materialization) |backing| {
+                _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_materialized_view_version);
+                const table = (try self.getTableTxn(a, txn, group, backing.table_id)) orelse return error.InvalidSqlViewRecord;
+                if (table.sql_materialized_view_id != current.id or !std.mem.eql(u8, table.name, backing.storage_name) or
+                    !std.mem.eql(u8, current.storage_name, backing.storage_name)) return error.InvalidSqlViewRecord;
+                if (try self.fkGenerationTableLockedTxn(txn, group, table.table_id) or try restoreStagingLocksTableTxn(txn, group, table.table_id) or
+                    try backupCohortLocksTableTxn(txn, group, table.table_id)) return error.TableTransitionActive;
+                const fence = try self.loadTableTransitionFenceTxn(txn, group, table.table_id);
+                if (fence.active()) return error.TableTransitionActive;
+                try backing_drops.append(a, .{ .table_id = table.table_id, .expected_name = table.name, .expected_transition_generation = fence.generation, .range_contract = .{ .membership = fence.membership(table.table_id) } });
+            }
             var key_buf: [160]u8 = undefined;
             for (try current_record.value.dependencies(a)) |dependency| {
                 const key = try sql_views.dependencyKey(&key_buf, group, dependency, current.id);
@@ -36178,6 +36329,14 @@ pub const RaftApplyStore = struct {
         // by a verified forward definition in this same closure.
         for (incoming.items) |key| if (!edge_set.contains(key)) return error.InvalidSqlViewRecord;
         if (apply) {
+            // Retire physical owners and their placements in the same metadata
+            // transaction as the verified dependency closure. Existing native
+            // reader leases and table cleanup own the eventual file deletion.
+            for (backing_drops.items) |drop| {
+                try self.applyTableTopologyMutationWithSqlDropTxn(txn, group, .{ .drop = drop }, true);
+                var key: [160]u8 = undefined;
+                if (try stagingGet(txn, try tableKeyForGroup(&key, group, drop.table_id)) != null) return error.TableTransitionActive;
+            }
             for (edges.items) |key| try txn.delete(key);
             try self.applySystemCatalogDeltaTxn(a, txn, group, .{ .upserts = &.{}, .removes = removes.items, .next_id = meta.next_id }, meta, hash);
             self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group });
@@ -40297,6 +40456,7 @@ fn decodeTableQueryProjection(alloc: std.mem.Allocator, encoded: []const u8, inc
 
 const TableProjectionMode = enum { identity, schema, query };
 const BorrowedTableProjection = struct {
+    sql_materialized_view_id: ?u64 = null,
     restore_pending: bool = false,
     table_id: u64,
     name: []const u8,
@@ -40327,6 +40487,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
     var storage: @import("antfly_local_sources").common_table_storage.Settings = .{};
     var reader_requirements: ?@import("antfly_local_sources").common_schema_readers.ReaderRequirements = null;
     var full_text_read_index: ?[]const u8 = null;
+    var materialized_view_id: ?u64 = null;
     var lake_index_catalog_json: []const u8 = "";
     while (pos < encoded.len and count < fields.len) : (count += 1) {
         const length = try readInt(encoded, &pos, u32);
@@ -40346,11 +40507,13 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
         storage = extension.storage;
         reader_requirements = extension.schema_reader_requirements;
         full_text_read_index = extension.full_text_read_index;
+        materialized_view_id = extension.sql_materialized_view_id;
     }
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
     if (count != 5 and count != 6 and count != 8) return error.InvalidMetadataTransitionEncoding;
-    return .{ .restore_pending = count == 8 and fields[6].len != 0, .table_id = table_id, .name = name, .schema_reader_requirements = reader_requirements, .full_text_read_index = full_text_read_index, .query_definition = if (mode != .identity) system_catalog.QueryDefinition{
+    if (materialized_view_id == table_id) return error.InvalidMetadataTransitionEncoding;
+    return .{ .sql_materialized_view_id = materialized_view_id, .restore_pending = count == 8 and fields[6].len != 0, .table_id = table_id, .name = name, .schema_reader_requirements = reader_requirements, .full_text_read_index = full_text_read_index, .query_definition = if (mode != .identity) system_catalog.QueryDefinition{
         .full_text_read_index = if (mode == .query) full_text_read_index else null,
         .table_id = table_id,
         .storage_engine = storage.engine,
@@ -42001,7 +42164,7 @@ fn appendTableRecord(
     }
     if (record.requiresStorageMetadataExtension()) {
         try appendInt(alloc, out, u32, table_storage_metadata_magic);
-        const version: u16 = if (record.full_text_read_index != null) 4 else if (record.schema_reader_requirements != null) 3 else if (record.storage.engine == .object) 2 else table_storage_metadata_version;
+        const version: u16 = if (record.sql_materialized_view_id != null) 5 else if (record.full_text_read_index != null) 4 else if (record.schema_reader_requirements != null) 3 else if (record.storage.engine == .object) 2 else table_storage_metadata_version;
         try appendInt(alloc, out, u16, version);
         if (version >= 2)
             try out.append(alloc, if (record.storage.engine == .object) 1 else 0);
@@ -42027,15 +42190,20 @@ fn appendTableRecord(
             try appendInt(alloc, out, u64, migration.request.budget.temporary_bytes);
             try appendInt(alloc, out, u64, migration.request.budget.disk_reserve_bytes);
         }
-        if (version == 4) try out.append(alloc, @intFromBool(record.schema_reader_requirements != null));
+        if (version >= 4) try out.append(alloc, @intFromBool(record.schema_reader_requirements != null));
         if (record.schema_reader_requirements) |requirements| {
             if (!requirements.valid()) return error.InvalidMetadataTransitionEncoding;
             try appendInt(alloc, out, u32, requirements.semantic_version);
             try appendInt(alloc, out, u32, requirements.encoding_version);
         }
+        if (version == 5) try out.append(alloc, @intFromBool(record.full_text_read_index != null));
         if (record.full_text_read_index) |index_name| {
             if (index_name.len == 0 or index_name.len > 1024 or std.mem.indexOfScalar(u8, index_name, 0) != null) return error.InvalidMetadataTransitionEncoding;
             try appendRequiredString(alloc, out, index_name);
+        }
+        if (record.sql_materialized_view_id) |id| {
+            if (id == 0 or id == record.table_id) return error.InvalidMetadataTransitionEncoding;
+            try appendInt(alloc, out, u64, id);
         }
     }
 }
@@ -42443,6 +42611,7 @@ fn readTableRecordWithReadSchema(
 }
 
 const BorrowedTableStorage = struct {
+    sql_materialized_view_id: ?u64 = null,
     full_text_read_index: ?[]const u8 = null,
     schema_reader_requirements: ?@import("antfly_local_sources").common_schema_readers.ReaderRequirements = null,
     object_storage_generation: u64 = 0,
@@ -42468,7 +42637,7 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableSto
     if (pos.* == encoded.len) return result;
     if (try readInt(encoded, pos, u32) != table_storage_metadata_magic) return error.InvalidMetadataTransitionEncoding;
     const version = try readInt(encoded, pos, u16);
-    if (version != table_storage_metadata_version and version != 2 and version != 3 and version != 4) return error.InvalidMetadataTransitionEncoding;
+    if (version != table_storage_metadata_version and version != 2 and version != 3 and version != 4 and version != 5) return error.InvalidMetadataTransitionEncoding;
     if (version >= 2) {
         const engine = try readInt(encoded, pos, u8);
         if (engine > 1 or (version == 2 and engine != 1)) return error.InvalidMetadataTransitionEncoding;
@@ -42505,7 +42674,7 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableSto
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
-    const has_requirements = if (version == 4) switch (try readInt(encoded, pos, u8)) {
+    const has_requirements = if (version >= 4) switch (try readInt(encoded, pos, u8)) {
         0 => false,
         1 => true,
         else => return error.InvalidMetadataTransitionEncoding,
@@ -42518,7 +42687,12 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableSto
         if (!requirements.valid()) return error.InvalidMetadataTransitionEncoding;
         result.schema_reader_requirements = requirements;
     }
-    if (version == 4) {
+    const has_text = if (version == 5) switch (try readInt(encoded, pos, u8)) {
+        0 => false,
+        1 => true,
+        else => return error.InvalidMetadataTransitionEncoding,
+    } else version == 4;
+    if (has_text) {
         const length = try readInt(encoded, pos, u32);
         if (length == 0 or length > 1024 or length > encoded.len - pos.*) return error.InvalidMetadataTransitionEncoding;
         const name = encoded[pos.*..][0..length];
@@ -42526,7 +42700,11 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableSto
         result.full_text_read_index = name;
         pos.* += length;
     }
-    if (pos.* != encoded.len or (result.storage.engine == .local and result.storage.dense_embeddings == .primary_lsm and result.migration == null and result.schema_reader_requirements == null and result.full_text_read_index == null)) return error.InvalidMetadataTransitionEncoding;
+    if (version == 5) {
+        result.sql_materialized_view_id = try readInt(encoded, pos, u64);
+        if (result.sql_materialized_view_id.? == 0) return error.InvalidMetadataTransitionEncoding;
+    }
+    if (pos.* != encoded.len or (result.storage.engine == .local and result.storage.dense_embeddings == .primary_lsm and result.migration == null and result.schema_reader_requirements == null and result.full_text_read_index == null and result.sql_materialized_view_id == null)) return error.InvalidMetadataTransitionEncoding;
     if (result.storage.engine == .object and (result.storage.dense_embeddings != .primary_lsm or result.migration != null)) return error.InvalidMetadataTransitionEncoding;
     return result;
 }
@@ -42565,10 +42743,12 @@ fn readTableRecordWithRestoreIntent(
     const lake_index_catalog_json = try alloc.dupe(u8, try readLakeIndexCatalogExtension(encoded, pos));
     errdefer alloc.free(lake_index_catalog_json);
     var extension = try readTableStorageExtension(encoded, pos);
+    if (extension.sql_materialized_view_id == table_id) return error.InvalidMetadataTransitionEncoding;
     const full_text_read_index = if (extension.full_text_read_index) |index_name| try alloc.dupe(u8, index_name) else null;
     errdefer if (full_text_read_index) |index_name| alloc.free(index_name);
     if (extension.migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
     return .{
+        .sql_materialized_view_id = extension.sql_materialized_view_id,
         .schema_reader_requirements = extension.schema_reader_requirements,
         .full_text_read_index = full_text_read_index,
         .storage = extension.storage,
@@ -43803,11 +43983,23 @@ fn verifySqlViewRecord(backing: std.mem.Allocator, reader: anytype, group: u64, 
     defer arena.deinit();
     const a = arena.allocator();
     const resource = try std.json.parseFromSliceLeaky(system_catalog.Resource, a, bytes, .{ .allocate = .alloc_always });
-    if (resource.kind != .view or resource.id != expected_id or resource.id == 0 or resource.parent_id == 0 or
-        resource.storage_name.len != 0 or resource.tablespace_id != 0) return error.InvalidSqlViewRecord;
+    if (resource.kind != .view or resource.id != expected_id or resource.id == 0 or resource.parent_id == 0) return error.InvalidSqlViewRecord;
     var record = try sql_views.Record.decode(a, resource.source_json);
     defer record.deinit();
     if (record.value.id != resource.id) return error.InvalidSqlViewRecord;
+    if (record.value.materialization) |backing_generation| {
+        if (!std.mem.eql(u8, resource.storage_name, backing_generation.storage_name)) return error.InvalidSqlViewRecord;
+        var table_key: [160]u8 = undefined;
+        const table = try borrowTableProjection(try reader.get(try tableKeyForGroup(&table_key, group, backing_generation.table_id)), .schema);
+        if (table.sql_materialized_view_id != resource.id or table.table_id != backing_generation.table_id or
+            !std.mem.eql(u8, table.name, backing_generation.storage_name)) return error.InvalidSqlViewRecord;
+        if (!std.mem.eql(u8, &backing_generation.schema_digest, &try restore_staging.runtimeSchemaDigestForTable(a, table.query_definition.?.schema_json))) return error.InvalidSqlViewRecord;
+        if (resource.tablespace_id != 0) {
+            const space_key = try system_catalog_storage.recordKeyAlloc(a, group, .tablespace, resource.tablespace_id);
+            const space = try std.json.parseFromSliceLeaky(system_catalog.Resource, a, try reader.get(space_key), .{});
+            if (space.kind != .tablespace or space.id != resource.tablespace_id) return error.InvalidSqlViewRecord;
+        }
+    } else if (resource.storage_name.len != 0 or resource.tablespace_id != 0) return error.InvalidSqlViewRecord;
     try system_catalog.validateTableName(resource.name);
     const name_key = try backing.alloc(u8, 8 + resource.name.len);
     std.mem.writeInt(u64, name_key[0..8], resource.parent_id, .big);
@@ -43835,7 +44027,7 @@ fn verifySqlViewRecord(backing: std.mem.Allocator, reader: anytype, group: u64, 
     var key_buf: [160]u8 = undefined;
     const activation_bytes = try reader.get(try RaftApplyStore.topologyActivationKeyForGroup(&key_buf, group));
     const activation = try std.json.parseFromSliceLeaky(topology_protocol.Activation, a, activation_bytes, .{});
-    const required_view_protocol = if (record.value.definition.requiredFormat() >= 2) topology_protocol.sql_view_domains_version else topology_protocol.sql_view_catalog_version;
+    const required_view_protocol = if (record.value.materialization != null) topology_protocol.sql_materialized_view_version else if (record.value.definition.requiredFormat() >= 2) topology_protocol.sql_view_domains_version else topology_protocol.sql_view_catalog_version;
     if (activation.version < required_view_protocol or activation.version > topology_protocol.current_version or
         activation.member_count == 0 or std.mem.allEqual(u8, &activation.membership_fingerprint, 0))
         return error.InvalidSqlViewRecord;
@@ -43846,8 +44038,12 @@ fn verifySqlViewRecord(backing: std.mem.Allocator, reader: anytype, group: u64, 
     const live = registry.live orelse return error.InvalidSqlViewRecord;
     if (live.root.coverage != .constraint_names or !live.root.epoch.eql(try RaftApplyStore.relationSourceEpochTxn(reader, group)))
         return error.InvalidSqlViewRecord;
-    if (try registry.getEntry(.{ .namespace_id = resource.parent_id, .name = resource.name }) != null)
-        return error.InvalidSqlViewRecord;
+    const entry = try registry.getEntry(.{ .namespace_id = resource.parent_id, .name = resource.name });
+    if (record.value.materialization) |backing_generation| {
+        const active = (entry orelse return error.InvalidSqlViewRecord).active orelse return error.InvalidSqlViewRecord;
+        if (active.kind != .table or active.table_id != backing_generation.table_id) return error.InvalidSqlViewRecord;
+        if ((try decodeMetadataIncarnationRecord(incarnation_bytes)).relational_topology_protocol_activated_version < metadata_table_manager.materialized_view_protocol_version) return error.InvalidSqlViewRecord;
+    } else if (entry != null) return error.InvalidSqlViewRecord;
     for (record.value.definition.sources, 0..) |source, index| {
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
         var source_arena = std.heap.ArenaAllocator.init(backing);
@@ -55998,4 +56194,121 @@ test "relational integrity restore staging population atomically raises data own
         try txn.commit();
     }
     try std.testing.expectEqual(restore_staging.State.validating, (try store.loadRestoreStagingProgress(a, group, plan.id)).?.state);
+}
+
+test "SQL view catalog backing ownership survives binary projections cloning and strict framing" {
+    const a = std.testing.allocator;
+    const record: metadata.TableRecord = .{ .table_id = 41, .name = "table:01010101010101010101010101010101", .sql_materialized_view_id = 42 };
+    const encoded = try encodeTableRecord(a, record);
+    defer a.free(encoded);
+    const restored = try decodeTableRecord(a, encoded);
+    defer metadata_table_manager.freeTable(a, restored);
+    try std.testing.expectEqual(@as(?u64, 42), restored.sql_materialized_view_id);
+    const cloned = try metadata_table_manager.cloneTable(a, restored);
+    defer metadata_table_manager.freeTable(a, cloned);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(record, cloned));
+    try std.testing.expectEqual(@as(?u64, 42), (try borrowTableProjection(encoded, .identity)).sql_materialized_view_id);
+    for (1..9) |missing| try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(a, encoded[0 .. encoded.len - missing]));
+    const corrupt = try a.dupe(u8, encoded);
+    defer a.free(corrupt);
+    @memset(corrupt[corrupt.len - 8 ..], 0);
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(a, corrupt));
+}
+
+test "SQL view catalog materialized hidden generation atomically publishes empty backing and definition" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/materialized", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const incarnation: metadata.MetadataClusterIncarnation = "01010101010101010101010101010101".*;
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+    try adoptRelationWriterForTest(&store, a, group);
+    _ = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
+    const local = @import("antfly_local_sources");
+    var compiled = try local.sql_compiler.compile(a, "CREATE TABLE mv(id TEXT)", .{});
+    defer compiled.deinit();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+    defer a.free(schema);
+    const target: restore_staging.Target = .{
+        .source_table_id = 0,
+        .population = .{ .materialized_view_id = 42, .expires_at_ms = 9000000000000, .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = try restore_staging.runtimeSchemaDigestForTable(a, schema), .principal_instance = @splat(5), .catalog_revision = 0, .write_version = 7 },
+        .materialized_view = .{ .id = 42, .populated = false, .definition = .{ .format = 1, .query = "SELECT 'x' AS id", .owner = .auth_disabled, .security = .owner, .security_barrier = false, .catalog_revision = 0, .setting_epoch = null, .columns = &.{.{ .name = "id", .type = .string, .element_type = compiled.statement.create_table.columns[0].element_type }}, .sources = &.{} } },
+        .table = .{ .table_id = 41, .sql_materialized_view_id = 42, .name = "table:01010101010101010101010101010101", .schema_json = schema, .min_ranges = 1 },
+        .catalog_binding = .{ .kind = .view, .id = 42, .parent_id = 2, .name = "mv", .storage_name = "table:01010101010101010101010101010101" },
+        .ranges = &.{.{ .table_id = 41, .group_id = 801, .range_id = 801, .doc_identity_shard_id = 801, .doc_identity_range_id = 801, .start_key = "" }},
+    };
+    const plan: restore_staging.Plan = .{ .id = try restore_staging.idForAttempt(104, 1), .cohort_digest = @splat(9), .targets = &.{target} };
+    try plan.validate(a);
+    var forged = target;
+    forged.population.?.principal_name = "forged-owner";
+    var invalid = plan;
+    invalid.targets = &.{forged};
+    try std.testing.expectError(error.InvalidRestoreStaging, invalid.validate(a));
+    forged = target;
+    var columns = [_]@import("antfly_local_sources").sql_view_definition.Output{.{ .name = "other", .type = .string }};
+    forged.materialized_view.?.definition.columns = &columns;
+    invalid.targets = &.{forged};
+    try std.testing.expectError(error.InvalidRestoreStaging, invalid.validate(a));
+    var buffer: [512]u8 = undefined;
+    // Neither an older metadata decoder nor a v3 population-only data owner
+    // may reserve a materialization or raise its durable data floor.
+    for ([_]struct { metadata_version: u16, data_version: u16 }{
+        .{ .metadata_version = topology_protocol.sql_population_version, .data_version = metadata_table_manager.materialized_view_protocol_version },
+        .{ .metadata_version = topology_protocol.sql_materialized_view_version, .data_version = metadata_table_manager.query_population_protocol_version },
+    }) |mixed| {
+        const incompatible = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = mixed.metadata_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+        defer a.free(incompatible);
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&buffer, group), incompatible);
+        _ = try store.writeStoreComponentsTxn(&txn, group, 1, .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current, .relational_topology_protocol_version = mixed.data_version }, false, null, null);
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        try txn.commit();
+        try std.testing.expect((try store.loadRestoreStagingProgress(a, group, plan.id)) == null);
+        try std.testing.expectEqual(@as(u16, 0), try store.getRelationalTopologyProtocolActivationVersion(group));
+    }
+    const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.sql_materialized_view_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    defer a.free(activation);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&buffer, group), activation);
+        _ = try store.writeStoreComponentsTxn(&txn, group, 1, .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current, .relational_topology_protocol_version = metadata_table_manager.materialized_view_protocol_version }, false, null, null);
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        try txn.commit();
+    }
+    try std.testing.expect((try store.loadRestoreStagingProgress(a, group, plan.id)) != null);
+    const digest = try plan.digest(a);
+    var cursor = try local.storage_db_relational_population_contract.Cursor.init(target.population.?.forPartition(801));
+    cursor = try cursor.seal(cursor.completionForSource(0));
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .expected_revision = 1, .action = .imported, .receipt = .{ .group_id = 801, .range_id = 801, .plan_digest = digest, .completion_digest = @splat(7), .population = cursor } });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .expected_revision = 2, .action = .validated, .receipt = .{ .group_id = 801, .range_id = 801, .plan_digest = digest, .completion_digest = @splat(8) } });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = plan.id, .expected_revision = 2, .action = .publish });
+        try txn.commit();
+    }
+    try std.testing.expectEqual(restore_staging.State.published, (try store.loadRestoreStagingProgress(a, group, plan.id)).?.state);
+    const result = try store.resolveSystemCatalogIdentities(a, group, .{ .sql_sources = &.{.{ .view_id = 42 }} });
+    defer result.deinit(a);
+    var record = try sql_views.Record.decode(a, result.sql_sources[0].?.value.view.source_json);
+    defer record.deinit();
+    try std.testing.expectEqual(@as(u64, 41), record.value.materialization.?.table_id);
+    try std.testing.expect(!record.value.materialization.?.populated);
+    try verifyRelationRecoveryForTest(&store, a, group);
+    const before = try store.systemCatalogMeta(a, group);
+    const drop = sql_views.command(.{ .expected_revision = before.revision, .mutation = .{ .target = .{ .table = "mv" }, .operation = .{ .drop = .{ .expected = .{ .id = 42, .generation = 1 }, .materialized = true } } } });
+    const bytes = try std.json.Stringify.valueAlloc(a, drop, .{});
+    defer a.free(bytes);
+    try store.applyStandaloneCommand(group, .{ .apply_system_catalog = bytes });
+    try std.testing.expect((try store.getTable(a, group, 41)) == null);
+    const missing = try store.resolveSystemCatalogIdentities(a, group, .{ .sql_sources = &.{.{ .view_id = 42 }} });
+    defer missing.deinit(a);
+    try std.testing.expect(missing.sql_sources[0] == null);
+    try verifyRelationRecoveryForTest(&store, a, group);
 }

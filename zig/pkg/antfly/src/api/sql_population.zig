@@ -72,7 +72,7 @@ fn requestCleanup(server: *http.ApiHttpServer, job_id: u64) void {
 
 pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, request_context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: @FieldType(catalog.Ddl, "populate"), path: ?*const Path) !catalog.DdlOutcome {
     const intent = input.intent;
-    if (intent.persistence != .permanent or (intent.operation != .create_table_as and intent.operation != .select_into)) return error.UnsupportedSqlExecution;
+    if (intent.persistence != .permanent or (intent.operation != .create_table_as and intent.operation != .select_into and intent.operation != .create_materialized_view)) return error.UnsupportedSqlExecution;
     const source = input.source orelse return error.InvalidSqlBackendResponse;
     const io = server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
     var context = try request_context.platformDeadline();
@@ -117,6 +117,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         defer attempt.deinit();
         const bytes = server.source.systemCatalog(attempt.allocator(), trusted, .{ .query_population_prepare = .{
             .namespace_id = ns,
+            .materialized_view = intent.operation == .create_materialized_view,
             .logical_name = target.table,
             .physical_name = physical,
             .tablespace_name = intent.tablespace,
@@ -142,6 +143,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     const id = try stages.idForAttempt(job_id, 1);
     const instance = if (identity) |actor| actor.user_instance_id orelse return error.Forbidden else nonce;
     const capture: local.storage_db_relational_population_contract.Capture = .{
+        .materialized_view_id = prepared.child.sql_materialized_view_id,
         .principal_name = if (identity) |actor| actor.username else "",
         .capture_id = nonce,
         .definition = source.definition,
@@ -152,17 +154,22 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         .write_version = @max(1, time.realtimeNs()),
         .expires_at_ms = time.realtimeNs() / std.time.ns_per_ms +| (try context.remainingTimeoutMs()).?,
     };
+    var view_definition: ?local.sql_view_definition.Owned = null;
+    defer if (view_definition) |*value| value.deinit();
+    if (intent.operation == .create_materialized_view)
+        view_definition = try @import("sql_view_ddl.zig").preparePopulation(server, identity, context, database, namespace, a, intent, prepared.expected_catalog_revision, path);
     const destination: stages.Target = .{
         .source_table_id = 0,
         .population = capture,
+        .materialized_view = if (view_definition) |definition| .{ .id = prepared.child.sql_materialized_view_id orelse return error.InvalidSqlBackendResponse, .definition = definition.value, .populated = intent.with_data } else null,
         .creation_guard = guard,
         .table = prepared.child,
         .ranges = prepared.child_ranges,
-        .catalog_binding = .{ .kind = .table, .id = prepared.child.table_id, .parent_id = ns, .tablespace_id = prepared.tablespace_id, .name = target.table, .storage_name = prepared.child.name },
+        .catalog_binding = .{ .kind = if (view_definition != null) .view else .table, .id = prepared.child.sql_materialized_view_id orelse prepared.child.table_id, .parent_id = ns, .tablespace_id = prepared.tablespace_id, .name = target.table, .storage_name = prepared.child.name },
     };
     const plan: stages.Plan = .{ .id = id, .cohort_digest = source.definition, .targets = &.{destination} };
     try plan.validate(a);
-    var receipt = try receiptAlloc(allocators.result, target, prepared.child.table_id, job_id, key);
+    var receipt = try receiptAlloc(allocators.result, target, prepared.child.sql_materialized_view_id orelse prepared.child.table_id, job_id, key);
     var transferred = false;
     defer if (!transferred) freeReceipt(allocators.result, receipt);
     const result = try server.restore_job_store.startRecoverable(allocators.scratch, .{

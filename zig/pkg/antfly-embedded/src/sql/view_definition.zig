@@ -262,6 +262,16 @@ pub fn prepareDdl(backing: A, resolver: Resolver, ddl: ast.CatalogDdl, options: 
     return prepareOwned(backing, resolver, definition.query_sql, effective, definition.query);
 }
 
+/// Population retains the compiler-owned SELECT tree while binding immutable
+/// source identities through the same view-definition preparation pipeline.
+pub fn preparePopulation(backing: A, resolver: Resolver, intent: ast.RelationPopulation, options: Options) !Owned {
+    if (intent.operation != .create_materialized_view or intent.persistence != .permanent or intent.query == null or intent.query_sql == null) return error.InvalidSqlViewDefinition;
+    var effective = options;
+    effective.columns = intent.columns;
+    effective.security = .owner;
+    return prepareOwned(backing, resolver, intent.query_sql.?, effective, intent.query);
+}
+
 fn prepareOwned(backing: A, resolver: Resolver, query: []const u8, options: Options, parsed: ?*const ast.Select) !Owned {
     if (query.len == 0) return error.InvalidSqlViewDefinition;
     if (query.len > max_query_bytes or options.columns.len > max_columns) return error.SqlProgramLimitExceeded;

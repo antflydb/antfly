@@ -20,6 +20,9 @@
 const std = @import("std");
 
 pub const TableRecord = struct {
+    /// Physical backing rows belong to this logical materialized-view identity.
+    /// Public mutations must address the view lifecycle, never this storage name.
+    sql_materialized_view_id: ?u64 = null,
     /// Server-derived requirements of the published definition and retained
     /// layouts. This internal fact is not a client capability or owner ACK.
     schema_reader_requirements: ?@import("schema_readers.zig").ReaderRequirements = null,
@@ -60,7 +63,7 @@ pub const TableRecord = struct {
             const reader_field = comptime std.mem.eql(u8, field_name, "schema_reader_requirements");
             const text_field = comptime std.mem.eql(u8, field_name, "full_text_read_index");
             const object_field = comptime std.mem.eql(u8, field_name, "object_storage_generation") or std.mem.eql(u8, field_name, "object_storage_identity");
-            if ((!reader_field or self.schema_reader_requirements != null) and (!text_field or self.full_text_read_index != null) and (!object_field or self.storage.engine == .object) and (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0)) {
+            if ((!std.mem.eql(u8, field_name, "sql_materialized_view_id") or self.sql_materialized_view_id != null) and (!reader_field or self.schema_reader_requirements != null) and (!text_field or self.full_text_read_index != null) and (!object_field or self.storage.engine == .object) and (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0)) {
                 try jw.objectField(field_name);
                 try jw.write(@field(self, field_name));
             }
@@ -71,7 +74,7 @@ pub const TableRecord = struct {
     /// Default legacy tables retain their exact durable record bytes. Storage
     /// ownership or an admitted migration requires the versioned extension.
     pub fn requiresStorageMetadataExtension(self: TableRecord) bool {
-        return self.full_text_read_index != null or self.schema_reader_requirements != null or self.storage.engine != .local or self.storage.dense_embeddings != .primary_lsm or self.storage_migration != null;
+        return self.sql_materialized_view_id != null or self.full_text_read_index != null or self.schema_reader_requirements != null or self.storage.engine != .local or self.storage.dense_embeddings != .primary_lsm or self.storage_migration != null;
     }
 
     pub fn migrationState(self: *const TableRecord) TableMigrationState {

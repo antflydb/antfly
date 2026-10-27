@@ -4,6 +4,397 @@
   "profile_sha256": "61b2349bfcd48d300e1e741f119acfb30c6914cbd1024f6de4b0968bad0584ec",
   "entries": [
     {
+      "id": "sql-0351",
+      "source_entry_sha256": "b15102a4940daca3451e8e04dd146560495e39cd402973b41520faf091f97dc1",
+      "sql": "CREATE MATERIALIZED VIEW usage_records_mv AS SELECT id, status FROM usage_records",
+      "command_tag": "SELECT 26",
+      "columns": [
+        [
+          "id",
+          "text",
+          false
+        ],
+        [
+          "status",
+          "text",
+          false
+        ]
+      ],
+      "rows": [
+        [
+          "c1",
+          "customer"
+        ],
+        [
+          "c2",
+          "customer"
+        ],
+        [
+          "u1",
+          "active"
+        ],
+        [
+          "u10",
+          "active-123"
+        ],
+        [
+          "u11",
+          "--active-"
+        ],
+        [
+          "u12",
+          "active-user"
+        ],
+        [
+          "u13",
+          "active ready"
+        ],
+        [
+          "u14",
+          "hello"
+        ],
+        [
+          "u15",
+          "a_b"
+        ],
+        [
+          "u16",
+          "active  user"
+        ],
+        [
+          "u17",
+          "manual"
+        ],
+        [
+          "u18",
+          null
+        ],
+        [
+          "u19",
+          "ready"
+        ],
+        [
+          "u2",
+          "ready"
+        ],
+        [
+          "u20",
+          "ready"
+        ],
+        [
+          "u21",
+          "ready"
+        ],
+        [
+          "u22",
+          "ready"
+        ],
+        [
+          "u23",
+          "ready"
+        ],
+        [
+          "u24",
+          "ready"
+        ],
+        [
+          "u3",
+          "pending"
+        ],
+        [
+          "u4",
+          "open"
+        ],
+        [
+          "u5",
+          "closed"
+        ],
+        [
+          "u6",
+          "draft"
+        ],
+        [
+          "u7",
+          "queued"
+        ],
+        [
+          "u8",
+          "deleted"
+        ],
+        [
+          "u9",
+          "archived"
+        ]
+      ]
+    },
+    {
+      "id": "sql-0352",
+      "source_entry_sha256": "e9a4aeefd56b7bbbfb148f470d743840fdf8f8e6f808ac85af367b587f7a42f6",
+      "sql": "CREATE MATERIALIZED VIEW usage_records_mv(record_id, record_status) AS SELECT id, status FROM usage_records",
+      "command_tag": "SELECT 26",
+      "columns": [
+        [
+          "record_id",
+          "text",
+          false
+        ],
+        [
+          "record_status",
+          "text",
+          false
+        ]
+      ],
+      "rows": [
+        [
+          "c1",
+          "customer"
+        ],
+        [
+          "c2",
+          "customer"
+        ],
+        [
+          "u1",
+          "active"
+        ],
+        [
+          "u10",
+          "active-123"
+        ],
+        [
+          "u11",
+          "--active-"
+        ],
+        [
+          "u12",
+          "active-user"
+        ],
+        [
+          "u13",
+          "active ready"
+        ],
+        [
+          "u14",
+          "hello"
+        ],
+        [
+          "u15",
+          "a_b"
+        ],
+        [
+          "u16",
+          "active  user"
+        ],
+        [
+          "u17",
+          "manual"
+        ],
+        [
+          "u18",
+          null
+        ],
+        [
+          "u19",
+          "ready"
+        ],
+        [
+          "u2",
+          "ready"
+        ],
+        [
+          "u20",
+          "ready"
+        ],
+        [
+          "u21",
+          "ready"
+        ],
+        [
+          "u22",
+          "ready"
+        ],
+        [
+          "u23",
+          "ready"
+        ],
+        [
+          "u24",
+          "ready"
+        ],
+        [
+          "u3",
+          "pending"
+        ],
+        [
+          "u4",
+          "open"
+        ],
+        [
+          "u5",
+          "closed"
+        ],
+        [
+          "u6",
+          "draft"
+        ],
+        [
+          "u7",
+          "queued"
+        ],
+        [
+          "u8",
+          "deleted"
+        ],
+        [
+          "u9",
+          "archived"
+        ]
+      ]
+    },
+    {
+      "id": "sql-0353",
+      "source_entry_sha256": "b47e39a8da308e306845dc2da130fd2c1839161d72e77ef32aa55425d8662936",
+      "sql": "CREATE MATERIALIZED VIEW usage_records_mv AS SELECT id AS record_id, status record_status FROM usage_records",
+      "command_tag": "SELECT 26",
+      "columns": [
+        [
+          "record_id",
+          "text",
+          false
+        ],
+        [
+          "record_status",
+          "text",
+          false
+        ]
+      ],
+      "rows": [
+        [
+          "c1",
+          "customer"
+        ],
+        [
+          "c2",
+          "customer"
+        ],
+        [
+          "u1",
+          "active"
+        ],
+        [
+          "u10",
+          "active-123"
+        ],
+        [
+          "u11",
+          "--active-"
+        ],
+        [
+          "u12",
+          "active-user"
+        ],
+        [
+          "u13",
+          "active ready"
+        ],
+        [
+          "u14",
+          "hello"
+        ],
+        [
+          "u15",
+          "a_b"
+        ],
+        [
+          "u16",
+          "active  user"
+        ],
+        [
+          "u17",
+          "manual"
+        ],
+        [
+          "u18",
+          null
+        ],
+        [
+          "u19",
+          "ready"
+        ],
+        [
+          "u2",
+          "ready"
+        ],
+        [
+          "u20",
+          "ready"
+        ],
+        [
+          "u21",
+          "ready"
+        ],
+        [
+          "u22",
+          "ready"
+        ],
+        [
+          "u23",
+          "ready"
+        ],
+        [
+          "u24",
+          "ready"
+        ],
+        [
+          "u3",
+          "pending"
+        ],
+        [
+          "u4",
+          "open"
+        ],
+        [
+          "u5",
+          "closed"
+        ],
+        [
+          "u6",
+          "draft"
+        ],
+        [
+          "u7",
+          "queued"
+        ],
+        [
+          "u8",
+          "deleted"
+        ],
+        [
+          "u9",
+          "archived"
+        ]
+      ]
+    },
+    {
+      "id": "sql-0358",
+      "source_entry_sha256": "564733308b46dc7065f7970d02d029e57388e8573a580a71336ec160c7e0f87b",
+      "sql": "DROP MATERIALIZED VIEW usage_records_mv",
+      "command_tag": "DROP MATERIALIZED VIEW",
+      "columns": [],
+      "rows": [],
+      "absent": true
+    },
+    {
+      "id": "sql-0359",
+      "source_entry_sha256": "83c57667a752b2dea60389befa73889ceee5b595895c9b31d6a30cb9f3c1006e",
+      "sql": "DROP MATERIALIZED VIEW IF EXISTS usage_records_mv CASCADE",
+      "command_tag": "DROP MATERIALIZED VIEW",
+      "columns": [],
+      "rows": [],
+      "absent": true,
+      "repeat_command_tag": "DROP MATERIALIZED VIEW"
+    },
+    {
       "id": "sql-0364",
       "source_entry_sha256": "befa08ce3823908de0183a1b6c4c60d6907c687ba439e02c992b350d13599f52",
       "sql": "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
@@ -102,5 +493,41 @@
       ]
     }
   ],
-  "postgres_version": "18.6 (Homebrew)"
+  "postgres_version": "18.6 (Homebrew)",
+  "materialized_diagnostics": [
+    {
+      "populated": false,
+      "probes": [
+        {
+          "sql": "DROP VIEW usage_records_mv",
+          "code": "42809"
+        },
+        {
+          "sql": "DELETE FROM usage_records_mv",
+          "code": "42809"
+        },
+        {
+          "sql": "SELECT * FROM usage_records_mv ORDER BY 1",
+          "code": "55000"
+        }
+      ]
+    },
+    {
+      "populated": true,
+      "probes": [
+        {
+          "sql": "DROP VIEW usage_records_mv",
+          "code": "42809"
+        },
+        {
+          "sql": "DELETE FROM usage_records_mv",
+          "code": "42809"
+        },
+        {
+          "sql": "SELECT * FROM usage_records_mv ORDER BY 1",
+          "code": null
+        }
+      ]
+    }
+  ]
 }

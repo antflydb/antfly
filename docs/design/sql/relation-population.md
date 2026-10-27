@@ -96,13 +96,55 @@ nullable text columns and conditional-repeat behavior with a checked-in,
 input-hash-verified PostgreSQL reference. WITH NO DATA and conditional repeats
 perform no source reads. These close sql-0364, sql-0365, sql-0366 and sql-0567.
 
+## Catalog-owned materializations
+
+Permanent `CREATE MATERIALIZED VIEW` now uses that same bounded producer and
+staged job lane. Its descriptor lives in the existing view catalog, with a
+logical view identity and durable source/output attributes. A separate immutable
+physical generation owns the rows. Metadata publishes the descriptor, source
+attribute bootstrap, dependency edges, backing table and ranges in one
+transaction. Reverse physical bindings distinguish tables from materializations
+without scanning the catalog. Legacy ordinary-view records retain their bytes.
+
+The admission capture binds the logical owner, principal instance and exact
+physical output layout. Metadata decoder v75 and native owner protocol v4 are
+required before reservation; rejected mixed-version attempts do not raise the
+data floor. Table records preserve backing ownership through binary projections,
+cloning and snapshots. The compiled metadata client forwards planning through the
+same native method, including its deadline. Native ABI v77 adds an append-only
+write-rejection status while preserving main's published numeric identities.
+
+Reads authorize the logical relation and use the existing SQL read/filter path
+over its bound physical generation. They verify that the descriptor still names
+that backing. A populated generation may contain zero rows; an unpopulated
+`WITH NO DATA` generation instead reports PostgreSQL SQLSTATE 55000. Source
+cursors are never opened for that declaration. Both ordinary and transaction
+write paths enforce backing immutability under the native apply fence, including
+cold reopen; staging import retains its dedicated admission path.
+
+`DROP MATERIALIZED VIEW` checks object kind and reuses the existing dependency
+closure and topology retirement transaction. It removes descriptors, dependency
+edges, backing tables and placements together. Physical reader ownership and
+cleanup continue through the shared native lifetime machinery. Ordinary
+`DROP VIEW` and row mutations cannot change a materialization.
+
+The mounted campaign closes sql-0351, sql-0352, sql-0353, sql-0358 and sql-0359
+against document and relational sources. The PostgreSQL reference now covers
+nine unchanged originals, plus populated/unpopulated read and mutation
+diagnostics. Native metadata tests verify mixed-version rejection, forged owner
+and output-layout rejection, publication, strict binary framing, snapshot
+recovery and retirement. The broader Debug gates also qualify existing ordinary
+views and mixed document/relational restore cohorts.
+
 ## Activation still required
 
 - Explicit transaction participation for population and its catalog publication.
-- Materialized definitions, bound dependencies and owner authority in the
-  existing view catalog; atomic backing-generation publication and retirement;
-  unpopulated-read errors; refresh isolation, MAINTAIN checks and concurrent
-  refresh prerequisites.
+- Materialized refresh: preserve logical/output identities while replacing the
+  backing through the shared fenced overwrite lane. Finish refresh isolation,
+  MAINTAIN/role-ownership semantics and concurrent-refresh index prerequisites.
+- Materialized index DDL and coherent backup/restore of descriptors and their
+  backing generations alongside ordinary tables. Archive restore must not
+  fabricate a query population or publish an unbound physical backing.
 - Connection-owned TEMP lifetimes and UNLOGGED crash semantics. Neither may be
   silently implemented as an ordinary global durable table.
 - Broader public fault campaigns for live authority/RLS revocation, namespace

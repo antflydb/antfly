@@ -26,6 +26,7 @@ pub const max_null_fields = 4096;
 /// A capture identifies one retained evaluation; it is not permission to
 /// reexecute the query after losing that evaluation or its source snapshot.
 pub const Binding = struct {
+    materialized_view_id: ?u64 = null,
     capture_id: [16]u8,
     definition: Digest,
     source_definition: Digest,
@@ -35,8 +36,19 @@ pub const Binding = struct {
     write_version: u64,
     partition: u64,
 
+    pub fn jsonStringify(self: Binding, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Binding).@"struct".field_names) |field| {
+            if (!std.mem.eql(u8, field, "materialized_view_id") or self.materialized_view_id != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: Binding) !void {
-        if (self.write_version == 0 or self.partition == 0 or zero(&self.capture_id) or zero(&self.definition) or zero(&self.source_definition) or zero(&self.target_schema) or zero(&self.principal_instance)) return error.InvalidRelationPopulation;
+        if (self.materialized_view_id == 0 or self.write_version == 0 or self.partition == 0 or zero(&self.capture_id) or zero(&self.definition) or zero(&self.source_definition) or zero(&self.target_schema) or zero(&self.principal_instance)) return error.InvalidRelationPopulation;
     }
     pub fn digest(self: Binding) !Digest {
         try self.validate();
@@ -54,6 +66,10 @@ pub const Binding = struct {
         number(&hash, self.catalog_revision);
         number(&hash, self.write_version);
         number(&hash, self.partition);
+        if (self.materialized_view_id) |id| {
+            hash.update("antfly:materialized-view:owner:v1\x00");
+            number(&hash, id);
+        }
         return finish(&hash);
     }
 };
@@ -61,6 +77,7 @@ pub const Binding = struct {
 /// A metadata plan retains the common request identity. Each destination
 /// receives a distinct partition binding derived from this immutable capture.
 pub const Capture = struct {
+    materialized_view_id: ?u64 = null,
     principal_name: []const u8 = "",
     capture_id: [16]u8,
     definition: Digest,
@@ -73,8 +90,19 @@ pub const Capture = struct {
     /// Durable producer lease. Expiry cancels incomplete output; it never permits reevaluation.
     expires_at_ms: u64,
 
+    pub fn jsonStringify(self: Capture, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Capture).@"struct".field_names) |field| {
+            if (!std.mem.eql(u8, field, "materialized_view_id") or self.materialized_view_id != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn forPartition(self: Capture, partition: u64) Binding {
-        return .{ .capture_id = self.capture_id, .definition = self.definition, .source_definition = self.source_definition, .target_schema = self.target_schema, .principal_instance = self.principal_instance, .catalog_revision = self.catalog_revision, .write_version = self.write_version, .partition = partition };
+        return .{ .materialized_view_id = self.materialized_view_id, .capture_id = self.capture_id, .definition = self.definition, .source_definition = self.source_definition, .target_schema = self.target_schema, .principal_instance = self.principal_instance, .catalog_revision = self.catalog_revision, .write_version = self.write_version, .partition = partition };
     }
     pub fn validate(self: Capture) !void {
         if (self.principal_name.len > 256 or self.expires_at_ms == 0 or self.expires_at_ms > std.math.maxInt(i64)) return error.InvalidRelationPopulation;

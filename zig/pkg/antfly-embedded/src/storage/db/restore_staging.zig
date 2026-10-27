@@ -157,6 +157,17 @@ pub fn requireScope(alloc: Allocator, txn: anytype, expected: ?Digest, allow_imp
     if (!allow_importing and progress.value.phase == .importing) return error.RestoreStagingInProgress;
 }
 
+/// Publication retires the import lock, but a materialized generation remains
+/// immutable. Read this under the ordinary apply fence, including 2PC replay.
+pub fn requirePrimaryWritable(alloc: Allocator, txn: anytype) !void {
+    const raw = (try optional(txn)) orelse return;
+    var progress = try Progress.decode(alloc, raw);
+    defer progress.deinit();
+    if (progress.value.phase == .published) if (progress.value.scope.population) |capture| {
+        if (capture.materialized_view_id != null) return error.MaterializedViewReadOnly;
+    };
+}
+
 /// Once a validated receipt is durable, neither stale workers nor an already
 /// captured private routing view may change its claims/checkpoint underneath it.
 pub fn requireMutableScope(alloc: Allocator, txn: anytype, expected: ?Digest) !void {

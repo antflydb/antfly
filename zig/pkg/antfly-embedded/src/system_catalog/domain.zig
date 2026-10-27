@@ -140,7 +140,7 @@ pub const Resource = struct {
     name: []const u8,
     /// Zero means inherit the enclosing namespace/database binding.
     tablespace_id: u64 = 0,
-    /// Only table resources have a storage name. Renames never change it.
+    /// Tables and materialized views bind an opaque physical generation.
     storage_name: []const u8 = "",
     placement_policy: PlacementPolicy = .{},
     /// Compatibility metadata only, never a filesystem path override.
@@ -327,6 +327,11 @@ pub const State = struct {
     }
 };
 
+/// Tables and catalog-owned materializations have one reverse physical binding.
+pub fn hasPhysicalStorageBinding(resource: Resource) bool {
+    return resource.kind == .table or (resource.kind == .view and resource.storage_name.len != 0);
+}
+
 /// Borrowed indexes over one immutable state. Rebuild before publication; keys
 /// borrow state strings and must be destroyed before their owner.
 pub const StateIndex = struct {
@@ -375,7 +380,7 @@ pub const StateIndex = struct {
             if (id.found_existing) return error.InvalidCatalogRecord;
             id.value_ptr.* = r;
             try self.appendChild(alloc, r);
-            if (r.kind == .table) {
+            if (hasPhysicalStorageBinding(r)) {
                 const storage = try self.storage_names.getOrPut(alloc, r.storage_name);
                 if (storage.found_existing) return error.InvalidCatalogRecord;
                 storage.value_ptr.* = r;
@@ -429,7 +434,7 @@ pub const StateIndex = struct {
     fn remove(self: *StateIndex, r: Resource) void {
         _ = self.names.remove(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
         _ = self.ids.remove(.{ .kind = r.kind, .id = r.id });
-        if (r.kind == .table) _ = self.storage_names.remove(r.storage_name);
+        if (hasPhysicalStorageBinding(r)) _ = self.storage_names.remove(r.storage_name);
         if (r.tablespace_id != 0) {
             const count = self.tablespace_users.getPtr(r.tablespace_id).?;
             count.* -= 1;
@@ -446,7 +451,7 @@ pub const StateIndex = struct {
     fn insert(self: *StateIndex, r: Resource) void {
         self.names.putAssumeCapacity(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name }, r);
         self.ids.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, r);
-        if (r.kind == .table) self.storage_names.putAssumeCapacity(r.storage_name, r);
+        if (hasPhysicalStorageBinding(r)) self.storage_names.putAssumeCapacity(r.storage_name, r);
         if (r.tablespace_id != 0) {
             const count = self.tablespace_users.getOrPutAssumeCapacity(r.tablespace_id);
             if (!count.found_existing) count.value_ptr.* = 0;
@@ -1425,14 +1430,14 @@ pub fn httpStatus(err: anyerror) u16 {
 /// mutation outcome. Unknown/committed responses must never become retryable
 /// admission failures merely because their bodies resemble these names.
 pub fn definiteNamingError(status: u16, body: []const u8) ?anyerror {
-    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired, error.ConstraintRetirementRequired, error.TableTransitionActive, error.ForeignKeyReferenced, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
+    inline for (.{ error.CatalogAlreadyExists, error.TableAlreadyExists, error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired, error.ConstraintRetirementRequired, error.TableTransitionActive, error.ForeignKeyReferenced, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
         if (status == httpStatus(err) and std.mem.eql(u8, body, @errorName(err))) return err;
     }
     return null;
 }
 
 test "system catalog definite naming diagnostics require exact status and error identity" {
-    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired, error.ConstraintRetirementRequired, error.TableTransitionActive, error.ForeignKeyReferenced, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
+    inline for (.{ error.CatalogAlreadyExists, error.TableAlreadyExists, error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired, error.ConstraintRetirementRequired, error.TableTransitionActive, error.ForeignKeyReferenced, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
         try std.testing.expectEqual(err, definiteNamingError(httpStatus(err), @errorName(err)).?);
         try std.testing.expect(definiteNamingError(200, @errorName(err)) == null);
     }

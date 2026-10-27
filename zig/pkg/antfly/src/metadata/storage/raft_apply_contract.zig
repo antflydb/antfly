@@ -347,6 +347,7 @@ pub const CatalogProjectionRequest = union(enum) {
     relational_index_owner_decision: @import("../relational_index_publication.zig").OwnerRequest,
     fk_initial_create_prepare: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest,
     fk_generation_name_admission: @import("../fk_generation_publication.zig").Plan,
+    relation_create_prepare: struct { request: @import("../relation_create.zig").Request, purpose: @import("../relation_create.zig").Purpose, deadline_ns: ?u64 = null },
     fk_initial_create_prepare_with_deadline: struct { request: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest, deadline_ns: ?u64 = null },
     constraint_name_prepare: struct { request: system_catalog.ConstraintNamePreparation, deadline_ns: ?u64 = null },
     constraint_name_check: struct { request: system_catalog.ConstraintNameCheck, deadline_ns: ?u64 = null },

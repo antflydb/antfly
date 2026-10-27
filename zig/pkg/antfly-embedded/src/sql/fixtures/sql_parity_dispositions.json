@@ -3532,6 +3532,17 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-materialized-catalog-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-view-catalog-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
@@ -9168,18 +9179,69 @@
     },
     {
       "id": "sql-0351",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original executes through mounted SQL HTTP against document and relational sources. Materialized definitions, stable output identities and hidden native backing rows publish atomically through the shared staged job lane. PostgreSQL qualifies complete nullable text postimages and aliases; cold native owners reject ordinary and transactional mutation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL view catalog materialized hidden generation atomically publishes empty backing and definition",
+          "gate": "sql-materialized-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0352",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original executes through mounted SQL HTTP against document and relational sources. Materialized definitions, stable output identities and hidden native backing rows publish atomically through the shared staged job lane. PostgreSQL qualifies complete nullable text postimages and aliases; cold native owners reject ordinary and transactional mutation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL view catalog materialized hidden generation atomically publishes empty backing and definition",
+          "gate": "sql-materialized-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0353",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original executes through mounted SQL HTTP against document and relational sources. Materialized definitions, stable output identities and hidden native backing rows publish atomically through the shared staged job lane. PostgreSQL qualifies complete nullable text postimages and aliases; cold native owners reject ordinary and transactional mutation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL view catalog materialized hidden generation atomically publishes empty backing and definition",
+          "gate": "sql-materialized-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0354",
@@ -9227,13 +9289,47 @@
     },
     {
       "id": "sql-0358",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged DROP original executes through mounted SQL HTTP for document and relational source cohorts. It checks object kind and atomically retires the logical descriptor, dependency edges, physical table and placements through the existing topology drop path. PostgreSQL independently qualifies the completion tag and relation absence; the native catalog verifies the published and retired states through snapshot recovery.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL view catalog materialized hidden generation atomically publishes empty backing and definition",
+          "gate": "sql-materialized-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0359",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged DROP original executes through mounted SQL HTTP for document and relational source cohorts. It checks object kind and atomically retires the logical descriptor, dependency edges, physical table and placements through the existing topology drop path. PostgreSQL independently qualifies the completion tag and relation absence; the native catalog verifies the published and retired states through snapshot recovery.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
+          "gate": "sql-population-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL view catalog materialized hidden generation atomically publishes empty backing and definition",
+          "gate": "sql-materialized-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
+          "gate": "sql-population-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0360",

@@ -122,6 +122,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlSearchUncommittedWrites => .{ .code = "0A000", .message = "Search indexes cannot rank uncommitted writes to the searched table.", .hint = "Commit those writes before searching their indexes.", .retryable = false },
         error.SqlAmbiguousIndex => .{ .code = "42725", .message = "The index name matches more than one table. Specify ON table.", .retryable = false },
         error.IndexNotFound, error.EmbeddingIndexNotFound, error.SqlIndexNotFound => .{ .code = "42704", .message = "The index does not exist.", .retryable = false },
+        error.MaterializedViewReadOnly => .{ .code = "42809", .message = "Materialized views are read-only.", .hint = "Use REFRESH MATERIALIZED VIEW to replace their contents.", .retryable = false },
+        error.SqlMaterializedViewNotPopulated => .{ .code = "55000", .message = "Materialized view has not been populated.", .hint = "Use REFRESH MATERIALIZED VIEW to populate it.", .retryable = false },
         error.SqlWrongObjectType => .{ .code = "42809", .message = "The named relation has an incompatible object type.", .retryable = false },
         error.SqlWindowingError => .{ .code = "42P20", .message = "A RANGE frame with offset PRECEDING or FOLLOWING requires exactly one ORDER BY column.", .retryable = false },
         error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped => .{ .code = "42P16", .message = "The replacement view must preserve existing output column names, order, and types.", .hint = "Keep the existing output prefix unchanged; new columns may be appended.", .retryable = false },

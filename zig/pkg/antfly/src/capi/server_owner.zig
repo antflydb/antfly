@@ -2244,6 +2244,10 @@ pub fn metadataApplyStoreProjection(
                     handle.store.preflightFkGenerationNameAdmission(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);
                 },
+                .relation_create_prepare => |input| {
+                    const value = handle.store.prepareRelationCreateJsonWithContext(a, group_id, input.request, input.purpose, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .fk_initial_create_prepare_with_deadline => |input| {
                     const value = handle.store.fkInitialCreatePrepareJsonWithContext(a, group_id, input.request, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

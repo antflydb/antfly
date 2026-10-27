@@ -644,6 +644,29 @@ pub fn find(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64
     return resource;
 }
 
+/// The existing table encoding remains eight bytes. New view backings carry
+/// an explicit kind byte; no storage lookup falls back to a catalog scan.
+pub fn getBindingForStorage(a: std.mem.Allocator, txn: anytype, group: u64, name: []const u8) !?std.json.Parsed(domain.Resource) {
+    const key = try storageBindingKey(a, group, name);
+    defer a.free(key);
+    const bytes = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    const kind: domain.Kind = if (bytes.len == 8) .table else if (bytes.len == 9 and bytes[0] == 'v') .view else return error.InvalidCatalogRecord;
+    const id = std.mem.readInt(u64, bytes[bytes.len - 8 ..][0..8], .little);
+    var record = (try getById(a, txn, group, kind, id)) orelse return error.InvalidCatalogRecord;
+    errdefer record.deinit();
+    if (!domain.hasPhysicalStorageBinding(record.value) or !std.mem.eql(u8, record.value.storage_name, name)) return error.InvalidCatalogRecord;
+    return record;
+}
+fn storageBindingValue(resource: domain.Resource, buffer: *[9]u8) []const u8 {
+    const offset: usize = if (resource.kind == .view) 1 else 0;
+    if (offset == 1) buffer[0] = 'v';
+    std.mem.writeInt(u64, buffer[offset..][0..8], resource.id, .little);
+    return buffer[0 .. offset + 8];
+}
+
 /// All returned records borrow this view's arena. Its transaction pins one
 /// catalog revision for both planning and response projection.
 pub const View = struct {
@@ -687,15 +710,8 @@ pub const View = struct {
         return out.items;
     }
     pub fn bindingForStorage(self: View, name: []const u8) !?domain.Resource {
-        const key = try storageBindingKey(self.alloc, self.group_id, name);
-        const bytes = self.txn.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        if (bytes.len != 8) return error.InvalidCatalogRecord;
-        const record = (try self.byId(.table, std.mem.readInt(u64, bytes[0..8], .little))) orelse return error.InvalidCatalogRecord;
-        if (!std.mem.eql(u8, record.storage_name, name)) return error.InvalidCatalogRecord;
-        return record;
+        const record = (try getBindingForStorage(self.alloc, self.txn, self.group_id, name)) orelse return null;
+        return record.value;
     }
     pub fn tablespaceInUse(self: View, id: u64) !bool {
         const prefix = try std.fmt.allocPrint(self.alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:uses:{d}:", .{ self.group_id, id });
@@ -785,11 +801,12 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
         const child_json = try std.json.Stringify.valueAlloc(alloc, resource, .{});
         defer alloc.free(child_json);
         if (!std.mem.eql(u8, txn.get(child_key) catch return error.InvalidCatalogRecord, child_json)) return error.InvalidCatalogRecord;
-        if (resource.kind == .table) {
+        if (domain.hasPhysicalStorageBinding(resource)) {
             const key = try storageBindingKey(alloc, group_id, resource.storage_name);
             defer alloc.free(key);
             const bytes = txn.get(key) catch return error.InvalidCatalogRecord;
-            if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
+            var expected: [9]u8 = undefined;
+            if (!std.mem.eql(u8, bytes, storageBindingValue(resource, &expected))) return error.InvalidCatalogRecord;
         }
         if (resource.tablespace_id != 0) {
             const key = try tablespaceUseKey(alloc, group_id, resource);
@@ -816,17 +833,17 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     const child_json = try std.json.Stringify.valueAlloc(alloc, r, .{});
     defer alloc.free(child_json);
     try txn.put(child_key, child_json);
-    if (r.kind == .table) {
+    if (domain.hasPhysicalStorageBinding(r)) {
         const key = try storageBindingKey(alloc, group_id, r.storage_name);
         defer alloc.free(key);
-        var id: [8]u8 = undefined;
-        std.mem.writeInt(u64, &id, r.id, .little);
+        var id_buffer: [9]u8 = undefined;
+        const id = storageBindingValue(r, &id_buffer);
         const previous = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
-        if (previous) |value| if (!std.mem.eql(u8, value, &id)) return error.InvalidCatalogRecord;
-        try txn.put(key, &id);
+        if (previous) |value| if (!std.mem.eql(u8, value, id)) return error.InvalidCatalogRecord;
+        try txn.put(key, id);
     }
     if (r.tablespace_id != 0) {
         const key = try tablespaceUseKey(alloc, group_id, r);
@@ -841,7 +858,7 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
         error.NotFound => {},
         else => return err,
     };
-    if (r.kind == .table) {
+    if (domain.hasPhysicalStorageBinding(r)) {
         const key = try storageBindingKey(alloc, group_id, r.storage_name);
         defer alloc.free(key);
         txn.delete(key) catch |err| switch (err) {

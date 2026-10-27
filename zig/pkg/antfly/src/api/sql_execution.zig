@@ -949,7 +949,20 @@ pub const Adapter = struct {
         const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true, .expected_revision = self.revision } });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
         if (snapshot.tables.len != 1) return error.InvalidSqlBackendResponse;
-        const table = snapshot.tables[0] orelse return error.TableNotFound;
+        const table = snapshot.tables[0] orelse {
+            if (action != .read) {
+                const resolved = try @import("sql_view_execution.zig").lookup(self, alloc, target);
+                if (resolved.sql_sources[0]) |source| switch (source.value) {
+                    .view => |view| {
+                        const record = try std.json.parseFromSliceLeaky(@import("../system_catalog/views.zig").Record, alloc, view.source_json, .{});
+                        if (record.materialization != null) return error.MaterializedViewReadOnly;
+                        return error.UnsupportedSqlExecution;
+                    },
+                    else => {},
+                };
+            }
+            return error.TableNotFound;
+        };
         return self.bindResolvedTable(alloc, target, table, snapshot.revision, action);
     }
 
@@ -1015,6 +1028,17 @@ pub const Adapter = struct {
         // statement. The coordinator still applies its own durable auth fence.
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const target: system_catalog.Target = .{ .database = scope.database, .namespace = scope.namespace, .table = scope.name };
+        if (table.materialized_view_id) |view_id| {
+            const bytes = try self.server.source.systemCatalog(temporary, self.context, .{ .resolve_many = .{ .sql_sources = &.{.{ .view_id = view_id }}, .expected_revision = scope.revision } });
+            const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, temporary, bytes, .{});
+            if (snapshot.revision != scope.revision or snapshot.sql_sources.len != 1) return error.CatalogGenerationChanged;
+            const found = snapshot.sql_sources[0] orelse return error.CatalogGenerationChanged;
+            if (found.value != .view) return error.CatalogGenerationChanged;
+            const record = try @import("../system_catalog/views.zig").Record.decode(temporary, found.value.view.source_json);
+            const backing = record.value.materialization orelse return error.CatalogGenerationChanged;
+            if (!backing.populated or backing.table_id != table.id or !std.mem.eql(u8, backing.storage_name, table.physical_name)) return error.CatalogGenerationChanged;
+            return;
+        }
         const bytes = try self.server.source.systemCatalog(temporary, self.context, .{ .resolve_many = .{ .targets = &.{target}, .expected_revision = scope.revision } });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, temporary, bytes, .{});
         if (snapshot.revision != scope.revision or snapshot.tables.len != 1) return error.CatalogGenerationChanged;
@@ -2379,6 +2403,7 @@ pub const Adapter = struct {
     }
 
     fn mutateInternal(ptr: *anyopaque, alloc: std.mem.Allocator, scratch: std.mem.Allocator, table: catalog.Table, raw_input: []const catalog.Mutation, already_prepared: bool) !catalog.MutationOutcome {
+        if (table.materialized_view_id != null) return error.MaterializedViewReadOnly;
         if (table.read_authority != null) return error.Forbidden;
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);

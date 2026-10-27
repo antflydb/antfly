@@ -39,6 +39,7 @@ pub fn validPhysicalName(name: []const u8) bool {
 pub const Purpose = enum { foreign_key, query_population };
 
 pub const Request = struct {
+    materialized_view: bool = false,
     physical_name: ?[]const u8 = null,
     namespace_id: u64,
     logical_name: []const u8,
@@ -53,7 +54,7 @@ pub const Request = struct {
     pub fn jsonStringify(self: Request, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Request).@"struct".field_names) |field_name| {
-            if ((!std.mem.eql(u8, field_name, "generated_constraint_names") or self.generated_constraint_names.len != 0) and (!std.mem.eql(u8, field_name, "physical_name") or self.physical_name != null)) {
+            if ((!std.mem.eql(u8, field_name, "materialized_view") or self.materialized_view) and (!std.mem.eql(u8, field_name, "generated_constraint_names") or self.generated_constraint_names.len != 0) and (!std.mem.eql(u8, field_name, "physical_name") or self.physical_name != null)) {
                 try writer.objectField(field_name);
                 try writer.write(@field(self, field_name));
             }

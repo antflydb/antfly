@@ -17,6 +17,10 @@
 //! FK and restore envelopes. Schema/row strings are validated but never copied.
 const std = @import("std");
 
+pub fn requiresMaterializedView(bytes: []const u8) bool {
+    return requiresMarker(bytes, "materialized_view") or requiresMarker(bytes, "sql_materialized_view_id") or requiresMarker(bytes, "materialized");
+}
+
 pub fn requiresPopulation(bytes: []const u8) bool {
     return requiresMarker(bytes, "population");
 }

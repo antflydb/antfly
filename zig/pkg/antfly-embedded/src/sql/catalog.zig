@@ -418,6 +418,8 @@ pub const Table = struct {
             return parts.next() == null and std.mem.eql(u8, first, self.database) and std.mem.eql(u8, second, self.namespace) and std.mem.eql(u8, third, self.name);
         }
     };
+    /// Read-only physical generation reached through a stable catalog view.
+    materialized_view_id: ?u64 = null,
     schema_json: []const u8 = "",
     id: u64,
     physical_name: []const u8,

@@ -200,6 +200,7 @@ pub const Target = struct {
         return (std.mem.eql(u8, name, "sequence_handoffs") and self.sequence_handoffs.len == 0) or
             (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
             (std.mem.eql(u8, name, "population") and self.population == null) or
+            (std.mem.eql(u8, name, "materialized_view") and self.materialized_view == null) or
             (std.mem.eql(u8, name, "creation_guard") and self.creation_guard == null) or
             (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null) or
             (std.mem.eql(u8, name, "source_table_name") and self.source_table_name.len == 0) or
@@ -213,6 +214,12 @@ pub const Target = struct {
     target_schema_digest: ?Digest = null,
     empty_generation: bool = false,
     population: ?@import("antfly_local_sources").storage_db_relational_population_contract.Capture = null,
+    /// The definition and backing rows publish in one catalog transaction.
+    materialized_view: ?struct {
+        id: u64,
+        definition: @import("antfly_local_sources").sql_view_definition.Definition,
+        populated: bool,
+    } = null,
     sequence_handoffs: []const @import("column_sequence_handoff.zig").Move = &.{},
     /// Binds graph artifact retirement to the exact old/new physical table
     /// incarnations and unchanged index declarations. Old edge/metric stores
@@ -545,6 +552,8 @@ pub const Plan = struct {
         }
         for (self.targets, 0..) |target, index| {
             const table = target.table;
+            if ((target.materialized_view != null) != (table.sql_materialized_view_id != null) or
+                (target.materialized_view != null and target.population == null)) return error.InvalidRestoreStaging;
             if (target.population) |capture| {
                 try capture.validate();
                 if (target.source_table_id != 0 or target.replace != null or target.catalog_binding == null or self.preparing_sources or
@@ -552,6 +561,23 @@ pub const Plan = struct {
                     target.source_generation_admissions.len != 0 or target.generation_handoffs.len != 0 or target.sequence_handoffs.len != 0 or
                     target.graph_retirement_digest != null or self.external_fk_parents.len != 0 or
                     !std.mem.eql(u8, &capture.target_schema, &try runtimeSchemaDigestForTable(alloc, table.schema_json))) return error.InvalidRestoreStaging;
+                if (target.materialized_view) |view| {
+                    const binding = target.catalog_binding.?;
+                    if (view.id == 0 or view.id != binding.id or binding.kind != .view or
+                        table.sql_materialized_view_id != view.id or capture.materialized_view_id != view.id or view.definition.security != .owner) return error.InvalidRestoreStaging;
+                    switch (view.definition.owner) {
+                        .auth_disabled => if (capture.principal_name.len != 0) return error.InvalidRestoreStaging,
+                        .user => |principal| if (!std.mem.eql(u8, principal.name, capture.principal_name) or !std.mem.eql(u8, &principal.instance_id, &capture.principal_instance)) return error.InvalidRestoreStaging,
+                        .role => return error.InvalidRestoreStaging,
+                    }
+                    const local = @import("antfly_local_sources");
+                    const columns = try alloc.alloc(local.sql_ast.Column, view.definition.columns.len);
+                    defer alloc.free(columns);
+                    for (columns, view.definition.columns) |*column, output| column.* = .{ .name = output.name, .type = output.type, .element_type = output.element_type, .numeric_modifier = output.numeric_modifier, .nullable = true };
+                    const schema = try local.sql_ddl_runtime.createSchemaAlloc(alloc, .{ .table = .{ .table = binding.name }, .columns = columns });
+                    defer alloc.free(schema);
+                    if (!std.mem.eql(u8, &capture.target_schema, &try runtimeSchemaDigestForTable(alloc, schema))) return error.InvalidRestoreStaging;
+                } else if (table.sql_materialized_view_id != null or target.catalog_binding.?.kind != .table) return error.InvalidRestoreStaging;
                 // A query produces new user values, not archived constraints,
                 // generated expressions or unverified native index artifacts.
                 var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
@@ -689,7 +715,7 @@ pub const Plan = struct {
                 if (target_schema.storage_mode == .relational) return error.InvalidRestoreStaging;
             }
             if (target.catalog_binding) |binding| {
-                if (binding.kind != .table or binding.id != table.table_id or binding.parent_id == 0 or
+                if ((if (target.materialized_view) |view| binding.kind != .view or binding.id != view.id else binding.kind != .table or binding.id != table.table_id) or binding.parent_id == 0 or
                     !std.mem.eql(u8, binding.storage_name, table.name)) return error.InvalidRestoreStaging;
                 try @import("antfly_local_sources").system_catalog_domain.validateTableName(binding.name);
                 for (self.targets[0..index]) |previous| if (previous.catalog_binding) |other| {

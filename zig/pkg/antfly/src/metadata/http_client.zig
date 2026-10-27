@@ -1271,7 +1271,7 @@ pub const MetadataHttpClient = struct {
             const token = std.mem.trim(u8, media[0 .. std.mem.indexOfScalar(u8, media, ';') orelse media.len], " \t");
             if (!std.ascii.eqlIgnoreCase(token, input.responseContentType())) return error.InvalidGenerationPublication;
         }
-        if ((input == .fk_initial_create_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
+        if ((input == .fk_initial_create_prepare or input == .query_population_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
             if (response.status == 405 and std.mem.eql(u8, response.body, "ExtensionOwnedObject")) return error.ExtensionOwnedObject;
         }

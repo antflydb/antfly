@@ -234,7 +234,15 @@ const Context = struct {
                         }.less);
                         const exposure = try a.alloc(catalog.ViewExposure, selected.len);
                         for (selected, exposure) |item, *output| output.* = item.exposure;
-                        nested.view.exposure = exposure;
+                        if (nested == .table) {
+                            const frozen = try a.alloc(catalog.Column, exposure.len);
+                            for (exposure, frozen) |column, *output| {
+                                if (column.ordinal >= nested.table.columns.len) return error.InvalidSqlViewRecord;
+                                output.* = nested.table.columns[column.ordinal];
+                                output.name = column.name;
+                            }
+                            nested.table.columns = frozen;
+                        } else nested.view.exposure = exposure;
                     }
                     return nested;
                 },
@@ -259,7 +267,7 @@ pub fn prepare(root: *Adapter, a: A, target: domain.Target, resource: domain.Res
     // and compiled body remain owned by that region through cursor teardown.
     const record = parsed.value;
     if (resource.kind != .view or resource.id != record.id) return error.InvalidSqlViewRecord;
-    const authority = try readAuthority(root, a, target, record, inherited);
+    const authority = if (record.materialization == null) try readAuthority(root, a, target, record, inherited) else null;
     const Binding = @import("sql_prepared.zig").Binding;
     const manifest = Binding.fromView(target, record.id, record.generation, record.attributes.epoch.digest, root.revision.?);
     if (root.prepared_bindings) |bindings| try Binding.verifyView(bindings, manifest);
@@ -273,6 +281,28 @@ pub fn prepare(root: *Adapter, a: A, target: domain.Target, resource: domain.Res
             if (bindings.items.len >= 64) return error.SqlProgramLimitExceeded;
             try bindings.append(a, manifest);
         }
+    }
+    if (record.materialization) |backing| {
+        const incoming = if (inherited) |value| value.effective else root.identity.*;
+        const logical = try target.resourceNameAlloc(a);
+        if (!try http.tablePermissionCurrentlyAllowed(incoming, logical, .read)) return error.Forbidden;
+        if (!backing.populated) return error.SqlMaterializedViewNotPopulated;
+        const bytes = try root.server.source.systemCatalog(a, root.context, .{ .resolve_many = .{
+            .sql_sources = &.{.{ .table_id = backing.table_id }},
+            .expected_revision = root.revision,
+            .include_query_definitions = true,
+        } });
+        const snapshot = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
+        if (!snapshot.sql_sources_resolved or snapshot.revision != root.revision.? or snapshot.sql_sources.len != 1) return error.CatalogGenerationChanged;
+        const source = snapshot.sql_sources[0] orelse return error.CatalogGenerationChanged;
+        if (source.value != .table or source.value.table.binding.table_id != backing.table_id or
+            !std.mem.eql(u8, source.value.table.binding.name, backing.storage_name)) return error.CatalogGenerationChanged;
+        var table = try root.bindViewSource(a, target, source.value.table.binding, snapshot.revision);
+        table.materialized_view_id = record.id;
+        table.virtual_columns_override = &.{};
+        table.read_authority = inherited;
+        try authority_api.check(table);
+        return .{ .table = table };
     }
     const lookups = try a.alloc(domain.SqlSourceLookup, record.definition.sources.len);
     for (record.definition.sources, lookups) |source, *output| output.* = switch (source.kind) {

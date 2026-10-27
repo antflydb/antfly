@@ -3639,6 +3639,23 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const materialized = switch (command) {
+        .apply_restore_staging => |bytes| @import("schema_reader_wire.zig").requiresMaterializedView(bytes),
+        .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresMaterializedView(request.plan_json),
+        .upsert_table => |table| table.sql_materialized_view_id != null,
+        .compare_and_replace_table => |cas| cas.expected.sql_materialized_view_id != null or cas.replacement.sql_materialized_view_id != null,
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| create.table.sql_materialized_view_id != null,
+            .drop => false,
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| blk: {
+            for (delta.upsert_tables) |table| if (table.sql_materialized_view_id != null) break :blk true;
+            break :blk false;
+        },
+        .apply_system_catalog => |bytes| @import("schema_reader_wire.zig").requiresMaterializedView(bytes),
+        else => false,
+    };
+    if (materialized) return metadata_topology_protocol.sql_materialized_view_version;
     const population = switch (command) {
         .apply_restore_staging => |bytes| @import("schema_reader_wire.zig").requiresPopulation(bytes),
         .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresPopulation(request.plan_json),
@@ -4123,8 +4140,14 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
 /// Existing restore/rewrite plans keep their original admission contract.
 pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const u8, context: api_operation.RequestContext) !void {
     try context.ensureActive();
-    if (@import("schema_reader_wire.zig").requiresPopulation(bytes))
+    if (@import("schema_reader_wire.zig").requiresMaterializedView(bytes))
+        try ensureMaterializedViewCapabilityWithContext(service, context)
+    else if (@import("schema_reader_wire.zig").requiresPopulation(bytes))
         try ensureQueryPopulationCapabilityWithContext(service, context);
+}
+
+pub fn ensureMaterializedViewCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_materialized_view_version);
 }
 
 pub fn ensureQueryPopulationCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
@@ -24082,4 +24105,14 @@ test "runtime status source authority merge preserves negotiated media and expli
 test "relational integrity restore staging population admission requires the complete decoder floor" {
     try std.testing.expectEqual(metadata_topology_protocol.sql_population_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"plan\":{\"targets\":[{\"population\":{}}]}}" }));
     try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"plan\":{\"targets\":[{\"population\":null}]}}" }) < metadata_topology_protocol.sql_population_version);
+}
+
+test "relational integrity restore staging materialized view decoder covers every table carrier" {
+    const version = metadata_topology_protocol.sql_materialized_view_version;
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 41, .name = "table:01010101010101010101010101010101", .sql_materialized_view_id = 42 };
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &.{} } } }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle = .{ .upsert_tables = &.{table} } }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
 }

@@ -3660,6 +3660,13 @@ test "opaque metadata initial FK reservation preserves placement authority acros
         .candidate = .{ .table_id = 0, .name = "", .schema_json = schema },
     });
     defer alloc.free(prepared_json);
+    const shared = try store.prepareRelationCreateJsonWithContext(alloc, group, .{
+        .namespace_id = catalog.default_namespace_id,
+        .logical_name = "nodes",
+        .candidate = .{ .table_id = 0, .name = "", .schema_json = schema },
+    }, .foreign_key, .{});
+    defer alloc.free(shared);
+    try std.testing.expectEqualStrings(prepared_json, shared);
     var prepared = try std.json.parseFromSlice(publication.InitialCreatePrepare, alloc, prepared_json, .{});
     defer prepared.deinit();
     var child = prepared.value.child;

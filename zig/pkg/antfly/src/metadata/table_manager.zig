@@ -23,7 +23,8 @@ pub const dense_native_storage_protocol_version: u16 = 1;
 /// executes captured query output, global row ordinals and sealed completion.
 pub const coordinated_integrity_protocol_version: u16 = 2;
 pub const query_population_protocol_version: u16 = 3;
-pub const relational_topology_protocol_version: u16 = query_population_protocol_version;
+pub const materialized_view_protocol_version: u16 = 4;
+pub const relational_topology_protocol_version: u16 = materialized_view_protocol_version;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("antfly_local_sources").common_group_ids;
 const topology_records = @import("antfly_local_sources").common_topology_records;
@@ -73,7 +74,7 @@ pub const TableRecord = @import("antfly_local_sources").metadata_local_catalog.T
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
+    return lhs.sql_materialized_view_id == rhs.sql_materialized_view_id and std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
         (if (lhs.full_text_read_index) |name| if (rhs.full_text_read_index) |other| std.mem.eql(u8, name, other) else false else rhs.full_text_read_index == null) and
         @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
         lhs.storage.engine == rhs.storage.engine and

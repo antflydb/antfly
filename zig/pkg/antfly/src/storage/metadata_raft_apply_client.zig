@@ -792,6 +792,13 @@ pub const RaftApplyStore = struct {
         if (bytes.len == 0 or bytes.len > @import("../metadata/relational_index_delivery_journal.zig").max_completion_bytes) return error.InvalidGenerationPublication;
         if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_source_complete_preflight = bytes })) return error.InvalidPrivateIndexClaimReceipt;
     }
+    pub fn prepareRelationCreateJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relation_create.zig").Request, purpose: @import("../metadata/relation_create.zig").Purpose, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        const normalized = try context.platformDeadline();
+        const bytes = try self.catalogProjection([]u8, alloc, group_id, .{ .relation_create_prepare = .{ .request = request, .purpose = purpose, .deadline_ns = normalized.deadline_ns } });
+        errdefer alloc.free(bytes);
+        try context.ensureActive();
+        return bytes;
+    }
     pub fn fkInitialCreatePrepareJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_prepare = request });
     }

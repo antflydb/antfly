@@ -984,6 +984,8 @@ pub const Detail = enum(c_int) {
     cloudflare_inference_failed,
     invalid_cloudflare_response,
     document_token_limit_exceeded,
+    // Append only: immutable materialized generations reject primary mutation.
+    materialized_view_read_only,
 };
 
 test "partial index proof rejection preserves exact callback error identity" {
@@ -1193,6 +1195,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedAudioFormat => status(.unsupported, .model_chunk_unsupported_audio_format),
         error.UnsupportedChunkMediaType => status(.unsupported, .model_chunk_unsupported_chunk_media_type),
         error.ExternalLakeReadOnly => status(.forbidden, .external_lake_read_only),
+        error.MaterializedViewReadOnly => status(.forbidden, .materialized_view_read_only),
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
         error.ExternalLakeSchemaUnavailable => status(.unavailable, .external_lake_schema_unavailable),
@@ -2160,6 +2163,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .source_visitor_failed => "SourceVisitorFailed",
 
         .external_lake_read_only => "ExternalLakeReadOnly",
+        .materialized_view_read_only => "MaterializedViewReadOnly",
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
         .external_lake_schema_unavailable => "ExternalLakeSchemaUnavailable",
@@ -3413,4 +3417,11 @@ test "durable document policy errors retain identity across native runtime bound
     }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
+}
+
+test "materialized view mutation rejection retains exact runtime boundary identity" {
+    const result = statusFromError(error.MaterializedViewReadOnly);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), result.code);
+    try std.testing.expectEqual(error.MaterializedViewReadOnly, errorFromStatus(result));
+    try std.testing.expectEqual(error.MaterializedViewReadOnly, errorFromStableName("MaterializedViewReadOnly").?);
 }

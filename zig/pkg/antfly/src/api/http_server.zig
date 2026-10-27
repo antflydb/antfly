@@ -14648,6 +14648,7 @@ pub const ApiHttpServer = struct {
             // partial outcome, without advertising a partial public commit.
             error.RaftBatchWritePartialOutcome => return error.WriteOutcomeUnknown,
             error.ExternalLakeReadOnly => return error.ExternalLakeReadOnly,
+            error.MaterializedViewReadOnly => return error.MaterializedViewReadOnly,
             error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
             error.HAPromotedStandbyRequiresPrimaryOpen => return error.HAPromotedStandbyRequiresPrimaryOpen,
             error.HAFencedPrimary => return error.HAFencedPrimary,
@@ -60474,4 +60475,14 @@ test "staged restore worker query population publishes sealed SQL output and ret
 
 test "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages" {
     for ([_]bool{ false, true }) |document| for ([_][]const u8{ "sql-0364", "sql-0365", "sql-0366", "sql-0567" }) |id| try @import("restore_worker_fixture.zig").runPopulationPublic(RestoreWorkerTestDriver, id, document);
+}
+
+test "staged restore worker query population mounted materialized originals retain aliases and physical reads" {
+    // After qualifying creation/read postimages, each fixture executes the
+    // unchanged sql-0358 or sql-0359 DROP and checks descriptor/backing retirement.
+    for ([_]bool{ false, true }) |document| for ([_][]const u8{ "sql-0351", "sql-0352", "sql-0353" }) |id| try @import("restore_worker_fixture.zig").runPopulationPublic(RestoreWorkerTestDriver, id, document);
+}
+
+test "staged restore worker query population materialized WITH NO DATA rejects reads without opening the source" {
+    for ([_]bool{ false, true }) |document| try @import("restore_worker_fixture.zig").runPopulationPublicEmpty(RestoreWorkerTestDriver, document);
 }

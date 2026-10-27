@@ -33,6 +33,7 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_relation_population, .err = error.InvalidRelationPopulation },
     .{ .status = .relation_population_page_too_large, .err = error.RelationPopulationPageTooLarge },
     .{ .status = .relation_population_changed, .err = error.RelationPopulationChanged },
+    .{ .status = .materialized_view_read_only, .err = error.MaterializedViewReadOnly },
     .{ .status = .foreign_key_validation_required, .err = error.ForeignKeyValidationRequired },
     .{ .status = .undefined_column, .err = error.UndefinedColumn },
     .{ .status = .conflicting_data_apply_batch, .err = error.ConflictingDataApplyBatch },
@@ -1294,4 +1295,9 @@ test "logical value exact sort rejection survives both compiled query boundaries
         try std.testing.expectError(error.UnsupportedExactSort, statusToError(failure.status));
         try std.testing.expectEqualStrings("UnsupportedExactSort", failure.errorName());
     }
+}
+
+test "materialized view write rejection survives the compiled storage owner boundary" {
+    try std.testing.expectEqual(abi.Status.materialized_view_read_only, statusFromError(error.MaterializedViewReadOnly));
+    try std.testing.expectError(error.MaterializedViewReadOnly, statusToError(.materialized_view_read_only));
 }

@@ -1133,6 +1133,7 @@ pub const LocalExecutionState = struct {
     merge_artifact_layout: @import("merge_artifact_catalog.zig").Cache = .{},
     source_publication: @import("source_publication_job.zig").Job = .{},
     restore_staging_required: std.atomic.Value(bool) = .init(false),
+    materialized_view_read_only: std.atomic.Value(bool) = .init(false),
     initial_child_hidden: std.atomic.Value(bool) = .init(false),
     initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
     vector_migration_reopen_required: std.atomic.Value(bool) = .init(false),

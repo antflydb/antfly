@@ -4366,6 +4366,7 @@ pub const DB = struct {
                 var staging_status = value;
                 defer staging_status.deinit();
                 db.local_execution.restore_staging_required.store(staging_status.value.phase != .published, .release);
+                db.local_execution.materialized_view_read_only.store(staging_status.value.phase == .published and if (staging_status.value.scope.population) |capture| capture.materialized_view_id != null else false, .release);
             }
             {
                 var hidden_read = try db.core.store.beginReadTxn();
@@ -10612,6 +10613,8 @@ pub const DB = struct {
         for (req.writes) |write| if ((@import("group_source_identity.zig").isAnchor(write.key) or @import("group_source_transfer.zig").isKey(write.key))) return error.InvalidBatchRequest;
         for (req.deletes) |document| if ((@import("group_source_identity.zig").isAnchor(document) or @import("group_source_transfer.zig").isKey(document))) return error.InvalidBatchRequest;
         for (req.transforms) |transform| if ((@import("group_source_identity.zig").isAnchor(transform.key) or @import("group_source_transfer.zig").isKey(transform.key))) return error.InvalidBatchRequest;
+        if (self.local_execution.materialized_view_read_only.load(.acquire) and opts.restore_staging == null and
+            (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0)) return error.MaterializedViewReadOnly;
         var lake_schema_view = self.core.acquireSchemaView();
         defer if (lake_schema_view) |*view| view.release();
         if (lake_schema_view) |view| if (view.tableSchema().external_base_source != null and
@@ -26486,6 +26489,7 @@ pub const DB = struct {
             var topology_read = try self.core.store.beginProbeTxn();
             defer topology_read.abort();
             if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireScope(preparation_alloc, &topology_read, null, false);
+            if (intents.len != 0 and self.local_execution.materialized_view_read_only.load(.acquire)) try @import("restore_staging.zig").requirePrimaryWritable(preparation_alloc, &topology_read);
             try @import("relational_integrity_topology.zig").admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
         }
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
@@ -26808,6 +26812,7 @@ pub const DB = struct {
         {
             var topology_read = try self.core.store.beginProbeTxn();
             defer topology_read.abort();
+            if (self.local_execution.materialized_view_read_only.load(.acquire) and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0)) try @import("restore_staging.zig").requirePrimaryWritable(preparation_alloc, &topology_read);
             try @import("restore_staging.zig").requireMutableScope(preparation_alloc, &topology_read, req.restore_staging_scope);
             if (req.restore_staging_scope != null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0 or req.relational_repair or req.relational_retirement != null)) return error.InvalidRestoreStagingCommand;
             if (req.restore_staging_scope != null) {
@@ -41003,6 +41008,7 @@ pub const DB = struct {
         try txn.commit();
         txn_open = false;
         self.local_execution.restore_staging_required.store(next.phase != .published, .release);
+        self.local_execution.materialized_view_read_only.store(next.phase == .published and if (next.scope.population) |capture| capture.materialized_view_id != null else false, .release);
         try self.core.store.sync(true);
         return next.receipt();
     }

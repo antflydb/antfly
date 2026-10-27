@@ -28,12 +28,29 @@ pub const max_bytes = domain.max_command_bytes;
 pub const Identity = struct { id: u64, generation: u32 };
 /// Private catalog intent. Ingress derives the owner and bound definition;
 /// neither SQL text nor a public request may supply an execution credential.
+pub const Drop = struct {
+    expected: ?Identity = null,
+    if_exists: bool = false,
+    cascade: bool = false,
+    materialized: bool = false,
+    pub fn jsonStringify(self: Drop, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Drop).@"struct".field_names) |field| {
+            if (!std.mem.eql(u8, field, "materialized") or self.materialized) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+};
+
 pub const Mutation = struct {
     target: domain.Target,
     operation: union(enum) {
         publish: struct { definition: definitions.Definition, replace: bool = false, expected: ?Identity = null },
         rename: struct { expected: Identity, name: []const u8 },
-        drop: struct { expected: ?Identity = null, if_exists: bool = false, cascade: bool = false },
+        drop: Drop,
     },
 
     pub fn validate(self: Mutation) !void {
@@ -166,7 +183,22 @@ pub fn firstDependent(txn: anytype, group: u64, kind: definitions.SourceKind, id
     if (!std.mem.eql(u8, row.value, &.{1})) return error.InvalidSqlViewRecord;
     return ((try dependencyFromKey(row.key, group)) orelse return error.InvalidSqlViewRecord).view;
 }
+/// A catalog-owned immutable backing generation. The logical view identity and
+/// output attribute IDs survive refresh; physical rows never move in place.
+pub const Materialization = struct {
+    table_id: u64,
+    storage_name: []const u8,
+    schema_digest: [32]u8,
+    populated: bool,
+
+    pub fn validate(self: @This()) !void {
+        if (self.table_id == 0 or !@import("../metadata/relation_create.zig").validPhysicalName(self.storage_name) or
+            std.mem.allEqual(u8, &self.schema_digest, 0)) return error.InvalidSqlViewRecord;
+    }
+};
+
 pub const Record = struct {
+    materialization: ?Materialization = null,
     format: u8,
     id: u64,
     generation: u32,
@@ -177,15 +209,30 @@ pub const Record = struct {
     /// Embedded output identities are not physical-table catalog rows.
     attributes: identities.State,
 
+    pub fn jsonStringify(self: Record, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Record).@"struct".field_names) |field| {
+            if (!std.mem.eql(u8, field, "materialization") or self.materialization != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: Record, a: A) !void {
         const definition = self.definition;
-        if (self.format != 1 or self.id == 0 or self.generation == 0 or definition.format != definition.requiredFormat() or
+        if (self.format != (if (self.materialization != null) @as(u8, 2) else 1) or self.id == 0 or self.generation == 0 or definition.format != definition.requiredFormat() or
             definition.query.len == 0 or definition.query.len > definitions.max_query_bytes or
             !std.unicode.utf8ValidateSlice(definition.query) or
             definition.columns.len == 0 or definition.columns.len > definitions.max_columns or
             definition.sources.len > definitions.max_sources or
             self.source_columns.len != definition.sources.len)
             return error.InvalidSqlViewRecord;
+        if (self.materialization) |backing| {
+            try backing.validate();
+            if (definition.security != .owner or backing.table_id == self.id) return error.InvalidSqlViewRecord;
+        }
         switch (definition.owner) {
             .auth_disabled => {},
             .user, .role => |principal| {

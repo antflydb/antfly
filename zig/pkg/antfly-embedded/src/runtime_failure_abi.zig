@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 76;
+pub const abi_version: u32 = 77;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -863,6 +863,7 @@ pub const Status = enum(u32) {
     invalid_relation_population = 904,
     relation_population_page_too_large = 905,
     relation_population_changed = 906,
+    materialized_view_read_only = 907,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
@@ -907,7 +908,11 @@ test "concurrent main and SQL statuses retain distinct wire identities" {
     try std_test.testing.expectEqual(@as(u32, 778), @backingInt(Status.seed_replica_policy_mismatch));
     try std_test.testing.expectEqual(@as(u32, 779), @backingInt(Status.document_artifact_publication_failed));
     try std_test.testing.expectEqual(@as(u32, 834), @backingInt(Status.grouped_source_owner_changed));
-    try std_test.testing.expectEqual(@as(u32, 838), @backingInt(Status.catalog_occupancy_not_ready));
+    // Main owns 838-840; SQL catalog additions must follow those released IDs.
+    try std_test.testing.expectEqual(@as(u32, 838), @backingInt(Status.unsupported_exact_sort));
+    try std_test.testing.expectEqual(@as(u32, 839), @backingInt(Status.invalid_document_checkpoint));
+    try std_test.testing.expectEqual(@as(u32, 840), @backingInt(Status.too_many_active_jobs));
+    try std_test.testing.expectEqual(@as(u32, 841), @backingInt(Status.catalog_occupancy_not_ready));
 }
 
 test "released native value search Status identifiers retain their numeric values" {
