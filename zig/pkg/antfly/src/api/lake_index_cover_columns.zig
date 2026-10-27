@@ -152,10 +152,11 @@ pub const Loaded = struct {
     leases: std.ArrayList(metadata.Owned(Block)) = .empty,
     directory: ?metadata.Owned(Directory) = null,
     wires: std.ArrayList([]u8) = .empty,
+    wire_allocator: ?A = null,
     pub fn deinit(self: *@This()) void {
         for (self.leases.items) |owned| owned.release();
         self.leases.deinit(self.a);
-        for (self.wires.items) |bytes| local.sql_memory_budget.reclaimingAllocator(self.a).free(bytes);
+        for (self.wires.items) |bytes| self.wire_allocator.?.free(bytes);
         self.wires.deinit(self.a);
         if (self.directory) |owned| owned.release();
         if (self.scratch_owner) |owner| {
@@ -224,7 +225,7 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
         if (block.values.len != width) return error.InvalidNativeLakeRowIndex;
         return .{ .a = a, .block = block, .hashed = false };
     }
-    var result: Loaded = .{ .a = a, .block = undefined, .hashed = true };
+    var result: Loaded = .{ .a = a, .block = undefined, .hashed = true, .wire_allocator = local.sql_memory_budget.reclaimingAllocator(a) };
     errdefer result.deinit();
     const directory = if (prepared) |known| verified: {
         if (known.reference.byte_len != ref.byte_len or !std.mem.eql(u8, known.reference.artifact_id, ref.artifact_id) or !std.mem.eql(u8, known.reference.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
@@ -282,7 +283,7 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
         }
         // Exact adjacency avoids reading omitted columns or charging gaps. Raw
         // transport storage is reclaimed after this wave; cache units stay stripes.
-        var wire = try ranges.load(local.sql_memory_budget.reclaimingAllocator(a), store, units[0..count], token, cached, .{ .ptr = &admitted, .charge = Charge.charge }, .{ .max_range = artifacts.max_block_bytes });
+        var wire = try ranges.load(result.wire_allocator.?, store, units[0..count], token, cached, .{ .ptr = &admitted, .charge = Charge.charge }, .{ .max_range = artifacts.max_block_bytes });
         defer wire.deinit();
         for (selected.items[begin..end], 0..) |index, position| {
             const section = directory.sections[index];

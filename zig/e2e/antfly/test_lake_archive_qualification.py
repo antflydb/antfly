@@ -1660,7 +1660,7 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
     bench = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = bench
     spec.loader.exec_module(bench)
-    count = 128
+    count = 256
     data = {
         "id": list(range(count)),
         "bucket": [i // 16 for i in range(count)],
@@ -1669,6 +1669,8 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
         "counter": [None if i % 7 == 0 else 9007199254740993 + i for i in range(count)],
         "payload": ["p" * 8192] * count,
     }
+    for i in range(4):
+        data[f"extra_{i}"] = [9007199254740993 + row + i for row in range(count)]
     archive = tmp_path / "archive.parquet"
     pq.write_table(pa.table(data), archive, row_group_size=16, use_dictionary=False)
     fixture_root = tmp_path / "fixture"
@@ -1680,6 +1682,8 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
         }
         for name in ("id", "bucket", "counter")
     }
+    for i in range(4):
+        properties[f"extra_{i}"] = {"type": "integer"}
     properties["counter"]["nullable"] = True
     properties.update(
         body={"type": "string", "x-antfly-field": {"type": "text"}},
@@ -1734,9 +1738,10 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
                         )
                         request = {
                             "full_text_search": {"match": "needle", "field": "body"},
-                            "fields": ["id", "bucket", "body", "note", "counter"],
+                            "fields": ["id", "bucket", "body", "note", "counter"]
+                            + [f"extra_{i}" for i in range(4)],
                             "order_by": [{"field": "id", "desc": descending}],
-                            "limit": 96,
+                            "limit": 192,
                         }
                         first = client.query({"request": request})
                         second = client.query(

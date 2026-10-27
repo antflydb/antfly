@@ -49,7 +49,7 @@ pub fn load(a: A, store: stores.ArtifactStore, domain: [32]u8, refs: []const tre
         units[i] = .{ .object = .{ .artifact_id = &ids[i], .checksum = ids[i][7..71], .byte_len = ref.artifactBytes() }, .offset = ref.offset(), .bytes = ref.bytes, .digest = ref.digest };
     }
     const batch = try ranges.load(a, store, units[0..refs.len], token, cached, budget, .{ .max_range = tree.max_page_bytes, .max_gap = 16 * 1024 });
-    return .{ .a = a, .refs = refs, .values = batch.values };
+    return .{ .a = a, .refs = refs, .values = batch.values[0..tree.max_read_batch].* };
 }
 
 test "external lake metadata navigation range waves coalesce authenticate cache and bound budgets" {

@@ -1780,3 +1780,31 @@ and resumable GC expands each directory once before marking its pack. Ordered
 metadata versions 11/12 and native reader protocol 90 fence older workers from
 interpreting the new layout. Existing unchanged cover blocks remain readable;
 no duplicate serialized source row is introduced.
+
+
+### Shared bounded range and field-major delivery
+
+Navigation pages and covering stripes use one authenticated range-wave planner.
+The adapter retains the navigation page limit and its bounded gap policy; covering
+stripes permit 4 MiB ranges and coalesce exact adjacency only. Omitted columns are
+never gap traffic. Each wave contains at most 16 logical units, keeps per-unit raw
+cache identities, verifies every requested digest, and joins all workers before
+releasing provider/context state. Required reads run inline if shared I/O slots
+are occupied. Distinct ranges within a pack can run concurrently; block waves
+retain their existing shared scheduler admission.
+
+Cover readers probe decoded stripe residency before physical preparation. Warm
+decoded stripes require no raw-cache residency and do not refetch evicted wire
+bytes. Uncached single-unit ranges transfer transport ownership without a second
+large allocation. Decoded metadata and retained raw bodies remain operation-owned
+and release on successful consumption, cancellation and allocation failures. The
+publication layout, recipe and reader protocol are unchanged by this refinement.
+
+Stored-source delivery validates identities and sorts only a permutation of the
+returned hits. It visits one field across the entire returned selection, checking
+cancellation at most every 64 positions, before advancing to the next field. Four
+cursors suffice even for wider projections; native field chunks stay open across
+those processing tiles. Metadata is proportional to the existing returned-hit
+set, never source-table cardinality. Legacy source documents are parsed once per
+returned row for the complete projection. Result order and hidden-field isolation
+retain the same contracts.
