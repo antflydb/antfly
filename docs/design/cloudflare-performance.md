@@ -1094,3 +1094,27 @@ before checkpoint completion. It then commits a new value after the prior
 negative probes, advances the checkpoint, replaces the owner and checks each
 fresh observed value. This removes a serialized storage wave on warm observers;
 the live gate must establish the end-to-end benefit.
+
+## Deadlines while storage is suspended
+
+Live candidate traces recorded R2 waits of 68–74 seconds inside requests with
+thirty-second native deadlines. Polling before/after transport does not enforce
+a deadline while the binding's promise remains unresolved. The host now races
+each suspension against the same absolute deadline and caller cancellation.
+Success already observed from transport still proceeds through native receipt
+handling; a timeout reports an indeterminate write outcome, never a negative
+commit acknowledgement.
+
+A timed-out suspended host is poisoned. Its native reservation and busy slot
+remain charged until all started I/O, upload workers and declared auxiliary
+prefetch settle. The pool then retires that host and admits the next caller in
+its submitting context. Batch checks capture their original options, so late
+settlement cannot start more uploads or read another request's options.
+
+The metadata coordinator rejects new writes with recoverable admission while
+an indeterminate operation drains. Queued groups also check this barrier. After
+settlement, fresh native recovery authenticates the durable outcome before
+another mutation. Background checkpoint hints defer during that drain. Tests
+hold a real metadata commit past its deadline, verify retained capacity and
+rejected intervening writes, then recover its late durable value. Actual-workerd
+coverage checks capacity across the completed RPC and the next caller's context.

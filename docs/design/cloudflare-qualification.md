@@ -1732,3 +1732,22 @@ coverage. It does not pass the gate. The prior pair-1 control subsequently
 exhausted the thirty-minute publication setup deadline despite both sides
 acknowledging all 32 seed batches; the candidate had converged. Its failed report
 is preserved before pausing the pair for the approved-control transition.
+
+Approved control `c44896ac8c` was deployed on all three pairs with original
+native hashes, alongside candidate `7f16e0d470` on fresh corpora. Exact replay
+recovered three control-1 and three control-2 DLQ jobs; both temporary consumers
+were removed after empty pulls, and all six DLQs then reported zero.
+
+This cohort still does not qualify. Pair 1 failed setup when candidate writes
+exhausted the unchanged sixty-second deadline; pair 2 exhausted the control's
+publication setup deadline. Pair 3 was stopped after more than 72 completed
+reads exceeded 1,000 ms, making the fixed 1,440-read hour's p95 target impossible.
+The original partial report was archived before interruption annotation. No
+cold epoch was consumed.
+
+Sanitized traces identified candidate storage suspensions lasting 68–74 seconds
+inside thirty-second native requests. The host/pool drain correction described
+in [performance design](cloudflare-performance.md) passes 231 Node checks and
+16 persisted Worker checks, including late durable-commit recovery and a real
+RPC context/reservation handoff. The candidate native modules are unchanged at
+this checkpoint; live deadline and latency qualification remains outstanding.

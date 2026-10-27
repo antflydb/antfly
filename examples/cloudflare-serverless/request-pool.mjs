@@ -69,7 +69,11 @@ export class RequestPool {
   const stage=(name,start)=>{try{job.options.onStage?.({name,duration_ms:performance.now()-start});}catch{}};
   stage("kernel_queue",job.queuedAt);
   try{await new Promise(resolve=>setTimeout(resolve,0));if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");if(!slot.host){const start=performance.now();slot.host=await this.create(job);slot.hostKey=job.hostKey;slot.hostReservationBytes=job.reservationBytes;stage("wasm_instantiate",start);}if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");return await (job.run?job.run(slot.host):slot.host.request(job.input,job.options));}
-  finally{if(slot.host&&(!slot.host.usable()||slot.host.memoryBytes()>=job.recycleBytes))slot.host=null;this.reservedBytes-=job.reservationBytes;slot.activeReservationBytes=0;slot.busy=false;this.drain();}
+  finally{
+   const release=()=>{if(slot.host&&(!slot.host.usable()||slot.host.memoryBytes()>=job.recycleBytes))slot.host=null;this.reservedBytes-=job.reservationBytes;slot.activeReservationBytes=0;slot.busy=false;this.drain();};
+   const draining=slot.host?.draining?.();
+   if(draining)Promise.resolve(draining).then(release,release);else release();
+  }
  }
  memoryBytes(){return this.slots.reduce((n,slot)=>n+(slot.host?.memoryBytes()??0),0);}
 }

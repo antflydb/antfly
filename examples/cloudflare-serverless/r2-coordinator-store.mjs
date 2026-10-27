@@ -52,7 +52,7 @@ export class R2CoordinatorStore {
   // its mutable accounting. Native authentication/CAS rejects stale owners and
   // preserves a newer checkpoint; the native one-second write limit applies.
   async checkpointHint() {
-    if(!this.acquired||this.recovering||!this.state)return{busy:true};
+    if(!this.acquired||this.recovering||this.ioDrain||!this.state)return{busy:true};
     const state=structuredClone(this.state),physical={};
     const transport=this.cache.wrap(instrumentTransport(this.rawTransport,physical),`coordinator/${this.namespace}`);
     const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{action:"checkpoint",owner:this.owner,state,checkpoint_commits:this.checkpointCommits}},{transport,fairKey:this.namespace,priority:"maintenance",deadlineMs:this.clock()+10000,maxOperations:32,maxTransferBytes:1024*1024,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.checkpoint_hint",...sample,physical_r2:physical});}catch{}}});
@@ -62,7 +62,7 @@ export class R2CoordinatorStore {
     if(this.ownerReady)await this.ownerReady;
     if(!this.kernel)this.host ??= await instantiateHost(this.module, this.transport, {clock:this.clock,onMetrics:sample=>this.chargeMetrics(sample)});
     const cursor=Object.hasOwn(coordinate,"state")?coordinate.state:this.state??(coordinate.action==="begin"&&this.observedState?.next>0?this.observedState:null);
-    let transport=this.transport,cleanup=async()=>{};
+    let transport=this.transport,cleanup=async()=>{},abandoned=false;
     if(coordinate.action==="retire_logs"&&this.base&&Array.isArray(coordinate.keys)&&coordinate.keys.length<=32){
       const prefix=this.base+"/epochs/",keys=[...new Set(coordinate.keys.filter(key=>typeof key==="string"&&key.startsWith(prefix)&&/^[a-f0-9]{32}\/(?:START|SEALED|[0-9]{20}\.json)$/.test(key.slice(prefix.length))))];
       if((this.usedOperations??0)+keys.length>=1024||(this.usedBytes??0)+keys.length*16384>=32*1024*1024)throw Error("CoordinatorIoBudgetExceeded");
@@ -105,8 +105,11 @@ export class R2CoordinatorStore {
     }
     try {
       if ((this.usedOperations ?? 0) >= 1024 || (this.usedBytes ?? 0) >= 32*1024*1024) throw new Error("CoordinatorIoBudgetExceeded");
-      return await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {checkpoint_commits:this.checkpointCommits,owner: this.owner, state: cursor, ...coordinate}}, {transport,fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"commit",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
-    } finally {await cleanup();if (this.host&&(!this.host.usable() || this.host.memoryBytes() >= 24 * 1024 * 1024)) this.host = null;}
+      return await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {checkpoint_commits:this.checkpointCommits,owner: this.owner, state: cursor, ...coordinate}}, {transport,drainTransport:()=>cleanup(),fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"commit",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
+    } catch(error) {
+      if(error?.ioSettled){abandoned=true;const draining=error.ioSettled;this.ioDrain=draining;draining.then(()=>{if(this.ioDrain===draining)this.ioDrain=null;});}
+      throw error;
+    } finally {if(!abandoned)await cleanup();if (this.host&&(!this.host.usable() || this.host.memoryBytes() >= 24 * 1024 * 1024)) this.host = null;}
   }
   chargeMetrics(sample){this.nativeCpuMs=(this.nativeCpuMs??0)+Math.max(0,(sample.elapsed_ms??0)-(sample.io_wait_ms??0));this.usedOperations=(this.usedOperations??0)+sample.operations;this.usedBytes=(this.usedBytes??0)+sample.transferred_bytes;try{this.onMetrics?.(sample);}catch{}}
   setReadHints(namespace,generation,hints){
@@ -186,6 +189,7 @@ export class R2CoordinatorStore {
     return this.enqueue({run,priority,traceId});
   }
   enqueue(input) {
+    if(this.ioDrain)return Promise.reject(new Error("CoordinatorRecovering"));
     if(this.pending.length>=64)return Promise.reject(new Error("CoordinatorCommitBusy"));
     return new Promise((resolve,reject)=>{
       let admit;
@@ -220,6 +224,7 @@ export class R2CoordinatorStore {
     this.groupPriority=this.pending[0]?.priority;
     const completed=[];
     try {
+      if(this.ioDrain)throw new Error("CoordinatorRecovering");
       if(this.pending[0]?.kind==="commit_wal"){
         this.deadline=Math.min(this.deadline,this.pending[0].deadlineMs);
         if(this.clock()>=this.deadline){completed.push(this.pending.shift());throw new Error("DeadlineExceeded");}

@@ -22,7 +22,7 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now, refreshClock = (delayMs = 0) => new Promise(resolve => setTimeout(resolve, delayMs)) } = {}) {
   if (!(module instanceof WebAssembly.Module)) throw new TypeError("a precompiled WebAssembly.Module is required");
   if (!Number.isSafeInteger(stackBytes) || stackBytes < 4096 || stackBytes > 8 * 1024 * 1024) throw new TypeError("invalid suspension stack size");
-  let wasm, pending, completed, activeTransport, activeOptions, operations, inferenceCalls, transferred, busy = false, poisoned = false;
+  let wasm, pending, completed, activeTransport, activeOptions, operations, inferenceCalls, transferred, draining = null, busy = false, poisoned = false;
   const bytes = (ptr, len) => new Uint8Array(wasm.memory.buffer, ptr, len);
   function allocate(value) {
     if (value.byteLength === 0) return 0;
@@ -59,9 +59,10 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
       // The WASM memory may grow while preparing a completion. Do not retain
       // views across the async boundary, including upload bodies.
       const body = bytes(bodyPtr, bodyLen).slice();
+      const options = activeOptions;
       const check = () => {
-        if (activeOptions.signal?.aborted) throw new ObjectStoreError(5, "canceled upload batch");
-        if (clock() >= activeOptions.deadlineMs) throw new ObjectStoreError(9, "upload batch deadline");
+        if (options.signal?.aborted) throw new ObjectStoreError(5, "canceled upload batch");
+        if (clock() >= options.deadlineMs) throw new ObjectStoreError(9, "upload batch deadline");
       };
       pending = Promise.resolve().then(() => batch ? executePutBatch(handler, request, body, check) : handler(request, body)).then(
         value => ({ status: 0, value }),
@@ -101,11 +102,31 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
   if (!stackDescriptor) throw new Error("WASM stack allocation failed");
   new DataView(wasm.memory.buffer).setUint32(stackDescriptor, stackDescriptor + 8, true);
   new DataView(wasm.memory.buffer).setUint32(stackDescriptor + 4, stackDescriptor + 8 + stackBytes, true);
+  function waitForIo(io, options) {
+    return new Promise((resolve, reject) => {
+      let timer, finished = false;
+      const finish = (error, value) => {
+        if (finished) return;
+        finished = true; clearTimeout(timer); options.signal?.removeEventListener("abort", abort);
+        error ? reject(error) : resolve(value);
+      };
+      const abort = () => finish(new Error("Canceled"));
+      const arm = () => {
+        const remaining = options.deadlineMs - clock();
+        if (remaining <= 0) finish(new Error("DeadlineExceeded"));
+        else timer = setTimeout(arm, Math.min(remaining, 2147483647));
+      };
+      io.then(value => finish(null, value), error => finish(error));
+      options.signal?.addEventListener("abort", abort, {once:true});
+      if (options.signal?.aborted) abort(); else arm();
+    });
+  }
   async function request(value, { transport: requestTransport = transport, signal,
-    inference, onMetrics: requestMetrics = onMetrics, deadlineMs = clock() + 30000, maxOperations = 1024, maxTransferBytes = 32 * 1024 * 1024 } = {}) {
+    inference, drainTransport, onMetrics: requestMetrics = onMetrics, deadlineMs = clock() + 30000, maxOperations = 1024, maxTransferBytes = 32 * 1024 * 1024 } = {}) {
     const unusable = poisoned || invalidClock;
     if (busy || unusable) throw new Error(unusable ? "WASM instance is unusable" : "WASM instance is busy");
     if (typeof requestTransport !== "function") throw new TypeError("request transport required");
+    if (drainTransport != null && typeof drainTransport !== "function") throw new TypeError("invalid transport drain");
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0 || !Number.isSafeInteger(maxOperations) || maxOperations < 1 ||
       !Number.isSafeInteger(maxTransferBytes) || maxTransferBytes < 1) throw new TypeError("invalid request budget");
     // Serialize before taking the execution lane: caller errors such as a
@@ -154,8 +175,19 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
         if (wasm.asyncify_get_state() !== 1 || !pending) throw new Error("invalid WASM suspension");
         wasm.asyncify_stop_unwind();
         const waitStarted = performance.now();
-        const completion = await pending;
-        waitMs += performance.now() - waitStarted;
+        let completion;
+        try { completion = await waitForIo(pending, activeOptions); }
+        catch (error) {
+          // Binding I/O cannot be canceled here. Retire the suspended host;
+          // keep its reservation until every started operation settles. A
+          // late write is indeterminate, never a negative commit receipt.
+          const io = pending;
+          let auxiliary;
+          try { auxiliary = drainTransport?.(); } catch (error) { auxiliary = Promise.reject(error); }
+          draining = Promise.allSettled([io, auxiliary]).then(() => { pending = null; draining = null; });
+          Object.defineProperty(error, "ioSettled", {value:draining});
+          throw error;
+        } finally { waitMs += performance.now() - waitStarted; }
         pending = null;
         const header = encoder.encode(JSON.stringify(completion.value.json ?? {}));
         const body = completion.value.body ?? new Uint8Array();
@@ -175,7 +207,7 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
         wasm.asyncify_start_rewind(stackDescriptor);
       }
     } catch (error) {
-      failureCode = protocolError && /^[A-Za-z][A-Za-z0-9_]{0,95}$/.test(error.message) ? error.message : "HostFailure";
+      failureCode = (protocolError && /^[A-Za-z][A-Za-z0-9_]{0,95}$/.test(error.message) || /^(DeadlineExceeded|Canceled)$/.test(error.message)) ? error.message : "HostFailure";
       // Ordinary database errors are returned with an idle stack. A trap or
       // incomplete unwind poisons the instance; never reuse its mutable state.
       // A foreign JS exception may bypass Zig defers even with an idle
@@ -197,5 +229,5 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
       try { requestMetrics(metrics); } catch {}
     }
   }
-  return { request, usable: () => !poisoned && !invalidClock, memoryBytes: () => wasm.memory.buffer.byteLength };
+  return { request, usable: () => !poisoned && !invalidClock, memoryBytes: () => wasm.memory.buffer.byteLength, draining: () => draining };
 }

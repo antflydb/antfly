@@ -507,6 +507,17 @@ test('warm unowned proof reads overlap checkpoint and tail without reusing negat
  const replacement=new R2CoordinatorStore(module,bucket,'parallel-observer-proof',{clock:()=>now});await replacement.transaction(tx=>tx.put('value',3));assert.equal(await observer.readOnly(tx=>tx.get('value')),3,'native recovery follows a replaced owner');assert.equal(observer.acquired,false);
 });
 
+test('ambiguous metadata deadlines retain native reservations and recover the late durable commit', {timeout:5000},async()=>{
+ const{RequestPool}=await import('../request-pool.mjs'),{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs'),compact=await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless-compact.wasm',import.meta.url)));
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket});let created=0,hold=false,release,entered;const held=new Promise(r=>release=r),started=new Promise(r=>entered=r);
+ const pool=new RequestPool(async()=>{created++;return instantiateHost(compact,null);},1,{maxReservedBytes:16*1024*1024,reservationBytes:16*1024*1024,recycleBytes:12*1024*1024}),store=new R2CoordinatorStore(module,bucket,'late-native-commit',{kernel:pool,transport:async(req,body)=>{if(hold&&req.op==='put'&&req.key.endsWith('.json')&&JSON.parse(new TextDecoder().decode(body)).kind==='commit'){entered();await held;}return raw(req,body);}});
+ await store.transaction(tx=>tx.put('value',1));hold=true;
+ const writing=store.transaction(tx=>{tx.put('value',2);store.deadline=Date.now()+25;});const failed=assert.rejects(writing,/DeadlineExceeded/);await started;
+ try{await failed;assert.ok(store.ioDrain);assert.equal(pool.reservedBytes,16*1024*1024);assert.equal(pool.slots[0].busy,true);assert.equal(pool.slots[0].host.usable(),false);assert.ok(pool.memoryBytes()>0);await assert.rejects(store.transaction(tx=>tx.put('value',3)),/CoordinatorRecovering/);assert.equal(created,1,'a draining host must not open replacement capacity');}
+ finally{hold=false;release();await failed;await store.ioDrain;}
+ assert.equal(pool.reservedBytes,0);assert.equal(await store.transaction(tx=>tx.get('value')),2,'fresh native recovery must authenticate the late commit');assert.equal(created,2);assert.equal(pool.reservedBytes,0);
+});
+
 test("point reads keep stable bounded placement across app isolate restarts",async()=>{
  const{readerSlot}=await import('../runtime-routing.mjs');for(const slots of[1,2,3,4]){const seen=new Set();for(let i=0;i<512;i++){const input={op:'lookup',doc_id:'gate/'+i},slot=readerSlot(input,slots,i);assert.ok(slot>=0&&slot<slots);assert.equal(readerSlot(input,slots,0),slot);assert.equal(readerSlot(input,slots,123456),slot);seen.add(slot);}assert.equal(seen.size,slots);}
  for(let i=0;i<512;i+=2)assert.notEqual(readerSlot({op:'lookup',doc_id:'gate/'+i},2),readerSlot({op:'lookup',doc_id:'gate/'+(i+1)},2));assert.equal(readerSlot({op:'count'},2,3),1);assert.equal(readerSlot({op:'lookup',doc_id:'😀/é'},4),readerSlot({op:'lookup',doc_id:'😀/é'},4,9));

@@ -135,6 +135,16 @@ test("host admission stops canceled or expired work before storage and bounds I/
   await host.request(append("ok"));
 });
 
+for(const mode of ['deadline','abort'])test(`suspended host ${mode} returns before storage settles and drains auxiliary I/O`,{timeout:3000},async()=>{
+ let release,releaseAux,entered,timer;const held=new Promise(r=>release=r),auxiliary=new Promise(r=>releaseAux=r),started=new Promise(r=>entered=r),metrics=[];
+ const {host,bucket}=await setup(undefined,raw=>async(req,body)=>{entered();await held;return raw(req,body);});const controller=new AbortController();
+ const work=host.request(request('latest'),{signal:controller.signal,deadlineMs:Date.now()+(mode==='deadline'?25:2000),drainTransport:()=>auxiliary,onMetrics:m=>metrics.push(m)}).then(value=>({value}),error=>({error}));await started;if(mode==='abort')controller.abort();
+ try{
+  const result=await Promise.race([work,new Promise(r=>timer=setTimeout(()=>r({late:true}),500))]);assert.equal(result.late,undefined,'caller must finish while underlying storage is still suspended');assert.match(result.error.message,mode==='deadline'?/DeadlineExceeded/:/Canceled/);assert.equal(host.usable(),false);assert.equal(bucket.writes,0);
+  const draining=host.draining();assert.ok(draining);assert.equal(result.error.ioSettled,draining);release();await new Promise(r=>setTimeout(r,0));assert.ok(host.draining(),'all auxiliary prefetch must settle before releasing the reservation');releaseAux();await draining;assert.equal(host.draining(),null);assert.equal(metrics.length,1);assert.equal(metrics[0].failure_code,mode==='deadline'?'DeadlineExceeded':'Canceled');
+ }finally{clearTimeout(timer);release();releaseAux();await work;await host.draining();}
+});
+
 test("a batch publishes one committed prefix and retries without duplicate mutations", async () => {
   const { host, bucket } = await setup();
   const input = request("append_batch", { operation_id: "batch", payloads: ["a", "b", "c"] });
