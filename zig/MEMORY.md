@@ -2676,7 +2676,9 @@ paths, while the bounded journal maintains deduplicated key invalidations for
 unaffected-root read proofs across edit bursts. Deletable counting summaries
 with exact SHA-256 checks keep large distinct-key bursts out of request arenas.
 Durable ingestion and next-work queues preserve active repair/walk progress under
-unrelated edits; configured parent guards cover masked-edge unmerge. Complete configured/native graph
-coverage is owner-built before membership readiness; native memory identities
+unrelated edits; ingestion uses available turn capacity with one scratch decode
+per event. Root-batch proofs bound the roots-by-edits cross product and reuse
+complete invalidation pages. Configured parent guards cover masked-edge unmerge.
+Complete configured/native graph coverage is owner-built before membership readiness; native memory identities
 without static consumers still create neither this projection nor its journal.
 See `RESOLUTION.md` for upgrade floors, bounded maintenance, and fallback rules.

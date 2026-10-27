@@ -2758,9 +2758,13 @@ pin-only edits do not enroll unnecessary graph work.
 Dirty old/new roots remain unreadable during partial publication. Journal ingestion
 has its own durable sequence and graph anchor, separate from the published graph.
 New edits enter deduplicated next-work queues without rewinding active expansion,
-path reconstruction or membership cursors. Ingestion gets a bounded share of each
-turn; active work pauses if it falls behind. A persisted set of visited walk nodes
-invalidates only walks whose prefix intersects a routing edit. Unrelated heads do
+path reconstruction or membership cursors. Ingestion consumes the shared turn
+budget until it catches up, then active repair uses the remaining capacity.
+A fixed quarter-turn quota must not idle spare capacity and starve active work.
+Each event is decoded once per turn in reusable scratch; only queued writes
+survive in the transaction arena. Active work pauses only after exhausting its
+available ingestion capacity while still behind. A persisted set of visited walk
+nodes invalidates only walks whose prefix intersects a routing edit. Unrelated heads do
 not restart a long walk, even across more than 256 updates, provided ingestion
 keeps pace. Trace rows and retired work sets are reclaimed in bounded turns.
 A bounded prune queue also removes unconfigured, undeclared nodes with no
@@ -2770,7 +2774,10 @@ routing declarations and referenced targets remain live. Cleanup and the final
 graph watermark share the native writer transaction.
 
 Read-side validity uses one retained lineage anchor. Tiny edit bursts use one
-ordered invalidation page and exact dependency reads. Larger bursts use compact
+ordered invalidation page and exact dependency reads. Strategy selection also
+bounds the roots-by-edits cross product: beyond 128 combinations (except one/two
+edits, which stay linear in roots), a complete small page supplies digests to the
+same summary proof without reopening journal slots. Larger bursts use compact
 full SHA-256 digests from the same 256-event journal and a deletable counting
 summary per requested root. Four digest-derived positions use four-bit counters
 in nonempty 1-KiB pages (128 KiB maximum per root), with exact sparse overflow
@@ -2876,3 +2883,17 @@ heads during a 16,000-hop backfill. Counter regressions cover collisions, repeat
 positions, overflow removal and empty-page reclamation. Owner turns allow at most
 129 derived/state writes with a 128-work budget; the minimum internal repair
 budget is 32 to accommodate atomic counter and guard updates.
+
+Further owner/read regressions use 16 unrelated routing updates before each
+128-work owner turn. The older 128-member component is fully moved within
+128 busy turns; the current background component then reaches global readiness
+in six quiet turns. Previously no members moved in 64 busy turns and recovery
+needed another 123 quiet turns. Global readiness under sustained input still
+depends on whether the complete repair workload fits available owner capacity.
+For 128-key journal batches, a turn performs 65 derived/state writes with under
+93 KiB of owner arena (formerly 17 writes with 1.03 MiB); a 512-KiB fixed allocator
+succeeds, and event reads are bounded to one lineage anchor plus one ingestion
+read. A 1,024-root, small-burst proof uses 2,050 point reads rather than 41,986;
+the complete zero-result query uses 11,270 point reads rather than 51,206.
+The summary path adds bounded root-prefix scans; this measures storage-operation
+counts rather than claiming equivalent end-to-end latency gains.

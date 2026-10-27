@@ -1341,38 +1341,45 @@ pub const Store = struct {
         _ = template;
         return if (!next.latent and (prior == null or !prior.?.latent)) (if (prior == null) @as(u32, 2) else 1) else 16;
     }
-    /// Ingestion has its own durable watermark and bounded share of each turn.
+    /// Ingestion has its own durable watermark and bounded turn budget.
     /// New edits enter the next work set, never rewind an active work cursor.
-    fn ingestPinEdits(self: Store, template: []const u8, root: []const u8, state: *PinProjection, latest: PinEditHead, lookup: AliasLookup, budget: *u32) !void {
+    fn ingestPinEdits(self: Store, template: []const u8, root: []const u8, state: *PinProjection, latest: PinEditHead, lookup: AliasLookup, budget: *u32, scratch: *std.heap.FixedBufferAllocator) !void {
         const repair = &state.repair.?;
         while (budget.* >= 2 and repair.sequence <= latest.sequence) {
-            const event = (try self.pinEdit(template, repair.sequence)) orelse return error.InvalidCatalogRecord;
+            // Event strings remain in reusable scratch until all items that
+            // fit this turn are queued. Only durable writes use the owner arena.
+            scratch.reset();
+            var temporary = self;
+            temporary.a = scratch.allocator();
+            const event = (try temporary.pinEdit(template, repair.sequence)) orelse return error.InvalidCatalogRecord;
             if (!std.mem.eql(u8, &event.before, &(repair.ingest_graph orelse state.graph))) return error.InvalidCatalogRecord;
-            if (repair.index < event.boundaries.len) {
-                const id = event.boundaries[repair.index];
-                try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}next-boundary/{s}", .{ root, try hash(self.a, id) }), try encode(self.a, id));
-                repair.index += 1;
-                budget.* -= 1;
-            } else if (repair.index < event.boundaries.len + event.routing.len) {
-                const id = event.routing[repair.index - event.boundaries.len];
-                try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}next-node/{s}", .{ root, try hash(self.a, id) }), try encode(self.a, id));
-                if (state.walk) |*walk| if (try self.backend.get(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}trace/{s}", .{ root, try hash(self.a, id) })) != null) {
-                    walk.invalid = true;
-                };
-                if (try lookup.node.?(lookup.ptr, self.a, id) == null) try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}prune-node/{s}", .{ root, try hash(self.a, id) }), try encode(self.a, id));
-                repair.index += 1;
-                budget.* -= 2;
-            } else if (repair.index < event.boundaries.len + event.routing.len + event.targets.len) {
-                const id = event.targets[repair.index - event.boundaries.len - event.routing.len];
-                if (try lookup.node.?(lookup.ptr, self.a, id) == null) try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}prune-node/{s}", .{ root, try hash(self.a, id) }), try encode(self.a, id));
-                repair.index += 1;
-                budget.* -= 1;
-            } else {
-                repair.target = event.sequence;
-                repair.ingest_graph = event.graph;
-                repair.sequence += 1;
-                repair.index = 0;
-                budget.* -= 1;
+            while (budget.* >= 2 and repair.sequence == event.sequence) {
+                if (repair.index < event.boundaries.len) {
+                    const id = event.boundaries[repair.index];
+                    try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}next-boundary/{s}", .{ root, try hash(self.a, id) }), try encode(self.a, id));
+                    repair.index += 1;
+                    budget.* -= 1;
+                } else if (repair.index < event.boundaries.len + event.routing.len) {
+                    const id = event.routing[repair.index - event.boundaries.len];
+                    try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}next-node/{s}", .{ root, try hash(self.a, id) }), try encode(self.a, id));
+                    if (state.walk) |*walk| if (try self.backend.get(self.backend.ptr, temporary.a, try std.fmt.allocPrint(temporary.a, "{s}trace/{s}", .{ root, try hash(temporary.a, id) })) != null) {
+                        walk.invalid = true;
+                    };
+                    if (try lookup.node.?(lookup.ptr, temporary.a, id) == null) try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}prune-node/{s}", .{ root, try hash(self.a, id) }), try encode(self.a, id));
+                    repair.index += 1;
+                    budget.* -= 2;
+                } else if (repair.index < event.boundaries.len + event.routing.len + event.targets.len) {
+                    const id = event.targets[repair.index - event.boundaries.len - event.routing.len];
+                    if (try lookup.node.?(lookup.ptr, temporary.a, id) == null) try self.backend.put(self.backend.ptr, self.a, try std.fmt.allocPrint(self.a, "{s}prune-node/{s}", .{ root, try hash(self.a, id) }), try encode(self.a, id));
+                    repair.index += 1;
+                    budget.* -= 1;
+                } else {
+                    repair.target = event.sequence;
+                    repair.ingest_graph = event.graph;
+                    repair.sequence += 1;
+                    repair.index = 0;
+                    budget.* -= 1;
+                }
             }
         }
     }
@@ -1388,12 +1395,10 @@ pub const Store = struct {
         if (repair.stage == .prune or repair.stage == .cleanup) {
             if (repair.target != latest.sequence) repair.stage = .seed;
         }
-        // Reserve progress capacity for the active repair. If ingestion itself
-        // falls behind, pause the walk without discarding its persisted prefix.
-        var ingress = limit / 4;
-        const reserved = ingress;
-        try self.ingestPinEdits(template, root, state, latest, lookup, &ingress);
-        budget -= reserved - ingress;
+        // An unconsumed head makes active graph work unsafe. Give ingestion
+        // the remaining shared budget, then spend every leftover unit on repair.
+        // A fixed ingress quota can otherwise starve repair while capacity sits idle.
+        try self.ingestPinEdits(template, root, state, latest, lookup, &budget, &frame);
         if (repair.sequence <= latest.sequence) return;
         if (state.walk) |walk| if (walk.invalid) {
             state.walk = null;
@@ -1714,10 +1719,7 @@ pub const Store = struct {
             var frame: std.heap.FixedBufferAllocator = .init(scratch.bytes);
             var budget = limit;
             if (state.repair != null) {
-                var ingress = limit / 4;
-                const reserved = ingress;
-                try self.ingestPinEdits(template, root, &state, latest, lookup, &ingress);
-                budget -= reserved - ingress;
+                try self.ingestPinEdits(template, root, &state, latest, lookup, &budget, &frame);
                 if (state.repair.?.sequence <= latest.sequence) {
                     try self.backend.put(self.backend.ptr, self.a, state_path, try encode(self.a, state));
                     return false;
@@ -1809,36 +1811,49 @@ pub const Store = struct {
         const prefix = try std.mem.concat(a, u8, &.{ try temporary.pinEditRoot(prepared.template), "invalidated/" });
         const after = try std.fmt.allocPrint(a, "{s}{d:0>20}/~", .{ prefix, sequence });
         const page = try self.backend.scan(self.backend.ptr, a, prefix, after, 32);
+        var changed_bytes: usize = 0;
         if (page.next == null) {
-            // Keep tiny/hot-key bursts on the existing one-page fast path.
+            // One/two edits stay linear in roots. Larger point proofs have a
+            // fixed cross-product cap; batch root sets use dependency summaries.
+            if (page.rows.len <= 2 or roots.count() <= 128 / page.rows.len) {
+                for (page.rows) |row| {
+                    root_frame.reset();
+                    const edit = try parse(PinInvalidation, root_frame.allocator(), row.value);
+                    if (edit.sequence <= sequence or edit.sequence > latest.sequence) return error.InvalidCatalogRecord;
+                    const digest = try hash(root_frame.allocator(), edit.key);
+                    var iterator = roots.keyIterator();
+                    while (iterator.next()) |id| {
+                        point_frame.reset();
+                        temporary.a = point_frame.allocator();
+                        if (try temporary.pinRootTouched(root, id.*, edit.key, digest, prepared.template)) return false;
+                    }
+                }
+                return true;
+            }
+            // The complete deduplicated page already names every changed key.
+            // Reuse it directly instead of reopening every retained ring event.
             for (page.rows) |row| {
                 root_frame.reset();
                 const edit = try parse(PinInvalidation, root_frame.allocator(), row.value);
                 if (edit.sequence <= sequence or edit.sequence > latest.sequence) return error.InvalidCatalogRecord;
-                const digest = try hash(root_frame.allocator(), edit.key);
-                var iterator = roots.keyIterator();
-                while (iterator.next()) |id| {
-                    point_frame.reset();
-                    temporary.a = point_frame.allocator();
-                    if (try temporary.pinRootTouched(root, id.*, edit.key, digest, prepared.template)) return false;
-                }
+                @import("antfly_hash").Sha256.hash(edit.key, scratch.bytes[changed_bytes..][0..32], .{});
+                changed_bytes += 32;
             }
-            return true;
-        }
-        // Large bursts carry only compact SHA-256 fingerprints through the
-        // proof. Their size is bounded by the same retained 256-event ring.
-        var changed_bytes: usize = 0;
-        var next = sequence;
-        while (next < latest.sequence) {
-            next += 1;
-            event_frame.reset();
-            const e = event_frame.allocator();
-            temporary.a = e;
-            const key = try std.fmt.allocPrint(e, "{s}compact/{d:0>3}", .{ try temporary.pinEditRoot(prepared.template), next % 256 });
-            const raw = (try self.backend.get(self.backend.ptr, e, key)) orelse return false;
-            if (raw.len < 8 or (raw.len - 8) % 32 != 0 or raw.len > 8 + 640 * 32 or std.mem.readInt(u64, raw[0..8], .little) != next or changed_bytes + raw.len - 8 > change_capacity) return error.InvalidCatalogRecord;
-            @memcpy(scratch.bytes[changed_bytes..][0 .. raw.len - 8], raw[8..]);
-            changed_bytes += raw.len - 8;
+        } else {
+            // Large bursts carry only compact full SHA-256 fingerprints from
+            // the bounded journal. Every summary hit still gets an exact read.
+            var next = sequence;
+            while (next < latest.sequence) {
+                next += 1;
+                event_frame.reset();
+                const e = event_frame.allocator();
+                temporary.a = e;
+                const key = try std.fmt.allocPrint(e, "{s}compact/{d:0>3}", .{ try temporary.pinEditRoot(prepared.template), next % 256 });
+                const raw = (try self.backend.get(self.backend.ptr, e, key)) orelse return false;
+                if (raw.len < 8 or (raw.len - 8) % 32 != 0 or raw.len > 8 + 640 * 32 or std.mem.readInt(u64, raw[0..8], .little) != next or changed_bytes + raw.len - 8 > change_capacity) return error.InvalidCatalogRecord;
+                @memcpy(scratch.bytes[changed_bytes..][0 .. raw.len - 8], raw[8..]);
+                changed_bytes += raw.len - 8;
+            }
         }
         var iterator = roots.keyIterator();
         while (iterator.next()) |id| {
@@ -4845,6 +4860,7 @@ const OrderedPinMemory = struct {
     rows: std.StringHashMapUnmanaged([]const u8) = .empty,
     tree: Tree = .{},
     reads: usize = 0,
+    pin_event_reads: usize = 0,
     scans: usize = 0,
     writes: usize = 0,
     visited: usize = 0,
@@ -4852,6 +4868,7 @@ const OrderedPinMemory = struct {
     fn get(ptr: *anyopaque, a: A, key: []const u8) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.reads += 1;
+        if (std.mem.indexOf(u8, key, "pin-edits-v1/") != null and std.mem.indexOf(u8, key, "/slot/") != null) self.pin_event_reads += 1;
         return if (self.rows.get(key)) |value| try a.dupe(u8, value) else null;
     }
     fn put(ptr: *anyopaque, _: A, key: []const u8, value: []const u8) !void {
@@ -5425,7 +5442,36 @@ test "resolver curation dependency repair scopes leaf edits and burst validity t
         for (many_roots, 0..) |*value, i| value.* = try std.fmt.allocPrint(a, "entity/unrelated-query-root-{d}", .{i});
         const prepared_many = (try store.prepareQuery(template, .{ .id = id, .lookup = reader.lookup() }, true)).?;
         defer prepared_many.release();
+        const read_before = memory.reads;
+        const scan_before = memory.scans;
         try std.testing.expectEqual(@as(usize, 0), (try store.queryExecutionPrepared(prepared_many, many_roots, &.{}, true)).namespace.state.distinct.len);
+        try std.testing.expect(memory.reads - read_before < 14000);
+        std.debug.print("DEPENDENCY MANY ROOTS roots={d} reads={d} scans={d}\n", .{ many_roots.len, memory.reads - read_before, memory.scans - scan_before });
+        var proof_roots: std.StringHashMapUnmanaged(void) = .empty;
+        for (many_roots) |key| try proof_roots.put(a, key, {});
+        const proof_state = try parse(Store.PinProjection, a, memory.rows.get(try std.mem.concat(a, u8, &.{ try store.pinProjectionRoot(template, id), "state" })).?);
+        const proof_reads = memory.reads;
+        const proof_scans = memory.scans;
+        try std.testing.expect(try store.pinRootsCurrent(prepared_many, proof_state, proof_roots, reader.lookup()));
+        try std.testing.expect(memory.reads - proof_reads <= many_roots.len * 3);
+        try std.testing.expect(memory.scans - proof_scans <= many_roots.len + 2);
+        std.debug.print("DEPENDENCY PROOF ROOTS roots={d} reads={d} scans={d}\n", .{ many_roots.len, memory.reads - proof_reads, memory.scans - proof_scans });
+        // The summary path must still reject real dependencies and roots,
+        // even when a complete small page supplies its changed digests.
+        var touched = previous;
+        touched.revision += 1;
+        const touched_edges = try a.alloc(resolver.KeyAlias, previous.merges.len + 1);
+        @memcpy(touched_edges[0..previous.merges.len], previous.merges);
+        touched_edges[touched_edges.len - 1] = .{ .key = aliases[1].key, .target = "entity/batch-new-root" };
+        touched.merges = touched_edges;
+        try store.apply(try difference(a, previous, touched));
+        const touched_query = (try store.prepareQuery(template, .{ .id = id, .lookup = reader.lookup() }, true)).?;
+        defer touched_query.release();
+        try proof_roots.put(a, "entity/pinned-root", {});
+        try std.testing.expect(!try store.pinRootsCurrent(touched_query, proof_state, proof_roots, reader.lookup()));
+        _ = proof_roots.remove("entity/pinned-root");
+        try proof_roots.put(a, "entity/batch-new-root", {});
+        try std.testing.expect(!try store.pinRootsCurrent(touched_query, proof_state, proof_roots, reader.lookup()));
         const invalidated = try store.backend.scan(store.backend.ptr, a, try std.mem.concat(a, u8, &.{ try store.pinEditRoot(template), "invalidated/" }), null, 256);
         try std.testing.expect(invalidated.rows.len < 32);
         var rows = memory.rows.iterator();
@@ -5555,7 +5601,8 @@ test "resolver curation dependency upgrade and masked unmerge remain exact at ev
 }
 
 test "resolver curation dependency repair progresses under ongoing unrelated churn" {
-    for ([_]bool{ false, true }) |churn| {
+    for ([_]u8{ 0, 1, 2 }) |mode| {
+        const churn = mode != 0;
         const count: usize = 128;
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -5624,13 +5671,16 @@ test "resolver curation dependency repair progresses under ongoing unrelated chu
         var ready = false;
         var owner_writes: usize = 0;
         var owner_turns: usize = 0;
-        for (0..64) |step| {
+        for (0..128) |step| {
             if (churn) {
                 var next = namespace;
                 next.revision += 1;
-                const edges = try a.alloc(resolver.KeyAlias, 2);
+                const edges = try a.alloc(resolver.KeyAlias, if (mode == 2) 17 else 2);
                 edges[0] = namespace.merges[0];
                 edges[1] = .{ .key = "entity/background", .target = if (step % 2 == 0) "entity/bg-a" else "entity/bg-b" };
+                if (mode == 2) for (edges[1..], 0..) |*edge, i| {
+                    edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/background-{d}", .{i}), .target = if (step % 2 == 0) "entity/bg-a" else "entity/bg-b" };
+                };
                 next.merges = edges;
                 try store.apply(try difference(a, namespace, next));
                 namespace = next;
@@ -5641,6 +5691,7 @@ test "resolver curation dependency repair progresses under ongoing unrelated chu
             owner.a = request.allocator();
             const before = memory.writes;
             ready = try owner.advanceQueryPins(template, id, reader.lookup(), 128);
+            try std.testing.expect(memory.writes - before <= 129);
             owner_writes += memory.writes - before;
             owner_turns += 1;
             if (ready) break;
@@ -5648,8 +5699,10 @@ test "resolver curation dependency repair progresses under ongoing unrelated chu
         const root = try store.pinProjectionRoot(template, id);
         const state = try parse(Store.PinProjection, a, memory.rows.get(try std.mem.concat(a, u8, &.{ root, "state" })).?);
         const members = try store.backend.scan(store.backend.ptr, a, try std.fmt.allocPrint(a, "{s}member/{s}/", .{ root, try hash(a, "entity/moved-root") }), null, 512);
-        std.debug.print("DEPENDENCY CHURN enabled={} pins={d} ready={} turns={d} owner_writes={d} phase={s} moved_members={d}\n", .{ churn, count, ready, owner_turns, owner_writes, @tagName(state.phase), members.rows.len });
-        try std.testing.expect(ready);
+        std.debug.print("DEPENDENCY CHURN mode={d} pins={d} ready={} turns={d} owner_writes={d} phase={s} moved_members={d}\n", .{ mode, count, ready, owner_turns, owner_writes, @tagName(state.phase), members.rows.len });
+        // Sixteen fresh routes per turn exceed the cost of fully repairing
+        // that background component, but cannot starve the older component.
+        if (mode != 2) try std.testing.expect(ready);
         try std.testing.expectEqual(count, members.rows.len);
         var recovery: usize = 0;
         while (!try store.advanceQueryPins(template, id, reader.lookup(), 128)) : (recovery += 1) try std.testing.expect(recovery < 256);
@@ -5720,12 +5773,12 @@ test "resolver curation dependency compact proof bounds distinct configured inva
             try std.testing.expectEqual(@as(usize, 0), result.namespace.state.distinct.len);
         }
         var namespace = initial;
-        for (0..count / 64) |step| {
+        for (0..count / 128) |step| {
             var next = namespace;
             next.revision += 1;
-            const edges = try a.alloc(resolver.KeyAlias, (step + 1) * 64);
+            const edges = try a.alloc(resolver.KeyAlias, (step + 1) * 128);
             @memcpy(edges[0..namespace.merges.len], namespace.merges);
-            for (0..64) |i| edges[step * 64 + i] = .{ .key = aliases[step * 64 + i].key, .target = "entity/curated-root" };
+            for (0..128) |i| edges[step * 128 + i] = .{ .key = aliases[step * 128 + i].key, .target = "entity/curated-root" };
             next.merges = edges;
             try store.apply(try difference(a, namespace, next));
             namespace = next;
@@ -5760,6 +5813,24 @@ test "resolver curation dependency compact proof bounds distinct configured inva
             try std.testing.expect(try current.pinRootsCurrent(prepared, projection, absent_roots, reader.lookup()));
             try std.testing.expect(request.queryCapacity() < 64 * 1024);
         }
+        var owner_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer owner_arena.deinit();
+        var probe_owner = store;
+        probe_owner.a = owner_arena.allocator();
+        const writes_before = memory.writes;
+        const event_reads_before = memory.pin_event_reads;
+        _ = try probe_owner.advanceQueryPins(template, id, reader.lookup(), 128);
+        try std.testing.expect(owner_arena.queryCapacity() < 512 * 1024);
+        try std.testing.expect(memory.pin_event_reads - event_reads_before <= 2);
+        try std.testing.expect(memory.writes - writes_before <= 129);
+        std.debug.print("DEPENDENCY OWNER count={d} arena={d} writes={d}\n", .{ count, owner_arena.queryCapacity(), memory.writes - writes_before });
+        var owner_bytes: [512 * 1024]u8 = undefined;
+        var owner_frame: std.heap.FixedBufferAllocator = .init(&owner_bytes);
+        var small_owner = store;
+        small_owner.a = owner_frame.allocator();
+        _ = try small_owner.advanceQueryPins(template, id, reader.lookup(), 128);
+        try std.testing.expect(owner_frame.end_index < 512 * 1024);
+        std.debug.print("DEPENDENCY OWNER bounded512k=success used={d}\n", .{owner_frame.end_index});
     }
 }
 
