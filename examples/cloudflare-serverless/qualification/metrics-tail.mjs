@@ -40,9 +40,9 @@ function metric(value,depth=0){
 }
 export function sanitizeTailEvent(event){
  if(!event||typeof event!=='object')return;
- const safe={};if(['ok','exception','canceled','exceededMemory','exceededCpu'].includes(event.outcome))safe.outcome=event.outcome;
+ const safe={};if(event.truncated===true||(event.logs?.length??0)>256||(event.logs??[]).some(log=>(log.message?.length??0)>32))safe.truncated=true;if(['ok','exception','canceled','exceededMemory','exceededCpu'].includes(event.outcome))safe.outcome=event.outcome;
  const logs=[];for(const log of (event.logs??[]).slice(0,256))for(const raw of(log.message??[]).slice(0,32)){
-  let value;try{value=JSON.parse(raw);}catch{const failure_code=resourceFailureCode(raw);if(failure_code)logs.push({timestamp:Number.isFinite(log.timestamp)?log.timestamp:undefined,message:[JSON.stringify({event:'antfly.resource_failure',failure_code})]});continue;}if(!events.has(value?.event))continue;
+  let value;try{value=JSON.parse(raw);}catch{const failure_code=resourceFailureCode(raw);if(failure_code)logs.push({timestamp:Number.isFinite(log.timestamp)?log.timestamp:undefined,message:[JSON.stringify({event:'antfly.resource_failure',failure_code})]});continue;}if(typeof value==='string'){const failure_code=resourceFailureCode(value);if(failure_code)logs.push({timestamp:Number.isFinite(log.timestamp)?log.timestamp:undefined,message:[JSON.stringify({event:'antfly.resource_failure',failure_code})]});continue;}if(!events.has(value?.event))continue;
   logs.push({timestamp:Number.isFinite(log.timestamp)?log.timestamp:undefined,message:[JSON.stringify(metric(value))]});
  }
  if(logs.length)safe.logs=logs;

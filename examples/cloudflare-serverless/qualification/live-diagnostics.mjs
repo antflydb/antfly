@@ -30,7 +30,7 @@ export class DiagnosticCoverage{
  connected(run,role){this.stream(run,role).connected=true;}
  lost(run,role){this.stream(run,role).gap=true;}
  observe(run,role,event){
-  const row=this.stream(run,role);row.events++;
+  const row=this.stream(run,role);row.events++;if(event.truncated===true)row.gap=true;
   if(['exceededMemory','exceededCpu'].includes(event.outcome))row.resource_failures++;
   for(const error of event.exceptions??[])if(resourceFailureCode(error.message))row.resource_failures++;
   for(const log of event.logs??[])for(const message of log.message??[]){let value;try{value=JSON.parse(message);}catch{continue;}
