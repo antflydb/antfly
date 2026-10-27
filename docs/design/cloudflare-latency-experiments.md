@@ -146,3 +146,21 @@ all 17 focused facts tests. The deployed full module SHA-256 is
 `c0f96a553ebdeb2be64c94d1cdbb3aa6bd753c8666282a029aa56af68550e8ce`.
 Earlier local experiment reports retain their actual intermediate module hashes;
 they are not rebound to this build.
+
+## Wall deadline headroom
+
+The first Cloudflare seed exposed successful publication slices dominated by
+20–25 seconds of storage I/O, followed by deadline cancellations. Compute-only
+feedback can immediately regrow a recovered prefix into that deadline again.
+The follow-up host guard keeps the native deadline at 30 seconds and uses a
+22.5-second wall headroom target alongside compute, transfer, operation and
+working-set guards. Growth additionally requires wall use below 80% of that
+target. Fixed network wait still does not count as compute. Local regression
+cases cover slow successful slices, preventing immediate regrowth, and recovery
+when wall headroom returns. The first deployed experiment predates this guard;
+its reports must not be attributed to the follow-up implementation.
+
+A repeat of the point experiment on the final codec module at 512 documents
+records no-inline versus inline p95 of 224/207 ms with the immutable cache
+cleared, and 176/158 ms warm. The GET reduction and retained-payload tradeoff
+remain the same as the earlier intermediate-module experiment.

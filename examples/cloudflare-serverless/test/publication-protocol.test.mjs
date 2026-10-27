@@ -43,6 +43,12 @@ test("publication feedback separates fixed network wait from admitted capacity",
  assert.equal(nextPublicationBudget(64,16,{}),16);
  assert.equal(nextPublicationBudget(64,64,{...healthy,native_io_wait_ms:15000}),64);
 });
+test("publication feedback retains wall deadline headroom during slow storage",()=>{
+ const ioBound={records:16,operations:64,transferred_bytes:600000,working_set_peak_bytes:600000,native_elapsed_ms:24000,native_io_wait_ms:23900};
+ assert.equal(nextPublicationBudget(16,64,ioBound),12,"successful slow prefixes shrink before the unchanged 30 second deadline");
+ assert.equal(nextPublicationBudget(8,64,{...ioBound,records:8,native_elapsed_ms:21000,native_io_wait_ms:20900}),8,"recovered prefixes must not immediately double into timeout");
+ assert.equal(nextPublicationBudget(8,64,{...ioBound,records:8,native_elapsed_ms:14000,native_io_wait_ms:13900}),16,"ample wall headroom still allows recovery");
+});
 test("queue delay and early cancellation do not lower publication capacity",()=>{
  const canceled=Error("Canceled");
  assert.equal(publicationExecutionFailure(canceled,{elapsed_ms:989}),canceled);
